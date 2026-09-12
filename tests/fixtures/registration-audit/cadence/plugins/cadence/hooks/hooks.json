@@ -1,0 +1,332 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact|clear|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start-journal",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start",
+            "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence platform-drift --baseline \"${CLAUDE_PLUGIN_ROOT}/config/platform-baseline.json\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session start",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session backstop-warn",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" pre-compact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence memory-guard",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence terminology",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence orphaned-todos",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence prevent-secret-writes",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence env-vars",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence line-endings",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence markdown-lint",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-overshare",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-external-content",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|mcp__.*(read|get_file|fetch_file|load_file|grep|search|find_file).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence prevent-secret-leaks",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence git-safety",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence prevent-secret-writes",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence prevent-secret-leaks",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-docs-update",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-changelog-entry",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence nudge-polish-before-pr",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session warn-plan-ready-flip",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-overshare",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-overshare",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-overshare",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence warn-overshare",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-external-content",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-external-content",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-external-content",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session guard",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session guard",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session guard",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session guard",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session warn-branch-drift",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session warn-commit-provenance",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session lint-plan-shape",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session guard",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session warn-branch-intent",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" user-prompt-submit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session persist-plan-approval",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session nudge-plan-tick",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" journal-tick",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/capture-insights.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session end",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session backstop-record",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

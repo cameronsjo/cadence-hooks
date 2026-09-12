@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$|^Edit$|^mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" obsidian trash-guard"
+          }
+        ]
+      }
+    ]
+  }
+}

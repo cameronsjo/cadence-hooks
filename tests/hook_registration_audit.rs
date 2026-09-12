@@ -685,6 +685,17 @@ fn enforce_complete_scan(scan: &PluginScan) {
 /// Scan every [`BINARY_PLUGIN_DIRS`] entry for its hooks.json, recording both
 /// what resolved and what didn't.
 fn hooks_json_references() -> PluginScan {
+    let (workspace_root, root_source) = resolved_workspace_root();
+    hooks_json_references_at(workspace_root, root_source)
+}
+
+/// [`hooks_json_references`] against an explicitly named root.
+///
+/// Split out so the checked-in fixture root is scanned by the *same* code that
+/// scans a developer's sibling checkout. A fixture leg with its own private
+/// scanner would be a second criterion, and the manifests it did not compare
+/// are exactly where drift would hide.
+fn hooks_json_references_at(workspace_root: PathBuf, root_source: RootSource) -> PluginScan {
     // An empty list would resolve nothing, look like "no sibling checkout",
     // and skip every assertion forever — the same silent no-op this audit was
     // just repaired for, one layer up.
@@ -693,8 +704,6 @@ fn hooks_json_references() -> PluginScan {
         "BINARY_PLUGIN_DIRS is empty — the audit would scan nothing and skip \
          every assertion. Removing the last entry is never the right fix."
     );
-
-    let (workspace_root, root_source) = resolved_workspace_root();
 
     let mut resolved = BTreeMap::new();
     let mut missing = Vec::new();
@@ -932,45 +941,425 @@ fn registered_commands(all_refs: &BTreeMap<String, Vec<HookRef>>) -> BTreeSet<&s
 
 // ---------- Tests ----------
 
-/// Resolve every expected plugin hooks.json, or stop the test — skipping only
-/// when there is genuinely nothing to audit.
+/// Where the checked-in manifest fixture lives.
 ///
-/// Three outcomes, all-or-none in both directions:
+/// Laid out as a workspace root (`<fixture>/cadence/plugins/<dir>/hooks/hooks.json`)
+/// so [`plugin_hooks_json`] resolves it with no special case — the fixture is a
+/// workspace like any other, not a second code path.
+fn fixture_workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/registration-audit")
+}
+
+/// The triage line for a *fixture*-leg failure.
 ///
-/// - **Nothing resolved, monorepo confirmed absent** — bare CI, a tarball
-///   build. Skip: there is no wiring to assert against.
-/// - **Everything resolved** — run the assertions.
-/// - **Anything else** — *fail*. A partial resolve is definitionally a broken
-///   environment (post-consolidation every manifest lives in the same
-///   checkout), and it used to skip. That is exactly how the audit became a
-///   false green: `cadence-canon` stayed in [`BINARY_PLUGIN_DIRS`] after the
-///   plugin was retired, so every assertion body returned before running while
-///   the suite reported 20 passing tests. Nothing-resolved-but-the-checkout-
-///   is-there fails for the same reason: it means every path this audit knows
-///   is wrong, which is the finding, not an excuse to stand down.
+/// Deliberately NOT [`STALE_CHECKOUT_HINT`], which tells the reader to suspect
+/// a stale sibling checkout. The fixture ships in this repository and there is
+/// no checkout behind it, so that hint would hand every fixture red an escape
+/// hatch that cannot apply — and on CI, where no sibling leg exists at all, it
+/// would be the only hint shown and pure misdirection.
+const FIXTURE_FAILURE_HINT: &str = "This is the checked-in fixture at \
+     tests/fixtures/registration-audit/, not a sibling checkout — no amount of \
+     fetching changes it. Either the binary drifted from the wiring, or the \
+     fixture is stale: refresh it with \
+     `bash scripts/refresh-registration-audit-fixture.sh` and re-read the \
+     failure.";
+
+/// One workspace an audit assertion runs against.
+struct AuditSubject {
+    /// Names the subject in a failure message, so a red assertion says which
+    /// workspace produced it.
+    label: &'static str,
+    /// The triage line for a failure from THIS subject. Per-subject because
+    /// the two subjects fail for structurally different reasons and the wrong
+    /// hint sends the reader to the wrong repository.
+    hint: &'static str,
+    refs: BTreeMap<String, Vec<HookRef>>,
+    root: PathBuf,
+}
+
+/// Every workspace the wiring assertions must hold for.
 ///
-/// The decision lives in [`PluginScan::verdict`] and [`enforce_complete_scan`]
-/// rather than in this macro body, so both branches are unit-testable — a
-/// macro nothing asserts on is how the last regression hid.
-macro_rules! require_plugin_refs {
-    ($refs:ident) => {
-        let scan = hooks_json_references();
-        if scan.verdict() == ScanVerdict::Skip {
-            eprintln!("{}", scan.skip_report());
-            return;
+/// **Always** the checked-in fixture, and additionally the sibling `cadence`
+/// monorepo checkout when one is present. The fixture is what puts this file on
+/// CI's gating leg: CI has no sibling checkout, so before the fixture existed
+/// every assertion below returned early and the suite reported 20 passing tests
+/// having asserted nothing about wiring. A skip is only ever the *live* leg
+/// standing down; the fixture leg has no skip branch at all.
+///
+/// The live leg keeps the full #909 verdict discipline — a partial resolve, or
+/// nothing resolving while a checkout IS present, still fails via
+/// [`enforce_complete_scan`] rather than quietly dropping out of the list.
+fn audit_subjects() -> Vec<AuditSubject> {
+    let mut subjects = vec![fixture_subject()];
+
+    let scan = hooks_json_references();
+    if scan.verdict() == ScanVerdict::Skip {
+        eprintln!("{}", scan.skip_report());
+        return subjects;
+    }
+    enforce_complete_scan(&scan);
+
+    subjects.push(AuditSubject {
+        label: "sibling cadence checkout",
+        hint: STALE_CHECKOUT_HINT,
+        refs: scan.resolved,
+        root: scan.workspace_root,
+    });
+    subjects
+}
+
+/// The fixture leg. It must always resolve completely: the fixture ships in
+/// this repo, so anything less is a defect in this repo rather than an
+/// environment to be tolerated.
+fn fixture_subject() -> AuditSubject {
+    let root = fixture_workspace_root();
+    let scan = hooks_json_references_at(root.clone(), RootSource::Override);
+
+    // Deliberately NOT `partial_resolve_report()`. That report is written for
+    // the sibling leg — it advises unsetting CADENCE_AUDIT_WORKSPACE_ROOT and
+    // checking whether the monorepo checkout is half-migrated, none of which
+    // can explain a manifest missing from this repository's own `tests/`.
+    assert_eq!(
+        scan.verdict(),
+        ScanVerdict::Run,
+        "the checked-in manifest fixture resolved {} of {} expected plugins. It \
+         ships in this repository, so this is never a missing sibling checkout — \
+         a BINARY_PLUGIN_DIRS entry has no fixture manifest, or one was \
+         deleted.\nunresolved:\n{}\n\n\
+         Add `tests/fixtures/registration-audit/{MONOREPO_PLUGINS_PREFIX}/<plugin>/hooks/hooks.json` \
+         for it, or remove the BINARY_PLUGIN_DIRS entry if the plugin is retired. \
+         `bash scripts/refresh-registration-audit-fixture.sh` populates an \
+         existing fixture directory from the monorepo.",
+        scan.resolved.len(),
+        BINARY_PLUGIN_DIRS.len(),
+        scan.missing_lines().join("\n"),
+    );
+
+    AuditSubject {
+        label: "checked-in fixture",
+        hint: FIXTURE_FAILURE_HINT,
+        refs: scan.resolved,
+        root,
+    }
+}
+
+/// The fixture leg is unconditional — the property that puts the wiring
+/// assertions on CI's gating leg, where there is no sibling checkout.
+#[test]
+fn audit_subjects_always_include_the_fixture() {
+    let subjects = audit_subjects();
+
+    assert!(
+        subjects.iter().any(|s| s.label == "checked-in fixture"),
+        "the fixture leg dropped out of the subject list — every wiring assertion \
+         below would then skip on CI, which is the false green #909 repaired"
+    );
+    assert!(
+        !subjects[0].refs.is_empty(),
+        "the fixture subject resolved no manifests"
+    );
+}
+
+/// The fixture is a mirror, and a mirror that drifts asserts about a wiring
+/// state that no longer exists — confidently, and forever, since nothing else
+/// compares them.
+///
+/// Runs only where a sibling checkout is present (a developer's machine); CI
+/// has none, so there is nothing to compare against there.
+///
+/// Compared against the sibling's **`origin/main`**, not its working tree. The
+/// fixture mirrors the wiring the plugins actually ship, and a developer's
+/// checkout is routinely parked on a feature branch or a few commits behind —
+/// the condition [`STALE_CHECKOUT_HINT`] exists to warn about. Reading the
+/// working tree here would turn every such checkout into a confident "the
+/// fixture is stale" that is really a fact about the checkout. Verified on a
+/// checkout five commits behind: the working tree reported drift in
+/// `cadence-metrics` that `origin/main` did not.
+///
+/// Compared as parsed JSON rather than bytes, because the two files live in
+/// different repositories and need not agree on formatting or line endings to
+/// agree on content.
+#[test]
+fn fixture_manifests_match_the_monorepo_default_branch() {
+    let live_root = workspace_root();
+    let fixture_root = fixture_workspace_root();
+
+    // `CADENCE_AUDIT_WORKSPACE_ROOT` pointed at the fixture is a DOCUMENTED way
+    // to exercise the wiring assertions against a known tree — but it would
+    // make this check compare the fixture to itself. `default_branch_manifest`
+    // runs git in the manifest's own directory, so a live path inside this
+    // checkout resolves `origin/main` against THIS repository and returns the
+    // committed fixture: five comparisons, zero drift, a confident green, and
+    // the monorepo never consulted. A verdict produced by comparing a file to
+    // itself is worth less than no verdict, so say so and decline.
+    if under(&live_root, &PathBuf::from(env!("CARGO_MANIFEST_DIR"))) {
+        eprintln!(
+            "SKIPPED: the workspace root ({}) is inside this checkout, so the only \
+             manifests reachable are the fixture's own. Freshness was NOT verified \
+             on this run — unset CADENCE_AUDIT_WORKSPACE_ROOT and re-run beside a \
+             cadence monorepo checkout to check it. The fixture's own assertions \
+             still ran.",
+            live_root.display()
+        );
+        return;
+    }
+
+    let mut compared = 0usize;
+    let mut drifted = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut absent = 0usize;
+
+    for (dir_name, _) in BINARY_PLUGIN_DIRS {
+        let Some(fixture_path) = plugin_hooks_json(&fixture_root, dir_name) else {
+            // `fixture_subject()` already failed the run for this; nothing to add.
+            continue;
+        };
+        let Some(live_path) = plugin_hooks_json(&live_root, dir_name) else {
+            absent += 1;
+            continue;
+        };
+
+        match default_branch_manifest(&live_path) {
+            Ok(shipped) => {
+                compared += 1;
+                if redact_prefilters(shipped) != redact_prefilters(read_json(&fixture_path)) {
+                    drifted.push(format!("  {dir_name}: {}", live_path.display()));
+                }
+            }
+            Err(why) => unreadable.push(format!("  {dir_name}: {} — {why}", live_path.display())),
         }
-        enforce_complete_scan(&scan);
-        let $refs = scan.resolved;
+    }
+
+    if absent == BINARY_PLUGIN_DIRS.len() {
+        eprintln!(
+            "SKIPPED: no sibling cadence monorepo at {}, so the fixture has nothing \
+             to be compared against. The fixture's own assertions still ran.",
+            live_root.display()
+        );
+        return;
+    }
+
+    // A manifest present for some plugins and absent for others is the same
+    // partial-scan shape the `unreadable` assertion below refuses, one step
+    // earlier: `continue`-ing past it would drop that plugin from the
+    // comparison while the remaining ones still produced a green.
+    assert_eq!(
+        absent,
+        0,
+        "the sibling checkout has some plugin manifests and not others, so the \
+         fixture can be confirmed current for only part of the wiring. All \
+         expected manifests live in ONE monorepo checkout, so this is a broken \
+         or half-migrated environment (`git -C <workspace-root>/cadence status -sb`), \
+         never a clean run. {} of {} plugins resolved.",
+        BINARY_PLUGIN_DIRS.len() - absent,
+        BINARY_PLUGIN_DIRS.len(),
+    );
+
+    // Fail closed on a PARTIAL comparison, the same criterion `enforce_complete_scan`
+    // applies one layer up. Collecting the unreadable manifests and then reporting
+    // only the readable ones would let one successful compare out of five read as
+    // green — "a broken environment silently passing", which is the exact shape
+    // cadence-hooks#909 repaired and which this check must not reintroduce under
+    // its own roof. A monorepo that is present but half-unreadable is a broken
+    // environment, never a clean run.
+    assert!(
+        unreadable.is_empty(),
+        "a sibling manifest could not be read from origin/main, so the fixture \
+         cannot be confirmed current:\n{}\n\n\
+         Comparing only the readable ones would report green on a partial check. \
+         Run `git -C <workspace-root>/cadence fetch origin` — an absent \
+         origin/main is the usual cause — and re-run.",
+        unreadable.join("\n")
+    );
+
+    // Every plugin is present (`absent == 0`) and every one was readable
+    // (`unreadable` empty), so the loop must have compared all of them. Binding
+    // the count keeps this from reporting a clean freshness verdict off a loop
+    // that compared nothing — the failure mode the whole file exists to refuse.
+    assert_eq!(
+        compared,
+        BINARY_PLUGIN_DIRS.len(),
+        "the freshness check passed its own preconditions but compared {compared} of \
+         {} manifests — it would be reporting the fixture current without having \
+         looked at all of it",
+        BINARY_PLUGIN_DIRS.len(),
+    );
+
+    assert!(
+        drifted.is_empty(),
+        "the checked-in fixture no longer matches the wiring on the monorepo's \
+         default branch:\n{}\n\n\
+         The fixture is what carries these assertions on CI, where no sibling \
+         checkout exists — a stale fixture asserts about wiring that no longer \
+         ships. Fetch first, since origin/main is itself only as current as the \
+         last fetch, then refresh:\n\
+           git -C <workspace-root>/cadence fetch origin\n\
+           bash scripts/refresh-registration-audit-fixture.sh",
+        drifted.join("\n")
+    );
+}
+
+/// The manifest as it stands on the sibling monorepo's default branch.
+///
+/// `<rev>:./<path>` resolves relative to git's cwd, so this needs no path
+/// arithmetic and works for the monorepo and legacy layouts alike. Both argv
+/// entries derive from consts — `file` is the literal `hooks.json` that
+/// [`plugin_hooks_json_candidates`] builds every path from — so no caller
+/// input reaches the argument list.
+///
+/// `Err` carries WHY, because the caller fails on an unreadable manifest
+/// rather than skipping it: "git is absent" and "the shipped manifest is not
+/// valid JSON" are different findings and must not collapse into one silent
+/// `None`.
+fn default_branch_manifest(live_path: &Path) -> Result<serde_json::Value, String> {
+    let dir = live_path
+        .parent()
+        .ok_or_else(|| "manifest path has no parent directory".to_string())?;
+    let file = live_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "manifest filename is not valid UTF-8".to_string())?;
+
+    let output = Command::new("git")
+        .args(["show", &format!("origin/main:./{file}")])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git show origin/main:./{file} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("origin/main's copy is not valid JSON: {e}"))
+}
+
+/// Blank every hook's `if:` VALUE, keeping the key.
+///
+/// The fixture ships in a public repository and the live manifests do not, so
+/// the fixture carries a placeholder in place of each guard's command
+/// prefilter — publishing the full set would publish, by omission, the exact
+/// commands each guard never sees. Applying the same projection to both sides
+/// keeps this a content comparison rather than a formatting one.
+///
+/// Sound only because no assertion in this file reads an `if:` value:
+/// [`parse_hooks_json`] records `has_if_filter` from `.is_some()` and discards
+/// the string. Redacting the key itself would silently disarm
+/// `bash_hooks_have_if_filter`, so the key must survive.
+fn redact_prefilters(mut manifest: serde_json::Value) -> serde_json::Value {
+    let Some(events) = manifest.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return manifest;
     };
+    for blocks in events.values_mut() {
+        let Some(blocks) = blocks.as_array_mut() else {
+            continue;
+        };
+        for block in blocks {
+            let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            for hook in hooks {
+                // Strings only. Rewriting ANY value to a string would make a
+                // live `"if": ["a","b"]` and a fixture `"if": "x"` compare
+                // equal — while `parse_hooks_json` reads the array as *no*
+                // filter (it takes `as_str`) and the string as one, so the two
+                // subjects would disagree about `has_if_filter` with the drift
+                // check silent. Preserving the type keeps that divergence
+                // visible.
+                if let Some(filter) = hook.get_mut("if")
+                    && filter.is_string()
+                {
+                    *filter = serde_json::Value::String(String::new());
+                }
+            }
+        }
+    }
+    manifest
+}
+
+/// The redaction must keep the `if:` key, because `bash_hooks_have_if_filter`
+/// reads its presence. Blanking the key instead of its value would disarm that
+/// check against every redacted hook while every test still passed.
+#[test]
+fn redaction_keeps_the_if_key_that_the_filter_check_reads() {
+    let manifest: serde_json::Value = serde_json::from_str(
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+             {"command":"x/run-cadence-hooks.sh cadence a","if":"Bash(*secret*)"},
+             {"command":"x/run-cadence-hooks.sh cadence b"},
+             {"command":"x/run-cadence-hooks.sh cadence c","if":["a","b"]}]}]}}"#,
+    )
+    .unwrap();
+
+    let redacted = redact_prefilters(manifest);
+    let hooks = redacted["hooks"]["PreToolUse"][0]["hooks"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(hooks[0]["if"], serde_json::Value::String(String::new()));
+    assert!(
+        hooks[1].get("if").is_none(),
+        "a hook with no filter gains none"
+    );
+    // A non-string `if` keeps its type. Coercing it to a string would make it
+    // compare equal to a redacted string filter while `parse_hooks_json` still
+    // read the two as differently filtered — drift the check could not see.
+    assert!(
+        hooks[2]["if"].is_array(),
+        "a non-string filter keeps its type through redaction"
+    );
+
+    let refs = parse_hooks_json(&redacted.to_string(), "cadence", "cadence");
+    assert!(
+        refs[0].has_if_filter,
+        "the filtered hook must still read as filtered"
+    );
+    assert!(!refs[1].has_if_filter);
+    assert!(
+        !refs[2].has_if_filter,
+        "an array filter reads as unfiltered before and after redaction alike"
+    );
+}
+
+/// Is `path` inside `ancestor`?
+///
+/// Canonicalizes both first: on macOS `/tmp` is a symlink to `/private/tmp`, so
+/// a raw `starts_with` answers `false` for two spellings of the same directory —
+/// and this predicate guards a fail-open, so a false negative is the costly
+/// direction. Falls back to the uncanonicalized path when a component does not
+/// exist, which still answers correctly for the case that matters.
+fn under(path: &Path, ancestor: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(path).starts_with(real(ancestor))
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()))
 }
 
 #[test]
 fn all_registered_hooks_exist_in_binary() {
     let binary_cmds = binary_subcommands();
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_registered_hooks_exist_in_binary(&subject, &binary_cmds);
+    }
+}
+
+fn check_registered_hooks_exist_in_binary(subject: &AuditSubject, binary_cmds: &BTreeSet<String>) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
 
     let mut missing = Vec::new();
-    for (dir, refs) in &all_refs {
+    for (dir, refs) in all_refs {
         for r in refs {
             if !binary_cmds.contains(&r.command) {
                 missing.push(format!(
@@ -983,8 +1372,8 @@ fn all_registered_hooks_exist_in_binary() {
 
     assert!(
         missing.is_empty(),
-        "hooks.json references subcommands not in the binary:\n{}\n\n\
-         {STALE_CHECKOUT_HINT}",
+        "[{label}] hooks.json references subcommands not in the binary:\n{}\n\n\
+         {hint}",
         missing.join("\n")
     );
 }
@@ -992,9 +1381,20 @@ fn all_registered_hooks_exist_in_binary() {
 #[test]
 fn all_binary_subcommands_are_registered() {
     let binary_cmds = binary_hooks();
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_binary_subcommands_are_registered(&subject, &binary_cmds);
+    }
+}
 
-    let registered = registered_commands(&all_refs);
+fn check_binary_subcommands_are_registered(subject: &AuditSubject, binary_cmds: &BTreeSet<String>) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        root,
+    } = subject;
+
+    let registered = registered_commands(all_refs);
 
     // Subcommands for plugins still using shell wrappers are expected to be unregistered.
     // They'll be migrated to binary dispatch later.
@@ -1012,13 +1412,19 @@ fn all_binary_subcommands_are_registered() {
     // uses — a monorepo-blind `workspace_root.join(dir)` here would be the
     // identical frozen assumption in a second place, inert only because the
     // const is currently empty.
-    let workspace_parent = workspace_root();
+    //
+    // `root` is THIS SUBJECT's root, not the developer's workspace: the
+    // exemption asks "is the plugin absent from the workspace being audited",
+    // and for the fixture leg that is the fixture tree. Inert while
+    // PENDING_PLUGIN_GROUPS is empty; a repopulated const makes the fixture's
+    // own layout decide the fixture leg's exemption, which is the intended
+    // reading — each subject is judged against its own contents.
     let pending_groups: BTreeSet<&str> = PENDING_PLUGIN_GROUPS
         .iter()
         .filter(|(group, _)| {
             !BINARY_PLUGIN_DIRS
                 .iter()
-                .any(|(dir, g)| g == group && plugin_dir(&workspace_parent, dir).is_some())
+                .any(|(dir, g)| g == group && plugin_dir(root, dir).is_some())
         })
         .map(|(group, _)| *group)
         .collect();
@@ -1056,11 +1462,11 @@ fn all_binary_subcommands_are_registered() {
 
     assert!(
         unregistered.is_empty(),
-        "registered hooks not wired in any hooks.json:\n{}\n\n\
+        "[{label}] registered hooks not wired in any hooks.json:\n{}\n\n\
          {shell_note}\
          A hook whose wiring lands in a later PR goes in PENDING_WIRING_HOOKS with \
          its tracking reference, and comes back out in that PR.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         unregistered
             .iter()
             .map(|c| format!("  {c}"))
@@ -1079,20 +1485,26 @@ fn all_binary_subcommands_are_registered() {
 /// only while the plugin genuinely wraps a shell script; the moment its
 /// hooks.json dispatches the binary, the entry is silent dead cover and the
 /// plugin belongs in `BINARY_PLUGIN_DIRS`.
+///
+/// Reads both the fixture root and the sibling checkout. `SHELL_PLUGIN_DIRS` is
+/// empty today, so a sibling-only probe is inert rather than wrong — but the
+/// next plugin that lands there would get no CI coverage of the ratchet at all,
+/// which is the same blindness the ratchet exists to end.
 #[test]
 fn shell_plugin_dirs_do_not_dispatch_the_binary() {
-    let workspace_root = workspace_root();
-
     let mut migrated = Vec::new();
-    for (dir_name, _) in SHELL_PLUGIN_DIRS {
-        let Some(hooks_path) = plugin_hooks_json(&workspace_root, dir_name) else {
-            continue; // no sibling checkout: nothing to judge
-        };
-        let Ok(content) = std::fs::read_to_string(&hooks_path) else {
-            continue;
-        };
-        if content.contains("run-cadence-hooks") {
-            migrated.push(format!("  {dir_name}: {}", hooks_path.display()));
+
+    for root in [fixture_workspace_root(), workspace_root()] {
+        for (dir_name, _) in SHELL_PLUGIN_DIRS {
+            let Some(hooks_path) = plugin_hooks_json(&root, dir_name) else {
+                continue; // not present in this workspace: nothing to judge
+            };
+            let Ok(content) = std::fs::read_to_string(&hooks_path) else {
+                continue;
+            };
+            if content.contains("run-cadence-hooks") {
+                migrated.push(format!("  {dir_name}: {}", hooks_path.display()));
+            }
         }
     }
 
@@ -1102,7 +1514,7 @@ fn shell_plugin_dirs_do_not_dispatch_the_binary() {
          Move it to BINARY_PLUGIN_DIRS. While it sits here its hooks.json is never \
          parsed by this audit and its whole plugin group is exempt from the \
          registered-hooks check — which is exactly how cadence-obsidian went \
-         unaudited.\n\
+         unaudited. The path above says which workspace reported it; \
          {STALE_CHECKOUT_HINT}",
         migrated.join("\n")
     );
@@ -1120,9 +1532,20 @@ fn shell_plugin_dirs_do_not_dispatch_the_binary() {
 /// inherits the same silent cover. This turns the allowlist self-expiring.
 #[test]
 fn pending_wiring_hooks_are_still_unwired() {
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_pending_wiring_hooks_are_still_unwired(&subject);
+    }
+}
 
-    let registered = registered_commands(&all_refs);
+fn check_pending_wiring_hooks_are_still_unwired(subject: &AuditSubject) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
+
+    let registered = registered_commands(all_refs);
 
     let now_wired: Vec<&(&str, &str)> = PENDING_WIRING_HOOKS
         .iter()
@@ -1131,9 +1554,9 @@ fn pending_wiring_hooks_are_still_unwired() {
 
     assert!(
         now_wired.is_empty(),
-        "PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
+        "[{label}] PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
          landed, so the exemption has served its purpose and must be removed:\n{}\n\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         now_wired
             .iter()
             .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
@@ -1174,7 +1597,18 @@ fn pending_wiring_hooks_still_name_a_real_subcommand() {
 
 #[test]
 fn no_cross_plugin_hooks() {
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_no_cross_plugin_hooks(&subject);
+    }
+}
+
+fn check_no_cross_plugin_hooks(subject: &AuditSubject) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
 
     let sanctioned: BTreeSet<(&str, &str)> = INTENTIONAL_CROSS_PLUGIN_HOOKS
         .iter()
@@ -1182,7 +1616,7 @@ fn no_cross_plugin_hooks() {
         .collect();
 
     let mut violations = Vec::new();
-    for (dir, refs) in &all_refs {
+    for (dir, refs) in all_refs {
         for r in refs {
             if r.plugin != r.expected_plugin
                 && !sanctioned.contains(&(dir.as_str(), r.command.as_str()))
@@ -1197,24 +1631,35 @@ fn no_cross_plugin_hooks() {
 
     assert!(
         violations.is_empty(),
-        "cross-plugin hook dispatch detected:\n{}\n\n\
+        "[{label}] cross-plugin hook dispatch detected:\n{}\n\n\
          Each plugin should only dispatch its own subcommands.\n\
          Move the hook registration to the owning plugin's hooks.json, or —\n\
          if the placement is deliberate — add it to INTENTIONAL_CROSS_PLUGIN_HOOKS\n\
          with the rationale.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         violations.join("\n")
     );
 }
 
 #[test]
 fn bash_hooks_have_if_filter() {
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_bash_hooks_have_if_filter(&subject);
+    }
+}
+
+fn check_bash_hooks_have_if_filter(subject: &AuditSubject) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
 
     let allowed: BTreeSet<&str> = INTENTIONAL_UNFILTERED_BASH_HOOKS.iter().copied().collect();
 
     let mut unfiltered = Vec::new();
-    for (dir, refs) in &all_refs {
+    for (dir, refs) in all_refs {
         for r in refs {
             if r.is_bash_matcher && !r.has_if_filter && !allowed.contains(r.command.as_str()) {
                 unfiltered.push(format!(
@@ -1227,10 +1672,10 @@ fn bash_hooks_have_if_filter() {
 
     assert!(
         unfiltered.is_empty(),
-        "Bash-matcher hooks without `if` filter spawn a process on every Bash command:\n{}\n\n\
+        "[{label}] Bash-matcher hooks without `if` filter spawn a process on every Bash command:\n{}\n\n\
          Either add an `if` field like `\"if\": \"Bash(*git push*)\"`,\n\
          or add to INTENTIONAL_UNFILTERED_BASH_HOOKS if broad matching is required.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         unfiltered.join("\n")
     );
 }
@@ -1247,12 +1692,63 @@ fn bash_hooks_have_if_filter() {
 /// landing state: the list is the inventory, the assertion is the ratchet.
 #[test]
 fn no_duplicate_command_registrations_per_matcher() {
-    require_plugin_refs!(all_refs);
+    let subjects = audit_subjects();
 
-    let allowed: BTreeSet<&str> = KNOWN_DUPLICATE_REGISTRATIONS.iter().copied().collect();
+    // The self-expiry half reads the UNION across subjects: an allowlist entry
+    // is dead cover only when NO workspace still fans it out. Judging it per
+    // subject would fire on the first workspace whose manifests happen to lag
+    // the other's — a checkout-freshness fact wearing a wiring finding's
+    // clothes.
+    let mut still_duplicated_anywhere: BTreeSet<&str> = BTreeSet::new();
+    for subject in &subjects {
+        still_duplicated_anywhere.extend(check_no_duplicate_command_registrations_per_matcher(
+            subject,
+        ));
+    }
+
+    let resolved: Vec<&&str> = KNOWN_DUPLICATE_REGISTRATIONS
+        .iter()
+        .filter(|command| !still_duplicated_anywhere.contains(**command))
+        .collect();
+    assert!(
+        resolved.is_empty(),
+        "KNOWN_DUPLICATE_REGISTRATIONS entry is no longer duplicated in ANY audited \
+         workspace ({}) — the wiring was consolidated, so the allowlist entry has \
+         served its purpose and must be removed:\n{}\n\n\
+         This is a union verdict across every subject, so neither a stale sibling \
+         checkout nor a stale fixture alone can produce it — but a row added for \
+         wiring that has not shipped yet will fail here, because no workspace fans \
+         it out. Land the wiring first, or refresh the fixture \
+         (`bash scripts/refresh-registration-audit-fixture.sh`) if it already has.",
+        subjects
+            .iter()
+            .map(|s| s.label)
+            .collect::<Vec<_>>()
+            .join(", "),
+        resolved
+            .iter()
+            .map(|command| format!("  `{command}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Fails on a NEW duplicate in this subject; returns the allowlisted commands
+/// this subject still fans out, for the union above.
+fn check_no_duplicate_command_registrations_per_matcher(
+    subject: &AuditSubject,
+) -> BTreeSet<&'static str> {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
+
+    let allowed: BTreeSet<&'static str> = KNOWN_DUPLICATE_REGISTRATIONS.iter().copied().collect();
 
     let mut counts: BTreeMap<(&str, &str, usize, &str), usize> = BTreeMap::new();
-    for (dir, refs) in &all_refs {
+    for (dir, refs) in all_refs {
         for r in refs {
             *counts
                 .entry((
@@ -1266,13 +1762,13 @@ fn no_duplicate_command_registrations_per_matcher() {
     }
 
     let mut new_offenders = Vec::new();
-    let mut still_duplicated: BTreeSet<&str> = BTreeSet::new();
+    let mut still_duplicated: BTreeSet<&'static str> = BTreeSet::new();
     for ((dir, event, index, command), count) in &counts {
         if *count < 2 {
             continue;
         }
-        if allowed.contains(command) {
-            still_duplicated.insert(command);
+        if let Some(entry) = allowed.iter().find(|allowed| *allowed == command) {
+            still_duplicated.insert(entry);
             continue;
         }
         new_offenders.push(format!(
@@ -1282,35 +1778,21 @@ fn no_duplicate_command_registrations_per_matcher() {
 
     assert!(
         new_offenders.is_empty(),
-        "a command is registered more than once inside one matcher block, so one tool call \
-         spawns that many identical hook processes:\n{}\n\n\
+        "[{label}] a command is registered more than once inside one matcher block, so one \
+         tool call spawns that many identical hook processes:\n{}\n\n\
          Consolidate the entries in the plugin's hooks.json (one registration, a broader \
          `if:` filter, or let the binary's own matching do the precision work), or — if the \
          fan-out is deliberate — add the command to KNOWN_DUPLICATE_REGISTRATIONS with the \
          wiring cleanup tracked at {DUPLICATE_REGISTRATION_TRACKING_REF}.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         new_offenders.join("\n")
     );
 
     // Self-expiring, the same discipline `pending_wiring_hooks_are_still_unwired`
     // applies to PENDING_WIRING_HOOKS: an entry that no longer names a real
-    // duplicate is dead cover for the next one.
-    let resolved: Vec<&&str> = KNOWN_DUPLICATE_REGISTRATIONS
-        .iter()
-        .filter(|command| !still_duplicated.contains(**command))
-        .collect();
-    assert!(
-        resolved.is_empty(),
-        "KNOWN_DUPLICATE_REGISTRATIONS entry is no longer duplicated anywhere — the wiring \
-         was consolidated, so the allowlist entry has served its purpose and must be \
-         removed:\n{}\n\n\
-         {STALE_CHECKOUT_HINT}",
-        resolved
-            .iter()
-            .map(|command| format!("  `{command}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    // duplicate is dead cover for the next one. Judged by the caller, over the
+    // union of every subject.
+    still_duplicated
 }
 
 fn scan_fixture(resolved: &[&str], missing: &[&'static str], monorepo_present: bool) -> PluginScan {
@@ -1458,16 +1940,35 @@ fn enforce_complete_scan_panics_on_a_partial_scan() {
 
 #[test]
 fn no_plugin_hooks_duplicated_in_settings_json() {
-    require_plugin_refs!(all_refs);
     let (shell_scripts, binary_dispatches) = settings_json_hooks();
+    for subject in audit_subjects() {
+        check_no_plugin_hooks_duplicated_in_settings_json(
+            &subject,
+            &shell_scripts,
+            &binary_dispatches,
+        );
+    }
+}
+
+fn check_no_plugin_hooks_duplicated_in_settings_json(
+    subject: &AuditSubject,
+    shell_scripts: &[String],
+    binary_dispatches: &[String],
+) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
 
     // Collect all plugin-registered commands for comparison
-    let plugin_commands = registered_commands(&all_refs);
+    let plugin_commands = registered_commands(all_refs);
 
     let mut duplicates = Vec::new();
 
     // Check if settings.json dispatches any cadence-hooks subcommands already in plugins
-    for dispatch in &binary_dispatches {
+    for dispatch in binary_dispatches {
         if plugin_commands.contains(dispatch.as_str()) {
             duplicates.push(format!(
                 "  settings.json dispatches `{dispatch}` (already registered in a plugin)"
@@ -1496,7 +1997,7 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
         .filter(|kw| kw.len() > 3) // skip short words like "git", "gh"
         .collect();
 
-    for script in &shell_scripts {
+    for script in shell_scripts {
         let filename = script.rsplit('/').next().unwrap_or(script).to_lowercase();
         if KNOWN_DISTINCT_SETTINGS_SCRIPTS.contains(&filename.as_str()) {
             continue;
@@ -1520,11 +2021,11 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
 
     assert!(
         duplicates.is_empty(),
-        "settings.json duplicates hooks already provided by plugins:\n{}\n\n\
+        "[{label}] settings.json duplicates hooks already provided by plugins:\n{}\n\n\
          Remove from settings.json — plugins handle these via hooks.json.\n\
          If the overlap is only in the filename keywords and the jobs are unrelated,\n\
          add the script to KNOWN_DISTINCT_SETTINGS_SCRIPTS with the distinction.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         duplicates.join("\n")
     );
 }
@@ -1764,7 +2265,21 @@ fn to_kebab_case(s: &str) -> String {
 #[test]
 fn hook_event_types_match_hooks_json() {
     let main_events = main_rs_event_types();
-    require_plugin_refs!(all_refs);
+    for subject in audit_subjects() {
+        check_hook_event_types_match_hooks_json(&subject, &main_events);
+    }
+}
+
+fn check_hook_event_types_match_hooks_json(
+    subject: &AuditSubject,
+    main_events: &BTreeMap<String, String>,
+) {
+    let AuditSubject {
+        label,
+        hint,
+        refs: all_refs,
+        ..
+    } = subject;
 
     let mut mismatches = Vec::new();
     for refs in all_refs.values() {
@@ -1782,12 +2297,12 @@ fn hook_event_types_match_hooks_json() {
 
     assert!(
         mismatches.is_empty(),
-        "Hook event type mismatch between hooks.json and main.rs:\n{}\n\n\
+        "[{label}] hook event type mismatch between hooks.json and main.rs:\n{}\n\n\
          The HookEvent passed to run_check_from_stdin must match the event key \
          in hooks.json. PreToolUse hooks emit PreToolUse JSON, PostToolUse hooks \
          emit PostToolUse JSON — using the wrong one means additionalContext \
          won't reach the model.\n\
-         {STALE_CHECKOUT_HINT}",
+         {hint}",
         mismatches.join("\n")
     );
 }
