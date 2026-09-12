@@ -135,6 +135,8 @@ pub mod snooze_meta;
 pub mod verify_pr_autoclose;
 /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
 pub mod warn_alias_parsing;
+/// Warn when `git commit --amend` would rewrite a commit a remote already has.
+pub mod warn_amend_pushed;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
 /// Remind to check datetime before scheduling cron jobs.
