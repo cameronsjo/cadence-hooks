@@ -654,12 +654,12 @@ fn print_hook_list() {
 
     let mut current_plugin = "";
     for hook in HOOKS {
-        if hook.plugin != current_plugin {
+        if hook.namespace != current_plugin {
             if !current_plugin.is_empty() {
                 println!();
             }
-            println!("{}:", hook.plugin);
-            current_plugin = hook.plugin;
+            println!("{}:", hook.namespace);
+            current_plugin = hook.namespace;
         }
 
         let status = if bypassed {
@@ -701,7 +701,7 @@ fn print_hook_manifest(format: ManifestFormat) {
                     serde_json::json!({
                         "name": hook.name,
                         "description": hook.description,
-                        "plugin": hook.plugin,
+                        "plugin": hook.namespace,
                         "event": hook.event.map(|event| event.name()).unwrap_or("logger"),
                         "criticality": if registry::is_security_critical(hook.name) {
                             "security-critical"
@@ -1637,9 +1637,9 @@ mod tests {
             assert!(
                 clap_pairs
                     .iter()
-                    .any(|(ns, sub)| ns == hook.plugin && sub == hook.name),
+                    .any(|(ns, sub)| ns == hook.namespace && sub == hook.name),
                 "registry entry '{} {}' has no clap subcommand — it's listed but not dispatchable",
-                hook.plugin,
+                hook.namespace,
                 hook.name
             );
         }

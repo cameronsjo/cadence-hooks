@@ -156,7 +156,7 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
     for hook in hooks {
         items.push(format!(
             "[{:<10}] {:<28} {}",
-            hook.plugin, hook.name, hook.description
+            hook.namespace, hook.name, hook.description
         ));
         // Pre-select hooks that are currently DISABLED (user is selecting what to disable)
         defaults.push(currently_disabled.iter().any(|d| d == hook.name));
