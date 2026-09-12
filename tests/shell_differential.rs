@@ -483,12 +483,22 @@ fn bounded_process_timeout_kills_and_reports_output() {
         "printf timeout-stdout; printf timeout-stderr >&2; exec /bin/sleep 60",
     ]);
 
+    // The configured deadline doubles as the window the child gets to run
+    // `printf timeout-stdout; printf timeout-stderr >&2` before it is killed.
+    // A tight bound races process-spawn scheduling: on a loaded runner the
+    // shell can be descheduled before either printf lands, killing it before
+    // stdout/stderr are populated and failing the assertions below without
+    // any real regression. Measured 80 runs (20 solo, 60 concurrent with a
+    // full `cargo test --workspace` in the background) against the old 25ms
+    // bound: worst observed wall time was ~47.6ms, comfortably under 100ms,
+    // so 250ms is slack a loaded runner clears while still keeping the test
+    // fast.
     let started = Instant::now();
-    let error = run_bounded(&mut command, None, Duration::from_millis(25))
+    let error = run_bounded(&mut command, None, Duration::from_millis(250))
         .expect_err("sleeping process must exceed the bounded deadline");
 
     assert!(started.elapsed() < Duration::from_secs(1), "{error}");
-    assert!(error.contains("timed out after 25ms"), "{error}");
+    assert!(error.contains("timed out after 250ms"), "{error}");
     assert!(error.contains("stdout=timeout-stdout"), "{error}");
     assert!(error.contains("stderr=timeout-stderr"), "{error}");
 }
