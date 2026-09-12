@@ -89,8 +89,28 @@ impl Prices {
     }
 
     /// Look up prices for a model, if present in the table.
+    ///
+    /// Tries an exact key first, so a deliberately dated row in the table
+    /// always wins. On a miss, if `model` ends in a `-` followed by exactly
+    /// eight ASCII digits (a `-YYYYMMDD` snapshot suffix, e.g.
+    /// `claude-haiku-4-5-20251001`), retries with that suffix stripped. Never
+    /// strips more than one suffix, and never touches an id that doesn't
+    /// match the shape (cadence-hooks#907).
     pub fn get(&self, model: &str) -> Option<&ModelPrice> {
-        self.models.get(model)
+        self.models
+            .get(model)
+            .or_else(|| self.models.get(strip_dated_suffix(model)?))
+    }
+}
+
+/// Returns `model` with a trailing `-YYYYMMDD` suffix removed, or `None` if
+/// `model` doesn't end in `-` followed by exactly eight ASCII digits.
+fn strip_dated_suffix(model: &str) -> Option<&str> {
+    let (prefix, suffix) = model.rsplit_once('-')?;
+    if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        Some(prefix)
+    } else {
+        None
     }
 }
 
@@ -226,6 +246,51 @@ mod tests {
         assert_eq!(m.cache_read_per_mtok, 4.0);
         assert_eq!(m.cache_write_1h_per_mtok, None);
         assert_eq!(m.cache_write_1h(), 2.0, "fallback is input * 2.0");
+    }
+
+    #[test]
+    fn dated_haiku_id_resolves_to_undated_row() {
+        // cadence-hooks#907: `unpricedModels` includes dated ids like
+        // `claude-haiku-4-5-20251001` because the table only keys undated
+        // aliases and nothing strips the date suffix.
+        let prices = Prices::embedded();
+        let dated = prices
+            .get("claude-haiku-4-5-20251001")
+            .expect("dated id must resolve to the undated row");
+        let undated = prices.get("claude-haiku-4-5").expect("undated row exists");
+        assert_eq!(dated.input_per_mtok, undated.input_per_mtok);
+        assert_eq!(dated.output_per_mtok, undated.output_per_mtok);
+    }
+
+    #[test]
+    fn dated_sonnet_4_5_id_resolves_to_undated_row() {
+        let prices = Prices::embedded();
+        let dated = prices
+            .get("claude-sonnet-4-5-20250929")
+            .expect("dated id must resolve to the undated row");
+        let undated = prices.get("claude-sonnet-4-5").expect("undated row exists");
+        assert_eq!(dated.input_per_mtok, undated.input_per_mtok);
+        assert_eq!(dated.output_per_mtok, undated.output_per_mtok);
+    }
+
+    #[test]
+    fn unknown_dated_id_still_unpriced() {
+        let prices = Prices::embedded();
+        assert!(
+            prices.get("claude-nope-9-9-20260101").is_none(),
+            "an id whose stripped prefix has no row must still be unpriced"
+        );
+    }
+
+    #[test]
+    fn non_eight_digit_suffix_is_not_stripped() {
+        // "2025" is only four digits — not a date suffix — so this must not
+        // be treated as `claude-haiku-4-5` with a suffix stripped.
+        let prices = Prices::embedded();
+        assert!(
+            prices.get("claude-haiku-4-5-2025").is_none(),
+            "a non-8-digit suffix must not be stripped"
+        );
     }
 
     #[test]

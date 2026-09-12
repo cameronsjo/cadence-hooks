@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dated model ids now resolve to their undated price row.** `Prices::get` tries the exact key first, then retries with a trailing `-YYYYMMDD` suffix stripped (cadence-hooks#907). Sessions running `claude-haiku-4-5-20251001` and `claude-sonnet-4-5-20250929` previously matched no key in `prices.json` and were priced at $0. Recorded ledger rows from before this fix are not retroactively repriced.
+
 ## [0.98.0] - 2026-09-08
 
 ### Changed
