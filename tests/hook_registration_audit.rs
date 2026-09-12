@@ -11,6 +11,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Which tier of [`resolved_workspace_root`] answered.
+///
+/// Recorded because only `GitCommonDir` has actually *looked* for the
+/// workspace: `Override` was asserted by an operator and `ManifestParent` is a
+/// guess, so neither may quietly license a skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSource {
+    Override,
+    GitCommonDir,
+    ManifestParent,
+}
+
 /// The workspace parent directory — where the sibling `cadence` monorepo
 /// checkout (and any surviving pre-consolidation standalone checkout) lives
 /// alongside this repo. Shared by every audit that cross-checks a sibling
@@ -26,19 +38,9 @@ use std::process::Command;
 ///    exactly the tree a developer is working in. `--git-common-dir` always
 ///    resolves to the *primary* checkout's `.git`, so its grandparent is the
 ///    real workspace root from a worktree and from the primary checkout alike.
-/// 3. `CARGO_MANIFEST_DIR`'s parent — the pre-existing behavior, kept so CI
-///    checkouts and non-git tarball builds (where step 2 has no answer) still
-///    resolve to something and skip cleanly.
-/// Which tier answered. Recorded because only tier 2 has actually *looked* for
-/// the workspace: tier 1 was asserted by an operator and tier 3 is a guess, so
-/// neither may quietly license a skip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootSource {
-    Override,
-    GitCommonDir,
-    ManifestParent,
-}
-
+/// 3. `CARGO_MANIFEST_DIR`'s parent — the pre-existing behavior, kept so a
+///    non-git build still resolves to something. It may not skip: see
+///    [`PluginScan::verdict`].
 fn workspace_root() -> PathBuf {
     resolved_workspace_root().0
 }
