@@ -3580,7 +3580,9 @@ mod tests {
     /// substring — `confi`**`rm`**, `fo`**`rm`**`at`, `terrafo`**`rm`**,
     /// `wa`**`rm`**, `perfo`**`rm`** — plus a sample of commands carrying no
     /// `rm` at all, which the prefilter never passed and the binary must still
-    /// handle once it does.
+    /// handle once it does. The corpus covers the other four shipped globs too
+    /// (`*unlink*`, `*shred*`, `*truncate*`, `*find*`), since dropping the
+    /// prefilter drops all five and each one drags in its own non-deletions.
     #[test]
     fn prefilter_false_positives_stay_silent() {
         for command in [
@@ -3602,6 +3604,16 @@ mod tests {
             "mkdir -p build/out",
             "docker compose up -d",
             "kubectl get pods",
+            // The other four shipped globs (`*unlink*`, `*shred*`,
+            // `*truncate*`, `*find*`) drag in their own words. `*find*` is the
+            // widest of them: it matches every `find` invocation and any flag
+            // spelling it appears in. All six were probed with cwd=$HOME.
+            "find . -name '*.rs' -print",
+            "find . -type f -exec grep -l x {} +",
+            "git log --find-renames",
+            "echo truncate",
+            "echo unlinked",
+            "echo shredder",
         ] {
             assert_eq!(
                 judge(command, &home()),

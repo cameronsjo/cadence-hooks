@@ -1006,6 +1006,7 @@ mod tests {
             "terraform apply",
             "npm run warm-cache",
             "./perform-migration.sh",
+            "find . -name '*.md' -print",
         ] {
             assert_eq!(
                 outcome_in_vault(command),
