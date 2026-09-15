@@ -10,26 +10,37 @@
 //!
 //! ## What counts as unpushed
 //!
-//! One rule for every worktree, chosen so a branch cannot hide in the gap
-//! between two rules:
+//! One rule for every worktree: `rev-list --count HEAD --not --remotes` — the
+//! commits reachable from the worktree's HEAD that **no remote-tracking ref**
+//! contains. The measure answers the question the advisory is for ("what is
+//! lost if this machine dies?"), and it answers it the same way for every
+//! branch, so none can hide in the gap between two rules:
 //!
-//! 1. **With an upstream**, the count is `rev-list --count @{u}..HEAD` — the
-//!    commits the configured upstream does not have.
-//! 2. **Without an upstream**, the count is `rev-list --count <default>..HEAD`
-//!    against the remote's default branch ([`default_remote_ref`]). A branch
-//!    that was never pushed has no upstream at all, which is the *riskiest*
-//!    case and the one a bare `@{u}..` probe silently reports as zero.
+//! - a branch with an upstream reports what the upstream does not have;
+//! - a branch pushed without `-u` — no upstream configured, yet published —
+//!   reports zero, because the remote already has those commits;
+//! - a branch stacked on a pushed base reports only its own commits, not its
+//!   base's;
+//! - a branch that was never pushed at all reports everything past the nearest
+//!   published commit, the riskiest case and the one a bare `@{u}..` probe
+//!   silently reports as zero.
+//!
+//! [`default_remote_ref`] gates the whole measure: with no remote-tracking refs
+//! in the repository, `--not --remotes` excludes nothing and every commit would
+//! read as unpushed, so a local-only repository reports nothing instead.
 //!
 //! A detached HEAD is skipped: there is no branch to push, and the commits are
 //! reachable from wherever it was detached in all but deliberate cases.
 //!
 //! ## Bounding
 //!
-//! Each worktree costs one or two `git` spawns, all of them under the shared
+//! Each worktree costs one `git` spawn, all of them under the shared
 //! per-process deadline (`cadence_hooks_core::deadline`). Two bounds keep a
 //! large or slow repo from eating the whole budget:
 //!
-//! - at most [`MAX_WORKTREES`] worktrees are probed, and
+//! - at most [`MAX_WORKTREES`] worktrees are probed — the session's own
+//!   checkout first, so the cap can never cost the caller its own count, and
+//!   then the siblings in `git worktree list` order; and
 //! - the scan stops at the first probe the deadline abandons.
 //!
 //! Either bound sets [`WorktreeScan::truncated`], which the rendered warning
@@ -40,8 +51,9 @@ use serde::{Deserialize, Serialize};
 
 /// Most worktrees to probe in one scan. A repo with more than this is scanned
 /// partially and says so — the alternative is spending the whole subprocess
-/// budget on an end-of-session advisory.
-const MAX_WORKTREES: usize = 16;
+/// budget on an end-of-session advisory. Also the most worktrees any one
+/// warning renders, so a marker cannot grow the text without bound.
+pub const MAX_WORKTREES: usize = 16;
 
 /// Remote-tracking refs tried, in order, when a remote publishes no
 /// `origin/HEAD`. A bare clone or a remote added by hand often has none.
@@ -55,8 +67,8 @@ pub struct UnpushedWorktree {
     pub path: String,
     /// The branch name, short form (`feat/x`).
     pub branch: String,
-    /// Commits absent from the upstream (or from the remote's default branch,
-    /// when the branch has no upstream).
+    /// Commits reachable from this worktree's HEAD that no remote-tracking ref
+    /// contains.
     pub commits: usize,
 }
 
@@ -82,19 +94,25 @@ pub struct WorktreeEntry {
     pub bare: bool,
 }
 
-/// Parse `git worktree list --porcelain`.
+/// Parse `git worktree list --porcelain -z`.
 ///
-/// The format is one blank-line-separated block per worktree, opening with
-/// `worktree <path>`; `branch refs/heads/<name>` names the branch, `detached`
-/// and `bare` are valueless flags. Unknown keys (`locked`, `prunable`,
-/// `HEAD`) are ignored rather than rejected, so a newer git adding a key
-/// cannot empty the scan.
+/// The format is one block per worktree, opening with `worktree <path>`;
+/// `branch refs/heads/<name>` names the branch, `detached` and `bare` are
+/// valueless flags. Unknown keys (`locked`, `prunable`, `HEAD`) are ignored
+/// rather than rejected, so a newer git adding a key cannot empty the scan.
+///
+/// **NUL-separated, not newline-separated.** `-z` terminates every record with
+/// a NUL and separates blocks with an empty record, which is the only framing
+/// a path may not contain: a worktree at a path with a newline in it splits
+/// into a phantom entry under newline framing, and git's own `-z` exists for
+/// exactly that reason.
 ///
 /// Pure — the whole parsing surface is table-testable without a repository.
 pub fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
     let mut entries: Vec<WorktreeEntry> = Vec::new();
-    for line in porcelain.lines() {
-        let line = line.trim_end();
+    for line in porcelain.split('\0') {
+        // No trimming: under `-z` git emits no trailing whitespace, and a
+        // worktree path is allowed to end in any byte but NUL.
         if let Some(path) = line.strip_prefix("worktree ") {
             entries.push(WorktreeEntry {
                 path: path.to_string(),
@@ -123,15 +141,14 @@ pub fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// The remote-tracking ref that stands in for "published" when a branch has no
-/// upstream.
+/// A remote-tracking ref, proving the repository has somewhere to push to.
 ///
 /// `refs/remotes/origin/HEAD` first — the remote's own answer — then the
 /// conventional [`DEFAULT_REF_FALLBACKS`], each verified to exist before it is
 /// returned. `None` when the repository has no remote-tracking refs at all, in
-/// which case an upstream-less branch is simply not counted: with nothing to
-/// compare against, every commit would look unpushed and the advisory would
-/// fire on every local-only repository.
+/// which case nothing is counted: `rev-list --not --remotes` would exclude
+/// nothing, so every commit would look unpushed and the advisory would fire on
+/// every local-only repository.
 pub fn default_remote_ref(dir: &str) -> Option<String> {
     if let GitQuery::Value(name) = git_command_detailed(
         dir,
@@ -150,33 +167,38 @@ pub fn default_remote_ref(dir: &str) -> Option<String> {
 
 /// How many commits `dir`'s checked-out branch carries that no remote has.
 ///
-/// `Ok(None)` means "nothing to measure against": no upstream and no default
-/// remote ref. `Err(())` means the probe was abandoned at the deadline — the
-/// caller stops scanning rather than reporting a short list as complete.
+/// `Ok(None)` means "nothing to measure": `has_remote_refs` is false, or git
+/// could not answer. `Err(())` means the probe was abandoned at the deadline —
+/// the caller stops scanning rather than reporting a short list as complete.
 type CountOutcome = Result<Option<usize>, ()>;
 
-fn unpushed_count(dir: &str, default_ref: Option<&str>) -> CountOutcome {
-    match count_range(dir, "@{u}..HEAD") {
-        Ok(Some(n)) => return Ok(Some(n)),
-        // A missing upstream exits non-zero, which is the fallback's trigger —
-        // not an error.
-        Ok(None) => {}
-        Err(()) => return Err(()),
-    }
-    let Some(default_ref) = default_ref else {
+/// One measure for every worktree: commits reachable from HEAD that no
+/// remote-tracking ref contains.
+///
+/// `--not --remotes` is what makes a branch's *publication*, rather than its
+/// upstream configuration, decide the count. `git push origin feat/x` without
+/// `-u` publishes the branch and configures no upstream, so an `@{u}..HEAD`
+/// probe cannot see it at all and a `<default>..HEAD` fallback counts commits
+/// the remote already holds — worse on a branch stacked on a pushed base,
+/// where the base's commits are counted against the child.
+///
+/// `has_remote_refs` is required because `--not --remotes` with no remotes
+/// excludes nothing: every commit in the repository would read as unpushed.
+fn unpushed_count(dir: &str, has_remote_refs: bool) -> CountOutcome {
+    if !has_remote_refs {
         return Ok(None);
-    };
-    count_range(dir, &format!("{default_ref}..HEAD"))
+    }
+    count_unpushed(dir)
 }
 
-/// `git rev-list --count <range>` in `dir`.
+/// `git rev-list --count HEAD --not --remotes` in `dir`.
 ///
-/// `Ok(None)` for a git error (an unknown ref, no upstream, an unborn HEAD),
-/// `Err(())` for a deadline timeout. A spawn failure — no `git` on `PATH` —
-/// is `Err(())` too: it will not succeed for the next worktree either, so
-/// continuing would spend the remaining budget learning the same thing.
-fn count_range(dir: &str, range: &str) -> CountOutcome {
-    match git_output_detailed(dir, &["rev-list", "--count", range]) {
+/// `Ok(None)` for a git error (an unborn HEAD, a broken ref), `Err(())` for a
+/// deadline timeout. A spawn failure — no `git` on `PATH` — is `Err(())` too:
+/// it will not succeed for the next worktree either, so continuing would spend
+/// the remaining budget learning the same thing.
+fn count_unpushed(dir: &str) -> CountOutcome {
+    match git_output_detailed(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"]) {
         GitOutput::Ok(value) => Ok(value.trim().parse::<usize>().ok()),
         GitOutput::Failed => Ok(None),
         GitOutput::Unavailable | GitOutput::TimedOut => Err(()),
@@ -191,22 +213,43 @@ fn count_range(dir: &str, range: &str) -> CountOutcome {
 /// [`UnpushedWorktree::path`], rather than this scan applying a second rule to
 /// one of them.
 pub fn scan(dir: &str) -> WorktreeScan {
-    let porcelain = match git_output_detailed(dir, &["worktree", "list", "--porcelain"]) {
+    let porcelain = match git_output_detailed(dir, &["worktree", "list", "--porcelain", "-z"]) {
         GitOutput::Ok(text) => text,
-        // No repository, no git, or out of budget — nothing to report, and
-        // nothing was skipped, so this is not a truncated scan.
-        GitOutput::Failed | GitOutput::Unavailable | GitOutput::TimedOut => {
-            return WorktreeScan::default();
+        // No repository or no git — nothing to report, and nothing was
+        // skipped, so this is not a truncated scan.
+        GitOutput::Failed | GitOutput::Unavailable => return WorktreeScan::default(),
+        // Out of budget before the list was even read: worktrees may well
+        // carry unpushed work and this scan will never know, which is exactly
+        // what `truncated` says.
+        GitOutput::TimedOut => {
+            return WorktreeScan {
+                unpushed: Vec::new(),
+                truncated: true,
+            };
         }
     };
 
-    let default_ref = default_remote_ref(dir);
+    let has_remote_refs = default_remote_ref(dir).is_some();
     let mut scan = WorktreeScan::default();
 
-    let candidates: Vec<WorktreeEntry> = parse_worktree_list(&porcelain)
+    let mut candidates: Vec<WorktreeEntry> = parse_worktree_list(&porcelain)
         .into_iter()
         .filter(|entry| !entry.bare && entry.branch.is_some())
         .collect();
+
+    // The caller's own checkout is probed first. The cap applies in list
+    // order, and a session sitting in the 17th worktree of a busy repo would
+    // otherwise have its OWN count silently dropped while 16 siblings were
+    // named — the one count it is most able to act on (cadence-hooks#619
+    // review).
+    let here = canonical_path(dir);
+    if let Some(index) = candidates
+        .iter()
+        .position(|entry| canonical_path(&entry.path) == here)
+    {
+        let own = candidates.remove(index);
+        candidates.insert(0, own);
+    }
 
     if candidates.len() > MAX_WORKTREES {
         scan.truncated = true;
@@ -214,7 +257,7 @@ pub fn scan(dir: &str) -> WorktreeScan {
 
     for entry in candidates.into_iter().take(MAX_WORKTREES) {
         let Some(branch) = entry.branch else { continue };
-        match unpushed_count(&entry.path, default_ref.as_deref()) {
+        match unpushed_count(&entry.path, has_remote_refs) {
             Ok(Some(commits)) if commits > 0 => {
                 scan.unpushed.push(UnpushedWorktree {
                     path: canonical_path(&entry.path),
@@ -253,9 +296,16 @@ mod tests {
 
     // --- parse_worktree_list: table ---
 
+    /// Fixture builder: `-z` framing from a readable newline-written block.
+    /// Only fixtures that deliberately carry a newline INSIDE a record build
+    /// their string by hand.
+    fn z(porcelain: &str) -> String {
+        porcelain.replace('\n', "\0")
+    }
+
     #[test]
     fn parses_a_primary_and_two_linked_worktrees() {
-        let porcelain = "\
+        let porcelain = z("\
 worktree /repo
 HEAD abc123
 branch refs/heads/main
@@ -267,8 +317,8 @@ branch refs/heads/feat/a
 worktree /repo/.claude/worktrees/b
 HEAD 789abc
 detached
-";
-        let entries = parse_worktree_list(porcelain);
+");
+        let entries = parse_worktree_list(&porcelain);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].path, "/repo");
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
@@ -279,22 +329,33 @@ detached
 
     #[test]
     fn parses_a_bare_main_worktree() {
-        let entries = parse_worktree_list("worktree /repo.git\nbare\n");
+        let entries = parse_worktree_list(&z("worktree /repo.git\nbare\n"));
         assert_eq!(entries.len(), 1);
         assert!(entries[0].bare);
     }
 
     #[test]
     fn keeps_a_branch_name_containing_slashes_and_ignores_unknown_keys() {
-        let entries = parse_worktree_list(
+        let entries = parse_worktree_list(&z(
             "worktree /repo\nHEAD abc\nbranch refs/heads/feat/deep/name\nlocked\nprunable gone\n",
-        );
+        ));
         assert_eq!(entries[0].branch.as_deref(), Some("feat/deep/name"));
     }
 
     #[test]
     fn ignores_keys_before_any_worktree_block() {
-        assert!(parse_worktree_list("branch refs/heads/x\nbare\n").is_empty());
+        assert!(parse_worktree_list(&z("branch refs/heads/x\nbare\n")).is_empty());
+    }
+
+    #[test]
+    fn a_path_containing_a_newline_stays_one_entry() {
+        // The reason for `-z`: under newline framing the second half of this
+        // path opens a phantom block, and the real worktree loses its branch.
+        let porcelain = "worktree /repo/wt/a\nb\0HEAD abc\0branch refs/heads/feat/a\0\0";
+        let entries = parse_worktree_list(porcelain);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, "/repo/wt/a\nb");
+        assert_eq!(entries[0].branch.as_deref(), Some("feat/a"));
     }
 
     #[test]
@@ -365,7 +426,7 @@ detached
                 branch: "feat/a".into(),
                 commits: 2,
             }],
-            "a never-pushed branch is measured against the remote's default branch"
+            "a never-pushed branch loses every commit past the last published one"
         );
     }
 
@@ -516,5 +577,82 @@ detached
 
         assert!(scan.truncated, "past the cap the scan says so: {scan:?}");
         assert_eq!(scan.unpushed.len(), MAX_WORKTREES, "{scan:?}");
+    }
+
+    #[test]
+    fn the_cap_never_drops_the_callers_own_checkout() {
+        let scratch = Scratch::new(&scratch_root(), "cap-own-first");
+        let repo = repo_with_remote(&scratch);
+        for i in 0..MAX_WORKTREES {
+            let name = format!("a{i:02}");
+            worktree_with_commits(&repo, &name, &format!("feat/{name}"), 1);
+        }
+        // The caller sits in the LAST worktree git lists, past the cap.
+        let own = worktree_with_commits(&repo, "zzz", "feat/zzz", 1);
+
+        let scan = scan(&own.to_string_lossy());
+
+        assert!(scan.truncated, "{scan:?}");
+        let own_path = canonical_path(&own.to_string_lossy());
+        let mine = scan
+            .unpushed
+            .iter()
+            .find(|w| w.path == own_path)
+            .unwrap_or_else(|| panic!("the caller's own worktree must survive the cap: {scan:?}"));
+        assert_eq!(mine.commits, 1);
+        assert_eq!(mine.branch, "feat/zzz");
+    }
+
+    #[test]
+    fn a_branch_pushed_without_an_upstream_reports_zero() {
+        let scratch = Scratch::new(&scratch_root(), "pushed-no-upstream");
+        let repo = repo_with_remote(&scratch);
+        let wt = worktree_with_commits(&repo, "nou", "feat/nou", 1);
+        // No `-u`: the branch is published, no upstream is configured.
+        git_in(&wt, &["push", "-q", "origin", "feat/nou"]);
+
+        let scan = scan(&repo.to_string_lossy());
+
+        assert!(
+            scan.unpushed.is_empty(),
+            "the remote already has these commits: {scan:?}"
+        );
+    }
+
+    #[test]
+    fn a_branch_stacked_on_a_pushed_base_counts_only_its_own_commits() {
+        let scratch = Scratch::new(&scratch_root(), "stacked");
+        let repo = repo_with_remote(&scratch);
+        let base = worktree_with_commits(&repo, "base", "feat/base", 1);
+        git_in(&base, &["push", "-q", "origin", "feat/base"]);
+
+        let top = repo.join("wt").join("top");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/top",
+                &top.to_string_lossy(),
+                "feat/base",
+            ],
+        );
+        std::fs::write(top.join("top.txt"), "t").unwrap();
+        git_in(&top, &["add", "."]);
+        git_in(&top, &["commit", "-q", "-m", "own work"]);
+
+        let scan = scan(&repo.to_string_lossy());
+
+        assert_eq!(
+            scan.unpushed,
+            vec![UnpushedWorktree {
+                path: canonical_path(&top.to_string_lossy()),
+                branch: "feat/top".into(),
+                commits: 1,
+            }],
+            "the base's published commit belongs to no worktree's count: {scan:?}"
+        );
     }
 }

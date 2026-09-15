@@ -29,7 +29,7 @@
 
 use crate::identity::{self, MAX_FIELD_DISPLAY};
 use crate::registry;
-use crate::unpushed_worktrees::{self, UnpushedWorktree};
+use crate::unpushed_worktrees::{self, MAX_WORKTREES, UnpushedWorktree};
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Logger, MetricsInput};
 use serde::{Deserialize, Serialize};
@@ -59,8 +59,7 @@ pub struct LooseEndMarker {
     pub branch: Option<String>,
     /// Uncommitted + untracked entries (`git status --short` line count).
     pub uncommitted: usize,
-    /// Unpushed commits on the session's own checkout — ahead of its upstream
-    /// where it has one, of the remote's default branch where it does not
+    /// Commits on the session's own checkout that no remote-tracking ref has
     /// (cadence-hooks#619). `0` when the repo has no remote-tracking refs at
     /// all, since then there is nothing to be unpushed against.
     pub unpushed: usize,
@@ -126,9 +125,9 @@ fn detect_loose_ends(root: &str) -> LooseEndMarker {
     let branch = git_command(root, &["branch", "--show-current"]);
 
     // One scan covers every worktree of this repo, this one included, under a
-    // single rule (upstream when there is one, the remote's default branch
-    // otherwise — `unpushed_worktrees` documents why). The session's own entry
-    // becomes the `unpushed` count; the rest ride as `worktrees`.
+    // single rule — commits no remote-tracking ref has (`unpushed_worktrees`
+    // documents why). The session's own entry becomes the `unpushed` count;
+    // the rest ride as `worktrees`.
     //
     // This REPLACES the old `git log --oneline @{u}..` probe, which reported 0
     // for a branch with no upstream — i.e. for a branch that was never pushed,
@@ -169,10 +168,24 @@ fn write_marker(dir: &Path, marker: &LooseEndMarker) -> std::io::Result<()> {
     std::fs::write(marker_path(dir), json + "\n")
 }
 
-/// Read the marker, if present and parseable. A torn/corrupt marker parses to
-/// `None` and is treated as absent (fail open — a missed nudge, never a break).
+/// Largest marker this reader will parse. A marker a session writes is a few
+/// hundred bytes (the worktree list is capped at [`MAX_WORKTREES`]); anything
+/// past this was not written by a scan, and parsing it would spend the hook's
+/// budget on an attacker-chosen allocation before the render cap could bound
+/// the text.
+const MAX_MARKER_BYTES: u64 = 64 * 1024;
+
+/// Read the marker, if present, small enough, and parseable. A torn, corrupt,
+/// or oversized marker reads as absent (fail open — a missed nudge, never a
+/// break).
 fn read_marker(dir: &Path) -> Option<LooseEndMarker> {
-    let text = std::fs::read_to_string(marker_path(dir)).ok()?;
+    let path = marker_path(dir);
+    // Size first: the file sits in a shared checkout, so its size is chosen by
+    // whoever wrote it, not by this binary.
+    if std::fs::metadata(&path).ok()?.len() > MAX_MARKER_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -192,6 +205,14 @@ impl Logger for BackstopRecord {
     fn run(&self, input: &MetricsInput) {
         // Deliberately-left work opts out before any git work.
         if suppressed() {
+            return;
+        }
+        // The event gate, ahead of the git work rather than only inside
+        // `run_record`: a worktree scan on a wrongly-wired event would spend
+        // one-or-more subprocesses per worktree and then discard the result.
+        // `run_record` keeps its own copy of this gate — it is the testable
+        // core, and a marker write must never depend on a caller remembering.
+        if input.hook_event_name.as_deref() != Some("SessionEnd") {
             return;
         }
         let Some(cwd) = input.cwd.as_deref() else {
@@ -320,12 +341,25 @@ pub fn render_warning(marker: &LooseEndMarker) -> String {
         let plural = if marker.stashes == 1 { "" } else { "es" };
         parts.push(format!("{} stash{plural}", marker.stashes));
     }
-    for worktree in &marker.worktrees {
+    // Capped like every other marker-derived list (`guard.rs` caps lanes at
+    // `identity::MAX_LANES` the same way): a scan writes at most
+    // `MAX_WORKTREES` entries, but the marker is a file in a shared checkout —
+    // a repository can even ship one tracked — so the RENDER, not the writer,
+    // is what bounds the text that reaches `additionalContext`.
+    for worktree in marker.worktrees.iter().take(MAX_WORKTREES) {
         parts.push(format!(
             "{} unpushed in worktree {}",
             worktree.commits,
             identity::sanitize_field(&worktree.branch, MAX_FIELD_DISPLAY)
         ));
+    }
+    if let Some(extra) = marker
+        .worktrees
+        .len()
+        .checked_sub(MAX_WORKTREES)
+        .filter(|n| *n > 0)
+    {
+        parts.push(format!("and {extra} more worktree(s)"));
     }
     let summary = parts.join(", ");
     let partial = if marker.worktrees_truncated {
@@ -624,6 +658,49 @@ mod tests {
     }
 
     #[test]
+    fn render_caps_the_worktree_list_and_says_how_many_it_dropped() {
+        // A marker with far more entries than any scan writes — the file lives
+        // in a shared checkout, so its length is not this binary's to assume.
+        let mut m = marker(0, 0, 0);
+        m.worktrees = (0..100)
+            .map(|i| UnpushedWorktree {
+                path: format!("/repo/wt/{i}"),
+                branch: format!("feat/{i}"),
+                commits: 1,
+            })
+            .collect();
+
+        let msg = render_warning(&m);
+
+        let rendered = msg.matches("unpushed in worktree").count();
+        assert_eq!(rendered, MAX_WORKTREES, "{rendered} clauses in: {msg}");
+        assert!(msg.contains("and 84 more worktree(s)"), "{msg}");
+    }
+
+    #[test]
+    fn an_oversized_marker_reads_as_absent() {
+        let tmp = TempDir::new().unwrap();
+        let mut m = marker(0, 0, 0);
+        // Valid JSON, just far too large to be anything a scan wrote.
+        m.worktrees = (0..20_000)
+            .map(|i| UnpushedWorktree {
+                path: format!("/repo/wt/{i}"),
+                branch: format!("feat/{i}"),
+                commits: 1,
+            })
+            .collect();
+        write_marker(tmp.path(), &m).unwrap();
+        assert!(
+            std::fs::metadata(marker_path(tmp.path())).unwrap().len() > MAX_MARKER_BYTES,
+            "fixture must exceed the cap or it proves nothing"
+        );
+
+        assert!(read_marker(tmp.path()).is_none());
+        // And the warning path stays silent rather than nudging with it.
+        assert_eq!(run_warn(tmp.path()).outcome, Outcome::Allow);
+    }
+
+    #[test]
     fn render_sanitizes_a_hostile_worktree_branch() {
         // Branch names come from a checkout other sessions write to, and the
         // rendered text lands in the additionalContext Claude reads.
@@ -657,6 +734,25 @@ mod tests {
         repo
     }
 
+    /// Add a linked worktree on a new branch with `n` commits of its own.
+    fn add_worktree(repo: &Path, name: &str, branch: &str, n: usize) -> PathBuf {
+        let path = repo.join("wt").join(name);
+        git_in(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                &path.to_string_lossy(),
+                "main",
+            ],
+        );
+        commit_n(&path, name, n);
+        path
+    }
+
     /// Commit `n` files in `dir`, each its own commit.
     fn commit_n(dir: &Path, tag: &str, n: usize) {
         for i in 0..n {
@@ -672,20 +768,7 @@ mod tests {
         let repo = repo_with_remote(&scratch);
 
         // A sibling worktree on a never-pushed branch, two commits deep.
-        let wt = repo.join("wt").join("a");
-        git_in(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "feat/a",
-                &wt.to_string_lossy(),
-                "main",
-            ],
-        );
-        commit_n(&wt, "a", 2);
+        add_worktree(&repo, "a", "feat/a", 2);
 
         // One unpushed commit on `main` in the session's own checkout.
         commit_n(&repo, "own", 1);
@@ -701,6 +784,31 @@ mod tests {
         assert_eq!(marker.worktrees[0].branch, "feat/a");
         assert_eq!(marker.worktrees[0].commits, 2);
         assert!(!marker.worktrees_truncated);
+    }
+
+    #[test]
+    fn detect_keeps_the_own_count_when_the_cap_truncates_the_siblings() {
+        let scratch = Scratch::new(&scratch_root(), "detect-cap-own");
+        let repo = repo_with_remote(&scratch);
+        for i in 0..MAX_WORKTREES {
+            let name = format!("a{i:02}");
+            add_worktree(&repo, &name, &format!("feat/{name}"), 1);
+        }
+        // The session sits in the worktree git lists last, past the cap.
+        let own = add_worktree(&repo, "zzz", "feat/zzz", 1);
+
+        let marker = detect_loose_ends(&own.to_string_lossy());
+
+        assert_eq!(
+            marker.unpushed, 1,
+            "the caller's own count survives the cap: {marker:?}"
+        );
+        assert_eq!(marker.branch.as_deref(), Some("feat/zzz"));
+        assert!(marker.worktrees_truncated, "{marker:?}");
+        assert!(
+            !marker.worktrees.iter().any(|w| w.branch == "feat/zzz"),
+            "the own checkout is never also a sibling: {marker:?}"
+        );
     }
 
     #[test]
