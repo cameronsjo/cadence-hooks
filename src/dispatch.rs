@@ -118,7 +118,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // payload, so recording it keeps the no-payload posture.
             cadence_hooks_metrics::log_failopen(
                 "parse",
-                crate::registry::plugin_for(hook_name),
+                crate::registry::namespace_of(hook_name),
                 Some(hook_name),
                 env!("CARGO_PKG_VERSION"),
                 Some(&e),
@@ -150,7 +150,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         Err(error) => {
             cadence_hooks_metrics::log_failopen(
                 "parse",
-                crate::registry::plugin_for(hook_name),
+                crate::registry::namespace_of(hook_name),
                 Some(hook_name),
                 env!("CARGO_PKG_VERSION"),
                 Some(&error),
@@ -201,10 +201,14 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
     // one and drift in the other. `enforced` is the only thing that differs: a
     // panic stopped nothing, so it always passes `false`.
     let emit_telemetry_tail = |enforced: bool| {
-        log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name), enforced);
+        log_deadline_degradation(
+            hook_name,
+            crate::registry::namespace_of(hook_name),
+            enforced,
+        );
         cadence_hooks_metrics::log_timing(
             hook_name,
-            crate::registry::plugin_for(hook_name).unwrap_or("unknown"),
+            crate::registry::namespace_of(hook_name).unwrap_or("unknown"),
             event.name(),
             started.elapsed().as_millis(),
             input.session_id(),
@@ -427,7 +431,7 @@ pub fn run_logged_logger(
     // backstop) and must decide inside the external hooks.json budget.
     cadence_hooks_core::deadline::arm();
     guard_interactive_terminal(logger.name(), None, sample_override);
-    let namespace = crate::registry::plugin_for(hook.unwrap_or(""));
+    let namespace = crate::registry::namespace_of(hook.unwrap_or(""));
     // Capture the session id (when the payload carries one) for the timing row;
     // a parse failure leaves it `None`, matching core's fail-open-to-exit-0 path.
     let mut session_id: Option<String> = None;
