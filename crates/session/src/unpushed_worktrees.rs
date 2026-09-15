@@ -25,9 +25,15 @@
 //!   published commit, the riskiest case and the one a bare `@{u}..` probe
 //!   silently reports as zero.
 //!
-//! [`default_remote_ref`] gates the whole measure: with no remote-tracking refs
-//! in the repository, `--not --remotes` excludes nothing and every commit would
-//! read as unpushed, so a local-only repository reports nothing instead.
+//! A stale remote-tracking ref over-excludes: nothing here fetches, so a branch
+//! whose remote counterpart was deleted elsewhere still measures against the
+//! last ref this checkout saw and under-reports. Under-reporting is the safe
+//! direction for an advisory, and fetching is not.
+//!
+//! [`has_remote_tracking_refs`] gates the whole measure: with no
+//! remote-tracking refs at all, `--not --remotes` excludes nothing and every
+//! commit would read as unpushed, so a local-only repository reports nothing
+//! instead.
 //!
 //! A detached HEAD is skipped: there is no branch to push, and the commits are
 //! reachable from wherever it was detached in all but deliberate cases.
@@ -54,10 +60,6 @@ use serde::{Deserialize, Serialize};
 /// budget on an end-of-session advisory. Also the most worktrees any one
 /// warning renders, so a marker cannot grow the text without bound.
 pub const MAX_WORKTREES: usize = 16;
-
-/// Remote-tracking refs tried, in order, when a remote publishes no
-/// `origin/HEAD`. A bare clone or a remote added by hand often has none.
-const DEFAULT_REF_FALLBACKS: &[&str] = &["origin/main", "origin/master"];
 
 /// One worktree whose branch carries commits no remote has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,28 +143,23 @@ pub fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// A remote-tracking ref, proving the repository has somewhere to push to.
+/// Whether the repository has any remote-tracking ref at all.
 ///
-/// `refs/remotes/origin/HEAD` first — the remote's own answer — then the
-/// conventional [`DEFAULT_REF_FALLBACKS`], each verified to exist before it is
-/// returned. `None` when the repository has no remote-tracking refs at all, in
-/// which case nothing is counted: `rev-list --not --remotes` would exclude
-/// nothing, so every commit would look unpushed and the advisory would fire on
-/// every local-only repository.
-pub fn default_remote_ref(dir: &str) -> Option<String> {
-    if let GitQuery::Value(name) = git_command_detailed(
-        dir,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) {
-        return Some(name);
-    }
-    DEFAULT_REF_FALLBACKS.iter().copied().find_map(|candidate| {
-        matches!(
-            git_command_detailed(dir, &["rev-parse", "--verify", "--quiet", candidate]),
-            GitQuery::Value(_)
-        )
-        .then(|| candidate.to_string())
-    })
+/// This asks about exactly the ref namespace the measure walks: `--remotes`
+/// means `refs/remotes`, so `for-each-ref --count=1 refs/remotes` answers the
+/// only question the gate has — is there anything for `--not --remotes` to
+/// exclude? A gate that named `origin` instead would silently report nothing
+/// for a repository whose remote is called `upstream`, and for an `origin`
+/// whose default branch is `trunk` with no `origin/HEAD` to find it by.
+///
+/// `false` when the answer is empty, unavailable, or abandoned at the
+/// deadline: with nothing to exclude, every commit would read as unpushed and
+/// the advisory would fire on every local-only repository.
+pub fn has_remote_tracking_refs(dir: &str) -> bool {
+    matches!(
+        git_command_detailed(dir, &["for-each-ref", "--count=1", "refs/remotes"]),
+        GitQuery::Value(_)
+    )
 }
 
 /// How many commits `dir`'s checked-out branch carries that no remote has.
@@ -182,8 +179,9 @@ type CountOutcome = Result<Option<usize>, ()>;
 /// the remote already holds — worse on a branch stacked on a pushed base,
 /// where the base's commits are counted against the child.
 ///
-/// `has_remote_refs` is required because `--not --remotes` with no remotes
-/// excludes nothing: every commit in the repository would read as unpushed.
+/// `has_remote_refs` — [`has_remote_tracking_refs`] for this repository — is
+/// required because `--not --remotes` with no `refs/remotes` excludes nothing:
+/// every commit in the repository would read as unpushed.
 fn unpushed_count(dir: &str, has_remote_refs: bool) -> CountOutcome {
     if !has_remote_refs {
         return Ok(None);
@@ -229,7 +227,7 @@ pub fn scan(dir: &str) -> WorktreeScan {
         }
     };
 
-    let has_remote_refs = default_remote_ref(dir).is_some();
+    let has_remote_refs = has_remote_tracking_refs(dir);
     let mut scan = WorktreeScan::default();
 
     let mut candidates: Vec<WorktreeEntry> = parse_worktree_list(&porcelain)
@@ -540,23 +538,84 @@ detached
     }
 
     #[test]
-    fn default_remote_ref_resolves_origin_main_without_origin_head() {
-        let scratch = Scratch::new(&scratch_root(), "default-ref");
+    fn the_gate_sees_a_remote_tracking_ref_however_it_is_named() {
+        let scratch = Scratch::new(&scratch_root(), "gate-present");
         let repo = repo_with_remote(&scratch);
-        // A `git push` sets no `origin/HEAD`, so this exercises the fallback.
-        assert_eq!(
-            default_remote_ref(&repo.to_string_lossy()).as_deref(),
-            Some("origin/main")
-        );
+        // A `git push` sets no `origin/HEAD`, and the gate does not need one.
+        assert!(has_remote_tracking_refs(&repo.to_string_lossy()));
     }
 
     #[test]
-    fn default_remote_ref_is_none_without_a_remote() {
-        let scratch = Scratch::new(&scratch_root(), "default-ref-none");
+    fn the_gate_is_false_without_a_remote() {
+        let scratch = Scratch::new(&scratch_root(), "gate-absent");
         let repo = scratch.path().join("solo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        assert_eq!(default_remote_ref(&repo.to_string_lossy()), None);
+        assert!(!has_remote_tracking_refs(&repo.to_string_lossy()));
+    }
+
+    #[test]
+    fn a_remote_not_named_origin_is_still_a_remote() {
+        let scratch = Scratch::new(&scratch_root(), "upstream-remote");
+        let remote = scratch.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git_in(
+            &repo,
+            &["remote", "add", "upstream", &remote.to_string_lossy()],
+        );
+        git_in(&repo, &["push", "-q", "upstream", "main"]);
+        std::fs::write(repo.join("after.txt"), "x").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "unpushed"]);
+
+        let scan = scan(&repo.to_string_lossy());
+
+        assert_eq!(
+            scan.unpushed.len(),
+            1,
+            "`origin` is a convention, not the gate: {scan:?}"
+        );
+        assert_eq!(scan.unpushed[0].commits, 1);
+    }
+
+    #[test]
+    fn an_origin_whose_default_branch_is_trunk_is_still_measured() {
+        let scratch = Scratch::new(&scratch_root(), "trunk-default");
+        let remote = scratch.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "--bare", "-b", "trunk"]);
+
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "trunk"]);
+        git_in(&repo, &["config", "user.email", "t@t"]);
+        git_in(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(
+            &repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git_in(&repo, &["push", "-q", "origin", "trunk"]);
+        std::fs::write(repo.join("after.txt"), "x").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "unpushed"]);
+
+        let scan = scan(&repo.to_string_lossy());
+
+        assert_eq!(
+            scan.unpushed.len(),
+            1,
+            "no origin/HEAD and no origin/main, but plenty to measure: {scan:?}"
+        );
+        assert_eq!(scan.unpushed[0].commits, 1);
+        assert_eq!(scan.unpushed[0].branch, "trunk");
     }
 
     #[test]

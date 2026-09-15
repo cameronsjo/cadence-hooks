@@ -30,6 +30,7 @@
 use crate::identity::{self, MAX_FIELD_DISPLAY};
 use crate::registry;
 use crate::unpushed_worktrees::{self, MAX_WORKTREES, UnpushedWorktree};
+use cadence_hooks_core::paths;
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Logger, MetricsInput};
 use serde::{Deserialize, Serialize};
@@ -83,9 +84,10 @@ pub struct LooseEndMarker {
     pub ended: String,
 }
 
-/// `skip_serializing_if` predicate for a default-`false` flag — a free function
-/// because `serde` needs a path, and `std::ops::Not::not` would serialize the
-/// flag whenever it IS set to nothing readable here.
+/// `skip_serializing_if` predicate for a default-`false` flag: true when the
+/// flag is `false`, which is when the field is omitted. A free function because
+/// `serde` needs a path to name, and `std::ops::Not::not` reads backwards at
+/// the attribute site.
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -175,23 +177,23 @@ fn write_marker(dir: &Path, marker: &LooseEndMarker) -> std::io::Result<()> {
 /// the text.
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 
-/// Read the marker, if present, small enough, and parseable. A torn, corrupt,
-/// or oversized marker reads as absent (fail open — a missed nudge, never a
-/// break).
+/// Read the marker, if it is a regular file, small enough, and parseable. A
+/// torn, corrupt, oversized, or non-regular marker reads as absent (fail open —
+/// a missed nudge, never a break).
 ///
 /// Reading as absent also means it is not consumed: `run_warn` deletes only a
-/// marker it read. That is deliberate for the oversized case — a file that big
-/// was not written by a scan (a scan writes at most [`MAX_WORKTREES`] entries),
-/// so it may well be a tracked file this binary has no business deleting, and
-/// the cost of leaving it is one `metadata` call per session start.
+/// marker it read. That is deliberate here — a file that big, or a FIFO at that
+/// path, was not written by a scan (a scan writes at most [`MAX_WORKTREES`]
+/// entries into a regular file), so it may well be a tracked file this binary
+/// has no business deleting, and the cost of leaving it is one `metadata` call
+/// per session start.
 fn read_marker(dir: &Path) -> Option<LooseEndMarker> {
-    let path = marker_path(dir);
-    // Size first: the file sits in a shared checkout, so its size is chosen by
-    // whoever wrote it, not by this binary.
-    if std::fs::metadata(&path).ok()?.len() > MAX_MARKER_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
+    // `read_capped` (cadence-hooks#361) is the shared primitive for exactly
+    // this: it rejects a non-regular file before opening it and enforces the
+    // cap on the READ. A `metadata().len()` pre-check does neither — `metadata`
+    // follows symlinks, and a FIFO or a `/dev/zero` symlink reports size 0 and
+    // then yields forever, hanging the hook the marker is supposed to inform.
+    let text = paths::read_capped(&marker_path(dir), MAX_MARKER_BYTES)?;
     serde_json::from_str(&text).ok()
 }
 
@@ -703,6 +705,37 @@ mod tests {
 
         assert!(read_marker(tmp.path()).is_none());
         // And the warning path stays silent rather than nudging with it.
+        assert_eq!(run_warn(tmp.path()).outcome, Outcome::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_marker_path_reads_as_absent_without_blocking() {
+        // `.claude/sessions/` is a shared directory, so the marker path is a
+        // name another process can take. A FIFO reports size 0 through
+        // `metadata` and then yields nothing forever: a size-then-read check
+        // would wave it through and hang `backstop-warn` on the open. No
+        // writer is ever attached here — the rejection happens before the
+        // open, which is the property under test — and the elapsed assertion
+        // is what would catch a regression to a blocking read.
+        let tmp = TempDir::new().unwrap();
+        let path = marker_path(tmp.path());
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "mkfifo failed; the fixture proves nothing without it");
+
+        let started = std::time::Instant::now();
+        let read = read_marker(tmp.path());
+        let elapsed = started.elapsed();
+
+        assert!(read.is_none(), "a FIFO is not a marker");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "read_marker must not block on a FIFO (took {elapsed:?})"
+        );
         assert_eq!(run_warn(tmp.path()).outcome, Outcome::Allow);
     }
 
