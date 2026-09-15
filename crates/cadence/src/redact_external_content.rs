@@ -42,7 +42,8 @@
 //! than filter its results.
 //!
 //! Within a matching segment, bodies are pulled from flag VALUES via
-//! [`tokenize`] — deliberately not from a further re-split, since [`tokenize`]
+//! [`cadence_hooks_core::gh_bodies::extract_bodies`], which tokenizes the
+//! segment — deliberately not a further re-split, since tokenizing
 //! keeps a quoted value as one token. A heredoc carried in a quoted command
 //! substitution — `git commit -m "$(cat <<'EOF' … EOF)"` — survives
 //! segmentation intact (the heredoc sits inside quotes, so segment splitting
@@ -54,14 +55,14 @@
 //! `--body-file`, a parse miss, or no hits all proceed without a message. In
 //! nudge mode, silent failure beats false positives.
 
-use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
+use cadence_hooks_core::gh_bodies::extract_bodies;
+use cadence_hooks_core::shell::{command_segments, strip_quotes};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 mod identity;
 
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::LazyLock;
 
 /// The three audience tiers, ordered narrow → wide: owned-internal(1) <
@@ -623,97 +624,6 @@ fn resolve_base_dir(input: &HookInput) -> String {
                 .map(|p| p.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| ".".to_string())
-}
-
-/// Extract body text from the flag values of ONE gate-passing segment. Callers
-/// must apply the [`EXTERNAL_POST`] gate to the segment first — a file-body flag
-/// is read here, so handing this a non-posting segment performs I/O the guard
-/// has no business doing (#424).
-///
-/// Literal-body flags (`--body`/`-b`/`-m`/`--message`, plus their `=`-joined and
-/// glued-short forms) contribute their value verbatim. File-body flags
-/// (`--body-file`/`-F`) contribute the file's contents read from disk; an
-/// unreadable path is silently skipped (fail-open). `tokenize` keeps a quoted
-/// value as one token, so a heredoc inside `"$(cat <<EOF … EOF)"` rides into the
-/// value intact. `--title`/`-t` is deliberately out of scope (the spec scans
-/// bodies only).
-fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
-    let tokens = tokenize(segment);
-    let mut bodies = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i].as_str();
-        // Separate-token literal body flags.
-        if matches!(tok, "--body" | "-b" | "-m" | "--message")
-            && let Some(v) = tokens.get(i + 1)
-        {
-            bodies.push(v.clone());
-            i += 2;
-            continue;
-        }
-        // Separate-token file-body flags (value is a path → read it). The flag
-        // consumes two tokens whether or not the file reads, so the i-advance
-        // stays outside the read-success branch.
-        if matches!(tok, "--body-file" | "-F")
-            && let Some(p) = tokens.get(i + 1)
-        {
-            if let Some(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
-            }
-            i += 2;
-            continue;
-        }
-        // `=`-joined long forms.
-        if let Some(v) = tok
-            .strip_prefix("--body=")
-            .or_else(|| tok.strip_prefix("--message="))
-        {
-            bodies.push(v.to_string());
-            i += 1;
-            continue;
-        }
-        if let Some(p) = tok.strip_prefix("--body-file=") {
-            if let Some(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
-            }
-            i += 1;
-            continue;
-        }
-        // Glued short forms: `-mMSG`, `-bBODY` (literal), `-FPATH` (file).
-        if !tok.starts_with("--") && tok.len() > 2 {
-            if let Some(v) = tok.strip_prefix("-m").or_else(|| tok.strip_prefix("-b")) {
-                bodies.push(v.to_string());
-                i += 1;
-                continue;
-            }
-            if let Some(p) = tok.strip_prefix("-F") {
-                if let Some(content) = read_body_file(p, base_dir) {
-                    bodies.push(content);
-                }
-                i += 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    bodies
-}
-
-/// Read a `--body-file` value from disk, resolving a relative path against
-/// `base_dir`. `None` on any error (missing, non-UTF-8, `-` for stdin,
-/// non-regular file, oversized) so the caller fails open.
-///
-/// #194: shares the #157 unbounded-read DoS shape — a symlink to an endless
-/// special file (`/dev/zero`, a FIFO) or a multi-GB file could hang or OOM the
-/// hook — so this routes through the same bounded, regular-file-only reader.
-fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
-    let p = Path::new(path);
-    let full = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        Path::new(base_dir).join(p)
-    };
-    cadence_hooks_core::paths::read_untrusted_config(&full)
 }
 
 /// Load this guard's `redaction` section from `<git-root>/.claude/cadence.json`

@@ -120,12 +120,34 @@ pub fn is_within(path: &str, dir: &Path) -> bool {
 /// Cap for an untrusted per-repo `.claude/*.json` read. These are tiny
 /// hand-authored exemption lists; 1 MiB is ~100–1000x any legitimate size and
 /// bounds a pathological/malicious multi-GB blob from OOM-ing the hook.
-const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
+pub const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Why a capped read yielded no text.
+///
+/// [`read_capped`] collapses all three to `None`, which is the right answer for
+/// a config load that fails open either way. A caller that must *say something*
+/// about an oversized file — the body-budget guard — needs them apart, so the
+/// detailed readers hand back this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CappedReadError {
+    /// Not a regular file, or any IO error (missing, permission, a FIFO or
+    /// device rejected on `stat` before the open).
+    Unreadable,
+    /// The bytes are not valid UTF-8.
+    NotUtf8,
+    /// The content exceeds the cap.
+    OverCap,
+}
 
 /// Read a per-repo, repo-controlled `.claude/*.json` config safely — the
 /// [`read_capped`] discipline at [`MAX_UNTRUSTED_CONFIG_BYTES`].
 pub fn read_untrusted_config(path: &Path) -> Option<String> {
     read_capped(path, MAX_UNTRUSTED_CONFIG_BYTES)
+}
+
+/// [`read_untrusted_config`], reporting why a read yielded nothing.
+pub fn read_untrusted_config_detailed(path: &Path) -> Result<String, CappedReadError> {
+    read_capped_detailed(path, MAX_UNTRUSTED_CONFIG_BYTES)
 }
 
 /// Read a small untrusted file whole, or reject it: `None` when it is not a
@@ -150,14 +172,33 @@ pub fn read_untrusted_config(path: &Path) -> Option<String> {
 /// `crate::transcript::read_tail` instead: this reads from the front, and
 /// rejects rather than truncates.
 pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None; // FIFO / device / dir / broken symlink
+    read_capped_detailed(path, max_bytes).ok()
+}
+
+/// [`read_capped`], reporting *why* instead of collapsing to `None`. The single
+/// implementation — `read_capped` is a projection of it, so the two can never
+/// drift on where the cap sits or what counts as a readable file.
+///
+/// The non-UTF-8 case is distinguished by `ErrorKind::InvalidData`, which is
+/// exactly what `read_to_string` raises for bytes that are not valid UTF-8;
+/// every other IO error is [`CappedReadError::Unreadable`].
+pub fn read_capped_detailed(path: &Path, max_bytes: u64) -> Result<String, CappedReadError> {
+    let meta = std::fs::metadata(path).map_err(|_| CappedReadError::Unreadable)?;
+    if !meta.is_file() {
+        return Err(CappedReadError::Unreadable); // FIFO / device / dir / broken symlink
     }
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path).map_err(|_| CappedReadError::Unreadable)?;
     let mut buf = String::new();
-    // non-UTF8 → None (same as read_to_string)
-    file.take(max_bytes + 1).read_to_string(&mut buf).ok()?;
-    (buf.len() as u64 <= max_bytes).then_some(buf)
+    file.take(max_bytes + 1)
+        .read_to_string(&mut buf)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidData => CappedReadError::NotUtf8,
+            _ => CappedReadError::Unreadable,
+        })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(CappedReadError::OverCap);
+    }
+    Ok(buf)
 }
 
 /// Resolve a checkout's git **common directory** — the shared `.git` that holds
