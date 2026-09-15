@@ -194,7 +194,7 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-amend-pushed",
         description: "Warn when git commit --amend rewrites a commit a remote already has",
-        plugin: "guardrails",
+        namespace: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
