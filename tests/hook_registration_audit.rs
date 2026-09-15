@@ -1625,27 +1625,38 @@ fn pending_wiring_hooks_still_name_a_real_subcommand() {
     );
 }
 
-/// Every `<plugin> <subcommand>` that some subject registers on a Bash matcher
-/// with no `if:` filter — the union across subjects.
+/// Every `<plugin> <subcommand>` some subject registers on a Bash matcher with
+/// no `if:` filter, mapped to the subjects that register it that way — plus
+/// every subject label, so a failure can name what was actually audited.
 ///
 /// The union is the right reading for both halves of the
 /// `INTENTIONAL_UNFILTERED_BASH_HOOKS` self-expiry, for the same reason
 /// `no_duplicate_command_registrations_per_matcher` reads its self-expiry that
 /// way: an exemption is dead cover only when NO workspace still needs it, and
 /// judging per subject would fire on whichever checkout happens to lag the
-/// other — a checkout-freshness fact wearing a wiring finding's clothes.
-fn unfiltered_bash_commands_across_subjects() -> BTreeSet<String> {
-    let mut unfiltered = BTreeSet::new();
+/// other — a checkout-freshness fact wearing a wiring finding's clothes. Which
+/// subjects a command came from is kept rather than collapsed, because the
+/// pending half fails on a SINGLE subject and the reader needs to know which.
+fn unfiltered_bash_commands_across_subjects()
+-> (Vec<&'static str>, BTreeMap<String, Vec<&'static str>>) {
+    let mut labels = Vec::new();
+    let mut unfiltered: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+
     for subject in audit_subjects() {
+        labels.push(subject.label);
         for refs in subject.refs.values() {
             for r in refs {
                 if r.is_bash_matcher && !r.has_if_filter {
-                    unfiltered.insert(r.command.clone());
+                    let seen = unfiltered.entry(r.command.clone()).or_default();
+                    if !seen.contains(&subject.label) {
+                        seen.push(subject.label);
+                    }
                 }
             }
         }
     }
-    unfiltered
+
+    (labels, unfiltered)
 }
 
 /// cameronsjo/cadence-hooks#597: the self-expiry
@@ -1666,22 +1677,25 @@ fn intentional_unfiltered_bash_hooks_are_still_unfiltered() {
         .iter()
         .map(|(command, _)| *command)
         .collect();
-    let unfiltered = unfiltered_bash_commands_across_subjects();
+    let (labels, unfiltered) = unfiltered_bash_commands_across_subjects();
 
     let stale: Vec<&&str> = INTENTIONAL_UNFILTERED_BASH_HOOKS
         .iter()
         .filter(|command| !pending.contains(**command))
-        .filter(|command| !unfiltered.contains(**command))
+        .filter(|command| !unfiltered.contains_key(**command))
         .collect();
 
     assert!(
         stale.is_empty(),
         "INTENTIONAL_UNFILTERED_BASH_HOOKS entry is no longer an unfiltered Bash matcher in ANY \
-         audited workspace — the wiring narrowed it with an `if:`, or the hook is gone, so the \
-         exemption covers nothing and must be removed:\n{}\n\n\
-         A row whose wiring has not dropped its `if:` YET belongs in \
-         PENDING_UNFILTERED_BASH_HOOKS with its tracking reference, not here.\n\
-         {STALE_CHECKOUT_HINT}",
+         audited workspace ({}) — the wiring narrowed it with an `if:`, or the hook is gone, so \
+         the exemption covers nothing and must be removed:\n{}\n\n\
+         This is a union verdict across every subject, so neither a stale sibling checkout nor a \
+         stale fixture alone can produce it. A row whose wiring has not dropped its `if:` YET \
+         fails here for that reason and belongs in PENDING_UNFILTERED_BASH_HOOKS with its \
+         tracking reference instead; if the wiring HAS shipped, refresh the fixture \
+         (`bash scripts/refresh-registration-audit-fixture.sh`).",
+        labels.join(", "),
         stale
             .iter()
             .map(|command| format!("  `{command}`"))
@@ -1698,11 +1712,18 @@ fn intentional_unfiltered_bash_hooks_are_still_unfiltered() {
 /// [`PENDING_UNFILTERED_BASH_HOOKS`] into the plain list.
 #[test]
 fn pending_unfiltered_bash_hooks_are_still_filtered() {
-    let unfiltered = unfiltered_bash_commands_across_subjects();
+    let (_labels, unfiltered) = unfiltered_bash_commands_across_subjects();
 
-    let now_unfiltered: Vec<&(&str, &str)> = PENDING_UNFILTERED_BASH_HOOKS
+    let now_unfiltered: Vec<String> = PENDING_UNFILTERED_BASH_HOOKS
         .iter()
-        .filter(|(command, _)| unfiltered.contains(*command))
+        .filter_map(|(command, tracking_ref)| {
+            unfiltered.get(*command).map(|subjects| {
+                format!(
+                    "  `{command}` ({tracking_ref}) — unfiltered in: {}",
+                    subjects.join(", ")
+                )
+            })
+        })
         .collect();
 
     assert!(
@@ -1710,12 +1731,10 @@ fn pending_unfiltered_bash_hooks_are_still_filtered() {
         "PENDING_UNFILTERED_BASH_HOOKS entry now runs unfiltered in an audited workspace — its \
          wiring PR landed, so the row graduates to INTENTIONAL_UNFILTERED_BASH_HOOKS and comes \
          out of the pending list:\n{}\n\n\
+         Unlike the union verdict above, this one fires on a SINGLE subject: the line names \
+         which. A sibling checkout carrying wiring that has not merged yet reports here first, \
          {STALE_CHECKOUT_HINT}",
-        now_unfiltered
-            .iter()
-            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        now_unfiltered.join("\n")
     );
 }
 
