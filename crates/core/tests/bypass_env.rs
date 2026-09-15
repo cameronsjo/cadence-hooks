@@ -16,7 +16,10 @@
 //! race the unit tests at all, and one local lock is enough to serialize the
 //! tests in *this* file against each other.
 
-use std::ffi::OsString;
+// Every import here must be used by an item that is NOT behind a `cfg`, or the
+// unused-import lint fires on the platform where that `cfg` is false and
+// `-D warnings` turns it into a build failure. The unix-only imports live
+// inside the `non_utf8` module below for exactly that reason.
 use std::sync::{Mutex, MutexGuard};
 
 use cadence_hooks_core::bypass::{BYPASS_VAR, BypassState, DISABLE_VAR, bypass_engaged, resolve};
@@ -118,6 +121,12 @@ fn bypass_engaged_reads_the_live_environment() {
 #[cfg(unix)]
 mod non_utf8 {
     use super::*;
+    // Both of these are unix-only: `OsStringExt::from_vec` is the only way to
+    // build the value, and `OsString` is only ever the type it returns. Kept in
+    // here rather than at file scope so the Windows build, which compiles this
+    // module away entirely, is not left holding an unused import under
+    // `-D warnings` (cadence-hooks#567 CI, windows-latest clippy).
+    use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     fn invalid_utf8() -> OsString {
