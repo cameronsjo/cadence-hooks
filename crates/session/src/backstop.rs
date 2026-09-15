@@ -59,7 +59,10 @@ pub struct LooseEndMarker {
     pub branch: Option<String>,
     /// Uncommitted + untracked entries (`git status --short` line count).
     pub uncommitted: usize,
-    /// Unpushed commits ahead of the configured upstream (`0` when none).
+    /// Unpushed commits on the session's own checkout — ahead of its upstream
+    /// where it has one, of the remote's default branch where it does not
+    /// (cadence-hooks#619). `0` when the repo has no remote-tracking refs at
+    /// all, since then there is nothing to be unpushed against.
     pub unpushed: usize,
     /// Entries in the stash (`git stash list` line count).
     pub stashes: usize,
