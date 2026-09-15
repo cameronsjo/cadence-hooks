@@ -330,7 +330,7 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
-    // Same shape, one repository over: no single `if:` glob expresses "a delete
+    // Same shape, one plugin over: no single `if:` glob expresses "a delete
     // verb", wherever it appears in a command. The prefilter matcher is
     // case-sensitive and has no notion of a command head, so a glob written
     // against the lowercase verb misses the capitalized spelling and a
@@ -1732,7 +1732,7 @@ fn pending_unfiltered_bash_hooks_are_still_filtered() {
          wiring PR landed, so the row graduates to INTENTIONAL_UNFILTERED_BASH_HOOKS and comes \
          out of the pending list:\n{}\n\n\
          Unlike the union verdict above, this one fires on a SINGLE subject: the line names \
-         which. A sibling checkout carrying wiring that has not merged yet reports here first, \
+         which. A sibling checkout carrying wiring that has not merged yet reports here first. \
          {STALE_CHECKOUT_HINT}",
         now_unfiltered.join("\n")
     );
@@ -1754,6 +1754,39 @@ fn pending_unfiltered_bash_hooks_are_listed_as_intentional() {
         "PENDING_UNFILTERED_BASH_HOOKS entry names a hook INTENTIONAL_UNFILTERED_BASH_HOOKS does \
          not list — the pending row excuses a self-expiry check that never looks at it:\n{}",
         orphaned
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The other half of the pending self-expiry: a pending row must still name a
+/// **real** subcommand. Direct port of
+/// [`pending_wiring_hooks_still_name_a_real_subcommand`], and needed for the
+/// same reason.
+///
+/// `pending_unfiltered_bash_hooks_are_still_filtered` passes both when the hook
+/// is registered with an `if:` and when it is registered nowhere at all, while
+/// `intentional_unfiltered_bash_hooks_are_still_unfiltered` excuses pending rows
+/// outright. So a hook retired rather than rewired would sit in BOTH lists
+/// forever, green, granting cover to nothing — the exact dead cover this pair
+/// exists to prevent. Reads the binary, so it needs no sibling checkout.
+#[test]
+fn pending_unfiltered_bash_hooks_still_name_a_real_hook() {
+    let binary_cmds = binary_hooks();
+
+    let stale: Vec<&(&str, &str)> = PENDING_UNFILTERED_BASH_HOOKS
+        .iter()
+        .filter(|(command, _)| !binary_cmds.contains(*command))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "PENDING_UNFILTERED_BASH_HOOKS entry names a subcommand the binary no longer registers — \
+         its tracking issue resolved by retiring the hook, so the row covers nothing and must be \
+         removed from this list and from INTENTIONAL_UNFILTERED_BASH_HOOKS:\n{}",
+        stale
             .iter()
             .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
             .collect::<Vec<_>>()
