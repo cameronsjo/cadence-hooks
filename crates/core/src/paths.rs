@@ -124,15 +124,25 @@ pub const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// Why a capped read yielded no text.
 ///
-/// [`read_capped`] collapses all three to `None`, which is the right answer for
+/// [`read_capped`] collapses all four to `None`, which is the right answer for
 /// a config load that fails open either way. A caller that must *say something*
 /// about an oversized file — the body-budget guard — needs them apart, so the
 /// detailed readers hand back this instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CappedReadError {
-    /// Not a regular file, or any IO error (missing, permission, a FIFO or
-    /// device rejected on `stat` before the open).
+    /// Missing, permission-denied, or any other IO error. The file is not
+    /// there for anyone, so a caller that fails open on it loses nothing.
     Unreadable,
+    /// The path exists but is not a regular file — a FIFO, a device, a
+    /// directory, or a `/dev/fd/N` process substitution.
+    ///
+    /// **Apart from [`Unreadable`](CappedReadError::Unreadable) because the two
+    /// mean opposite things to a guard.** A missing path yields nothing to the
+    /// command either; a FIFO yields its content to the command and nothing to
+    /// the reader, because reading it here would consume the stream (and can
+    /// block forever). A guard that measures file content must refuse this
+    /// shape rather than wave it through as if the file were absent.
+    NotRegular,
     /// The bytes are not valid UTF-8.
     NotUtf8,
     /// The content exceeds the cap.
@@ -185,7 +195,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
 pub fn read_capped_detailed(path: &Path, max_bytes: u64) -> Result<String, CappedReadError> {
     let meta = std::fs::metadata(path).map_err(|_| CappedReadError::Unreadable)?;
     if !meta.is_file() {
-        return Err(CappedReadError::Unreadable); // FIFO / device / dir / broken symlink
+        return Err(CappedReadError::NotRegular); // FIFO / device / dir / broken symlink
     }
     let file = std::fs::File::open(path).map_err(|_| CappedReadError::Unreadable)?;
     let mut buf = String::new();

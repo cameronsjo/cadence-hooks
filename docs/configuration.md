@@ -156,8 +156,21 @@ nudge whose first line is the parse error:
 CADENCE_BODY_BUDGET_PR: expected soft:hard, e.g. 150:300; got "600" — budget not applied this call
 ```
 
+The same goes for a malformed `CADENCE_BODY_BUDGET_MODE`. When that downgrade
+turns what would have been a **block** into a nudge, it is recorded in
+`bypasses.jsonl` naming the malformed setting as the mechanism — a typo that
+lets a body through is a bypass, not a footnote.
+
 A non-default budget in effect is named in every message with its source, e.g.
 `(budget 400:800 from .claude/cadence.json)`.
+
+**Every posting segment is measured, behind any prefix.** A command that posts
+more than once — `gh pr comment 1 --body ok && gh pr create --body-file long.md`
+— has every body measured, and the most severe verdict decides; a segment with
+no body flag is logged and the scan continues past it. Transparent prefixes
+(`command`, `builtin`, `exec`, `time`, `nice`, `nohup`, `env`, a leading
+`NAME=value`, and their backslash spellings) and leading shell keywords
+(`if true; then gh pr create …; fi`) are peeled before the `gh` check.
 
 **Accepted gaps.** The guard measures what the command carries, so it is silent
 where there is nothing to measure — and each of these appends an `unmeasured`
@@ -165,8 +178,16 @@ row to `failopen.jsonl` rather than blocking:
 
 - `gh pr create` with **no body flag** opens an editor; there is no body at hook time.
 - An **unreadable** or **non-UTF-8** body file (a write/hook race, a permission, a binary file).
-- A body file **over 1 MiB** is not read at all — that one is *not* silent: it produces the block text with `body not measured: file exceeds 1 MiB`.
 - A body assembled by a command substitution the guard cannot resolve to a literal.
+- A **`gh` alias** (`gh alias set prc 'pr create'`) — the expansion lives in `gh`'s own config, which the hook does not read.
+- **`gh api … -f body=@file`** — the raw API path carries no `--body` flag to find.
+- A body reached through **`xargs`** (`echo x | xargs -I{} gh pr create --body …`) — the `gh` argv is assembled by another process at run time. Write the body to a regular file and call `gh` directly if you want it measured.
+
+Two shapes are **not** silent. Each produces the block text rather than an
+allow, because the content exists and `gh` will post it:
+
+- A body file **over 1 MiB** is not read at all: `body not measured: file exceeds 1 MiB`.
+- A `--body-file` path that exists but is **not a regular file** — a FIFO, or a `/dev/fd/N` process substitution such as `--body-file <(cat big.md)`: `body not measured: body file is not a regular file (FIFO or process substitution); write the body to a regular file`. Reading one would consume the stream `gh` is about to post, and a FIFO can block forever. A **missing** path is still an ordinary fail-open allow.
 
 **Measuring a file by hand.** `cadence-hooks guardrails guard-body-budget
 --measure <file> --surface pr|comment|issue` prints one JSON line — the counts,

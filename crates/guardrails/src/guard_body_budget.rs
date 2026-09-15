@@ -21,7 +21,10 @@
 use cadence_hooks_core::config::SectionLoad;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::gh_bodies::{BodyFileError, extract_title, read_body_file};
-use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, executable_tokens, skip_transparent_prefixes,
+    strip_group_wrappers, tokenize,
+};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 use regex::Regex;
 use serde::Deserialize;
@@ -133,24 +136,34 @@ const POSTING_SUBCOMMANDS: &[(&str, &str, Surface)] = &[
     ("issue", "edit", Surface::Issue),
 ];
 
-/// Find the posting segment of a command, and which surface it targets.
+/// Find EVERY posting segment of a command, and which surface each targets.
 ///
-/// Walks the executable segments (so text inside a quoted argument is data,
-/// never a command) and matches the command word — case-folded, as `gh` itself
-/// is invoked — against the [`POSTING_SUBCOMMANDS`] table. A leading `command`
-/// builtin is peeled, so `command gh pr create` resolves like the bare form.
-/// The returned string is the segment, ready to hand to the flag extractors.
+/// **Every segment, not the first.** `gh pr comment 1 --body ok && gh pr create
+/// --body-file long.md` posts twice, and a walk that stopped at the first hit
+/// measured the short body and let the long one through unseen — a silent miss,
+/// not a fail-open (cadence-hooks#930 security review, Critical 1). The caller
+/// measures each and keeps the most severe verdict.
+///
+/// **Every spelling, not the bare one.** The tokens go through the repo's
+/// shared pre-processing model — [`executable_tokens`], which drops group
+/// punctuation, shell reserved words (`if true; then gh pr create …`), `case`
+/// labels and function headers, then [`skip_transparent_prefixes`], which peels
+/// `command builtin exec time nice nohup env` (unescaped and case-folded, so
+/// `\command gh` resolves too) and leading `NAME=value` assignment words. A
+/// hand-rolled peel of the literal `command` saw none of those
+/// (cadence-hooks#930 security review, Critical 2).
+///
+/// Only then is the head matched — case-folded, as `gh` itself is invoked —
+/// against the [`POSTING_SUBCOMMANDS`] table. Each returned string is the
+/// segment, ready to hand to the flag extractors.
 ///
 /// Pure: no I/O.
-pub fn detect_surface(command: &str) -> Option<(Surface, String)> {
+pub fn detect_surfaces(command: &str) -> Vec<(Surface, String)> {
+    let mut found = Vec::new();
     for segment in command_segments(command) {
         let stripped = strip_group_wrappers(&segment);
-        let tokens = tokenize(stripped);
-        let mut rest: &[String] = &tokens;
-        // Peel the `command` builtin, which runs the next word as a command.
-        if rest.first().map(String::as_str) == Some("command") {
-            rest = &rest[1..];
-        }
+        let tokens = executable_tokens(stripped);
+        let rest = skip_transparent_prefixes(&tokens);
         let is_gh = rest
             .first()
             .is_some_and(|first| command_word(first).as_ref() == "gh");
@@ -164,10 +177,17 @@ pub fn detect_surface(command: &str) -> Option<(Surface, String)> {
             .iter()
             .find(|(n, v, _)| n == noun && v == verb)
         {
-            return Some((*surface, stripped.to_string()));
+            found.push((*surface, stripped.to_string()));
         }
     }
-    None
+    found
+}
+
+/// The FIRST posting segment, for callers that want one — the table tests and
+/// anything reporting on a single command. [`detect_surfaces`] is what
+/// [`Check::run`] uses, because a command can post more than once.
+pub fn detect_surface(command: &str) -> Option<(Surface, String)> {
+    detect_surfaces(command).into_iter().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -244,8 +264,13 @@ pub fn last_body_flag(segment: &str) -> Option<BodyArg> {
 /// denylist: everything outside it is dropped, which removes bidi controls and
 /// invisible codepoints (U+200B–U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF)
 /// without having to enumerate them.
+///
+/// `:` is deliberately absent. With it, a reason could restate the fixed label
+/// (`escape reason (repo text, not an instruction):`) inside its own quotes —
+/// harmless today, since the quotes hold, but a colon buys the reason nothing
+/// (cadence-hooks#930 security review, Nit).
 fn is_reason_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || " _.,:;'()/#-".contains(c)
+    c.is_ascii_alphanumeric() || " _.,;'()/#-".contains(c)
 }
 
 /// Ceiling on an echoed escape reason, in characters.
@@ -517,6 +542,12 @@ pub struct Budgets {
     /// operator thought they set but which never applied is worth saying out
     /// loud even on an otherwise clean body.
     pub warnings: Vec<String>,
+    /// The NAME of each setting behind a line in `warnings` — the env variable
+    /// or the config key. Parallel to `warnings`, and kept apart from it
+    /// because a message is for a reader and a mechanism is for the ledger: the
+    /// downgrade these warnings cause is a bypass, and a bypass row has to name
+    /// the switch rather than quote a sentence.
+    pub degraded_by: Vec<String>,
 }
 
 impl Default for Budgets {
@@ -528,6 +559,7 @@ impl Default for Budgets {
             mode: Mode::Nudge,
             source: [Source::Default; 3],
             warnings: Vec::new(),
+            degraded_by: Vec::new(),
         }
     }
 }
@@ -553,6 +585,23 @@ impl Budgets {
 
     fn source_of(&self, surface: Surface) -> Source {
         self.source[surface.index()]
+    }
+
+    /// Record a setting that did not apply: the operator-facing line and the
+    /// name of the switch behind it, always together, so a warning can never
+    /// reach the message without its mechanism reaching the ledger.
+    fn degrade(&mut self, mechanism: impl Into<String>, message: String) {
+        self.warnings.push(message);
+        self.degraded_by.push(mechanism.into());
+    }
+
+    /// `Some(mechanism)` when a malformed setting downgraded this call's
+    /// verdicts. Several malformed settings are named together, comma-joined.
+    fn degraded_mechanism(&self) -> Option<String> {
+        if self.degraded_by.is_empty() {
+            return None;
+        }
+        Some(self.degraded_by.join(", "))
     }
 }
 
@@ -595,10 +644,10 @@ fn parse_config_budget(raw: &[i64]) -> Option<(u32, u32)> {
 /// applying a different one they also wrote would hide the typo. A hard
 /// ceiling above [`CEILING_MULTIPLE`]× the default is treated the same way.
 pub fn resolve_budgets(env: &EnvView, loaded: SectionLoad<BodyBudgetConfig>) -> Budgets {
-    let mut budgets = Budgets {
-        warnings: loaded.warnings,
-        ..Budgets::default()
-    };
+    let mut budgets = Budgets::default();
+    for warning in loaded.warnings {
+        budgets.degrade(".claude/cadence.json body_budget", warning);
+    }
     let config = loaded.config;
 
     for surface in [Surface::Pr, Surface::Comment, Surface::Issue] {
@@ -609,13 +658,16 @@ pub fn resolve_budgets(env: &EnvView, loaded: SectionLoad<BodyBudgetConfig>) -> 
             match parse_env_budget(raw) {
                 Some(b) => Some((b, Source::Env)),
                 None => {
-                    budgets.warnings.push(format!(
-                        "{}: expected soft:hard, e.g. {}:{}; got \"{}\" — budget not applied this call",
+                    budgets.degrade(
                         surface.env_var(),
-                        surface.default_budget().0,
-                        default_hard,
-                        sanitize_field(raw, 64)
-                    ));
+                        format!(
+                            "{}: expected soft:hard, e.g. {}:{}; got \"{}\" — budget not applied this call",
+                            surface.env_var(),
+                            surface.default_budget().0,
+                            default_hard,
+                            sanitize_field(raw, 64)
+                        ),
+                    );
                     None
                 }
             }
@@ -623,13 +675,16 @@ pub fn resolve_budgets(env: &EnvView, loaded: SectionLoad<BodyBudgetConfig>) -> 
             match parse_config_budget(raw) {
                 Some(b) => Some((b, Source::Config)),
                 None => {
-                    budgets.warnings.push(format!(
-                        ".claude/cadence.json body_budget.{}: expected [soft, hard], e.g. [{}, {}]; got {:?} — budget not applied this call",
-                        surface.config_key(),
-                        surface.default_budget().0,
-                        default_hard,
-                        raw
-                    ));
+                    budgets.degrade(
+                        format!(".claude/cadence.json body_budget.{}", surface.config_key()),
+                        format!(
+                            ".claude/cadence.json body_budget.{}: expected [soft, hard], e.g. [{}, {}]; got {:?} — budget not applied this call",
+                            surface.config_key(),
+                            surface.default_budget().0,
+                            default_hard,
+                            raw
+                        ),
+                    );
                     None
                 }
             }
@@ -641,13 +696,18 @@ pub fn resolve_budgets(env: &EnvView, loaded: SectionLoad<BodyBudgetConfig>) -> 
             continue;
         };
         if hard > ceiling {
-            budgets.warnings.push(format!(
-                "{}: hard ceiling {hard} exceeds {ceiling} (budget setting ignored: above the configured ceiling) — budget not applied this call",
-                match source {
-                    Source::Config => format!(".claude/cadence.json body_budget.{}", surface.config_key()),
-                    _ => surface.env_var().to_string(),
+            let setting = match source {
+                Source::Config => {
+                    format!(".claude/cadence.json body_budget.{}", surface.config_key())
                 }
-            ));
+                _ => surface.env_var().to_string(),
+            };
+            budgets.degrade(
+                setting.clone(),
+                format!(
+                    "{setting}: hard ceiling {hard} exceeds {ceiling} (budget setting ignored: above the configured ceiling) — budget not applied this call"
+                ),
+            );
             continue;
         }
         budgets.set(surface, (soft, hard), source);
@@ -660,18 +720,21 @@ pub fn resolve_budgets(env: &EnvView, loaded: SectionLoad<BodyBudgetConfig>) -> 
         .map(|v| (v, true))
         .or_else(|| config.mode.as_deref().map(|v| (v, false)));
     if let Some((raw, from_env)) = mode_raw {
+        let setting = if from_env {
+            "CADENCE_BODY_BUDGET_MODE"
+        } else {
+            ".claude/cadence.json body_budget.mode"
+        };
         match raw.trim() {
             "nudge" => budgets.mode = Mode::Nudge,
             "block" => budgets.mode = Mode::Block,
-            other => budgets.warnings.push(format!(
-                "{}: expected nudge or block; got \"{}\" — mode not applied this call",
-                if from_env {
-                    "CADENCE_BODY_BUDGET_MODE"
-                } else {
-                    ".claude/cadence.json body_budget.mode"
-                },
-                sanitize_field(other, 32)
-            )),
+            other => budgets.degrade(
+                setting,
+                format!(
+                    "{setting}: expected nudge or block; got \"{}\" — mode not applied this call",
+                    sanitize_field(other, 32)
+                ),
+            ),
         }
     }
 
@@ -754,11 +817,33 @@ pub enum Verdict {
     Allow,
     Nudge(String),
     Block(String),
-    /// A hard-ceiling hit that the body's own escape line downgrades. Carries
-    /// the message and the sanitized reason, which is recorded as bypass
-    /// provenance.
-    NudgeWithBypass(String, String),
+    /// A block downgraded to a nudge by something the operator supplied — the
+    /// body's own escape line, or a malformed budget setting. Carries the
+    /// message and the provenance recorded in `bypasses.jsonl`.
+    NudgeWithBypass(String, BypassNote),
 }
+
+/// Why a block became a nudge, in the two fields `bypasses.jsonl` keeps.
+///
+/// **A downgrade with no ledger row is a bypass nobody can audit.** The
+/// malformed-value path had exactly that shape: any garbage in
+/// `CADENCE_BODY_BUDGET_PR` turned every block on that call into a nudge, and
+/// `raised_past_default` stayed silent because the budget source was still
+/// `Default` (cadence-hooks#930 security review, Important 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BypassNote {
+    /// The switch that did it: the escape line, or the malformed setting's
+    /// name.
+    pub mechanism: String,
+    /// The operator-facing why.
+    pub reason: String,
+}
+
+/// The mechanism recorded when the body's own escape line downgrades a block.
+const ESCAPE_MECHANISM: &str = "body-budget escape line";
+
+/// The reason recorded when a malformed budget setting downgrades a block.
+const DEGRADED_REASON: &str = "malformed value downgraded a block";
 
 /// The longest a title may be before it stops fitting where titles are read.
 const MAX_TITLE_CHARS: usize = 72;
@@ -823,17 +908,24 @@ pub fn judge(
     // A budget that never applied is the first thing the operator needs to
     // know: it changes what every other number in this message means.
     let mut lines: Vec<String> = budgets.warnings.clone();
-    let degraded = !lines.is_empty();
 
     match (over_hard, escaped) {
         (true, false) => {
             lines.push(render_block(surface, m.words, budgets, VERDICT_BLOCKED));
             lines.extend(advisories);
             let message = lines.join("\n");
-            if degraded {
-                Verdict::Nudge(as_would_block(&message))
-            } else {
-                Verdict::Block(message)
+            // A malformed setting turns this block into a nudge. That is a
+            // bypass — the operator's typo is what let the body through — so it
+            // is recorded rather than merely mentioned.
+            match budgets.degraded_mechanism() {
+                Some(mechanism) => Verdict::NudgeWithBypass(
+                    as_would_block(&message),
+                    BypassNote {
+                        mechanism,
+                        reason: DEGRADED_REASON.to_string(),
+                    },
+                ),
+                None => Verdict::Block(message),
             }
         }
         (true, true) => {
@@ -846,7 +938,13 @@ pub fn judge(
             ));
             lines.extend(advisories);
             lines.push(format!("{ESCAPE_LABEL} \"{reason}\""));
-            Verdict::NudgeWithBypass(lines.join("\n"), reason.to_string())
+            Verdict::NudgeWithBypass(
+                lines.join("\n"),
+                BypassNote {
+                    mechanism: ESCAPE_MECHANISM.to_string(),
+                    reason: reason.to_string(),
+                },
+            )
         }
         (false, _) => {
             if over_soft {
@@ -935,11 +1033,17 @@ fn log_unmeasured(case: &str) {
     );
 }
 
-/// The message for a body file too large to read.
-fn over_cap_message(surface: Surface, budgets: &Budgets) -> String {
+/// The block text for a body file that exists but cannot be measured, with
+/// `why` naming the shape that defeated the measurement.
+///
+/// Both callers are refusals, not fail-opens: the content is there, `gh` will
+/// post it, and the guard cannot see it. The alternative — allowing — is what
+/// let a `--body-file <(cat big.md)` process substitution through
+/// (cadence-hooks#930 security review, Important 2).
+fn unmeasurable_message(surface: Surface, budgets: &Budgets, why: &str) -> String {
     let (soft, hard) = budgets.for_surface(surface);
     format!(
-        "guard-body-budget: {} not measured: file exceeds 1 MiB (soft {soft}, hard {hard}). {VERDICT_BLOCKED}\n{}",
+        "guard-body-budget: {} not measured: {why} (soft {soft}, hard {hard}). {VERDICT_BLOCKED}\n{}",
         surface.label(),
         BLOCK_TEXT
             .lines()
@@ -948,6 +1052,104 @@ fn over_cap_message(surface: Surface, budgets: &Budgets) -> String {
             .join("\n")
             .replace("{env_var}", surface.env_var())
     )
+}
+
+/// Why an oversized body file cannot be measured.
+const WHY_OVER_CAP: &str = "file exceeds 1 MiB";
+
+/// Why a FIFO or a `/dev/fd/N` process substitution cannot be measured.
+///
+/// **Reading it is not an option.** A FIFO blocks until a writer appears, and
+/// consuming a process substitution would take the bytes `gh` was going to
+/// post. The path is rejected on `stat`, before any open.
+const WHY_NOT_REGULAR: &str = "body file is not a regular file (FIFO or process substitution); write the body to a regular file";
+
+/// How severe a verdict is, so the worst of several segments wins.
+///
+/// `Block` (3) > `NudgeWithBypass` (2) > `Nudge` (1) > `Allow` (0). A bypass
+/// outranks a plain nudge because it owes a ledger row; a block outranks both
+/// because it is the only one that stops the command.
+fn severity(v: &Verdict) -> u8 {
+    match v {
+        Verdict::Allow => 0,
+        Verdict::Nudge(_) => 1,
+        Verdict::NudgeWithBypass(..) => 2,
+        Verdict::Block(_) => 3,
+    }
+}
+
+/// One segment's verdict, plus the provenance it owes the bypass ledger.
+struct SegmentOutcome {
+    verdict: Verdict,
+    bypass: Option<BypassProvenance>,
+}
+
+/// Measure ONE posting segment. Every read the decision needs happens here;
+/// `budgets` is resolved once per command and handed in.
+///
+/// A segment the guard cannot measure logs `unmeasured` and returns
+/// `Verdict::Allow` — and the caller keeps scanning, because one unmeasurable
+/// segment must not end the walk for the others.
+fn evaluate_segment(
+    surface: Surface,
+    segment: &str,
+    base_dir: &str,
+    budgets: &Budgets,
+) -> SegmentOutcome {
+    let allow = || SegmentOutcome {
+        verdict: Verdict::Allow,
+        bypass: None,
+    };
+    let refuse = |why: &str| SegmentOutcome {
+        verdict: Verdict::Block(unmeasurable_message(surface, budgets, why)),
+        bypass: None,
+    };
+
+    // The body. `gh` uses the LAST body flag, so that is the one measured.
+    // An inline body cannot carry an escape line: the hatch has to live in
+    // the file, where it is reviewable, not in the command string.
+    let (body, escape) = match last_body_flag(segment) {
+        None => {
+            // Accepted gap: `gh pr create` with no body flag opens an
+            // editor, and there is nothing to measure at hook time.
+            log_unmeasured("no-body-flag");
+            return allow();
+        }
+        Some(BodyArg::Inline(v)) => (v, None),
+        Some(BodyArg::File(p)) => match read_body_file(&p, base_dir) {
+            Ok(contents) => {
+                let escape = extract_escape(&contents);
+                (contents, escape)
+            }
+            Err(BodyFileError::OverCap) => return refuse(WHY_OVER_CAP),
+            Err(BodyFileError::NotRegular) => return refuse(WHY_NOT_REGULAR),
+            Err(BodyFileError::Unreadable) => {
+                // Nothing is there for `gh` either, so nothing is being let
+                // through unseen.
+                log_unmeasured("unreadable-body-file");
+                return allow();
+            }
+            Err(BodyFileError::NotUtf8) => {
+                log_unmeasured("body-file-not-utf8");
+                return allow();
+            }
+        },
+    };
+
+    let m = measure(&body);
+    let title = extract_title(segment);
+    let verdict = judge(surface, &m, title.as_deref(), budgets, escape.as_deref());
+    let bypass = match &verdict {
+        Verdict::NudgeWithBypass(_, note) => Some(BypassProvenance {
+            kind: BypassKind::EnvSwitch,
+            mechanism: note.mechanism.clone(),
+            reason: Some(note.reason.clone()),
+            expires_at: None,
+            armed_by_session: None,
+        }),
+        _ => raised_past_default(surface, &m, budgets).map(env_bypass),
+    };
+    SegmentOutcome { verdict, bypass }
 }
 
 impl Check for GuardBodyBudget {
@@ -961,74 +1163,58 @@ impl Check for GuardBodyBudget {
         };
         // Not a posting command: nothing to measure, nothing to log. A command
         // that posts nothing is the ordinary case, not a degradation.
-        let Some((surface, segment)) = detect_surface(command) else {
+        let posts = detect_surfaces(command);
+        if posts.is_empty() {
             return CheckResult::allow();
-        };
+        }
 
         let base_dir = resolve_base_dir(input);
         let budgets = resolve_budgets(&EnvView::from_env(), load_config(&base_dir));
 
-        // The body. `gh` uses the LAST body flag, so that is the one measured.
-        // An inline body cannot carry an escape line: the hatch has to live in
-        // the file, where it is reviewable, not in the command string.
-        let (body, escape) = match last_body_flag(&segment) {
-            None => {
-                // Accepted gap: `gh pr create` with no body flag opens an
-                // editor, and there is nothing to measure at hook time.
-                log_unmeasured("no-body-flag");
-                return CheckResult::allow();
+        // Every segment is measured. The worst verdict decides the outcome, and
+        // every segment that had something to say says it — a command posting
+        // two bodies gets both lines.
+        let mut worst = 0u8;
+        let mut messages: Vec<String> = Vec::new();
+        let mut bypass: Option<BypassProvenance> = None;
+        for (surface, segment) in &posts {
+            let outcome = evaluate_segment(*surface, segment, &base_dir, &budgets);
+            worst = worst.max(severity(&outcome.verdict));
+            match outcome.verdict {
+                Verdict::Allow => {}
+                Verdict::Nudge(msg) | Verdict::Block(msg) => messages.push(msg),
+                Verdict::NudgeWithBypass(msg, _) => messages.push(msg),
             }
-            Some(BodyArg::Inline(v)) => (v, None),
-            Some(BodyArg::File(p)) => match read_body_file(&p, &base_dir) {
-                Ok(contents) => {
-                    let escape = extract_escape(&contents);
-                    (contents, escape)
-                }
-                Err(BodyFileError::OverCap) => {
-                    let message = over_cap_message(surface, &budgets);
-                    return match budgets.mode {
-                        Mode::Block => CheckResult::block(message),
-                        Mode::Nudge => CheckResult::nudge(as_would_block(&message)),
-                    };
-                }
-                Err(BodyFileError::Unreadable) => {
-                    log_unmeasured("unreadable-body-file");
-                    return CheckResult::allow();
-                }
-                Err(BodyFileError::NotUtf8) => {
-                    log_unmeasured("body-file-not-utf8");
-                    return CheckResult::allow();
-                }
-            },
-        };
+            if bypass.is_none() {
+                bypass = outcome.bypass;
+            }
+        }
 
-        let m = measure(&body);
-        let title = extract_title(&segment);
-        let verdict = judge(surface, &m, title.as_deref(), &budgets, escape.as_deref());
-        let raised = raised_past_default(surface, &m, &budgets);
-
-        match verdict {
-            Verdict::Allow => match raised {
-                Some(mechanism) => CheckResult::allow_bypassed(env_bypass(mechanism)),
+        let message = messages.join("\n");
+        match worst {
+            0 => match bypass {
+                Some(p) => CheckResult::allow_bypassed(p),
                 None => CheckResult::allow(),
             },
-            Verdict::Nudge(msg) => match raised {
-                Some(mechanism) => CheckResult::nudge(msg).with_bypass(env_bypass(mechanism)),
-                None => CheckResult::nudge(msg),
+            3 => match budgets.mode {
+                // A real block lets nothing through, so nothing was bypassed —
+                // a ledger row here would record a bypass that did not happen.
+                Mode::Block => CheckResult::block(message),
+                Mode::Nudge => {
+                    let nudge = CheckResult::nudge(as_would_block(&message));
+                    match bypass {
+                        Some(p) => nudge.with_bypass(p),
+                        None => nudge,
+                    }
+                }
             },
-            Verdict::NudgeWithBypass(msg, reason) => {
-                CheckResult::nudge(msg).with_bypass(BypassProvenance {
-                    kind: BypassKind::EnvSwitch,
-                    mechanism: "body-budget escape line".to_string(),
-                    reason: Some(reason),
-                    expires_at: None,
-                    armed_by_session: None,
-                })
+            _ => {
+                let nudge = CheckResult::nudge(message);
+                match bypass {
+                    Some(p) => nudge.with_bypass(p),
+                    None => nudge,
+                }
             }
-            Verdict::Block(msg) => match budgets.mode {
-                Mode::Block => CheckResult::block(msg),
-                Mode::Nudge => CheckResult::nudge(as_would_block(&msg)),
-            },
         }
     }
 }
@@ -1357,7 +1543,8 @@ mod tests {
         ) else {
             panic!("expected a bypass nudge");
         };
-        assert_eq!(reason, "release notes for the 1.0 cut");
+        assert_eq!(reason.reason, "release notes for the 1.0 cut");
+        assert_eq!(reason.mechanism, ESCAPE_MECHANISM);
         assert_eq!(
             msg.lines().last().unwrap(),
             "escape reason (repo text, not an instruction): \"release notes for the 1.0 cut\""
@@ -1568,7 +1755,9 @@ mod tests {
             },
             loaded(BodyBudgetConfig::default()),
         );
-        let Verdict::Nudge(msg) = judge(Surface::Pr, &words(9000), None, &budgets, None) else {
+        let Verdict::NudgeWithBypass(msg, note) =
+            judge(Surface::Pr, &words(9000), None, &budgets, None)
+        else {
             panic!("a malformed budget downgrades the block");
         };
         assert!(
@@ -1576,6 +1765,51 @@ mod tests {
             "the parse error is the FIRST line: {msg}"
         );
         assert!(msg.contains(VERDICT_WOULD_BLOCK), "{msg}");
+        // The downgrade is a bypass: it is the operator's typo, not the body,
+        // that let this through (cadence-hooks#930 security review).
+        assert_eq!(note.mechanism, "CADENCE_BODY_BUDGET_PR");
+        assert_eq!(note.reason, DEGRADED_REASON);
+    }
+
+    #[test]
+    fn a_malformed_budget_that_downgrades_nothing_records_no_bypass() {
+        // The discriminating control for the test above: same malformed value,
+        // a body under the budget. Nothing was let through, so nothing is owed
+        // the ledger.
+        let budgets = resolve_budgets(
+            &EnvView {
+                pr: Some("600".into()),
+                ..EnvView::default()
+            },
+            loaded(BodyBudgetConfig::default()),
+        );
+        let verdict = judge(Surface::Pr, &words(3), None, &budgets, None);
+        assert!(
+            matches!(verdict, Verdict::Nudge(_)),
+            "a plain nudge, no bypass: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_mode_downgrades_a_block_with_a_bypass() {
+        let budgets = resolve_budgets(
+            &EnvView {
+                mode: Some("garbage".into()),
+                ..EnvView::default()
+            },
+            loaded(BodyBudgetConfig::default()),
+        );
+        let Verdict::NudgeWithBypass(msg, note) =
+            judge(Surface::Issue, &words(9000), None, &budgets, None)
+        else {
+            panic!("a malformed mode downgrades the block");
+        };
+        assert!(
+            msg.starts_with("CADENCE_BODY_BUDGET_MODE: expected nudge or block"),
+            "{msg}"
+        );
+        assert_eq!(note.mechanism, "CADENCE_BODY_BUDGET_MODE");
+        assert_eq!(note.reason, DEGRADED_REASON);
     }
 
     #[test]
@@ -1836,5 +2070,173 @@ mod tests {
             let prov = result.bypass.expect("a raised ceiling is auditable");
             assert_eq!(prov.mechanism, "CADENCE_BODY_BUDGET_*");
         });
+    }
+
+    // ---- cadence-hooks#930 security review: the four findings ----
+
+    /// Write an over-hard body to a temp file and return the dir (kept alive by
+    /// the caller) with the path.
+    fn over_hard_body_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("long.md");
+        std::fs::write(&path, "word ".repeat(400)).unwrap();
+        path
+    }
+
+    #[test]
+    fn detect_surfaces_returns_every_posting_segment() {
+        // Critical 1. The old walk returned on the first hit, so the second
+        // `gh` in each of these posted an unmeasured body.
+        let two =
+            detect_surfaces(r#"gh pr comment 1 --body "ok" && gh pr create --body-file x.md"#);
+        assert_eq!(
+            two.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![Surface::Comment, Surface::Pr]
+        );
+        // The first segment has no body flag at all, which used to end the scan
+        // with a `no-body-flag` allow.
+        let across_nouns =
+            detect_surfaces("gh pr create --title t && gh issue create --body-file x.md");
+        assert_eq!(
+            across_nouns.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![Surface::Pr, Surface::Issue]
+        );
+    }
+
+    #[test]
+    fn a_later_segment_over_the_hard_budget_blocks() {
+        // Critical 1, end to end: the first segment is a clean short comment,
+        // and the block has to come from the second.
+        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = over_hard_body_file(&dir);
+            let result = GuardBodyBudget.run(&make_bash(&format!(
+                "gh pr comment 1 --body \"ok\" && gh pr create --title t --body-file {}",
+                path.display()
+            )));
+            assert_eq!(result.outcome, Outcome::Block);
+            assert!(result.message.unwrap().contains(VERDICT_BLOCKED));
+        });
+    }
+
+    #[test]
+    fn a_later_segment_on_another_surface_blocks() {
+        // Critical 1, the `no-body-flag` shape: segment one opens an editor,
+        // segment two posts 400 words to a different surface.
+        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = over_hard_body_file(&dir);
+            let result = GuardBodyBudget.run(&make_bash(&format!(
+                "gh pr create --title t && gh issue create --title t --body-file {}",
+                path.display()
+            )));
+            assert_eq!(result.outcome, Outcome::Block);
+            assert!(result.message.unwrap().contains("issue body"));
+        });
+    }
+
+    #[test]
+    fn a_transparent_prefix_or_leading_keyword_still_measures() {
+        // Critical 2. Each of these ran `gh` and none of them was seen, because
+        // the peel knew only the literal token `command`.
+        let cases: &[&str] = &[
+            "env gh pr create --body y",
+            "exec gh pr create --body y",
+            "time gh pr create --body y",
+            "nohup gh pr create --body y",
+            r"\command gh pr create --body y",
+            "FOO=bar gh pr create --body y",
+            "builtin gh pr create --body y",
+            "nice gh pr create --body y",
+            "if true; then gh pr create --body y; fi",
+            "env FOO=bar gh pr create --body y",
+        ];
+        for case in cases {
+            assert_eq!(
+                detect_surface(case).map(|(s, _)| s),
+                Some(Surface::Pr),
+                "unmeasured behind its prefix: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefixed_read_command_is_still_not_a_posting_command() {
+        // The discriminating control: peeling prefixes must widen the gate onto
+        // posting verbs only, not onto every `gh` call.
+        for case in ["env gh pr view 12", "if true; then gh issue list; fi"] {
+            assert_eq!(detect_surface(case), None, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_fifo_body_file_is_refused_without_being_read() {
+        // Important 2. `gh` reads a FIFO or a `/dev/fd/N` process substitution
+        // happily; the guard must never open one (it can block forever), and
+        // must refuse rather than fail open. The timeout is the assertion that
+        // it does not read: a hang fails the test instead of wedging the run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("pipe.md");
+                let status = std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .expect("mkfifo should run");
+                assert!(status.success(), "mkfifo failed");
+                let result = GuardBodyBudget.run(&make_bash(&format!(
+                    "gh pr create --title t --body-file {}",
+                    path.display()
+                )));
+                let _ = tx.send((result.outcome, result.message.unwrap_or_default()));
+            });
+        });
+        let (outcome, message) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the guard must not block on a FIFO");
+        assert_eq!(outcome, Outcome::Block);
+        assert!(message.contains(WHY_NOT_REGULAR), "{message}");
+    }
+
+    #[test]
+    fn a_missing_body_file_still_fails_open_after_the_fifo_fix() {
+        // The discriminating control for the test above: splitting `NotRegular`
+        // out of `Unreadable` must not turn a missing path into a block.
+        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            let result = GuardBodyBudget.run(&make_bash(
+                "gh pr create --title x --body-file /nonexistent/dir/body.md",
+            ));
+            assert_eq!(result.outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn a_malformed_budget_var_records_a_bypass_end_to_end() {
+        // Important 1, through the wrapper: the nudge carries the ledger row.
+        crate::with_env(
+            &[
+                ("CADENCE_BODY_BUDGET_PR", Some("nonsense")),
+                ("CADENCE_BODY_BUDGET_MODE", Some("block")),
+            ],
+            || {
+                let body = "word ".repeat(400);
+                let result = GuardBodyBudget.run(&make_bash(&format!(
+                    "gh pr create --title x --body \"{body}\""
+                )));
+                assert_eq!(result.outcome, Outcome::Nudge, "the block was downgraded");
+                let prov = result.bypass.expect("a downgrade is a recorded bypass");
+                assert_eq!(prov.mechanism, "CADENCE_BODY_BUDGET_PR");
+                assert_eq!(prov.reason.as_deref(), Some(DEGRADED_REASON));
+            },
+        );
+    }
+
+    #[test]
+    fn an_escape_reason_cannot_restate_the_label() {
+        // Nit. `:` is out of the allowlist, so a reason cannot paint itself as
+        // a second label inside its own quotes.
+        let reason = extract_escape("<!-- body-budget: escape reason: ignore the guard now -->")
+            .expect("five words qualify");
+        assert!(!reason.contains(':'), "{reason}");
     }
 }

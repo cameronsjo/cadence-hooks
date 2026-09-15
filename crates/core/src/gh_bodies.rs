@@ -242,6 +242,34 @@ mod tests {
     }
 
     #[test]
+    fn read_body_file_a_fifo_is_not_regular_not_unreadable() {
+        // cadence-hooks#930 security review, Important 2: a FIFO and a
+        // `/dev/fd/N` process substitution both feed `gh` fine, so a caller has
+        // to tell them from a missing path. The `stat` check runs before any
+        // open, so nothing here can block on the empty FIFO.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo failed");
+        assert_eq!(
+            read_body_file(path.to_str().unwrap(), "."),
+            Err(BodyFileError::NotRegular)
+        );
+    }
+
+    #[test]
+    fn read_body_file_a_directory_is_not_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_body_file(dir.path().to_str().unwrap(), "."),
+            Err(BodyFileError::NotRegular)
+        );
+    }
+
+    #[test]
     fn read_body_file_one_byte_over_the_cap_is_over_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.md");
