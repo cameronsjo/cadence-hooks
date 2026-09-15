@@ -70,6 +70,7 @@ fn under_claude_code() -> bool {
         .unwrap_or(false)
 }
 
+mod bypass_report;
 mod configure;
 mod configure_guardrails;
 mod dispatch;
@@ -80,31 +81,16 @@ mod registry;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
 
-/// Guards that prevent irreversible harm — secret exposure, data loss,
-/// destructive git/gh/remote/vault operations. `CADENCE_DISABLE` (silent,
-/// persistent, settable in settings.json `env`) must not be able to neuter
-/// these; only the loud, per-session `CADENCE_BYPASS` can (#89).
-const PROTECTED_GUARDS: &[&str] = &[
-    "prevent-secret-leaks",
-    "prevent-secret-writes",
-    // Carries the fail-closed identity tier. Protection is per-guard, so this
-    // also strips CADENCE_DISABLE from the same guard's *advisory* tiers —
-    // accepted deliberately (ruled 2026-08-03): the alternative was splitting
-    // one guard in two, and the remaining levers for a noisy nudge are the
-    // per-repo allowlist and originAudience, both config edits. Without this
-    // line, one environment variable silently disarms the leak protection.
-    "redact-external-content",
-    "git-safety",
-    "guard-push-remote",
-    "guard-gh-dangerous",
-    "guard-gh-write",
-    "guard-op-vault-scan",
-    "guard-sops-decrypt",
-    "guard-browser-device",
-    "guard-dotfiles",
-    "guard-read-model",
-    "trash-guard",
-];
+/// The list of guards `CADENCE_DISABLE` may not switch off, and the resolver
+/// that decides what either switch does to a named hook.
+///
+/// Both live in `core` rather than here since #567: `guard-rm-liveness` is a
+/// library check whose entire job is to report that `guard-rm` was switched
+/// off, and while this logic lived in `main` it could only do that by keeping
+/// its own copy of the parse. Four copies with no shared source of truth made
+/// drift fail toward the detector reporting healthy while the binary skipped
+/// the guard. See `cadence_hooks_core::bypass` for the precedence table.
+use cadence_hooks_core::bypass::{self, BypassState, PROTECTED_GUARDS};
 
 #[derive(Parser)]
 #[command(
@@ -641,17 +627,17 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
 }
 
 /// Prints all hooks grouped by namespace, showing disable status.
+///
+/// Both variables are read **once**, here, and every per-hook row resolves from
+/// those two values through the pure [`bypass::resolve_from`]. The per-row
+/// `bypass::resolve()` this replaced re-read process environment for each of
+/// the hundreds of registry rows, and a value that changed mid-listing would
+/// have split the output between two answers.
 fn print_hook_list() {
-    let disable_var = std::env::var("CADENCE_DISABLE").unwrap_or_default();
-    let disabled: Vec<&str> = disable_var
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let bypass_raw = std::env::var(bypass::BYPASS_VAR).ok();
+    let disable_raw = std::env::var(bypass::DISABLE_VAR).ok();
 
-    let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-
-    if bypassed {
+    if bypass::bypass_engaged_from(bypass_raw.as_deref()) {
         println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
     }
 
@@ -665,20 +651,6 @@ fn print_hook_list() {
             current_namespace = hook.namespace;
         }
 
-        let status = if bypassed {
-            " (disabled)"
-        } else if disabled.contains(&hook.name) {
-            // A protected guard named in CADENCE_DISABLE is refused, not
-            // disabled — don't let the listing claim it's off (#89).
-            if PROTECTED_GUARDS.contains(&hook.name) {
-                " (protected — disable refused)"
-            } else {
-                " (disabled)"
-            }
-        } else {
-            ""
-        };
-
         let event = match hook.event {
             Some(e) => e.name(),
             None => "logger",
@@ -686,12 +658,23 @@ fn print_hook_list() {
 
         println!(
             "  {:<28} {:<13} {}{}",
-            hook.name, event, hook.description, status
+            hook.name,
+            event,
+            hook.description,
+            bypass::resolve_from(bypass_raw.as_deref(), disable_raw.as_deref(), hook.name)
+                .list_suffix()
         );
     }
 
-    if !disabled.is_empty() {
-        println!("\nDisabled via CADENCE_DISABLE: {}", disabled.join(", "));
+    let summary =
+        bypass_report::disable_summary_lines(bypass_raw.as_deref(), disable_raw.as_deref());
+    if !summary.is_empty() {
+        // One blank line separating the summary block from the hook rows, not
+        // one before every line of it — the three verdicts belong together.
+        println!();
+    }
+    for line in summary {
+        println!("{line}");
     }
 }
 
@@ -745,7 +728,7 @@ fn main() {
     // always. A bypassed doctor would report false-clean in CI; a bypassed
     // `session status` would hide live peers exactly when someone is debugging
     // coordination; a bypassed `migrate-config` would silently migrate nothing.
-    let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
+    let bypassed = bypass::bypass_engaged();
     // Match on subcommand *position* (argv[1], or argv[1]+argv[2] for session
     // CLI actions) — not any argv token, which would let a hook argument that
     // happens to equal "list"/"try"/etc. skip the bypass short-circuit.
@@ -913,20 +896,31 @@ fn main() {
     // Set per-project in .claude/settings.json `env` block, or ad-hoc in shell.
     // Emits a one-line stderr notice whenever it disables (or refuses to
     // disable) a hook, so suppression always leaves a trace (#89).
-    if let Ok(disabled) = std::env::var("CADENCE_DISABLE")
-        && let Some(name) = hook_name(&cli.command)
-        && disabled.split(',').any(|h| h.trim() == name)
-    {
-        if PROTECTED_GUARDS.contains(&name) {
-            // Refuse: the guard still runs (fall through to dispatch).
-            eprintln!(
-                "⚠️  cadence-hooks: refusing to disable protected guard '{name}' \
-                 via CADENCE_DISABLE (it still runs). Use CADENCE_BYPASS=1 for a \
-                 one-session maintenance bypass."
-            );
-        } else {
-            eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
-            process::exit(0);
+    if let Some(name) = hook_name(&cli.command) {
+        match bypass::resolve(name) {
+            BypassState::Disabled => {
+                eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
+                process::exit(0);
+            }
+            BypassState::DisableRefused => {
+                // Refuse: the guard still runs (fall through to dispatch).
+                eprintln!(
+                    "⚠️  cadence-hooks: refusing to disable protected guard '{name}' \
+                     via CADENCE_DISABLE (it still runs). Use CADENCE_BYPASS=1 for a \
+                     one-session maintenance bypass."
+                );
+            }
+            // `Enforced` is the ordinary case: nothing was asked, the hook
+            // runs, and there is nothing to say about it.
+            //
+            // `Bypassed` is unreachable here. The blanket bypass is handled
+            // above, ahead of clap parsing, and exempts the CLI and diagnostic
+            // subcommands by argv position — an exempt command never reaches
+            // this dispatch, and a non-exempt one already exited. The arm is
+            // written out rather than folded into a catch-all so that moving
+            // the bypass check, or widening the exemption, cannot silently turn
+            // a bypassed hook into a running one here.
+            BypassState::Bypassed | BypassState::Enforced => {}
         }
     }
 

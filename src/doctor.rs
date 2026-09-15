@@ -2547,10 +2547,25 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 ///   - Warnings only: ONE summary line to stdout, exit 0
 ///   - Errors (with or without warnings): one line to stderr, exit 2 — the
 ///     warning summary is suppressed; errors take precedence
+///   - Enforcement suppressed (`CADENCE_BYPASS=1`, and/or any `CADENCE_DISABLE`
+///     entry): the suppression lines to **stdout**, ahead of everything above,
+///     and independent of the exit code — a bypassed session is a fact about
+///     the session, not a finding about the plugin cache
 ///
 /// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
+///
+/// The suppression lines are the fourth emitter, and they take **stdout** for
+/// the same reason the warnings do. The documented SessionStart wiring
+/// (`docs/configuration.md`) is `if msg=$(cadence-hooks doctor --quiet
+/// 2>/dev/null)`, so stderr is discarded there — a stderr route would leave a
+/// fully-bypassed session silent at exactly the moment the operator and the
+/// agent are told what the session's posture is. Nothing is printed when
+/// enforcement is fully active, so a clean session's quiet output stays
+/// byte-identical; the "enforcement active" line is an unquiet-mode statement
+/// only. Every operator-supplied byte in these lines goes through
+/// `bypass_report`'s allowlist sanitizer before it reaches that stdout.
 ///
 /// `prune` switches to the orphaned-cache-dir listing/removal mode (see
 /// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
@@ -2566,6 +2581,17 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 
     if prune {
         return run_prune(root_override, quiet, apply);
+    }
+
+    // Ahead of every scan, and outside the `root_override.is_none()` gate the
+    // other status printers sit behind: this reads process environment, not the
+    // live machine's plugin cache, so it is as true under `--root` as without
+    // it. Printed first because a bypassed session makes every finding below it
+    // a statement about hooks that are not currently running.
+    if quiet {
+        crate::bypass_report::print_suppression_only();
+    } else {
+        crate::bypass_report::print_bypass_status();
     }
 
     // Resolve the install channel once — it's process-invariant, so the scan

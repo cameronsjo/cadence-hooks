@@ -107,6 +107,11 @@ fn write_disabled_hooks(settings_path: &Path, disabled: &[String]) -> Result<(),
 }
 
 /// Print current configuration without interactive mode.
+///
+/// Renders through [`crate::bypass_report::configure_status_lines`], the same
+/// module `list` and `doctor` render from, so this surface cannot report a
+/// protected guard as disabled while the binary refuses that entry — and cannot
+/// echo an unrecognized name from `settings.json` unsanitized.
 fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
     let disabled = read_disabled_hooks(settings_path);
 
@@ -117,23 +122,18 @@ fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
         return;
     }
 
-    println!("\nDisabled hooks:");
-    for name in &disabled {
-        // Find description from catalog
-        let desc = hooks
-            .iter()
-            .find(|h| h.name == name)
-            .map(|h| h.description)
-            .unwrap_or("(unknown hook)");
-        println!("  {name:<28} {desc}");
+    let (lines, active) = crate::bypass_report::configure_status_lines(hooks, &disabled);
+    for line in lines {
+        // A heading opens its own block; an indented row stays with the heading
+        // above it.
+        if line.starts_with("  ") {
+            println!("{line}");
+        } else {
+            println!("\n{line}");
+        }
     }
 
-    let enabled_count = hooks.len()
-        - disabled
-            .iter()
-            .filter(|d| hooks.iter().any(|h| h.name == d.as_str()))
-            .count();
-    println!("\n{} of {} hooks active.", enabled_count, hooks.len());
+    println!("\n{} of {} hooks active.", active, hooks.len());
 }
 
 /// Run the configure wizard (or --list mode).
@@ -195,6 +195,30 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
                     new_disabled.join(", ")
                 );
                 println!("Written to: {}", settings_path.display());
+                // The wizard offers every registered hook, protected ones
+                // included, and persists whatever was picked. CADENCE_DISABLE
+                // cannot switch a protected guard off, so without this line the
+                // wizard's own confirmation would be the operator's last word
+                // on a request the binary refuses at runtime. A notice rather
+                // than a filtered list: the selection is still written, and a
+                // guard the operator asked about stays visible in the picker.
+                let refused: Vec<&str> = new_disabled
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| cadence_hooks_core::bypass::is_protected(name))
+                    .collect();
+                if !refused.is_empty() {
+                    let (is_are, it_they, runs) = if refused.len() == 1 {
+                        ("is", "it", "runs")
+                    } else {
+                        ("are", "they", "run")
+                    };
+                    println!(
+                        "Note: {} {is_are} protected — CADENCE_DISABLE is refused there, so \
+                         {it_they} still {runs}.",
+                        refused.join(", ")
+                    );
+                }
             }
             process::exit(0);
         }

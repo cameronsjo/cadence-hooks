@@ -6,8 +6,20 @@
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+/// The binary under test, with the two enforcement switches cleared.
+///
+/// `doctor` now reports its resolved bypass state on **both** the unquiet and
+/// the `--quiet` route (#567), and a child process inherits the parent's
+/// environment. A developer shell carrying `CADENCE_DISABLE=guard-rm` — which
+/// this repo's own sessions routinely do — would otherwise add a suppression
+/// line to stdout and turn `doctor_quiet_clean_prints_nothing` into a confident
+/// false failure about the plugin scan. Cleared here rather than per test, so a
+/// future `doctor` test cannot be steered by whoever runs it.
 fn cadence_hooks() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    cmd.env_remove("CADENCE_BYPASS")
+        .env_remove("CADENCE_DISABLE");
+    cmd
 }
 
 /// A HOME tempdir carrying an empty plugin cache, so the default (no-`--root`)

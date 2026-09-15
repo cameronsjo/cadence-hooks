@@ -173,31 +173,29 @@ fn probe_input(command: &str) -> Result<HookInput, String> {
 
 /// Whether `guard-rm` is switched off by environment, and which switch did it.
 ///
-/// Mirrors the binary's own resolution in `main()` — `CADENCE_DISABLE` is a
-/// comma-separated list of hook names, `CADENCE_BYPASS=1` is the blanket
-/// escape. Duplicated rather than shared because that logic lives in the
-/// binary's `main`, not a library crate; the duplication is the reason this
-/// check can observe the disable state at all.
-///
-/// **The duplication is load-bearing, so drift here fails toward false
-/// reassurance**: if the binary's parse ever accepts a form this one rejects,
-/// the binary skips `guard-rm` while this check reports healthy — the exact
-/// outcome the check exists to prevent. Verified identical at time of writing
-/// (`split(',')`, `trim`, exact equality; `CADENCE_BYPASS` compared against
-/// `"1"`, matching both of `main.rs`'s own copies). Any edit to either side
-/// changes both, or extracts one shared resolver into `core`.
+/// Delegates to `cadence_hooks_core::bypass`, the one resolver the binary's own
+/// enforcement path and `list` display also call (#567). This check used to
+/// carry its own copy of the parse, because the resolution lived in the
+/// binary's `main` where a library crate could not reach it — and that
+/// duplication failed toward false reassurance in exactly the direction that
+/// matters: had the binary's parse ever accepted a form this copy rejected, the
+/// binary would have skipped `guard-rm` while this check reported healthy. One
+/// resolver removes the drift channel rather than documenting it.
 ///
 /// `CADENCE_BYPASS` is checked for completeness of the report, not for
 /// coverage: a bypassed session never runs this check either.
-fn disabled_by_environment() -> Option<&'static str> {
-    if std::env::var("CADENCE_BYPASS").as_deref() == Ok("1") {
-        return Some("CADENCE_BYPASS=1");
+///
+/// A `DisableRefused` resolution reports nothing, because the guard still runs.
+/// `guard-rm` is deliberately outside `PROTECTED_GUARDS` today, so that arm is
+/// unreachable now — it is written out rather than folded into the disabled
+/// branch so that promoting `guard-rm` into the protected set cannot silently
+/// turn this check into a false alarm.
+fn disabled_by_environment() -> Option<String> {
+    let state = cadence_hooks_core::bypass::resolve(GUARDED_HOOK);
+    if state.is_enforcing() {
+        return None;
     }
-    let disabled = std::env::var("CADENCE_DISABLE").ok()?;
-    disabled
-        .split(',')
-        .any(|hook| hook.trim() == GUARDED_HOOK)
-        .then_some("CADENCE_DISABLE=guard-rm")
+    state.switch(GUARDED_HOOK)
 }
 
 /// Assert at SessionStart that `guard-rm` is present and classifying correctly.

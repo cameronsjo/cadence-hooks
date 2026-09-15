@@ -471,7 +471,13 @@ pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
         .find(|h| h.namespace == namespace && h.name == subcommand)
 }
 
-const SECURITY_CRITICAL_HOOKS: &[&str] = &[
+/// Guards whose inability to parse a relevant operation must block rather than
+/// fail open.
+///
+/// `pub(crate)` so `bypass_report`'s tests can cross-check it against
+/// `cadence_hooks_core::bypass::PROTECTED_GUARDS` — two lists about the same
+/// risk, maintained apart, whose divergences must be deliberate.
+pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
     "git-safety",
