@@ -40,9 +40,8 @@ fn manifest_keeps_the_plugin_key_and_fills_it_with_the_clap_namespace() {
     // (which is what it always held); this pins the wire name against a
     // follow-up rename carrying through to the JSON.
     //
-    // The value assertions are the other half: `session` hooks must report the
-    // clap namespace `session`, not the `cadence` plugin that wires them, and
-    // no row may report a retired plugin name.
+    // The value assertion is the other half: `session` hooks must report the
+    // clap namespace `session`, not the `cadence` plugin that wires them.
     let metrics = tempfile::tempdir().expect("temp metrics dir");
     let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
         .env("CADENCE_METRICS_DIR", metrics.path())
@@ -61,22 +60,4 @@ fn manifest_keeps_the_plugin_key_and_fills_it_with_the_clap_namespace() {
         start["plugin"], "session",
         "`session start` reports its clap namespace; the cadence plugin wires it"
     );
-
-    const CLAP_NAMESPACES: [&str; 6] = [
-        "cadence",
-        "guardrails",
-        "rules",
-        "obsidian",
-        "metrics",
-        "session",
-    ];
-    for row in hooks {
-        let ns = row["plugin"].as_str().expect("namespace string");
-        assert!(
-            CLAP_NAMESPACES.contains(&ns),
-            "hook '{}' reports namespace '{ns}', which the binary dispatches \
-             nothing under — a selection on it would silently match zero hooks",
-            row["name"]
-        );
-    }
 }

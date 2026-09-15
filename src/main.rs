@@ -637,7 +637,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
     }
 }
 
-/// Prints all hooks grouped by plugin, showing disable status.
+/// Prints all hooks grouped by namespace, showing disable status.
 fn print_hook_list() {
     let disable_var = std::env::var("CADENCE_DISABLE").unwrap_or_default();
     let disabled: Vec<&str> = disable_var
@@ -652,14 +652,14 @@ fn print_hook_list() {
         println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
     }
 
-    let mut current_plugin = "";
+    let mut current_namespace = "";
     for hook in HOOKS {
-        if hook.namespace != current_plugin {
-            if !current_plugin.is_empty() {
+        if hook.namespace != current_namespace {
+            if !current_namespace.is_empty() {
                 println!();
             }
             println!("{}:", hook.namespace);
-            current_plugin = hook.namespace;
+            current_namespace = hook.namespace;
         }
 
         let status = if bypassed {

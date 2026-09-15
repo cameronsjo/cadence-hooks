@@ -148,7 +148,7 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
     let currently_disabled = read_disabled_hooks(&settings_path);
 
     // Build items for the multi-select — only real hooks, no separators.
-    // Plugin name is prefixed to each item for visual grouping.
+    // The namespace is prefixed to each item for visual grouping.
     let mut items: Vec<String> = Vec::new();
     let mut defaults: Vec<bool> = Vec::new();
     let mut hook_names: Vec<&str> = Vec::new();
