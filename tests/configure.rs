@@ -161,8 +161,18 @@ fn configure_list_handles_empty_disable_value() {
     );
 }
 
+/// `configure --list` reports each settings-sourced name under its real
+/// verdict, end to end.
+///
+/// The fixture carries one unknown name and one protected guard, which is
+/// exactly the pair that used to be wrong: both were printed under a bare
+/// `Disabled hooks:` heading, and `git-safety` was subtracted from the active
+/// count, though the binary refuses that entry and runs the guard. The
+/// `(unknown hook)` marker this test previously asserted is gone — the same
+/// fact is now stated in the sentence the other two surfaces use, so all three
+/// report a disable request in one vocabulary.
 #[test]
-fn configure_list_preserves_unknown_hooks() {
+fn configure_list_reports_each_names_real_verdict() {
     let tmp = tempfile::tempdir().unwrap();
     let claude_dir = tmp.path().join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
@@ -181,11 +191,31 @@ fn configure_list_preserves_unknown_hooks() {
 
     assert!(
         stdout.contains("future-hook"),
-        "should show unknown hooks too: {stdout}"
+        "an unrecognized name must still be shown, so a typo is visible: {stdout}"
     );
     assert!(
-        stdout.contains("(unknown hook)"),
-        "should mark unknown hooks: {stdout}"
+        stdout.contains("Named in CADENCE_DISABLE but not a hook"),
+        "an unrecognized name must be reported as having disabled nothing: {stdout}"
+    );
+    assert!(
+        stdout.contains("Refused (protected)") && stdout.contains("these still run:"),
+        "a protected guard must be reported as refused, not disabled: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Disabled hooks:"),
+        "neither name was honoured, so the disabled heading must not appear: {stdout}"
+    );
+
+    // Neither entry switched a hook off, so the count must be unchanged. The
+    // old code printed `68 of 69 hooks active` here.
+    let total: usize = stdout
+        .split_whitespace()
+        .nth_back(2)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not read the hook total from: {stdout}"));
+    assert!(
+        stdout.contains(&format!("{total} of {total} hooks active")),
+        "a refused and an unknown entry leave every hook active: {stdout}"
     );
 }
 

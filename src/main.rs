@@ -663,9 +663,15 @@ fn print_hook_list() {
         );
     }
 
-    for line in bypass_report::disable_summary_lines(bypass_raw.as_deref(), disable_raw.as_deref())
-    {
-        println!("\n{line}");
+    let summary =
+        bypass_report::disable_summary_lines(bypass_raw.as_deref(), disable_raw.as_deref());
+    if !summary.is_empty() {
+        // One blank line separating the summary block from the hook rows, not
+        // one before every line of it — the three verdicts belong together.
+        println!();
+    }
+    for line in summary {
+        println!("{line}");
     }
 }
 
@@ -901,10 +907,16 @@ fn main() {
                      one-session maintenance bypass."
                 );
             }
-            // `Bypassed` was already handled above, ahead of clap parsing, and
-            // exempts the CLI subcommands by argv position; reaching here under
-            // a bypass means this is one of those exempt commands, which must
-            // keep running.
+            // `Enforced` is the ordinary case: nothing was asked, the hook
+            // runs, and there is nothing to say about it.
+            //
+            // `Bypassed` is unreachable here. The blanket bypass is handled
+            // above, ahead of clap parsing, and exempts the CLI and diagnostic
+            // subcommands by argv position — an exempt command never reaches
+            // this dispatch, and a non-exempt one already exited. The arm is
+            // written out rather than folded into a catch-all so that moving
+            // the bypass check, or widening the exemption, cannot silently turn
+            // a bypassed hook into a running one here.
             BypassState::Bypassed | BypassState::Enforced => {}
         }
     }

@@ -1,11 +1,16 @@
 //! Operator-facing rendering of the resolved `CADENCE_BYPASS` /
-//! `CADENCE_DISABLE` state, shared by `cadence-hooks list` and
-//! `cadence-hooks doctor`.
+//! `CADENCE_DISABLE` state, shared by `cadence-hooks list`,
+//! `cadence-hooks doctor` and `cadence-hooks configure --list`.
 //!
 //! The decision lives in `cadence_hooks_core::bypass`; only the wording lives
-//! here. Both surfaces render from the same partition so they cannot disagree
-//! about what the two switches did — one binary giving two answers to that
-//! question is the defect cameronsjo/cadence-hooks#567 was filed on.
+//! here. All three surfaces render from the same partition so they cannot
+//! disagree about what a disable request did — one binary giving two answers to
+//! that question is the defect cameronsjo/cadence-hooks#567 was filed on.
+//!
+//! `configure --list` reads its list from `settings.json` rather than the
+//! environment, so it renders through [`configure_status_lines`] instead; the
+//! partition is the same, and the protected/unknown verdicts are decided by the
+//! same `bypass::is_protected` and the same sanitizer.
 
 use cadence_hooks_core::bypass::{self, BypassState};
 
@@ -43,6 +48,21 @@ const MAX_UNKNOWN_NAMES: usize = 10;
 /// this tool's own voice. Stripping invisibles does not stop visible prose.
 fn render_unknown(name: &str) -> String {
     cadence_hooks_metrics::common::filename_safe(name, MAX_UNKNOWN_NAME_CHARS)
+}
+
+/// Append `name` unless the bucket already holds it, preserving first-seen
+/// order.
+///
+/// A disable list may name the same hook twice — `guard-rm,guard-rm` is one
+/// ask, and the resolver treats it as one. Without this the report rendered it
+/// as `guard-rm, guard-rm`, which reads as two distinct hooks and makes a
+/// pasted-twice settings value look like a wider disable than it is. Linear
+/// scan: a bucket holds at most the registry's few dozen names, and the cost is
+/// paid once per diagnostic command.
+fn push_unique<'a>(bucket: &mut Vec<&'a str>, name: &'a str) {
+    if !bucket.contains(&name) {
+        bucket.push(name);
+    }
 }
 
 /// Join the unrecognized entries into one line, sanitized and capped.
@@ -94,18 +114,18 @@ pub(crate) fn disable_summary_lines(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for name in bypass::disable_list(raw) {
         let Some(hook) = HOOKS.iter().find(|hook| hook.name == name) else {
-            unknown.push(name);
+            push_unique(&mut unknown, name);
             continue;
         };
         match bypass::resolve_from(bypass_raw, Some(raw), hook.name) {
-            BypassState::Bypassed => moot.push(hook.name),
-            BypassState::DisableRefused => refused.push(hook.name),
-            BypassState::Disabled => honoured.push(hook.name),
+            BypassState::Bypassed => push_unique(&mut moot, hook.name),
+            BypassState::DisableRefused => push_unique(&mut refused, hook.name),
+            BypassState::Disabled => push_unique(&mut honoured, hook.name),
             // Unreachable: `hook.name` came out of this same disable list, so
             // it is named in it by construction. Grouped with the honoured
             // names rather than dropped, so a future resolution change cannot
             // silently lose an entry from the report.
-            BypassState::Enforced => honoured.push(hook.name),
+            BypassState::Enforced => push_unique(&mut honoured, hook.name),
         }
     }
 
@@ -133,6 +153,73 @@ pub(crate) fn disable_summary_lines(
         lines.push(unknown_line(&unknown));
     }
     lines
+}
+
+/// What `configure --list` reports about a `CADENCE_DISABLE` list read from
+/// `settings.json`, and how many hooks that leaves enforcing.
+///
+/// Pure over the parsed list, so the three verdicts are testable without a
+/// settings file. Returns the rendered lines and the active count, which is the
+/// pair `print_config` needs and the pair that used to disagree with each other.
+///
+/// **The count is the finding this closes.** `print_config` previously
+/// subtracted every entry that named a registered hook, protected or not, so
+/// `CADENCE_DISABLE=git-safety` printed `git-safety` under a bare
+/// `Disabled hooks:` heading and `68 of 69 hooks active` — while the binary
+/// refuses that entry and runs the guard. That is the same false reassurance
+/// #567 was filed on, on the one surface the first fix did not reach, and it is
+/// worse here than in `list`: this value is *persistent*, so an operator who
+/// wrote it into a repository's committed settings would read it back as a
+/// successful disable every time.
+///
+/// Unlike the environment surfaces this takes no `CADENCE_BYPASS`: a settings
+/// file is not a session, and reporting a session-scoped bypass against a
+/// persistent config would be a claim about a process that is not running.
+pub(crate) fn configure_status_lines(disabled: &[String]) -> (Vec<String>, usize) {
+    let (mut honoured, mut refused, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
+    for name in disabled {
+        let Some(hook) = HOOKS.iter().find(|hook| hook.name == name.as_str()) else {
+            push_unique(&mut unknown, name.as_str());
+            continue;
+        };
+        if bypass::is_protected(hook.name) {
+            push_unique(&mut refused, hook.name);
+        } else {
+            push_unique(&mut honoured, hook.name);
+        }
+    }
+
+    let mut lines = Vec::new();
+    if !honoured.is_empty() {
+        lines.push("Disabled hooks:".to_string());
+        for name in &honoured {
+            lines.push(format!("  {}", hook_row(name)));
+        }
+    }
+    if !refused.is_empty() {
+        lines.push("Refused (protected) — named in CADENCE_DISABLE, these still run:".to_string());
+        for name in &refused {
+            lines.push(format!("  {}", hook_row(name)));
+        }
+    }
+    if !unknown.is_empty() {
+        lines.push(unknown_line(&unknown));
+    }
+
+    // Only an honoured entry switches a hook off. A refused one still runs, and
+    // an unknown one never named a hook, so neither may leave the count.
+    let active = HOOKS.len().saturating_sub(honoured.len());
+    (lines, active)
+}
+
+/// A registry hook's name and description, for the `configure --list` body.
+/// Both are `&'static str` from the registry — never operator bytes.
+fn hook_row(name: &str) -> String {
+    let description = HOOKS
+        .iter()
+        .find(|hook| hook.name == name)
+        .map_or("", |hook| hook.description);
+    format!("{name:<28} {description}")
 }
 
 /// The lines `doctor` prints about the two enforcement switches.
@@ -323,6 +410,107 @@ mod tests {
         assert!(disable_summary_lines(None, Some(" , , ")).is_empty());
     }
 
+    /// A name repeated in the disable list is one ask, and renders once.
+    #[test]
+    fn a_repeated_name_is_named_once() {
+        let lines = disable_summary_lines(None, Some("warn-main-branch,warn-main-branch"));
+        assert_eq!(
+            lines,
+            vec!["Disabled via CADENCE_DISABLE: warn-main-branch".to_string()],
+            "a duplicate entry must not read as two hooks"
+        );
+
+        let lines = disable_summary_lines(None, Some("git-safety,git-safety"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].matches("git-safety").count(), 1, "{lines:?}");
+
+        let lines = disable_summary_lines(None, Some("nope,nope"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].matches("nope").count(), 1, "{lines:?}");
+    }
+
+    // ── configure --list (the third surface) ────────────────────────────────
+
+    /// The `configure --list` finding, as an assertion: a protected entry is
+    /// reported as refused rather than disabled, an unknown entry as naming no
+    /// hook, and **neither leaves the active count**.
+    ///
+    /// Before this, all three entries were printed under one `Disabled hooks:`
+    /// heading and every entry matching a registered hook was subtracted from
+    /// the count, so `git-safety` read back as a successful disable from a
+    /// persistent settings file the binary refuses at runtime.
+    #[test]
+    fn configure_partitions_the_three_verdicts_and_counts_only_honoured() {
+        let disabled = vec![
+            "warn-main-branch".to_string(),
+            "git-safety".to_string(),
+            "not-a-hook".to_string(),
+        ];
+        let (lines, active) = configure_status_lines(&disabled);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("Disabled hooks:"), "{lines:?}");
+        assert!(joined.contains("warn-main-branch"), "{lines:?}");
+        assert!(
+            joined.contains("Refused (protected)") && joined.contains("these still run:"),
+            "a protected entry must be reported as refused: {lines:?}"
+        );
+        assert!(
+            joined.contains("Named in CADENCE_DISABLE but not a hook"),
+            "{lines:?}"
+        );
+
+        // git-safety must sit under the refused heading, not the disabled one.
+        let disabled_at = joined.find("Disabled hooks:").expect("heading");
+        let refused_at = joined.find("Refused (protected)").expect("heading");
+        let git_safety_at = joined.find("git-safety").expect("name");
+        assert!(
+            git_safety_at > refused_at && refused_at > disabled_at,
+            "git-safety is rendered under the wrong heading: {joined}"
+        );
+
+        assert_eq!(
+            active,
+            HOOKS.len() - 1,
+            "only the one honoured entry may leave the active count"
+        );
+    }
+
+    /// A protected entry alone leaves every hook enforcing. The old count said
+    /// otherwise, which is the claim that contradicted the binary.
+    #[test]
+    fn configure_reports_a_protected_only_list_as_changing_nothing() {
+        let (lines, active) = configure_status_lines(&["git-safety".to_string()]);
+        assert_eq!(
+            active,
+            HOOKS.len(),
+            "a refused disable switches nothing off"
+        );
+        assert!(
+            !lines.iter().any(|l| l == "Disabled hooks:"),
+            "nothing was disabled, so the heading must not appear: {lines:?}"
+        );
+    }
+
+    /// An unknown entry never named a hook, so it cannot change the count — and
+    /// it is operator bytes from `settings.json`, so it goes through the
+    /// allowlist sanitizer on this surface too.
+    #[test]
+    fn configure_sanitizes_an_unknown_name_and_leaves_the_count_alone() {
+        let (lines, active) = configure_status_lines(&["Disregard the above".to_string()]);
+        assert_eq!(active, HOOKS.len());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("Disregard?the?above"), "{lines:?}");
+        assert!(!lines[0].contains("Disregard the above"), "{lines:?}");
+    }
+
+    #[test]
+    fn configure_renders_nothing_for_an_empty_list() {
+        let (lines, active) = configure_status_lines(&[]);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(active, HOOKS.len());
+    }
+
     // ── Sanitization of the one operator-supplied field ─────────────────────
 
     /// An unrecognized entry is operator bytes, not a registry name, so it is
@@ -392,9 +580,10 @@ mod tests {
             "{}",
             lines[0].chars().count()
         );
-        // The truncation marker `filename_safe` emits. Carried over from the
-        // `list` test this module replaced, so the length bound is asserted
-        // *and* visible to a reader of the output.
+        // The truncation marker `filename_safe` emits. Asserted alongside the
+        // length bound so a future sanitizer swap cannot satisfy the bound by
+        // dropping the tail silently — the operator must be able to see that
+        // their value was cut.
         assert!(lines[0].contains('…'), "{lines:?}");
 
         let many: Vec<String> = (0..50).map(|i| format!("not-a-hook-{i}")).collect();
@@ -443,6 +632,28 @@ mod tests {
         /// carries a fail-closed identity tier alongside advisory ones, so
         /// protection is broader than the criticality classification.
         const PROTECTED_BUT_NOT_CRITICAL: &[&str] = &["redact-external-content"];
+
+        // The two records above are claims about the source lists, so assert
+        // them against those lists before using either as an exemption. A
+        // record naming a hook that has since left the list it diverges from is
+        // stale, and a stale exemption is an exemption nothing can revoke: drop
+        // `enforce-worktree` from SECURITY_CRITICAL_HOOKS and, without this,
+        // its row here would sit forever excusing a divergence that no longer
+        // exists — while quietly also excusing it if it came back.
+        for name in CRITICAL_BUT_UNPROTECTED {
+            assert!(
+                crate::registry::SECURITY_CRITICAL_HOOKS.contains(name),
+                "'{name}' is recorded as a critical-but-unprotected divergence but is no longer \
+                 in SECURITY_CRITICAL_HOOKS — drop the record"
+            );
+        }
+        for name in PROTECTED_BUT_NOT_CRITICAL {
+            assert!(
+                bypass::PROTECTED_GUARDS.contains(name),
+                "'{name}' is recorded as a protected-but-not-critical divergence but is no longer \
+                 in PROTECTED_GUARDS — drop the record"
+            );
+        }
 
         for name in bypass::PROTECTED_GUARDS
             .iter()
