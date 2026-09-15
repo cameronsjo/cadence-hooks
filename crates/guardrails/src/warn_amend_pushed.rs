@@ -35,9 +35,12 @@
 //!
 //! ## What the scan sees
 //!
-//! Amend detection runs over every executable segment `core::shell` can reach,
-//! `sh -c '…'` wrappers, command substitutions, and loop/conditional bodies
-//! included ([`command_segments`] + [`executable_tokens`]).
+//! Amend detection and directory resolution run over the SAME unit: a top-level
+//! segment's own tokens ([`split_segments_with_ops`] + [`executable_tokens`]).
+//! Detection used to descend into wrappers, substitutions and loop bodies while
+//! resolution stayed at the top level, and that gap is precisely how the check
+//! produced confident answers about repositories the amend never touched. An
+//! amend nested deeper is now a deliberate miss rather than a guess.
 //!
 //! The probed *directory* is decided by an **allowlist of command shapes**, and
 //! that is a deliberate design choice rather than a conservative default. The
@@ -76,9 +79,8 @@
 
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
-    GitOutput, command_segments, command_word, executable_tokens, git_output_detailed,
-    is_transparent_prefix_word, resolve_cd_target, skip_transparent_prefixes,
-    split_segments_with_ops,
+    GitOutput, command_word, executable_tokens, git_output_detailed, is_transparent_prefix_word,
+    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -241,12 +243,16 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
 
     let mut effective = cwd.to_string();
     for (segment, _op) in &segments {
-        for inner in command_segments(segment) {
-            if let Some(dir) = amend_dir_of(&executable_tokens(&inner), &effective)
-                && !dirs.contains(&dir)
-            {
-                dirs.push(dir);
-            }
+        // The segment's OWN tokens, not the segments nested inside it. Every
+        // surviving segment is git-headed or a bare `cd`, so an amend nested
+        // deeper can only sit inside a command substitution — which the shell
+        // runs in a subshell, in a directory this walk cannot prove. Resolving
+        // it against `effective` would be the same wrong-repo answer the
+        // allowlist exists to prevent, so it is a deliberate miss.
+        if let Some(dir) = amend_dir_of(&executable_tokens(segment), &effective)
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
         }
 
         // A `cd` applies to what comes AFTER it, so this runs once the segment
@@ -274,13 +280,15 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
 ///
 /// The two accepted shapes:
 ///
-/// - **git-headed.** Every executable segment reachable inside this top-level
-///   segment ([`command_segments`], so a wrapper's script and a substitution
-///   count) has `git` as its head, after the leading env assignments and
-///   transparent prefixes [`skip_transparent_prefixes`] already peels. Such a
-///   segment cannot move the directory, and where it names another repository
-///   through `-C`/`--git-dir`/`--work-tree` or the env, [`amend_dir_of`]
-///   handles it.
+/// - **git-headed.** The segment's OWN head executable is `git`, after the
+///   leading env assignments and transparent prefixes
+///   [`skip_transparent_prefixes`] already peels. Such a segment cannot move the
+///   directory, and where it names another repository through
+///   `-C`/`--git-dir`/`--work-tree` or the env, [`amend_dir_of`] handles it. A
+///   command substitution written inside that command line runs in a subshell,
+///   so it cannot move THIS shell's directory and gets no say here — testing
+///   every nested segment's head instead silenced an ordinary
+///   `git commit --amend -m "$(date)"`.
 /// - **a bare `cd`** ([`bare_cd_target`]), whose one effect is known exactly.
 ///
 /// Anything else — `make`, `cargo`, `sh -c`, `pushd`, `eval`, `source`, a shell
@@ -298,11 +306,13 @@ fn every_segment_is_followable(segments: &[(String, Option<&'static str>)]) -> b
         if bare_cd_target(segment).is_some() {
             return true;
         }
-        command_segments(segment).iter().all(|inner| {
-            let tokens = executable_tokens(inner);
-            // An empty segment (a trailing `;`) runs nothing and moves nothing.
-            tokens.is_empty() || is_git_headed(&tokens)
-        })
+        let tokens = executable_tokens(segment);
+        // An empty segment (a trailing `;`) runs nothing and moves nothing.
+        // The test is the segment's OWN head: a command substitution written
+        // inside a git command line (`git commit --amend -m "$(date)"`) runs in
+        // a subshell and cannot move this shell's directory, so it has no say
+        // in whether the directory is followable.
+        tokens.is_empty() || is_git_headed(&tokens)
     })
 }
 
@@ -834,6 +844,20 @@ mod tests {
             amend_target_dirs("git -C /a commit --amend", "/cwd"),
             vec!["/a".to_string()]
         );
+        // A command substitution inside a git command line runs in a subshell,
+        // so it cannot move THIS shell's directory and has no say in whether
+        // the shape is followable. Testing every nested segment's head instead
+        // of the segment's own silenced this ordinary amend.
+        for command in [
+            "git commit --amend -m \"$(date)\"",
+            "git commit --amend -m \"release $(cat VERSION)\"",
+        ] {
+            assert_eq!(
+                amend_target_dirs(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command} amends in the session's own directory"
+            );
+        }
     }
 
     #[test]
