@@ -39,27 +39,40 @@
 //! `sh -c '…'` wrappers, command substitutions, and loop/conditional bodies
 //! included ([`command_segments`] + [`executable_tokens`]).
 //!
-//! The probed *directory* is deliberately narrower: the payload `cwd`, advanced
-//! only by a `cd` that is a **top-level segment's own command** and ordered
-//! **before** the amend, then by that segment's `-C` chain. A `cd` written
-//! inside a quoted argument is one token and moves nothing, and a `cd` after
-//! the amend moves nothing either — both were live misreads before
-//! cadence-hooks#610's security review.
+//! The probed *directory* is decided by an **allowlist of command shapes**, and
+//! that is a deliberate design choice rather than a conservative default. The
+//! set of ways a shell can change directory has no closed enumeration — beyond
+//! `cd` there is `pushd`, `eval`, a sourced script, a shell function, an alias,
+//! a `CDPATH` hop, and whatever the next shell adds — so a list of spellings to
+//! REFUSE can never be finished. A denylist of `cd` spellings shipped here
+//! first, and `command cd`, `builtin cd`, `time cd`, `\cd`, `pushd` and `eval
+//! 'cd …'` all walked straight past it into a confident nudge about the wrong
+//! repository.
 //!
-//! **A `cd` anywhere else in a segment silences that segment.** A `cd` inside a
-//! wrapper, a subshell, or a loop body is not an accepted miss; it is a
-//! deliberate silence. Amend detection descends into those wrappers while
-//! directory resolution cannot follow them, so `sh -c 'cd /b && git commit
-//! --amend'` run from repo A used to nudge naming *A's* refs about a commit in
-//! B — a confident wrong answer, which is worse than saying nothing.
+//! So directory resolution proceeds only when EVERY segment is one of two
+//! shapes it can prove ([`every_segment_is_followable`]):
+//!
+//! - every executable segment reachable inside it runs `git` (after the leading
+//!   env assignments and transparent prefixes are peeled), which cannot move
+//!   the directory; or
+//! - the segment is a bare `cd <dir>` ([`bare_cd_target`]), whose one effect is
+//!   known exactly, applying to the segments that FOLLOW it since that is when
+//!   the shell's `cd` takes effect.
+//!
+//! Any other head executable — `make`, `cargo`, `sh -c`, `pushd`, `eval`,
+//! `source`, a shell function, a subshell opener — silences the whole command.
+//! A `cd` written inside a quoted argument is one token and is not a command at
+//! all, so a commit message mentioning `cd` still resolves normally.
 //!
 //! A `--git-dir` or `--work-tree` amend is skipped outright, and so is a
 //! `GIT_DIR=`/`GIT_WORK_TREE=` env prefix (bare or behind `env`). Its
 //! repository is not the segment's directory, so probing there would answer a
 //! confident question about the wrong repo — silence is the honest result.
 //!
-//! Every miss is a lost nudge, never a bypassed block: the check has no block
-//! arm.
+//! Silence costs one advisory nudge, and never more than that: the check has no
+//! block arm, so every miss loses a warning and none bypasses a block, while a
+//! guess would produce a confident claim about a repository the amend never
+//! touched.
 
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
@@ -220,17 +233,15 @@ fn redirects_repository(argv: &[String]) -> bool {
 /// costs no git spawn at all.
 fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
-    let mut effective = cwd.to_string();
+    let segments = split_segments_with_ops(command);
 
-    if has_an_unfollowable_cd(command) {
+    if !every_segment_is_followable(&segments) {
         return dirs;
     }
 
-    for (segment, _op) in split_segments_with_ops(command) {
-        let tokens = executable_tokens(&segment);
-        let leads_with_cd = tokens.first().map(String::as_str) == Some("cd");
-
-        for inner in command_segments(&segment) {
+    let mut effective = cwd.to_string();
+    for (segment, _op) in &segments {
+        for inner in command_segments(segment) {
             if let Some(dir) = amend_dir_of(&executable_tokens(&inner), &effective)
                 && !dirs.contains(&dir)
             {
@@ -239,48 +250,94 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
         }
 
         // A `cd` applies to what comes AFTER it, so this runs once the segment
-        // has been examined. Only the segment's own leading `cd` counts: a `cd`
-        // inside a quoted argument is a single token and never reaches here.
-        if leads_with_cd && let Some(target) = tokens.get(1) {
-            effective = resolve_cd_target(target, &effective);
+        // has been examined.
+        if let Some(target) = bare_cd_target(segment) {
+            effective = resolve_cd_target(&target, &effective);
         }
     }
 
     dirs
 }
 
-/// True when `command` carries a `cd` this walk cannot follow, which makes
-/// every amend in it unresolvable.
+/// True when EVERY segment of the command is one of the two shapes whose effect
+/// on the working directory this check can prove.
 ///
-/// Exactly one shape is followable: a `cd` that is a top-level segment's own
-/// leading command, outside any subshell. Everything else — a `cd` inside a
-/// wrapper's script (`sh -c 'cd /b && git commit --amend'`), inside a subshell
-/// (`( cd /b && … )`), or inside a loop body — moves the amend somewhere
-/// directory resolution does not go, while amend DETECTION descends into all of
-/// them ([`command_segments`]). That disagreement produced a confident wrong
-/// answer rather than a miss: run from repo A, those commands nudged naming
-/// *A's* remote refs about a commit being rewritten in B.
+/// This is the allowlist named in the module header, and it replaced a denylist
+/// of `cd` spellings. The denylist matched the literal token `cd`, so `command
+/// cd /b`, `builtin cd /b`, `time cd /b`, `\cd /b`, `pushd /b` and `eval 'cd
+/// /b'` all walked past it and produced a nudge naming the session's own refs
+/// for an amend performed elsewhere — each one measured moving `$PWD`. Adding
+/// those six spellings would have left the seventh: the set of ways a shell can
+/// change directory is open-ended (a shell function, an alias, a sourced script,
+/// a `CDPATH` hop), so no list of what to refuse can be finished. A list of what
+/// to ACCEPT can.
 ///
-/// The whole command is silenced rather than the one segment, because
-/// [`split_segments_with_ops`] splits a subshell into ordinary top-level
-/// segments and drops the pairing: `( cd /b && git commit --amend )` arrives as
-/// `( cd /b` and `git commit --amend )`, so the amend cannot be matched back to
-/// the subshell that moved it. A stray `(` or `)` in a segment is the only
-/// remaining tell. Silence costs a nudge; guessing costs a wrong one.
-fn has_an_unfollowable_cd(command: &str) -> bool {
-    split_segments_with_ops(command)
-        .iter()
-        .any(|(segment, _op)| {
-            let opens_a_subshell = segment.contains('(') || segment.contains(')');
-            let leads_with_cd =
-                executable_tokens(segment).first().map(String::as_str) == Some("cd");
-            if leads_with_cd && !opens_a_subshell {
-                return false;
-            }
-            command_segments(segment)
-                .iter()
-                .any(|inner| executable_tokens(inner).first().map(String::as_str) == Some("cd"))
+/// The two accepted shapes:
+///
+/// - **git-headed.** Every executable segment reachable inside this top-level
+///   segment ([`command_segments`], so a wrapper's script and a substitution
+///   count) has `git` as its head, after the leading env assignments and
+///   transparent prefixes [`skip_transparent_prefixes`] already peels. Such a
+///   segment cannot move the directory, and where it names another repository
+///   through `-C`/`--git-dir`/`--work-tree` or the env, [`amend_dir_of`]
+///   handles it.
+/// - **a bare `cd`** ([`bare_cd_target`]), whose one effect is known exactly.
+///
+/// Anything else — `make`, `cargo`, `sh -c`, `pushd`, `eval`, `source`, a shell
+/// function — silences the whole command. That also retires the subshell
+/// heuristic this function used to carry: `( cd /b && git commit --amend )`
+/// splits into `( cd /b` and `git commit --amend )`, and the first is not a bare
+/// `cd` (its raw text opens with a paren), so the command is unfollowable
+/// without anyone having to reason about parens.
+///
+/// Silence costs one advisory nudge. Guessing costs a confident answer about a
+/// repository the amend never touched, which is the failure this guard exists
+/// to avoid.
+fn every_segment_is_followable(segments: &[(String, Option<&'static str>)]) -> bool {
+    segments.iter().all(|(segment, _op)| {
+        if bare_cd_target(segment).is_some() {
+            return true;
+        }
+        command_segments(segment).iter().all(|inner| {
+            let tokens = executable_tokens(inner);
+            // An empty segment (a trailing `;`) runs nothing and moves nothing.
+            tokens.is_empty() || is_git_headed(&tokens)
         })
+    })
+}
+
+/// True when `tokens` runs `git`, after the leading env assignments and
+/// transparent prefixes are peeled — so `command git commit`, `env FOO=1 git
+/// commit` and `/usr/bin/git commit` all qualify, and `command cd` does not.
+fn is_git_headed(tokens: &[String]) -> bool {
+    skip_transparent_prefixes(tokens)
+        .first()
+        .is_some_and(|head| command_word(head) == "git")
+}
+
+/// `Some(<dir>)` when `segment` is a bare `cd <dir>` — the one directory change
+/// whose effect is provable from the text.
+///
+/// Both halves are required. The TOKENS must be exactly `cd` plus one
+/// non-flag argument, which rejects `cd` with options and `cd` with no
+/// argument (a `$HOME` hop this check will not guess at). The RAW TEXT must
+/// also begin with `cd` and a space, which is what rejects every spelling that
+/// reaches the same builtin through something else — `command cd /b`, `builtin
+/// cd /b`, `time cd /b`, `\cd /b` — and what rejects the subshell opener
+/// `( cd /b`, whose tokens are exactly `["cd", "/b"]` once the paren is
+/// stripped.
+///
+/// A quoted argument stays one token, so `cd '/tmp/old (archive)'` is a bare
+/// `cd` and a commit message mentioning `cd` never becomes one.
+fn bare_cd_target(segment: &str) -> Option<String> {
+    let after_cd = segment.trim_start().strip_prefix("cd")?;
+    if !after_cd.starts_with(char::is_whitespace) {
+        return None;
+    }
+    match executable_tokens(segment).as_slice() {
+        [head, dir] if head == "cd" && !dir.starts_with('-') => Some(dir.clone()),
+        _ => None,
+    }
 }
 
 /// True when the leading assignment words set `GIT_DIR` or `GIT_WORK_TREE`.
@@ -564,10 +621,6 @@ mod tests {
             r"\git commit --amend",
             "git -c commit.gpgsign=false commit --amend",
             "git add -A && git commit --amend --no-edit",
-            // Keyword-headed segments: a bare token walk never reached these.
-            "for d in x; do git commit --amend; done",
-            "if true; then git commit --amend; fi",
-            "sh -c 'git commit --amend'",
         ];
         for command in matching {
             assert_eq!(
@@ -705,10 +758,81 @@ mod tests {
             amend_target_dirs("cd /b && git commit --amend", "/cwd"),
             vec!["/b".to_string()]
         );
-        // A wrapper with no `cd` is still read.
+    }
+
+    #[test]
+    fn a_non_git_head_anywhere_silences_the_command() {
+        // Every one of these reaches a directory change the guard cannot prove,
+        // and every one moved `$PWD` when measured. A denylist of `cd`
+        // spellings matched none of them, so the guard nudged naming the
+        // session's own refs for an amend performed elsewhere. The allowlist
+        // asks the opposite question — is this shape provable — and none of
+        // these are.
+        for command in [
+            "command cd /b && git commit --amend",
+            "builtin cd /b && git commit --amend",
+            "time cd /b && git commit --amend",
+            "eval 'cd /b' && git commit --amend",
+            "pushd /b && git commit --amend",
+            "\\cd /b && git commit --amend",
+            // Not a directory change at all, but equally unprovable: the guard
+            // cannot know what an arbitrary command did to the working dir.
+            "make && git commit --amend",
+            "git commit --amend && make",
+            "source ./env.sh && git commit --amend",
+            ". ./env.sh && git commit --amend",
+            // These three DO amend in the session's own directory, so the
+            // allowlist costs a real nudge on each. It is the price of the
+            // shape test being decidable: a wrapper script or a loop body is
+            // exactly where an unprovable `cd` hides, and the guard cannot tell
+            // these apart from `sh -c 'cd /b && git commit --amend'` without
+            // re-opening the question the denylist failed to answer.
+            "sh -c 'git commit --amend'",
+            "for d in x; do git commit --amend; done",
+            "if true; then git commit --amend; fi",
+        ] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} is not a shape this guard can follow"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlisted_shapes_still_resolve() {
+        // Shape (a): every segment is git-headed, including the transparent
+        // prefixes the module already peels.
+        for command in [
+            "git commit --amend",
+            "git add . && git commit --amend",
+            "FOO=bar git commit --amend",
+            "command git commit --amend",
+            // Commit-message prose is data, not a command, so neither a `cd`
+            // nor a paren in it reaches the shape test.
+            "git commit --amend -m 'cd into the dir'",
+            "git commit --amend -m 'wip (typo)'",
+        ] {
+            assert_eq!(
+                amend_target_dirs(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command} resolves to the session's own directory"
+            );
+        }
+        // Shape (b): a bare `cd`, applying to what follows it.
         assert_eq!(
-            amend_target_dirs("sh -c 'git commit --amend'", "/cwd"),
-            vec!["/cwd".to_string()]
+            amend_target_dirs("cd /a && git commit --amend", "/cwd"),
+            vec!["/a".to_string()]
+        );
+        // The paren heuristic is gone, so a directory whose NAME carries parens
+        // is an ordinary bare `cd` again.
+        assert_eq!(
+            amend_target_dirs("cd '/tmp/old (archive)' && git commit --amend", "/cwd"),
+            vec!["/tmp/old (archive)".to_string()]
+        );
+        // A `-C` on the git segment itself still redirects the probe.
+        assert_eq!(
+            amend_target_dirs("git -C /a commit --amend", "/cwd"),
+            vec!["/a".to_string()]
         );
     }
 
