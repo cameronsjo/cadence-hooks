@@ -1835,16 +1835,28 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// The Claude config root: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+///
+/// Thin `Option`-wrapper over the canonical resolver,
+/// [`cadence_hooks_core::paths::claude_config_dir`] — this crate must not
+/// carry its own second copy of the `CLAUDE_CONFIG_DIR` fallback logic
+/// (cadence-hooks#599). Returns `None` only when neither `CLAUDE_CONFIG_DIR`
+/// nor a resolvable home directory is set — the same "nothing to resolve
+/// against" gate as before, though [`cadence_hooks_core::paths::user_home`]
+/// now also honors `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH`, so this recognizes
+/// a home on Windows where the old bare-`HOME`-env check would not. The
+/// actual path construction (tilde expansion, comma-list) always runs
+/// through the shared resolver, and so does the "is a config dir named at
+/// all" test — [`cadence_hooks_core::paths::config_dir_is_named`] — so a
+/// degenerate `CLAUDE_CONFIG_DIR` of only commas or whitespace counts as
+/// unset here exactly as it does in the resolver.
 pub fn claude_config_root() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
-        && !dir.is_empty()
-    {
-        return Some(std::path::PathBuf::from(dir));
+    let raw = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let has_config_dir = cadence_hooks_core::paths::config_dir_is_named(raw.as_deref());
+    if has_config_dir || cadence_hooks_core::paths::user_home().is_some() {
+        Some(cadence_hooks_core::paths::claude_config_dir())
+    } else {
+        None
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| std::path::Path::new(&h).join(".claude"))
 }
 
 /// Is this the canonical 8-4-4-4-12 hex UUID shape?
@@ -1919,6 +1931,116 @@ pub fn resolve_session_transcript(
                 .collect::<Vec<_>>()
                 .join("\n  ")
         )),
+    }
+}
+
+#[cfg(test)]
+mod config_root_tests {
+    use super::*;
+    use crate::common::ENV_LOCK;
+
+    /// Run `f` with `CLAUDE_CONFIG_DIR` and the whole home-var family set to
+    /// the given values, restoring every one afterwards.
+    ///
+    /// `HOME`, `USERPROFILE`, `HOMEDRIVE` and `HOMEPATH` are all cleared or
+    /// set together because `user_home()` reads all four in order — leaving
+    /// one behind would let the ambient environment answer a test that is
+    /// asserting on an absent home. Holds the crate-wide `ENV_LOCK`, since
+    /// process env is global and these tests run beside every other
+    /// env-mutating test in the crate, and restores through a `Drop` guard so
+    /// a failing assertion cannot leave the whole suite with no `HOME` (the
+    /// `WorktreeEnvGuard` shape in `crates/session/src/start.rs`).
+    const CONFIG_ENV_VARS: [&str; 5] = [
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    ];
+
+    /// Restores every var in [`CONFIG_ENV_VARS`] to the value it carried when
+    /// the guard was built.
+    struct ConfigEnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: only constructed inside `with_config_env`, which holds
+            // ENV_LOCK for this guard's whole lifetime (declared after the
+            // lock, so it drops before the lock releases — panic included).
+            unsafe {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn with_config_env<F: FnOnce()>(config_dir: Option<&str>, home: Option<&str>, f: F) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = ConfigEnvGuard(
+            CONFIG_ENV_VARS
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect(),
+        );
+
+        // SAFETY: serialized against every other env-mutating test via ENV_LOCK.
+        unsafe {
+            for key in CONFIG_ENV_VARS {
+                std::env::remove_var(key);
+            }
+            if let Some(v) = config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", v);
+            }
+            if let Some(v) = home {
+                std::env::set_var("HOME", v);
+            }
+        }
+
+        f();
+    }
+
+    #[test]
+    fn config_root_expands_tilde_entry() {
+        with_config_env(Some("~/work-claude"), Some("/home/test"), || {
+            assert_eq!(
+                claude_config_root(),
+                Some(std::path::PathBuf::from("/home/test/work-claude")),
+                "a `~/` entry must expand against HOME, not stay literal"
+            );
+        });
+    }
+
+    #[test]
+    fn config_root_takes_first_comma_entry() {
+        with_config_env(
+            Some("/first/claude,/second/claude"),
+            Some("/home/test"),
+            || {
+                assert_eq!(
+                    claude_config_root(),
+                    Some(std::path::PathBuf::from("/first/claude")),
+                    "a comma list resolves to its first entry"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn config_root_refuses_degenerate_config_dir() {
+        for degenerate in [",", " , , ", " ", ""] {
+            with_config_env(Some(degenerate), None, || {
+                assert_eq!(
+                    claude_config_root(),
+                    None,
+                    "{degenerate:?} names no config dir, and with no home there is \
+                     nothing to fall back to — must not resolve to a temp dir"
+                );
+            });
+        }
     }
 }
 
@@ -2036,7 +2158,8 @@ pub fn run_grade(
             let Some(root) = claude_config_root() else {
                 eprintln!(
                     "metrics grade: cannot locate the Claude config directory \
-                     (set CLAUDE_CONFIG_DIR or HOME), so --session-id cannot be resolved."
+                     (set CLAUDE_CONFIG_DIR, or HOME — on Windows USERPROFILE, \
+                     or HOMEDRIVE plus HOMEPATH), so --session-id cannot be resolved."
                 );
                 return 1;
             };
