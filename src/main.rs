@@ -623,7 +623,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
     }
 }
 
-/// Prints all hooks grouped by plugin, showing disable status.
+/// Prints all hooks grouped by namespace, showing disable status.
 ///
 /// Both variables are read **once**, here, and every per-hook row resolves from
 /// those two values through the pure [`bypass::resolve_from`]. The per-row
@@ -638,14 +638,14 @@ fn print_hook_list() {
         println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
     }
 
-    let mut current_plugin = "";
+    let mut current_namespace = "";
     for hook in HOOKS {
-        if hook.plugin != current_plugin {
-            if !current_plugin.is_empty() {
+        if hook.namespace != current_namespace {
+            if !current_namespace.is_empty() {
                 println!();
             }
-            println!("{}:", hook.plugin);
-            current_plugin = hook.plugin;
+            println!("{}:", hook.namespace);
+            current_namespace = hook.namespace;
         }
 
         let event = match hook.event {
@@ -678,7 +678,7 @@ fn print_hook_manifest(format: ManifestFormat) {
                     serde_json::json!({
                         "name": hook.name,
                         "description": hook.description,
-                        "plugin": hook.plugin,
+                        "plugin": hook.namespace,
                         "event": hook.event.map(|event| event.name()).unwrap_or("logger"),
                         "criticality": if registry::is_security_critical(hook.name) {
                             "security-critical"
@@ -1619,9 +1619,9 @@ mod tests {
             assert!(
                 clap_pairs
                     .iter()
-                    .any(|(ns, sub)| ns == hook.plugin && sub == hook.name),
+                    .any(|(ns, sub)| ns == hook.namespace && sub == hook.name),
                 "registry entry '{} {}' has no clap subcommand — it's listed but not dispatchable",
-                hook.plugin,
+                hook.namespace,
                 hook.name
             );
         }
