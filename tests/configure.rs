@@ -206,16 +206,25 @@ fn configure_list_reports_each_names_real_verdict() {
         "neither name was honoured, so the disabled heading must not appear: {stdout}"
     );
 
-    // Neither entry switched a hook off, so the count must be unchanged. The
-    // old code printed `68 of 69 hooks active` here.
-    let total: usize = stdout
+    // Neither entry switched a hook off, so the two numbers in the count line
+    // must be equal. The old code printed `68 of 69 hooks active` here.
+    //
+    // Parsed off the located line rather than off the tail of stdout: reading
+    // by offset from the end would silently start measuring a different line
+    // the moment anything else is appended, and would then pass for the wrong
+    // reason.
+    let count_line = stdout
+        .lines()
+        .find(|line| line.ends_with("hooks active."))
+        .unwrap_or_else(|| panic!("no `N of M hooks active.` line in: {stdout}"));
+    let numbers: Vec<&str> = count_line
         .split_whitespace()
-        .nth_back(2)
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("could not read the hook total from: {stdout}"));
-    assert!(
-        stdout.contains(&format!("{total} of {total} hooks active")),
-        "a refused and an unknown entry leave every hook active: {stdout}"
+        .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    assert_eq!(numbers.len(), 2, "expected two numbers in: {count_line}");
+    assert_eq!(
+        numbers[0], numbers[1],
+        "a refused and an unknown entry leave every hook active: {count_line}"
     );
 }
 

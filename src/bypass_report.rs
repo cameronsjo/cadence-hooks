@@ -175,10 +175,19 @@ pub(crate) fn disable_summary_lines(
 /// Unlike the environment surfaces this takes no `CADENCE_BYPASS`: a settings
 /// file is not a session, and reporting a session-scoped bypass against a
 /// persistent config would be a claim about a process that is not running.
-pub(crate) fn configure_status_lines(disabled: &[String]) -> (Vec<String>, usize) {
+///
+/// Takes the hook slice rather than reading the module's `HOOKS`, so the
+/// numerator and the denominator of `N of M hooks active` come from **one**
+/// list. `print_config` is handed a slice and prints `M` from it; had the count
+/// been derived here from `HOOKS` instead, the two halves of that sentence
+/// would have had two sources — the same shape this change exists to remove.
+pub(crate) fn configure_status_lines(
+    hooks: &[crate::registry::HookEntry],
+    disabled: &[String],
+) -> (Vec<String>, usize) {
     let (mut honoured, mut refused, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
     for name in disabled {
-        let Some(hook) = HOOKS.iter().find(|hook| hook.name == name.as_str()) else {
+        let Some(hook) = hooks.iter().find(|hook| hook.name == name.as_str()) else {
             push_unique(&mut unknown, name.as_str());
             continue;
         };
@@ -193,13 +202,13 @@ pub(crate) fn configure_status_lines(disabled: &[String]) -> (Vec<String>, usize
     if !honoured.is_empty() {
         lines.push("Disabled hooks:".to_string());
         for name in &honoured {
-            lines.push(format!("  {}", hook_row(name)));
+            lines.push(format!("  {}", hook_row(hooks, name)));
         }
     }
     if !refused.is_empty() {
         lines.push("Refused (protected) — named in CADENCE_DISABLE, these still run:".to_string());
         for name in &refused {
-            lines.push(format!("  {}", hook_row(name)));
+            lines.push(format!("  {}", hook_row(hooks, name)));
         }
     }
     if !unknown.is_empty() {
@@ -208,14 +217,14 @@ pub(crate) fn configure_status_lines(disabled: &[String]) -> (Vec<String>, usize
 
     // Only an honoured entry switches a hook off. A refused one still runs, and
     // an unknown one never named a hook, so neither may leave the count.
-    let active = HOOKS.len().saturating_sub(honoured.len());
+    let active = hooks.len().saturating_sub(honoured.len());
     (lines, active)
 }
 
 /// A registry hook's name and description, for the `configure --list` body.
 /// Both are `&'static str` from the registry — never operator bytes.
-fn hook_row(name: &str) -> String {
-    let description = HOOKS
+fn hook_row(hooks: &[crate::registry::HookEntry], name: &str) -> String {
+    let description = hooks
         .iter()
         .find(|hook| hook.name == name)
         .map_or("", |hook| hook.description);
@@ -446,7 +455,7 @@ mod tests {
             "git-safety".to_string(),
             "not-a-hook".to_string(),
         ];
-        let (lines, active) = configure_status_lines(&disabled);
+        let (lines, active) = configure_status_lines(HOOKS, &disabled);
         let joined = lines.join("\n");
 
         assert!(joined.contains("Disabled hooks:"), "{lines:?}");
@@ -480,7 +489,7 @@ mod tests {
     /// otherwise, which is the claim that contradicted the binary.
     #[test]
     fn configure_reports_a_protected_only_list_as_changing_nothing() {
-        let (lines, active) = configure_status_lines(&["git-safety".to_string()]);
+        let (lines, active) = configure_status_lines(HOOKS, &["git-safety".to_string()]);
         assert_eq!(
             active,
             HOOKS.len(),
@@ -497,7 +506,7 @@ mod tests {
     /// allowlist sanitizer on this surface too.
     #[test]
     fn configure_sanitizes_an_unknown_name_and_leaves_the_count_alone() {
-        let (lines, active) = configure_status_lines(&["Disregard the above".to_string()]);
+        let (lines, active) = configure_status_lines(HOOKS, &["Disregard the above".to_string()]);
         assert_eq!(active, HOOKS.len());
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("Disregard?the?above"), "{lines:?}");
@@ -506,7 +515,7 @@ mod tests {
 
     #[test]
     fn configure_renders_nothing_for_an_empty_list() {
-        let (lines, active) = configure_status_lines(&[]);
+        let (lines, active) = configure_status_lines(HOOKS, &[]);
         assert!(lines.is_empty(), "{lines:?}");
         assert_eq!(active, HOOKS.len());
     }

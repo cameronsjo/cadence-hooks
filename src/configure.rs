@@ -122,7 +122,7 @@ fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
         return;
     }
 
-    let (lines, active) = crate::bypass_report::configure_status_lines(&disabled);
+    let (lines, active) = crate::bypass_report::configure_status_lines(hooks, &disabled);
     for line in lines {
         // A heading opens its own block; an indented row stays with the heading
         // above it.
