@@ -152,14 +152,22 @@ pub fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
 /// for a repository whose remote is called `upstream`, and for an `origin`
 /// whose default branch is `trunk` with no `origin/HEAD` to find it by.
 ///
-/// `false` when the answer is empty, unavailable, or abandoned at the
-/// deadline: with nothing to exclude, every commit would read as unpushed and
-/// the advisory would fire on every local-only repository.
-pub fn has_remote_tracking_refs(dir: &str) -> bool {
-    matches!(
-        git_command_detailed(dir, &["for-each-ref", "--count=1", "refs/remotes"]),
-        GitQuery::Value(_)
-    )
+/// `Ok(false)` when the answer is empty or git could not answer: with nothing
+/// to exclude, every commit would read as unpushed and the advisory would fire
+/// on every local-only repository. `Err(())` when the deadline abandoned the
+/// probe — the caller reports a truncated scan rather than the empty one a
+/// plain `false` would produce, which would claim "nothing unpushed" on a
+/// question that was never answered.
+///
+/// Private: `Result<_, ()>` is this module's internal convention for "the
+/// deadline abandoned it" (see [`CountOutcome`]), and clippy's
+/// `result_unit_err` is right that it is no shape for a public API.
+fn has_remote_tracking_refs(dir: &str) -> Result<bool, ()> {
+    match git_command_detailed(dir, &["for-each-ref", "--count=1", "refs/remotes"]) {
+        GitQuery::Value(_) => Ok(true),
+        GitQuery::Failed => Ok(false),
+        GitQuery::TimedOut => Err(()),
+    }
 }
 
 /// How many commits `dir`'s checked-out branch carries that no remote has.
@@ -227,7 +235,15 @@ pub fn scan(dir: &str) -> WorktreeScan {
         }
     };
 
-    let has_remote_refs = has_remote_tracking_refs(dir);
+    let Ok(has_remote_refs) = has_remote_tracking_refs(dir) else {
+        // Out of budget before the gate could answer. Reporting an empty,
+        // complete-looking scan here would say "nothing unpushed" about a
+        // question nobody asked.
+        return WorktreeScan {
+            unpushed: Vec::new(),
+            truncated: true,
+        };
+    };
     let mut scan = WorktreeScan::default();
 
     let mut candidates: Vec<WorktreeEntry> = parse_worktree_list(&porcelain)
@@ -542,7 +558,7 @@ detached
         let scratch = Scratch::new(&scratch_root(), "gate-present");
         let repo = repo_with_remote(&scratch);
         // A `git push` sets no `origin/HEAD`, and the gate does not need one.
-        assert!(has_remote_tracking_refs(&repo.to_string_lossy()));
+        assert_eq!(has_remote_tracking_refs(&repo.to_string_lossy()), Ok(true));
     }
 
     #[test]
@@ -551,7 +567,7 @@ detached
         let repo = scratch.path().join("solo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        assert!(!has_remote_tracking_refs(&repo.to_string_lossy()));
+        assert_eq!(has_remote_tracking_refs(&repo.to_string_lossy()), Ok(false));
     }
 
     #[test]
