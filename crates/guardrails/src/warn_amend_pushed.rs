@@ -55,12 +55,19 @@
 //! So directory resolution proceeds only when EVERY segment is one of two
 //! shapes it can prove ([`every_segment_is_followable`]):
 //!
-//! - every executable segment reachable inside it runs `git` (after the leading
-//!   env assignments and transparent prefixes are peeled), which cannot move
-//!   the directory; or
-//! - the segment is a bare `cd <dir>` ([`bare_cd_target`]), whose one effect is
-//!   known exactly, applying to the segments that FOLLOW it since that is when
-//!   the shell's `cd` takes effect.
+//! - the segment's OWN head executable is `git` (after the leading env
+//!   assignments and transparent prefixes are peeled), which cannot move the
+//!   directory; or
+//! - the segment is a bare `cd <dir>` ([`bare_cd_target`]) **joined by `&&`,
+//!   `;` or a newline, or ending the command**. `&` and `|` put one side in a
+//!   subshell and `||` runs the rest only when the `cd` FAILED, so under those
+//!   operators the effect is not known and the command is silenced.
+//!
+//! The accepted `cd` still carries one residual: a RELATIVE target is resolved
+//! lexically against the effective directory, so a `CDPATH` entry that sends
+//! `cd name` somewhere else would be followed to the wrong place. `CDPATH` is
+//! rare, unset by default, and the miss is a wrong directory rather than an
+//! unnoticed one — an absolute `cd` has no such gap.
 //!
 //! Any other head executable — `make`, `cargo`, `sh -c`, `pushd`, `eval`,
 //! `source`, a shell function, a subshell opener — silences the whole command.
@@ -224,12 +231,13 @@ fn redirects_repository(argv: &[String]) -> bool {
 /// matching segment, resolved against `cwd`.
 ///
 /// Walks the command's TOP-LEVEL segments in order, carrying an effective
-/// directory that only a top-level `cd` moves — and only for the segments that
+/// directory that only a bare `cd` moves — and only for the segments that
 /// follow it, since the shell's `cd` takes effect after that segment runs.
-/// Within each top-level segment, every executable segment `core::shell` can
-/// reach is examined for an amend (a `sh -c` wrapper, a substitution, a loop
-/// body), each resolved against that segment's effective directory plus its own
-/// `-C` chain.
+/// Each segment is examined for an amend using its OWN tokens plus its own `-C`
+/// chain: detection and resolution read the same unit, deliberately. A wrapper
+/// script, a loop or conditional body, and a command substitution are not
+/// examined at all — [`every_segment_is_followable`] has already silenced any
+/// command containing one, because their working directory is not provable.
 ///
 /// Empty when the command contains no amend — the common case, and the one that
 /// costs no git spawn at all.
@@ -243,6 +251,9 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
 
     let mut effective = cwd.to_string();
     for (segment, _op) in &segments {
+        // The operator is read by `every_segment_is_followable`, which has
+        // already refused the whole command if any bare `cd` was joined by one
+        // that makes its effect conditional or subshell-local.
         // The segment's OWN tokens, not the segments nested inside it. Every
         // surviving segment is git-headed or a bare `cd`, so an amend nested
         // deeper can only sit inside a command substitution — which the shell
@@ -302,9 +313,30 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
 /// repository the amend never touched, which is the failure this guard exists
 /// to avoid.
 fn every_segment_is_followable(segments: &[(String, Option<&'static str>)]) -> bool {
-    segments.iter().all(|(segment, _op)| {
+    segments.iter().all(|(segment, op)| {
+        // A segment whose parentheses do not balance is a fragment, not a
+        // top-level command: either a subshell opener/closer, or the residue of
+        // the splitter cutting inside an unquoted `$( … )`. `git log $(git
+        // rev-parse HEAD; cd B) ; git commit --amend` splits at the `;` INSIDE
+        // the substitution, and the fragment `cd B)` otherwise passes the
+        // bare-`cd` test — tokens `["cd", "B"]`, raw text opening `cd ` — which
+        // moved the probe into B on a command where the shell never leaves the
+        // cwd. A quoted name keeps its parens paired, so
+        // `cd '/tmp/old (archive)'` is unaffected.
+        if segment.matches('(').count() != segment.matches(')').count() {
+            return false;
+        }
         if bare_cd_target(segment).is_some() {
-            return true;
+            // The operator JOINING this `cd` to what follows decides whether
+            // its effect is knowable. `&&` and `;` (and a newline, and nothing
+            // at all) run the rest in this shell after the `cd` succeeded.
+            // `&` and `|` put one side in a SUBSHELL, so `cd B & git commit
+            // --amend` and `cd B | git commit --amend` leave $PWD untouched for
+            // the amend — measured under bash and zsh. `||` runs the rest only
+            // if the `cd` FAILED, so the shape test's promise ("this cd's
+            // effect is known exactly") is simply false. Each of these produced
+            // a nudge naming the wrong repository's refs.
+            return matches!(op, None | Some("&&") | Some(";") | Some("\n"));
         }
         let tokens = executable_tokens(segment);
         // An empty segment (a trailing `;`) runs nothing and moves nothing.
@@ -800,12 +832,57 @@ mod tests {
             "sh -c 'git commit --amend'",
             "for d in x; do git commit --amend; done",
             "if true; then git commit --amend; fi",
+            // Same class, same declared cost: the tail segment's head is not
+            // `git`, so an amend that really does run in the session's own
+            // directory goes unnudged.
+            "git commit --amend || echo failed",
+            "git commit --amend | tee /tmp/x",
         ] {
             assert!(
                 amend_target_dirs(command, "/cwd").is_empty(),
                 "{command} is not a shape this guard can follow"
             );
         }
+    }
+
+    #[test]
+    fn an_operator_that_hides_the_cd_silences_the_command() {
+        // The operator JOINING a bare `cd` decides whether its effect is
+        // knowable, and the splitter has always returned it. Discarding it left
+        // four wrong-repo nudges: `&` and `|` run one side in a subshell, so
+        // $PWD never moves for the amend (measured under bash and zsh); `||`
+        // runs the amend only if the `cd` FAILED, so no amend runs at all.
+        for command in [
+            "cd /b & git commit --amend",
+            "cd /b | git commit --amend",
+            "cd /b |& git commit --amend",
+            "cd /b || git commit --amend",
+        ] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} does not move the amend's directory the way a bare cd does"
+            );
+        }
+        // The splitter cuts inside an unquoted `$( … )`, and the fragment
+        // `cd /b)` passes the bare-`cd` token and raw-text tests. Unbalanced
+        // parens are what says it is a fragment rather than a command.
+        assert!(
+            amend_target_dirs(
+                "git log $(git rev-parse HEAD; cd /b) ; git commit --amend",
+                "/cwd"
+            )
+            .is_empty(),
+            "a substitution fragment is not a top-level cd"
+        );
+        // `&&` and `;` remain followable.
+        assert_eq!(
+            amend_target_dirs("cd /b && git commit --amend", "/cwd"),
+            vec!["/b".to_string()]
+        );
+        assert_eq!(
+            amend_target_dirs("cd /b ; git commit --amend", "/cwd"),
+            vec!["/b".to_string()]
+        );
     }
 
     #[test]
