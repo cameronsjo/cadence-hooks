@@ -1947,25 +1947,53 @@ mod config_root_tests {
     /// one behind would let the ambient environment answer a test that is
     /// asserting on an absent home. Holds the crate-wide `ENV_LOCK`, since
     /// process env is global and these tests run beside every other
-    /// env-mutating test in the crate.
-    fn with_config_env<F: FnOnce()>(config_dir: Option<&str>, home: Option<&str>, f: F) {
-        const HOME_VARS: [&str; 4] = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    /// env-mutating test in the crate, and restores through a `Drop` guard so
+    /// a failing assertion cannot leave the whole suite with no `HOME` (the
+    /// `WorktreeEnvGuard` shape in `crates/session/src/start.rs`).
+    const CONFIG_ENV_VARS: [&str; 5] = [
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    ];
 
-        let previous_config = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        let previous_home: Vec<(&str, Option<String>)> = HOME_VARS
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
+    /// Restores every var in [`CONFIG_ENV_VARS`] to the value it carried when
+    /// the guard was built.
+    struct ConfigEnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: only constructed inside `with_config_env`, which holds
+            // ENV_LOCK for this guard's whole lifetime (declared after the
+            // lock, so it drops before the lock releases — panic included).
+            unsafe {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn with_config_env<F: FnOnce()>(config_dir: Option<&str>, home: Option<&str>, f: F) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = ConfigEnvGuard(
+            CONFIG_ENV_VARS
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect(),
+        );
 
         // SAFETY: serialized against every other env-mutating test via ENV_LOCK.
         unsafe {
-            match config_dir {
-                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-            }
-            for key in HOME_VARS {
+            for key in CONFIG_ENV_VARS {
                 std::env::remove_var(key);
+            }
+            if let Some(v) = config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", v);
             }
             if let Some(v) = home {
                 std::env::set_var("HOME", v);
@@ -1973,20 +2001,6 @@ mod config_root_tests {
         }
 
         f();
-
-        // SAFETY: same ENV_LOCK guard as the mutations above.
-        unsafe {
-            match previous_config {
-                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-            }
-            for (key, value) in previous_home {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
     }
 
     #[test]

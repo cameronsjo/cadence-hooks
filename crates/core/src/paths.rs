@@ -351,6 +351,33 @@ mod tests {
     }
 
     #[test]
+    fn config_dir_is_named_agrees_with_the_resolver() {
+        // The predicate must answer "did this value name a dir?" for exactly
+        // the values `resolve_config_dir` takes its first branch on — the two
+        // reading the same value differently is the bug it exists to prevent.
+        for named in ["/custom/claude", "~/work-claude", ",/real", "  /spaced  "] {
+            assert!(config_dir_is_named(Some(named)), "{named:?} names a dir");
+            assert_ne!(
+                resolve_config_dir(Some(named), "/home/test"),
+                PathBuf::from("/home/test/.claude"),
+                "{named:?} must not fall back"
+            );
+        }
+        for unnamed in [",", " , , ", " ", ""] {
+            assert!(
+                !config_dir_is_named(Some(unnamed)),
+                "{unnamed:?} names none"
+            );
+            assert_eq!(
+                resolve_config_dir(Some(unnamed), "/home/test"),
+                PathBuf::from("/home/test/.claude"),
+                "{unnamed:?} must fall back"
+            );
+        }
+        assert!(!config_dir_is_named(None), "an unset var names none");
+    }
+
+    #[test]
     fn resolve_home_prefers_home() {
         assert_eq!(
             resolve_home(
