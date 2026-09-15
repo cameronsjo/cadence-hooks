@@ -74,6 +74,11 @@
 //! A `cd` written inside a quoted argument is one token and is not a command at
 //! all, so a commit message mentioning `cd` still resolves normally.
 //!
+//! A `cd` carrying anything beyond its one directory argument is likewise not
+//! the followable shape: `cd /b >/dev/null && git commit --amend` silences,
+//! because the redirection makes the segment more than the `cd <dir>` whose
+//! effect this check claims to know.
+//!
 //! A `--git-dir` or `--work-tree` amend is skipped outright, and so is a
 //! `GIT_DIR=`/`GIT_WORK_TREE=` env prefix (bare or behind `env`). Its
 //! repository is not the segment's directory, so probing there would answer a
@@ -86,8 +91,9 @@
 
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
-    GitOutput, command_word, executable_tokens, git_output_detailed, is_transparent_prefix_word,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
+    GitOutput, command_word, executable_tokens, git_output_detailed, has_unbalanced_groups,
+    is_transparent_prefix_word, resolve_cd_target, skip_transparent_prefixes,
+    split_segments_with_ops,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -314,16 +320,21 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
 /// to avoid.
 fn every_segment_is_followable(segments: &[(String, Option<&'static str>)]) -> bool {
     segments.iter().all(|(segment, op)| {
-        // A segment whose parentheses do not balance is a fragment, not a
-        // top-level command: either a subshell opener/closer, or the residue of
-        // the splitter cutting inside an unquoted `$( … )`. `git log $(git
-        // rev-parse HEAD; cd B) ; git commit --amend` splits at the `;` INSIDE
-        // the substitution, and the fragment `cd B)` otherwise passes the
-        // bare-`cd` test — tokens `["cd", "B"]`, raw text opening `cd ` — which
-        // moved the probe into B on a command where the shell never leaves the
-        // cwd. A quoted name keeps its parens paired, so
-        // `cd '/tmp/old (archive)'` is unaffected.
-        if segment.matches('(').count() != segment.matches(')').count() {
+        // A segment whose grouping syntax does not close is a fragment, not a
+        // top-level command: a subshell opener/closer, or the residue of the
+        // splitter cutting inside a `$( … )` or `` `…` `` substitution. `git log
+        // $(git rev-parse HEAD; cd B) ; git commit --amend` splits at the `;`
+        // INSIDE the substitution, and the fragment `cd B)` otherwise passes
+        // the bare-`cd` test — tokens `["cd", "B"]`, raw text opening `cd ` —
+        // which moved the probe into B on a command where the shell never
+        // leaves the cwd.
+        //
+        // [`has_unbalanced_groups`] asks the shared quote scanner rather than
+        // counting raw characters, because a raw count is wrong in both
+        // directions: it misses the backtick spelling (no paren at all) and a
+        // cut hidden behind quoted parens, and it silences honest commands
+        // whose commit message contains `:)` or `fix(scope):`.
+        if has_unbalanced_groups(segment) {
             return false;
         }
         if bare_cd_target(segment).is_some() {
@@ -863,16 +874,30 @@ mod tests {
                 "{command} does not move the amend's directory the way a bare cd does"
             );
         }
-        // The splitter cuts inside an unquoted `$( … )`, and the fragment
-        // `cd /b)` passes the bare-`cd` token and raw-text tests. Unbalanced
-        // parens are what says it is a fragment rather than a command.
+        // The splitter cuts inside a substitution, and the fragment `cd /b)`
+        // passes the bare-`cd` token and raw-text tests. Unclosed grouping
+        // syntax is what says it is a fragment rather than a command — counted
+        // outside quotes only, so all three spellings are caught.
+        for command in [
+            // `$( … )`: the paren spelling.
+            "git log $(git rev-parse HEAD; cd /b) ; git commit --amend",
+            // Backticks: the same cut with NO paren anywhere, which a raw paren
+            // count could never see.
+            "git log `git rev-parse HEAD; cd /b; git status` ; git commit --amend",
+            // Quoted parens inside the substitution make a raw count balance,
+            // hiding the real cut behind them.
+            "git log $(echo ')' ; cd /b ; git log '(' ) ; git commit --amend",
+        ] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} is cut inside a substitution, so its `cd` is a fragment"
+            );
+        }
+        // A `cd` carrying anything beyond its one directory argument is not the
+        // followable shape either.
         assert!(
-            amend_target_dirs(
-                "git log $(git rev-parse HEAD; cd /b) ; git commit --amend",
-                "/cwd"
-            )
-            .is_empty(),
-            "a substitution fragment is not a top-level cd"
+            amend_target_dirs("cd /b >/dev/null && git commit --amend", "/cwd").is_empty(),
+            "a redirected cd is more than the shape this check can prove"
         );
         // `&&` and `;` remain followable.
         assert_eq!(
@@ -928,6 +953,14 @@ mod tests {
         for command in [
             "git commit --amend -m \"$(date)\"",
             "git commit --amend -m \"release $(cat VERSION)\"",
+            // The backtick spelling of the same thing: balanced, so whole.
+            "git commit --amend -m \"built `date`\"",
+            // Parens inside a quoted commit message are text, not grouping
+            // syntax. A raw character count called each of these a fragment and
+            // silenced an ordinary amend.
+            "git commit --amend -m \"done :)\"",
+            "git commit --amend -m \"(wip\"",
+            "git commit --amend -m 'fix(scope): x'",
         ] {
             assert_eq!(
                 amend_target_dirs(command, "/cwd"),
