@@ -330,7 +330,30 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
+    // Same shape, one repository over: no single `if:` glob expresses "a delete
+    // verb", wherever it appears in a command. The prefilter matcher is
+    // case-sensitive and has no notion of a command head, so a glob written
+    // against the lowercase verb misses the capitalized spelling and a
+    // head-anchored form misses the verb after a shell operator. The guard
+    // therefore inspects every Bash call and lets the binary's tokenizer decide
+    // (cameronsjo/cadence-hooks#597; docs/hooks.md § Wiring prefilters).
+    "guardrails guard-rm",
 ];
+
+/// Entries of [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] whose wiring still carries
+/// an `if:` today, because the allowlist row deliberately lands *before* the
+/// monorepo PR that drops the filter.
+///
+/// The split keeps both directions of the self-expiry honest.
+/// `intentional_unfiltered_bash_hooks_are_still_unfiltered` would go red for a
+/// row like this one — the exemption is not earned yet — so a pending row is
+/// excused there and held to the opposite assertion instead:
+/// `pending_unfiltered_bash_hooks_are_still_filtered` fails the moment the
+/// wiring drops the filter, which is the signal to move the row out of this
+/// list. Same discipline as [`PENDING_WIRING_HOOKS`].
+/// (`<plugin> <subcommand>`, tracking_reference)
+const PENDING_UNFILTERED_BASH_HOOKS: &[(&str, &str)] =
+    &[("guardrails guard-rm", "cameronsjo/cadence-hooks#597")];
 
 /// Hooks a plugin dispatches from *another* plugin's CLI group on purpose.
 /// (plugin_dir, command, rationale)
@@ -1595,6 +1618,123 @@ fn pending_wiring_hooks_still_name_a_real_subcommand() {
          its tracking issue resolved by retiring the hook, so the exemption covers \
          nothing and must be removed:\n{}",
         stale
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Every `<plugin> <subcommand>` that some subject registers on a Bash matcher
+/// with no `if:` filter — the union across subjects.
+///
+/// The union is the right reading for both halves of the
+/// `INTENTIONAL_UNFILTERED_BASH_HOOKS` self-expiry, for the same reason
+/// `no_duplicate_command_registrations_per_matcher` reads its self-expiry that
+/// way: an exemption is dead cover only when NO workspace still needs it, and
+/// judging per subject would fire on whichever checkout happens to lag the
+/// other — a checkout-freshness fact wearing a wiring finding's clothes.
+fn unfiltered_bash_commands_across_subjects() -> BTreeSet<String> {
+    let mut unfiltered = BTreeSet::new();
+    for subject in audit_subjects() {
+        for refs in subject.refs.values() {
+            for r in refs {
+                if r.is_bash_matcher && !r.has_if_filter {
+                    unfiltered.insert(r.command.clone());
+                }
+            }
+        }
+    }
+    unfiltered
+}
+
+/// cameronsjo/cadence-hooks#597: the self-expiry
+/// [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] never had.
+///
+/// `bash_hooks_have_if_filter` lets an allowlisted hook run unfiltered without
+/// failing; nothing checked that the hook is STILL unfiltered. A wiring change
+/// that adds an `if:` back — or a hook retired outright — would leave a row
+/// granting silent cover to a matcher nobody re-examined, and the next
+/// genuinely-broad hook inherits it. This fails when a row stops being needed,
+/// exactly as `pending_wiring_hooks_are_still_unwired` does for its own list.
+///
+/// Rows in [`PENDING_UNFILTERED_BASH_HOOKS`] are excused here and checked by
+/// `pending_unfiltered_bash_hooks_are_still_filtered` instead.
+#[test]
+fn intentional_unfiltered_bash_hooks_are_still_unfiltered() {
+    let pending: BTreeSet<&str> = PENDING_UNFILTERED_BASH_HOOKS
+        .iter()
+        .map(|(command, _)| *command)
+        .collect();
+    let unfiltered = unfiltered_bash_commands_across_subjects();
+
+    let stale: Vec<&&str> = INTENTIONAL_UNFILTERED_BASH_HOOKS
+        .iter()
+        .filter(|command| !pending.contains(**command))
+        .filter(|command| !unfiltered.contains(**command))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "INTENTIONAL_UNFILTERED_BASH_HOOKS entry is no longer an unfiltered Bash matcher in ANY \
+         audited workspace — the wiring narrowed it with an `if:`, or the hook is gone, so the \
+         exemption covers nothing and must be removed:\n{}\n\n\
+         A row whose wiring has not dropped its `if:` YET belongs in \
+         PENDING_UNFILTERED_BASH_HOOKS with its tracking reference, not here.\n\
+         {STALE_CHECKOUT_HINT}",
+        stale
+            .iter()
+            .map(|command| format!("  `{command}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The complement: a row added ahead of its wiring PR must still be filtered.
+///
+/// `intentional_unfiltered_bash_hooks_are_still_unfiltered` excuses these rows,
+/// so this one fails the moment the wiring drops the `if:` — the signal that the
+/// exemption is earned and the row moves out of
+/// [`PENDING_UNFILTERED_BASH_HOOKS`] into the plain list.
+#[test]
+fn pending_unfiltered_bash_hooks_are_still_filtered() {
+    let unfiltered = unfiltered_bash_commands_across_subjects();
+
+    let now_unfiltered: Vec<&(&str, &str)> = PENDING_UNFILTERED_BASH_HOOKS
+        .iter()
+        .filter(|(command, _)| unfiltered.contains(*command))
+        .collect();
+
+    assert!(
+        now_unfiltered.is_empty(),
+        "PENDING_UNFILTERED_BASH_HOOKS entry now runs unfiltered in an audited workspace — its \
+         wiring PR landed, so the row graduates to INTENTIONAL_UNFILTERED_BASH_HOOKS and comes \
+         out of the pending list:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        now_unfiltered
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// A pending row must name a hook the plain list actually carries; otherwise the
+/// pending exemption excuses nothing and the pair drifts apart.
+#[test]
+fn pending_unfiltered_bash_hooks_are_listed_as_intentional() {
+    let intentional: BTreeSet<&str> = INTENTIONAL_UNFILTERED_BASH_HOOKS.iter().copied().collect();
+
+    let orphaned: Vec<&(&str, &str)> = PENDING_UNFILTERED_BASH_HOOKS
+        .iter()
+        .filter(|(command, _)| !intentional.contains(*command))
+        .collect();
+
+    assert!(
+        orphaned.is_empty(),
+        "PENDING_UNFILTERED_BASH_HOOKS entry names a hook INTENTIONAL_UNFILTERED_BASH_HOOKS does \
+         not list — the pending row excuses a self-expiry check that never looks at it:\n{}",
+        orphaned
             .iter()
             .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
             .collect::<Vec<_>>()
