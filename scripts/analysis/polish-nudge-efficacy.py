@@ -50,7 +50,6 @@ def claude_config_dir() -> Path:
 
 
 NUDGE_LOG = claude_config_dir() / "cadence" / "metrics" / "polish_nudges.jsonl"
-COMMITS_LOG = claude_config_dir() / "cadence" / "metrics" / "commits.jsonl"
 BOUNDARY_TS = "2026-06-19T20:24:00-05:00"  # cadence v0.33.0, ~20:24 CDT
 
 
