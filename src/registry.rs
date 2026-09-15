@@ -456,7 +456,13 @@ pub fn plugin_for(name: &str) -> Option<&'static str> {
     HOOKS.iter().find(|h| h.name == name).map(|h| h.plugin)
 }
 
-const SECURITY_CRITICAL_HOOKS: &[&str] = &[
+/// Guards whose inability to parse a relevant operation must block rather than
+/// fail open.
+///
+/// `pub(crate)` so `bypass_report`'s tests can cross-check it against
+/// `cadence_hooks_core::bypass::PROTECTED_GUARDS` — two lists about the same
+/// risk, maintained apart, whose divergences must be deliberate.
+pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
     "git-safety",

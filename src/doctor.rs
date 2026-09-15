@@ -1645,48 +1645,6 @@ fn print_platform_drift_status() {
     }
 }
 
-/// The lines `doctor` prints about the two enforcement switches.
-///
-/// Pure over the raw variable values so the wording is testable without
-/// touching process environment.
-///
-/// `doctor` reported nothing about either switch before #567, so a session
-/// running with every guard bypassed got a clean diagnostic — the one command
-/// an operator runs to ask "is this working?" could not say "nothing is
-/// enforcing right now". Silence here now means enforcement is on, which is
-/// the only reading that makes the silence worth anything.
-fn bypass_status_lines(bypass_raw: Option<&str>, disable_raw: Option<&str>) -> Vec<String> {
-    let mut lines = Vec::new();
-    if cadence_hooks_core::bypass::bypass_engaged_from(bypass_raw) {
-        lines.push(
-            "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed for \
-             this session (diagnostic commands still run)"
-                .to_string(),
-        );
-    }
-    for line in crate::disable_summary_lines(disable_raw) {
-        lines.push(format!("cadence-hooks doctor: {line}"));
-    }
-    if lines.is_empty() {
-        lines.push(
-            "cadence-hooks doctor: enforcement active — CADENCE_BYPASS and CADENCE_DISABLE are \
-             not switching anything off"
-                .to_string(),
-        );
-    }
-    lines
-}
-
-/// Report the resolved state of `CADENCE_BYPASS` / `CADENCE_DISABLE` — the
-/// live-environment wrapper around [`bypass_status_lines`].
-fn print_bypass_status() {
-    let bypass_raw = std::env::var(cadence_hooks_core::bypass::BYPASS_VAR).ok();
-    let disable_raw = std::env::var(cadence_hooks_core::bypass::DISABLE_VAR).ok();
-    for line in bypass_status_lines(bypass_raw.as_deref(), disable_raw.as_deref()) {
-        println!("{line}");
-    }
-}
-
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
 /// registry-file reaps when nonzero. No threshold — reaping is normal
 /// operation; this is visibility, not an alarm.
@@ -2589,10 +2547,25 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 ///   - Warnings only: ONE summary line to stdout, exit 0
 ///   - Errors (with or without warnings): one line to stderr, exit 2 — the
 ///     warning summary is suppressed; errors take precedence
+///   - Enforcement suppressed (`CADENCE_BYPASS=1`, and/or any `CADENCE_DISABLE`
+///     entry): the suppression lines to **stdout**, ahead of everything above,
+///     and independent of the exit code — a bypassed session is a fact about
+///     the session, not a finding about the plugin cache
 ///
 /// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
+///
+/// The suppression lines are the fourth emitter, and they take **stdout** for
+/// the same reason the warnings do. The documented SessionStart wiring
+/// (`docs/configuration.md`) is `if msg=$(cadence-hooks doctor --quiet
+/// 2>/dev/null)`, so stderr is discarded there — a stderr route would leave a
+/// fully-bypassed session silent at exactly the moment the operator and the
+/// agent are told what the session's posture is. Nothing is printed when
+/// enforcement is fully active, so a clean session's quiet output stays
+/// byte-identical; the "enforcement active" line is an unquiet-mode statement
+/// only. Every operator-supplied byte in these lines goes through
+/// `bypass_report`'s allowlist sanitizer before it reaches that stdout.
 ///
 /// `prune` switches to the orphaned-cache-dir listing/removal mode (see
 /// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
@@ -2615,8 +2588,10 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
     // live machine's plugin cache, so it is as true under `--root` as without
     // it. Printed first because a bypassed session makes every finding below it
     // a statement about hooks that are not currently running.
-    if !quiet {
-        print_bypass_status();
+    if quiet {
+        crate::bypass_report::print_suppression_only();
+    } else {
+        crate::bypass_report::print_bypass_status();
     }
 
     // Resolve the install channel once — it's process-invariant, so the scan
@@ -2855,88 +2830,6 @@ mod tests {
     use super::*;
     use cadence_hooks_core::capability::is_executable_at;
     use std::fs;
-
-    // ── Resolved bypass state reporting (#567) ──────────────────────────────
-
-    #[test]
-    fn a_clean_environment_states_that_enforcement_is_active() {
-        let lines = bypass_status_lines(None, None);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("enforcement active"), "{lines:?}");
-    }
-
-    /// The gap #567 asked to close: before this, `doctor` ran clean under a
-    /// blanket bypass, so the one command an operator uses to ask "is this
-    /// working?" could not say that nothing was enforcing.
-    #[test]
-    fn a_blanket_bypass_is_never_silent() {
-        let lines = bypass_status_lines(Some("1"), None);
-        assert!(
-            lines.iter().any(|l| l.contains("CADENCE_BYPASS=1")),
-            "{lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("enforcement active")),
-            "a bypassed session must not also be reported as enforcing: {lines:?}"
-        );
-    }
-
-    /// Unknown values fail toward reporting enforcement, matching what the
-    /// resolver actually does — the report and the behaviour move together.
-    #[test]
-    fn an_unrecognised_bypass_value_reports_enforcement_active() {
-        for value in ["0", "", "true", "yes", " 1"] {
-            let lines = bypass_status_lines(Some(value), None);
-            assert_eq!(lines.len(), 1, "CADENCE_BYPASS={value:?}: {lines:?}");
-            assert!(
-                lines[0].contains("enforcement active"),
-                "CADENCE_BYPASS={value:?}: {lines:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_refused_disable_is_reported_as_refused_not_as_disabled() {
-        let lines = bypass_status_lines(None, Some("git-safety"));
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("disable refused"), "{lines:?}");
-        assert!(
-            !lines[0].contains("Disabled via"),
-            "a refused disable must not read as a disable: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn an_honoured_disable_is_named_in_the_doctor_report() {
-        let lines = bypass_status_lines(None, Some("warn-main-branch"));
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("warn-main-branch"), "{lines:?}");
-        assert!(
-            lines[0].contains("Disabled via CADENCE_DISABLE"),
-            "{lines:?}"
-        );
-    }
-
-    /// Every line carries the `cadence-hooks doctor:` prefix the rest of the
-    /// report uses, so a caller grepping that prefix cannot miss the one line
-    /// that says nothing is enforcing.
-    #[test]
-    fn every_bypass_status_line_carries_the_doctor_prefix() {
-        let cases = [
-            (None, None),
-            (Some("1"), None),
-            (None, Some("warn-main-branch,git-safety,not-a-hook")),
-            (Some("1"), Some("warn-main-branch")),
-        ];
-        for (bypass_raw, disable_raw) in cases {
-            for line in bypass_status_lines(bypass_raw, disable_raw) {
-                assert!(
-                    line.starts_with("cadence-hooks doctor: "),
-                    "{bypass_raw:?}/{disable_raw:?}: {line}"
-                );
-            }
-        }
-    }
 
     // ── Finding::render sanitization (#440) ─────────────────────────────────
 

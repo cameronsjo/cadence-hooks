@@ -331,6 +331,47 @@ mod tests {
             (None, Some("guard"), UNPROTECTED, BypassState::Enforced),
             (None, Some("*"), UNPROTECTED, BypassState::Enforced),
             (None, Some("all"), UNPROTECTED, BypassState::Enforced),
+            // A duplicate entry is still one ask, and resolves the same way it
+            // would alone — for both the honoured and the refused branch.
+            (
+                None,
+                Some(&format!("{UNPROTECTED},{UNPROTECTED}")),
+                UNPROTECTED,
+                BypassState::Disabled,
+            ),
+            (
+                None,
+                Some(&format!("{PROTECTED},{PROTECTED}")),
+                PROTECTED,
+                BypassState::DisableRefused,
+            ),
+            // One mixed list, read twice: each hook gets its own outcome, and a
+            // protected name in the list does not make the unprotected one
+            // refused (or vice versa).
+            (
+                None,
+                Some(&format!("{UNPROTECTED},{PROTECTED}")),
+                UNPROTECTED,
+                BypassState::Disabled,
+            ),
+            (
+                None,
+                Some(&format!("{UNPROTECTED},{PROTECTED}")),
+                PROTECTED,
+                BypassState::DisableRefused,
+            ),
+            // A degenerate value names nothing, so a PROTECTED hook is plain
+            // Enforced — never DisableRefused. The distinction matters: the
+            // report surfaces claim an operator *asked* for something whenever
+            // a hook reads DisableRefused, and an empty variable is not an ask.
+            (None, Some(""), PROTECTED, BypassState::Enforced),
+            (None, Some(" "), PROTECTED, BypassState::Enforced),
+            (None, Some(","), PROTECTED, BypassState::Enforced),
+            // Trimming applies to the *list entries*, not to the hook name the
+            // caller passes in. A caller handing over a padded name is asking
+            // about a hook that does not exist, and gets the fail-toward-
+            // enforced answer rather than a fuzzy match.
+            (None, Some(UNPROTECTED), " guard-rm", BypassState::Enforced),
         ];
 
         for (bypass, disable, hook, expected) in rows {
