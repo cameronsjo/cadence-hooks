@@ -976,8 +976,8 @@ mod tests {
     }
 
     /// The cadence-hooks#559 report table as a regression pin, plus one row
-    /// (`find …`) that report did not name — the `*find*` glob a sibling hook
-    /// ships behind drags it in, and this guard must stay silent on it too.
+    /// (`find …`) that report did not name — a substring prefilter on a
+    /// delete verb drags it in, and this guard must stay silent on it too.
     ///
     /// Filed against 0.70.0 against a guard that scanned the whole command
     /// string for `rm`, so `echo confirm`, `echo thermal` and a `gh` query

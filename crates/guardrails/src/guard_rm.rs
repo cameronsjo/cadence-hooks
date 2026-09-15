@@ -73,20 +73,22 @@
 //!   shell moves a variable through more routes than a parser at this altitude
 //!   can enumerate, so an unexpanded variable stays ASK.
 //!
-//! **Wiring: the binary is the filter, the `if:` glob is not.** The plugin
-//! gates this guard behind `"if": "Bash(*rm*)"`, which is a substring glob over
-//! the whole command string with no word boundary, no command-head notion, and
-//! no case folding (measured — see `docs/hooks.md` § Wiring prefilters for the
-//! table). Two consequences, opposite in direction and both load-bearing here:
+//! **Wiring: the binary is the filter, the `if:` prefilter is not.** The plugin
+//! registers this guard behind a case-sensitive substring glob, which matches
+//! over the whole command string with no word boundary and no command-head
+//! notion (the platform behaviour is measured in `docs/hooks.md` § Wiring
+//! prefilters; the registration itself lives in the plugin repo, and replacing
+//! it is tracked on cadence-hooks#597). Two consequences, opposite in direction
+//! and both load-bearing here:
 //!
 //! - **It over-fires.** `echo confirm`, `git format-patch`, `terraform apply`,
-//!   `npm run warm-cache` and `./perform-migration.sh` all carry the letters
-//!   `rm` inside an ordinary word and all spawn this guard. That costs a
-//!   process and nothing else *only because* the verb test below is a
+//!   `npm run warm-cache` and `./perform-migration.sh` all carry a delete
+//!   verb's letters inside an ordinary word, and all spawn this guard. That
+//!   costs a process and nothing else *only because* the verb test below is a
 //!   tokenized command-head match: an ordinary command must reach a silent
 //!   ALLOW. `prefilter_false_positives_stay_silent` pins the corpus
 //!   (cadence-hooks#597, whose own word list also named `chmod` — which
-//!   contains no `rm` and never matched anything).
+//!   carries none of those letters and never matched anything).
 //! - **It under-fires.** The prefilter in the plugin wiring matches
 //!   case-sensitively, while this guard's verb match does not — so the ASCII
 //!   case folding below is exercised only on what the wiring hands the binary,
@@ -3570,8 +3572,8 @@ mod tests {
 
     // --- #597 / #577: the wiring prefilter is coarse in both directions ---
 
-    /// Every command the shipped `Bash(*rm*)` glob drags in that is not a
-    /// deletion must reach a silent ALLOW, judged from `$HOME` — the strictest
+    /// Every command a substring prefilter drags in that is not a deletion
+    /// must reach a silent ALLOW, judged from `$HOME` — the strictest
     /// cwd this guard has, so an accidental match here would be a BLOCK on an
     /// ordinary command rather than a survivable prompt.
     ///
@@ -3581,10 +3583,10 @@ mod tests {
     /// what makes that true. The words are the ones that actually contain the
     /// substring — `confi`**`rm`**, `fo`**`rm`**`at`, `terrafo`**`rm`**,
     /// `wa`**`rm`**, `perfo`**`rm`** — plus a sample of commands carrying no
-    /// `rm` at all, which the prefilter never passed and the binary must still
-    /// handle once it does. The corpus covers the other four shipped globs too
-    /// (`*unlink*`, `*shred*`, `*truncate*`, `*find*`), since dropping the
-    /// prefilter drops all five and each one drags in its own non-deletions.
+    /// `rm` at all, which a prefilter would not have passed and the binary
+    /// must still handle once it stops filtering. The corpus also covers the
+    /// other delete verbs this guard folds, and `find`, since each one's
+    /// letters turn up inside its own set of ordinary commands.
     #[test]
     fn prefilter_false_positives_stay_silent() {
         for command in [
@@ -3606,10 +3608,8 @@ mod tests {
             "mkdir -p build/out",
             "docker compose up -d",
             "kubectl get pods",
-            // The other four shipped globs (`*unlink*`, `*shred*`,
-            // `*truncate*`, `*find*`) drag in their own words. `*find*` is the
-            // widest of them: it matches every `find` invocation and any flag
-            // spelling it appears in. All six were probed with cwd=$HOME.
+            // The remaining delete verbs, and `find`, turn up inside their own
+            // ordinary words. All six rows below were probed with cwd=$HOME.
             "find . -name '*.rs' -print",
             "find . -type f -exec grep -l x {} +",
             "git log --find-renames",
@@ -3633,10 +3633,8 @@ mod tests {
     ///
     /// The case rows are the ones cadence-hooks#577 is about. `command_word`
     /// folds ASCII case (`fold_verb`, cadence-hooks#488/#528), so the binary
-    /// has always judged `RM`; the shipped case-sensitive `Bash(*rm*)` glob is
-    /// the only reason production never saw one. Verified live by neutering
-    /// `fold_verb`, which flips exactly these two rows to ALLOW and leaves the
-    /// rest untouched.
+    /// has always judged `RM`. Verified live by neutering `fold_verb`, which
+    /// flips exactly these two rows to ALLOW and leaves the rest untouched.
     #[test]
     fn prefilter_true_positives_still_judge() {
         for (command, expected) in [
