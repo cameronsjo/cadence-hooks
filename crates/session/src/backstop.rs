@@ -178,6 +178,12 @@ const MAX_MARKER_BYTES: u64 = 64 * 1024;
 /// Read the marker, if present, small enough, and parseable. A torn, corrupt,
 /// or oversized marker reads as absent (fail open — a missed nudge, never a
 /// break).
+///
+/// Reading as absent also means it is not consumed: `run_warn` deletes only a
+/// marker it read. That is deliberate for the oversized case — a file that big
+/// was not written by a scan (a scan writes at most [`MAX_WORKTREES`] entries),
+/// so it may well be a tracked file this binary has no business deleting, and
+/// the cost of leaving it is one `metadata` call per session start.
 fn read_marker(dir: &Path) -> Option<LooseEndMarker> {
     let path = marker_path(dir);
     // Size first: the file sits in a shared checkout, so its size is chosen by
