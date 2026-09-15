@@ -44,13 +44,19 @@
 //! **before** the amend, then by that segment's `-C` chain. A `cd` written
 //! inside a quoted argument is one token and moves nothing, and a `cd` after
 //! the amend moves nothing either — both were live misreads before
-//! cadence-hooks#610's security review. A `cd` inside a subshell or a loop body
-//! is a named accepted miss: it does not move the parent shell's directory in
-//! every case, and guessing wrong points the probe at a different repository.
+//! cadence-hooks#610's security review.
 //!
-//! A `--git-dir` or `--work-tree` amend is skipped outright. Its repository is
-//! not the segment's directory, so probing there would answer a confident
-//! question about the wrong repo — silence is the honest result.
+//! **A `cd` anywhere else in a segment silences that segment.** A `cd` inside a
+//! wrapper, a subshell, or a loop body is not an accepted miss; it is a
+//! deliberate silence. Amend detection descends into those wrappers while
+//! directory resolution cannot follow them, so `sh -c 'cd /b && git commit
+//! --amend'` run from repo A used to nudge naming *A's* refs about a commit in
+//! B — a confident wrong answer, which is worse than saying nothing.
+//!
+//! A `--git-dir` or `--work-tree` amend is skipped outright, and so is a
+//! `GIT_DIR=`/`GIT_WORK_TREE=` env prefix (bare or behind `env`). Its
+//! repository is not the segment's directory, so probing there would answer a
+//! confident question about the wrong repo — silence is the honest result.
 //!
 //! Every miss is a lost nudge, never a bypassed block: the check has no block
 //! arm.
@@ -58,7 +64,8 @@
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
     GitOutput, command_segments, command_word, executable_tokens, git_output_detailed,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
+    is_transparent_prefix_word, resolve_cd_target, skip_transparent_prefixes,
+    split_segments_with_ops,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -108,14 +115,22 @@ fn is_amend_flag(token: &str) -> bool {
 /// data, not a flag: `git commit -m --amend` sets a commit *message*, it does
 /// not amend. Prefix-matched for the same reason [`is_amend_flag`] is — git
 /// accepts any unambiguous abbreviation.
+///
+/// **Only options whose argument is REQUIRED belong here.** git's three
+/// optional-argument commit options — `-S`/`--gpg-sign[=<keyid>]` and
+/// `-u`/`--untracked-files[=<mode>]` — take a value only when it is *attached*
+/// with `=`, so the following word is the next flag, not their argument. Listed
+/// here they swallowed it: measured on git 2.55.0, `git commit -S --amend`,
+/// `git commit -u --amend` and `git commit --untracked-files --amend` all amend,
+/// and the guard read every one of them as a non-amend and stayed silent. An
+/// `=`-attached spelling carries its own value and is handled by the
+/// [`takes_separate_value`] `=` test, so dropping them loses nothing.
 const COMMIT_VALUE_OPTS: &[&str] = &[
     "-m",
     "-c",
     "-C",
     "-F",
     "-t",
-    "-S",
-    "-u",
     "--message",
     "--file",
     "--author",
@@ -127,7 +142,6 @@ const COMMIT_VALUE_OPTS: &[&str] = &[
     "--cleanup",
     "--template",
     "--trailer",
-    "--untracked-files",
     "--pathspec-from-file",
 ];
 
@@ -208,7 +222,14 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     let mut effective = cwd.to_string();
 
+    if has_an_unfollowable_cd(command) {
+        return dirs;
+    }
+
     for (segment, _op) in split_segments_with_ops(command) {
+        let tokens = executable_tokens(&segment);
+        let leads_with_cd = tokens.first().map(String::as_str) == Some("cd");
+
         for inner in command_segments(&segment) {
             if let Some(dir) = amend_dir_of(&executable_tokens(&inner), &effective)
                 && !dirs.contains(&dir)
@@ -220,15 +241,70 @@ fn amend_target_dirs(command: &str, cwd: &str) -> Vec<String> {
         // A `cd` applies to what comes AFTER it, so this runs once the segment
         // has been examined. Only the segment's own leading `cd` counts: a `cd`
         // inside a quoted argument is a single token and never reaches here.
-        let tokens = executable_tokens(&segment);
-        if tokens.first().map(String::as_str) == Some("cd")
-            && let Some(target) = tokens.get(1)
-        {
+        if leads_with_cd && let Some(target) = tokens.get(1) {
             effective = resolve_cd_target(target, &effective);
         }
     }
 
     dirs
+}
+
+/// True when `command` carries a `cd` this walk cannot follow, which makes
+/// every amend in it unresolvable.
+///
+/// Exactly one shape is followable: a `cd` that is a top-level segment's own
+/// leading command, outside any subshell. Everything else — a `cd` inside a
+/// wrapper's script (`sh -c 'cd /b && git commit --amend'`), inside a subshell
+/// (`( cd /b && … )`), or inside a loop body — moves the amend somewhere
+/// directory resolution does not go, while amend DETECTION descends into all of
+/// them ([`command_segments`]). That disagreement produced a confident wrong
+/// answer rather than a miss: run from repo A, those commands nudged naming
+/// *A's* remote refs about a commit being rewritten in B.
+///
+/// The whole command is silenced rather than the one segment, because
+/// [`split_segments_with_ops`] splits a subshell into ordinary top-level
+/// segments and drops the pairing: `( cd /b && git commit --amend )` arrives as
+/// `( cd /b` and `git commit --amend )`, so the amend cannot be matched back to
+/// the subshell that moved it. A stray `(` or `)` in a segment is the only
+/// remaining tell. Silence costs a nudge; guessing costs a wrong one.
+fn has_an_unfollowable_cd(command: &str) -> bool {
+    split_segments_with_ops(command)
+        .iter()
+        .any(|(segment, _op)| {
+            let opens_a_subshell = segment.contains('(') || segment.contains(')');
+            let leads_with_cd =
+                executable_tokens(segment).first().map(String::as_str) == Some("cd");
+            if leads_with_cd && !opens_a_subshell {
+                return false;
+            }
+            command_segments(segment)
+                .iter()
+                .any(|inner| executable_tokens(inner).first().map(String::as_str) == Some("cd"))
+        })
+}
+
+/// True when the leading assignment words set `GIT_DIR` or `GIT_WORK_TREE`.
+///
+/// `GIT_DIR=/other/.git git commit --amend` names a target repository exactly
+/// as plainly as `--git-dir` does, and [`skip_transparent_prefixes`] discards
+/// those words before [`redirects_repository`] ever sees them — so the flag
+/// spelling was refused while the env spelling produced a nudge naming the
+/// SESSION's refs for a commit in another repo. Walks the same leading region
+/// as `skip_transparent_prefixes`, over the shared
+/// [`is_transparent_prefix_word`] predicate, so assignments behind `env` (`env
+/// GIT_DIR=… git commit`) are seen too and the two walks cannot disagree about
+/// where the region ends. Mirrors `guardrails::enforce_worktree`'s
+/// `git_env_overrides`, which reads the same two variables for the same reason.
+fn sets_git_repo_env(tokens: &[String]) -> bool {
+    let mut idx = 0;
+    while idx + 1 < tokens.len() && is_transparent_prefix_word(tokens, idx) {
+        let token = tokens[idx].as_str();
+        if token.starts_with("GIT_DIR=") || token.starts_with("GIT_WORK_TREE=") {
+            return true;
+        }
+        idx += 1;
+    }
+    false
 }
 
 /// The directory an amending `git commit` in `argv` would run in, or `None`
@@ -271,8 +347,10 @@ fn amend_dir_of(tokens: &[String], effective: &str) -> Option<String> {
     }
     // The repository is elsewhere and this check cannot say where — answering
     // about the segment's directory would be a confident answer about the wrong
-    // repo.
-    if redirects_repository(&argv[..idx]) {
+    // repo. Both spellings count: the `--git-dir`/`--work-tree` flags, and the
+    // `GIT_DIR=`/`GIT_WORK_TREE=` env prefix the flag walk never sees because
+    // `skip_transparent_prefixes` already dropped it.
+    if redirects_repository(&argv[..idx]) || sets_git_repo_env(tokens) {
         return None;
     }
 
@@ -575,6 +653,98 @@ mod tests {
                 "{command} amends the session's own repo, so it is owed a nudge"
             );
         }
+    }
+
+    #[test]
+    fn a_git_repo_env_prefix_silences_the_segment() {
+        // Each of these names another repository through the environment. The
+        // flag spelling was already refused; `skip_transparent_prefixes` drops
+        // the assignment words before the flag walk sees them, so the env
+        // spelling used to nudge naming the SESSION's refs for a commit made
+        // elsewhere.
+        for command in [
+            "GIT_DIR=/other/.git git commit --amend",
+            "GIT_WORK_TREE=/other GIT_DIR=/other/.git git commit --amend",
+            "env GIT_DIR=/other/.git git commit --amend",
+            "GIT_WORK_TREE=/other git commit --amend",
+        ] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} names another repo through the environment"
+            );
+        }
+        // Positive control: the same amend with no env prefix still resolves.
+        assert_eq!(
+            amend_target_dirs("git commit --amend", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        // An unrelated assignment word is not a repository redirect.
+        assert_eq!(
+            amend_target_dirs("FOO=bar git commit --amend", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_cd_inside_a_wrapper_silences_the_segment() {
+        // Amend detection descends into these; directory resolution cannot
+        // follow. Nudging would name the session's own refs for a commit made
+        // in another repo.
+        for command in [
+            "sh -c 'cd /b && git commit --amend'",
+            "bash -c 'cd /b; git commit --amend'",
+            "( cd /b && git commit --amend )",
+        ] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} moves the amend somewhere this walk cannot follow"
+            );
+        }
+        // A top-level `cd` is followed, and keeps its existing behavior.
+        assert_eq!(
+            amend_target_dirs("cd /b && git commit --amend", "/cwd"),
+            vec!["/b".to_string()]
+        );
+        // A wrapper with no `cd` is still read.
+        assert_eq!(
+            amend_target_dirs("sh -c 'git commit --amend'", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_optional_argument_option_does_not_swallow_the_amend() {
+        // git 2.55.0 amends on every one of these: `-S`/`--gpg-sign` and
+        // `-u`/`--untracked-files` take a value only when attached with `=`.
+        for command in [
+            "git commit -S --amend",
+            "git commit -u --amend",
+            "git commit --untracked-files --amend",
+            "git commit --gpg-sign --amend",
+        ] {
+            assert_eq!(
+                amend_target_dirs(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command} amends, so it is owed a nudge"
+            );
+        }
+        // Controls: no amend anywhere in these, so they stay silent.
+        for command in ["git commit -S -m x", "git commit -u --no-edit"] {
+            assert!(
+                amend_target_dirs(command, "/cwd").is_empty(),
+                "{command} does not amend"
+            );
+        }
+        // An option whose argument really is required still consumes it, and an
+        // `=`-attached optional argument is still its own value.
+        assert!(
+            amend_target_dirs("git commit -m --amend", "/cwd").is_empty(),
+            "-m takes a required value, which happens to spell the flag"
+        );
+        assert_eq!(
+            amend_target_dirs("git commit --untracked-files=no --amend", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
     }
 
     #[test]
