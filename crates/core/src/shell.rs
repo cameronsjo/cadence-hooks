@@ -150,6 +150,55 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
     Some(j)
 }
 
+/// True when `segment` is a FRAGMENT of a command rather than a whole one: its
+/// unquoted grouping syntax does not close.
+///
+/// [`split_segments_with_ops`] cuts on `;`, `&&`, `|` and friends wherever they
+/// are not inside a quoted run — including when they sit inside a command
+/// substitution, which it does not track. So `git log $(git rev-parse HEAD; cd
+/// /b)` arrives as two segments, and the second one, `cd /b)`, looks exactly
+/// like a top-level `cd` to any caller reading tokens alone. A caller that acts
+/// on a segment's shape needs to know it was handed half of one.
+///
+/// Two tells, both counted only OUTSIDE quotes via [`scan_quote_syntax`], which
+/// is why this lives here rather than in a caller counting raw characters:
+///
+/// - parentheses that do not balance — a subshell opener, or the residue of a
+///   `$( … )` cut;
+/// - an odd number of backticks — the same cut through a `` `…` `` substitution,
+///   which contains no paren at all.
+///
+/// Asking the shared scanner is what keeps quoted text out of the count. A raw
+/// count is wrong in both directions: `git commit -m "done :)"` and
+/// `-m 'fix(scope): x'` are whole commands that a raw count calls fragments,
+/// while `git log $(echo ')' ; cd /b ; git log '(' )` hides a real cut behind
+/// quoted parens that a raw count sees as balanced. An escaped `\(` outside
+/// quotes is likewise not grouping syntax and is not counted.
+pub fn has_unbalanced_groups(segment: &str) -> bool {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut quote: Option<Quote> = None;
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    let mut backticks = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        // `Some` means the scanner consumed quoting syntax, or an ordinary
+        // character INSIDE a quoted run. Only `None` is unquoted plain text.
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
+            continue;
+        }
+        match chars[i] {
+            '(' => opens += 1,
+            ')' => closes += 1,
+            '`' => backticks += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    opens != closes || backticks % 2 == 1
+}
+
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
 ///
 /// Content inside matching `'` or `"` pairs stays in one token with the quotes
@@ -5582,6 +5631,44 @@ mod tests {
             out.iter().any(|s| s.contains("rm -rf ~/Documents")),
             "escaped space opened a bogus comment: {out:?}"
         );
+    }
+
+    #[test]
+    fn unbalanced_groups_counts_only_unquoted_syntax() {
+        // Whole commands: balanced, or carrying parens that are text.
+        for whole in [
+            "git commit --amend",
+            "git commit --amend -m \"$(date)\"",
+            "git commit --amend -m \"built `date`\"",
+            "git commit --amend -m \"done :)\"",
+            "git commit --amend -m \"(wip\"",
+            "git commit --amend -m 'fix(scope): x'",
+            "cd '/tmp/old (archive)'",
+            // Escaped outside quotes is not grouping syntax either.
+            "echo \\( ",
+        ] {
+            assert!(
+                !has_unbalanced_groups(whole),
+                "{whole:?} is a whole command"
+            );
+        }
+        // Fragments: what a split inside a substitution leaves behind, in each
+        // spelling, plus a subshell opener and closer.
+        for fragment in [
+            "git log $(git rev-parse HEAD",
+            "cd /b)",
+            "git log `git rev-parse HEAD",
+            "git status`",
+            "( cd /b",
+            "git commit --amend )",
+            // Quoted parens must not balance out a real cut.
+            "git log $(echo ')'",
+        ] {
+            assert!(
+                has_unbalanced_groups(fragment),
+                "{fragment:?} is a fragment"
+            );
+        }
     }
 
     #[test]

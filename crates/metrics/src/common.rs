@@ -311,43 +311,18 @@ pub fn display_safe(s: &str) -> String {
 /// agent's context invisibly: any Cc control, any Cf format character, or the
 /// Unicode line/paragraph separators.
 ///
-/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
-/// stays dependency-free — but the enumeration is deliberately the **whole**
-/// category, not just the famous blocks. Partial coverage is the trap: the
-/// obvious primitives (U+202E, the isolates) protect a *terminal*, while the
-/// primitive that matters for the agent-context sink is the **Tags** block
-/// (U+E0000–U+E007F). `U+E0001` plus `U+E0020`–`U+E007F` encodes arbitrary
-/// ASCII that renders as nothing at all yet survives into `additionalContext`
-/// and through most tokenizers — invisible text smuggling, and it is Cf, so
-/// `is_control` passes it and no bidi-shaped range catches it.
-///
-/// So the list below is maintained against the Unicode Cf category as a whole.
-/// If a future Unicode release adds a Cf block, it belongs here. `is_control`
-/// already covers Cc.
+/// **The range list now lives in
+/// [`cadence_hooks_core::display::is_invisible_or_control`]**, which
+/// `core::display::sanitize_field` also uses. It was maintained here while that
+/// sanitizer — the one every *hook message* goes through — carried a shorter,
+/// bidi-shaped enumeration that passed U+2028/U+2029, U+2060–U+2064, U+061C,
+/// U+180E and the whole Tags block. Two lists for one question is how that gap
+/// stayed open, so there is one list, in the crate both sides already depend on
+/// (cadence-hooks#610 Gate 2). This wrapper stays because the two sinks differ
+/// in what they DO with the verdict: metrics filters the character out, hook
+/// text replaces it with a space.
 fn is_display_unsafe(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{2028}' | '\u{2029}'          // line / paragraph separator
-            | '\u{00AD}'                      // soft hyphen
-            | '\u{0600}'..='\u{0605}'         // Arabic number signs
-            | '\u{061C}'                      // Arabic letter mark
-            | '\u{06DD}' | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'         // Arabic pound / piastre marks
-            | '\u{08E2}'
-            | '\u{180E}'                      // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
-            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
-            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}'         // directional isolates
-            | '\u{206A}'..='\u{206F}'         // deprecated format controls
-            | '\u{FEFF}'                      // zero-width no-break space (BOM)
-            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
-            | '\u{110BD}' | '\u{110CD}'       // Kaithi number sign
-            | '\u{13430}'..='\u{1343F}'       // Egyptian hieroglyph format
-            | '\u{1BCA0}'..='\u{1BCA3}'       // shorthand format controls
-            | '\u{1D173}'..='\u{1D17A}'       // musical beam / phrase controls
-            | '\u{E0000}'..='\u{E007F}'       // TAGS — invisible text smuggling
-        )
+    cadence_hooks_core::display::is_invisible_or_control(c)
 }
 
 /// [`display_safe`] plus a character ceiling — filtering alone bounds the
@@ -469,6 +444,33 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_safe_is_unchanged_by_the_move_to_core() {
+        // One fixture carrying every class the range list covers, pinned as a
+        // whole. `is_display_unsafe` now delegates to
+        // `core::display::is_invisible_or_control`; this is what says the
+        // delegation did not quietly change what `display_safe` strips.
+        let every_class = concat!(
+            "start",
+            "\u{0007}",  // Cc: bell
+            "\n",        // Cc: newline
+            "\u{00AD}",  // soft hyphen
+            "\u{061C}",  // Arabic letter mark
+            "\u{180E}",  // Mongolian vowel separator
+            "\u{200B}",  // zero-width space
+            "\u{202E}",  // right-to-left override
+            "\u{2028}",  // line separator
+            "\u{2060}",  // word joiner
+            "\u{2066}",  // first strong isolate
+            "\u{FEFF}",  // BOM
+            "\u{FFF9}",  // interlinear annotation anchor
+            "\u{1D173}", // musical beam
+            "\u{E0041}", // Tags block
+            "-café-日本-🚀",
+        );
+        assert_eq!(display_safe(every_class), "start-café-日本-🚀");
+    }
 
     // `metrics_dir`'s resolution order is tested through the pure(-ish)
     // `metrics_dir_from` helper against a temp-dir fixture, so these never
