@@ -55,8 +55,13 @@
 //!   The variable is a switch with one on-position, not a truthiness test, so a
 //!   value nobody defined can never silently disarm the binary.
 //! - A `CADENCE_DISABLE` entry that matches no registered hook disables
-//!   nothing. A near-miss (`Guard-Rm`, `guard_rm`, `guard-rm-liveness` when
+//!   nothing. A near-miss (`Guard-Rm`, `guard_rm`, `guard-rm-live` when
 //!   `guard-rm` was meant) is a near-miss, not a fuzzy match.
+//! - A name that *extends* a hook name is a different hook, not a near-miss:
+//!   `guard-rm-liveness` is registered, so naming it disables **it** and leaves
+//!   `guard-rm` running. Never cite it as an example of a name that disables
+//!   nothing — it is the check that reports `guard-rm`'s own switch, so the one
+//!   thing disabling it actually does is hide that report.
 //! - Either variable holding non-UTF-8 bytes reads as unset.
 //!
 //! The direction is deliberate and is the whole point of the extraction:
@@ -314,8 +319,14 @@ mod tests {
             (Some(" 1"), None, UNPROTECTED, BypassState::Enforced),
             (Some("1 "), None, UNPROTECTED, BypassState::Enforced),
             (Some("11"), None, UNPROTECTED, BypassState::Enforced),
-            // Unknown CADENCE_DISABLE entries fail toward ENFORCED — no
-            // case-folding, no separator fuzzing, no prefix matching.
+            // A CADENCE_DISABLE value that does not name THIS hook leaves it
+            // enforcing — no case-folding, no separator fuzzing, no prefix
+            // matching.
+            //
+            // The `guard-rm-liveness` row is the odd one out and the reason
+            // this comment does not say "unknown": that name IS a registered
+            // hook. Naming it disables that hook; what the row pins is that it
+            // does not also disable `guard-rm`, whose name it merely extends.
             (None, Some(""), UNPROTECTED, BypassState::Enforced),
             (None, Some(","), UNPROTECTED, BypassState::Enforced),
             (None, Some("  "), UNPROTECTED, BypassState::Enforced),
