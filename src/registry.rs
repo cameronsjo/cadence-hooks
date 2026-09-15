@@ -656,9 +656,9 @@ pub fn is_known(namespace: &str, subcommand: &str) -> bool {
 ///
 /// Two callers, one question: "namespace mismatch" diagnostics, and the
 /// dispatch self-timing write, which tags a slow hook with its namespace.
-/// Until cadence-hooks#884 the second called a behaviorally identical `plugin_for`,
-/// whose name implied it answered the different question of which Claude Code
-/// plugin wires the hook. It never did.
+/// Until cadence-hooks#884 the second called a behaviorally identical
+/// `plugin_for`, whose name implied it answered the different question of
+/// which Claude Code plugin wires the hook. It never did.
 pub fn namespace_of(subcommand: &str) -> Option<&'static str> {
     HOOKS
         .iter()
