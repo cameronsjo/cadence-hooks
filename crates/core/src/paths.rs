@@ -248,15 +248,27 @@ pub fn claude_config_dir() -> PathBuf {
 /// Pure form: first non-empty comma entry of `config_dir`, `~`-expanded;
 /// else `<home>/.claude`.
 pub fn resolve_config_dir(config_dir: Option<&str>, home: &str) -> PathBuf {
-    if let Some(first) = config_dir.and_then(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .map(str::to_owned)
-    }) {
-        return expand_tilde_with(&first, home);
+    if let Some(first) = first_config_entry(config_dir) {
+        return expand_tilde_with(first, home);
     }
     PathBuf::from(home).join(".claude")
+}
+
+/// The first usable entry of a `CLAUDE_CONFIG_DIR` value: comma-split and
+/// trimmed, first non-empty one wins. The one place that rule is written.
+fn first_config_entry(config_dir: Option<&str>) -> Option<&str> {
+    config_dir.and_then(|raw| raw.split(',').map(str::trim).find(|s| !s.is_empty()))
+}
+
+/// Does a `CLAUDE_CONFIG_DIR` value carry at least one usable entry?
+///
+/// The predicate behind [`resolve_config_dir`]'s first branch, exposed so a
+/// caller that must decide *whether* a config dir was named — rather than
+/// which one — asks the same question the resolver answers, instead of a
+/// looser `!value.is_empty()` that accepts a degenerate `","` or `" "`
+/// the resolver itself treats as unset (cadence-hooks#599).
+pub fn config_dir_is_named(config_dir: Option<&str>) -> bool {
+    first_config_entry(config_dir).is_some()
 }
 
 /// Replace a leading `~/` (or a bare `~`) with `home`; pass other paths through.
@@ -336,6 +348,33 @@ mod tests {
             resolve_config_dir(Some(" , , "), "/home/test"),
             PathBuf::from("/home/test/.claude")
         );
+    }
+
+    #[test]
+    fn config_dir_is_named_agrees_with_the_resolver() {
+        // The predicate must answer "did this value name a dir?" for exactly
+        // the values `resolve_config_dir` takes its first branch on — the two
+        // reading the same value differently is the bug it exists to prevent.
+        for named in ["/custom/claude", "~/work-claude", ",/real", "  /spaced  "] {
+            assert!(config_dir_is_named(Some(named)), "{named:?} names a dir");
+            assert_ne!(
+                resolve_config_dir(Some(named), "/home/test"),
+                PathBuf::from("/home/test/.claude"),
+                "{named:?} must not fall back"
+            );
+        }
+        for unnamed in [",", " , , ", " ", ""] {
+            assert!(
+                !config_dir_is_named(Some(unnamed)),
+                "{unnamed:?} names none"
+            );
+            assert_eq!(
+                resolve_config_dir(Some(unnamed), "/home/test"),
+                PathBuf::from("/home/test/.claude"),
+                "{unnamed:?} must fall back"
+            );
+        }
+        assert!(!config_dir_is_named(None), "an unset var names none");
     }
 
     #[test]
