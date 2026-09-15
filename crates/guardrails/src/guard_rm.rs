@@ -87,12 +87,14 @@
 //!   ALLOW. `prefilter_false_positives_stay_silent` pins the corpus
 //!   (cadence-hooks#597, whose own word list also named `chmod` — which
 //!   contains no `rm` and never matched anything).
-//! - **It under-fires.** `RM -rf …` does not match `Bash(*rm*)`, so the ASCII
-//!   case folding this guard performs is unreachable through that filter —
-//!   correct in the unit tests below and dead in production (cadence-hooks#577).
-//!   Character classes are not supported either, so no cleverer glob buys the
-//!   coverage back. The fix is wiring-side: drop the `if:` and let this binary
-//!   filter, the way `obsidian::trash_guard` already does.
+//! - **It under-fires.** The prefilter in the plugin wiring matches
+//!   case-sensitively, while this guard's verb match does not — so the ASCII
+//!   case folding below is exercised only on what the wiring hands the binary,
+//!   which is narrower than the set of spellings the guard itself judges
+//!   (cadence-hooks#577). Character classes are not supported either, so no
+//!   cleverer glob widens it. The fix is wiring-side: drop the `if:` and let
+//!   this binary filter, the way `obsidian::trash_guard` already does; that
+//!   wiring is tracked on cadence-hooks#597.
 //!
 //! The fold itself lives in `shell::fold_verb`, reached through
 //! `shell::command_word`, and this guard reads it from **two** independent
