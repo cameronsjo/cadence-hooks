@@ -356,6 +356,8 @@ enum GuardrailsCommands {
     NudgeUpgradeAfterPush,
     /// Warn about untracked files during git commit operations
     WarnUntracked,
+    /// Warn when `git commit --amend` would rewrite a commit a remote already has
+    WarnAmendPushed,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
     /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
@@ -561,6 +563,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
+            GuardrailsCommands::WarnAmendPushed => "warn-amend-pushed",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::GuardRm => "guard-rm",
             GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
@@ -1195,6 +1198,11 @@ fn main() {
             ),
             GuardrailsCommands::WarnUntracked => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::WarnAmendPushed => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_amend_pushed::WarnAmendPushed,
                 pre,
                 canonical_hook,
             ),
