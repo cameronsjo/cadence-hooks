@@ -354,6 +354,16 @@ enum GuardrailsCommands {
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
     WarnPrIssueLink,
+    /// Measure gh pr/issue bodies against a per-surface word budget
+    GuardBodyBudget {
+        /// Measure this file instead of running as a hook: prints one JSON
+        /// line and exits without reading stdin.
+        #[arg(long, value_name = "FILE")]
+        measure: Option<String>,
+        /// Surface to measure against: `pr`, `comment`, or `issue`.
+        #[arg(long, value_name = "SURFACE", default_value = "pr")]
+        surface: String,
+    },
     /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
     WarnIssueTracker,
     /// Nudge on repo create/publicize when name or description telegraphs sensitive content
@@ -555,6 +565,14 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
+            // `--measure` is a CLI action, not a hook: it reads a file the
+            // operator named, prints one JSON line, and never touches stdin.
+            // Resolving it to the hook name would let CADENCE_DISABLE exit
+            // before anything was printed, breaking the one-line contract.
+            GuardrailsCommands::GuardBodyBudget {
+                measure: Some(_), ..
+            } => return None,
+            GuardrailsCommands::GuardBodyBudget { .. } => "guard-body-budget",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
@@ -1225,6 +1243,17 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
+            GuardrailsCommands::GuardBodyBudget { measure, surface } => match measure {
+                Some(file) => process::exit(
+                    cadence_hooks_guardrails::guard_body_budget::run_measure(&file, &surface)
+                        .into(),
+                ),
+                None => dispatch::run_logged_check(
+                    &cadence_hooks_guardrails::guard_body_budget::GuardBodyBudget,
+                    pre,
+                    canonical_hook,
+                ),
+            },
             GuardrailsCommands::WarnIssueTracker => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
                 pre,

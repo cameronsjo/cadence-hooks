@@ -84,6 +84,99 @@ invalid JSON is ignored and the block stands (fail-open, ADR-0001).
 entry in document order that matches both the path and the term decides. An entry
 matches the term when `terms` is omitted/empty or contains it.
 
+### `body_budget` — size the gh body budgets
+
+`guard-body-budget` measures the body a `gh` posting command would send and
+compares it with a per-surface word budget. Three surfaces, each with a soft
+budget (nudge), a hard budget (block), and a header cap:
+
+| Surface | Commands | Soft | Hard | Header cap |
+|---------|----------|-----:|-----:|-----------:|
+| PR | `gh pr create`, `gh pr edit` | 150 | 300 | 4 |
+| Comment | `gh pr review`, `gh pr comment`, `gh issue comment` | 100 | 200 | 2 |
+| Issue | `gh issue create`, `gh issue edit` | 200 | 400 | 5 |
+
+Budgets are written `[soft, hard]` in the config section and `soft:hard` in the
+environment. Environment wins over config, config over the default.
+
+```jsonc
+{
+  "version": 1,
+  "body_budget": {
+    "pr": [200, 400],
+    "comment": [100, 200],
+    "issue": [300, 600],
+    "mode": "nudge"
+  }
+}
+```
+
+**Mode.** `nudge` (the default this release ships with) produces the block text
+and exits 0, saying it would block once the mode flips. `block` makes the hard
+ceiling a real block.
+
+**What is measured.** Fenced code blocks, HTML comments, the `Session-Id` /
+`Model` / `Harness` / `Machine` / `Co-Authored-By` trailers, the
+`🤖 Generated with [Claude Code]` line, markdown link targets and inline code
+spans are all stripped before counting, and cost nothing. A finding bullet — a
+line like `- crates/core/src/lib.rs:42 — this is never validated` — costs no
+words either; more than 15 of them nudges toward inline comments instead. Four
+things nudge on any surface regardless of length: headers over the cap, session
+narration (`this run`, `this session`, `round <n>`, `gate <n>`, `tranche`,
+`altitude`, `carrier`, `disposition`, `receipt`, `fold in` / `folded in`,
+`slated`, `ground truth`), more than 15 finding bullets, and a title over 72
+characters. Em-dashes and emoji are not measured.
+
+**The escape hatch.** A body file carrying
+
+```text
+<!-- body-budget: <reason, at least five words> -->
+```
+
+downgrades a hard-ceiling block to a nudge that echoes the reason, and silences
+the narration and header advisories for that call. The line is stripped before
+counting. It must live in the **body file**, never in the command line: a
+command string that could arm its own bypass is not a hatch. The ride-through is
+recorded in `bypasses.jsonl`.
+
+**Bounded override.** A configured hard ceiling is clamped to twice the default
+(PR 600, comment 400, issue 800). A larger value — from either channel — is
+refused with `(budget setting ignored: above the configured ceiling)` and the
+default applies. When a raised ceiling lets through a body the *default* ceiling
+would have blocked, that is recorded in `bypasses.jsonl` too, naming
+`CADENCE_BODY_BUDGET_*` or `body_budget config` as the mechanism.
+
+**Malformed values.** `soft >= hard`, a one-sided `150:`, a non-numeric value, a
+zero, or a config array of the wrong length all fall back to the **default**
+(not to the next tier down — quietly applying a different budget the operator
+also wrote would hide the typo). Every verdict for that call downgrades to a
+nudge whose first line is the parse error:
+
+```text
+CADENCE_BODY_BUDGET_PR: expected soft:hard, e.g. 150:300; got "600" — budget not applied this call
+```
+
+A non-default budget in effect is named in every message with its source, e.g.
+`(budget 400:800 from .claude/cadence.json)`.
+
+**Accepted gaps.** The guard measures what the command carries, so it is silent
+where there is nothing to measure — and each of these appends an `unmeasured`
+row to `failopen.jsonl` rather than blocking:
+
+- `gh pr create` with **no body flag** opens an editor; there is no body at hook time.
+- An **unreadable** or **non-UTF-8** body file (a write/hook race, a permission, a binary file).
+- A body file **over 1 MiB** is not read at all — that one is *not* silent: it produces the block text with `body not measured: file exceeds 1 MiB`.
+- A body assembled by a command substitution the guard cannot resolve to a literal.
+
+**Measuring a file by hand.** `cadence-hooks guardrails guard-body-budget
+--measure <file> --surface pr|comment|issue` prints one JSON line — the counts,
+the effective budget, and the verdict tier — reading the same environment and
+per-repo config a real run does.
+
+**Turning it off.** `CADENCE_DISABLE=guard-body-budget` in the repo's
+`.claude/settings.json` `env` block. `cadence-hooks list` shows what is
+disabled.
+
 ## Environment Variables
 
 All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
@@ -100,6 +193,10 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/cadence-ecosystem`, plus its pre-rename alias `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them, scoped to owners that appear in this set |
 | `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset. Also moves the owner-scope for the nudge |
+| `CADENCE_BODY_BUDGET_PR` | `guard-body-budget` | `soft:hard` word budget for a PR body (default `150:300`). Hard ceiling clamped to `600`; a malformed or over-ceiling value falls back to the default and nudges — see [`body_budget`](#body_budget--size-the-gh-body-budgets) |
+| `CADENCE_BODY_BUDGET_COMMENT` | `guard-body-budget` | `soft:hard` word budget for a review or comment body (default `100:200`, ceiling `400`) |
+| `CADENCE_BODY_BUDGET_ISSUE` | `guard-body-budget` | `soft:hard` word budget for an issue body (default `200:400`, ceiling `800`) |
+| `CADENCE_BODY_BUDGET_MODE` | `guard-body-budget` | `nudge` (default) or `block`. In `nudge` a hard-ceiling hit produces the block text and exits 0 |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
 | `CADENCE_ALLOW_MAIN` | `warn-main-branch`, `enforce-worktree` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to mark a repo where `main` is the working branch by design (dotfiles, vaults, scratchpads) — silences the main-branch warning and exempts the repo from worktree enforcement. `enforce-worktree` resolves this from process env OR the *target* repo's own tracked `.claude/settings.json`/`settings.local.json` (`settings.local` overriding `settings`) — so a cross-repo mutation into a by-design-main repo is exempt even when that repo isn't the session root |
 | `CADENCE_NO_ENFORCE_WORKTREE` | `enforce-worktree` | Set truthy (`1`/`true`/`yes`) to disable the primary-checkout block everywhere — the kill switch for the proving period; prefer `CADENCE_ALLOW_MAIN` per repo |
