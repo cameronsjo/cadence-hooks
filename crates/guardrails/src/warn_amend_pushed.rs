@@ -706,17 +706,21 @@ mod tests {
         let scratch = Scratch::new(&scratch_root(), "dash-c");
         let repo = repo_with_pushed_commit(&scratch);
 
-        // The session sits in the scratch root, which is not a repo at all; the
+        // The session sits in a tempdir outside any repo — Scratch's default root is inside the
+        // checkout, so a scratch cwd left this passing even if `-C` handling were deleted. The
         // `-C` is what makes the probe land on the pushed checkout.
+        let outside = tempfile::tempdir().unwrap();
         let command = format!("git -C {} commit --amend", repo.to_string_lossy());
-        let input = make_bash_with_cwd(&command, &scratch.path().to_string_lossy());
+        let input = make_bash_with_cwd(&command, &outside.path().to_string_lossy());
         assert_eq!(WarnAmendPushed.run(&input).outcome, Outcome::Nudge);
     }
 
     #[test]
     fn silent_outside_a_repository() {
-        let scratch = Scratch::new(&scratch_root(), "no-repo");
-        let input = make_bash_with_cwd("git commit --amend", &scratch.path().to_string_lossy());
+        // Scratch's default root is inside the checkout, so the "no repo" premise held only on a
+        // carve-out worktree; a tempdir is outside any repo everywhere.
+        let outside = tempfile::tempdir().unwrap();
+        let input = make_bash_with_cwd("git commit --amend", &outside.path().to_string_lossy());
         assert_eq!(WarnAmendPushed.run(&input).outcome, Outcome::Allow);
     }
 
