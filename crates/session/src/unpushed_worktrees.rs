@@ -497,4 +497,24 @@ detached
         init_repo(&repo);
         assert_eq!(default_remote_ref(&repo.to_string_lossy()), None);
     }
+
+    #[test]
+    fn a_repo_past_the_worktree_cap_is_truncated() {
+        let scratch = Scratch::new(&scratch_root(), "cap");
+        let repo = repo_with_remote(&scratch);
+        // One unpushed commit in the primary checkout too, so every candidate
+        // carries work and the cap is the only thing shortening the list.
+        std::fs::write(repo.join("own.txt"), "z").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "unpushed on main"]);
+        for i in 0..=MAX_WORKTREES {
+            let name = format!("cap{i}");
+            worktree_with_commits(&repo, &name, &format!("feat/{name}"), 1);
+        }
+
+        let scan = scan(&repo.to_string_lossy());
+
+        assert!(scan.truncated, "past the cap the scan says so: {scan:?}");
+        assert_eq!(scan.unpushed.len(), MAX_WORKTREES, "{scan:?}");
+    }
 }
