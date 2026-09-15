@@ -177,13 +177,17 @@ fn selects_amend(args: &[String]) -> bool {
 /// cannot resolve — `--git-dir` or `--work-tree`, in either spelling.
 fn redirects_repository(argv: &[String]) -> bool {
     argv.iter().enumerate().any(|(i, token)| {
-        matches!(token.as_str(), "--git-dir" | "--work-tree")
+        let names_a_redirect = matches!(token.as_str(), "--git-dir" | "--work-tree")
             || token.starts_with("--git-dir=")
-            || token.starts_with("--work-tree=")
-            // A value that merely LOOKS like one of these belongs to the
-            // preceding option and is not a redirect.
-            && i > 0
-            && !VALUE_GLOBALS.contains(&argv[i - 1].as_str())
+            || token.starts_with("--work-tree=");
+        // A value that merely LOOKS like one of these belongs to the preceding
+        // option and is not a redirect. Written as its own binding because `&&`
+        // binds tighter than `||`: inlined, this clause guarded only the last
+        // arm, so `git -c --git-dir=/other commit --amend` read as a redirect
+        // and silently dropped the nudge.
+        let belongs_to_the_preceding_option =
+            i > 0 && VALUE_GLOBALS.contains(&argv[i - 1].as_str());
+        names_a_redirect && !belongs_to_the_preceding_option
     })
 }
 
@@ -240,15 +244,23 @@ fn amend_dir_of(tokens: &[String], effective: &str) -> Option<String> {
 
     let mut redirect: Option<String> = None;
     let mut idx = 1;
-    while idx < argv.len()
-        && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
-    {
-        // `-C` compounds: each hop resolves against the previous one.
-        if argv[idx - 1] == "-C" {
-            let from = redirect.as_deref().unwrap_or(effective);
-            redirect = Some(resolve_cd_target(&argv[idx], from));
+    while idx < argv.len() {
+        let token = argv[idx].as_str();
+        if !token.starts_with('-') {
+            break;
         }
-        idx += 1;
+        // `-C` compounds: each hop resolves against the previous one.
+        if token == "-C"
+            && let Some(target) = argv.get(idx + 1)
+        {
+            let from = redirect.as_deref().unwrap_or(effective);
+            redirect = Some(resolve_cd_target(target, from));
+        }
+        // A global that takes a separate value consumes the NEXT token as data.
+        // Stepping one at a time and testing the PRECEDING token instead read a
+        // value that happened to spell a global (`git -c --git-dir commit`) as a
+        // global of its own, which then swallowed `commit` and lost the amend.
+        idx += if VALUE_GLOBALS.contains(&token) { 2 } else { 1 };
     }
 
     if argv.get(idx).map(String::as_str) != Some("commit") {
@@ -542,6 +554,27 @@ mod tests {
             !amend_target_dirs("git -c -C commit --amend", "/cwd").contains(&"commit".to_string()),
             "the subcommand must never be read as a -C directory"
         );
+    }
+
+    #[test]
+    fn a_value_that_looks_like_a_git_dir_redirect_is_not_one() {
+        // Each of these passes a repository-redirect SPELLING as the value of
+        // `-c`. Git reads it as config data, so the amend still runs in the
+        // session's own directory and the nudge is owed. Measured live before
+        // the fix: the `--work-tree=` spelling nudged while both `--git-dir`
+        // spellings went silent, because `&&` bound tighter than `||`.
+        for command in [
+            "git -c --git-dir=/other commit --amend",
+            "git -c --git-dir commit --amend",
+            "git -c --work-tree=/other commit --amend",
+            "git -c --work-tree commit --amend",
+        ] {
+            assert_eq!(
+                amend_target_dirs(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command} amends the session's own repo, so it is owed a nudge"
+            );
+        }
     }
 
     #[test]
