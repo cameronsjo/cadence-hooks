@@ -250,6 +250,9 @@ enum CadenceCommands {
         #[arg(long, value_name = "PATH")]
         baseline: Option<String>,
     },
+    /// Inject the Fable seat posture when the session starts on Fable or
+    /// switches onto it (SessionStart + PostModelSwitch)
+    ModelPosture,
     /// Scan text (stdin or --file) for redaction hits at a destination
     /// audience tier. CLI action — the single engine behind the redaction
     /// skill's pre-post scan; scans the identity tier and the four shaped
@@ -542,6 +545,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
+            CadenceCommands::ModelPosture => "model-posture",
             // record-polish and redact-scan are CLI actions, not hooks — no
             // hooks.json wiring and not subject to CADENCE_DISABLE (same
             // treatment as declare / status / dismiss-*).
@@ -1119,6 +1123,14 @@ fn main() {
                 &cadence_hooks_cadence::platform_drift::PlatformDrift {
                     baseline_path: baseline,
                 },
+                session,
+                canonical_hook,
+            ),
+            // Wired on SessionStart *and* PostModelSwitch, so the emitted
+            // `hookEventName` has to follow the payload rather than a fixed
+            // event — see the payload-event dispatch in `src/dispatch.rs`.
+            CadenceCommands::ModelPosture => dispatch::run_logged_check_payload_event(
+                &cadence_hooks_cadence::model_posture::ModelPosture,
                 session,
                 canonical_hook,
             ),
