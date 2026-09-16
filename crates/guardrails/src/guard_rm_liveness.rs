@@ -52,14 +52,35 @@
 //! This check ships in the same plugin and the same binary as the guard it
 //! watches, so it shares their fate. It cannot report:
 //!
-//! - `CADENCE_BYPASS=1` — bypasses this check too, before it runs
 //! - the plugin disabled, or `hooks.json` wiring missing or inert
 //! - the binary absent or stale (`run-cadence-hooks.sh` exits 0, fail-open)
 //! - a `guard-rm` hook timeout at the moment of an actual delete
 //!
+//! `CADENCE_BYPASS=1` used to head that list and no longer belongs on it. This
+//! hook is **bypass-exempt** (`cadence_hooks_core::bypass::BYPASS_EXEMPT_HOOKS`
+//! plus the argv arm in the binary's `is_bypass_exempt`, cadence-hooks#927), so
+//! it is the one thing that still reports during a blanket bypass — which is
+//! the point: a bypass is exactly the state an operator most needs told about.
+//! It is also in `PROTECTED_GUARDS`, so `CADENCE_DISABLE=guard-rm-liveness` is
+//! refused and the check runs anyway. Disabling the plugin is the remaining way
+//! to switch it off, and that is the first bullet above.
+//!
 //! Silence from this check therefore means "guard-rm's classifier is intact and
 //! not switched off", never "deletes are guarded". A self-check cannot announce
 //! its own absence; closing that half needs an observer outside this binary.
+//!
+//! # The false-alarm channel
+//!
+//! Under `CADENCE_DISABLE=guard-rm-liveness` the check used to exit before
+//! probing; refused, it now runs its full probe set in a session where an
+//! operator asked for silence. `home_block_probe` resolves `$HOME`, and
+//! `guard-rm`'s temp classification reads `$TMPDIR`, so a crafted value for
+//! either can make a probe diverge and fire the nudge ("home directory —
+//! expected Block, got Ask"). That is a false alarm, not a leak: the nudge
+//! renders the probe's `classification` and the two `Outcome` values, all
+//! `&'static str` or enum names from this file. No operand, path or environment
+//! value reaches the message, which is why no sanitizer is added here — there
+//! are no attacker bytes in the output to sanitize.
 //!
 //! # No daily gate, deliberately
 //!
@@ -79,7 +100,9 @@ use crate::guard_rm::GuardRm;
 /// The hook name `CADENCE_DISABLE` matches to switch off the guard this check
 /// watches. `guard-rm` is deliberately absent from the binary's
 /// `PROTECTED_GUARDS`, so naming it here genuinely neuters it — and its own Ask
-/// message advertises the opt-out.
+/// message advertises the opt-out. The asymmetry is the design: the watcher is
+/// protected and bypass-exempt while the watched guard is neither, so the one
+/// thing an operator cannot do is switch the guard off unobserved.
 const GUARDED_HOOK: &str = "guard-rm";
 
 /// A probe is one command string plus the verdict `guard-rm` is contracted to
@@ -182,8 +205,11 @@ fn probe_input(command: &str) -> Result<HookInput, String> {
 /// binary would have skipped `guard-rm` while this check reported healthy. One
 /// resolver removes the drift channel rather than documenting it.
 ///
-/// `CADENCE_BYPASS` is checked for completeness of the report, not for
-/// coverage: a bypassed session never runs this check either.
+/// `CADENCE_BYPASS` is now checked for **coverage** as well as completeness:
+/// this hook is bypass-exempt (cadence-hooks#927), so a bypassed session does
+/// run it, and this is the branch that reports the bypass. Before that it was
+/// report-only — a bypassed session never reached this code, so naming the
+/// switch was a courtesy rather than a live path.
 ///
 /// A `DisableRefused` resolution reports nothing, because the guard still runs.
 /// `guard-rm` is deliberately outside `PROTECTED_GUARDS` today, so that arm is
@@ -468,6 +494,33 @@ mod tests {
                 let result = GuardRmLiveness.run(&make_session("s1", "startup"));
                 assert_eq!(result.outcome, Outcome::Nudge);
                 assert!(result.message.unwrap().contains("CADENCE_BYPASS=1"));
+            },
+        );
+    }
+
+    #[test]
+    fn the_nudge_never_echoes_the_environment_value() {
+        // The nudge text lands in SessionStart additionalContext, so an
+        // operator-supplied `CADENCE_DISABLE` reaching it verbatim would be a
+        // prompt-injection channel through a repository's committed
+        // settings.json. It structurally cannot: `switch()` renders
+        // `format!("{DISABLE_VAR}={hook_name}")` with `hook_name` the
+        // `&'static str` GUARDED_HOOK, never the raw variable. This test is
+        // what goes red if that changes.
+        with_env(
+            &[
+                ("CADENCE_DISABLE", Some("guard-rm,INJECTED-PROSE")),
+                ("CADENCE_BYPASS", None),
+            ],
+            || {
+                let result = GuardRmLiveness.run(&make_session("s1", "startup"));
+                assert_eq!(result.outcome, Outcome::Nudge);
+                let message = result.message.expect("a nudge carries its message");
+                assert!(message.contains("CADENCE_DISABLE=guard-rm"), "{message}");
+                assert!(
+                    !message.contains("INJECTED"),
+                    "the raw variable reached the message: {message}"
+                );
             },
         );
     }

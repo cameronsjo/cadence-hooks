@@ -1046,7 +1046,17 @@ pub fn is_assignment_word(token: &str) -> bool {
 /// expanded inner segment can match — and per-segment draft scoping survives
 /// the expansion, leaving `sh -c 'gh pr create --draft'` correctly skipped.
 pub fn is_polish_ship_anchor(command: &str) -> bool {
-    polish_ship_anchor(command).is_some()
+    is_polish_ship_anchor_for_origin(command, None)
+}
+
+/// Origin-aware form of [`is_polish_ship_anchor`] (cadence-hooks#881):
+/// `origin` is the canonical `host/owner/repo` triple of the cwd's `origin`
+/// remote, when the caller has resolved it — see
+/// [`GhPrInvocation::targets_the_current_branch`] for what it changes. `None`
+/// reproduces [`is_polish_ship_anchor`] exactly: a retargeted merge never
+/// anchors without an origin to compare against.
+pub fn is_polish_ship_anchor_for_origin(command: &str, origin: Option<&str>) -> bool {
+    polish_ship_anchor_for_origin(command, origin).is_some()
 }
 
 /// Which anchor `command` trips — `"create"`, `"ready"`, or `"merge"` — or
@@ -1061,9 +1071,44 @@ pub fn is_polish_ship_anchor(command: &str) -> bool {
 /// so a naive rate reads better than reality (security review, #325). Anything
 /// measuring adherence should dedup on `(repo, branch)` or split by this field.
 pub fn polish_ship_anchor(command: &str) -> Option<&'static str> {
+    polish_ship_anchor_for_origin(command, None)
+}
+
+/// Origin-aware form of [`polish_ship_anchor`] — see
+/// [`is_polish_ship_anchor_for_origin`].
+pub fn polish_ship_anchor_for_origin(command: &str, origin: Option<&str>) -> Option<&'static str> {
     command_segments(command)
         .iter()
-        .find_map(|segment| segment_ship_anchor(segment))
+        .find_map(|segment| segment_ship_anchor(segment, origin))
+}
+
+/// Whether `command` contains a `gh pr merge` segment that would anchor
+/// **once its repo override is checked against the origin remote** —
+/// everything about it looks like a same-repo merge except the retarget
+/// itself (cadence-hooks#881). Callers use this to decide whether the `git
+/// remote get-url origin` spawn is worth paying for: a command this returns
+/// `None` for can never become an anchor no matter what origin resolves to.
+///
+/// `None` covers every case where origin cannot change the answer: no `gh pr
+/// merge` segment at all, a segment that already anchors without origin (a
+/// bare, non-retargeted merge — [`is_polish_ship_anchor`] already says yes),
+/// a `GH_HOST=` override (never own-repo-eligible regardless of origin), a
+/// merge naming a PR/branch/number operand, or a retargeted merge with no
+/// resolvable repo values at all.
+pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
+    command_segments(command).iter().find_map(|segment| {
+        let tokens = tokenize(strip_group_wrappers(segment));
+        let invocation = gh_pr_invocation(&tokens)?;
+        if invocation.subcommand != "merge"
+            || !invocation.operands_flags_only
+            || !invocation.retargeted
+            || invocation.host_overridden
+            || invocation.repo_targets.is_empty()
+        {
+            return None;
+        }
+        Some(invocation.repo_targets.clone())
+    })
 }
 
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
@@ -1076,7 +1121,7 @@ pub fn polish_ship_anchor(command: &str) -> Option<&'static str> {
 /// (`enforce_worktree`, `guard_rm`), because [`tokenize`] fuses the punctuation
 /// to the adjacent word — without it `{ gh pr create; }` presents `{` as the
 /// command word and the index-0 gate never fires.
-fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
+fn segment_ship_anchor(segment: &str, origin: Option<&str>) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
     let invocation = gh_pr_invocation(&tokens)?;
     match invocation.subcommand {
@@ -1101,7 +1146,7 @@ fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
         // branch would kill the canonical `gh pr ready <n>` spelling.
         "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
         "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
-        "merge" if invocation.targets_the_current_branch() => Some("merge"),
+        "merge" if invocation.targets_the_current_branch(origin) => Some("merge"),
         _ => None,
     }
 }
@@ -1113,8 +1158,25 @@ struct GhPrInvocation<'a> {
     /// Tokens following the subcommand — its own flags and operands.
     operands: &'a [String],
     /// The command was pointed at another repository: a `--repo`/`-R` flag in
-    /// global position, or a `GH_REPO=`/`GH_HOST=` assignment prefix.
+    /// global position or after the subcommand, or a `GH_REPO=`/`GH_HOST=`
+    /// assignment prefix.
     retargeted: bool,
+    /// Whether `operands` carry only flags/redirects/repo-overrides — no
+    /// positional PR selector. Computed once at construction (via
+    /// [`scan_operands`]) so [`GhPrInvocation::targets_the_current_branch`]
+    /// does not re-walk `operands` on every call.
+    operands_flags_only: bool,
+    /// Every `-R`/`--repo`/`GH_REPO=` VALUE this invocation carries, in
+    /// global position, post-subcommand position, and the inline-assignment
+    /// prefix — every spelling [`gh_pr_invocation`] can see. Empty when the
+    /// command was never retargeted, or was retargeted by a flag with no
+    /// resolvable value (see [`scan_operands`]).
+    repo_targets: Vec<String>,
+    /// A `GH_HOST=` assignment prefix was present. Distinct from
+    /// `retargeted`: a host override is never own-repo-eligible regardless of
+    /// what `repo_targets` compares to, because it can point the SAME
+    /// `owner/repo` slug at a different forge entirely.
+    host_overridden: bool,
 }
 
 /// True for every spelling of gh's repo override. gh accepts the value
@@ -1122,6 +1184,24 @@ struct GhPrInvocation<'a> {
 /// for the shorthand — attached bare (`-Rowner/r`). A token starting with `-R`
 /// can only be that flag: no other gh flag on `pr merge` begins with a capital
 /// `R`, and the separated form is `-R` exactly.
+///
+/// **Sibling scanners for the same flag**, so a change to one grammar does not
+/// silently orphan the others (cadence-hooks#881; reproducible with
+/// `rg -- '-R"|--repo' crates/`):
+///
+/// | site | what it does |
+/// |---|---|
+/// | `is_repo_flag` (here) | prefix test, detect-only |
+/// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
+/// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
+/// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
+/// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
+/// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
+///
+/// `git push --repo` is deliberately NOT a sibling: it is a different
+/// executable's flag (`PUSH_SEPARATE_VALUE_LONG_OPTS`, this file), spelled
+/// `--repo` only by coincidence, and gh's `-R` shorthand has no `git push`
+/// analog at all.
 fn is_repo_flag(token: &str) -> bool {
     token.starts_with("--repo") || token.starts_with("-R")
 }
@@ -1168,13 +1248,49 @@ impl GhPrInvocation<'_> {
     ///
     /// So this returns "targets the current branch" as the best available
     /// reading of the command text, not as a proof about what gh will do.
-    fn targets_the_current_branch(&self) -> bool {
-        !self.retargeted && operands_are_flags_only(self.operands)
+    ///
+    /// **Origin-aware (cadence-hooks#881).** A retargeted merge no longer
+    /// disqualifies outright: when every `-R`/`--repo`/`GH_REPO=` value this
+    /// invocation carries normalizes to the SAME repository as `origin` — the
+    /// cwd's own repo, canonicalized the same way — the retarget is a no-op
+    /// and the merge still targets the current branch. Unanimity across every
+    /// target mirrors `guard_gh_write::scan_unanimous_flag`'s fail-closed
+    /// rule: disagreeing targets (`gh -R own/r pr merge -R other/r`) suppress,
+    /// same as `origin` being unresolvable (`None`) or a `GH_HOST=` override
+    /// being present — a host override can point the identical `owner/repo`
+    /// slug at a different forge, so it is never own-repo-eligible regardless
+    /// of what the targets compare to.
+    fn targets_the_current_branch(&self, origin: Option<&str>) -> bool {
+        if !self.operands_flags_only {
+            return false;
+        }
+        if !self.retargeted {
+            return true;
+        }
+        if self.host_overridden {
+            return false;
+        }
+        let Some(origin) = origin else {
+            return false;
+        };
+        !self.repo_targets.is_empty()
+            && self
+                .repo_targets
+                .iter()
+                .all(|target| normalize_gh_target(target).as_deref() == Some(origin))
     }
 }
 
-/// True when nothing in `operands` selects a PR — only flags, shell
-/// redirections, and a trailing comment.
+/// What scanning [`GhPrInvocation::operands`] found: whether every token is a
+/// flag, a shell redirection, a trailing comment, or a repo override — no
+/// positional PR selector — and every `-R`/`--repo` VALUE seen along the way.
+struct OperandScan {
+    flags_only: bool,
+    repo_targets: Vec<String>,
+}
+
+/// Scan `operands` — the tokens after a `gh pr <sub>` subcommand — for
+/// whether they select a PR, and for every repo-override value they carry.
 ///
 /// Redirections have to be skipped rather than counted, and the reason is
 /// concrete: this ecosystem's own rule for gating a merge on a command's exit
@@ -1183,7 +1299,24 @@ impl GhPrInvocation<'_> {
 /// for the most careful spelling, exactly the un-nudged-ship hole #325 exists
 /// to close (security review). `ready` and `create` never had this asymmetry,
 /// because neither inspects its operands at all.
-fn operands_are_flags_only(operands: &[String]) -> bool {
+///
+/// A `-R`/`--repo` here no longer disqualifies outright (cadence-hooks#881):
+/// its VALUE is captured into `repo_targets` and the matching tokens are
+/// skipped, so the flags-only scan can continue past it — the retarget
+/// decision moves to [`GhPrInvocation::targets_the_current_branch`], which
+/// compares the captured targets against the resolved origin. A trailing
+/// `-R`/`--repo` with no following value cannot be attributed a target at
+/// all, so it disqualifies exactly as the old rule did.
+///
+/// **`--` terminates flag parsing, and anything after it disqualifies.**
+/// cobra reads every token after `--` as positional — never a flag, never a
+/// repo override — so `gh pr merge -- -R own/repo` selects a (malformed) PR
+/// literally named `-R`, not a retarget. Without this terminator, that
+/// spelling would newly read as an own-repo retarget and fire a false nudge:
+/// the one new hazard adding value capture here creates, and the reason `--`
+/// gets its own arm rather than falling through to the generic flag test.
+fn scan_operands(operands: &[String]) -> OperandScan {
+    let mut repo_targets = Vec::new();
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
@@ -1202,7 +1335,10 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         // direction is also the safe one — returning true means "no PR
         // selected", which makes the gate fire rather than fall silent.
         if token == "#" {
-            return true;
+            return OperandScan {
+                flags_only: true,
+                repo_targets,
+            };
         }
         if is_redirect_token(token) {
             // A bare operator (`>`, `2>`, `&>`) takes the NEXT token as its
@@ -1213,21 +1349,66 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
             i += 1;
             continue;
         }
-        // A positional operand selects a PR; a repo flag retargets the command.
-        // Either way the cwd's branch is not what gh will act on.
+        // `--` ends flag parsing; everything after it is a POSITIONAL to
+        // cobra, never a flag — see the doc comment above for why this must
+        // disqualify rather than fall through to the repo-flag test below.
+        if token == "--" {
+            let anything_follows = operands.get(i + 1..).is_some_and(|rest| !rest.is_empty());
+            return OperandScan {
+                flags_only: !anything_follows,
+                repo_targets,
+            };
+        }
+        if token == "-R" || token == "--repo" {
+            match operands.get(i + 1) {
+                Some(value) => {
+                    repo_targets.push(value.clone());
+                    i += 2;
+                    continue;
+                }
+                // A trailing repo flag with no value cannot be attributed a
+                // target — disqualify, same as the old is_repo_flag() rule.
+                None => {
+                    return OperandScan {
+                        flags_only: false,
+                        repo_targets,
+                    };
+                }
+            }
+        }
+        if let Some(value) = token.strip_prefix("--repo=") {
+            repo_targets.push(value.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("-R").filter(|v| !v.is_empty()) {
+            repo_targets.push(value.to_string());
+            i += 1;
+            continue;
+        }
+        // A positional operand selects a PR; any other repo-flag spelling
+        // `is_repo_flag` recognizes that isn't handled above retargets with
+        // no attributable value. Either way the cwd's branch is not what gh
+        // will act on.
         if !token.starts_with('-') || is_repo_flag(token) {
-            return false;
+            return OperandScan {
+                flags_only: false,
+                repo_targets,
+            };
         }
         i += 1;
     }
-    true
+    OperandScan {
+        flags_only: true,
+        repo_targets,
+    }
 }
 
 /// True when `operands` carry a `--undo` that **gh will actually receive** —
 /// the un-ship spelling of `gh pr ready`, which flips a PR back to draft.
 ///
 /// Redirect targets and here-string words are skipped for the same reason
-/// [`operands_are_flags_only`] skips them: the shell consumes them, so gh never
+/// [`scan_operands`] skips them: the shell consumes them, so gh never
 /// sees them. `gh pr ready 12 > --undo` writes a file literally named `--undo`
 /// and ships the PR for real; counting it would suppress a genuine ship, which
 /// is the costly direction (a missed nudge, never a wrong block).
@@ -1243,7 +1424,7 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
         // A comment ends the command — nothing after it reaches gh. Equality,
-        // not a prefix, for the reason spelled out in [`operands_are_flags_only`]:
+        // not a prefix, for the reason spelled out in [`scan_operands`]:
         // a quoted flag value may merely begin with `#`.
         if token == "#" {
             return false;
@@ -1362,9 +1543,19 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
     // The prefix region `skip_transparent_prefixes` consumed — assignment words
     // and transparent prefixes both live here.
     let prefix = &tokens[..tokens.len() - argv.len()];
-    let mut retargeted = prefix
-        .iter()
-        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="));
+    let mut retargeted = false;
+    let mut repo_targets: Vec<String> = Vec::new();
+    let mut host_overridden = false;
+    for t in prefix {
+        if let Some(value) = t.strip_prefix("GH_REPO=") {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+        }
+        if t.starts_with("GH_HOST=") {
+            retargeted = true;
+            host_overridden = true;
+        }
+    }
     let mut i = 1;
     while let Some(flag) = argv.get(i) {
         if !flag.starts_with('-') {
@@ -1374,7 +1565,18 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         // (`--repo=owner/r`, `-Rowner/r`) consumes only itself.
         if flag == "--repo" || flag == "-R" {
             retargeted = true;
+            if let Some(value) = argv.get(i + 1) {
+                repo_targets.push(value.clone());
+            }
             i += 2;
+        } else if let Some(value) = flag.strip_prefix("--repo=") {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+            i += 1;
+        } else if let Some(value) = flag.strip_prefix("-R").filter(|v| !v.is_empty()) {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+            i += 1;
         } else {
             retargeted |= is_repo_flag(flag);
             i += 1;
@@ -1384,11 +1586,59 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         return None;
     }
     let subcommand = argv.get(i + 1)?;
+    let operands = argv.get(i + 2..).unwrap_or(&[]);
+    let scan = scan_operands(operands);
+    if !scan.repo_targets.is_empty() {
+        retargeted = true;
+    }
+    repo_targets.extend(scan.repo_targets);
     Some(GhPrInvocation {
         subcommand: subcommand.as_str(),
-        operands: argv.get(i + 2..).unwrap_or(&[]),
+        operands,
         retargeted,
+        operands_flags_only: scan.flags_only,
+        repo_targets,
+        host_overridden,
     })
+}
+
+/// Canonical `(host, owner/repo)` triple, lowercased, for a `-R`/`--repo`/
+/// `GH_REPO=` VALUE — in every shape gh accepts (cadence-hooks#881): a bare
+/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (https, ssh,
+/// or SCP-style). Measured live against gh 2.96.0: `gh pr list -R
+/// https://github.com/cameronsjo/cadence-hooks` and `-R
+/// git@github.com:cameronsjo/cadence-hooks.git` both resolved, rc 0.
+///
+/// A URL form is tried FIRST via [`host_and_repo_from_url`], because
+/// splitting on `/` would otherwise misparse a URL's path segments as a bare
+/// slug. Exactly two plain slash segments default the host to
+/// `github.com`, matching gh's own default — this branch is only reached
+/// when no `GH_HOST=` prefix is present, because that prefix already sets
+/// [`GhPrInvocation::host_overridden`] and suppresses eligibility before this
+/// runs. Three or more segments are `HOST/OWNER/REPO`; the first is the host,
+/// the next two are the slug, and anything after that (a subpath) is
+/// discarded — same as [`host_and_repo_from_url`] does for a URL's path.
+/// Anything else — one segment, an empty owner or repo — returns `None`,
+/// which suppresses the same way an unattributable target always has.
+fn normalize_gh_target(value: &str) -> Option<String> {
+    if let Some((host, slug)) = host_and_repo_from_url(value) {
+        return Some(format!("{host}/{}", slug.to_ascii_lowercase()));
+    }
+    let parts: Vec<&str> = value.split('/').filter(|s| !s.is_empty()).collect();
+    match parts.len() {
+        2 => Some(format!(
+            "github.com/{}/{}",
+            parts[0].to_ascii_lowercase(),
+            parts[1].to_ascii_lowercase()
+        )),
+        n if n >= 3 => Some(format!(
+            "{}/{}/{}",
+            parts[0].to_ascii_lowercase(),
+            parts[1].to_ascii_lowercase(),
+            parts[2].to_ascii_lowercase()
+        )),
+        _ => None,
+    }
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -1507,15 +1757,35 @@ pub fn looks_like_push_url(candidate: &str) -> bool {
 
 /// Outcome of a wall-clock-bounded subprocess run.
 ///
-/// The tri-state exists so fail-closed guard arms can tell "git answered
-/// badly" (a genuine resolution failure they should still block on) apart
-/// from "git never answered" (the guard's own infrastructure failing —
-/// ADR-0001 fail-open territory). Collapsing both into one failure value is
-/// how a slow host turns into false blocks.
+/// The split exists so fail-closed guard arms can tell "git answered badly"
+/// (a genuine resolution failure they should still block on) apart from "git
+/// never answered" (the guard's own infrastructure failing — ADR-0001
+/// fail-open territory). Collapsing both into one failure value is how a slow
+/// host turns into false blocks.
+///
+/// Four states, not three. [`GitSpawn::Truncated`] is the fourth: the child
+/// exited, but the pipe never reached EOF inside the budget because something
+/// other than the child still holds its write end (an orphaned grandchild).
+/// It is deliberately NOT [`GitSpawn::Completed`], because a caller cannot
+/// tell a complete answer from a clipped one, and a guard reading a clipped
+/// answer is a guard reading attacker-chosen data.
 #[derive(Debug)]
 pub enum GitSpawn {
     /// The process ran to completion (any exit code); stderr is not captured.
     Completed(std::process::Output),
+    /// The process exited, but stdout could not be drained within the
+    /// remaining budget — something other than the child still holds the
+    /// pipe's write end (an orphaned grandchild). The `Output` carries the
+    /// real exit status and the bytes read so far.
+    ///
+    /// `Truncated` means EOF was never observed within the budget, NOT that
+    /// bytes were lost: the buffer may well hold the complete answer. It is
+    /// treated as a no-answer because the reader cannot tell the two apart.
+    ///
+    /// Routing for this variant is decided once, in [`git_output_detailed`],
+    /// which reaches every fail-closed guard (`crates/cadence/src/git_safety.rs`,
+    /// `guard_push_remote.rs`, `guard_gh_write.rs`, `crates/guardrails/src/enforce_worktree.rs`).
+    Truncated(std::process::Output),
     /// The process could not be spawned (e.g. no `git` on PATH).
     SpawnFailed,
     /// The process was killed at the deadline, or the shared budget was
@@ -1541,8 +1811,25 @@ pub enum GitQuery {
 /// set so git skips optional index writes — cloud-sync clients hold locks on
 /// exactly those files. On expiry the child is killed *and reaped* (no
 /// zombie), the shared deadline is marked hit, and `TimedOut` is returned.
+///
+/// **The drain itself is bounded too.** Waiting for the reader thread to see
+/// EOF is not the same as waiting for the child: an orphaned grandchild that
+/// inherited the pipe's write end holds it open after the child exits, so a
+/// blocking join outlives the deadline by however long that grandchild lives
+/// (measured: 20s against a 1s deadline). Every return path therefore gives
+/// the reader a budget and takes whatever bytes have arrived, returning
+/// [`GitSpawn::Truncated`] when EOF was never observed.
 pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
     use std::process::Stdio;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    // Slack for the post-exit drain when the deadline is already spent. Each
+    // truncated spawn can overrun the shared budget by up to this much (~800ms
+    // across a worst-case hook), against the ~2000ms of headroom
+    // `deadline::DEFAULT_BUDGET_MS` reserves under the 5s external hooks.json
+    // timeout. Strictly better than the unbounded 20-30s hang it replaces.
+    const DRAIN_FLOOR: Duration = Duration::from_millis(100);
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1554,38 +1841,88 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
         Err(_) => return GitSpawn::SpawnFailed,
     };
 
-    let drain = child.stdout.take().map(|mut out| {
+    // The reader appends into a shared sink so the parent can read the bytes
+    // collected so far without joining. The `Sender` is moved into the reader
+    // closure and no clone is kept here: a sender alive in the parent would
+    // never disconnect, turning every drain into a full-budget stall.
+    let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let done = child.stdout.take().map(|mut out| {
+        let (tx, rx) = mpsc::channel::<()>();
+        let sink = Arc::clone(&sink);
+        // The thread is deliberately leaked when it is still blocked on a read
+        // the orphan holds open — joining it IS the hang this function exists
+        // to avoid. Bounded in practice for hooks, which are short-lived
+        // processes. The long-lived path (`deadline::BudgetState::Unarmed`, the
+        // CLI and `doctor`) can accumulate a leaked reader stack and one pipe
+        // fd per truncated probe across a sequence of them.
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
-        })
+            let mut chunk = [0u8; 8192];
+            loop {
+                // Never hold the lock across a read.
+                match out.read(&mut chunk) {
+                    // A read ERROR signals the same "done" as EOF, so an EIO
+                    // mid-stream reports complete on a partial buffer. That is
+                    // parity with the previous `read_to_end`, which also
+                    // discarded its error, and is kept deliberately.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(());
+        });
+        rx
     });
+
+    // True when EOF was observed inside `budget`. With no stdout handle there is
+    // nothing to drain and nothing to wait for, so it is complete by
+    // construction. With a handle, only `Ok(())` is complete: `Disconnected`
+    // means the reader died before signalling, and a timeout means the pipe is
+    // still held open.
+    let drained = |budget: Duration| -> bool {
+        match done.as_ref() {
+            None => true,
+            Some(rx) => matches!(rx.recv_timeout(budget), Ok(())),
+        }
+    };
+    // Kept separate from `drained` so the arms that discard stdout do not copy
+    // the buffer they are about to throw away.
+    let bytes_so_far = || -> Vec<u8> {
+        sink.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    };
 
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = drain
-                    .and_then(|handle| handle.join().ok())
-                    .unwrap_or_default();
-                return GitSpawn::Completed(std::process::Output {
+                let budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
+                let complete = drained(budget);
+                let output = std::process::Output {
                     status,
-                    stdout,
+                    stdout: bytes_so_far(),
                     stderr: Vec::new(),
-                });
+                };
+                if complete {
+                    return GitSpawn::Completed(output);
+                }
+                // Truncation means the drain spent its bound, which is the
+                // deadline being hit — and it is what makes the downstream
+                // `Truncated -> TimedOut` routing honest for the guards.
+                crate::deadline::note_hit();
+                return GitSpawn::Truncated(output);
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Reaping the child closed the pipe's write end, so the
-                    // drain thread's read_to_end has hit EOF; join it so the
-                    // handle isn't detached with a swallowed result.
-                    if let Some(handle) = drain {
-                        let _ = handle.join();
-                    }
+                    // The bytes are discarded on this arm, and the shared
+                    // budget is already at zero, so spend nothing here.
+                    let _ = drained(Duration::ZERO);
                     crate::deadline::note_hit();
                     return GitSpawn::TimedOut;
                 }
@@ -1594,9 +1931,7 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(handle) = drain {
-                    let _ = handle.join();
-                }
+                let _ = drained(Duration::ZERO);
                 return GitSpawn::SpawnFailed;
             }
         }
@@ -1613,6 +1948,9 @@ pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     let timeout = match deadline::state() {
         BudgetState::Disabled => {
             // Escape hatch (CADENCE_HOOK_DEADLINE_MS=0): legacy unbounded run.
+            // `GitSpawn::Truncated` is unreachable here by construction —
+            // `cmd.output()` blocks until EOF, so there is no drain budget to
+            // exhaust and no partial answer to report.
             return match cmd.output() {
                 Ok(output) => GitSpawn::Completed(output),
                 Err(_) => GitSpawn::SpawnFailed,
@@ -1663,15 +2001,37 @@ pub enum GitOutput {
 ///
 /// The single spawn path — [`git_command_detailed`] and [`git_command`] are
 /// thin readings of this one, so the three cannot drift about what a git error
-/// looks like.
+/// looks like. It is also the one place [`GitSpawn::Truncated`] is routed, so
+/// every fail-closed guard inherits that decision without its own edit.
+///
+/// **Where a truncated read lands, stated honestly.** A non-zero exit is a
+/// complete answer about the exit code — every consumer discards stdout on
+/// non-success — so it keeps reading as [`GitOutput::Failed`], and the
+/// fail-closed arms in `crates/cadence/src/git_safety.rs`,
+/// `guard_push_remote.rs` and `guard_gh_write.rs` still block on it. A
+/// SUCCESS-status truncation reads as [`GitOutput::TimedOut`], which is the
+/// ADR-0001 infrastructure-failure arm: for most of those guards that is a
+/// LOUD FAIL-OPEN (`note_suppressed_block()`), and only
+/// `guard_push_remote.rs`'s remote check and
+/// `crates/guardrails/src/enforce_worktree.rs` block there. The win is that an
+/// unobservable-EOF read stops masquerading as a confident answer and stops
+/// blowing the 5s external timeout — not that anything newly blocks.
 pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(work_dir).args(args);
-    match run_git_bounded(&mut cmd) {
+    classify_spawn(run_git_bounded(&mut cmd))
+}
+
+/// The security-bearing line, split out from its spawn so it can be pinned by
+/// a unit test rather than only by a live subprocess.
+fn classify_spawn(spawn: GitSpawn) -> GitOutput {
+    match spawn {
         GitSpawn::Completed(output) if output.status.success() => {
             GitOutput::Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
         GitSpawn::Completed(_) => GitOutput::Failed,
+        GitSpawn::Truncated(output) if !output.status.success() => GitOutput::Failed,
+        GitSpawn::Truncated(_) => GitOutput::TimedOut,
         GitSpawn::SpawnFailed => GitOutput::Unavailable,
         GitSpawn::TimedOut => GitOutput::TimedOut,
     }
@@ -1684,7 +2044,13 @@ pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
 /// behavior every current caller is written against. A caller for whom an empty
 /// answer is meaningful wants [`git_output_detailed`] instead.
 pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
-    match git_output_detailed(work_dir, args) {
+    narrow_output(git_output_detailed(work_dir, args))
+}
+
+/// [`GitOutput`] read down to the tri-state, split out for the same reason as
+/// [`classify_spawn`].
+fn narrow_output(output: GitOutput) -> GitQuery {
+    match output {
         GitOutput::Ok(value) if !value.is_empty() => GitQuery::Value(value),
         GitOutput::Ok(_) | GitOutput::Failed | GitOutput::Unavailable => GitQuery::Failed,
         GitOutput::TimedOut => GitQuery::TimedOut,
@@ -4743,6 +5109,85 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_orphan_holding_stdout_does_not_hold_the_deadline() {
+        // The child exits immediately, but its backgrounded grandchild
+        // inherits the stdout pipe and holds the write end open for 5s. Before
+        // the bounded drain, joining the reader waited on the GRANDCHILD, so
+        // this returned Completed at ~5s against a 300ms deadline.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let shim = dir.path().join("orphan-holder.sh");
+        let mut file = std::fs::File::create(&shim).expect("create shim");
+        file.write_all(b"#!/bin/sh\nsleep 5 &\necho orphan-holder\nexit 0\n")
+            .expect("write shim");
+        drop(file);
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+
+        // Point Command at the shim path directly: no PATH edit and no
+        // env::set_var, since the test process is shared across the suite.
+        let mut cmd = Command::new(&shim);
+        let timeout = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = run_bounded_with(&mut cmd, timeout);
+        let elapsed = started.elapsed();
+
+        match result {
+            GitSpawn::Truncated(out) => assert!(
+                out.status.success(),
+                "the child's own exit status is still the real one"
+            ),
+            other => panic!("an un-drainable pipe must report Truncated, got {other:?}"),
+        }
+        // 10x slack over the 300ms deadline, matching the slow-command test —
+        // the failure mode being pinned is the grandchild's full 5s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the orphan must not hold the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_routes_by_exit_status_at_the_single_security_point() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let truncated_ok = GitSpawn::Truncated(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"partial".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            classify_spawn(truncated_ok),
+            GitOutput::TimedOut,
+            "a success-status truncation is no answer, not a confident one"
+        );
+        assert_eq!(
+            narrow_output(GitOutput::TimedOut),
+            GitQuery::TimedOut,
+            "and it must reach the fail-open arm as TimedOut, not Failed"
+        );
+
+        // A non-zero exit is a complete answer ABOUT THE EXIT CODE — every
+        // consumer discards stdout on non-success — so the fail-closed arms
+        // still block on it.
+        let truncated_failed = GitSpawn::Truncated(std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"partial".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            classify_spawn(truncated_failed),
+            GitOutput::Failed,
+            "a non-zero exit stays a real failure the guards block on"
+        );
+        assert_eq!(narrow_output(GitOutput::Failed), GitQuery::Failed);
+    }
+
     #[test]
     fn bounded_missing_program_is_spawn_failed() {
         let mut cmd = Command::new("definitely-not-a-real-program-271");
@@ -5003,6 +5448,162 @@ mod tests {
         assert!(is_polish_ship_anchor("env gh pr merge --squash"));
         // An UNRELATED assignment prefix must not disqualify.
         assert!(is_polish_ship_anchor("FOO=1 gh pr merge --squash"));
+    }
+
+    /// The canonical `host/owner/repo` triple `origin` resolves to across the
+    /// origin-aware tests below — the cwd's own repo, in the shape
+    /// `normalize_gh_target` and the origin-resolution callers both produce.
+    const OWN_ORIGIN: &str = "github.com/cameronsjo/cadence-hooks";
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_own_repo_every_spelling_anchors() {
+        // #881 RED: every -R/--repo spelling the plan enumerates, naming the
+        // cwd's OWN repo, must anchor once origin resolves to it — a
+        // retarget to the repo you're already in is not a retarget in any
+        // sense the anchor cares about.
+        for cmd in [
+            "gh pr merge -R cameronsjo/cadence-hooks",
+            "gh pr merge --repo cameronsjo/cadence-hooks",
+            "gh pr merge --repo=cameronsjo/cadence-hooks",
+            "gh pr merge -Rcameronsjo/cadence-hooks",
+            "gh -R cameronsjo/cadence-hooks pr merge",
+            "GH_REPO=cameronsjo/cadence-hooks gh pr merge",
+        ] {
+            assert!(
+                is_polish_ship_anchor_for_origin(cmd, Some(OWN_ORIGIN)),
+                "own-repo retarget must anchor: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_other_repo_suppressed() {
+        // #881 RED: a repo target naming a DIFFERENT owner/repo must stay
+        // suppressed even once origin resolution is wired up — comparing by
+        // owner alone (or not at all) would wrongly anchor a real
+        // orchestrator-shape merge.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R other/repo",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_host_override_suppressed() {
+        // #881 RED: a `GH_HOST=` override suppresses even when the
+        // owner/repo SLUG matches origin's — the override can point that
+        // identical slug at a different forge entirely, so the slug match
+        // alone proves nothing.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "GH_HOST=example.com gh pr merge -R cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_host_segment_in_target_is_respected() {
+        // #881 RED: a target that names its OWN host segment
+        // (`host/owner/repo`, no `GH_HOST=`) must compare that host too, not
+        // silently drop it and fall through to an owner/repo-only match.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R github.example.com/cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+        // The control: the same slug on the SAME host origin resolves to
+        // anchors.
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh pr merge -R github.com/cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_none_origin_suppressed() {
+        // #881 RED: an unresolvable origin (no remote, spawn failure, a
+        // non-GitHub-shaped URL) must suppress a retargeted merge exactly as
+        // today — never anchor on missing evidence.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R cameronsjo/cadence-hooks",
+            None
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_double_dash_terminator_suppressed() {
+        // #881 RED: the one new hazard adding repo-target capture creates.
+        // Without a `--` terminator in the operand scan, `-R` after `--`
+        // would newly read as an own-repo retarget — but cobra stops flag
+        // parsing at `--`, so gh reads `-R` here as a (malformed) PR
+        // selector, never a repo override. Must stay suppressed regardless
+        // of origin.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -- -R cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_value_skip_does_not_swallow_a_pr_number() {
+        // #881 RED: consuming a repo flag's VALUE must not also consume a
+        // real positional operand sitting right after it — `gh pr merge -R
+        // own/repo 12` names PR 12 explicitly and must never resolve from the
+        // cwd's branch, regardless of how the retarget resolves.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R cameronsjo/cadence-hooks 12",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_disagreeing_targets_suppressed() {
+        // #881 RED: unanimity across every target this invocation carries,
+        // mirroring `guard_gh_write::scan_unanimous_flag`'s fail-closed rule.
+        // A global `-R` naming origin and a post-subcommand `-R` naming
+        // something else disagree, so the merge suppresses even though one
+        // reading alone would have anchored.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh -R cameronsjo/cadence-hooks pr merge -R other/repo",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_create_and_ready_untouched() {
+        // #881 positive control: `create`/`ready` never inspected retargeting
+        // and must not start now — origin is consulted only by the `merge`
+        // arm (#452 pins the same invariant for the unretargeted case).
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh -R owner/r pr create --title x",
+            Some(OWN_ORIGIN)
+        ));
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh -R owner/r pr ready 12",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn merge_anchor_repo_targets_scopes_the_origin_spawn() {
+        // #881: callers pay for `git remote get-url origin` only when this
+        // returns `Some` — every shape that origin cannot change the answer
+        // for must return `None`.
+        assert_eq!(merge_anchor_repo_targets("gh pr create --title x"), None);
+        assert_eq!(merge_anchor_repo_targets("gh pr ready 12"), None);
+        // A bare, non-retargeted merge already anchors without origin.
+        assert_eq!(merge_anchor_repo_targets("gh pr merge"), None);
+        // A GH_HOST= override is never own-repo-eligible regardless of origin.
+        assert_eq!(
+            merge_anchor_repo_targets("GH_HOST=example.com gh pr merge -R owner/r"),
+            None
+        );
+        // A merge naming a PR number is disqualified before origin matters.
+        assert_eq!(merge_anchor_repo_targets("gh pr merge -R owner/r 12"), None);
+        // The positive case: a retargeted, otherwise-anchor-shaped merge with
+        // a resolvable target IS origin-dependent.
+        assert_eq!(
+            merge_anchor_repo_targets("gh pr merge -R cameronsjo/cadence-hooks"),
+            Some(vec!["cameronsjo/cadence-hooks".to_string()])
+        );
     }
 
     #[test]

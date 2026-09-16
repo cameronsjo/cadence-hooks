@@ -39,6 +39,28 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence model-posture",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "matcher": ".*fable.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence model-posture",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreCompact": [

@@ -9,10 +9,10 @@ use cadence_hooks_core::HookEvent;
 pub struct HookEntry {
     pub name: &'static str,
     pub description: &'static str,
-    /// The clap namespace this subcommand is dispatched under:
-    /// `cadence` | `guardrails` | `rules` | `obsidian` | `metrics` | `session`.
-    /// `registry_matches_clap_dispatch` (src/main.rs) holds this to exactly the
-    /// namespaces clap declares, in both directions.
+    /// The clap namespace this subcommand is dispatched under. The valid
+    /// set is derived from `Cli::command()` by `registry_matches_clap_dispatch`
+    /// (src/main.rs), not hand-enumerated here, so this field is held to
+    /// exactly the namespaces clap declares, in both directions.
     ///
     /// **Not the Claude Code plugin that wires the hook**, and the two differ:
     /// every `session` subcommand is wired by the always-on `cadence` plugin,
