@@ -1254,9 +1254,20 @@ fn classify_operand(
             TargetClass::Scratch
         }
         // An unreadable target that only reached `GitRepo` because the probe
-        // could not answer keeps the ambiguous verdict (Ask) rather than either
-        // softening to Allow or hardening to the git-repo Block message, which
-        // would name a repo nobody confirmed.
+        // could not answer is re-classified with the probe forced to `No`,
+        // which is exactly the class it had before #933 — neither the `Scratch`
+        // softening above (the probe never followed the link, so the rationale
+        // for it never applied) nor the git-repo Block message (which would
+        // name a repo nobody confirmed).
+        //
+        // Re-classifying rather than returning a flat `Unknown`: `GitRoot`
+        // pre-empts `ClaudeState` inside `pathclass::classify`, so a `.claude`
+        // durable-state target arrives here wearing `GitRepo`, and a flat
+        // `Unknown` would then be lifted to `Scratch` (Allow) by the
+        // `SingleFile` arm of [`judge_targets`] — the one softening
+        // `ClaudeState` exists as its own class to prevent. The re-call cannot
+        // return `GitRepo` again: the only other route into that class is a
+        // literal `.git` segment, which this arm's guard already excludes.
         TargetClass::GitRepo
             if !dereferences
                 && !path.ends_with(['/', '\\'])
@@ -1264,7 +1275,7 @@ fn classify_operand(
                 && is_git_root(path) == GitRoot::Unknown
                 && is_symlink(path) =>
         {
-            TargetClass::Unknown
+            classify_path(path, ctx, &|_| GitRoot::No)
         }
         other => other,
     }
@@ -3954,6 +3965,43 @@ mod tests {
             judge_rm("rm /srv/repo/*.tgz", "/srv", &ctx, &unknown, &nothing).outcome,
             Outcome::Ask,
             "an unreadable directory must not soften a glob sweep to Allow"
+        );
+    }
+
+    /// The `SingleFile` route through the same arm, and the reason it
+    /// re-classifies instead of returning a flat `Unknown`: `GitRoot` pre-empts
+    /// `ClaudeState` in the shared classifier, and `judge_targets` lifts
+    /// `Unknown` to `Scratch` (Allow) for one named file — so a flat fallback
+    /// would hand a session transcript the one softening its own class exists
+    /// to prevent.
+    #[test]
+    fn an_unreadable_claude_state_target_keeps_its_own_class() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let unknown = |_: &str| GitRoot::Unknown;
+        let transcript = format!("{home}/.claude/projects/proj/session.jsonl");
+        let link = |p: &str| p == transcript;
+
+        assert_eq!(
+            judge_rm(&format!("rm {transcript}"), &home, &ctx, &unknown, &link).outcome,
+            Outcome::Ask,
+            "an unreadable .claude target must keep ClaudeState, not soften to Allow"
+        );
+        // The recursive spelling was never at risk; pinned as the control.
+        assert_eq!(
+            judge_rm(
+                &format!("rm -rf {transcript}"),
+                &home,
+                &ctx,
+                &unknown,
+                &link
+            )
+            .outcome,
+            Outcome::Ask
         );
     }
 
