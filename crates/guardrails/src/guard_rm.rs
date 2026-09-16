@@ -41,7 +41,9 @@
 //! boundary. Fails open (ADR-0001). Deliberately NOT in `PROTECTED_GUARDS`, so
 //! `CADENCE_DISABLE=guard-rm` may neuter it. The catastrophic floor (built-in
 //! circuit breakers + retained settings `deny` rows) bounds the
-//! fail-open-plus-allow window.
+//! fail-open-plus-allow window. Its watcher `guard-rm-liveness` **is**
+//! protected, and bypass-exempt besides (cadence-hooks#927): this guard stays
+//! switchable, but not switchable in silence.
 //!
 //! **v1 scope (deferred, not forgotten):** a fourth ALLOW mechanism — a per-repo
 //! declared safe-path config (`.claude/rm-exemptions.json`) — was cut from v1 as
