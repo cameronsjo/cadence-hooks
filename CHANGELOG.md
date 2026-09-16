@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Running the `guard-body-budget` test suite no longer appends rows to your real `failopen.jsonl`** (cameronsjo/cadence-hooks#946). Every `cargo test -p cadence-hooks-guardrails body_budget` wrote the same five `unmeasured` rows (`no-body-flag`, `unreadable-body-file`, `body-file-not-utf8`, …) into `~/.claude/metrics/failopen.jsonl`, because the unit tests reached `Check::run` without pinning `CADENCE_METRICS_DIR`. They now share a throwaway metrics root, the way the integration suite already did. That test-run noise is what #946 observed; **a heredoc's text was never scanned** — `detect_surfaces` already reaches `shell::command_segments`, which strips heredoc bodies. Four regression tests pin that: the reported heredoc shape detects no posting surface, a heredoc-written body file is still measured on the segment after the terminator, an unterminated heredoc keeps its text (ambiguity keeps), and a `--body` value quoting another `gh` command is measured once.
+
 ## [0.100.0] - 2026-09-15
 
 ### Added
