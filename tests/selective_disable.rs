@@ -376,7 +376,7 @@ fn list_works_during_bypass() {
     );
     assert!(
         stdout.contains("(disabled)"),
-        "all hooks should show as disabled during bypass"
+        "hooks should show as disabled during bypass — all but the bypass-exempt ones (#927)"
     );
 }
 
@@ -417,6 +417,40 @@ fn session_status_works_during_bypass() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn guard_rm_liveness_still_runs_during_bypass() {
+    // The binary-level half of cadence-hooks#927: `guard-rm-liveness` is the
+    // one enforcement-path hook exempt from CADENCE_BYPASS, so the process must
+    // no longer exit at the argv bypass check in `main`. Asserting the exit
+    // code alone would prove nothing — every state of this hook exits 0 — so
+    // this reads the stdout the hook only produces by running: the SessionStart
+    // `additionalContext` carrying the nudge that names the bypass.
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "guard-rm-liveness"]);
+    cmd.env("CADENCE_BYPASS", "1");
+
+    let output = run_with_stdin(
+        cmd,
+        r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"startup"}"#,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "the detector never blocks");
+    assert!(
+        !stderr.contains("all enforcement bypassed"),
+        "the detector must not be swallowed by the bypass: {stderr}"
+    );
+    assert!(
+        stdout.contains("additionalContext"),
+        "the hook ran and emitted its SessionStart context: {stdout}"
+    );
+    assert!(
+        stdout.contains("CADENCE_BYPASS=1"),
+        "the nudge names the switch it is reporting on: {stdout}"
+    );
 }
 
 #[test]
