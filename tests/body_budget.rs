@@ -72,19 +72,37 @@ fn guard(command: &str, cwd: &std::path::Path, env: &[(&str, &str)]) -> std::pro
 
 /// Write a body file the way a session actually writes one: a heredoc into an
 /// absolute path under the system temp dir, outside every git root.
+///
+/// **Unix only writes it through `sh`.** A Windows temp path is
+/// `C:\Users\…\Temp\…`, and a bash heredoc reads each `\` as an escape, so an
+/// unquoted path wrote the body to a mangled name, `cat` succeeded, and the
+/// guard then found nothing at the path it was handed — an allow with empty
+/// stdout that read as a measurement bug. The path is single-quoted here so the
+/// shell takes it literally, and on Windows the file is written directly: what
+/// these tests exercise is the guard reading a real absolute path out of a real
+/// command, not the shell's heredoc.
 fn heredoc_body(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    let script = format!(
-        "cat > {} <<'BODY_EOF'\n{contents}\nBODY_EOF\n",
+    if cfg!(windows) {
+        std::fs::write(&path, format!("{contents}\n")).expect("body write");
+    } else {
+        let script = format!(
+            "cat > '{}' <<'BODY_EOF'\n{contents}\nBODY_EOF\n",
+            path.display()
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("sh should run");
+        assert!(status.success(), "heredoc write failed");
+    }
+    assert!(path.is_absolute(), "the body path must be absolute");
+    assert!(
+        path.is_file(),
+        "the body file must exist at the path the guard is handed: {}",
         path.display()
     );
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(&script)
-        .status()
-        .expect("sh should run");
-    assert!(status.success(), "heredoc write failed");
-    assert!(path.is_absolute(), "the body path must be absolute");
     assert!(
         cadence_hooks_core::paths::find_git_root(&dir.to_string_lossy()).is_none(),
         "the fixture directory must sit outside every git root, or the per-repo \

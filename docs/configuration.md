@@ -123,9 +123,15 @@ line like `- crates/core/src/lib.rs:42 — this is never validated` — costs no
 words either; more than 15 of them nudges toward inline comments instead. Four
 things nudge on any surface regardless of length: headers over the cap, session
 narration (`this run`, `this session`, `round <n>`, `gate <n>`, `tranche`,
-`altitude`, `carrier`, `disposition`, `receipt`, `fold in` / `folded in`,
-`slated`, `ground truth`), more than 15 finding bullets, and a title over 72
-characters. Em-dashes and emoji are not measured.
+`altitude`, `receipt`, `fold in` / `folded in`, `slated`, `ground truth`), more
+than 15 finding bullets, and a title over 72 characters. Em-dashes and emoji are
+not measured.
+
+A fence opens only at the start of a line, so a backtick-triple written
+mid-sentence starts no code block; an unclosed fence strips to the end of the
+body. A finding bullet needs a path-like token before the line number — a file
+extension (`y.rs:42`) or a path separator (`src/main:12`) — so an ordinary
+bullet mentioning a time (`- deploy at 09:00`) counts its words like any other.
 
 **The escape hatch.** A body file carrying
 
@@ -136,8 +142,12 @@ characters. Em-dashes and emoji are not measured.
 downgrades a hard-ceiling block to a nudge that echoes the reason, and silences
 the narration and header advisories for that call. The line is stripped before
 counting. It must live in the **body file**, never in the command line: a
-command string that could arm its own bypass is not a hatch. The ride-through is
-recorded in `bypasses.jsonl`.
+command string that could arm its own bypass is not a hatch. It must also live
+in the body's own prose — an escape line quoted **inside a code fence** grants
+nothing, so a PR or issue that shows the example does not bypass itself. The
+ride-through is recorded in `bypasses.jsonl`. A command posting more than one
+body records the most severe segment's mechanism and names the others in the
+row's reason.
 
 **Bounded override.** A configured hard ceiling is clamped to twice the default
 (PR 600, comment 400, issue 800). A larger value — from either channel — is
@@ -184,7 +194,9 @@ row to `failopen.jsonl` rather than blocking:
 - A body reached through **`xargs`** (`echo x | xargs -I{} gh pr create --body …`) — the `gh` argv is assembled by another process at run time. Write the body to a regular file and call `gh` directly if you want it measured.
 
 Two shapes are **not** silent. Each produces the block text rather than an
-allow, because the content exists and `gh` will post it:
+allow, because the content exists and `gh` will post it. Both bind only at
+`mode: "block"` — under the shipping `nudge` default they print the refusal and
+exit 0, so the command still reaches `gh`:
 
 - A body file **over 1 MiB** is not read at all: `body not measured: file exceeds 1 MiB`.
 - A `--body-file` path that exists but is **not a regular file** — a FIFO, or a `/dev/fd/N` process substitution such as `--body-file <(cat big.md)`: `body not measured: body file is not a regular file (FIFO or process substitution); write the body to a regular file`. Reading one would consume the stream `gh` is about to post, and a FIFO can block forever. A **missing** path is still an ordinary fail-open allow.
@@ -192,7 +204,9 @@ allow, because the content exists and `gh` will post it:
 **Measuring a file by hand.** `cadence-hooks guardrails guard-body-budget
 --measure <file> --surface pr|comment|issue` prints one JSON line — the counts,
 the effective budget, and the verdict tier — reading the same environment and
-per-repo config a real run does.
+per-repo config a real run does. It measures a **file**, not a command, so it
+judges no title: `title_len` is always `null` and the 72-character advisory
+never appears there.
 
 **Turning it off.** `CADENCE_DISABLE=guard-body-budget` in the repo's
 `.claude/settings.json` `env` block. `cadence-hooks list` shows what is

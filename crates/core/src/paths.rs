@@ -195,7 +195,9 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
 pub fn read_capped_detailed(path: &Path, max_bytes: u64) -> Result<String, CappedReadError> {
     let meta = std::fs::metadata(path).map_err(|_| CappedReadError::Unreadable)?;
     if !meta.is_file() {
-        return Err(CappedReadError::NotRegular); // FIFO / device / dir / broken symlink
+        // FIFO / device / dir. A broken symlink is NOT here: `metadata`
+        // follows the link, fails, and returns `Unreadable` above.
+        return Err(CappedReadError::NotRegular);
     }
     let file = std::fs::File::open(path).map_err(|_| CappedReadError::Unreadable)?;
     let mut buf = String::new();

@@ -283,10 +283,13 @@ static ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)<!--\s*body-budget:\s*(.*?)-->").expect("pattern should compile")
 });
 
-/// Extract the escape reason from a RAW body, before any stripping.
+/// Extract the escape reason from a FENCE-STRIPPED body.
 ///
-/// The marker is an HTML comment, which [`measure`] removes — so this runs
-/// first or the reason is gone by the time anyone looks for it. A reason of
+/// Callers pass `strip_fences(&body)`, never the raw text: an escape line
+/// QUOTED inside a code fence — this guard's own docs, a PR about the guard —
+/// granted the bypass, so any body showing the example self-bypassed. HTML
+/// comments are still stripped afterwards, by [`measure`], for counting; the
+/// reason has to be read before that or it is gone. A reason of
 /// fewer than [`MIN_REASON_WORDS`] words does not qualify: the hatch exists so
 /// the operator states a case, and `ok`, `long`, `release notes` state none.
 ///
@@ -318,14 +321,17 @@ pub fn extract_escape(body: &str) -> Option<String> {
 /// documentation quotes it, no other file restates it:
 ///
 /// `this run`, `this session`, `round <n>`, `gate <n>`, `tranche`, `altitude`,
-/// `carrier`, `disposition`, `receipt`, `fold in` / `folded in`, `slated`,
-/// `ground truth`.
+/// `receipt`, `fold in` / `folded in`, `slated`, `ground truth`.
 ///
 /// Bare `gate`, `lane`, `seat`, `panel`, `posture`, `ruling` and `gambit` are
 /// deliberately ABSENT. They are ordinary domain nouns — a CI gate, a lane in a
 /// pipeline, a security posture — and flagging them would fire on bodies that
 /// are about exactly those things. Only the numbered forms (`gate 2`, `round
 /// 3`), which can only be counting a session's own passes, are listed.
+///
+/// `disposition` and `carrier` were listed and are gone for that same reason:
+/// `Content-Disposition` and a carrier signal are ordinary prose, and the table
+/// fired on bodies that were about exactly those things.
 ///
 /// Em-dashes and emoji are deliberately not measured: both are ordinary prose,
 /// and a guard that policed them would be policing style, not length.
@@ -336,8 +342,6 @@ const NARRATION: &[(&str, &str)] = &[
     ("gate <n>", r"(?i)\bgate \d+\b"),
     ("tranche", r"(?i)\btranche\b"),
     ("altitude", r"(?i)\baltitude\b"),
-    ("carrier", r"(?i)\bcarrier\b"),
-    ("disposition", r"(?i)\bdisposition\b"),
     ("receipt", r"(?i)\breceipt\b"),
     ("fold in", r"(?i)\bfold(ed)? in\b"),
     ("slated", r"(?i)\bslated\b"),
@@ -351,8 +355,6 @@ static NARRATION_RES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
         .collect()
 });
 
-static FENCE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)```.*?```").expect("pattern should compile"));
 static HTML_COMMENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("pattern should compile"));
 static TRAILER_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -362,12 +364,21 @@ static TRAILER_RE: LazyLock<Regex> = LazyLock::new(|| {
 static ROBOT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^.*🤖 Generated with \[Claude Code\].*$").expect("pattern should compile")
 });
+/// A link target, bounded to one line. Spanning newlines let a stray `](` eat
+/// prose down to the next `)` anywhere in the body.
 static LINK_TARGET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\]\([^)]*\)").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"\]\([^)\n]*\)").expect("pattern should compile"));
 static CODE_SPAN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("pattern should compile"));
-static FINDING_BULLET_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*[-*] .*\S+:\d+").expect("pattern should compile"));
+/// A finding bullet: a bullet carrying a PATH-LIKE token immediately before the
+/// `:<line>`. Either a token with a file extension (`y.rs:42`) or one holding a
+/// path separator (`src/main:12`). A bare `token:digits` is not enough — that
+/// matched `- deploy at 09:00 …`, which cost the body no words at all and
+/// pushed it toward the 15-bullet advisory.
+static FINDING_BULLET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*[-*] .*(?:[\w.-]+\.[A-Za-z0-9]+|[\w.-]*/[\w./-]*):\d+")
+        .expect("pattern should compile")
+});
 
 /// What a body measures out to. Every field is a count the judge can act on;
 /// the body text itself never travels past this struct.
@@ -385,6 +396,58 @@ pub struct Measurement {
     pub narration: Vec<(&'static str, String)>,
 }
 
+/// A fence opener: three or more backticks or tildes at the start of a line,
+/// optionally indented, optionally carrying an info string.
+///
+/// Fences are matched LINE BY LINE rather than by one regex, because the close
+/// must use the same character as the open and Rust's `regex` has no
+/// backreference. A blind `(?s)```.*?``` ` paired a backtick-triple written
+/// mid-sentence with the next real fence, dropping the prose between them and
+/// counting the code instead.
+fn fence_marker(line: &str) -> Option<char> {
+    let t = line.trim_start();
+    ['`', '~']
+        .into_iter()
+        .find(|&c| t.chars().take_while(|x| *x == c).count() >= 3)
+}
+
+/// Whether `line` closes a fence opened with `marker`: the marker run and
+/// nothing else on the line.
+fn closes_fence(line: &str, marker: char) -> bool {
+    let t = line.trim();
+    t.chars().take_while(|c| *c == marker).count() >= 3
+        && t.chars()
+            .skip_while(|c| *c == marker)
+            .all(char::is_whitespace)
+}
+
+/// Drop every fenced code block, fence lines included.
+///
+/// A fence opens only at the start of a line (leading whitespace allowed), so a
+/// backtick-triple written in prose opens nothing. An UNCLOSED fence strips to
+/// the end of the body: the writer opened a code block, and everything after it
+/// is inside it as far as any renderer is concerned.
+///
+/// Pure.
+pub fn strip_fences(body: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut open: Option<char> = None;
+    for line in body.lines() {
+        match open {
+            Some(marker) => {
+                if closes_fence(line, marker) {
+                    open = None;
+                }
+            }
+            None => match fence_marker(line) {
+                Some(marker) => open = Some(marker),
+                None => out.push(line),
+            },
+        }
+    }
+    out.join("\n")
+}
+
 /// Strip everything that is not prose, then count what is left.
 ///
 /// Strip order matters and is fixed: fenced code blocks first (a fence can
@@ -394,7 +457,7 @@ pub struct Measurement {
 ///
 /// Pure.
 pub fn measure(body: &str) -> Measurement {
-    let stripped = FENCE_RE.replace_all(body, "");
+    let stripped = strip_fences(body);
     let stripped = HTML_COMMENT_RE.replace_all(&stripped, "");
     let stripped = TRAILER_RE.replace_all(&stripped, "");
     let stripped = ROBOT_RE.replace_all(&stripped, "");
@@ -1118,7 +1181,9 @@ fn evaluate_segment(
         Some(BodyArg::Inline(v)) => (v, None),
         Some(BodyArg::File(p)) => match read_body_file(&p, base_dir) {
             Ok(contents) => {
-                let escape = extract_escape(&contents);
+                // Fence-stripped first: an escape line quoted inside a code
+                // fence grants nothing.
+                let escape = extract_escape(&strip_fences(&contents));
                 (contents, escape)
             }
             Err(BodyFileError::OverCap) => return refuse(WHY_OVER_CAP),
@@ -1176,19 +1241,21 @@ impl Check for GuardBodyBudget {
         // two bodies gets both lines.
         let mut worst = 0u8;
         let mut messages: Vec<String> = Vec::new();
-        let mut bypass: Option<BypassProvenance> = None;
+        let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
         for (surface, segment) in &posts {
             let outcome = evaluate_segment(*surface, segment, &base_dir, &budgets);
-            worst = worst.max(severity(&outcome.verdict));
+            let sev = severity(&outcome.verdict);
+            worst = worst.max(sev);
             match outcome.verdict {
                 Verdict::Allow => {}
                 Verdict::Nudge(msg) | Verdict::Block(msg) => messages.push(msg),
                 Verdict::NudgeWithBypass(msg, _) => messages.push(msg),
             }
-            if bypass.is_none() {
-                bypass = outcome.bypass;
+            if let Some(p) = outcome.bypass {
+                bypasses.push((sev, p));
             }
         }
+        let bypass = fold_bypasses(bypasses);
 
         let message = messages.join("\n");
         match worst {
@@ -1217,6 +1284,43 @@ impl Check for GuardBodyBudget {
             }
         }
     }
+}
+
+/// Reduce every segment's bypass to the ONE row a [`CheckResult`] can carry,
+/// losing no mechanism.
+///
+/// `CheckResult` holds a single [`BypassProvenance`], and the guard used to keep
+/// whichever segment came first — so `gh pr create --body-file a.md && gh issue
+/// create --body-file b.md`, where each body rode a different mechanism, logged
+/// one row naming the wrong one for the other body. The most severe segment's
+/// provenance is emitted, and every other segment's mechanism is folded into its
+/// reason, so the ledger row names them all. PURE.
+fn fold_bypasses(bypasses: Vec<(u8, BypassProvenance)>) -> Option<BypassProvenance> {
+    if bypasses.is_empty() {
+        return None;
+    }
+    // The first of the most severe, so a block-tier bypass outranks a nudge's.
+    let lead = bypasses
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, (sev, _))| (*sev, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mut others: Vec<String> = Vec::new();
+    for (i, (_, p)) in bypasses.iter().enumerate() {
+        if i != lead {
+            others.push(p.mechanism.clone());
+        }
+    }
+    let mut primary = bypasses.into_iter().nth(lead).map(|(_, p)| p)?;
+    if !others.is_empty() {
+        let also = format!("also bypassed in another segment via {}", others.join(", "));
+        primary.reason = Some(match primary.reason {
+            Some(r) => format!("{r}; {also}"),
+            None => also,
+        });
+    }
+    Some(primary)
 }
 
 /// Provenance for a body that rode a raised ceiling past the default.
@@ -1256,7 +1360,7 @@ pub fn run_measure(file: &str, surface: &str) -> u8 {
         }
     };
     let budgets = resolve_budgets(&EnvView::from_env(), load_config(&base_dir));
-    let escape = extract_escape(&body);
+    let escape = extract_escape(&strip_fences(&body));
     let m = measure(&body);
     let verdict = judge(surface, &m, None, &budgets, escape.as_deref());
     let (soft, hard) = budgets.for_surface(surface);
@@ -1395,6 +1499,88 @@ mod tests {
         // Two prose words, and a URL that must not be counted as prose.
         let m = measure("see [the plan](https://example.com/a/very/long/path)");
         assert_eq!(m.words, 3, "see + the + plan");
+    }
+
+    #[test]
+    fn a_prose_backtick_triple_opens_no_fence() {
+        // The reviewer's probe. With the old blind pair, the in-prose triple
+        // paired with the real opening fence: the six code words counted and
+        // the six words of closing prose were dropped.
+        let body = "Use the fence marker ``` in prose.\n\
+                    ```\n\
+                    alpha beta gamma delta epsilon zeta\n\
+                    ```\n\
+                    one two three four five six";
+        let m = measure(body);
+        assert_eq!(m.words, 12, "six words of lead prose plus six of closing");
+        assert!(
+            !body_words_contain(body, "alpha"),
+            "the fenced code must not be counted"
+        );
+    }
+
+    /// Whether a word survives stripping — used to prove a fence really went.
+    fn body_words_contain(body: &str, needle: &str) -> bool {
+        strip_fences(body).contains(needle)
+    }
+
+    #[test]
+    fn a_tilde_fence_is_stripped_and_a_mismatched_marker_does_not_close_it() {
+        assert_eq!(
+            measure("~~~\nalpha beta gamma\n~~~\nreal prose here").words,
+            3
+        );
+        // A ``` inside a ~~~ fence is content, not a close, so everything after
+        // it is still inside the fence.
+        assert_eq!(measure("~~~\nalpha\n```\nbeta gamma delta").words, 0);
+    }
+
+    #[test]
+    fn an_unclosed_fence_strips_to_the_end_of_the_body() {
+        assert_eq!(
+            measure("two words\n```\nthis is all inside the code block").words,
+            2
+        );
+    }
+
+    #[test]
+    fn a_stray_link_open_paren_does_not_eat_the_following_lines() {
+        // The reviewer's probe: a link whose target never closes on its line.
+        let m = measure(
+            "See the [long doc](https://example.com/a and then twelve more\nprose words follow here (paren) end.",
+        );
+        assert!(
+            m.words >= 14,
+            "prose after the stray `](` still counts: {m:?}"
+        );
+    }
+
+    #[test]
+    fn a_timestamped_bullet_is_not_a_finding_bullet() {
+        // The reviewer's probe: `09:00` is a time, not a file:line.
+        let m = measure("- deploy at 09:00 blocks the release for everyone waiting on it");
+        assert_eq!(m.finding_bullets, 0);
+        assert_eq!(m.words, 11);
+    }
+
+    #[test]
+    fn a_path_like_bullet_is_still_a_finding_bullet() {
+        for line in [
+            "- crates/x/src/y.rs:42 — the argument is never validated",
+            "* docs/configuration.md:12 — stale",
+            "- src/main:12 — no extension, but a path",
+        ] {
+            let m = measure(line);
+            assert_eq!(m.finding_bullets, 1, "{line:?}");
+            assert_eq!(m.words, 0, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn content_disposition_and_a_carrier_signal_are_ordinary_prose() {
+        // The reviewer's nit: both fired on a body that was about exactly them.
+        let m = measure("The Content-Disposition header is set. The carrier signal is fine.");
+        assert!(m.narration.is_empty(), "{:?}", m.narration);
     }
 
     #[test]
@@ -1981,6 +2167,72 @@ mod tests {
     }
 
     #[test]
+    fn an_escape_line_quoted_inside_a_fence_grants_nothing() {
+        // The reviewer's probe: a body documenting the hatch showed the example
+        // line inside a code fence and bypassed itself.
+        scrubbed_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("body.md");
+            std::fs::write(
+                &path,
+                format!(
+                    "How the hatch is written:\n\n```text\n<!-- body-budget: release notes for the 1.0 cut -->\n```\n\n{}",
+                    "word ".repeat(320)
+                ),
+            )
+            .unwrap();
+            let result = GuardBodyBudget.run(&make_bash(&format!(
+                "gh pr create --title x --body-file {}",
+                path.display()
+            )));
+            assert_eq!(result.outcome, Outcome::Nudge, "nudge mode ships first");
+            assert!(
+                result.bypass.is_none(),
+                "a fenced escape line must not arm a bypass"
+            );
+            let msg = result.message.unwrap();
+            assert!(msg.contains(VERDICT_WOULD_BLOCK), "{msg}");
+        });
+    }
+
+    #[test]
+    fn every_segments_bypass_mechanism_reaches_the_ledger_row() {
+        // The reviewer's input: one body rides a raised PR ceiling, the other
+        // carries an escape line. Keeping only the first segment's provenance
+        // named the wrong mechanism for the other body.
+        crate::with_env(&[("CADENCE_BODY_BUDGET_PR", Some("500:600"))], || {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.md");
+            let b = dir.path().join("b.md");
+            std::fs::write(&a, "word ".repeat(400)).unwrap();
+            std::fs::write(
+                &b,
+                format!(
+                    "<!-- body-budget: release notes for the 1.0 cut -->\n{}",
+                    "word ".repeat(500)
+                ),
+            )
+            .unwrap();
+            let result = GuardBodyBudget.run(&make_bash(&format!(
+                "gh pr create --body-file {} && gh issue create --body-file {}",
+                a.display(),
+                b.display()
+            )));
+            let prov = result.bypass.expect("both segments bypassed something");
+            assert_eq!(
+                prov.mechanism, "body-budget escape line",
+                "the most severe segment's mechanism leads"
+            );
+            let reason = prov.reason.expect("the lead bypass carries its reason");
+            assert!(reason.contains("release notes for the 1.0 cut"), "{reason}");
+            assert!(
+                reason.contains("CADENCE_BODY_BUDGET_*"),
+                "the other segment's mechanism is folded in: {reason}"
+            );
+        });
+    }
+
+    #[test]
     fn an_unreadable_body_file_fails_open() {
         scrubbed_env(|| {
             let result = GuardBodyBudget.run(&make_bash(
@@ -2168,6 +2420,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_fifo_body_file_is_refused_without_being_read() {
         // Important 2. `gh` reads a FIFO or a `/dev/fd/N` process substitution

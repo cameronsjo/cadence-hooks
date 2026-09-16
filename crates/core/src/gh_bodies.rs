@@ -110,8 +110,11 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
 }
 
 /// Extract the title from ONE segment: `--title <v>`, `--title=<v>`, `-t <v>`,
-/// or glued `-t<v>`. First occurrence wins, matching `gh`, which takes the
-/// first of a repeated flag.
+/// or glued `-t<v>`. The LAST occurrence wins, matching `gh`: it parses flags
+/// with pflag/Cobra, where a repeated string flag keeps the last value. Taking
+/// the first made the 72-character cap evadable (`--title short --title <long>`
+/// passed) and could report a title `gh` never posts — the same last-wins rule
+/// `last_body_flag` already applies to `--body`.
 ///
 /// Pure — no I/O, because no title flag names a file.
 ///
@@ -122,14 +125,23 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
 /// flag-looking word passed as another flag's value (`--body --title`).
 pub fn extract_title(segment: &str) -> Option<String> {
     let tokens = tokenize(segment);
+    let mut found: Option<String> = None;
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         if matches!(tok, "--title" | "-t") {
-            return tokens.get(i + 1).cloned();
+            if let Some(v) = tokens.get(i + 1) {
+                found = Some(v.clone());
+                i += 2;
+                continue;
+            }
+            // A bare trailing flag has no value; leave the previous one.
+            break;
         }
         if let Some(v) = tok.strip_prefix("--title=") {
-            return Some(v.to_string());
+            found = Some(v.to_string());
+            i += 1;
+            continue;
         }
         // Glued short form `-tTITLE`. `--title` is excluded by the `--` guard;
         // a bare `-t` is excluded by the length guard.
@@ -137,7 +149,9 @@ pub fn extract_title(segment: &str) -> Option<String> {
             && tok.len() > 2
             && let Some(v) = tok.strip_prefix("-t")
         {
-            return Some(v.to_string());
+            found = Some(v.to_string());
+            i += 1;
+            continue;
         }
         // Another flag's value is data, not a flag.
         if VALUE_FLAGS.contains(&tok) {
@@ -146,7 +160,7 @@ pub fn extract_title(segment: &str) -> Option<String> {
         }
         i += 1;
     }
-    None
+    found
 }
 
 /// Read a `--body-file` value from disk, resolving a relative path against
@@ -189,8 +203,13 @@ mod tests {
                 Some("Real"),
             ),
             ("gh pr create --body \"--title fake\"", None),
-            // First occurrence wins.
-            ("gh pr create --title First --title Second", Some("First")),
+            // LAST occurrence wins, as pflag does.
+            ("gh pr create --title First --title Second", Some("Second")),
+            ("gh pr create --title First --title=Second", Some("Second")),
+            ("gh pr create -t First -tSecond", Some("Second")),
+            // A trailing bare `--title` has no value and does not erase the
+            // one already found.
+            ("gh pr create --title Real --title", Some("Real")),
             // An unquoted flag-looking word is still another flag's value.
             ("gh pr create --body --title", None),
             // A bare trailing flag has no value.
@@ -208,6 +227,16 @@ mod tests {
                 "extract_title({cmd:?})"
             );
         }
+    }
+
+    #[test]
+    fn extract_title_takes_the_last_repeat_so_the_cap_cannot_be_evaded() {
+        // The reviewer's probe: a short title first, the real one second. With
+        // first-wins the long title was never seen and the 72-char cap was
+        // evadable by adding a decoy.
+        let long = "t".repeat(84);
+        let cmd = format!("gh pr create --title short --title \"{long}\" --body hi");
+        assert_eq!(extract_title(&cmd).as_deref(), Some(long.as_str()));
     }
 
     // --- read_body_file: each error variant is distinguishable
@@ -241,6 +270,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_body_file_a_fifo_is_not_regular_not_unreadable() {
         // cadence-hooks#930 security review, Important 2: a FIFO and a
