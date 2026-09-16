@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`guardrails guard-rm`'s git-root probe no longer softens a deletion verdict on a stat error** (cameronsjo/cadence-hooks#933). `is_git_root_on_disk` used `Path::exists()`, which collapses every error to `false`, so an unreadable repo root (`EACCES`, a vanished parent) read as "not a repo" and the verdict dropped from BLOCK to the plain-directory path. The probe now stats `<target>/.git` and reads the result by kind: `Ok` is a repo, `NotFound` is not, and **any other error keeps the git-repo verdict** — unknown means "might be a repo", which keeps the block. That is the direction the sibling `is_symlink_on_disk` already documents, and for the same reason: a stat failure in either probe can only grant a softening, never withhold one, so it is the one place the guard's usual fail-open posture (ADR-0001) does not apply. A linked worktree's `.git` **file** still classifies as a repo. `guard-rm` is switched off estate-wide via `CADENCE_DISABLE`, so no live behavior changes until it is re-enabled.
+
 ## [0.100.0] - 2026-09-15
 
 ### Added

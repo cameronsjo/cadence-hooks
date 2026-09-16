@@ -1557,9 +1557,34 @@ impl Check for GuardRm {
 }
 
 /// Real git-root probe: `<target>/.git` exists (a repo root, or a linked
-/// worktree whose `.git` is a *file*). One `stat` per target — no subprocess.
+/// worktree whose `.git` is a *file* — a directory is NOT required). One `stat`
+/// per target — no subprocess.
 fn is_git_root_on_disk(target: &str) -> bool {
-    !target.is_empty() && Path::new(target).join(".git").exists()
+    !target.is_empty() && git_root_from_stat(std::fs::metadata(Path::new(target).join(".git")))
+}
+
+/// Read a `<target>/.git` stat result as "this target is a git repo".
+///
+/// | stat result | verdict | why |
+/// |---|---|---|
+/// | `Ok(_)` | `true` | `.git` is there — repo root or linked worktree |
+/// | `Err(NotFound)` | `false` | the only error that proves the absence |
+/// | any other `Err` | `true` | unknown reads as "might be a repo" |
+///
+/// Same direction its sibling [`is_symlink_on_disk`] documents, for the same
+/// reason: unlike the guard's usual fail-open posture (ADR-0001), the only
+/// thing a stat failure here can do is grant a softening (the `GitRepo` verdict
+/// drops to the plain-directory path), never withhold one. So an unreadable
+/// target keeps the stricter verdict and BLOCKs.
+///
+/// `Path::exists()` cannot express this — it collapses every `Err` to `false`,
+/// which is the fail-open defect this replaces.
+/// see cameronsjo/cadence-hooks#933
+fn git_root_from_stat(stat: std::io::Result<std::fs::Metadata>) -> bool {
+    match stat {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Real symlink probe: `target` is ITSELF a symbolic link.
@@ -3677,5 +3702,64 @@ mod tests {
         )
         .expect("parse write payload");
         assert_eq!(GuardRm.run(&input).outcome, Outcome::Allow);
+    }
+
+    // --- #933: the git-root probe's fail direction ---
+
+    /// `NotFound` is the ONE error that proves `.git` is absent, so it is the
+    /// one error allowed to soften the verdict.
+    #[test]
+    fn git_root_probe_reads_not_found_as_not_a_repo() {
+        let stat = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            !git_root_from_stat(stat),
+            "a missing .git must read as 'not a repo'"
+        );
+    }
+
+    /// Every other error kind is UNKNOWN, and unknown keeps the stricter
+    /// verdict. `Path::exists()` collapsed all of these to `false`, which let an
+    /// unreadable repo root soften from BLOCK to the plain-directory path —
+    /// the defect #933 reports. A stat error can only grant a softening here,
+    /// never withhold one, so the safe reading is "might be a repo".
+    #[test]
+    fn git_root_probe_reads_other_errors_as_maybe_a_repo() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                git_root_from_stat(Err(std::io::Error::from(kind))),
+                "an unreadable .git must keep the git-repo verdict: {kind:?}"
+            );
+        }
+    }
+
+    /// A successful stat is a repo whatever the file type — asserted through
+    /// the real probe with a `.git` **file**, the linked-worktree shape. Pinned
+    /// because the obvious "fix" (requiring `is_dir()`) would silently stop
+    /// protecting every linked worktree on disk.
+    #[test]
+    fn git_root_probe_accepts_a_dot_git_file() {
+        let repo = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            repo.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/w",
+        )
+        .expect("write .git file");
+        assert!(
+            is_git_root_on_disk(&repo.path().to_string_lossy()),
+            "a linked worktree's .git FILE is still a git root"
+        );
+    }
+
+    /// The other half of the real probe: a directory with no `.git` at all is
+    /// not a repo, and an empty target never stats anything.
+    #[test]
+    fn git_root_probe_rejects_a_plain_directory_and_an_empty_target() {
+        let plain = tempfile::tempdir().expect("create temp dir");
+        assert!(!is_git_root_on_disk(&plain.path().to_string_lossy()));
+        assert!(!is_git_root_on_disk(""));
     }
 }
