@@ -177,7 +177,11 @@ fn git_output(cwd: Option<&str>, args: &[&str]) -> Option<String> {
     cmd.args(args);
     let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
         cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => output,
-        _ => return None,
+        // A truncated SHA is not a SHA.
+        cadence_hooks_core::shell::GitSpawn::Completed(_)
+        | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+        | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+        | cadence_hooks_core::shell::GitSpawn::TimedOut => return None,
     };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() { None } else { Some(text) }

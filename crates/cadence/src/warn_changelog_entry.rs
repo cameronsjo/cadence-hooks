@@ -120,7 +120,10 @@ fn tracked_changelog_paths(dir: &str) -> Option<Vec<String>> {
                 .map(str::to_string)
                 .collect(),
         ),
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed | GitSpawn::TimedOut => None,
+        GitSpawn::Completed(_)
+        | GitSpawn::Truncated(_)
+        | GitSpawn::SpawnFailed
+        | GitSpawn::TimedOut => None,
     }
 }
 
