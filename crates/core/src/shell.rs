@@ -1199,9 +1199,9 @@ struct GhPrInvocation<'a> {
 /// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
 ///
 /// `git push --repo` is deliberately NOT a sibling: it is a different
-/// executable's flag (`crates/core/src/shell.rs`'s `PUSH_SEPARATE_VALUE_LONG_OPTS`),
-/// spelled `--repo` only by coincidence, and gh's `-R` shorthand has no `git
-/// push` analog at all.
+/// executable's flag (`PUSH_SEPARATE_VALUE_LONG_OPTS`, this file), spelled
+/// `--repo` only by coincidence, and gh's `-R` shorthand has no `git push`
+/// analog at all.
 fn is_repo_flag(token: &str) -> bool {
     token.starts_with("--repo") || token.starts_with("-R")
 }

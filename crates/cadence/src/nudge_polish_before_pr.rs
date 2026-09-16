@@ -194,17 +194,21 @@ impl Check for NudgePolishBeforePr {
         // bare `gh pr merge`) pays the git-resolution cost; every other command
         // short-circuits to allow inside `decide`.
         let cwd = input.cwd.as_deref();
+        // Both the origin resolution below and the lazy predicates further
+        // down need the same `cd`-aware working directory, so it is resolved
+        // ONCE here rather than per-consumer. This is string parsing with no
+        // I/O — the cost the laziness elsewhere protects against is the git
+        // work, not this.
+        let work_dir = cwd.map(|cwd| parse_work_dir(command, cwd));
         // The `git remote get-url origin` spawn is paid only when a
         // repo-retargeted `gh pr merge` segment could still anchor pending an
         // origin match (cadence-hooks#881) — `merge_anchor_repo_targets` is
         // `None` for every other shape (no merge segment, an
         // already-decided bare merge, a `GH_HOST=` override, a merge naming a
         // PR), so the common `create`/`ready` paths never pay for this.
-        let work_dir_for_origin = cwd
-            .filter(|_| merge_anchor_repo_targets(command).is_some())
-            .map(|cwd| parse_work_dir(command, cwd));
-        let origin = work_dir_for_origin
+        let origin = work_dir
             .as_deref()
+            .filter(|_| merge_anchor_repo_targets(command).is_some())
             .and_then(|dir| git_command(dir, &["remote", "get-url", "origin"]))
             .and_then(|url| host_and_repo_from_url(&url))
             .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
@@ -245,13 +249,7 @@ impl Check for NudgePolishBeforePr {
         // separate precedence table can drift from `decide`'s guards
         // (cadence-hooks#775 I2). A timed-out or unspawnable git yields no
         // evidence (`None`), which reads as "does not touch code" → allow
-        // (ADR-0001).
-        //
-        // Both lazy predicates need the same `cd`-aware working directory, so
-        // it is resolved ONCE here rather than inside each. This is string
-        // parsing with no I/O — the cost the laziness protects against is the
-        // git work below, not this.
-        let work_dir = cwd.map(|cwd| parse_work_dir(command, cwd));
+        // (ADR-0001). `work_dir` is the one resolved above.
         let touches_code = || {
             work_dir
                 .as_ref()
