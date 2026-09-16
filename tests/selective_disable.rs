@@ -378,6 +378,23 @@ fn list_works_during_bypass() {
         stdout.contains("(disabled)"),
         "hooks should show as disabled during bypass — all but the bypass-exempt ones (#927)"
     );
+
+    // The rendered half of #927, pinned end to end rather than only at
+    // `resolve_from`: the banner must name the exception instead of claiming a
+    // universal it no longer has, and the exempt hook's own row must carry no
+    // `(disabled)` suffix while the hook still runs.
+    assert!(
+        stdout.contains("all hooks bypassed except guard-rm-liveness"),
+        "the banner still claims every hook is bypassed: {stdout}"
+    );
+    let liveness_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("guard-rm-liveness "))
+        .unwrap_or_else(|| panic!("no guard-rm-liveness row: {stdout}"));
+    assert!(
+        !liveness_line.contains("(disabled)"),
+        "the bypass-exempt hook is rendered as disabled while it runs: {liveness_line}"
+    );
 }
 
 #[test]
