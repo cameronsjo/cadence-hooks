@@ -306,6 +306,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
+    // guard-body-budget ships registered and inert: the `cadence-guardrails`
+    // hooks.json entry lands in the monorepo wiring PR after this binary is
+    // released, so the fixture refresh and this entry's removal ride that PR.
+    (
+        "guardrails guard-body-budget",
+        "wiring lands in the cadence-guardrails PR after the release",
+    ),
     // The SessionStart + PostModelSwitch wiring lands in the cadence monorepo
     // PR tracked by cameronsjo/cadence#1347, after this binary releases. The
     // fixture refresh and this entry's removal ride that follow-up.

@@ -15,6 +15,7 @@ pub mod capability;
 pub mod config;
 pub mod deadline;
 pub mod display;
+pub mod gh_bodies;
 pub mod gitstate;
 pub mod loop_analysis;
 pub mod markers;
