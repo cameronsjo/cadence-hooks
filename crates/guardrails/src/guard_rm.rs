@@ -1568,7 +1568,8 @@ fn is_git_root_on_disk(target: &str) -> bool {
 /// | stat result | verdict | why |
 /// |---|---|---|
 /// | `Ok(_)` | `true` | `.git` is there — repo root or linked worktree |
-/// | `Err(NotFound)` | `false` | the only error that proves the absence |
+/// | `Err(NotFound)` | `false` | proves `.git` is absent |
+/// | `Err(NotADirectory)` | `false` | also proves it: `target` is a plain file |
 /// | any other `Err` | `true` | unknown reads as "might be a repo" |
 ///
 /// Same direction its sibling [`is_symlink_on_disk`] documents, for the same
@@ -1577,13 +1578,21 @@ fn is_git_root_on_disk(target: &str) -> bool {
 /// drops to the plain-directory path), never withhold one. So an unreadable
 /// target keeps the stricter verdict and BLOCKs.
 ///
-/// `Path::exists()` cannot express this — it collapses every `Err` to `false`,
-/// which is the fail-open defect this replaces.
+/// The two proving kinds are NOT interchangeable with "any error". Every
+/// `rm <file>` target stats `<file>/.git`, which is `ENOTDIR` on Unix and
+/// `ERROR_DIRECTORY` on Windows — reading that as unknown would classify every
+/// ordinary file deletion as a repo root and block it.
+///
+/// `Path::exists()` cannot express any of this — it collapses every `Err` to
+/// `false`, which is the fail-open defect this replaces.
 /// see cameronsjo/cadence-hooks#933
 fn git_root_from_stat(stat: std::io::Result<std::fs::Metadata>) -> bool {
     match stat {
         Ok(_) => true,
-        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+        Err(err) => !matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -3706,14 +3715,34 @@ mod tests {
 
     // --- #933: the git-root probe's fail direction ---
 
-    /// `NotFound` is the ONE error that proves `.git` is absent, so it is the
-    /// one error allowed to soften the verdict.
+    /// Two error kinds PROVE `.git` is absent, and only those two soften the
+    /// verdict: it is missing, or `target` is not a directory at all (every
+    /// `rm <file>` stats `<file>/.git`, which is `ENOTDIR`).
     #[test]
-    fn git_root_probe_reads_not_found_as_not_a_repo() {
-        let stat = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    fn git_root_probe_reads_the_proving_errors_as_not_a_repo() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            assert!(
+                !git_root_from_stat(Err(std::io::Error::from(kind))),
+                "an absent .git must read as 'not a repo': {kind:?}"
+            );
+        }
+    }
+
+    /// The same property through the real probe: deleting an ordinary file must
+    /// not classify as a repo root. Reading `ENOTDIR` as unknown would block
+    /// every `rm <file>` in the estate, which is why the mapping names the
+    /// proving kinds rather than excluding `NotFound` alone.
+    #[test]
+    fn git_root_probe_rejects_a_plain_file_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "x").expect("write plain file");
         assert!(
-            !git_root_from_stat(stat),
-            "a missing .git must read as 'not a repo'"
+            !is_git_root_on_disk(&file.to_string_lossy()),
+            "a regular file is not a git root"
         );
     }
 
@@ -3726,7 +3755,7 @@ mod tests {
     fn git_root_probe_reads_other_errors_as_maybe_a_repo() {
         for kind in [
             std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::Other,
         ] {
             assert!(
