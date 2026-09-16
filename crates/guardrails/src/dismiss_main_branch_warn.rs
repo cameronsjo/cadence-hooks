@@ -129,7 +129,11 @@ fn repo_root() -> Option<PathBuf> {
     cmd.args(["rev-parse", "--show-toplevel"]);
     let out = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
         cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => out,
-        _ => return None,
+        // A truncated path is a wrong path.
+        cadence_hooks_core::shell::GitSpawn::Completed(_)
+        | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+        | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+        | cadence_hooks_core::shell::GitSpawn::TimedOut => return None,
     };
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() {

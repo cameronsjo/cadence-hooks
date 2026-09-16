@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **An orphaned grandchild can no longer hold a hook past its deadline.** `run_bounded_with` waited for the stdout pipe to reach EOF, which is not the same as waiting for the child: a backgrounded grandchild inherits the pipe's write end and holds it open after the child exits. Measured on both arms at a 1s deadline, a 20s orphan took **20.1s** (reported as a confident `Completed`) and 30.1s on the timeout arm. The drain is now bounded on every return path, and a drain that never sees EOF yields the new `GitSpawn::Truncated`, which carries the real exit status and the bytes read so far. A **success-status** truncation routes to `GitOutput::TimedOut`, so every fail-closed guard reads a partial answer as *no answer* — most degrade to a recorded fail-open rather than a block, and only the push-remote and worktree checks block there. A **non-zero-exit** truncation still routes to `GitOutput::Failed`, because the exit code is a complete answer, so "git said no" keeps blocking. Refs cadence-hooks#927.
+
 ## [0.99.0] - 2026-09-15
 
 ### Added

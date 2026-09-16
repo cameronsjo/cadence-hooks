@@ -126,7 +126,11 @@ impl Check for WarnMainBranch {
             cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
-            _ => return CheckResult::allow(),
+            // Advisory: a truncated branch name is not a branch name.
+            cadence_hooks_core::shell::GitSpawn::Completed(_)
+            | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+            | cadence_hooks_core::shell::GitSpawn::TimedOut => return CheckResult::allow(),
         };
 
         // Repo root for marker — same source as the branch query so the
@@ -137,7 +141,11 @@ impl Check for WarnMainBranch {
             cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
-            _ => return CheckResult::allow(),
+            // Advisory: a truncated path is a wrong path.
+            cadence_hooks_core::shell::GitSpawn::Completed(_)
+            | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+            | cadence_hooks_core::shell::GitSpawn::TimedOut => return CheckResult::allow(),
         };
 
         let marker = Self::marker_path(input, &repo_root);
