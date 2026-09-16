@@ -306,13 +306,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
-    // guard-body-budget ships registered and inert: the `cadence-guardrails`
-    // hooks.json entry lands in the monorepo wiring PR after this binary is
-    // released, so the fixture refresh and this entry's removal ride that PR.
-    (
-        "guardrails guard-body-budget",
-        "wiring lands in the cadence-guardrails PR after the release",
-    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
