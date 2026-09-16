@@ -158,7 +158,11 @@ fn diff_against_base() -> Option<Vec<String>> {
     cmd.args(["diff", "--name-only", &format!("{base}...HEAD")]);
     let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
         cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => output,
-        _ => return None,
+        // A truncated `diff --name-only` would drop files and under-warn.
+        cadence_hooks_core::shell::GitSpawn::Completed(_)
+        | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+        | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+        | cadence_hooks_core::shell::GitSpawn::TimedOut => return None,
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -178,7 +182,10 @@ fn find_base_branch() -> Option<String> {
         cmd.args(["rev-parse", "--verify", &format!("origin/{branch}")]);
         let status = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
             cadence_hooks_core::shell::GitSpawn::Completed(output) => output,
-            _ => return None,
+            // `Completed(_)` is already bound above, guard-free.
+            cadence_hooks_core::shell::GitSpawn::Truncated(_)
+            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+            | cadence_hooks_core::shell::GitSpawn::TimedOut => return None,
         };
         if status.status.success() {
             return Some(format!("origin/{branch}"));
