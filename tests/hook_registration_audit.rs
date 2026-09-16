@@ -306,10 +306,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
-    // The SessionStart + PostModelSwitch wiring lands in the cadence monorepo
-    // PR tracked by cameronsjo/cadence#1347, after this binary releases. The
-    // fixture refresh and this entry's removal ride that follow-up.
-    ("cadence model-posture", "cameronsjo/cadence#1347"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

@@ -1439,6 +1439,85 @@ mod tests {
         assert!(segment.starts_with("gh pr edit"), "got {segment:?}");
     }
 
+    // ---- heredoc bodies are data, not commands (cadence-hooks#946) ----
+    //
+    // `detect_surfaces` reaches the shared `shell::command_segments`, which
+    // strips heredoc bodies. These pin that reach: a session routinely writes a
+    // script or a report whose TEXT quotes a `gh … --body-file <path>` line,
+    // and measuring that text would read an unrelated path, write an
+    // `unmeasured` ledger row, and — once the mode flips to block — refuse a
+    // command that posts nothing.
+
+    #[test]
+    fn a_heredoc_body_quoting_a_gh_post_is_not_a_posting_segment() {
+        // The shape reported in #946: a probe script written through a quoted
+        // heredoc, its body lines carrying quoted `gh pr edit … --body-file`.
+        let command = concat!(
+            "command cat > /tmp/probe.sh <<'EOF'\n",
+            "run() { printf '%s' \"$1\" | cadence-hooks guardrails guard-body-budget; }\n",
+            "run '\"gh pr edit 1352 -R owner/repo --body-file /tmp/body.md 2>&1 | tail -1\"'\n",
+            "run '\"gh issue create --body-file /tmp/missing.md\"'\n",
+            // A body line whose own first word is `gh` — the shape a report or
+            // a runbook written through a heredoc carries. Without the strip
+            // this line heads a segment and gets measured.
+            "gh pr comment 1 --body-file /tmp/missing.md\n",
+            "EOF\n",
+            "bash /tmp/probe.sh",
+        );
+        assert!(
+            detect_surfaces(command).is_empty(),
+            "heredoc text is data: {:?}",
+            detect_surfaces(command)
+        );
+        scrubbed_env(|| {
+            assert_eq!(
+                GuardBodyBudget.run(&make_bash(command)).outcome,
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn a_heredoc_written_body_file_is_still_measured_on_the_next_segment() {
+        // The counterpart the strip must not break: the heredoc WRITES the
+        // body file, and the `gh` call after the terminator is a real post.
+        let command = concat!(
+            "cat > /tmp/body.md <<'EOF'\n",
+            "the body text\n",
+            "EOF\n",
+            "gh pr create --title x --body-file /tmp/body.md",
+        );
+        let found = detect_surfaces(command);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].0, Surface::Pr);
+        assert!(
+            found[0].1.starts_with("gh pr create"),
+            "got {:?}",
+            found[0].1
+        );
+    }
+
+    #[test]
+    fn an_unterminated_heredoc_keeps_its_text_visible() {
+        // Ambiguity keeps (security review #93): with no terminator the parser
+        // cannot tell body from command, so the lines stay — measuring one
+        // spurious segment beats missing a command bash executes.
+        let command = concat!(
+            "cat > /tmp/probe.sh <<'EOF'\n",
+            "gh pr edit 1 --body-file /tmp/body.md\n",
+        );
+        assert_eq!(detect_surfaces(command).len(), 1);
+    }
+
+    #[test]
+    fn a_gh_body_value_quoting_another_gh_command_is_measured_once() {
+        // The inline mirror of the heredoc case: text inside `--body` is the
+        // value being posted, not a second command.
+        let command = r#"gh pr edit 1 --body "run gh pr create --body-file /x to reproduce this""#;
+        let found = detect_surfaces(command);
+        assert_eq!(found.len(), 1, "got {found:?}");
+    }
+
     // ---- last_body_flag ----
 
     #[test]
@@ -2073,8 +2152,36 @@ mod tests {
         ("CADENCE_BODY_BUDGET_MODE", None),
     ];
 
+    /// Throwaway metrics root, so a run of these tests cannot append
+    /// `unmeasured` rows to the operator's real `failopen.jsonl`. Held
+    /// process-lifetime so every test in the run shares it.
+    ///
+    /// Without this, `cargo test -p cadence-hooks-guardrails body_budget`
+    /// wrote five rows (`no-body-flag`, `unreadable-body-file`,
+    /// `body-file-not-utf8`, …) into `~/.claude/metrics/failopen.jsonl` on
+    /// every run — the ledger noise reported as cadence-hooks#946. The
+    /// integration suite (`tests/body_budget.rs`) already pinned one; the unit
+    /// tests did not.
+    fn scratch_metrics_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| tempfile::tempdir().expect("temp metrics dir"))
+            .path()
+    }
+
+    /// `crate::with_env`, with the metrics root pinned to [`scratch_metrics_dir`].
+    ///
+    /// Every test that reaches `Check::run` or `evaluate_segment` goes through
+    /// here, not through `crate::with_env` directly: an unmeasurable body logs
+    /// a row, and a test that skips the pin writes it to the operator's ledger.
+    fn with_budget_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let metrics = scratch_metrics_dir().to_string_lossy().into_owned();
+        let mut all: Vec<(&str, Option<&str>)> = vars.to_vec();
+        all.push(("CADENCE_METRICS_DIR", Some(metrics.as_str())));
+        crate::with_env(&all, f);
+    }
+
     fn scrubbed_env(f: impl FnOnce()) {
-        crate::with_env(NO_BUDGET_ENV, f);
+        with_budget_env(NO_BUDGET_ENV, f);
     }
 
     #[test]
@@ -2200,7 +2307,7 @@ mod tests {
         // The reviewer's input: one body rides a raised PR ceiling, the other
         // carries an escape line. Keeping only the first segment's provenance
         // named the wrong mechanism for the other body.
-        crate::with_env(&[("CADENCE_BODY_BUDGET_PR", Some("500:600"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_PR", Some("500:600"))], || {
             let dir = tempfile::tempdir().unwrap();
             let a = dir.path().join("a.md");
             let b = dir.path().join("b.md");
@@ -2301,7 +2408,7 @@ mod tests {
 
     #[test]
     fn block_mode_blocks() {
-        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
             let body = "word ".repeat(400);
             let result = GuardBodyBudget.run(&make_bash(&format!(
                 "gh pr create --title x --body \"{body}\""
@@ -2313,7 +2420,7 @@ mod tests {
 
     #[test]
     fn a_raised_env_ceiling_that_passes_a_default_block_records_a_bypass() {
-        crate::with_env(&[("CADENCE_BODY_BUDGET_PR", Some("500:600"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_PR", Some("500:600"))], || {
             let body = "word ".repeat(400);
             let result = GuardBodyBudget.run(&make_bash(&format!(
                 "gh pr create --title x --body \"{body}\""
@@ -2358,7 +2465,7 @@ mod tests {
     fn a_later_segment_over_the_hard_budget_blocks() {
         // Critical 1, end to end: the first segment is a clean short comment,
         // and the block has to come from the second.
-        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
             let dir = tempfile::tempdir().unwrap();
             let path = over_hard_body_file(&dir);
             let result = GuardBodyBudget.run(&make_bash(&format!(
@@ -2374,7 +2481,7 @@ mod tests {
     fn a_later_segment_on_another_surface_blocks() {
         // Critical 1, the `no-body-flag` shape: segment one opens an editor,
         // segment two posts 400 words to a different surface.
-        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
             let dir = tempfile::tempdir().unwrap();
             let path = over_hard_body_file(&dir);
             let result = GuardBodyBudget.run(&make_bash(&format!(
@@ -2429,7 +2536,7 @@ mod tests {
         // it does not read: a hang fails the test instead of wedging the run.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("pipe.md");
                 let status = std::process::Command::new("mkfifo")
@@ -2455,7 +2562,7 @@ mod tests {
     fn a_missing_body_file_still_fails_open_after_the_fifo_fix() {
         // The discriminating control for the test above: splitting `NotRegular`
         // out of `Unreadable` must not turn a missing path into a block.
-        crate::with_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
             let result = GuardBodyBudget.run(&make_bash(
                 "gh pr create --title x --body-file /nonexistent/dir/body.md",
             ));
@@ -2466,7 +2573,7 @@ mod tests {
     #[test]
     fn a_malformed_budget_var_records_a_bypass_end_to_end() {
         // Important 1, through the wrapper: the nudge carries the ledger row.
-        crate::with_env(
+        with_budget_env(
             &[
                 ("CADENCE_BODY_BUDGET_PR", Some("nonsense")),
                 ("CADENCE_BODY_BUDGET_MODE", Some("block")),
