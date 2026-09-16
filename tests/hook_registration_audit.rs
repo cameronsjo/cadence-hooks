@@ -306,6 +306,10 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
+    // The SessionStart + PostModelSwitch wiring lands in the cadence monorepo
+    // PR tracked by cameronsjo/cadence#1347, after this binary releases. The
+    // fixture refresh and this entry's removal ride that follow-up.
+    ("cadence model-posture", "cameronsjo/cadence#1347"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -2469,6 +2473,20 @@ fn hook_event_types_match_hooks_json() {
     }
 }
 
+/// Subcommands deliberately wired on **more than one** hook event.
+///
+/// Their dispatch resolves the event it reports from the payload's own
+/// `hook_event_name`, so the single `HookEvent` main.rs passes is only the
+/// fallback for an unmodeled event — comparing it for equality would report a
+/// mismatch the binary does not have. Each entry lists every event the
+/// subcommand models, and the wiring is checked against that set instead.
+///
+/// (`<plugin> <subcommand>`, allowed hooks.json event keys)
+const MULTI_EVENT_HOOKS: &[(&str, &[&str])] = &[(
+    "cadence model-posture",
+    &["SessionStart", "PostModelSwitch"],
+)];
+
 fn check_hook_event_types_match_hooks_json(
     subject: &AuditSubject,
     main_events: &BTreeMap<String, String>,
@@ -2483,6 +2501,24 @@ fn check_hook_event_types_match_hooks_json(
     let mut mismatches = Vec::new();
     for refs in all_refs.values() {
         for r in refs {
+            // A multi-event subcommand reports the event from the payload, so
+            // the one event main.rs passes is a fallback and equality would
+            // report a mismatch the binary does not have. Its wiring is still
+            // checked — against the set of events it models.
+            if let Some((_, allowed)) = MULTI_EVENT_HOOKS
+                .iter()
+                .find(|(command, _)| *command == r.command)
+            {
+                if !allowed.contains(&r.event_type.as_str()) {
+                    mismatches.push(format!(
+                        "  `{}`: hooks.json wires it on {} but the subcommand models only {}",
+                        r.command,
+                        r.event_type,
+                        allowed.join(", ")
+                    ));
+                }
+                continue;
+            }
             if let Some(main_event) = main_events.get(&r.command)
                 && main_event != &r.event_type
             {

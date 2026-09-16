@@ -64,6 +64,13 @@ pub enum HookEvent {
     /// approve-and-clear plan re-injection) submits a prompt. Nudges inject
     /// context via `hookSpecificOutput.additionalContext`, same as SessionStart.
     UserPromptSubmit,
+    /// PostModelSwitch — fires after the session's model changes (a requested
+    /// switch, an automatic fallback, `opusplan` entering or leaving plan mode,
+    /// or the model Claude Code restores when a session resumes). Requires
+    /// Claude Code 2.1.251 or later. It cannot block — the model has already
+    /// changed — so the only output it accepts is
+    /// `hookSpecificOutput.additionalContext`, delivered with the next request.
+    PostModelSwitch,
 }
 
 impl HookEvent {
@@ -75,6 +82,21 @@ impl HookEvent {
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::SessionStart => "SessionStart",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::PostModelSwitch => "PostModelSwitch",
+        }
+    }
+
+    /// The inverse of [`Self::name`]: resolve a payload's `hook_event_name`
+    /// into a modeled event. `None` for an event this binary does not model —
+    /// callers treat that as "do nothing", never as a default event.
+    pub fn from_name(name: &str) -> Option<HookEvent> {
+        match name {
+            "PreToolUse" => Some(HookEvent::PreToolUse),
+            "PostToolUse" => Some(HookEvent::PostToolUse),
+            "SessionStart" => Some(HookEvent::SessionStart),
+            "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
+            "PostModelSwitch" => Some(HookEvent::PostModelSwitch),
+            _ => None,
         }
     }
 
@@ -91,6 +113,9 @@ impl HookEvent {
             }
             HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
             HookEvent::UserPromptSubmit => r#"{"prompt":"test prompt"}"#,
+            HookEvent::PostModelSwitch => {
+                r#"{"session_id":"test","hook_event_name":"PostModelSwitch","from_model":"claude-opus-5","to_model":"claude-sonnet-5","source":"command"}"#
+            }
         }
     }
 }
@@ -166,6 +191,20 @@ pub fn normalize_path(path: &str) -> String {
     cleaned
 }
 
+/// True when any token is a case-insensitive substring of the model id.
+///
+/// The one matching rule shared by every model-aware check: `opus` matches
+/// `claude-opus-4-8`, the full id `claude-opus-4-8` matches only itself, and a
+/// `[1m]` context-window suffix on the resolved id is tolerated because a
+/// substring test never reaches it. Lifted out of `guard-read-model` so the
+/// model-posture emitter cannot drift to a second, subtly different rule.
+pub fn model_matches<S: AsRef<str>>(resolved: &str, models: &[S]) -> bool {
+    let lowered = resolved.to_lowercase();
+    models
+        .iter()
+        .any(|token| lowered.contains(&token.as_ref().to_lowercase()))
+}
+
 /// The JSON structure Claude Code sends to PreToolUse/PostToolUse hooks on stdin.
 ///
 /// `session_id`, `source`, and `model` are top-level fields the `SessionStart`
@@ -217,10 +256,36 @@ pub struct HookInput {
     pub transcript_path: Option<String>,
     /// Claude Code session id — present on `SessionStart`.
     pub session_id: Option<String>,
-    /// `SessionStart` trigger: `startup` | `resume` | `clear` | `compact`.
+    /// Name of the event that fired (`SessionStart`, `PostModelSwitch`, …) — a
+    /// documented common input field on every hook event. Carried so a hook
+    /// wired on more than one event can tell which half it is running as; it
+    /// never gates an enforcement decision. Mirrors [`MetricsInput::hook_event_name`].
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub hook_event_name: Option<String>,
+    /// The trigger that fired this event. **The value set is event-specific**:
+    /// on `SessionStart` it is `startup` | `resume` | `clear` | `compact`; on
+    /// `PreModelSwitch` it is `command` | `picker` | `sdk`, and
+    /// `PostModelSwitch` adds `auto` (a change Claude Code made on its own) and
+    /// `resume` (the model restored when a session resumes). Read it only
+    /// alongside the event that produced it.
     pub source: Option<String>,
-    /// Model id for the session (e.g. `claude-opus-4-8`), when supplied.
+    /// Model id for the session (e.g. `claude-opus-4-8`), when supplied. Only
+    /// `SessionStart` receives this field, and not always; the model-switch
+    /// events carry [`Self::from_model`] / [`Self::to_model`] instead.
     pub model: Option<String>,
+    /// Model id the session switched **from** — `PreModelSwitch` /
+    /// `PostModelSwitch` only. Lenient: an absent or wrong-typed value
+    /// degrades to `None` rather than failing the whole parse, so a payload
+    /// shape change can never turn this field into a hard error.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub from_model: Option<String>,
+    /// Model id the session switched **to** — `PreModelSwitch` /
+    /// `PostModelSwitch` only. The event's hooks.json matcher is evaluated
+    /// against this model's canonical name (with a `[1m]` context suffix
+    /// stripped), so the raw value here can still carry the suffix. Lenient,
+    /// like [`Self::from_model`].
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub to_model: Option<String>,
     /// Subagent id for a dispatched agent, when the payload carries it. Mirrors
     /// [`MetricsInput::agent_id`]; deserializes to `None` on the main thread and
     /// on payloads that omit it. Carried so the denial audit log can attribute a
@@ -2878,16 +2943,44 @@ mod tests {
         assert_eq!(HookEvent::PostToolUse.name(), "PostToolUse");
         assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
         assert_eq!(HookEvent::UserPromptSubmit.name(), "UserPromptSubmit");
+        assert_eq!(HookEvent::PostModelSwitch.name(), "PostModelSwitch");
     }
 
     #[test]
+    fn from_name_round_trips_every_event() {
+        for event in EVERY_EVENT {
+            assert_eq!(
+                HookEvent::from_name(event.name()),
+                Some(event),
+                "{} must round-trip through from_name",
+                event.name()
+            );
+        }
+    }
+
+    #[test]
+    fn from_name_rejects_an_unmodeled_event() {
+        // Silence, not a defaulted event: a caller that guessed would emit a
+        // `hookEventName` naming an event that never fired.
+        assert_eq!(HookEvent::from_name("PreModelSwitch"), None);
+        assert_eq!(HookEvent::from_name("SessionEnd"), None);
+        assert_eq!(HookEvent::from_name(""), None);
+        assert_eq!(HookEvent::from_name("pretooluse"), None);
+    }
+
+    /// Every modeled event, so an added variant joins the enumerated tests
+    /// instead of quietly skipping them.
+    const EVERY_EVENT: [HookEvent; 5] = [
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+        HookEvent::SessionStart,
+        HookEvent::UserPromptSubmit,
+        HookEvent::PostModelSwitch,
+    ];
+
+    #[test]
     fn sample_payloads_parse_as_hook_input() {
-        for event in [
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::SessionStart,
-            HookEvent::UserPromptSubmit,
-        ] {
+        for event in EVERY_EVENT {
             let parsed: Result<HookInput, _> = serde_json::from_str(event.sample_payload());
             assert!(
                 parsed.is_ok(),
@@ -2903,6 +2996,43 @@ mod tests {
         let input: HookInput =
             serde_json::from_str(HookEvent::PreToolUse.sample_payload()).unwrap();
         assert!(input.command().is_some());
+    }
+
+    #[test]
+    fn post_model_switch_sample_carries_the_switch_fields() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::PostModelSwitch.sample_payload()).unwrap();
+        assert_eq!(input.hook_event_name.as_deref(), Some("PostModelSwitch"));
+        assert!(input.from_model.is_some());
+        assert!(input.to_model.is_some());
+        assert_eq!(input.source.as_deref(), Some("command"));
+    }
+
+    // --- model_matches (shared by guard-read-model and model-posture) ---
+
+    #[test]
+    fn model_matches_is_a_case_insensitive_substring() {
+        assert!(model_matches("CLAUDE-OPUS-4-8", &["opus"]));
+        assert!(model_matches("claude-opus-4-8", &["OpUs"]));
+    }
+
+    #[test]
+    fn model_matches_tolerates_a_context_window_suffix() {
+        // The canonical name a matcher sees has `[1m]` stripped; the raw
+        // `to_model` a hook receives may still carry it.
+        assert!(model_matches("claude-fable-5-1[1m]", &["claude-fable"]));
+    }
+
+    #[test]
+    fn model_matches_full_id_matches_only_itself() {
+        assert!(model_matches("claude-opus-4-8", &["claude-opus-4-8"]));
+        assert!(!model_matches("claude-sonnet-4-5", &["claude-opus-4-8"]));
+    }
+
+    #[test]
+    fn model_matches_empty_list_never_matches() {
+        let none: [&str; 0] = [];
+        assert!(!model_matches("claude-opus-4-8", &none));
     }
 
     #[test]
