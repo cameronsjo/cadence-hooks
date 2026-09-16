@@ -131,7 +131,9 @@ enum Commands {
 
     /// Run a hook against a generated sample payload (manual testing)
     Try {
-        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, session)
+        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, session
+        /// — see `registry_matches_clap_dispatch` in this file for the derived
+        /// source of truth)
         namespace: String,
         /// Hook name (see `cadence-hooks list`)
         subcommand: String,
@@ -1622,14 +1624,29 @@ mod tests {
     #[test]
     fn registry_matches_clap_dispatch() {
         let cli = Cli::command();
-        let namespaces = [
-            "cadence",
-            "guardrails",
-            "rules",
-            "obsidian",
-            "metrics",
-            "session",
-        ];
+        // The one grouping subcommand that is a wizard, not a hook namespace.
+        const NON_HOOK_PARENTS: [&str; 1] = ["configure"];
+        let namespaces: Vec<&str> = cli
+            .get_subcommands()
+            .filter(|sc| sc.has_subcommands())
+            .map(|sc| sc.get_name())
+            .filter(|n| !NON_HOOK_PARENTS.contains(n))
+            .collect();
+        assert!(
+            !namespaces.is_empty(),
+            "derived namespace set is empty — registry_matches_clap_dispatch would \
+             pass vacuously with no subcommands to check"
+        );
+        for parent in NON_HOOK_PARENTS {
+            let parent_cmd = cli.find_subcommand(parent).unwrap_or_else(|| {
+                panic!("NON_HOOK_PARENTS entry '{parent}' is not a clap subcommand")
+            });
+            assert!(
+                parent_cmd.has_subcommands(),
+                "NON_HOOK_PARENTS entry '{parent}' no longer groups subcommands — \
+                 it may have been renamed or flattened; update the exclusion list"
+            );
+        }
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
         let non_hooks = [
             "dismiss-main-branch-warn",
@@ -1640,9 +1657,20 @@ mod tests {
             "redact-scan",
             "grade",
         ];
+        for skipped in non_hooks {
+            let is_real_subcommand = namespaces.iter().any(|ns| {
+                cli.find_subcommand(ns)
+                    .is_some_and(|ns_cmd| ns_cmd.find_subcommand(skipped).is_some())
+            });
+            assert!(
+                is_real_subcommand,
+                "non_hooks entry '{skipped}' is not a clap subcommand of any \
+                 namespace — stale exemption"
+            );
+        }
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();
-        for ns in namespaces {
+        for ns in &namespaces {
             let ns_cmd = cli
                 .find_subcommand(ns)
                 .unwrap_or_else(|| panic!("namespace '{ns}' should exist in clap"));
