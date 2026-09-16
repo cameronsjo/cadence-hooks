@@ -25,13 +25,13 @@ const DEFAULT_THRESHOLD_MS: u128 = 1000;
 /// Record a hook's wall-clock time at the dispatch seam — but only when it
 /// exceeds the threshold.
 ///
-/// `hook` is the canonical registry name threaded from the binary, `plugin` its
+/// `hook` is the canonical registry name threaded from the binary, `namespace` its
 /// namespace, `event` the rendered event string (e.g. `PreToolUse`, `logger`),
 /// and `elapsed_ms` the measured duration. `session_id` is recorded when present
 /// and null otherwise. Fully fail-open: any error along the way is a no-op.
 pub fn log_timing(
     hook: &str,
-    plugin: &str,
+    namespace: &str,
     event: &str,
     elapsed_ms: u128,
     session_id: Option<&str>,
@@ -40,7 +40,7 @@ pub fn log_timing(
         return;
     }
 
-    let record = build_timing_record(hook, plugin, event, elapsed_ms, session_id);
+    let record = build_timing_record(hook, namespace, event, elapsed_ms, session_id);
 
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -84,7 +84,7 @@ fn over_threshold(elapsed_ms: u128, threshold: u128) -> bool {
 /// `sessionId` (null when `None`).
 fn build_timing_record(
     hook: &str,
-    plugin: &str,
+    namespace: &str,
     event: &str,
     elapsed_ms: u128,
     session_id: Option<&str>,
@@ -92,7 +92,7 @@ fn build_timing_record(
     json!({
         "ts": common::utc_timestamp(),
         "hook": hook,
-        "plugin": plugin,
+        "plugin": namespace,
         "event": event,
         "elapsedMs": elapsed_ms,
         "sessionId": session_id,
