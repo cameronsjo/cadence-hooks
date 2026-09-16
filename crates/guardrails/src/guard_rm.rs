@@ -1100,13 +1100,24 @@ fn is_transient_scratch(norm: &str) -> bool {
 /// shared git-root, preserving the prototype's exact precedence (and thus its
 /// BLOCK-message wording). A `pathclass` `DocsPlans`/`Source` fact (no guard-rm
 /// consumer) falls through to the ambiguous [`TargetClass::Unknown`] default.
-fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool) -> TargetClass {
+fn classify_path(
+    path: &str,
+    ctx: &RmContext,
+    is_git_root: &dyn Fn(&str) -> GitRoot,
+) -> TargetClass {
     let norm = pathclass::normalize(path);
     let pc_ctx = PathClassContext {
         home: ctx.home,
         tmpdir: ctx.tmpdir,
     };
-    let shared = pathclass::classify(&norm, &pc_ctx, is_git_root);
+    // The shared classifier takes a two-valued probe, so `Unknown` reaches it as
+    // "yes": an unreadable target arrives here classified `GitRoot`, which is
+    // the stricter reading. The three-valued answer is consulted again at the
+    // two arms where `GitRepo` SOFTENS rather than blocks (see
+    // [`classify_operand`] and the `FileGlob` arm of [`judge_targets`]), which
+    // is where "yes" and "unknown" have to part company.
+    let probe_says_yes = |p: &str| is_git_root(p) != GitRoot::No;
+    let shared = pathclass::classify(&norm, &pc_ctx, &probe_says_yes);
 
     // #576: `Temp` is a claim about where the target LIVES; a `.git` is an
     // explicit protection the user put there. A repo checked out under `/tmp`
@@ -1120,7 +1131,7 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     // — a worktree that lives under `/tmp` arrives here reported as `Temp`.
     if shared == PathClass::Temp
         && !pathclass::under_claude_scratch(&norm)
-        && (has_git_component(&norm) || is_git_root(&norm))
+        && (has_git_component(&norm) || is_git_root(&norm) != GitRoot::No)
     {
         return TargetClass::GitRepo;
     }
@@ -1186,7 +1197,7 @@ fn classify_operand(
     path: &str,
     dereferences: bool,
     ctx: &RmContext,
-    is_git_root: &dyn Fn(&str) -> bool,
+    is_git_root: &dyn Fn(&str) -> GitRoot,
     is_symlink: &dyn Fn(&str) -> bool,
 ) -> TargetClass {
     match classify_path(path, ctx, is_git_root) {
@@ -1225,15 +1236,48 @@ fn classify_operand(
         //
         // The arm does not check the verb, so `shred`/`truncate` reach it too —
         // and those two DO follow a symlink. Harmless rather than overlooked:
-        // reaching `GitRepo` at all means `<target>/.git` resolved, so the
-        // dereferenced target is a directory, and both verbs fail on one.
+        // reaching this arm means `<target>/.git` resolved (`GitRoot::Yes`, the
+        // guard below), so the dereferenced target is a directory, and both
+        // verbs fail on one.
+        //
+        // - `is_git_root(path) == GitRoot::Yes` — the demotion rests on the
+        //   probe having FOLLOWED the link, which an unreadable target never
+        //   did. Without this, a stat error would promote to `GitRepo` and then
+        //   be softened straight to `Scratch` (Allow), turning the probe's
+        //   fail-closed reading into a fail-open one on this route
+        //   (cameronsjo/cadence-hooks#933).
         TargetClass::GitRepo
             if !dereferences
                 && !path.ends_with(['/', '\\'])
                 && !has_git_component(&pathclass::normalize(path))
+                && is_git_root(path) == GitRoot::Yes
                 && is_symlink(path) =>
         {
             TargetClass::Scratch
+        }
+        // An unreadable target that only reached `GitRepo` because the probe
+        // could not answer is re-classified with the probe forced to `No`,
+        // which is exactly the class it had before #933 — neither the `Scratch`
+        // softening above (the probe never followed the link, so the rationale
+        // for it never applied) nor the git-repo Block message (which would
+        // name a repo nobody confirmed).
+        //
+        // Re-classifying rather than returning a flat `Unknown`: `GitRoot`
+        // pre-empts `ClaudeState` inside `pathclass::classify`, so a `.claude`
+        // durable-state target arrives here wearing `GitRepo`, and a flat
+        // `Unknown` would then be lifted to `Scratch` (Allow) by the
+        // `SingleFile` arm of [`judge_targets`] — the one softening
+        // `ClaudeState` exists as its own class to prevent. The re-call cannot
+        // return `GitRepo` again: the only other route into that class is a
+        // literal `.git` segment, which this arm's guard already excludes.
+        TargetClass::GitRepo
+            if !dereferences
+                && !path.ends_with(['/', '\\'])
+                && !has_git_component(&pathclass::normalize(path))
+                && is_git_root(path) == GitRoot::Unknown
+                && is_symlink(path) =>
+        {
+            classify_path(path, ctx, &|_| GitRoot::No)
         }
         other => other,
     }
@@ -1262,7 +1306,7 @@ fn judge_rm(
     command: &str,
     cwd: &str,
     ctx: &RmContext,
-    is_git_root: &dyn Fn(&str) -> bool,
+    is_git_root: &dyn Fn(&str) -> GitRoot,
     is_symlink: &dyn Fn(&str) -> bool,
 ) -> CheckResult {
     let mut targets = Vec::new();
@@ -1347,7 +1391,7 @@ fn judge_delete_path(
     path: &str,
     cwd: &str,
     ctx: &RmContext,
-    is_git_root: &dyn Fn(&str) -> bool,
+    is_git_root: &dyn Fn(&str) -> GitRoot,
     is_symlink: &dyn Fn(&str) -> bool,
 ) -> CheckResult {
     // `normalize_path("/")` is `""` (the trailing slash is trimmed), and
@@ -1374,7 +1418,7 @@ fn judge_delete_path(
 fn judge_targets(
     targets: &[TargetToken],
     ctx: &RmContext,
-    is_git_root: &dyn Fn(&str) -> bool,
+    is_git_root: &dyn Fn(&str) -> GitRoot,
     is_symlink: &dyn Fn(&str) -> bool,
 ) -> CheckResult {
     let mut worst = Outcome::Allow;
@@ -1423,7 +1467,15 @@ fn judge_targets(
                     // fixture rather than the operator's only copy. Widening to
                     // them is a scope call, not an oversight — it wants its own
                     // measured trigger.
-                    TargetClass::GitRepo if !*recursive => {
+                    //
+                    // The softening is gated on a CONFIRMED repo
+                    // (cameronsjo/cadence-hooks#933): a directory whose `.git`
+                    // could not be stat'd reaches `GitRepo` on the strict
+                    // reading of an unknown, and softening that to Allow would
+                    // turn the probe's fail-closed direction into a fail-open
+                    // one here. An unknown takes the recursive arm's verdict
+                    // instead — `Unknown`, which asks.
+                    TargetClass::GitRepo if !*recursive && is_git_root(dir) == GitRoot::Yes => {
                         if *secret_shaped {
                             TargetClass::SecretSweep
                         } else {
@@ -1558,10 +1610,96 @@ impl Check for GuardRm {
     }
 }
 
-/// Real git-root probe: `<target>/.git` exists (a repo root, or a linked
-/// worktree whose `.git` is a *file*). One `stat` per target — no subprocess.
-fn is_git_root_on_disk(target: &str) -> bool {
-    !target.is_empty() && Path::new(target).join(".git").exists()
+/// What the git-root probe could establish about `<target>/.git`.
+///
+/// Three-valued on purpose: `GitRepo` is the stricter class on the plain-target
+/// route (it blocks where an unknown would only ask) and the SOFTER one on two
+/// others — the symlink demotion in [`classify_operand`] and the non-recursive
+/// [`TargetToken::FileGlob`] arm of [`judge_targets`] both read `GitRepo` as
+/// "routine repo housekeeping, allow". A two-valued probe cannot be strict in
+/// both directions at once, so an `Unknown` that reads as a repo for
+/// classification has to stay distinguishable at the two arms that soften.
+/// see cameronsjo/cadence-hooks#933
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GitRoot {
+    /// `<target>/.git` is there — a repo root, or a linked worktree whose
+    /// `.git` is a *file*.
+    Yes,
+    /// `<target>/.git` is proven absent.
+    No,
+    /// The probe could not answer: unreadable, a vanished parent, a dead mount.
+    Unknown,
+}
+
+/// Real git-root probe: does `<target>/.git` exist? One `stat` per target — no
+/// subprocess, and a second `lstat` only on the `NotFound` branch.
+///
+/// | stat result | verdict | why |
+/// |---|---|---|
+/// | `Ok(_)` | `Yes` | `.git` is there — repo root or linked worktree |
+/// | `Err(NotFound)` | `lstat` decides | a DANGLING `.git` symlink is still a repo |
+/// | `Err(NotADirectory)` | `No` | proves it: `target` is not a directory |
+/// | any other `Err` | `Unknown` | nothing was established |
+///
+/// The direction its sibling [`is_symlink_on_disk`] documents, for the same
+/// reason: unlike the guard's usual fail-open posture (ADR-0001), a failure in
+/// this probe can only grant a softening, never withhold one. `Path::exists()`
+/// could not express that — it collapses every `Err` to `false`, so an
+/// unreadable repo root read as "not a repo" and the verdict dropped from BLOCK
+/// to the plain-directory path. That is the defect this replaces.
+///
+/// `metadata` rather than `symlink_metadata` on the main call, because
+/// `exists()` is `metadata().is_ok()` and the classification either side of
+/// this change has to agree. The `NotFound` branch then re-asks with an `lstat`
+/// for the one shape `metadata` cannot see: the `repo/.git -> /store/repo.git`
+/// bare layout whose store is unmounted, where the dangling link is the repo's
+/// own marker and following it reports `NotFound` on a real repo root.
+///
+/// The proving kinds are NOT interchangeable with "any error". Every
+/// `rm <file>` target stats `<file>/.git`, which is `ENOTDIR` on Unix and
+/// `ERROR_DIRECTORY` on Windows — reading that as unknown would classify every
+/// ordinary file deletion as a repo root.
+/// see cameronsjo/cadence-hooks#933
+fn is_git_root_on_disk(target: &str) -> GitRoot {
+    if target.is_empty() {
+        return GitRoot::No;
+    }
+    let dot_git = Path::new(target).join(".git");
+    git_root_from_stat(std::fs::metadata(&dot_git), || {
+        std::fs::symlink_metadata(&dot_git)
+    })
+}
+
+/// The probe's pure mapping: a `<target>/.git` stat result, plus the `lstat`
+/// consulted only when the first call reports `NotFound`.
+///
+/// Split out so the fail direction is unit-testable without arranging a real
+/// permission error. `relstat` is a closure so the second syscall happens on
+/// the `NotFound` branch alone.
+fn git_root_from_stat(
+    stat: std::io::Result<std::fs::Metadata>,
+    relstat: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+) -> GitRoot {
+    match stat {
+        Ok(_) => GitRoot::Yes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match relstat() {
+            // A `.git` entry the follow could not resolve is still a `.git`.
+            Ok(_) => GitRoot::Yes,
+            Err(err) if is_proving_kind(err.kind()) => GitRoot::No,
+            Err(_) => GitRoot::Unknown,
+        },
+        Err(err) if is_proving_kind(err.kind()) => GitRoot::No,
+        Err(_) => GitRoot::Unknown,
+    }
+}
+
+/// The error kinds that PROVE `<target>/.git` does not exist, as opposed to
+/// leaving the question open.
+fn is_proving_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Real symlink probe: `target` is ITSELF a symbolic link.
@@ -1611,7 +1749,13 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let git_probe = |p: &str| git_roots.contains(&p);
+        let git_probe = |p: &str| {
+            if git_roots.contains(&p) {
+                GitRoot::Yes
+            } else {
+                GitRoot::No
+            }
+        };
         let link_probe = |p: &str| symlinks.contains(&p);
         judge_rm(command, cwd, &ctx, &git_probe, &link_probe).outcome
     }
@@ -1637,7 +1781,13 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let git_probe = |p: &str| git_roots.contains(&p);
+        let git_probe = |p: &str| {
+            if git_roots.contains(&p) {
+                GitRoot::Yes
+            } else {
+                GitRoot::No
+            }
+        };
         let nothing = |_: &str| false;
         judge_rm(command, cwd, &ctx, &git_probe, &nothing).outcome
     }
@@ -1898,7 +2048,7 @@ mod tests {
             "rm -rf /srv/repo/.claude/worktrees/x",
             "/home",
             &ctx,
-            &|_| true,
+            &|_| GitRoot::Yes,
             &|_| false,
         )
         .outcome;
@@ -1918,7 +2068,14 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: Some(&home),
         };
-        let out = judge_rm("rm -rf ~/Documents", "/home", &ctx, &|_| false, &|_| false).outcome;
+        let out = judge_rm(
+            "rm -rf ~/Documents",
+            "/home",
+            &ctx,
+            &|_| GitRoot::No,
+            &|_| false,
+        )
+        .outcome;
         assert_eq!(out, Outcome::Block);
     }
 
@@ -2115,8 +2272,9 @@ mod tests {
             tmpdir: None,
         };
         // The same path is just an unknown middle path with no vault configured.
+        let no_git = |_: &str| GitRoot::No;
         let nothing = |_: &str| false;
-        let out = judge_rm("rm -rf /vaults/main/x", "/home", &ctx, &nothing, &nothing).outcome;
+        let out = judge_rm("rm -rf /vaults/main/x", "/home", &ctx, &no_git, &nothing).outcome;
         assert_eq!(out, Outcome::Ask);
     }
 
@@ -2746,8 +2904,9 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
+        let no_git = |_: &str| GitRoot::No;
         let nothing = |_: &str| false;
-        let result = judge_rm("rm -f /tmp/build/*.pem", "/home", &ctx, &nothing, &nothing);
+        let result = judge_rm("rm -f /tmp/build/*.pem", "/home", &ctx, &no_git, &nothing);
         assert_eq!(result.outcome, Outcome::Nudge);
         assert!(
             result
@@ -3051,8 +3210,9 @@ mod tests {
             vault: Some("C:/vault"),
             tmpdir: None,
         };
+        let no_git = |_: &str| GitRoot::No;
         let nothing = |_: &str| false;
-        let out = judge_rm("rm -rf C:/vault/notes", "/home", &ctx, &nothing, &nothing).outcome;
+        let out = judge_rm("rm -rf C:/vault/notes", "/home", &ctx, &no_git, &nothing).outcome;
         assert_eq!(out, Outcome::Block);
     }
 
@@ -3087,7 +3247,7 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false, &|_| false);
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| GitRoot::No, &|_| false);
         let msg = r.message.expect("block carries a message");
         assert!(msg.contains("filesystem root"));
         assert!(msg.contains("CADENCE_DISABLE=guard-rm"));
@@ -3102,7 +3262,7 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false, &|_| false);
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| GitRoot::No, &|_| false);
         let msg = r.message.expect("block carries a message");
         // The recoverable alternative that never trips guard-rm.
         assert!(msg.contains("~/.Trash"));
@@ -3120,7 +3280,7 @@ mod tests {
             vault: None,
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf $VAR", "/home", &ctx, &|_| false, &|_| false);
+        let r = judge_rm("rm -rf $VAR", "/home", &ctx, &|_| GitRoot::No, &|_| false);
         assert_eq!(r.outcome, Outcome::Ask);
         assert!(
             r.message
@@ -3679,5 +3839,219 @@ mod tests {
         )
         .expect("parse write payload");
         assert_eq!(GuardRm.run(&input).outcome, Outcome::Allow);
+    }
+
+    // --- #933: the git-root probe's fail direction ---
+
+    /// A stat that never ran. Every mapping case below feeds this as the
+    /// `lstat` fallback except the ones testing the fallback itself, so a test
+    /// that reaches it by accident fails loudly rather than passing quietly.
+    fn unreachable_lstat() -> std::io::Result<std::fs::Metadata> {
+        panic!("the lstat fallback must run only on the NotFound branch")
+    }
+
+    /// Two error kinds PROVE `.git` is absent, and only those two answer `No`:
+    /// it is missing, or `target` is not a directory at all (every `rm <file>`
+    /// stats `<file>/.git`, which is `ENOTDIR`).
+    #[test]
+    fn git_root_probe_reads_the_proving_errors_as_not_a_repo() {
+        assert_eq!(
+            git_root_from_stat(
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                || { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) }
+            ),
+            GitRoot::No,
+            "a missing .git, with nothing there to lstat either"
+        );
+        assert_eq!(
+            git_root_from_stat(
+                Err(std::io::Error::from(std::io::ErrorKind::NotADirectory)),
+                unreachable_lstat
+            ),
+            GitRoot::No,
+            "a target that is not a directory cannot hold a .git"
+        );
+    }
+
+    /// The same property through the real probe: deleting an ordinary file must
+    /// not classify as a repo root. Reading `ENOTDIR` as unknown would block
+    /// every `rm <file>` in the estate, which is why the mapping names the
+    /// proving kinds rather than excluding `NotFound` alone.
+    #[test]
+    fn git_root_probe_rejects_a_plain_file_target() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "x").expect("write plain file");
+        assert_eq!(
+            is_git_root_on_disk(&file.to_string_lossy()),
+            GitRoot::No,
+            "a regular file is not a git root"
+        );
+    }
+
+    /// Every other error kind is UNKNOWN. `Path::exists()` collapsed all of
+    /// these to `false`, which let an unreadable repo root soften from BLOCK to
+    /// the plain-directory path — the defect #933 reports.
+    #[test]
+    fn git_root_probe_reads_other_errors_as_unknown() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                git_root_from_stat(Err(std::io::Error::from(kind)), unreachable_lstat),
+                GitRoot::Unknown,
+                "an unreadable .git establishes nothing: {kind:?}"
+            );
+        }
+    }
+
+    /// An unknown reaching the guard through the CLASSIFIER still reads as a
+    /// repo, which is the strict direction on the plain-target route: the
+    /// verdict stays BLOCK instead of softening to the plain-directory path.
+    #[test]
+    fn an_unreadable_git_root_still_blocks() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let unknown = |_: &str| GitRoot::Unknown;
+        let nothing = |_: &str| false;
+        assert_eq!(
+            judge_rm("rm -rf /srv/repo", "/srv", &ctx, &unknown, &nothing).outcome,
+            Outcome::Block,
+            "an unreadable target must keep the git-repo BLOCK"
+        );
+    }
+
+    /// The other direction of the same rule, and the reason the probe is
+    /// three-valued: `GitRepo` SOFTENS on two routes, so reading an unknown as
+    /// a confirmed repo there would turn a fail-closed probe into a fail-open
+    /// one. Both fall back to the ambiguous Ask instead — which is also what
+    /// they did before #933, so the fix adds blocks without adding allows.
+    #[test]
+    fn an_unreadable_git_root_never_softens() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let confirmed = |_: &str| GitRoot::Yes;
+        let unknown = |_: &str| GitRoot::Unknown;
+        let link = |p: &str| p == "/srv/link";
+        let nothing = |_: &str| false;
+
+        // The symlink demotion: `rm <symlink>` removes the link only, so a
+        // CONFIRMED repo behind it allows. An unknown asks.
+        assert_eq!(
+            judge_rm("rm -rf /srv/link", "/srv", &ctx, &confirmed, &link).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge_rm("rm -rf /srv/link", "/srv", &ctx, &unknown, &link).outcome,
+            Outcome::Ask,
+            "an unreadable target must not be demoted to a bare symlink delete"
+        );
+
+        // The flat artifact sweep: routine housekeeping in a CONFIRMED repo
+        // allows. An unknown asks.
+        assert_eq!(
+            judge_rm("rm /srv/repo/*.tgz", "/srv", &ctx, &confirmed, &nothing).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge_rm("rm /srv/repo/*.tgz", "/srv", &ctx, &unknown, &nothing).outcome,
+            Outcome::Ask,
+            "an unreadable directory must not soften a glob sweep to Allow"
+        );
+    }
+
+    /// The `SingleFile` route through the same arm, and the reason it
+    /// re-classifies instead of returning a flat `Unknown`: `GitRoot` pre-empts
+    /// `ClaudeState` in the shared classifier, and `judge_targets` lifts
+    /// `Unknown` to `Scratch` (Allow) for one named file — so a flat fallback
+    /// would hand a session transcript the one softening its own class exists
+    /// to prevent.
+    #[test]
+    fn an_unreadable_claude_state_target_keeps_its_own_class() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let unknown = |_: &str| GitRoot::Unknown;
+        let transcript = format!("{home}/.claude/projects/proj/session.jsonl");
+        let link = |p: &str| p == transcript;
+
+        assert_eq!(
+            judge_rm(&format!("rm {transcript}"), &home, &ctx, &unknown, &link).outcome,
+            Outcome::Ask,
+            "an unreadable .claude target must keep ClaudeState, not soften to Allow"
+        );
+        // The recursive spelling was never at risk; pinned as the control.
+        assert_eq!(
+            judge_rm(
+                &format!("rm -rf {transcript}"),
+                &home,
+                &ctx,
+                &unknown,
+                &link
+            )
+            .outcome,
+            Outcome::Ask
+        );
+    }
+
+    /// A successful stat is a repo whatever the file type — asserted through
+    /// the real probe with a `.git` **file**, the linked-worktree shape. Pinned
+    /// because the obvious "fix" (requiring `is_dir()`) would silently stop
+    /// protecting every linked worktree on disk.
+    #[test]
+    fn git_root_probe_accepts_a_dot_git_file() {
+        let repo = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            repo.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/w",
+        )
+        .expect("write .git file");
+        assert_eq!(
+            is_git_root_on_disk(&repo.path().to_string_lossy()),
+            GitRoot::Yes,
+            "a linked worktree's .git FILE is still a git root"
+        );
+    }
+
+    /// The `repo/.git -> /store/repo.git` bare layout with the store unmounted:
+    /// `metadata` follows the link and reports `NotFound` on a real repo root,
+    /// so the probe re-asks with an `lstat`. Without that second look the
+    /// deletion of a whole repo would read as an ordinary directory.
+    #[cfg(unix)]
+    #[test]
+    fn git_root_probe_accepts_a_dangling_dot_git_symlink() {
+        let repo = tempfile::tempdir().expect("create temp dir");
+        std::os::unix::fs::symlink("/nonexistent/store/repo.git", repo.path().join(".git"))
+            .expect("create dangling .git symlink");
+        assert_eq!(
+            is_git_root_on_disk(&repo.path().to_string_lossy()),
+            GitRoot::Yes,
+            "a dangling .git symlink is still the repo's own marker"
+        );
+    }
+
+    /// The other half of the real probe: a directory with no `.git` at all is
+    /// not a repo, and an empty target never stats anything.
+    #[test]
+    fn git_root_probe_rejects_a_plain_directory_and_an_empty_target() {
+        let plain = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(
+            is_git_root_on_disk(&plain.path().to_string_lossy()),
+            GitRoot::No
+        );
+        assert_eq!(is_git_root_on_disk(""), GitRoot::No);
     }
 }
