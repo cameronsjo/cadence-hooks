@@ -228,6 +228,171 @@ fn configure_list_reports_each_names_real_verdict() {
     );
 }
 
+/// `configure --list` used to describe only `settings.json`, so a hook
+/// disabled from the live session's own environment was invisible here while
+/// `cadence-hooks list`/`doctor` reported it correctly (cameronsjo/cadence-hooks#929).
+#[test]
+fn configure_list_reports_an_environment_only_disable() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CADENCE_DISABLE", "warn-main-branch");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("Disabled hooks:") && stdout.contains("warn-main-branch"),
+        "an environment-only disable must be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("(via environment)"),
+        "must attribute the entry to the environment: {stdout}"
+    );
+}
+
+/// A name in both the settings file and the environment is attributed to
+/// both, and counted once.
+#[test]
+fn configure_list_attributes_a_name_in_both_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude_dir = tmp.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"env":{"CADENCE_DISABLE":"warn-main-branch"}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CADENCE_DISABLE", "warn-main-branch");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("(via settings.json and environment)"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("warn-main-branch").count(),
+        1,
+        "a name in both sources must be reported once: {stdout}"
+    );
+}
+
+/// Neither source naming anything still reports "All hooks enabled" — the
+/// regression guard for the early-return path.
+#[test]
+fn configure_list_reports_all_enabled_when_neither_source_names_anything() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("All hooks enabled"), "{stdout}");
+}
+
+/// `CADENCE_BYPASS=1` alone used to print "All hooks enabled" here, though
+/// every non-exempt hook was off in this very invocation.
+#[test]
+fn configure_list_reports_a_blanket_bypass_not_all_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !stdout.contains("All hooks enabled"),
+        "a blanket bypass must not read as nothing overridden: {stdout}"
+    );
+    assert!(stdout.contains("CADENCE_BYPASS=1"), "{stdout}");
+}
+
+/// `CADENCE_BYPASS=1` plus a settings-file list is the scenario measured
+/// wrong on origin/main: `these still run: git-safety` and `71 of 72`, a
+/// false claim under a bypass that already switched the guard off.
+#[test]
+fn configure_list_reports_bypass_with_settings_list_as_moot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude_dir = tmp.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"env":{"CADENCE_DISABLE":"git-safety,warn-main-branch"}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !stdout.contains("these still run:"),
+        "nothing still runs under CADENCE_BYPASS=1: {stdout}"
+    );
+    assert!(stdout.contains("Moot"), "{stdout}");
+    assert!(stdout.contains("git-safety"), "{stdout}");
+
+    let count_line = stdout
+        .lines()
+        .find(|line| line.ends_with("hooks active."))
+        .unwrap_or_else(|| panic!("no `N of M hooks active.` line in: {stdout}"));
+    let numbers: Vec<&str> = count_line
+        .split_whitespace()
+        .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    assert_eq!(numbers.len(), 2, "expected two numbers in: {count_line}");
+    assert_eq!(
+        numbers[0], "1",
+        "only the bypass-exempt hook is enforcing: {count_line}"
+    );
+}
+
+/// A protected name named only from the environment is refused, not
+/// silently invisible.
+#[test]
+fn configure_list_reports_a_protected_name_refused_from_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CADENCE_DISABLE", "git-safety");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("Refused (protected)") && stdout.contains("these still run:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("(via environment)"), "{stdout}");
+}
+
 // ── configure works during bypass ────────────────────────────────────
 
 #[test]

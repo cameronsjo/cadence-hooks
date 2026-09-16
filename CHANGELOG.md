@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`cadence-hooks configure --list` now reports the live session, not only `settings.json`.** It previously read `CADENCE_DISABLE` from the settings file alone and never consulted `CADENCE_BYPASS` or the environment's own `CADENCE_DISABLE`, so a hook disabled or bypassed from the session's own environment — the state the binary was actually running in — went unreported here while `cadence-hooks list` and `cadence-hooks doctor` described it correctly. **This supersedes the claim in `[0.99.0]` below** that `configure --list` "describes what is written in the settings file" rather than the live session, and it is the same false-reassurance shape as the two prior findings in that entry: `CADENCE_BYPASS=1` plus a settings-file `CADENCE_DISABLE=git-safety` printed `Refused (protected) — … these still run: git-safety` and `71 of 72 hooks active`, though the bypass had already switched the guard off. `configure --list` now renders through the same `cadence_hooks_core::bypass::resolve_from` resolver as `list` and `doctor`, reports the bypass banner when engaged, reports a bypassed entry as moot rather than refused, and attributes each entry to the source(s) that named it (`via settings.json`, `via environment`, or `via settings.json and environment`) — the two mean different things to fix, since an environment entry leaves no trace once the session exits. The interactive wizard is unchanged: it still reads and writes `settings.json` only, deliberately not the environment, because pre-selecting an environment-sourced name in the picker would let one confirmation persist a session variable into a committed file. Refs cadence-hooks#929 (item 4).
+
 ## [0.100.1] - 2026-09-15
 
 ### Fixed
