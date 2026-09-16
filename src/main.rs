@@ -39,8 +39,6 @@ pub(crate) static PANIC_GUARDED: AtomicBool = AtomicBool::new(false);
 /// only knowable at runtime.
 static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
-/// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
-/// which Claude Code exports for every spawned shell. Empty/unset means no.
 /// True when the positional subcommand path names a CLI/diagnostic command
 /// that `CADENCE_BYPASS=1` must NOT short-circuit.
 ///
@@ -61,9 +59,21 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             // command never ran" — the exact failure its fail-closed exit
             // codes exist to prevent.
             | (Some("metrics"), Some("grade"))
+            // The one ENFORCEMENT-path hook that must survive the bypass, and
+            // deliberately its own arm rather than a widened `guardrails`
+            // alternation — namespace-wide exemption would run every guardrails
+            // hook during a maintenance bypass. Its entire job is to report
+            // that a guard is switched off, and `CADENCE_BYPASS=1` is one of
+            // the two switches it reports on, so bypassing it suppresses the
+            // report of the bypass (cadence-hooks#927). Kept in lockstep with
+            // `bypass::BYPASS_EXEMPT_HOOKS` by the two drift guards in this
+            // file's test module.
+            | (Some("guardrails"), Some("guard-rm-liveness"))
     )
 }
 
+/// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
+/// which Claude Code exports for every spawned shell. Empty/unset means no.
 fn under_claude_code() -> bool {
     std::env::var("CLAUDECODE")
         .map(|v| !v.is_empty())
@@ -660,7 +670,21 @@ fn print_hook_list() {
     let disable_raw = std::env::var(bypass::DISABLE_VAR).ok();
 
     if bypass::bypass_engaged_from(bypass_raw.as_deref()) {
-        println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
+        // The exception is rendered from the list rather than spelled out, so a
+        // second exempt hook cannot leave this banner claiming something false.
+        //
+        // Shape constraint, not style: `tests/hook_registration_audit.rs`'s
+        // `parse_hook_list` treats any column-0 line as a candidate group
+        // header. This line stays safe by containing whitespace and not ending
+        // in `:`; keep both properties if you reword it.
+        if bypass::BYPASS_EXEMPT_HOOKS.is_empty() {
+            println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
+        } else {
+            println!(
+                "CADENCE_BYPASS=1 — all hooks bypassed except {}\n",
+                bypass::BYPASS_EXEMPT_HOOKS.join(", ")
+            );
+        }
     }
 
     let mut current_namespace = "";
@@ -719,6 +743,10 @@ fn print_hook_manifest(format: ManifestFormat) {
                             "workflow"
                         },
                         "protected": PROTECTED_GUARDS.contains(&hook.name),
+                        // Additive: the cadence monorepo's scripts/catalog_lib.py
+                        // joins its vendored snapshot on (plugin, name), so a new
+                        // key is inert there.
+                        "bypassExempt": bypass::is_bypass_exempt_hook(hook.name),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -932,17 +960,28 @@ fn main() {
                      one-session maintenance bypass."
                 );
             }
+            // `Bypassed` is reachable only through a DISAGREEMENT between the
+            // two lists that encode one fact: `is_bypass_exempt`'s argv arms
+            // (checked above, ahead of clap) and `bypass::BYPASS_EXEMPT_HOOKS`
+            // (read by the resolver called here). A command exempt by argv but
+            // absent from the name list arrives with `Bypassed` — it is running
+            // in a session the operator asked to be silent, which is exactly
+            // the thing a fall-through must not do quietly. So it falls through
+            // (the hook runs; refusing here would be a second, undocumented
+            // enforcement decision) and leaves a one-line trace naming both
+            // lists, the same discipline the disable arms follow (#89). The two
+            // drift guards in this file's test module are what keep this arm
+            // unreachable in practice.
+            BypassState::Bypassed => {
+                eprintln!(
+                    "⚠️  cadence-hooks: '{name}' is exempt from CADENCE_BYPASS by argv but is \
+                     not in bypass::BYPASS_EXEMPT_HOOKS — running it anyway. The two lists \
+                     disagree; fix them so this notice stops."
+                );
+            }
             // `Enforced` is the ordinary case: nothing was asked, the hook
             // runs, and there is nothing to say about it.
-            //
-            // `Bypassed` is unreachable here. The blanket bypass is handled
-            // above, ahead of clap parsing, and exempts the CLI and diagnostic
-            // subcommands by argv position — an exempt command never reaches
-            // this dispatch, and a non-exempt one already exited. The arm is
-            // written out rather than folded into a catch-all so that moving
-            // the bypass check, or widening the exemption, cannot silently turn
-            // a bypassed hook into a running one here.
-            BypassState::Bypassed | BypassState::Enforced => {}
+            BypassState::Enforced => {}
         }
     }
 
@@ -1555,6 +1594,11 @@ mod tests {
         assert!(is_bypass_exempt(Some("configure"), None));
         assert!(is_bypass_exempt(Some("doctor"), None));
         assert!(is_bypass_exempt(Some("session"), Some("status")));
+        // The one enforcement-path hook in the set (cadence-hooks#927).
+        assert!(is_bypass_exempt(
+            Some("guardrails"),
+            Some("guard-rm-liveness")
+        ));
     }
 
     #[test]
@@ -1563,9 +1607,75 @@ mod tests {
             Some("guardrails"),
             Some("guard-push-remote")
         ));
+        // The watched guard, beside its watcher: goes red if the
+        // `guard-rm-liveness` arm is ever widened to the whole namespace.
+        assert!(!is_bypass_exempt(Some("guardrails"), Some("guard-rm")));
         // Position, not presence: an argument spelled like an exempt command
         // must not buy an exemption.
         assert!(!is_bypass_exempt(Some("cadence"), Some("configure")));
+    }
+
+    /// Two lists encode one fact — `bypass::BYPASS_EXEMPT_HOOKS` (name-keyed,
+    /// read by the resolver) and `is_bypass_exempt`'s argv arms (position-keyed,
+    /// checked first, before clap). This is the first of two guards holding them
+    /// together, and it covers the direction that loses the exemption: a name
+    /// the resolver exempts whose command still exits at the argv check never
+    /// runs at all, so the report it exists to produce silently disappears.
+    #[test]
+    fn every_name_exempt_hook_is_also_exempt_by_argv() {
+        assert!(
+            !bypass::BYPASS_EXEMPT_HOOKS.is_empty(),
+            "an empty exemption list would make this test assert nothing"
+        );
+        for name in bypass::BYPASS_EXEMPT_HOOKS {
+            let namespace = HOOKS
+                .iter()
+                .find(|hook| hook.name == *name)
+                .unwrap_or_else(|| panic!("'{name}' is bypass-exempt but names no registered hook"))
+                .namespace;
+            assert!(
+                is_bypass_exempt(Some(namespace), Some(name)),
+                "'{namespace} {name}' is in BYPASS_EXEMPT_HOOKS but is_bypass_exempt refuses it — \
+                 the process would exit before the hook ran"
+            );
+        }
+    }
+
+    /// The opposite direction, and the one with teeth: an argv arm widened
+    /// beyond the name list lets a hook RUN during a blanket bypass with
+    /// nothing reporting it. The `Bypassed` arm in `main` prints a notice for
+    /// exactly this disagreement; this test is what stops it shipping.
+    #[test]
+    fn no_hook_is_exempt_by_argv_unless_the_name_list_says_so() {
+        for hook in HOOKS {
+            if bypass::BYPASS_EXEMPT_HOOKS.contains(&hook.name) {
+                continue;
+            }
+            assert!(
+                !is_bypass_exempt(Some(hook.namespace), Some(hook.name)),
+                "'{} {}' is exempt from CADENCE_BYPASS by argv but is not in \
+                 bypass::BYPASS_EXEMPT_HOOKS — it would run during a blanket bypass while \
+                 `list` and `doctor` report it as bypassed",
+                hook.namespace,
+                hook.name
+            );
+        }
+    }
+
+    /// The rendering cross-check: `list` builds every row's suffix from
+    /// `resolve_from`, so an exempt hook reading `(disabled)` under a blanket
+    /// bypass means the resolver exemption is gone and every surface is now
+    /// claiming the detector is off while it runs.
+    #[test]
+    fn an_exempt_hook_is_never_listed_as_disabled_under_a_bypass() {
+        for name in bypass::BYPASS_EXEMPT_HOOKS {
+            let state = bypass::resolve_from(Some("1"), None, name);
+            assert_ne!(
+                state.list_suffix(),
+                " (disabled)",
+                "'{name}' renders as disabled under CADENCE_BYPASS=1 but still runs: {state:?}"
+            );
+        }
     }
 
     /// `configure guardrails` parses, and its flags land where the dispatch

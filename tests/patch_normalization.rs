@@ -27,9 +27,21 @@ use std::process::Command;
 /// `metrics_dir()` to the *operator's real* ledger — creating it and writing
 /// production-shaped rows there just for running the suite. Every other
 /// integration test in this directory pins it; these must too.
+///
+/// The two enforcement switches are scrubbed here for the same class of reason.
+/// A launching shell carrying `CADENCE_DISABLE=guard-rm` (a documented, common
+/// ambient value) made every guard-reachability test in this file fail with a
+/// message blaming the guard's reachability, while the real cause sat one line
+/// lower in the same stderr as `'guard-rm' disabled via CADENCE_DISABLE`
+/// (cadence-hooks#927). `CADENCE_BYPASS` is scrubbed for the identical reason.
+/// `tests/configure.rs` scrubs `CLAUDECODE` alongside these two; this file does
+/// not, because nothing here reads it and a scrub nothing needs is a claim the
+/// next reader has to re-derive.
 fn isolated_cadence_hooks(metrics_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     cmd.env("CADENCE_METRICS_DIR", metrics_dir);
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.env_remove("CADENCE_BYPASS");
     cmd
 }
 
