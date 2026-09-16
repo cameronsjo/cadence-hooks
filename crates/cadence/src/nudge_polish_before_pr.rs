@@ -117,7 +117,10 @@ use cadence_hooks_core::markers::{
     POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
     read_polish_marker,
 };
-use cadence_hooks_core::shell::{is_polish_ship_anchor, parse_work_dir};
+use cadence_hooks_core::shell::{
+    git_command, host_and_repo_from_url, is_polish_ship_anchor_for_origin,
+    merge_anchor_repo_targets, parse_work_dir,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// What the branch-scoped polish marker says, as far as the gate can read it
@@ -191,7 +194,22 @@ impl Check for NudgePolishBeforePr {
         // bare `gh pr merge`) pays the git-resolution cost; every other command
         // short-circuits to allow inside `decide`.
         let cwd = input.cwd.as_deref();
-        let present = is_polish_ship_anchor(command) && polish_marker_present(command, cwd);
+        // The `git remote get-url origin` spawn is paid only when a
+        // repo-retargeted `gh pr merge` segment could still anchor pending an
+        // origin match (cadence-hooks#881) — `merge_anchor_repo_targets` is
+        // `None` for every other shape (no merge segment, an
+        // already-decided bare merge, a `GH_HOST=` override, a merge naming a
+        // PR), so the common `create`/`ready` paths never pay for this.
+        let work_dir_for_origin = cwd
+            .filter(|_| merge_anchor_repo_targets(command).is_some())
+            .map(|cwd| parse_work_dir(command, cwd));
+        let origin = work_dir_for_origin
+            .as_deref()
+            .and_then(|dir| git_command(dir, &["remote", "get-url", "origin"]))
+            .and_then(|url| host_and_repo_from_url(&url))
+            .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
+        let present = is_polish_ship_anchor_for_origin(command, origin.as_deref())
+            && polish_marker_present(command, cwd);
         let record = if present {
             read_polish_marker(command, cwd)
         } else {
@@ -251,7 +269,14 @@ impl Check for NudgePolishBeforePr {
                 .filter(|d| live_digest_is_comparable(d))?;
             Some(live != recorded)
         };
-        decide(command, marker, touches_code, digest_moved, &annotations)
+        decide(
+            command,
+            marker,
+            touches_code,
+            digest_moved,
+            &annotations,
+            origin.as_deref(),
+        )
     }
 }
 
@@ -359,8 +384,9 @@ fn decide(
     branch_touches_code: impl Fn() -> bool,
     digest_moved: impl Fn() -> Option<bool>,
     annotations: &[String],
+    origin: Option<&str>,
 ) -> CheckResult {
-    if !is_polish_ship_anchor(command) {
+    if !is_polish_ship_anchor_for_origin(command, origin) {
         return CheckResult::allow();
     }
     match marker {
@@ -598,6 +624,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
@@ -625,6 +652,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -638,7 +666,8 @@ mod tests {
                 PRESENT_SECURITY_RAN,
                 || true,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -659,6 +688,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -675,6 +705,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
@@ -692,6 +723,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
@@ -704,11 +736,27 @@ mod tests {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-anchor gh command slipping through.
         assert_eq!(
-            decide("gh pr list", MarkerState::Absent, || false, || None, &[]).outcome,
+            decide(
+                "gh pr list",
+                MarkerState::Absent,
+                || false,
+                || None,
+                &[],
+                None
+            )
+            .outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("git commit -m x", PRESENT_UNKNOWN, || false, || None, &[]).outcome,
+            decide(
+                "git commit -m x",
+                PRESENT_UNKNOWN,
+                || false,
+                || None,
+                &[],
+                None
+            )
+            .outcome,
             Outcome::Allow
         );
         // A merge that NAMES a PR is excluded — it is the orchestrator shape,
@@ -720,7 +768,8 @@ mod tests {
                 MarkerState::Absent,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -731,7 +780,8 @@ mod tests {
                 MarkerState::Absent,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -742,7 +792,8 @@ mod tests {
                 MarkerState::Absent,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Nudge
@@ -754,7 +805,8 @@ mod tests {
                 PRESENT_UNKNOWN,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -771,7 +823,8 @@ mod tests {
                 MarkerState::Absent,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -782,7 +835,8 @@ mod tests {
                 MarkerState::Absent,
                 || false,
                 || None,
-                &[]
+                &[],
+                None
             )
             .outcome,
             Outcome::Allow
@@ -799,10 +853,18 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(nudge.outcome, Outcome::Nudge);
         nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
-        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, || false, || None, &[]);
+        let allow = decide(
+            "gh pr ready 12",
+            PRESENT_UNKNOWN,
+            || false,
+            || None,
+            &[],
+            None,
+        );
         assert_eq!(allow.outcome, Outcome::Allow);
         assert!(allow.message.is_none());
     }
@@ -993,6 +1055,93 @@ mod tests {
         (tmp, root)
     }
 
+    // --- cadence-hooks#881: own-repo `-R` merge, end to end through run() ---
+
+    /// [`init_repo_with_origin_and_files`], plus a REAL `origin` remote — the
+    /// merge tests below need `git remote get-url origin` to resolve to
+    /// something, unlike every marker/security-arm test above, which never
+    /// exercises the merge arm and so never pays for the resolution at all.
+    fn init_repo_with_real_origin_remote(
+        branch: &str,
+        origin_url: &str,
+        files: &[&str],
+    ) -> (tempfile::TempDir, String) {
+        let (tmp, root) = init_repo_with_origin_and_files(branch, files);
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["remote", "add", "origin", origin_url])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git remote add origin {origin_url} failed");
+        (tmp, root)
+    }
+
+    #[test]
+    fn run_own_repo_merge_no_marker_nudges() {
+        // #881 RED: a `gh pr merge -R` naming the cwd's OWN repo (resolved via
+        // its `origin` remote) is a real ship anchor — same fail-open floor
+        // as any other anchor, no marker means nudge.
+        let (tmp, _root) = init_repo_with_real_origin_remote(
+            "feat/own-repo-merge",
+            "https://github.com/cameronsjo/cadence-hooks.git",
+            &["src/lib.rs"],
+        );
+        let input = make_bash_with_cwd(
+            "gh pr merge -R cameronsjo/cadence-hooks",
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn run_different_repo_merge_stays_silent() {
+        // #881 positive control: the same spelling naming a DIFFERENT repo
+        // than origin must stay silent — the orchestrator shape this check
+        // was built to exclude (#325), and origin resolution must not widen
+        // it.
+        let (tmp, _root) = init_repo_with_real_origin_remote(
+            "feat/other-repo-merge",
+            "https://github.com/cameronsjo/cadence-hooks.git",
+            &["src/lib.rs"],
+        );
+        let input = make_bash_with_cwd(
+            "gh pr merge -R someone-else/other-repo",
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn run_own_repo_merge_with_marker_allows_silently() {
+        // #881 positive control: the marker path is unaffected — a
+        // branch-scoped marker still satisfies an own-repo `-R` merge exactly
+        // as it satisfies a bare one.
+        let (tmp, root) = init_repo_with_real_origin_remote(
+            "feat/own-repo-merge-marked",
+            "https://github.com/cameronsjo/cadence-hooks.git",
+            &["src/lib.rs"],
+        );
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/own-repo-merge-marked"),
+                r#"{"scope":"full","arms":{"security":"ran"}}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd(
+                "gh pr merge -R cameronsjo/cadence-hooks",
+                tmp.path().to_str().unwrap(),
+            );
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
     #[test]
     fn run_docs_marker_on_code_branch_fires_security_nudge() {
         // #467 RED (integration, positive control — FIRES): a docs-scoped
@@ -1123,6 +1272,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
@@ -1147,6 +1297,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -1160,6 +1311,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -1207,6 +1359,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
@@ -1232,6 +1385,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -1252,6 +1406,7 @@ mod tests {
                 || true,
                 || None,
                 &[],
+                None,
             );
             assert_eq!(
                 result.outcome,
@@ -1267,6 +1422,7 @@ mod tests {
                 || true,
                 || None,
                 &[],
+                None,
             );
             assert_eq!(
                 result.outcome,
@@ -1293,6 +1449,7 @@ mod tests {
             || true,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -1308,6 +1465,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
@@ -1639,6 +1797,7 @@ mod tests {
             || true,
             counted,
             &[],
+            None,
         );
         assert!(
             result.message.unwrap_or_default().contains("SECURITY arm"),
@@ -1657,6 +1816,7 @@ mod tests {
             || true,
             counted,
             &[],
+            None,
         );
         assert!(result.message.unwrap_or_default().contains("sonnet"));
         assert_eq!(calls.get(), 0);
@@ -1669,6 +1829,7 @@ mod tests {
             || true,
             counted,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         assert!(
@@ -1696,6 +1857,7 @@ mod tests {
             || false, // a docs-only branch, by the committed-diff classifier
             || Some(true),
             &[],
+            None,
         );
         assert_eq!(
             result.outcome,
@@ -1806,6 +1968,7 @@ mod tests {
             || false,
             || None,
             &["the marker directory is not the hardened per-user one".to_string()],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
@@ -1821,6 +1984,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(silent.outcome, Outcome::Allow);
         assert!(silent.message.is_none());
@@ -1836,6 +2000,7 @@ mod tests {
             || false,
             || None,
             &[],
+            None,
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();

@@ -1046,7 +1046,17 @@ pub fn is_assignment_word(token: &str) -> bool {
 /// expanded inner segment can match — and per-segment draft scoping survives
 /// the expansion, leaving `sh -c 'gh pr create --draft'` correctly skipped.
 pub fn is_polish_ship_anchor(command: &str) -> bool {
-    polish_ship_anchor(command).is_some()
+    is_polish_ship_anchor_for_origin(command, None)
+}
+
+/// Origin-aware form of [`is_polish_ship_anchor`] (cadence-hooks#881):
+/// `origin` is the canonical `host/owner/repo` triple of the cwd's `origin`
+/// remote, when the caller has resolved it — see
+/// [`GhPrInvocation::targets_the_current_branch`] for what it changes. `None`
+/// reproduces [`is_polish_ship_anchor`] exactly: a retargeted merge never
+/// anchors without an origin to compare against.
+pub fn is_polish_ship_anchor_for_origin(command: &str, origin: Option<&str>) -> bool {
+    polish_ship_anchor_for_origin(command, origin).is_some()
 }
 
 /// Which anchor `command` trips — `"create"`, `"ready"`, or `"merge"` — or
@@ -1061,9 +1071,44 @@ pub fn is_polish_ship_anchor(command: &str) -> bool {
 /// so a naive rate reads better than reality (security review, #325). Anything
 /// measuring adherence should dedup on `(repo, branch)` or split by this field.
 pub fn polish_ship_anchor(command: &str) -> Option<&'static str> {
+    polish_ship_anchor_for_origin(command, None)
+}
+
+/// Origin-aware form of [`polish_ship_anchor`] — see
+/// [`is_polish_ship_anchor_for_origin`].
+pub fn polish_ship_anchor_for_origin(command: &str, origin: Option<&str>) -> Option<&'static str> {
     command_segments(command)
         .iter()
-        .find_map(|segment| segment_ship_anchor(segment))
+        .find_map(|segment| segment_ship_anchor(segment, origin))
+}
+
+/// Whether `command` contains a `gh pr merge` segment that would anchor
+/// **once its repo override is checked against the origin remote** —
+/// everything about it looks like a same-repo merge except the retarget
+/// itself (cadence-hooks#881). Callers use this to decide whether the `git
+/// remote get-url origin` spawn is worth paying for: a command this returns
+/// `None` for can never become an anchor no matter what origin resolves to.
+///
+/// `None` covers every case where origin cannot change the answer: no `gh pr
+/// merge` segment at all, a segment that already anchors without origin (a
+/// bare, non-retargeted merge — [`is_polish_ship_anchor`] already says yes),
+/// a `GH_HOST=` override (never own-repo-eligible regardless of origin), a
+/// merge naming a PR/branch/number operand, or a retargeted merge with no
+/// resolvable repo values at all.
+pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
+    command_segments(command).iter().find_map(|segment| {
+        let tokens = tokenize(strip_group_wrappers(segment));
+        let invocation = gh_pr_invocation(&tokens)?;
+        if invocation.subcommand != "merge"
+            || !invocation.operands_flags_only
+            || !invocation.retargeted
+            || invocation.host_overridden
+            || invocation.repo_targets.is_empty()
+        {
+            return None;
+        }
+        Some(invocation.repo_targets.clone())
+    })
 }
 
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
@@ -1076,7 +1121,7 @@ pub fn polish_ship_anchor(command: &str) -> Option<&'static str> {
 /// (`enforce_worktree`, `guard_rm`), because [`tokenize`] fuses the punctuation
 /// to the adjacent word — without it `{ gh pr create; }` presents `{` as the
 /// command word and the index-0 gate never fires.
-fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
+fn segment_ship_anchor(segment: &str, origin: Option<&str>) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
     let invocation = gh_pr_invocation(&tokens)?;
     match invocation.subcommand {
@@ -1101,7 +1146,7 @@ fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
         // branch would kill the canonical `gh pr ready <n>` spelling.
         "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
         "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
-        "merge" if invocation.targets_the_current_branch() => Some("merge"),
+        "merge" if invocation.targets_the_current_branch(origin) => Some("merge"),
         _ => None,
     }
 }
@@ -1113,8 +1158,25 @@ struct GhPrInvocation<'a> {
     /// Tokens following the subcommand — its own flags and operands.
     operands: &'a [String],
     /// The command was pointed at another repository: a `--repo`/`-R` flag in
-    /// global position, or a `GH_REPO=`/`GH_HOST=` assignment prefix.
+    /// global position or after the subcommand, or a `GH_REPO=`/`GH_HOST=`
+    /// assignment prefix.
     retargeted: bool,
+    /// Whether `operands` carry only flags/redirects/repo-overrides — no
+    /// positional PR selector. Computed once at construction (via
+    /// [`scan_operands`]) so [`GhPrInvocation::targets_the_current_branch`]
+    /// does not re-walk `operands` on every call.
+    operands_flags_only: bool,
+    /// Every `-R`/`--repo`/`GH_REPO=` VALUE this invocation carries, in
+    /// global position, post-subcommand position, and the inline-assignment
+    /// prefix — every spelling [`gh_pr_invocation`] can see. Empty when the
+    /// command was never retargeted, or was retargeted by a flag with no
+    /// resolvable value (see [`scan_operands`]).
+    repo_targets: Vec<String>,
+    /// A `GH_HOST=` assignment prefix was present. Distinct from
+    /// `retargeted`: a host override is never own-repo-eligible regardless of
+    /// what `repo_targets` compares to, because it can point the SAME
+    /// `owner/repo` slug at a different forge entirely.
+    host_overridden: bool,
 }
 
 /// True for every spelling of gh's repo override. gh accepts the value
@@ -1122,6 +1184,24 @@ struct GhPrInvocation<'a> {
 /// for the shorthand — attached bare (`-Rowner/r`). A token starting with `-R`
 /// can only be that flag: no other gh flag on `pr merge` begins with a capital
 /// `R`, and the separated form is `-R` exactly.
+///
+/// **Sibling scanners for the same flag**, so a change to one grammar does not
+/// silently orphan the others (cadence-hooks#881; reproducible with
+/// `rg -- '-R"|--repo' crates/`):
+///
+/// | site | what it does |
+/// |---|---|
+/// | `is_repo_flag` (here) | prefix test, detect-only |
+/// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
+/// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
+/// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
+/// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
+/// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
+///
+/// `git push --repo` is deliberately NOT a sibling: it is a different
+/// executable's flag (`crates/core/src/shell.rs`'s `PUSH_SEPARATE_VALUE_LONG_OPTS`),
+/// spelled `--repo` only by coincidence, and gh's `-R` shorthand has no `git
+/// push` analog at all.
 fn is_repo_flag(token: &str) -> bool {
     token.starts_with("--repo") || token.starts_with("-R")
 }
@@ -1168,13 +1248,49 @@ impl GhPrInvocation<'_> {
     ///
     /// So this returns "targets the current branch" as the best available
     /// reading of the command text, not as a proof about what gh will do.
-    fn targets_the_current_branch(&self) -> bool {
-        !self.retargeted && operands_are_flags_only(self.operands)
+    ///
+    /// **Origin-aware (cadence-hooks#881).** A retargeted merge no longer
+    /// disqualifies outright: when every `-R`/`--repo`/`GH_REPO=` value this
+    /// invocation carries normalizes to the SAME repository as `origin` — the
+    /// cwd's own repo, canonicalized the same way — the retarget is a no-op
+    /// and the merge still targets the current branch. Unanimity across every
+    /// target mirrors `guard_gh_write::scan_unanimous_flag`'s fail-closed
+    /// rule: disagreeing targets (`gh -R own/r pr merge -R other/r`) suppress,
+    /// same as `origin` being unresolvable (`None`) or a `GH_HOST=` override
+    /// being present — a host override can point the identical `owner/repo`
+    /// slug at a different forge, so it is never own-repo-eligible regardless
+    /// of what the targets compare to.
+    fn targets_the_current_branch(&self, origin: Option<&str>) -> bool {
+        if !self.operands_flags_only {
+            return false;
+        }
+        if !self.retargeted {
+            return true;
+        }
+        if self.host_overridden {
+            return false;
+        }
+        let Some(origin) = origin else {
+            return false;
+        };
+        !self.repo_targets.is_empty()
+            && self
+                .repo_targets
+                .iter()
+                .all(|target| normalize_gh_target(target).as_deref() == Some(origin))
     }
 }
 
-/// True when nothing in `operands` selects a PR — only flags, shell
-/// redirections, and a trailing comment.
+/// What scanning [`GhPrInvocation::operands`] found: whether every token is a
+/// flag, a shell redirection, a trailing comment, or a repo override — no
+/// positional PR selector — and every `-R`/`--repo` VALUE seen along the way.
+struct OperandScan {
+    flags_only: bool,
+    repo_targets: Vec<String>,
+}
+
+/// Scan `operands` — the tokens after a `gh pr <sub>` subcommand — for
+/// whether they select a PR, and for every repo-override value they carry.
 ///
 /// Redirections have to be skipped rather than counted, and the reason is
 /// concrete: this ecosystem's own rule for gating a merge on a command's exit
@@ -1183,7 +1299,24 @@ impl GhPrInvocation<'_> {
 /// for the most careful spelling, exactly the un-nudged-ship hole #325 exists
 /// to close (security review). `ready` and `create` never had this asymmetry,
 /// because neither inspects its operands at all.
-fn operands_are_flags_only(operands: &[String]) -> bool {
+///
+/// A `-R`/`--repo` here no longer disqualifies outright (cadence-hooks#881):
+/// its VALUE is captured into `repo_targets` and the matching tokens are
+/// skipped, so the flags-only scan can continue past it — the retarget
+/// decision moves to [`GhPrInvocation::targets_the_current_branch`], which
+/// compares the captured targets against the resolved origin. A trailing
+/// `-R`/`--repo` with no following value cannot be attributed a target at
+/// all, so it disqualifies exactly as the old rule did.
+///
+/// **`--` terminates flag parsing, and anything after it disqualifies.**
+/// cobra reads every token after `--` as positional — never a flag, never a
+/// repo override — so `gh pr merge -- -R own/repo` selects a (malformed) PR
+/// literally named `-R`, not a retarget. Without this terminator, that
+/// spelling would newly read as an own-repo retarget and fire a false nudge:
+/// the one new hazard adding value capture here creates, and the reason `--`
+/// gets its own arm rather than falling through to the generic flag test.
+fn scan_operands(operands: &[String]) -> OperandScan {
+    let mut repo_targets = Vec::new();
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
@@ -1202,7 +1335,10 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         // direction is also the safe one — returning true means "no PR
         // selected", which makes the gate fire rather than fall silent.
         if token == "#" {
-            return true;
+            return OperandScan {
+                flags_only: true,
+                repo_targets,
+            };
         }
         if is_redirect_token(token) {
             // A bare operator (`>`, `2>`, `&>`) takes the NEXT token as its
@@ -1213,21 +1349,66 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
             i += 1;
             continue;
         }
-        // A positional operand selects a PR; a repo flag retargets the command.
-        // Either way the cwd's branch is not what gh will act on.
+        // `--` ends flag parsing; everything after it is a POSITIONAL to
+        // cobra, never a flag — see the doc comment above for why this must
+        // disqualify rather than fall through to the repo-flag test below.
+        if token == "--" {
+            let anything_follows = operands.get(i + 1..).is_some_and(|rest| !rest.is_empty());
+            return OperandScan {
+                flags_only: !anything_follows,
+                repo_targets,
+            };
+        }
+        if token == "-R" || token == "--repo" {
+            match operands.get(i + 1) {
+                Some(value) => {
+                    repo_targets.push(value.clone());
+                    i += 2;
+                    continue;
+                }
+                // A trailing repo flag with no value cannot be attributed a
+                // target — disqualify, same as the old is_repo_flag() rule.
+                None => {
+                    return OperandScan {
+                        flags_only: false,
+                        repo_targets,
+                    };
+                }
+            }
+        }
+        if let Some(value) = token.strip_prefix("--repo=") {
+            repo_targets.push(value.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("-R").filter(|v| !v.is_empty()) {
+            repo_targets.push(value.to_string());
+            i += 1;
+            continue;
+        }
+        // A positional operand selects a PR; any other repo-flag spelling
+        // `is_repo_flag` recognizes that isn't handled above retargets with
+        // no attributable value. Either way the cwd's branch is not what gh
+        // will act on.
         if !token.starts_with('-') || is_repo_flag(token) {
-            return false;
+            return OperandScan {
+                flags_only: false,
+                repo_targets,
+            };
         }
         i += 1;
     }
-    true
+    OperandScan {
+        flags_only: true,
+        repo_targets,
+    }
 }
 
 /// True when `operands` carry a `--undo` that **gh will actually receive** —
 /// the un-ship spelling of `gh pr ready`, which flips a PR back to draft.
 ///
 /// Redirect targets and here-string words are skipped for the same reason
-/// [`operands_are_flags_only`] skips them: the shell consumes them, so gh never
+/// [`scan_operands`] skips them: the shell consumes them, so gh never
 /// sees them. `gh pr ready 12 > --undo` writes a file literally named `--undo`
 /// and ships the PR for real; counting it would suppress a genuine ship, which
 /// is the costly direction (a missed nudge, never a wrong block).
@@ -1243,7 +1424,7 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
         // A comment ends the command — nothing after it reaches gh. Equality,
-        // not a prefix, for the reason spelled out in [`operands_are_flags_only`]:
+        // not a prefix, for the reason spelled out in [`scan_operands`]:
         // a quoted flag value may merely begin with `#`.
         if token == "#" {
             return false;
@@ -1362,9 +1543,19 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
     // The prefix region `skip_transparent_prefixes` consumed — assignment words
     // and transparent prefixes both live here.
     let prefix = &tokens[..tokens.len() - argv.len()];
-    let mut retargeted = prefix
-        .iter()
-        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="));
+    let mut retargeted = false;
+    let mut repo_targets: Vec<String> = Vec::new();
+    let mut host_overridden = false;
+    for t in prefix {
+        if let Some(value) = t.strip_prefix("GH_REPO=") {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+        }
+        if t.starts_with("GH_HOST=") {
+            retargeted = true;
+            host_overridden = true;
+        }
+    }
     let mut i = 1;
     while let Some(flag) = argv.get(i) {
         if !flag.starts_with('-') {
@@ -1374,7 +1565,18 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         // (`--repo=owner/r`, `-Rowner/r`) consumes only itself.
         if flag == "--repo" || flag == "-R" {
             retargeted = true;
+            if let Some(value) = argv.get(i + 1) {
+                repo_targets.push(value.clone());
+            }
             i += 2;
+        } else if let Some(value) = flag.strip_prefix("--repo=") {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+            i += 1;
+        } else if let Some(value) = flag.strip_prefix("-R").filter(|v| !v.is_empty()) {
+            retargeted = true;
+            repo_targets.push(value.to_string());
+            i += 1;
         } else {
             retargeted |= is_repo_flag(flag);
             i += 1;
@@ -1384,11 +1586,59 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         return None;
     }
     let subcommand = argv.get(i + 1)?;
+    let operands = argv.get(i + 2..).unwrap_or(&[]);
+    let scan = scan_operands(operands);
+    if !scan.repo_targets.is_empty() {
+        retargeted = true;
+    }
+    repo_targets.extend(scan.repo_targets);
     Some(GhPrInvocation {
         subcommand: subcommand.as_str(),
-        operands: argv.get(i + 2..).unwrap_or(&[]),
+        operands,
         retargeted,
+        operands_flags_only: scan.flags_only,
+        repo_targets,
+        host_overridden,
     })
+}
+
+/// Canonical `(host, owner/repo)` triple, lowercased, for a `-R`/`--repo`/
+/// `GH_REPO=` VALUE — in every shape gh accepts (cadence-hooks#881): a bare
+/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (https, ssh,
+/// or SCP-style). Measured live against gh 2.96.0: `gh pr list -R
+/// https://github.com/cameronsjo/cadence-hooks` and `-R
+/// git@github.com:cameronsjo/cadence-hooks.git` both resolved, rc 0.
+///
+/// A URL form is tried FIRST via [`host_and_repo_from_url`], because
+/// splitting on `/` would otherwise misparse a URL's path segments as a bare
+/// slug. Exactly two plain slash segments default the host to
+/// `github.com`, matching gh's own default — this branch is only reached
+/// when no `GH_HOST=` prefix is present, because that prefix already sets
+/// [`GhPrInvocation::host_overridden`] and suppresses eligibility before this
+/// runs. Three or more segments are `HOST/OWNER/REPO`; the first is the host,
+/// the next two are the slug, and anything after that (a subpath) is
+/// discarded — same as [`host_and_repo_from_url`] does for a URL's path.
+/// Anything else — one segment, an empty owner or repo — returns `None`,
+/// which suppresses the same way an unattributable target always has.
+fn normalize_gh_target(value: &str) -> Option<String> {
+    if let Some((host, slug)) = host_and_repo_from_url(value) {
+        return Some(format!("{host}/{}", slug.to_ascii_lowercase()));
+    }
+    let parts: Vec<&str> = value.split('/').filter(|s| !s.is_empty()).collect();
+    match parts.len() {
+        2 => Some(format!(
+            "github.com/{}/{}",
+            parts[0].to_ascii_lowercase(),
+            parts[1].to_ascii_lowercase()
+        )),
+        n if n >= 3 => Some(format!(
+            "{}/{}/{}",
+            parts[0].to_ascii_lowercase(),
+            parts[1].to_ascii_lowercase(),
+            parts[2].to_ascii_lowercase()
+        )),
+        _ => None,
+    }
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -5003,6 +5253,162 @@ mod tests {
         assert!(is_polish_ship_anchor("env gh pr merge --squash"));
         // An UNRELATED assignment prefix must not disqualify.
         assert!(is_polish_ship_anchor("FOO=1 gh pr merge --squash"));
+    }
+
+    /// The canonical `host/owner/repo` triple `origin` resolves to across the
+    /// origin-aware tests below — the cwd's own repo, in the shape
+    /// `normalize_gh_target` and the origin-resolution callers both produce.
+    const OWN_ORIGIN: &str = "github.com/cameronsjo/cadence-hooks";
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_own_repo_every_spelling_anchors() {
+        // #881 RED: every -R/--repo spelling the plan enumerates, naming the
+        // cwd's OWN repo, must anchor once origin resolves to it — a
+        // retarget to the repo you're already in is not a retarget in any
+        // sense the anchor cares about.
+        for cmd in [
+            "gh pr merge -R cameronsjo/cadence-hooks",
+            "gh pr merge --repo cameronsjo/cadence-hooks",
+            "gh pr merge --repo=cameronsjo/cadence-hooks",
+            "gh pr merge -Rcameronsjo/cadence-hooks",
+            "gh -R cameronsjo/cadence-hooks pr merge",
+            "GH_REPO=cameronsjo/cadence-hooks gh pr merge",
+        ] {
+            assert!(
+                is_polish_ship_anchor_for_origin(cmd, Some(OWN_ORIGIN)),
+                "own-repo retarget must anchor: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_other_repo_suppressed() {
+        // #881 RED: a repo target naming a DIFFERENT owner/repo must stay
+        // suppressed even once origin resolution is wired up — comparing by
+        // owner alone (or not at all) would wrongly anchor a real
+        // orchestrator-shape merge.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R other/repo",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_host_override_suppressed() {
+        // #881 RED: a `GH_HOST=` override suppresses even when the
+        // owner/repo SLUG matches origin's — the override can point that
+        // identical slug at a different forge entirely, so the slug match
+        // alone proves nothing.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "GH_HOST=example.com gh pr merge -R cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_host_segment_in_target_is_respected() {
+        // #881 RED: a target that names its OWN host segment
+        // (`host/owner/repo`, no `GH_HOST=`) must compare that host too, not
+        // silently drop it and fall through to an owner/repo-only match.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R github.example.com/cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+        // The control: the same slug on the SAME host origin resolves to
+        // anchors.
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh pr merge -R github.com/cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_none_origin_suppressed() {
+        // #881 RED: an unresolvable origin (no remote, spawn failure, a
+        // non-GitHub-shaped URL) must suppress a retargeted merge exactly as
+        // today — never anchor on missing evidence.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R cameronsjo/cadence-hooks",
+            None
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_double_dash_terminator_suppressed() {
+        // #881 RED: the one new hazard adding repo-target capture creates.
+        // Without a `--` terminator in the operand scan, `-R` after `--`
+        // would newly read as an own-repo retarget — but cobra stops flag
+        // parsing at `--`, so gh reads `-R` here as a (malformed) PR
+        // selector, never a repo override. Must stay suppressed regardless
+        // of origin.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -- -R cameronsjo/cadence-hooks",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_value_skip_does_not_swallow_a_pr_number() {
+        // #881 RED: consuming a repo flag's VALUE must not also consume a
+        // real positional operand sitting right after it — `gh pr merge -R
+        // own/repo 12` names PR 12 explicitly and must never resolve from the
+        // cwd's branch, regardless of how the retarget resolves.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh pr merge -R cameronsjo/cadence-hooks 12",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_disagreeing_targets_suppressed() {
+        // #881 RED: unanimity across every target this invocation carries,
+        // mirroring `guard_gh_write::scan_unanimous_flag`'s fail-closed rule.
+        // A global `-R` naming origin and a post-subcommand `-R` naming
+        // something else disagree, so the merge suppresses even though one
+        // reading alone would have anchored.
+        assert!(!is_polish_ship_anchor_for_origin(
+            "gh -R cameronsjo/cadence-hooks pr merge -R other/repo",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_create_and_ready_untouched() {
+        // #881 positive control: `create`/`ready` never inspected retargeting
+        // and must not start now — origin is consulted only by the `merge`
+        // arm (#452 pins the same invariant for the unretargeted case).
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh -R owner/r pr create --title x",
+            Some(OWN_ORIGIN)
+        ));
+        assert!(is_polish_ship_anchor_for_origin(
+            "gh -R owner/r pr ready 12",
+            Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn merge_anchor_repo_targets_scopes_the_origin_spawn() {
+        // #881: callers pay for `git remote get-url origin` only when this
+        // returns `Some` — every shape that origin cannot change the answer
+        // for must return `None`.
+        assert_eq!(merge_anchor_repo_targets("gh pr create --title x"), None);
+        assert_eq!(merge_anchor_repo_targets("gh pr ready 12"), None);
+        // A bare, non-retargeted merge already anchors without origin.
+        assert_eq!(merge_anchor_repo_targets("gh pr merge"), None);
+        // A GH_HOST= override is never own-repo-eligible regardless of origin.
+        assert_eq!(
+            merge_anchor_repo_targets("GH_HOST=example.com gh pr merge -R owner/r"),
+            None
+        );
+        // A merge naming a PR number is disqualified before origin matters.
+        assert_eq!(merge_anchor_repo_targets("gh pr merge -R owner/r 12"), None);
+        // The positive case: a retargeted, otherwise-anchor-shaped merge with
+        // a resolvable target IS origin-dependent.
+        assert_eq!(
+            merge_anchor_repo_targets("gh pr merge -R cameronsjo/cadence-hooks"),
+            Some(vec!["cameronsjo/cadence-hooks".to_string()])
+        );
     }
 
     #[test]
