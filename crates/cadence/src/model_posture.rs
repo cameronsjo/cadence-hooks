@@ -14,16 +14,31 @@
 //! *whether* the fixed line is emitted.
 //!
 //! **Silence is the default.** The line is emitted only when the target model
-//! matches Fable and, on a switch, the session was not already on Fable and the
-//! switch is not the model restore a `resume` performs (SessionStart already
-//! covers a restored model). Every other case — a non-Fable target, an
-//! unmodeled event, an absent `hook_event_name`, a wrong-typed or all-`None`
-//! payload — exits 0 with no stdout.
+//! matches Fable and, on a switch, the session was not already on Fable. Every
+//! other case — a non-Fable target, an unmodeled event, an absent
+//! `hook_event_name`, a wrong-typed or all-`None` payload — exits 0 with no
+//! stdout.
+//!
+//! **The switch half does not suppress a `resume` restore**, even though
+//! SessionStart fires for the same session. It would be suppressing the one
+//! case where SessionStart is least able to cover it: `model` is documented as
+//! optional and "can be omitted, for example after `/clear` or when a session
+//! is restored through conversation recovery" (live hooks doc, SessionStart
+//! input, read 2026-09-15). The trade is one duplicated line against the
+//! feature going silent on exactly the sessions it exists for, which is not a
+//! trade worth taking for a nudge that costs one line of context.
 //!
 //! There is deliberately **no once-per-day gate**. The Fable-target filter is
 //! what bounds the volume: `opusplan` fires `PostModelSwitch` on every
-//! plan-mode toggle, but those switches target Opus, not Fable, so they never
-//! reach the emitter.
+//! plan-mode toggle, but it targets Opus in plan mode and Sonnet outside it, so
+//! neither direction reaches the emitter.
+//!
+//! The emitted *content* is one constant; the emitted *length* is not bounded
+//! here. A payload carrying several normalized targets (an `apply_patch` body,
+//! a rename) has its per-target results joined by the dispatch layer, so the
+//! line would repeat. Neither wired event carries a `tool_input`, so this is
+//! unreachable in practice — and it is the shared behavior of every nudge
+//! check, not something this hook introduces.
 
 use cadence_hooks_core::{Check, CheckResult, HookEvent, HookInput, model_matches};
 
@@ -36,11 +51,6 @@ pub const FABLE_POSTURE_LINE: &str =
 /// `[1m]` context-window suffix still matches.
 const FABLE_TOKENS: [&str; 1] = ["claude-fable"];
 
-/// The `PostModelSwitch` `source` value for the model Claude Code restores when
-/// a session resumes. SessionStart already emits the posture for that model, so
-/// the switch half stays quiet on it rather than saying the same thing twice.
-const RESUME_SOURCE: &str = "resume";
-
 /// True when the model id names a Fable model.
 fn is_fable(model: &str) -> bool {
     model_matches(model, &FABLE_TOKENS)
@@ -49,13 +59,15 @@ fn is_fable(model: &str) -> bool {
 /// Pure emitter: the posture line, or `None` for silence.
 ///
 /// `target` is the model the session is (or has just become) running —
-/// `model` on SessionStart, `to_model` on a switch. `from` and `source` are
-/// meaningful on `PostModelSwitch` only.
+/// `model` on SessionStart, `to_model` on a switch. `from` is meaningful on
+/// `PostModelSwitch` only.
+///
+/// No `source` parameter: neither half filters on it. See the module docs for
+/// why the switch half does not suppress a `resume` restore.
 pub fn posture_line(
     event: HookEvent,
     from: Option<&str>,
     target: Option<&str>,
-    source: Option<&str>,
 ) -> Option<&'static str> {
     // No identified target model is silence — the same fail-direction
     // `guard-read-model` takes on an unresolvable model.
@@ -64,18 +76,9 @@ pub fn posture_line(
     }
     match event {
         HookEvent::SessionStart => Some(FABLE_POSTURE_LINE),
-        HookEvent::PostModelSwitch => {
-            // A resume restores the session's saved model; SessionStart fires
-            // for that same session and already carries the posture.
-            if source.is_some_and(|s| s.eq_ignore_ascii_case(RESUME_SOURCE)) {
-                return None;
-            }
-            // Already on Fable — the seat did not change.
-            if from.is_some_and(is_fable) {
-                return None;
-            }
-            Some(FABLE_POSTURE_LINE)
-        }
+        // Already on Fable — the seat did not change.
+        HookEvent::PostModelSwitch if from.is_some_and(is_fable) => None,
+        HookEvent::PostModelSwitch => Some(FABLE_POSTURE_LINE),
         HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::UserPromptSubmit => None,
     }
 }
@@ -99,12 +102,16 @@ impl Check for ModelPosture {
         else {
             return CheckResult::allow();
         };
+        // Exhaustive on purpose: a new `HookEvent` variant must break the build
+        // here and force a decision, rather than being absorbed by a wildcard.
         let (from, target) = match event {
             HookEvent::SessionStart => (None, input.model.as_deref()),
             HookEvent::PostModelSwitch => (input.from_model.as_deref(), input.to_model.as_deref()),
-            _ => return CheckResult::allow(),
+            HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::UserPromptSubmit => {
+                return CheckResult::allow();
+            }
         };
-        match posture_line(event, from, target, input.source.as_deref()) {
+        match posture_line(event, from, target) {
             Some(line) => CheckResult::nudge(line.to_string()),
             None => CheckResult::allow(),
         }
@@ -144,7 +151,6 @@ mod tests {
                 HookEvent::PostModelSwitch,
                 Some("claude-opus-5"),
                 Some("claude-fable-5-1"),
-                Some("command"),
             ),
             Some(FABLE_POSTURE_LINE)
         );
@@ -157,7 +163,6 @@ mod tests {
                 HookEvent::PostModelSwitch,
                 Some("claude-fable-5-1"),
                 Some("claude-opus-5"),
-                Some("command"),
             ),
             None
         );
@@ -172,7 +177,6 @@ mod tests {
                 HookEvent::PostModelSwitch,
                 Some("claude-fable-5-1"),
                 Some("claude-fable-5-1[1m]"),
-                Some("command"),
             ),
             None
         );
@@ -187,39 +191,31 @@ mod tests {
                 HookEvent::PostModelSwitch,
                 Some("claude-opus-5[1m]"),
                 Some("claude-fable-5-1[1m]"),
-                Some("command"),
             ),
             Some(FABLE_POSTURE_LINE)
         );
     }
 
     #[test]
-    fn resume_source_is_silent_on_the_switch_half() {
-        // SessionStart already emits for a restored model.
-        assert_eq!(
-            posture_line(
-                HookEvent::PostModelSwitch,
+    fn no_switch_source_suppresses_the_posture() {
+        // `source` does not gate either half. `resume` is the load-bearing row:
+        // suppressing it would hand the whole feature to SessionStart, whose
+        // `model` field is documented as optional and omitted "after `/clear`
+        // or when a session is restored through conversation recovery" — the
+        // sessions this hook most exists for. `auto` is a real fallback the
+        // harness performed, so the seat changed and the posture is owed.
+        for source in ["command", "picker", "sdk", "auto", "resume"] {
+            let result = ModelPosture.run(&switch(
                 Some("claude-opus-5"),
                 Some("claude-fable-5-1"),
-                Some("resume"),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn auto_fallback_onto_fable_emits() {
-        // `auto` is a real switch Claude Code made on its own — the seat
-        // changed, so the posture is owed.
-        assert_eq!(
-            posture_line(
-                HookEvent::PostModelSwitch,
-                Some("claude-opus-5"),
-                Some("claude-fable-5-1"),
-                Some("auto"),
-            ),
-            Some(FABLE_POSTURE_LINE)
-        );
+                Some(source),
+            ));
+            assert_eq!(
+                result.message.as_deref(),
+                Some(FABLE_POSTURE_LINE),
+                "PostModelSwitch source {source:?} must still emit"
+            );
+        }
     }
 
     #[test]
@@ -229,7 +225,6 @@ mod tests {
                 HookEvent::PostModelSwitch,
                 Some("CLAUDE-OPUS-5"),
                 Some("CLAUDE-FABLE-5-1"),
-                Some("command"),
             ),
             Some(FABLE_POSTURE_LINE)
         );
@@ -239,12 +234,7 @@ mod tests {
     fn a_missing_from_model_still_emits_onto_fable() {
         // `from_model` absent is not evidence the session was already on Fable.
         assert_eq!(
-            posture_line(
-                HookEvent::PostModelSwitch,
-                None,
-                Some("claude-fable-5-1"),
-                Some("command"),
-            ),
+            posture_line(HookEvent::PostModelSwitch, None, Some("claude-fable-5-1"),),
             Some(FABLE_POSTURE_LINE)
         );
     }
@@ -254,29 +244,22 @@ mod tests {
     #[test]
     fn session_start_on_fable_emits() {
         assert_eq!(
-            posture_line(
-                HookEvent::SessionStart,
-                None,
-                Some("claude-fable-5-1"),
-                Some("startup"),
-            ),
+            posture_line(HookEvent::SessionStart, None, Some("claude-fable-5-1"),),
             Some(FABLE_POSTURE_LINE)
         );
     }
 
     #[test]
     fn session_start_on_fable_emits_for_every_trigger() {
-        // The SessionStart half has no source filter — `resume` suppression
-        // belongs to the switch half alone, and suppressing it here would make
-        // a resumed Fable session the one case with no posture at all.
-        for source in ["startup", "resume", "clear", "compact"] {
+        // Every documented SessionStart trigger, `fork` included (2.1.214+,
+        // which reported `resume` before that). None of them gates the posture.
+        for source in ["startup", "resume", "clear", "compact", "fork"] {
+            let input = HookInput {
+                source: Some(source.into()),
+                ..session_start(Some("claude-fable-5-1"))
+            };
             assert_eq!(
-                posture_line(
-                    HookEvent::SessionStart,
-                    None,
-                    Some("claude-fable-5-1"),
-                    Some(source),
-                ),
+                ModelPosture.run(&input).message.as_deref(),
                 Some(FABLE_POSTURE_LINE),
                 "SessionStart source {source:?} must still emit"
             );
@@ -286,12 +269,7 @@ mod tests {
     #[test]
     fn session_start_on_opus_is_silent() {
         assert_eq!(
-            posture_line(
-                HookEvent::SessionStart,
-                None,
-                Some("claude-opus-5"),
-                Some("startup"),
-            ),
+            posture_line(HookEvent::SessionStart, None, Some("claude-opus-5"),),
             None
         );
     }
@@ -300,34 +278,18 @@ mod tests {
 
     #[test]
     fn all_none_is_silent() {
-        assert_eq!(
-            posture_line(HookEvent::PostModelSwitch, None, None, None),
-            None
-        );
-        assert_eq!(
-            posture_line(HookEvent::SessionStart, None, None, None),
-            None
-        );
+        assert_eq!(posture_line(HookEvent::PostModelSwitch, None, None), None);
+        assert_eq!(posture_line(HookEvent::SessionStart, None, None), None);
     }
 
     #[test]
     fn an_unrelated_event_is_silent_even_on_fable() {
         assert_eq!(
-            posture_line(
-                HookEvent::PreToolUse,
-                None,
-                Some("claude-fable-5-1"),
-                Some("command"),
-            ),
+            posture_line(HookEvent::PreToolUse, None, Some("claude-fable-5-1"),),
             None
         );
         assert_eq!(
-            posture_line(
-                HookEvent::UserPromptSubmit,
-                None,
-                Some("claude-fable-5-1"),
-                Some("command"),
-            ),
+            posture_line(HookEvent::UserPromptSubmit, None, Some("claude-fable-5-1"),),
             None
         );
     }

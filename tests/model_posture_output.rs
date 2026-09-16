@@ -25,12 +25,19 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 }
 
 fn run(payload: &str) -> std::process::Output {
+    run_in(scratch_metrics_dir(), payload)
+}
+
+fn run_in(metrics_dir: &std::path::Path, payload: &str) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     // A runner session can ambiently carry either of these, which would exempt
     // the hook and turn an emit-expecting assertion into a false pass.
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
-    cmd.env("CADENCE_METRICS_DIR", scratch_metrics_dir());
+    // Nudge rows are on by default; an ambient opt-out would make the denial
+    // row vanish and read as a pass in the telemetry test below.
+    cmd.env_remove("CADENCE_LOG_NUDGES");
+    cmd.env("CADENCE_METRICS_DIR", metrics_dir);
     cmd.args(["cadence", "model-posture"]);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -126,12 +133,30 @@ fn a_session_starting_on_opus_is_silent() {
 }
 
 #[test]
-fn a_resume_restore_onto_fable_is_silent() {
+fn a_resume_restore_onto_fable_still_emits() {
+    // SessionStart is not a reliable backstop here: `model` is documented as
+    // optional and omitted "after `/clear` or when a session is restored
+    // through conversation recovery". Suppressing this would trade one
+    // duplicated line for total silence on the sessions the hook exists for.
     let payload = serde_json::json!({
         "session_id": "s1",
         "hook_event_name": "PostModelSwitch",
         "from_model": "claude-opus-5",
         "to_model": "claude-fable-5-1",
+        "source": "resume",
+    })
+    .to_string();
+    assert_posture_envelope(&run(&payload), "PostModelSwitch");
+}
+
+#[test]
+fn a_session_start_that_omits_the_model_field_is_silent() {
+    // The documented `/clear` and conversation-recovery shape. Nothing to
+    // report, and nothing to crash on — but it is why the switch half must not
+    // defer to this one.
+    let payload = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "SessionStart",
         "source": "resume",
     })
     .to_string();
@@ -141,6 +166,35 @@ fn a_resume_restore_onto_fable_is_silent() {
 #[test]
 fn an_empty_payload_is_silent_and_exits_zero() {
     assert_silent(&run("{}"));
+}
+
+/// The denial row records the event too, and it is a *separate* read of the
+/// same rebinding. An implementation that resolved the payload's event only for
+/// the output envelope and left the audit rows on the dispatch-time fallback
+/// would pass every other test in this file while writing `SessionStart` on
+/// every switch — a ledger that quietly disagrees with what fired.
+#[test]
+fn the_denial_row_records_the_payload_event_not_the_fallback() {
+    let dir = tempfile::tempdir().expect("temp metrics dir");
+    let payload = serde_json::json!({
+        "session_id": "s-telemetry",
+        "hook_event_name": "PostModelSwitch",
+        "from_model": "claude-opus-5",
+        "to_model": "claude-fable-5-1",
+        "source": "command",
+    })
+    .to_string();
+    assert_posture_envelope(&run_in(dir.path(), &payload), "PostModelSwitch");
+
+    let rows = std::fs::read_to_string(dir.path().join("denials.jsonl"))
+        .expect("a nudging hook must write a denials.jsonl row");
+    let row: serde_json::Value = rows
+        .lines()
+        .find(|line| line.contains("\"model-posture\""))
+        .map(|line| serde_json::from_str(line).expect("the row must be JSON"))
+        .expect("no model-posture row written");
+    assert_eq!(row["event"], "PostModelSwitch");
+    assert_eq!(row["decision"], "nudge");
 }
 
 #[test]

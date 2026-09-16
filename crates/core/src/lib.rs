@@ -198,6 +198,12 @@ pub fn normalize_path(path: &str) -> String {
 /// `[1m]` context-window suffix on the resolved id is tolerated because a
 /// substring test never reaches it. Lifted out of `guard-read-model` so the
 /// model-posture emitter cannot drift to a second, subtly different rule.
+///
+/// **An empty token matches every model**, since every string contains `""`.
+/// Neither caller can supply one — `config::env_list` drops empty entries, and
+/// the posture emitter's tokens are a `const` — so this is left as the
+/// substring rule's plain consequence rather than a special case. A future
+/// caller building tokens from another source owes that filter.
 pub fn model_matches<S: AsRef<str>>(resolved: &str, models: &[S]) -> bool {
     let lowered = resolved.to_lowercase();
     models
@@ -263,11 +269,13 @@ pub struct HookInput {
     #[serde(default, deserialize_with = "lenient_option")]
     pub hook_event_name: Option<String>,
     /// The trigger that fired this event. **The value set is event-specific**:
-    /// on `SessionStart` it is `startup` | `resume` | `clear` | `compact`; on
-    /// `PreModelSwitch` it is `command` | `picker` | `sdk`, and
-    /// `PostModelSwitch` adds `auto` (a change Claude Code made on its own) and
-    /// `resume` (the model restored when a session resumes). Read it only
-    /// alongside the event that produced it.
+    /// on `SessionStart` it is `startup` | `resume` | `clear` | `compact` |
+    /// `fork` (the last since Claude Code 2.1.214, which reported `resume`
+    /// before that); on `PreModelSwitch` it is `command` | `picker` | `sdk`,
+    /// and `PostModelSwitch` adds `auto` (a change Claude Code made on its own)
+    /// and `resume` (the model restored when a session resumes). Read it only
+    /// alongside the event that produced it — and note the two events give
+    /// `resume` different meanings.
     pub source: Option<String>,
     /// Model id for the session (e.g. `claude-opus-4-8`), when supplied. Only
     /// `SessionStart` receives this field, and not always; the model-switch
@@ -3033,6 +3041,17 @@ mod tests {
     fn model_matches_empty_list_never_matches() {
         let none: [&str; 0] = [];
         assert!(!model_matches("claude-opus-4-8", &none));
+    }
+
+    #[test]
+    fn model_matches_empty_token_matches_everything() {
+        // Pinned, not guarded: every string contains `""`, and neither caller
+        // can supply an empty token (`config::env_list` drops empty entries;
+        // the posture emitter's tokens are a const). A future caller that can
+        // owes the filter, and this test is where it will find that out.
+        assert!(model_matches("claude-opus-4-8", &[""]));
+        assert!(model_matches("", &[""]));
+        assert!(!model_matches("", &["opus"]));
     }
 
     #[test]

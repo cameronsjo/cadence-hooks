@@ -2499,13 +2499,18 @@ fn check_hook_event_types_match_hooks_json(
     } = subject;
 
     let mut mismatches = Vec::new();
+    // Events actually wired for each multi-event command in this subject. A
+    // half-wiring — the subcommand on one of its two events — is the failure
+    // this repo keeps hitting ("a fully-tested subcommand can ship and do
+    // nothing"), and set-membership alone cannot see it.
+    let mut multi_event_seen: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for refs in all_refs.values() {
         for r in refs {
             // A multi-event subcommand reports the event from the payload, so
             // the one event main.rs passes is a fallback and equality would
             // report a mismatch the binary does not have. Its wiring is still
             // checked — against the set of events it models.
-            if let Some((_, allowed)) = MULTI_EVENT_HOOKS
+            if let Some((command, allowed)) = MULTI_EVENT_HOOKS
                 .iter()
                 .find(|(command, _)| *command == r.command)
             {
@@ -2517,6 +2522,10 @@ fn check_hook_event_types_match_hooks_json(
                         allowed.join(", ")
                     ));
                 }
+                multi_event_seen
+                    .entry(command)
+                    .or_default()
+                    .insert(r.event_type.clone());
                 continue;
             }
             if let Some(main_event) = main_events.get(&r.command)
@@ -2527,6 +2536,31 @@ fn check_hook_event_types_match_hooks_json(
                     r.command, r.event_type, main_event
                 ));
             }
+        }
+    }
+
+    // Wired on one of its events but not the others: the missing half is dead,
+    // and nothing else in this file can see it. Skipped entirely while the
+    // command appears in no hooks.json at all — that state is
+    // `PENDING_WIRING_HOOKS`' to police, and `pending_wiring_hooks_are_still_unwired`
+    // forces the row out the moment any wiring lands.
+    for (command, allowed) in MULTI_EVENT_HOOKS {
+        let Some(seen) = multi_event_seen.get(command) else {
+            continue;
+        };
+        let missing: Vec<&str> = allowed
+            .iter()
+            .copied()
+            .filter(|event| !seen.contains(*event))
+            .collect();
+        if !missing.is_empty() {
+            mismatches.push(format!(
+                "  `{command}`: wired on {} but not on {}. The subcommand models all of \
+                 [{}]; an unwired half never fires",
+                seen.iter().cloned().collect::<Vec<_>>().join(", "),
+                missing.join(", "),
+                allowed.join(", ")
+            ));
         }
     }
 
