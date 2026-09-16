@@ -5,12 +5,15 @@
 //!
 //! This is the deterministic denominator for the polish-nudge efficacy
 //! measurement (claude-configurations#151): every ship anchor *is* a nudged PR
-//! (it fires `nudge-polish-before-pr`), so the same [`polish_ship_anchor`]
-//! predicate gates both — a draft create nudges nowhere, so it is logged
-//! nowhere either (#297). Each row carries the anchor **kind**, because a
-//! draft-first branch now trips `ready` and again at `merge` (#325) and the two
-//! rows would otherwise read as two separate ships; dedup on `(repo, branch)`
-//! or split by `anchor` before computing a rate. `polished` is a best-effort transcript scan for a
+//! (it fires `nudge-polish-before-pr`), so the same origin-aware
+//! [`polish_ship_anchor_for_origin`] predicate gates both — a draft create
+//! nudges nowhere, so it is logged nowhere either (#297), and a `gh pr merge
+//! -R` naming the cwd's OWN repo is a real ship anchor on both sides
+//! (cadence-hooks#881), never a denominator gap between the two. Each row
+//! carries the anchor **kind**, because a draft-first branch now trips `ready`
+//! and again at `merge` (#325) and the two rows would otherwise read as two
+//! separate ships; dedup on `(repo, branch)` or split by `anchor` before
+//! computing a rate. `polished` is a best-effort transcript scan for a
 //! `cadence-forge:polish` Skill invocation earlier in the session — a row with
 //! `polished: false` is a deterministic *skip candidate*. Distinguishing a
 //! rationalized skip from a legitimate one stays a transcript/prose judgment;
@@ -20,7 +23,10 @@
 
 use crate::common;
 use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::polish_ship_anchor;
+use cadence_hooks_core::shell::{
+    git_command, host_and_repo_from_url, merge_anchor_repo_targets, parse_work_dir,
+    polish_ship_anchor_for_origin,
+};
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
 };
@@ -41,11 +47,24 @@ impl Logger for LogPolishNudge {
             return;
         };
         // The denominator is defined as "every PR that fired the nudge", so the
-        // gate MUST be the same predicate the nudge uses. The anchor KIND rides
-        // along on the row: a draft-first branch now trips `ready` and again at
-        // `merge` (#325), and without the kind those two rows read as two
-        // separate ships of the same branch.
-        let Some(anchor) = polish_ship_anchor(command) else {
+        // gate MUST be the same predicate the nudge uses — origin-aware, so a
+        // `gh pr merge -R` naming the cwd's own repo counts here exactly when
+        // it nudges (cadence-hooks#881). The `git remote get-url origin` spawn
+        // is paid only when `merge_anchor_repo_targets` says a merge segment
+        // could still anchor pending that origin match; every other shape
+        // (create, ready, a bare merge, an unrelated command) never pays for
+        // it. The anchor KIND rides along on the row: a draft-first branch now
+        // trips `ready` and again at `merge` (#325), and without the kind
+        // those two rows read as two separate ships of the same branch.
+        let origin = input
+            .cwd
+            .as_deref()
+            .filter(|_| merge_anchor_repo_targets(command).is_some())
+            .map(|cwd| parse_work_dir(command, cwd))
+            .and_then(|dir| git_command(&dir, &["remote", "get-url", "origin"]))
+            .and_then(|url| host_and_repo_from_url(&url))
+            .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
+        let Some(anchor) = polish_ship_anchor_for_origin(command, origin.as_deref()) else {
             return;
         };
         // Skip malformed payloads (mirrors the other loggers); session_id is

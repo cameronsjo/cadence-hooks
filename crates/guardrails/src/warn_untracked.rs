@@ -74,8 +74,13 @@ impl Check for WarnUntrackedFiles {
             cmd.current_dir(dir);
         }
         let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
-            cadence_hooks_core::shell::GitSpawn::Completed(out) => out,
-            _ => return CheckResult::allow(),
+            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => out,
+            // Advisory: a truncated (or failed) `status --porcelain` would
+            // otherwise produce a confident, short untracked list.
+            cadence_hooks_core::shell::GitSpawn::Completed(_)
+            | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+            | cadence_hooks_core::shell::GitSpawn::TimedOut => return CheckResult::allow(),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);

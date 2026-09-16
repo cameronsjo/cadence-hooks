@@ -143,9 +143,14 @@ pub(crate) fn disable_summary_lines(
         ));
     }
     if !moot.is_empty() {
+        // The universal is rendered away, not written out: `CADENCE_BYPASS=1`
+        // no longer switches off the names in `BYPASS_EXEMPT_HOOKS`, and this
+        // sentence ships through `doctor --quiet` into SessionStart
+        // additionalContext — the same destination as the banner below, so the
+        // two must not disagree. A name in the moot list is genuinely off, so
+        // the claim narrows to those names rather than disappearing.
         lines.push(format!(
-            "CADENCE_DISABLE also names {} — moot, CADENCE_BYPASS=1 has already switched every \
-             hook off",
+            "CADENCE_DISABLE also names {} — moot, CADENCE_BYPASS=1 has already switched them off",
             moot.join(", ")
         ));
     }
@@ -246,11 +251,24 @@ pub(crate) fn bypass_status_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     if bypass::bypass_engaged_from(bypass_raw) {
-        lines.push(
-            "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed for \
-             this session (diagnostic commands still run)"
-                .to_string(),
-        );
+        // The exception is rendered from `BYPASS_EXEMPT_HOOKS` rather than
+        // named in the string, so adding a second exempt hook cannot leave this
+        // line making a false universal claim. It reaches the agent's context
+        // through `doctor --quiet`, which is the surface an operator trusts to
+        // say what is and is not enforcing.
+        if bypass::BYPASS_EXEMPT_HOOKS.is_empty() {
+            lines.push(
+                "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed \
+                 for this session (diagnostic commands still run)"
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!(
+                "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed \
+                 for this session except {} (diagnostic commands still run)",
+                bypass::BYPASS_EXEMPT_HOOKS.join(", ")
+            ));
+        }
     }
     for line in disable_summary_lines(bypass_raw, disable_raw) {
         lines.push(format!("cadence-hooks doctor: {line}"));
@@ -359,6 +377,26 @@ mod tests {
         }
     }
 
+    /// The same partition with a bypass-exempt hook in the list. It is the one
+    /// name a blanket bypass does not switch off, so it must land in `refused`
+    /// ("these still run") and never in `moot` — reporting it as moot would be
+    /// the false-reassurance failure in its most direct form: the report saying
+    /// the detector is off, in the session where it is the only thing running.
+    #[test]
+    fn a_bypass_exempt_hook_is_refused_not_moot() {
+        let lines = disable_summary_lines(Some("1"), Some("guard-rm-liveness,git-safety"));
+        let refused = lines
+            .iter()
+            .find(|l| l.starts_with("Protected — disable refused, these still run:"))
+            .unwrap_or_else(|| panic!("no refusal line: {lines:?}"));
+        assert!(refused.contains("guard-rm-liveness"), "{lines:?}");
+        let moot = lines.iter().find(|l| l.contains("moot"));
+        assert!(
+            moot.is_some_and(|l| l.contains("git-safety") && !l.contains("guard-rm-liveness")),
+            "the exempt hook must not be reported as moot: {lines:?}"
+        );
+    }
+
     /// The same case through `doctor`, which is where an operator meets it.
     #[test]
     fn doctor_never_claims_a_guard_runs_under_a_bypass() {
@@ -373,6 +411,32 @@ mod tests {
         // enforcement hook runs.
         assert!(
             !lines.iter().any(|l| l.contains("these still run:")),
+            "{lines:?}"
+        );
+    }
+
+    /// The one hook that DOES run under a bypass, through the same surface.
+    ///
+    /// The test above pins that `doctor` never claims a guard runs when none
+    /// does; this one pins the complement, because a report that is silent
+    /// about the exception is as wrong as one that overclaims — and this text
+    /// reaches the agent through `doctor --quiet`'s stdout. Both the banner and
+    /// the refusal line must name it.
+    #[test]
+    fn doctor_names_the_bypass_exempt_hook_as_still_running() {
+        let lines = bypass_status_lines(Some("1"), Some("guard-rm-liveness"));
+        let banner = lines
+            .iter()
+            .find(|l| l.contains("CADENCE_BYPASS=1"))
+            .unwrap_or_else(|| panic!("no bypass banner: {lines:?}"));
+        assert!(
+            banner.contains("guard-rm-liveness"),
+            "the banner claims a universal it no longer has: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("these still run:") && l.contains("guard-rm-liveness")),
             "{lines:?}"
         );
     }
@@ -637,10 +701,22 @@ mod tests {
         /// Both are workflow guards over recoverable state, and both have a
         /// legitimate reason to be switched off per session.
         const CRITICAL_BUT_UNPROTECTED: &[&str] = &["guard-rm", "enforce-worktree"];
-        /// Protected from `CADENCE_DISABLE` but not security-critical: it
-        /// carries a fail-closed identity tier alongside advisory ones, so
-        /// protection is broader than the criticality classification.
-        const PROTECTED_BUT_NOT_CRITICAL: &[&str] = &["redact-external-content"];
+        /// Protected from `CADENCE_DISABLE` but not security-critical. Two
+        /// different reasons, one per entry:
+        ///
+        /// - `redact-external-content` carries a fail-closed identity tier
+        ///   alongside advisory ones, so protection is broader than the
+        ///   criticality classification.
+        /// - `guard-rm-liveness` is a **detector**, not a guard. It is
+        ///   protected because hiding it is the harm — it reports whether
+        ///   `guard-rm` is switched off — while it must stay advisory in every
+        ///   state. Adding it to `SECURITY_CRITICAL_HOOKS` to settle this test
+        ///   is the WRONG fix: `src/dispatch.rs` exits **2** for a
+        ///   security-critical hook on an unparseable or unenumerable payload,
+        ///   which would turn a SessionStart advisory into a blocker. The test
+        ///   below pins that.
+        const PROTECTED_BUT_NOT_CRITICAL: &[&str] =
+            &["redact-external-content", "guard-rm-liveness"];
 
         // The two records above are claims about the source lists, so assert
         // them against those lists before using either as an exemption. A
@@ -707,6 +783,29 @@ mod tests {
                  with why"
             );
         }
+    }
+
+    /// The detector must stay exit-0 advisory in every state.
+    ///
+    /// `src/dispatch.rs` exits 2 for a security-critical hook whose payload
+    /// cannot be parsed or whose patch targets cannot be enumerated. Classifying
+    /// `guard-rm-liveness` as security-critical — the tempting way to settle
+    /// `the_two_security_lists_diverge_only_where_intended` — would therefore
+    /// convert a SessionStart nudge into a hard block on a malformed payload,
+    /// which is the opposite of what a fail-open detector is for (ADR-0001).
+    /// Protection from `CADENCE_DISABLE` and criticality are separate
+    /// properties, and this hook deliberately has only the first.
+    #[test]
+    fn the_liveness_detector_is_protected_but_never_security_critical() {
+        assert!(
+            bypass::is_protected("guard-rm-liveness"),
+            "the detector must be protected from CADENCE_DISABLE"
+        );
+        assert!(
+            !crate::registry::is_security_critical("guard-rm-liveness"),
+            "classifying the detector security-critical makes dispatch exit 2 on an unparseable \
+             payload — record the divergence in PROTECTED_BUT_NOT_CRITICAL instead"
+        );
     }
 
     // ── doctor status lines ─────────────────────────────────────────────────

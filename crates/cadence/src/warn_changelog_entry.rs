@@ -67,6 +67,14 @@ impl Check for WarnChangelogEntry {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
+        // Deliberately the origin-UNaware form (cadence-hooks#881): this check
+        // already resolves `dir` from the cwd for `changed_files` below, so an
+        // own-repo `-R` merge that reaches here has to pay for `changed_files`
+        // regardless — there is no cheaper-path argument for threading origin
+        // through a second, independent predicate. Widening the fix here was
+        // ruled out of #881's scope; a `gh pr merge -R <own-repo>` nudges
+        // toward `/polish` but not toward a changelog entry until this is
+        // revisited.
         if !is_polish_ship_anchor(command) {
             return CheckResult::allow();
         }
@@ -120,7 +128,10 @@ fn tracked_changelog_paths(dir: &str) -> Option<Vec<String>> {
                 .map(str::to_string)
                 .collect(),
         ),
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed | GitSpawn::TimedOut => None,
+        GitSpawn::Completed(_)
+        | GitSpawn::Truncated(_)
+        | GitSpawn::SpawnFailed
+        | GitSpawn::TimedOut => None,
     }
 }
 

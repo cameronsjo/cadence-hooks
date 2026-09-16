@@ -19,10 +19,11 @@
 //!
 //! # Precedence
 //!
-//! Resolution is a fixed three-step ladder. The first rule that matches wins.
+//! Resolution is a fixed ladder. The first rule that matches wins.
 //!
 //! | # | Condition | Result | Does the hook run? |
 //! |---|-----------|--------|--------------------|
+//! | 0 | the hook's name is listed in [`BYPASS_EXEMPT_HOOKS`] | never [`BypassState::Bypassed`] — fall through to rule 2 | yes, unless rule 2/3 says otherwise |
 //! | 1 | `CADENCE_BYPASS` is exactly `1` | [`BypassState::Bypassed`] | no |
 //! | 2 | the hook's name is listed in `CADENCE_DISABLE` **and** the hook is in [`PROTECTED_GUARDS`] | [`BypassState::DisableRefused`] | yes — loudly |
 //! | 3 | the hook's name is listed in `CADENCE_DISABLE` | [`BypassState::Disabled`] | no |
@@ -34,13 +35,22 @@
 //! sits ahead of rule 3 so that no value of the silent, persistent variable can
 //! neuter a guard that prevents irreversible harm (#89).
 //!
+//! Rule 0 is the one exception to that outranking, and it is narrow: a hook
+//! whose only job is to report on the enforcement state cannot be switched off
+//! by the switch it reports on, or the report of a blanket bypass disappears
+//! with the bypass that caused it (cadence-hooks#927).
+//!
 //! # Scoping
 //!
 //! - `CADENCE_BYPASS` is **process-wide**: it takes no hook name and switches
-//!   off every enforcement path at once. The binary exempts its CLI and
-//!   diagnostic subcommands from it by argv position (`is_bypass_exempt` in
-//!   `main`) — that is a question about *commands*, not about this resolution,
-//!   so it stays in the binary.
+//!   off every enforcement path at once, except the names in
+//!   [`BYPASS_EXEMPT_HOOKS`]. The binary separately exempts its CLI and
+//!   diagnostic subcommands by argv position (`is_bypass_exempt` in `main`) —
+//!   that is a question about *commands*, not about this resolution, so it
+//!   stays in the binary. The two lists must agree about any hook named here:
+//!   the argv check runs first and exits the process, so a name exempt in this
+//!   list and absent from the argv arms would still never run. `main`'s test
+//!   module holds them together in both directions.
 //! - `CADENCE_DISABLE` is **per hook name**: a comma-separated list matched
 //!   against the canonical registry name, exactly, case-sensitively, after
 //!   trimming surrounding whitespace from each entry. Empty entries are
@@ -58,10 +68,12 @@
 //!   nothing. A near-miss (`Guard-Rm`, `guard_rm`, `guard-rm-live` when
 //!   `guard-rm` was meant) is a near-miss, not a fuzzy match.
 //! - A name that *extends* a hook name is a different hook, not a near-miss:
-//!   `guard-rm-liveness` is registered, so naming it disables **it** and leaves
+//!   `guard-rm-liveness` is registered, so naming it names **it** and leaves
 //!   `guard-rm` running. Never cite it as an example of a name that disables
-//!   nothing — it is the check that reports `guard-rm`'s own switch, so the one
-//!   thing disabling it actually does is hide that report.
+//!   nothing — it is the check that reports `guard-rm`'s own switch, and
+//!   because hiding that report is the whole harm, the name is *refused*
+//!   rather than honoured (it is in [`PROTECTED_GUARDS`]). Either way it says
+//!   nothing about `guard-rm`, whose name it merely extends.
 //! - Either variable holding non-UTF-8 bytes reads as unset.
 //!
 //! The direction is deliberate and is the whole point of the extraction:
@@ -69,9 +81,16 @@
 //! operator would have no way to tell that from an intended disable.
 
 /// Guards that prevent irreversible harm — secret exposure, data loss,
-/// destructive git/gh/remote/vault operations. `CADENCE_DISABLE` (silent,
-/// persistent, settable in settings.json `env`) must not be able to neuter
-/// these; only the loud, per-session `CADENCE_BYPASS` can (#89).
+/// destructive git/gh/remote/vault operations — **or** the detector that
+/// reports such a guard's own state. `CADENCE_DISABLE` (silent, persistent,
+/// settable in settings.json `env`) must not be able to neuter these; only the
+/// loud, per-session `CADENCE_BYPASS` can (#89) — and not even that, for a name
+/// also listed in [`BYPASS_EXEMPT_HOOKS`].
+///
+/// The second class is the later addition. A detector prevents no harm by
+/// itself; what it prevents is the harm happening *unobserved*, and the one
+/// thing switching it off accomplishes is hiding the report that the watched
+/// guard is gone. That makes it exactly as attractive a target as the guard.
 pub const PROTECTED_GUARDS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
@@ -92,7 +111,29 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     "guard-dotfiles",
     "guard-read-model",
     "trash-guard",
+    // The detector, not a guard: `guard-rm-liveness` is the SessionStart check
+    // that reports whether `guard-rm` has been switched off. `CADENCE_DISABLE`
+    // is silent and persistent, so one line in a committed settings file could
+    // otherwise disarm `guard-rm` and hide the report of it in the same breath
+    // — the watched guard stays unprotected by charter (see `guard_rm.rs`),
+    // which is precisely why the watcher may not be.
+    "guard-rm-liveness",
 ];
+
+/// Hooks the blanket [`BYPASS_VAR`] escape does **not** switch off.
+///
+/// The bypass is otherwise complete by design, and this list is deliberately
+/// tiny. A name qualifies only when the hook's entire job is to report on the
+/// enforcement state — `CADENCE_BYPASS=1` included — so bypassing it would
+/// suppress the report of the very switch that suppressed it. Anything that
+/// *enforces* belongs to the bypass; a detector of the bypass cannot.
+pub const BYPASS_EXEMPT_HOOKS: &[&str] = &["guard-rm-liveness"];
+
+/// Whether [`BYPASS_VAR`] may not switch this hook off.
+#[must_use]
+pub fn is_bypass_exempt_hook(hook_name: &str) -> bool {
+    BYPASS_EXEMPT_HOOKS.contains(&hook_name)
+}
 
 /// The blanket, per-session maintenance escape.
 pub const BYPASS_VAR: &str = "CADENCE_BYPASS";
@@ -218,7 +259,13 @@ pub fn bypass_engaged() -> bool {
 /// the caller's `None` too, since it cannot name a hook or equal `1`.
 #[must_use]
 pub fn resolve_from(bypass: Option<&str>, disable: Option<&str>, hook_name: &str) -> BypassState {
-    if bypass_engaged_from(bypass) {
+    // The exemption is applied here, in the one resolver, rather than at each
+    // rendering surface: `list`, `doctor`, `configure --list` and the
+    // enforcement path all read this function precisely so they cannot give
+    // four answers to one question (#567). Patching them individually would
+    // re-open that drift channel for the one hook whose whole value is that its
+    // answer is trustworthy.
+    if bypass_engaged_from(bypass) && !is_bypass_exempt_hook(hook_name) {
         return BypassState::Bypassed;
     }
     let named = disable
@@ -281,6 +328,17 @@ mod tests {
                 BypassState::Bypassed,
             ),
             (Some("1"), Some(PROTECTED), PROTECTED, BypassState::Bypassed),
+            // Row 0: a bypass-exempt hook is never Bypassed. Under the blanket
+            // switch alone it enforces; named in CADENCE_DISABLE as well, it
+            // falls through to row 2 and is refused — which is what keeps the
+            // report visible in the one state where it matters most.
+            (Some("1"), None, "guard-rm-liveness", BypassState::Enforced),
+            (
+                Some("1"),
+                Some("guard-rm-liveness"),
+                "guard-rm-liveness",
+                BypassState::DisableRefused,
+            ),
             // Row 2: a protected guard named in the disable list still runs.
             (
                 None,
@@ -469,10 +527,51 @@ mod tests {
         // ever fails, `CADENCE_BYPASS` has stopped being a complete escape and
         // the docs promising one are wrong.
         for guard in PROTECTED_GUARDS {
+            if is_bypass_exempt_hook(guard) {
+                // Named, not silently filtered: this entry is a *detector* of
+                // the enforcement state, and a bypass that hid it would hide
+                // its own report. The companion test below asserts the
+                // opposite property for exactly these names, so the pair
+                // covers every protected entry between them.
+                continue;
+            }
             assert_eq!(
                 resolve_from(Some("1"), None, guard),
                 BypassState::Bypassed,
                 "{guard} did not yield to CADENCE_BYPASS=1"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bypass_exempt_hook_survives_the_blanket_bypass() {
+        // The companion to the test above, and the reason that one may skip
+        // these names. A revert of the `resolve_from` exemption fails here.
+        assert!(
+            !BYPASS_EXEMPT_HOOKS.is_empty(),
+            "an empty exemption list would make this test assert nothing"
+        );
+        for hook in BYPASS_EXEMPT_HOOKS {
+            let state = resolve_from(Some("1"), None, hook);
+            assert_ne!(
+                state,
+                BypassState::Bypassed,
+                "{hook} is bypass-exempt but CADENCE_BYPASS=1 switched it off"
+            );
+            assert!(state.is_enforcing(), "{hook} must still run: {state:?}");
+        }
+    }
+
+    #[test]
+    fn a_bypass_exempt_hook_is_also_protected_from_the_silent_switch() {
+        // Exempting a hook from the loud switch while leaving the silent,
+        // persistent one able to neuter it would move the hole rather than
+        // close it — `CADENCE_DISABLE` is the easier of the two to set and the
+        // harder to notice.
+        for hook in BYPASS_EXEMPT_HOOKS {
+            assert!(
+                is_protected(hook),
+                "{hook} is exempt from CADENCE_BYPASS but CADENCE_DISABLE can still switch it off"
             );
         }
     }
