@@ -13,6 +13,9 @@ pub mod git_safety;
 pub mod markdown_lint;
 /// Enforce line limits on MEMORY.md and topic files.
 pub mod memory_guard;
+/// Inject the Fable seat posture at session start and on a switch onto Fable
+/// (SessionStart + PostModelSwitch).
+pub mod model_posture;
 /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR.
 pub mod nudge_polish_before_pr;
 /// Nudge when the installed cadence-hooks binary or Claude Code has drifted

@@ -97,6 +97,33 @@ impl Drop for PanicGuard {
 /// `hook` is the canonical registry name from `main::hook_name`; when `None`
 /// (e.g. a subcommand with no registry mapping) it falls back to `check.name()`.
 pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>) -> ! {
+    run_logged_check_inner(check, event, hook, false)
+}
+
+/// [`run_logged_check`] for a subcommand wired on **more than one event**: the
+/// event it reports (the output envelope's `hookEventName`, the denial row, the
+/// timing row) follows the payload's own `hook_event_name` when that names an
+/// event this binary models.
+///
+/// `fallback_event` covers a payload whose `hook_event_name` is absent or
+/// unmodeled, and is what the pre-parse interactive-terminal guidance uses.
+/// Emitting the dispatch-time event instead would ship a `hookEventName` that
+/// contradicts the event that actually fired — Claude Code reads that field, so
+/// a mismatch is an output-schema failure, not a cosmetic one.
+pub fn run_logged_check_payload_event(
+    check: &dyn Check,
+    fallback_event: HookEvent,
+    hook: Option<&str>,
+) -> ! {
+    run_logged_check_inner(check, fallback_event, hook, true)
+}
+
+fn run_logged_check_inner(
+    check: &dyn Check,
+    event: HookEvent,
+    hook: Option<&str>,
+    event_from_payload: bool,
+) -> ! {
     let started = Instant::now();
     // Arm the shared subprocess deadline before any guard logic can spawn git
     // (cadence-hooks#271): probes abandon at the internal budget so the guard
@@ -144,6 +171,18 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             }
             process::exit(0);
         }
+    };
+    // Resolve the reported event from the payload for a multi-event
+    // subcommand. Every later use — the output envelope, the denial row, the
+    // timing row — reads this rebinding, so the three cannot disagree.
+    let event = if event_from_payload {
+        input
+            .hook_event_name
+            .as_deref()
+            .and_then(HookEvent::from_name)
+            .unwrap_or(event)
+    } else {
+        event
     };
     let normalized_inputs = match input.normalized_inputs() {
         Ok(inputs) => inputs,

@@ -124,6 +124,15 @@ pub const HOOKS: &[HookEntry] = &[
         namespace: "cadence",
         event: Some(HookEvent::SessionStart),
     },
+    HookEntry {
+        // Wired on SessionStart *and* PostModelSwitch. The registry records one
+        // event per hook, so it names the entry point that fires first; the
+        // subcommand itself picks its half from the payload's `hook_event_name`.
+        name: "model-posture",
+        description: "Inject the Fable seat posture at session start and on a switch onto Fable",
+        namespace: "cadence",
+        event: Some(HookEvent::SessionStart),
+    },
     // guardrails
     HookEntry {
         name: "guard-push-remote",
@@ -518,6 +527,12 @@ pub fn is_security_critical(name: &str) -> bool {
 /// `HookInput` (checks) — enforced by unit test.
 pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
     match (namespace, subcommand) {
+        // model-posture picks its half from `hook_event_name` and only emits on
+        // a Fable target; the generic SessionStart sample carries neither, so it
+        // would report silence and prove nothing about the hook.
+        ("cadence", "model-posture") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostModelSwitch","from_model":"claude-opus-5","to_model":"claude-fable-5-1","source":"command"}"#,
+        ),
         // snapshot gates on a `git commit` command (PreToolUse partner of log-commit)
         ("metrics", "snapshot") => Some(
             r#"{"session_id":"test","hook_event_name":"PreToolUse","tool_input":{"command":"git commit -m test"}}"#,
