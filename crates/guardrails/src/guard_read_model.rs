@@ -26,7 +26,7 @@
 //! resolved model id: `opus` matches `claude-opus-4-8`; a full id matches only
 //! itself.
 
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput, model_matches};
 
 /// Env var: the model token list. Unset/empty disables the guard.
 const MODELS_VAR: &str = "CADENCE_READ_MODEL_GUARD_MODELS";
@@ -73,16 +73,6 @@ impl OnUnknown {
             OnUnknown::Allow
         }
     }
-}
-
-/// True when any config token is a case-insensitive substring of the model id.
-/// `opus` matches `claude-opus-4-8`; the full id `claude-opus-4-8` matches only
-/// itself.
-fn model_matches(resolved: &str, models: &[String]) -> bool {
-    let lowered = resolved.to_lowercase();
-    models
-        .iter()
-        .any(|token| lowered.contains(&token.to_lowercase()))
 }
 
 /// Pure policy decision — no env reads, no I/O. `Some(block_message)` blocks;
