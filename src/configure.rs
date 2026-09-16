@@ -5,6 +5,7 @@
 //! clobbering other settings.
 
 use crate::HookEntry;
+use cadence_hooks_core::bypass;
 use dialoguer::MultiSelect;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -31,28 +32,21 @@ fn find_settings_path() -> PathBuf {
     start.join(".claude/settings.json")
 }
 
-/// Read the current `CADENCE_DISABLE` value from settings.json.
-fn read_disabled_hooks(settings_path: &Path) -> Vec<String> {
-    let content = match fs::read_to_string(settings_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let json: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
+/// Read the raw `CADENCE_DISABLE` string from settings.json, unparsed.
+///
+/// `None` covers a missing file, unparseable JSON, and a missing or
+/// non-string value — every case where settings.json names nothing. Parsing
+/// the raw string into hook names is `cadence_hooks_core::bypass::disable_list`'s
+/// job, done once inside [`crate::bypass_report::configure_status_lines`], so
+/// this surface and the resolver cannot disagree about what counts as an
+/// entry.
+fn read_settings_disable_raw(settings_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(settings_path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
     json.get("env")
         .and_then(|env| env.get("CADENCE_DISABLE"))
         .and_then(|v| v.as_str())
-        .map(|s| {
-            s.split(',')
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(str::to_string)
 }
 
 /// Write the disabled hooks list back to settings.json, merging into existing content.
@@ -112,17 +106,31 @@ fn write_disabled_hooks(settings_path: &Path, disabled: &[String]) -> Result<(),
 /// module `list` and `doctor` render from, so this surface cannot report a
 /// protected guard as disabled while the binary refuses that entry — and cannot
 /// echo an unrecognized name from `settings.json` unsanitized.
+///
+/// Reads both `CADENCE_DISABLE` sources — the settings file and the live
+/// session's environment — plus `CADENCE_BYPASS`, so this report describes
+/// what the binary actually does in *this* invocation rather than only what
+/// is written to disk (cameronsjo/cadence-hooks#929).
 fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
-    let disabled = read_disabled_hooks(settings_path);
+    let settings_raw = read_settings_disable_raw(settings_path);
+    let env_raw = std::env::var(bypass::DISABLE_VAR).ok();
+    let bypass_raw = std::env::var(bypass::BYPASS_VAR).ok();
 
     println!("Settings: {}", settings_path.display());
 
-    if disabled.is_empty() {
+    let settings_empty = settings_raw.as_deref().is_none_or(str::is_empty);
+    let env_empty = env_raw.as_deref().is_none_or(str::is_empty);
+    if !bypass::bypass_engaged_from(bypass_raw.as_deref()) && settings_empty && env_empty {
         println!("\nAll hooks enabled (no overrides).");
         return;
     }
 
-    let (lines, active) = crate::bypass_report::configure_status_lines(hooks, &disabled);
+    let (lines, active) = crate::bypass_report::configure_status_lines(
+        hooks,
+        settings_raw.as_deref(),
+        env_raw.as_deref(),
+        bypass_raw.as_deref(),
+    );
     for line in lines {
         // A heading opens its own block; an indented row stays with the heading
         // above it.
@@ -145,7 +153,14 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
         process::exit(0);
     }
 
-    let currently_disabled = read_disabled_hooks(&settings_path);
+    // The wizard writes settings.json only, and pre-selects only what is
+    // already written there. Pre-selecting an environment-sourced name too
+    // would let one confirm round-trip persist a session variable into a
+    // committed file — the one place this fix could do damage — so the
+    // environment is deliberately not consulted here.
+    let currently_disabled: Vec<String> = read_settings_disable_raw(&settings_path)
+        .map(|raw| bypass::disable_list(&raw).map(str::to_string).collect())
+        .unwrap_or_default();
 
     // Build items for the multi-select — only real hooks, no separators.
     // The namespace is prefixed to each item for visual grouping.

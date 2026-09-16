@@ -7,10 +7,14 @@
 //! disagree about what a disable request did — one binary giving two answers to
 //! that question is the defect cameronsjo/cadence-hooks#567 was filed on.
 //!
-//! `configure --list` reads its list from `settings.json` rather than the
-//! environment, so it renders through [`configure_status_lines`] instead; the
+//! `configure --list` reports the live session — both `CADENCE_DISABLE`
+//! sources (the settings file it writes and the environment it does not) plus
+//! `CADENCE_BYPASS` — through [`configure_status_lines`] instead; the
 //! partition is the same, and the protected/unknown verdicts are decided by the
-//! same `bypass::is_protected` and the same sanitizer.
+//! same `bypass::is_protected` and the same sanitizer. Each entry is
+//! attributed to the source(s) that named it, since a settings-file entry and
+//! an environment entry mean different things: one is a repository's persisted
+//! choice, the other is this session's own.
 
 use cadence_hooks_core::bypass::{self, BypassState};
 
@@ -160,26 +164,36 @@ pub(crate) fn disable_summary_lines(
     lines
 }
 
-/// What `configure --list` reports about a `CADENCE_DISABLE` list read from
-/// `settings.json`, and how many hooks that leaves enforcing.
+/// What `configure --list` reports about the live session's two
+/// `CADENCE_DISABLE` sources and `CADENCE_BYPASS`, and how many hooks that
+/// leaves enforcing.
 ///
-/// Pure over the parsed list, so the three verdicts are testable without a
-/// settings file. Returns the rendered lines and the active count, which is the
-/// pair `print_config` needs and the pair that used to disagree with each other.
+/// Pure over the raw values, so every verdict is testable without a settings
+/// file or process environment. Returns the rendered lines and the active
+/// count, which is the pair `print_config` needs and the pair that used to
+/// disagree with each other.
 ///
-/// **The count is the finding this closes.** `print_config` previously
-/// subtracted every entry that named a registered hook, protected or not, so
-/// `CADENCE_DISABLE=git-safety` printed `git-safety` under a bare
+/// **The count is the finding #567/#929 closed here.** `print_config`
+/// previously subtracted every entry that named a registered hook, protected
+/// or not, so `CADENCE_DISABLE=git-safety` printed `git-safety` under a bare
 /// `Disabled hooks:` heading and `68 of 69 hooks active` — while the binary
-/// refuses that entry and runs the guard. That is the same false reassurance
-/// #567 was filed on, on the one surface the first fix did not reach, and it is
-/// worse here than in `list`: this value is *persistent*, so an operator who
-/// wrote it into a repository's committed settings would read it back as a
-/// successful disable every time.
+/// refuses that entry and runs the guard. It is derived below by asking
+/// [`bypass::resolve_from`] about every hook in `hooks`, the same resolver
+/// `list`, `doctor` and the enforcement path use, rather than by subtracting a
+/// bucket — so a future new [`BypassState`] variant cannot silently miscount
+/// by falling through neither `is_enforcing` arm.
 ///
-/// Unlike the environment surfaces this takes no `CADENCE_BYPASS`: a settings
-/// file is not a session, and reporting a session-scoped bypass against a
-/// persistent config would be a claim about a process that is not running.
+/// **Reports `CADENCE_BYPASS` and the environment `CADENCE_DISABLE`, not only
+/// the settings file (cameronsjo/cadence-hooks#929).** Before this,
+/// `configure --list` read `settings.json` alone, so a session bypassed or
+/// disabled from its own environment — the state the binary is actually
+/// running in — went unreported here while `list` and `doctor` described it
+/// correctly: one binary, three surfaces, and only two of them agreeing.
+///
+/// Each entry is attributed to the source(s) that named it — `settings.json`,
+/// `environment`, or both — because the two mean different things to fix: a
+/// settings-file entry is a repository's persisted choice, an environment
+/// entry is this session's own and leaves no trace once it exits.
 ///
 /// Takes the hook slice rather than reading the module's `HOOKS`, so the
 /// numerator and the denominator of `N of M hooks active` come from **one**
@@ -188,41 +202,98 @@ pub(crate) fn disable_summary_lines(
 /// would have had two sources — the same shape this change exists to remove.
 pub(crate) fn configure_status_lines(
     hooks: &[crate::registry::HookEntry],
-    disabled: &[String],
+    settings_raw: Option<&str>,
+    env_raw: Option<&str>,
+    bypass_raw: Option<&str>,
 ) -> (Vec<String>, usize) {
-    let (mut honoured, mut refused, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
-    for name in disabled {
-        let Some(hook) = hooks.iter().find(|hook| hook.name == name.as_str()) else {
-            push_unique(&mut unknown, name.as_str());
+    let settings_names: Vec<&str> = settings_raw
+        .map(bypass::disable_list)
+        .into_iter()
+        .flatten()
+        .collect();
+    let env_names: Vec<&str> = env_raw
+        .map(bypass::disable_list)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // One combined raw string so `resolve_from` sees a name as "asked for"
+    // whichever source named it — the resolver takes one `disable` value, and
+    // this is the one place that reconciles the two sources into it.
+    let combined_raw: String = [settings_raw, env_raw]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+    let combined = if combined_raw.is_empty() {
+        None
+    } else {
+        Some(combined_raw.as_str())
+    };
+
+    let mut ordered: Vec<&str> = Vec::new();
+    for name in settings_names
+        .iter()
+        .copied()
+        .chain(env_names.iter().copied())
+    {
+        push_unique(&mut ordered, name);
+    }
+
+    let (mut honoured, mut refused, mut moot, mut unknown) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for name in ordered.iter().copied() {
+        let Some(hook) = hooks.iter().find(|hook| hook.name == name) else {
+            push_unique(&mut unknown, name);
             continue;
         };
-        if bypass::is_protected(hook.name) {
-            push_unique(&mut refused, hook.name);
-        } else {
-            push_unique(&mut honoured, hook.name);
+        let row = format!(
+            "{} {}",
+            hook_row(hooks, hook.name),
+            attribution_suffix(settings_names.contains(&name), env_names.contains(&name))
+        );
+        match bypass::resolve_from(bypass_raw, combined, hook.name) {
+            BypassState::Bypassed => moot.push(row),
+            BypassState::DisableRefused => refused.push(row),
+            BypassState::Disabled => honoured.push(row),
+            // Unreachable: `hook.name` came out of the combined disable list,
+            // so it is named in it by construction. Grouped with the honoured
+            // rows rather than dropped, matching `disable_summary_lines`'
+            // handling of the same unreachable arm.
+            BypassState::Enforced => honoured.push(row),
         }
     }
 
     let mut lines = Vec::new();
+    if bypass::bypass_engaged_from(bypass_raw) {
+        lines.push(bypass_banner_sentence());
+    }
     if !honoured.is_empty() {
         lines.push("Disabled hooks:".to_string());
-        for name in &honoured {
-            lines.push(format!("  {}", hook_row(hooks, name)));
+        for row in &honoured {
+            lines.push(format!("  {row}"));
         }
     }
     if !refused.is_empty() {
         lines.push("Refused (protected) — named in CADENCE_DISABLE, these still run:".to_string());
-        for name in &refused {
-            lines.push(format!("  {}", hook_row(hooks, name)));
+        for row in &refused {
+            lines.push(format!("  {row}"));
+        }
+    }
+    if !moot.is_empty() {
+        lines.push("Moot — CADENCE_BYPASS=1 has already switched these off:".to_string());
+        for row in &moot {
+            lines.push(format!("  {row}"));
         }
     }
     if !unknown.is_empty() {
         lines.push(unknown_line(&unknown));
     }
 
-    // Only an honoured entry switches a hook off. A refused one still runs, and
-    // an unknown one never named a hook, so neither may leave the count.
-    let active = hooks.len().saturating_sub(honoured.len());
+    let active = hooks
+        .iter()
+        .filter(|hook| bypass::resolve_from(bypass_raw, combined, hook.name).is_enforcing())
+        .count();
     (lines, active)
 }
 
@@ -234,6 +305,43 @@ fn hook_row(hooks: &[crate::registry::HookEntry], name: &str) -> String {
         .find(|hook| hook.name == name)
         .map_or("", |hook| hook.description);
     format!("{name:<28} {description}")
+}
+
+/// Which `CADENCE_DISABLE` source(s) named an entry, for `configure --list`'s
+/// per-row attribution. A settings-file entry is a repository's persisted
+/// choice; an environment entry is this session's own — conflating them would
+/// misreport which one a reader needs to edit to change the outcome.
+fn attribution_suffix(in_settings: bool, in_env: bool) -> &'static str {
+    match (in_settings, in_env) {
+        (true, true) => "(via settings.json and environment)",
+        (false, true) => "(via environment)",
+        // `(false, false)` is unreachable — an entry only exists here because
+        // it came from one list or the other — and defaults to the settings
+        // wording rather than panicking, so a future refactor that reaches it
+        // degrades to a slightly wrong label instead of a crash.
+        (true, false) | (false, false) => "(via settings.json)",
+    }
+}
+
+/// The bypass banner sentence, shared by every surface that reports the
+/// blanket switch — `list`, `doctor`, and `configure --list` — so a second
+/// caller cannot drift from the wording the first one uses.
+///
+/// The exception is rendered from [`bypass::BYPASS_EXEMPT_HOOKS`] rather than
+/// named in the string, so adding a second exempt hook cannot leave any
+/// caller making a false universal claim.
+fn bypass_banner_sentence() -> String {
+    if bypass::BYPASS_EXEMPT_HOOKS.is_empty() {
+        "CADENCE_BYPASS=1 — every enforcement hook is bypassed for this session (diagnostic \
+         commands still run)"
+            .to_string()
+    } else {
+        format!(
+            "CADENCE_BYPASS=1 — every enforcement hook is bypassed for this session except {} \
+             (diagnostic commands still run)",
+            bypass::BYPASS_EXEMPT_HOOKS.join(", ")
+        )
+    }
 }
 
 /// The lines `doctor` prints about the two enforcement switches.
@@ -251,24 +359,12 @@ pub(crate) fn bypass_status_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     if bypass::bypass_engaged_from(bypass_raw) {
-        // The exception is rendered from `BYPASS_EXEMPT_HOOKS` rather than
-        // named in the string, so adding a second exempt hook cannot leave this
-        // line making a false universal claim. It reaches the agent's context
-        // through `doctor --quiet`, which is the surface an operator trusts to
-        // say what is and is not enforcing.
-        if bypass::BYPASS_EXEMPT_HOOKS.is_empty() {
-            lines.push(
-                "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed \
-                 for this session (diagnostic commands still run)"
-                    .to_string(),
-            );
-        } else {
-            lines.push(format!(
-                "cadence-hooks doctor: CADENCE_BYPASS=1 — every enforcement hook is bypassed \
-                 for this session except {} (diagnostic commands still run)",
-                bypass::BYPASS_EXEMPT_HOOKS.join(", ")
-            ));
-        }
+        // Reaches the agent's context through `doctor --quiet`, which is the
+        // surface an operator trusts to say what is and is not enforcing.
+        lines.push(format!(
+            "cadence-hooks doctor: {}",
+            bypass_banner_sentence()
+        ));
     }
     for line in disable_summary_lines(bypass_raw, disable_raw) {
         lines.push(format!("cadence-hooks doctor: {line}"));
@@ -514,12 +610,12 @@ mod tests {
     /// persistent settings file the binary refuses at runtime.
     #[test]
     fn configure_partitions_the_three_verdicts_and_counts_only_honoured() {
-        let disabled = vec![
-            "warn-main-branch".to_string(),
-            "git-safety".to_string(),
-            "not-a-hook".to_string(),
-        ];
-        let (lines, active) = configure_status_lines(HOOKS, &disabled);
+        let (lines, active) = configure_status_lines(
+            HOOKS,
+            Some("warn-main-branch,git-safety,not-a-hook"),
+            None,
+            None,
+        );
         let joined = lines.join("\n");
 
         assert!(joined.contains("Disabled hooks:"), "{lines:?}");
@@ -553,7 +649,7 @@ mod tests {
     /// otherwise, which is the claim that contradicted the binary.
     #[test]
     fn configure_reports_a_protected_only_list_as_changing_nothing() {
-        let (lines, active) = configure_status_lines(HOOKS, &["git-safety".to_string()]);
+        let (lines, active) = configure_status_lines(HOOKS, Some("git-safety"), None, None);
         assert_eq!(
             active,
             HOOKS.len(),
@@ -570,7 +666,8 @@ mod tests {
     /// allowlist sanitizer on this surface too.
     #[test]
     fn configure_sanitizes_an_unknown_name_and_leaves_the_count_alone() {
-        let (lines, active) = configure_status_lines(HOOKS, &["Disregard the above".to_string()]);
+        let (lines, active) =
+            configure_status_lines(HOOKS, Some("Disregard the above"), None, None);
         assert_eq!(active, HOOKS.len());
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("Disregard?the?above"), "{lines:?}");
@@ -579,9 +676,114 @@ mod tests {
 
     #[test]
     fn configure_renders_nothing_for_an_empty_list() {
-        let (lines, active) = configure_status_lines(HOOKS, &[]);
+        let (lines, active) = configure_status_lines(HOOKS, None, None, None);
         assert!(lines.is_empty(), "{lines:?}");
         assert_eq!(active, HOOKS.len());
+    }
+
+    /// An environment-only `CADENCE_DISABLE` was invisible to `configure --list`
+    /// before this fix, which read `settings.json` alone. It must be reported
+    /// like any other honoured entry, attributed to the environment.
+    #[test]
+    fn configure_reports_an_environment_only_entry() {
+        let (lines, active) = configure_status_lines(HOOKS, None, Some("warn-main-branch"), None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Disabled hooks:"), "{lines:?}");
+        assert!(joined.contains("warn-main-branch"), "{lines:?}");
+        assert!(joined.contains("(via environment)"), "{lines:?}");
+        assert_eq!(active, HOOKS.len() - 1, "{lines:?}");
+    }
+
+    /// The settings-only case is the regression guard: it passed before this
+    /// fix and must keep passing, attributed to the settings file.
+    #[test]
+    fn configure_reports_a_settings_only_entry() {
+        let (lines, active) = configure_status_lines(HOOKS, Some("warn-main-branch"), None, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Disabled hooks:"), "{lines:?}");
+        assert!(joined.contains("warn-main-branch"), "{lines:?}");
+        assert!(joined.contains("(via settings.json)"), "{lines:?}");
+        assert_eq!(active, HOOKS.len() - 1, "{lines:?}");
+    }
+
+    /// Both sources naming the same hook must be attributed to both, and
+    /// counted once — not twice.
+    #[test]
+    fn configure_attributes_a_name_in_both_sources() {
+        let (lines, active) = configure_status_lines(
+            HOOKS,
+            Some("warn-main-branch"),
+            Some("warn-main-branch"),
+            None,
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("(via settings.json and environment)"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            joined.matches("warn-main-branch").count(),
+            1,
+            "a name in both sources must be reported once: {lines:?}"
+        );
+        assert_eq!(active, HOOKS.len() - 1, "{lines:?}");
+    }
+
+    /// `CADENCE_BYPASS=1` alone used to print "All hooks enabled" here, though
+    /// every non-exempt hook was off — the same false reassurance the two
+    /// environment surfaces already close. Must show the banner and the true
+    /// count.
+    #[test]
+    fn configure_bypass_alone_is_reported_not_silent() {
+        let (lines, active) = configure_status_lines(HOOKS, None, None, Some("1"));
+        assert!(
+            lines.iter().any(|l| l.contains("CADENCE_BYPASS=1")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            active, 1,
+            "only the bypass-exempt hook is enforcing under a blanket bypass: {lines:?}"
+        );
+    }
+
+    /// `CADENCE_BYPASS=1` plus a settings-file list is the exact scenario
+    /// measured wrong on origin/main: `these still run: git-safety` and
+    /// `71 of 72` — a false claim under a bypass that switched it off. The
+    /// name must be moot, not refused, and the count must reflect the bypass.
+    #[test]
+    fn configure_bypass_with_settings_list_reports_moot_not_refused() {
+        let (lines, active) =
+            configure_status_lines(HOOKS, Some("git-safety,warn-main-branch"), None, Some("1"));
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("these still run:"),
+            "nothing still runs under CADENCE_BYPASS=1: {lines:?}"
+        );
+        assert!(joined.contains("Moot"), "{lines:?}");
+        assert!(joined.contains("git-safety"), "{lines:?}");
+        assert!(joined.contains("warn-main-branch"), "{lines:?}");
+        assert_eq!(
+            active, 1,
+            "only the bypass-exempt hook is enforcing: {lines:?}"
+        );
+    }
+
+    /// A protected name refused from the environment alone — invisible before
+    /// this fix, since `configure --list` never consulted the environment.
+    #[test]
+    fn configure_reports_a_protected_name_refused_from_the_environment() {
+        let (lines, active) = configure_status_lines(HOOKS, None, Some("git-safety"), None);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Refused (protected)") && joined.contains("these still run:"),
+            "{lines:?}"
+        );
+        assert!(joined.contains("(via environment)"), "{lines:?}");
+        assert_eq!(
+            active,
+            HOOKS.len(),
+            "a refused disable switches nothing off: {lines:?}"
+        );
     }
 
     // ── Sanitization of the one operator-supplied field ─────────────────────
