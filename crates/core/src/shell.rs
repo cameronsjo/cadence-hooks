@@ -1757,15 +1757,35 @@ pub fn looks_like_push_url(candidate: &str) -> bool {
 
 /// Outcome of a wall-clock-bounded subprocess run.
 ///
-/// The tri-state exists so fail-closed guard arms can tell "git answered
-/// badly" (a genuine resolution failure they should still block on) apart
-/// from "git never answered" (the guard's own infrastructure failing —
-/// ADR-0001 fail-open territory). Collapsing both into one failure value is
-/// how a slow host turns into false blocks.
+/// The split exists so fail-closed guard arms can tell "git answered badly"
+/// (a genuine resolution failure they should still block on) apart from "git
+/// never answered" (the guard's own infrastructure failing — ADR-0001
+/// fail-open territory). Collapsing both into one failure value is how a slow
+/// host turns into false blocks.
+///
+/// Four states, not three. [`GitSpawn::Truncated`] is the fourth: the child
+/// exited, but the pipe never reached EOF inside the budget because something
+/// other than the child still holds its write end (an orphaned grandchild).
+/// It is deliberately NOT [`GitSpawn::Completed`], because a caller cannot
+/// tell a complete answer from a clipped one, and a guard reading a clipped
+/// answer is a guard reading attacker-chosen data.
 #[derive(Debug)]
 pub enum GitSpawn {
     /// The process ran to completion (any exit code); stderr is not captured.
     Completed(std::process::Output),
+    /// The process exited, but stdout could not be drained within the
+    /// remaining budget — something other than the child still holds the
+    /// pipe's write end (an orphaned grandchild). The `Output` carries the
+    /// real exit status and the bytes read so far.
+    ///
+    /// `Truncated` means EOF was never observed within the budget, NOT that
+    /// bytes were lost: the buffer may well hold the complete answer. It is
+    /// treated as a no-answer because the reader cannot tell the two apart.
+    ///
+    /// Routing for this variant is decided once, in [`git_output_detailed`],
+    /// which reaches every fail-closed guard (`crates/cadence/src/git_safety.rs`,
+    /// `guard_push_remote.rs`, `guard_gh_write.rs`, `crates/guardrails/src/enforce_worktree.rs`).
+    Truncated(std::process::Output),
     /// The process could not be spawned (e.g. no `git` on PATH).
     SpawnFailed,
     /// The process was killed at the deadline, or the shared budget was
@@ -1791,8 +1811,25 @@ pub enum GitQuery {
 /// set so git skips optional index writes — cloud-sync clients hold locks on
 /// exactly those files. On expiry the child is killed *and reaped* (no
 /// zombie), the shared deadline is marked hit, and `TimedOut` is returned.
+///
+/// **The drain itself is bounded too.** Waiting for the reader thread to see
+/// EOF is not the same as waiting for the child: an orphaned grandchild that
+/// inherited the pipe's write end holds it open after the child exits, so a
+/// blocking join outlives the deadline by however long that grandchild lives
+/// (measured: 20s against a 1s deadline). Every return path therefore gives
+/// the reader a budget and takes whatever bytes have arrived, returning
+/// [`GitSpawn::Truncated`] when EOF was never observed.
 pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
     use std::process::Stdio;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    // Slack for the post-exit drain when the deadline is already spent. Each
+    // truncated spawn can overrun the shared budget by up to this much (~800ms
+    // across a worst-case hook), against the ~2000ms of headroom
+    // `deadline::DEFAULT_BUDGET_MS` reserves under the 5s external hooks.json
+    // timeout. Strictly better than the unbounded 20-30s hang it replaces.
+    const DRAIN_FLOOR: Duration = Duration::from_millis(100);
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1804,38 +1841,88 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
         Err(_) => return GitSpawn::SpawnFailed,
     };
 
-    let drain = child.stdout.take().map(|mut out| {
+    // The reader appends into a shared sink so the parent can read the bytes
+    // collected so far without joining. The `Sender` is moved into the reader
+    // closure and no clone is kept here: a sender alive in the parent would
+    // never disconnect, turning every drain into a full-budget stall.
+    let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let done = child.stdout.take().map(|mut out| {
+        let (tx, rx) = mpsc::channel::<()>();
+        let sink = Arc::clone(&sink);
+        // The thread is deliberately leaked when it is still blocked on a read
+        // the orphan holds open — joining it IS the hang this function exists
+        // to avoid. Bounded in practice for hooks, which are short-lived
+        // processes. The long-lived path (`deadline::BudgetState::Unarmed`, the
+        // CLI and `doctor`) can accumulate a leaked reader stack and one pipe
+        // fd per truncated probe across a sequence of them.
         std::thread::spawn(move || {
             use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
-        })
+            let mut chunk = [0u8; 8192];
+            loop {
+                // Never hold the lock across a read.
+                match out.read(&mut chunk) {
+                    // A read ERROR signals the same "done" as EOF, so an EIO
+                    // mid-stream reports complete on a partial buffer. That is
+                    // parity with the previous `read_to_end`, which also
+                    // discarded its error, and is kept deliberately.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(());
+        });
+        rx
     });
+
+    // True when EOF was observed inside `budget`. With no stdout handle there is
+    // nothing to drain and nothing to wait for, so it is complete by
+    // construction. With a handle, only `Ok(())` is complete: `Disconnected`
+    // means the reader died before signalling, and a timeout means the pipe is
+    // still held open.
+    let drained = |budget: Duration| -> bool {
+        match done.as_ref() {
+            None => true,
+            Some(rx) => matches!(rx.recv_timeout(budget), Ok(())),
+        }
+    };
+    // Kept separate from `drained` so the arms that discard stdout do not copy
+    // the buffer they are about to throw away.
+    let bytes_so_far = || -> Vec<u8> {
+        sink.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    };
 
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = drain
-                    .and_then(|handle| handle.join().ok())
-                    .unwrap_or_default();
-                return GitSpawn::Completed(std::process::Output {
+                let budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
+                let complete = drained(budget);
+                let output = std::process::Output {
                     status,
-                    stdout,
+                    stdout: bytes_so_far(),
                     stderr: Vec::new(),
-                });
+                };
+                if complete {
+                    return GitSpawn::Completed(output);
+                }
+                // Truncation means the drain spent its bound, which is the
+                // deadline being hit — and it is what makes the downstream
+                // `Truncated -> TimedOut` routing honest for the guards.
+                crate::deadline::note_hit();
+                return GitSpawn::Truncated(output);
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Reaping the child closed the pipe's write end, so the
-                    // drain thread's read_to_end has hit EOF; join it so the
-                    // handle isn't detached with a swallowed result.
-                    if let Some(handle) = drain {
-                        let _ = handle.join();
-                    }
+                    // The bytes are discarded on this arm, and the shared
+                    // budget is already at zero, so spend nothing here.
+                    let _ = drained(Duration::ZERO);
                     crate::deadline::note_hit();
                     return GitSpawn::TimedOut;
                 }
@@ -1844,9 +1931,7 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(handle) = drain {
-                    let _ = handle.join();
-                }
+                let _ = drained(Duration::ZERO);
                 return GitSpawn::SpawnFailed;
             }
         }
@@ -1863,6 +1948,9 @@ pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     let timeout = match deadline::state() {
         BudgetState::Disabled => {
             // Escape hatch (CADENCE_HOOK_DEADLINE_MS=0): legacy unbounded run.
+            // `GitSpawn::Truncated` is unreachable here by construction —
+            // `cmd.output()` blocks until EOF, so there is no drain budget to
+            // exhaust and no partial answer to report.
             return match cmd.output() {
                 Ok(output) => GitSpawn::Completed(output),
                 Err(_) => GitSpawn::SpawnFailed,
@@ -1913,15 +2001,37 @@ pub enum GitOutput {
 ///
 /// The single spawn path — [`git_command_detailed`] and [`git_command`] are
 /// thin readings of this one, so the three cannot drift about what a git error
-/// looks like.
+/// looks like. It is also the one place [`GitSpawn::Truncated`] is routed, so
+/// every fail-closed guard inherits that decision without its own edit.
+///
+/// **Where a truncated read lands, stated honestly.** A non-zero exit is a
+/// complete answer about the exit code — every consumer discards stdout on
+/// non-success — so it keeps reading as [`GitOutput::Failed`], and the
+/// fail-closed arms in `crates/cadence/src/git_safety.rs`,
+/// `guard_push_remote.rs` and `guard_gh_write.rs` still block on it. A
+/// SUCCESS-status truncation reads as [`GitOutput::TimedOut`], which is the
+/// ADR-0001 infrastructure-failure arm: for most of those guards that is a
+/// LOUD FAIL-OPEN (`note_suppressed_block()`), and only
+/// `guard_push_remote.rs`'s remote check and
+/// `crates/guardrails/src/enforce_worktree.rs` block there. The win is that an
+/// unobservable-EOF read stops masquerading as a confident answer and stops
+/// blowing the 5s external timeout — not that anything newly blocks.
 pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(work_dir).args(args);
-    match run_git_bounded(&mut cmd) {
+    classify_spawn(run_git_bounded(&mut cmd))
+}
+
+/// The security-bearing line, split out from its spawn so it can be pinned by
+/// a unit test rather than only by a live subprocess.
+fn classify_spawn(spawn: GitSpawn) -> GitOutput {
+    match spawn {
         GitSpawn::Completed(output) if output.status.success() => {
             GitOutput::Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
         GitSpawn::Completed(_) => GitOutput::Failed,
+        GitSpawn::Truncated(output) if !output.status.success() => GitOutput::Failed,
+        GitSpawn::Truncated(_) => GitOutput::TimedOut,
         GitSpawn::SpawnFailed => GitOutput::Unavailable,
         GitSpawn::TimedOut => GitOutput::TimedOut,
     }
@@ -1934,7 +2044,13 @@ pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
 /// behavior every current caller is written against. A caller for whom an empty
 /// answer is meaningful wants [`git_output_detailed`] instead.
 pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
-    match git_output_detailed(work_dir, args) {
+    narrow_output(git_output_detailed(work_dir, args))
+}
+
+/// [`GitOutput`] read down to the tri-state, split out for the same reason as
+/// [`classify_spawn`].
+fn narrow_output(output: GitOutput) -> GitQuery {
+    match output {
         GitOutput::Ok(value) if !value.is_empty() => GitQuery::Value(value),
         GitOutput::Ok(_) | GitOutput::Failed | GitOutput::Unavailable => GitQuery::Failed,
         GitOutput::TimedOut => GitQuery::TimedOut,
@@ -4991,6 +5107,85 @@ mod tests {
             GitSpawn::Completed(out) => assert_eq!(out.stdout.len(), 200_000),
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_orphan_holding_stdout_does_not_hold_the_deadline() {
+        // The child exits immediately, but its backgrounded grandchild
+        // inherits the stdout pipe and holds the write end open for 5s. Before
+        // the bounded drain, joining the reader waited on the GRANDCHILD, so
+        // this returned Completed at ~5s against a 300ms deadline.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let shim = dir.path().join("orphan-holder.sh");
+        let mut file = std::fs::File::create(&shim).expect("create shim");
+        file.write_all(b"#!/bin/sh\nsleep 5 &\necho orphan-holder\nexit 0\n")
+            .expect("write shim");
+        drop(file);
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+
+        // Point Command at the shim path directly: no PATH edit and no
+        // env::set_var, since the test process is shared across the suite.
+        let mut cmd = Command::new(&shim);
+        let timeout = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = run_bounded_with(&mut cmd, timeout);
+        let elapsed = started.elapsed();
+
+        match result {
+            GitSpawn::Truncated(out) => assert!(
+                out.status.success(),
+                "the child's own exit status is still the real one"
+            ),
+            other => panic!("an un-drainable pipe must report Truncated, got {other:?}"),
+        }
+        // 10x slack over the 300ms deadline, matching the slow-command test —
+        // the failure mode being pinned is the grandchild's full 5s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the orphan must not hold the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_routes_by_exit_status_at_the_single_security_point() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let truncated_ok = GitSpawn::Truncated(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"partial".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            classify_spawn(truncated_ok),
+            GitOutput::TimedOut,
+            "a success-status truncation is no answer, not a confident one"
+        );
+        assert_eq!(
+            narrow_output(GitOutput::TimedOut),
+            GitQuery::TimedOut,
+            "and it must reach the fail-open arm as TimedOut, not Failed"
+        );
+
+        // A non-zero exit is a complete answer ABOUT THE EXIT CODE — every
+        // consumer discards stdout on non-success — so the fail-closed arms
+        // still block on it.
+        let truncated_failed = GitSpawn::Truncated(std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"partial".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            classify_spawn(truncated_failed),
+            GitOutput::Failed,
+            "a non-zero exit stays a real failure the guards block on"
+        );
+        assert_eq!(narrow_output(GitOutput::Failed), GitQuery::Failed);
     }
 
     #[test]

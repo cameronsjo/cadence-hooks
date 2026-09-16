@@ -58,181 +58,187 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-push-remote",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git push*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-gh-dangerous",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh repo delete*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-gh-write",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails inject-gh-write-context",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-going-public",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh repo create*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-going-public",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh repo edit*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-untracked",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git commit*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails enforce-worktree",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git *commit*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-branch-base",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git checkout*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-branch-base",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git switch*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-pr-issue-link",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh pr create*)",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-body-budget",
+            "if": "Bash(*gh *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-issue-tracker",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh issue create*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-issue-tracker",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*/issues*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-op-vault-scan",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*op item*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-sops-decrypt",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*sops*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-op-vault-scan",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*op vault*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-curl-alias",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*curl *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-gh-merge-preflight",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh pr merge*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-unreviewed-ready-flip",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh pr *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*ls *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*find *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*cat *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*du *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*df *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*top *)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*rm*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*unlink*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*shred*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*truncate*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*find*)",
             "timeout": 5
           }
         ]
@@ -275,25 +281,25 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-git-init",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git init*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails nudge-upgrade-after-push",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*git push*)",
             "timeout": 5
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails verify-pr-autoclose",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh pr create*)",
             "timeout": 30
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails verify-pr-autoclose",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "if": "Bash(*gh pr merge*)",
             "timeout": 30
           }
         ]

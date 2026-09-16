@@ -409,7 +409,11 @@ fn checkout_staleness_line(cwd: &str) -> Option<String> {
                 .parse()
                 .ok()?
         }
-        _ => return None,
+        // A truncated `rev-list --count` parses to a wrong number.
+        cadence_hooks_core::shell::GitSpawn::Completed(_)
+        | cadence_hooks_core::shell::GitSpawn::Truncated(_)
+        | cadence_hooks_core::shell::GitSpawn::SpawnFailed
+        | cadence_hooks_core::shell::GitSpawn::TimedOut => return None,
     };
     if behind == 0 {
         return None;

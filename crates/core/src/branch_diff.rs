@@ -282,7 +282,10 @@ fn git_nul_list(dir: &str, args: &[&str]) -> Option<BTreeSet<String>> {
                 .map(str::to_string)
                 .collect(),
         ),
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed | GitSpawn::TimedOut => None,
+        GitSpawn::Completed(_)
+        | GitSpawn::Truncated(_)
+        | GitSpawn::SpawnFailed
+        | GitSpawn::TimedOut => None,
     }
 }
 
