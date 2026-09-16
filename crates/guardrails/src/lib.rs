@@ -99,6 +99,8 @@ pub mod dismiss_main_branch_warn;
 pub mod enforce_worktree;
 /// Shared renderer for the gh-write allowlist + `-R` rule context line.
 pub mod gh_context;
+/// Measure `gh` pr/issue bodies against a per-surface word budget.
+pub mod guard_body_budget;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.

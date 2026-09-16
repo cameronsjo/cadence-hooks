@@ -228,6 +228,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-body-budget",
+        description: "Measure gh pr/issue bodies against a per-surface word budget",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-issue-tracker",
         description: "Nudge when gh issue create targets a repo other than the canonical tracker",
         namespace: "guardrails",
@@ -556,6 +562,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // useful signal without a live gh call.
         ("guardrails", "warn-unreviewed-ready-flip") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
+        ),
+        // guard-body-budget only engages on a gh posting subcommand carrying a
+        // body flag; the generic PreToolUse sample (`git status`) would allow
+        // without measuring anything.
+        ("guardrails", "guard-body-budget") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
         ),
         // warn-amend-pushed only engages on an amending `git commit`; the
         // generic PreToolUse sample (`git status`) would never reach the probe.
