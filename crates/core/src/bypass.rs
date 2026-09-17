@@ -76,9 +76,9 @@
 //! because rule 1 is reached before rule 2 in [`resolve_from`] — only the names
 //! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
 //! stronger of the two a repository can set. Either switch leaves a stderr
-//! line per affected invocation; a `CADENCE_DISABLE` is additionally reported
-//! at session start by `guard-rm-liveness` (for the guard it watches) and on
-//! request by `list`, `doctor`, and `configure --list`.
+//! line per affected invocation, and both are reported at session start by
+//! `guard-rm-liveness` (for the guard it watches) and on request by `list`,
+//! `doctor`, and `configure --list`.
 //!
 //! The same channel writes every other `CADENCE_*` variable the binary reads,
 //! and some of those weaken a guard the two switches above do not touch.
@@ -169,7 +169,7 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     "trash-guard",
     // The detector, not a guard: `guard-rm-liveness` is the SessionStart check
     // that reports whether `guard-rm` has been switched off. `CADENCE_DISABLE`
-    // is silent and persistent, so one line in a committed settings file could
+    // is selective and persistent, so one line in a committed settings file could
     // otherwise disarm `guard-rm` and hide the report of it in the same breath
     // — the watched guard stays unprotected by charter (see `guard_rm.rs`),
     // which is precisely why the watcher may not be.
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn every_protected_guard_still_yields_to_the_blanket_bypass() {
-        // The loud switch is the documented escape for maintenance. If this
+        // The blanket switch is the documented escape for maintenance. If this
         // ever fails, `CADENCE_BYPASS` has stopped being a complete escape and
         // the docs promising one are wrong.
         for guard in PROTECTED_GUARDS {
@@ -620,11 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bypass_exempt_hook_is_also_protected_from_the_silent_switch() {
-        // Exempting a hook from the loud switch while leaving the silent,
+    fn a_bypass_exempt_hook_is_also_protected_from_the_selective_switch() {
+        // Exempting a hook from the blanket switch while leaving the selective,
         // persistent one able to neuter it would move the hole rather than
-        // close it — `CADENCE_DISABLE` is the easier of the two to set and the
-        // harder to notice.
+        // close it — `CADENCE_DISABLE` names one hook and is the easier of the
+        // two to justify in a committed settings file.
         for hook in BYPASS_EXEMPT_HOOKS {
             assert!(
                 is_protected(hook),
