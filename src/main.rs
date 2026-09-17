@@ -773,7 +773,9 @@ fn main() {
     let _ = MAIN_THREAD.set(std::thread::current().id());
 
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
-    // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
+    // Useful when editing hook source or testing. It CAN be left on: any
+    // settings file's `env` block sets it, a project's checked-in one included
+    // (see the `core::bypass` module docs); the stderr line below is its trace.
     // Note: `list`, `configure`, `doctor`, `try`, `migrate-config`, and the
     // session CLI actions (`declare`, `status`) are exempt — they're
     // CLI/diagnostic/maintenance commands, not enforcement paths, and must work

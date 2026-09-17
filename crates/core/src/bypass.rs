@@ -30,14 +30,14 @@
 //! | — | otherwise | [`BypassState::Enforced`] | yes |
 //!
 //! `CADENCE_BYPASS` outranks `CADENCE_DISABLE` because it is the loud, blanket
-//! maintenance escape: it switches everything off at once and announces itself
-//! on stderr. It **can** be set from a settings file's `env` block, a project's
-//! checked-in one included, exactly as `CADENCE_DISABLE` can — the stderr
-//! announcement is what keeps that visible, not any limit on where the value
-//! may come from (see "Project-scope settings are a writer of both variables"
-//! below). Rule 2 sits ahead of rule 3 so that no value of the silent,
-//! persistent variable can neuter a guard that prevents irreversible harm
-//! (#89).
+//! maintenance escape: it switches everything off at once, and the binary
+//! prints one stderr line on every invocation it short-circuits. It **can** be
+//! set from a settings file's `env` block, a project's checked-in one included,
+//! exactly as `CADENCE_DISABLE` can — that stderr line is the trace it leaves,
+//! not any limit on where the value may come from (see "Project-scope settings
+//! write every `CADENCE_*` variable" below). Rule 2 sits ahead of rule 3 so
+//! that no value of the silent, persistent variable can neuter a guard that
+//! prevents irreversible harm (#89).
 //!
 //! Rule 0 is the one exception to that outranking, and it is narrow: a hook
 //! whose only job is to report on the enforcement state cannot be switched off
@@ -60,14 +60,14 @@
 //!   trimming surrounding whitespace from each entry. Empty entries are
 //!   ignored, so `a,,b` and `a, b` both name `a` and `b`.
 //!
-//! # Project-scope settings are a writer of both variables
+//! # Project-scope settings write every `CADENCE_*` variable
 //!
 //! A project-scope `.claude/settings.json` `env` block reaches hook processes.
-//! A cloned repository can therefore set `CADENCE_DISABLE` and `CADENCE_BYPASS`
-//! for every session opened in it, without the operator writing anything.
-//! Measured on Claude Code 2.1.273: a project `env` value arrived in a
-//! `PreToolUse` hook's own environment after one tool call, and in ordinary
-//! Bash tool processes as well.
+//! Once the folder is trusted, a cloned repository can therefore set
+//! `CADENCE_DISABLE` and `CADENCE_BYPASS` for every session opened in it,
+//! without the operator writing anything. Measured on Claude Code 2.1.273: a
+//! project `env` value arrived in a `PreToolUse` hook's own environment after
+//! one tool call, and in ordinary Bash tool processes as well.
 //!
 //! What each switch does from that channel follows the precedence table above.
 //! `CADENCE_DISABLE` silences every hook that is not in [`PROTECTED_GUARDS`];
@@ -75,8 +75,23 @@
 //! `CADENCE_BYPASS=1` silences every hook **including** the protected set,
 //! because rule 1 is reached before rule 2 in [`resolve_from`] — only the names
 //! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
-//! stronger of the two a repository can set, and the only one that announces
-//! itself.
+//! stronger of the two a repository can set. It is also the one the binary
+//! reports on every invocation; a `CADENCE_DISABLE` is reported at session
+//! start by `guard-rm-liveness` (for the guard it watches) and on request by
+//! `list`, `doctor`, and `configure --list`.
+//!
+//! The same channel writes every other `CADENCE_*` variable the binary reads,
+//! and some of those weaken a guard the two switches above do not touch.
+//! `CADENCE_ALLOW_SENSITIVE_TERMS` downgrades `redact-external-content`'s
+//! identity-tier block to a nudge, and that guard is in [`PROTECTED_GUARDS`]:
+//! no bypass banner prints, only a provenance row. `CADENCE_ALLOW_MAIN` and
+//! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR`
+//! and `CADENCE_METRICS_DIR` relocate the marker and ledger state that other
+//! checks key on. The identity tier already removed one such override
+//! (`CADENCE_REDACTION_TERMS`) for exactly this reason; see the "Why no
+//! environment override in production" note on `terms_path` in the
+//! `cadence` crate. Protection here is per-switch, not per-guard: a guard is
+//! only as protected as the least-guarded variable that can weaken it.
 //!
 //! The binary cannot tell a project-scope value from a user-scope one: it reads
 //! one merged process environment, with no marker saying which settings file
@@ -88,7 +103,8 @@
 //! `guard-rm` is left out of [`PROTECTED_GUARDS`] on purpose — the operator
 //! disables it estate-wide through their own `CADENCE_DISABLE` (2026-08-12), so
 //! protecting it would refuse an intended disable. This channel is therefore an
-//! accepted, documented exposure for every unprotected guard rather than an
+//! accepted, documented exposure for every unprotected guard, and for every
+//! protected guard that has a repo-settable switch of its own, rather than an
 //! oversight.
 //!
 //! # Unknown values fail toward ENFORCED
@@ -119,11 +135,11 @@
 /// destructive git/gh/remote/vault operations — **or** the detector that
 /// reports such a guard's own state. `CADENCE_DISABLE` (silent, persistent,
 /// settable in settings.json `env`) must not be able to neuter these; only the
-/// loud, per-session `CADENCE_BYPASS` can (#89) — and not even that, for a name
-/// also listed in [`BYPASS_EXEMPT_HOOKS`]. That settings file includes a
+/// loud, blanket `CADENCE_BYPASS` can (#89) — and not even that, for a name
+/// also listed in [`BYPASS_EXEMPT_HOOKS`]. "settings.json" includes a
 /// repository's own checked-in `.claude/settings.json`, and `CADENCE_BYPASS`
 /// arrives by the same channel; see the module docs, "Project-scope settings
-/// are a writer of both variables".
+/// write every `CADENCE_*` variable".
 ///
 /// The second class is the later addition. A detector prevents no harm by
 /// itself; what it prevents is the harm happening *unobserved*, and the one
@@ -173,7 +189,8 @@ pub fn is_bypass_exempt_hook(hook_name: &str) -> bool {
     BYPASS_EXEMPT_HOOKS.contains(&hook_name)
 }
 
-/// The blanket, per-session maintenance escape.
+/// The blanket maintenance escape. Settable from any settings file's `env`
+/// block, a project's checked-in one included; see the module docs.
 pub const BYPASS_VAR: &str = "CADENCE_BYPASS";
 
 /// The selective, per-hook-name disable list.
