@@ -29,15 +29,15 @@
 //! | 3 | the hook's name is listed in `CADENCE_DISABLE` | [`BypassState::Disabled`] | no |
 //! | — | otherwise | [`BypassState::Enforced`] | yes |
 //!
-//! `CADENCE_BYPASS` outranks `CADENCE_DISABLE` because it is the loud, blanket
-//! maintenance escape: it switches everything off at once, and the binary
-//! prints one stderr line on every invocation it short-circuits. It **can** be
-//! set from a settings file's `env` block, a project's checked-in one included,
-//! exactly as `CADENCE_DISABLE` can — that stderr line is the trace it leaves,
-//! not any limit on where the value may come from (see "Project-scope settings
-//! write every `CADENCE_*` variable" below). Rule 2 sits ahead of rule 3 so
-//! that no value of the silent, persistent variable can neuter a guard that
-//! prevents irreversible harm (#89).
+//! `CADENCE_BYPASS` outranks `CADENCE_DISABLE` because it is the blanket
+//! maintenance escape: it switches everything off at once, where
+//! `CADENCE_DISABLE` is selective. Both leave the same trace — the binary
+//! prints one stderr line on every invocation either switch affects (#89) —
+//! and both **can** be set from a settings file's `env` block, a project's
+//! checked-in one included (see "Project-scope settings write every
+//! `CADENCE_*` variable" below). Rule 2 sits ahead of rule 3 so that no value
+//! of the selective, persistent variable can neuter a guard that prevents
+//! irreversible harm (#89).
 //!
 //! Rule 0 is the one exception to that outranking, and it is narrow: a hook
 //! whose only job is to report on the enforcement state cannot be switched off
@@ -75,23 +75,26 @@
 //! `CADENCE_BYPASS=1` silences every hook **including** the protected set,
 //! because rule 1 is reached before rule 2 in [`resolve_from`] — only the names
 //! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
-//! stronger of the two a repository can set. It is also the one the binary
-//! reports on every invocation; a `CADENCE_DISABLE` is reported at session
-//! start by `guard-rm-liveness` (for the guard it watches) and on request by
-//! `list`, `doctor`, and `configure --list`.
+//! stronger of the two a repository can set. Either switch leaves a stderr
+//! line per affected invocation; a `CADENCE_DISABLE` is additionally reported
+//! at session start by `guard-rm-liveness` (for the guard it watches) and on
+//! request by `list`, `doctor`, and `configure --list`.
 //!
 //! The same channel writes every other `CADENCE_*` variable the binary reads,
 //! and some of those weaken a guard the two switches above do not touch.
 //! `CADENCE_ALLOW_SENSITIVE_TERMS` downgrades `redact-external-content`'s
 //! identity-tier block to a nudge, and that guard is in [`PROTECTED_GUARDS`]:
-//! no bypass banner prints, only a provenance row. `CADENCE_ALLOW_MAIN` and
+//! no bypass banner prints, only a provenance row in `bypasses.jsonl`.
+//! `CADENCE_METRICS_DIR` relocates that ledger, so one `env` block setting
+//! both leaves no durable record where the operator's tooling reads
+//! (cadence-hooks#963 holds the design call). `CADENCE_ALLOW_MAIN` and
 //! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR`
-//! and `CADENCE_METRICS_DIR` relocate the marker and ledger state that other
-//! checks key on. The identity tier already removed one such override
-//! (`CADENCE_REDACTION_TERMS`) for exactly this reason; see the "Why no
-//! environment override in production" note on `terms_path` in the
-//! `cadence` crate. Protection here is per-switch, not per-guard: a guard is
-//! only as protected as the least-guarded variable that can weaken it.
+//! relocates the marker state other checks key on. The identity tier already
+//! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this
+//! reason; see the "Why no environment override in production" note on
+//! `terms_path` in the `cadence` crate. Protection here is per-switch, not
+//! per-guard: a guard is only as protected as the least-guarded variable that
+//! can weaken it.
 //!
 //! The binary cannot tell a project-scope value from a user-scope one: it reads
 //! one merged process environment, with no marker saying which settings file
@@ -103,9 +106,8 @@
 //! `guard-rm` is left out of [`PROTECTED_GUARDS`] on purpose — the operator
 //! disables it estate-wide through their own `CADENCE_DISABLE` (2026-08-12), so
 //! protecting it would refuse an intended disable. This channel is therefore an
-//! accepted, documented exposure for every unprotected guard, and for every
-//! protected guard that has a repo-settable switch of its own, rather than an
-//! oversight.
+//! accepted, documented exposure for every guard but the bypass-exempt ones,
+//! rather than an oversight.
 //!
 //! # Unknown values fail toward ENFORCED
 //!
@@ -133,9 +135,9 @@
 
 /// Guards that prevent irreversible harm — secret exposure, data loss,
 /// destructive git/gh/remote/vault operations — **or** the detector that
-/// reports such a guard's own state. `CADENCE_DISABLE` (silent, persistent,
+/// reports such a guard's own state. `CADENCE_DISABLE` (selective, persistent,
 /// settable in settings.json `env`) must not be able to neuter these; only the
-/// loud, blanket `CADENCE_BYPASS` can (#89) — and not even that, for a name
+/// blanket `CADENCE_BYPASS` can (#89) — and not even that, for a name
 /// also listed in [`BYPASS_EXEMPT_HOOKS`]. "settings.json" includes a
 /// repository's own checked-in `.claude/settings.json`, and `CADENCE_BYPASS`
 /// arrives by the same channel; see the module docs, "Project-scope settings

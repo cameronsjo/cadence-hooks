@@ -961,7 +961,7 @@ fn main() {
                 eprintln!(
                     "⚠️  cadence-hooks: refusing to disable protected guard '{name}' \
                      via CADENCE_DISABLE (it still runs). Use CADENCE_BYPASS=1 for a \
-                     one-session maintenance bypass."
+                     blanket maintenance bypass."
                 );
             }
             // `Bypassed` is reachable only through a DISAGREEMENT between the
