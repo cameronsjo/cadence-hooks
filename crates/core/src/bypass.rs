@@ -29,11 +29,15 @@
 //! | 3 | the hook's name is listed in `CADENCE_DISABLE` | [`BypassState::Disabled`] | no |
 //! | — | otherwise | [`BypassState::Enforced`] | yes |
 //!
-//! `CADENCE_BYPASS` outranks `CADENCE_DISABLE` because it is the loud,
-//! per-session maintenance escape: it announces itself on stderr and cannot be
-//! left switched on in a settings file the way `CADENCE_DISABLE` can. Rule 2
-//! sits ahead of rule 3 so that no value of the silent, persistent variable can
-//! neuter a guard that prevents irreversible harm (#89).
+//! `CADENCE_BYPASS` outranks `CADENCE_DISABLE` because it is the loud, blanket
+//! maintenance escape: it switches everything off at once and announces itself
+//! on stderr. It **can** be set from a settings file's `env` block, a project's
+//! checked-in one included, exactly as `CADENCE_DISABLE` can — the stderr
+//! announcement is what keeps that visible, not any limit on where the value
+//! may come from (see "Project-scope settings are a writer of both variables"
+//! below). Rule 2 sits ahead of rule 3 so that no value of the silent,
+//! persistent variable can neuter a guard that prevents irreversible harm
+//! (#89).
 //!
 //! Rule 0 is the one exception to that outranking, and it is narrow: a hook
 //! whose only job is to report on the enforcement state cannot be switched off
@@ -55,6 +59,37 @@
 //!   against the canonical registry name, exactly, case-sensitively, after
 //!   trimming surrounding whitespace from each entry. Empty entries are
 //!   ignored, so `a,,b` and `a, b` both name `a` and `b`.
+//!
+//! # Project-scope settings are a writer of both variables
+//!
+//! A project-scope `.claude/settings.json` `env` block reaches hook processes.
+//! A cloned repository can therefore set `CADENCE_DISABLE` and `CADENCE_BYPASS`
+//! for every session opened in it, without the operator writing anything.
+//! Measured on Claude Code 2.1.273: a project `env` value arrived in a
+//! `PreToolUse` hook's own environment after one tool call, and in ordinary
+//! Bash tool processes as well.
+//!
+//! What each switch does from that channel follows the precedence table above.
+//! `CADENCE_DISABLE` silences every hook that is not in [`PROTECTED_GUARDS`];
+//! a name in that list is refused and the guard runs anyway (rule 2).
+//! `CADENCE_BYPASS=1` silences every hook **including** the protected set,
+//! because rule 1 is reached before rule 2 in [`resolve_from`] — only the names
+//! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
+//! stronger of the two a repository can set, and the only one that announces
+//! itself.
+//!
+//! The binary cannot tell a project-scope value from a user-scope one: it reads
+//! one merged process environment, with no marker saying which settings file
+//! contributed a name. Refusing a project-scope override would need that marker
+//! on the hook input, which is the upstream ask recorded on
+//! cameronsjo/cadence-ecosystem#567 (a different issue from the
+//! cameronsjo/cadence-hooks#567 cited above).
+//!
+//! `guard-rm` is left out of [`PROTECTED_GUARDS`] on purpose — the operator
+//! disables it estate-wide through their own `CADENCE_DISABLE` (2026-08-12), so
+//! protecting it would refuse an intended disable. This channel is therefore an
+//! accepted, documented exposure for every unprotected guard rather than an
+//! oversight.
 //!
 //! # Unknown values fail toward ENFORCED
 //!
@@ -85,7 +120,10 @@
 /// reports such a guard's own state. `CADENCE_DISABLE` (silent, persistent,
 /// settable in settings.json `env`) must not be able to neuter these; only the
 /// loud, per-session `CADENCE_BYPASS` can (#89) — and not even that, for a name
-/// also listed in [`BYPASS_EXEMPT_HOOKS`].
+/// also listed in [`BYPASS_EXEMPT_HOOKS`]. That settings file includes a
+/// repository's own checked-in `.claude/settings.json`, and `CADENCE_BYPASS`
+/// arrives by the same channel; see the module docs, "Project-scope settings
+/// are a writer of both variables".
 ///
 /// The second class is the later addition. A detector prevents no harm by
 /// itself; what it prevents is the harm happening *unobserved*, and the one
