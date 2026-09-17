@@ -1548,7 +1548,7 @@ fn block_message(class: TargetClass) -> String {
          these in the `env` block of .claude/settings.json, or export it before \
          launching Claude Code:\n   \
          • CADENCE_DISABLE=guard-rm — opt this guard out (persists in settings)\n   \
-         • CADENCE_BYPASS=1 — bypass all cadence enforcement for one session"
+         • CADENCE_BYPASS=1 — bypass all cadence enforcement (also persists in settings)"
     )
 }
 
