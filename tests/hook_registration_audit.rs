@@ -345,15 +345,14 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
 /// monorepo PR that drops the filter.
 ///
 /// The split keeps both directions of the self-expiry honest.
-/// `intentional_unfiltered_bash_hooks_are_still_unfiltered` would go red for a
-/// row like this one — the exemption is not earned yet — so a pending row is
+/// `intentional_unfiltered_bash_hooks_are_still_unfiltered` would go red for
+/// such a row — the exemption is not earned yet — so a pending row is
 /// excused there and held to the opposite assertion instead:
 /// `pending_unfiltered_bash_hooks_are_still_filtered` fails the moment the
 /// wiring drops the filter, which is the signal to move the row out of this
 /// list. Same discipline as [`PENDING_WIRING_HOOKS`].
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_UNFILTERED_BASH_HOOKS: &[(&str, &str)] =
-    &[("guardrails guard-rm", "cameronsjo/cadence-hooks#597")];
+const PENDING_UNFILTERED_BASH_HOOKS: &[(&str, &str)] = &[];
 
 /// Hooks a plugin dispatches from *another* plugin's CLI group on purpose.
 /// (plugin_dir, command, rationale)
@@ -460,7 +459,6 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "cadence redact-external-content",
     "cadence warn-overshare",
     "guardrails guard-op-vault-scan",
-    "guardrails guard-rm",
     "guardrails verify-pr-autoclose",
     "guardrails warn-alias-parsing",
     "guardrails warn-branch-base",

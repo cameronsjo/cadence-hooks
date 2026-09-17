@@ -214,31 +214,6 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
             "timeout": 5
           }
         ]
