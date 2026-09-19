@@ -1,16 +1,24 @@
-//! CLI actions: `session declare` and `session status`.
+//! CLI actions: `session declare`, `session status`, and `session plans`.
 //!
 //! These are user/skill-facing commands, not hooks — they read no stdin
 //! payload and are exempt from hooks.json wiring (like
 //! `guardrails dismiss-main-branch-warn`). A coordination convenience must not
-//! fail a script that calls it, so both succeed on every answer they can give
-//! — including "no sessions registered", which is a real answer.
+//! fail a script that calls it, so each succeeds on every answer it can give —
+//! including "no sessions registered" and "no plans in flight", which are real
+//! answers.
 //!
-//! The one exception is `session status` outside a git repository: there is no
-//! registry to read, so the question could not be asked at all. That exits 1
-//! with the message on stderr, because a parser needs to tell it apart from an
-//! empty registry. `session declare` keeps its exit-0 contract — it is a
-//! fire-and-forget write whose failure a caller has nothing to do about.
+//! Exit codes, one per command:
+//!
+//! - `session declare` — always **0**. A fire-and-forget write whose failure a
+//!   caller has nothing to do about; it reports the problem on stdout.
+//! - `session status` — **0** for any answer it can give, **1** outside a git
+//!   repository, with the message on stderr. There is no registry to read
+//!   there, so the question could not be asked at all, and a parser needs to
+//!   tell that apart from an empty registry.
+//! - `session plans` — **0** for any answer it can give, **2** outside a git
+//!   repository, with the scanned root on stderr. Same distinction as
+//!   `status`, a different code, so a caller running both can tell which one
+//!   could not answer.
 
 use crate::identity;
 use crate::registry;
