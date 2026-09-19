@@ -109,6 +109,12 @@ pub const HOOK_OUTPUT_BUDGET_UTF16: usize = 9_000;
 /// matching the whole sentence.
 pub const CLAMP_MARKER_PREFIX: &str = "[hook-output-clamped]";
 
+/// Cap on the `recovery_hint` a caller may ride into the marker line, in
+/// UTF-16 code units. The marker is the one part of a clamped message the
+/// clamp itself authors, and its length is subtracted from the text the reader
+/// actually wanted; an uncapped hint would spend the whole budget on itself.
+pub const MAX_RECOVERY_HINT_UTF16: usize = 200;
+
 /// Length of `s` in UTF-16 code units — the unit the platform measures hook
 /// output in. See [`HOOK_OUTPUT_BUDGET_UTF16`].
 #[must_use]
@@ -150,6 +156,12 @@ fn take_utf16(s: &str, max: usize) -> String {
 /// This is a **backstop**, not a display strategy: it never changes a guard's
 /// decision or its exit code, only the text. A clamped message still carries
 /// far more than the 2,000-character preview the platform's own spill leaves.
+///
+/// Lines are split with [`str::lines`], which normalizes `\r\n` to `\n` and
+/// drops one trailing newline — so a clamped message can differ from its input
+/// in line endings and in whether it ends with a newline, even where the text
+/// itself is unchanged. Callers that need a trailing newline add it after this
+/// returns (`render_output`'s block arm does).
 #[must_use]
 pub fn clamp_hook_output<'a>(
     msg: &'a str,
@@ -162,13 +174,40 @@ pub fn clamp_hook_output<'a>(
         return Cow::Borrowed(msg);
     }
 
-    // Head and tail split the budget 5:6 and 1:9 — 7,500 and 1,000 units at the
-    // default budget — scaled so a reduced budget (a block whose Fix line and
-    // footer are appended afterwards) keeps the same shape.
-    let head_budget = budget * 5 / 6;
-    let tail_budget = budget / 9;
-
     let lines: Vec<&str> = msg.lines().collect();
+
+    // The marker is built FIRST and gets an explicit reserve, because its
+    // length is partly caller-controlled through `recovery_hint`. Head and tail
+    // budgets are then computed from what it leaves, so
+    // `head + marker + tail <= budget` holds by construction rather than by a
+    // trailing truncation that would silently eat the kept tail.
+    //
+    // `omitted` is not known until the head and tail are chosen, so the count
+    // is rendered from the worst case (every line dropped) purely to MEASURE
+    // the marker; the real count is substituted once the split is known. Both
+    // renderings use the same digits-widening bound, so the measured reserve is
+    // never smaller than the final marker.
+    let marker_of = |omitted: usize| {
+        let mut marker = format!(
+            "{CLAMP_MARKER_PREFIX} {omitted} line{} omitted to stay under Claude Code's \
+             10,000-character hook limit.",
+            if omitted == 1 { "" } else { "s" }
+        );
+        if let Some(hint) = recovery_hint {
+            marker.push(' ');
+            marker.push_str(&take_utf16(hint, MAX_RECOVERY_HINT_UTF16));
+        }
+        marker
+    };
+    let marker_reserve = utf16_len(&marker_of(lines.len())) + 1; // + the newline
+
+    let room = budget.saturating_sub(marker_reserve);
+    // Head and tail split what is left 15:2 — 7,500 and 1,000 units at the
+    // default budget, the same shape as before the marker was given its own
+    // reserve. A reduced budget (a block whose Fix line and footer are appended
+    // afterwards) scales the same way.
+    let head_budget = room.saturating_mul(15) / 17;
+    let tail_budget = room - head_budget;
 
     let mut head: Vec<&str> = Vec::new();
     let mut head_used = 0usize;
@@ -193,22 +232,12 @@ pub fn clamp_hook_output<'a>(
     }
     tail.reverse();
 
-    let omitted = lines.len() - head.len() - tail.len();
-    let mut marker = format!(
-        "{CLAMP_MARKER_PREFIX} {omitted} line{} omitted to stay under Claude Code's \
-         10,000-character hook limit.",
-        if omitted == 1 { "" } else { "s" }
-    );
-    if let Some(hint) = recovery_hint {
-        marker.push(' ');
-        marker.push_str(hint);
-    }
+    let marker = marker_of(lines.len() - head.len() - tail.len());
 
     // No whole line fits: one over-long line (or a first line past the budget).
     // Cut it at a char boundary and leave room for the marker.
     if head.is_empty() && tail.is_empty() {
-        let room = budget.saturating_sub(utf16_len(&marker) + 1);
-        let cut = take_utf16(msg, room);
+        let cut = take_utf16(msg, budget.saturating_sub(marker_reserve));
         return Cow::Owned(fit(format!("{cut}\n{marker}"), budget));
     }
 
@@ -276,7 +305,11 @@ mod tests {
     fn head_and_tail_both_survive() {
         let msg = many_lines(2_000);
         let out = clamp_hook_output(&msg, HOOK_OUTPUT_BUDGET_UTF16, None);
-        assert!(out.contains("line 0:"), "head kept: {}", &out[..60]);
+        assert!(
+            out.contains("line 0:"),
+            "head kept: {}",
+            out.chars().take(60).collect::<String>()
+        );
         assert!(out.contains("line 1999:"), "tail kept");
     }
 
@@ -312,6 +345,29 @@ mod tests {
         assert!(utf16_len(&out) <= 500);
         assert!(out.starts_with('é'), "cut on a char boundary, not a byte");
         assert!(out.contains(CLAMP_MARKER_PREFIX));
+    }
+
+    #[test]
+    fn a_long_recovery_hint_cannot_eat_the_kept_tail() {
+        // The marker is caller-controlled through `recovery_hint`. Head and
+        // tail budgets are computed from what the marker leaves, so a long
+        // hint shrinks the kept text instead of silently truncating the tail
+        // off the end of the assembled string.
+        let msg = many_lines(2_000);
+        let hint = "h".repeat(400);
+        let out = clamp_hook_output(&msg, HOOK_OUTPUT_BUDGET_UTF16, Some(&hint));
+        assert!(utf16_len(&out) <= HOOK_OUTPUT_BUDGET_UTF16);
+        assert!(out.contains("line 1999:"), "the last line survives");
+    }
+
+    #[test]
+    fn an_absurd_recovery_hint_is_capped_and_the_tail_still_survives() {
+        let msg = many_lines(2_000);
+        let hint = "h".repeat(50_000);
+        let out = clamp_hook_output(&msg, HOOK_OUTPUT_BUDGET_UTF16, Some(&hint));
+        assert!(utf16_len(&out) <= HOOK_OUTPUT_BUDGET_UTF16);
+        assert!(out.contains("line 0:"), "the head survives");
+        assert!(out.contains("line 1999:"), "the last line survives");
     }
 
     #[test]

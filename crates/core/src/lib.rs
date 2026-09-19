@@ -1337,10 +1337,11 @@ struct RenderedOutput {
 ///   telemetry while delivering nothing.
 ///
 /// Structured block hints ([`BlockMetadata::fix`]) therefore ride the stderr
-/// channel: the `fix` is appended as a `Fix:` line *only when the prose doesn't
-/// already carry one*, so the machine-intended hint reaches Claude via the only
-/// channel exit 2 surfaces — without duplicating a fix the block message already
-/// spells out.
+/// channel: the `fix` is appended as a `Fix:` line *only when the clamped prose
+/// doesn't already carry one*, so the machine-intended hint reaches Claude via
+/// the only channel exit 2 surfaces — without duplicating a fix the block
+/// message already spells out, and without dropping it when the clamp is what
+/// removed the prose one.
 ///
 /// `footer` is the resolved feedback footer ([`feedback_footer`]); passing it in
 /// keeps this pure without touching process-global env.
@@ -1356,6 +1357,12 @@ fn render_output(
     };
     let event_name = event.name();
     match outcome {
+        // One emitter (`cadence markdown-lint`) clamps its own message first,
+        // so it can name a recovery command in the marker line that
+        // `CheckResult` has no field to carry. That is safe only while the
+        // budget here is the same `HOOK_OUTPUT_BUDGET_UTF16` it uses: the
+        // second clamp is then a no-op and exactly one marker line ships.
+        // Change this budget and you must change that one.
         Outcome::Nudge => RenderedOutput {
             stdout: Some(
                 serde_json::json!({
@@ -1410,20 +1417,39 @@ fn render_output(
             // appended *after* the clamp and their length is taken off the
             // body's budget first — a clamp applied to the assembled string
             // would cut the one line the block exists to deliver.
-            let fix_suffix = block_metadata.and_then(|meta| {
-                let has_fix_line = msg.lines().any(|l| l.trim_start().starts_with("Fix:"));
-                (!meta.fix.is_empty() && !has_fix_line).then(|| format!("\n   Fix: {}", meta.fix))
-            });
+            //
+            // Whether the structured fix is appended is decided on the
+            // **clamped** body, not the raw message: a message carrying its own
+            // `Fix:` line mid-body would otherwise suppress the structured one
+            // while the clamp drops the prose one, and the block would ship
+            // with no fix at all. The suffix length is reserved either way, so
+            // the decision cannot change how much body fits.
+            let fix_suffix = block_metadata
+                .filter(|meta| !meta.fix.is_empty())
+                .map(|meta| format!("\n   Fix: {}", meta.fix));
             let reserved = fix_suffix.as_deref().map_or(0, display::utf16_len)
                 + footer.map_or(0, display::utf16_len)
                 + 1; // the trailing newline added below
             let body_budget = display::HOOK_OUTPUT_BUDGET_UTF16.saturating_sub(reserved);
             let mut body = display::clamp_hook_output(msg, body_budget, None).into_owned();
             if let Some(fix) = fix_suffix {
-                body.push_str(&fix);
+                let has_fix_line = body.lines().any(|l| l.trim_start().starts_with("Fix:"));
+                if !has_fix_line {
+                    body.push_str(&fix);
+                }
             }
             let mut full = apply_feedback_footer(Outcome::Block, &body, footer);
             if !full.ends_with('\n') {
+                full.push('\n');
+            }
+            // Last resort: a `fix` or footer big enough on its own saturates
+            // `body_budget` to zero and the assembled string can still be over.
+            // Clamping the whole thing costs the shape but keeps the contract —
+            // and never touches the decision or the exit code.
+            if display::utf16_len(&full) > display::HOOK_OUTPUT_BUDGET_UTF16 {
+                full =
+                    display::clamp_hook_output(&full, display::HOOK_OUTPUT_BUDGET_UTF16 - 1, None)
+                        .into_owned();
                 full.push('\n');
             }
             RenderedOutput {
@@ -2133,6 +2159,136 @@ mod tests {
             stderr.contains(display::CLAMP_MARKER_PREFIX),
             "marker present"
         );
+    }
+
+    /// Every line of `s` that reads as a `Fix:` line to the same test the
+    /// renderer applies.
+    fn fix_lines(s: &str) -> Vec<&str> {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with("Fix:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_mid_body_fix_line_that_the_clamp_drops_is_replaced_by_the_structured_one() {
+        // The prose carries its own Fix: line at line 5 of 2,000 — well inside
+        // the head, so the clamp keeps it and the structured fix must NOT be
+        // appended on top of it.
+        let mut lines: Vec<String> = (0..2_000)
+            .map(|i| format!("line {i}: a plausible finding about some file"))
+            .collect();
+        lines[4] = "   Fix: run the prose-suggested command".to_string();
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&lines.join("\n")),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "exactly one Fix: line ships: {:?}",
+            fix_lines(&stderr)
+        );
+    }
+
+    #[test]
+    fn a_fix_line_the_clamp_cuts_away_is_restored_from_the_metadata() {
+        // The prose's own Fix: line sits deep in the middle, where the clamp
+        // drops it. Deciding on the UNCLAMPED message would suppress the
+        // structured fix too and ship a block with no Fix: line at all.
+        let mut lines: Vec<String> = (0..2_000)
+            .map(|i| format!("line {i}: a plausible finding about some file"))
+            .collect();
+        lines[900] = "   Fix: run the prose-suggested command".to_string();
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&lines.join("\n")),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "exactly one Fix: line ships: {:?}",
+            fix_lines(&stderr)
+        );
+        assert!(
+            stderr.contains("Fix: -R owner/repo"),
+            "the structured fix is what survives: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_fix_longer_than_the_whole_budget_cannot_push_stderr_past_the_cap() {
+        // Fix line plus footer alone reach the budget: the body's budget
+        // saturates to zero and the assembled string must still be clamped.
+        let meta = BlockMetadata {
+            rule_id: "x".to_string(),
+            fix: "f".repeat(9_500),
+            allowed_owners: vec![],
+            severity: "error",
+        };
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&oversized_message()),
+            Some(&meta),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        assert!(rendered.stdout.is_none(), "a block still writes no stdout");
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+    }
+
+    #[test]
+    fn an_emitter_that_pre_clamps_with_a_hint_is_not_clamped_twice() {
+        // markdown-lint clamps its own message so it can name a recovery
+        // command in the marker; render_output's Nudge clamp then has to be a
+        // no-op. One marker, and the hint still there.
+        let hint = "Run `markdownlint x.md` for the full list.";
+        let pre = display::clamp_hook_output(
+            &oversized_message(),
+            display::HOOK_OUTPUT_BUDGET_UTF16,
+            Some(hint),
+        )
+        .into_owned();
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some(&pre),
+            None,
+            HookEvent::PostToolUse,
+            None,
+        );
+        let stdout = rendered.stdout.expect("nudge writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let field = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("string");
+        assert_eq!(
+            field.matches(display::CLAMP_MARKER_PREFIX).count(),
+            1,
+            "exactly one marker: {field}"
+        );
+        assert!(field.contains(hint), "the recovery hint survives");
     }
 
     #[test]
