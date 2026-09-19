@@ -1424,9 +1424,19 @@ fn render_output(
             // while the clamp drops the prose one, and the block would ship
             // with no fix at all. The suffix length is reserved either way, so
             // the decision cannot change how much body fits.
+            //
+            // The fix itself is capped at `MAX_BLOCK_FIX_UTF16` as it is
+            // built. A fix larger than the whole budget would otherwise
+            // saturate `body_budget` to zero and leave the last-resort clamp
+            // to drop the `Fix:` line whole — a truncated fix beats none.
             let fix_suffix = block_metadata
                 .filter(|meta| !meta.fix.is_empty())
-                .map(|meta| format!("\n   Fix: {}", meta.fix));
+                .map(|meta| {
+                    format!(
+                        "\n   Fix: {}",
+                        display::take_utf16(&meta.fix, display::MAX_BLOCK_FIX_UTF16)
+                    )
+                });
             let reserved = fix_suffix.as_deref().map_or(0, display::utf16_len)
                 + footer.map_or(0, display::utf16_len)
                 + 1; // the trailing newline added below
@@ -2170,10 +2180,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mid_body_fix_line_that_the_clamp_drops_is_replaced_by_the_structured_one() {
+    fn a_prose_fix_line_the_clamp_keeps_is_not_duplicated_by_the_structured_one() {
         // The prose carries its own Fix: line at line 5 of 2,000 — well inside
-        // the head, so the clamp keeps it and the structured fix must NOT be
-        // appended on top of it.
+        // the head the clamp keeps, so the prose line survives and the
+        // structured fix must NOT be appended on top of it.
         let mut lines: Vec<String> = (0..2_000)
             .map(|i| format!("line {i}: a plausible finding about some file"))
             .collect();
@@ -2237,6 +2247,8 @@ mod tests {
     fn a_fix_longer_than_the_whole_budget_cannot_push_stderr_past_the_cap() {
         // Fix line plus footer alone reach the budget: the body's budget
         // saturates to zero and the assembled string must still be clamped.
+        // A truncated fix beats none, so the fix is capped when the suffix is
+        // built and a `Fix:` line still ships alongside the footer.
         let meta = BlockMetadata {
             rule_id: "x".to_string(),
             fix: "f".repeat(9_500),
@@ -2256,6 +2268,15 @@ mod tests {
             display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
             "stderr is {} UTF-16 units",
             display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "a truncated Fix: line still ships: {stderr}"
+        );
+        assert!(
+            stderr.contains("/cadence:feedback"),
+            "the footer survives: {stderr}"
         );
     }
 

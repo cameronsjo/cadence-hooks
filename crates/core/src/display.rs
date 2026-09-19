@@ -115,6 +115,14 @@ pub const CLAMP_MARKER_PREFIX: &str = "[hook-output-clamped]";
 /// actually wanted; an uncapped hint would spend the whole budget on itself.
 pub const MAX_RECOVERY_HINT_UTF16: usize = 200;
 
+/// Cap on the structured `fix` a block folds into its stderr as a `Fix:` line,
+/// in UTF-16 code units. A quarter of the budget: enough for any real fix, and
+/// small enough that the line still fits once the prose and the footer have
+/// taken their share. Without it an oversized fix saturates the body's budget
+/// to zero and the whole-string backstop drops the `Fix:` line outright — a
+/// truncated fix is worth more to the reader than none.
+pub const MAX_BLOCK_FIX_UTF16: usize = HOOK_OUTPUT_BUDGET_UTF16 / 4;
+
 /// Length of `s` in UTF-16 code units — the unit the platform measures hook
 /// output in. See [`HOOK_OUTPUT_BUDGET_UTF16`].
 #[must_use]
@@ -125,7 +133,7 @@ pub fn utf16_len(s: &str) -> usize {
 /// The first `max` UTF-16 code units of `s`, cut at a **char** boundary so a
 /// multi-byte character is never split (and a surrogate pair is never halved:
 /// a char costing 2 units is dropped whole rather than truncated to one).
-fn take_utf16(s: &str, max: usize) -> String {
+pub(crate) fn take_utf16(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for c in s.chars() {
