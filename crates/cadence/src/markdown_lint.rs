@@ -3,6 +3,7 @@
 //! Shells out to `markdownlint` CLI if available. Skips silently when
 //! the tool is not installed, so this hook degrades gracefully.
 
+use cadence_hooks_core::display::{HOOK_OUTPUT_BUDGET_UTF16, clamp_hook_output};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
 use std::process::Command;
@@ -75,10 +76,19 @@ impl Check for MarkdownLint {
         let lint_output = String::from_utf8_lossy(&output.stdout);
         let filename = path.rsplit('/').next().unwrap_or(&path);
 
-        CheckResult::nudge(format!(
+        // markdownlint prints one line per violation with no cap of its own, so
+        // a 2,000-line document can push this nudge past Claude Code's hook
+        // limit on its own. The shared clamp keeps the head (the first
+        // findings) and the tail (the Fix line), and this is the one emitter
+        // with a real recovery command to name in the marker.
+        let message = format!(
             "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\
              Fix: markdownlint --fix {path}"
-        ))
+        );
+        let hint = format!("Run `markdownlint {path}` for the full list.");
+        CheckResult::nudge(
+            clamp_hook_output(&message, HOOK_OUTPUT_BUDGET_UTF16, Some(&hint)).into_owned(),
+        )
     }
 }
 

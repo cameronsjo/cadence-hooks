@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Every hook message is now held under Claude Code's 10,000-character output cap by the renderer itself** (cameronsjo/cadence-ecosystem — hook output budget plan, Task 1). `display::clamp_hook_output` takes a message, a budget in **UTF-16 code units** (the unit the platform measures in, because it is JavaScript — an emoji costs 2 there and 1 to Rust's `chars()`), and an optional recovery hint. Under budget it returns the input untouched and borrowed. Over budget it keeps whole lines from the head and the tail with one `[hook-output-clamped]` marker line between them naming how many lines went; a line longer than the whole budget is cut at a char boundary rather than dropped. `render_output` applies it per outcome at `HOOK_OUTPUT_BUDGET_UTF16` (9,000), so a single emitter can no longer spill a hook's output to a `tool-results/` file the model is never asked to read. On a hard block the measured field is the whole stderr string, so the `Fix:` line and the feedback footer are appended *after* the clamp and their length comes off the body's budget first — the one line a block exists to deliver cannot be the line that gets cut. The clamp changes message text only: never a guard's decision, never its exit code, and every existing `sanitize_field` call is untouched.
+- **`markdown-lint` names a recovery command when its output is clamped.** `markdownlint` prints one line per violation with no cap of its own, so a long document could push this nudge past the platform limit on its own; the marker line now carries ``Run `markdownlint <path>` for the full list.``
+
 ### Fixed
 
 - **`guardrails guard-rm`'s git-root probe no longer softens a deletion verdict on a stat error** (cameronsjo/cadence-hooks#933). `is_git_root_on_disk` used `Path::exists()`, which collapses every error to `false`, so an unreadable repo root (`EACCES`, a vanished parent, a dead mount) read as "not a repo" and the verdict dropped from BLOCK to the plain-directory path. That is the direction the sibling `is_symlink_on_disk` already documents, and for the same reason: a stat failure in either probe can only grant a softening, never withhold one, so it is the one place the guard's usual fail-open posture (ADR-0001) does not apply.
