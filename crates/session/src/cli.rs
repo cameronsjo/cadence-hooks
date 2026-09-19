@@ -295,7 +295,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = plans_text(tmp.path());
         assert!(out.starts_with("no in-flight plans under "), "{out}");
-        assert!(out.contains("docs/plans"), "{out}");
+        // Built with `join`, not a literal: the separator is `\` on Windows.
+        let scanned = std::path::Path::new("docs").join("plans");
+        assert!(out.contains(&scanned.display().to_string()), "{out}");
     }
 
     #[test]
