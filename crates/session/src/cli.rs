@@ -1,16 +1,24 @@
-//! CLI actions: `session declare` and `session status`.
+//! CLI actions: `session declare`, `session status`, and `session plans`.
 //!
 //! These are user/skill-facing commands, not hooks — they read no stdin
 //! payload and are exempt from hooks.json wiring (like
 //! `guardrails dismiss-main-branch-warn`). A coordination convenience must not
-//! fail a script that calls it, so both succeed on every answer they can give
-//! — including "no sessions registered", which is a real answer.
+//! fail a script that calls it, so each succeeds on every answer it can give —
+//! including "no sessions registered" and "no plans in flight", which are real
+//! answers.
 //!
-//! The one exception is `session status` outside a git repository: there is no
-//! registry to read, so the question could not be asked at all. That exits 1
-//! with the message on stderr, because a parser needs to tell it apart from an
-//! empty registry. `session declare` keeps its exit-0 contract — it is a
-//! fire-and-forget write whose failure a caller has nothing to do about.
+//! Exit codes, one per command:
+//!
+//! - `session declare` — always **0**. A fire-and-forget write whose failure a
+//!   caller has nothing to do about; it reports the problem on stdout.
+//! - `session status` — **0** for any answer it can give, **1** outside a git
+//!   repository, with the message on stderr. There is no registry to read
+//!   there, so the question could not be asked at all, and a parser needs to
+//!   tell that apart from an empty registry.
+//! - `session plans` — **0** for any answer it can give, **2** outside a git
+//!   repository, with the scanned root on stderr. Same distinction as
+//!   `status`, a different code, so a caller running both can tell which one
+//!   could not answer.
 
 use crate::identity;
 use crate::registry;
@@ -219,9 +227,87 @@ pub fn run_status() -> u8 {
     0
 }
 
+/// Pure: the stdout text `session plans` prints for an already-resolved repo
+/// root. The empty answer names the directory it scanned — without that,
+/// "nothing in flight" is indistinguishable from "you are in the wrong repo".
+fn plans_text(repo_root: &std::path::Path) -> String {
+    crate::plan_scan::render_plans_report(repo_root).unwrap_or_else(|| {
+        format!(
+            "no in-flight plans under {}",
+            repo_root.join("docs").join("plans").display()
+        )
+    })
+}
+
+/// `session plans` — the tier-2 view of the SessionStart plan pointer: every
+/// in-flight and blocked plan in this repo, with its next step, branch, and PR.
+/// Returns the process exit code.
+///
+/// Read-only, and a plain print rather than a dispatched check: it reads no
+/// stdin payload, writes no metrics, and has no outcome for the hook contract
+/// to carry. Zero plans is a real answer and exits 0. Exit **2** when the scan
+/// could not be run at all (no git repository here), with the scanned root on
+/// stderr — a parser needs to tell an empty list from a question never asked.
+pub fn run_plans() -> u8 {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let Some(root) = registry::repo_root(&cwd) else {
+        eprintln!("session plans: not inside a git repository. Scanned root: {cwd}");
+        return 2;
+    };
+    println!("{}", plans_text(&root));
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- session plans: the tier-2 view of the SessionStart plan pointer ---
+
+    fn write_plan(root: &std::path::Path, name: &str, body: &str) {
+        let dir = root.join("docs").join("plans");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn plans_text_lists_each_plan() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_plan(
+            tmp.path(),
+            "2026-09-19-a.md",
+            "---\nstatus: in-flight\nnext: \"ship it\"\nbranch: feat/x\npr: 12\n---\n\nbody\n",
+        );
+        let out = plans_text(tmp.path());
+        assert!(out.starts_with("1 in-flight plan in docs/plans/:"), "{out}");
+        assert!(out.contains("2026-09-19-a"), "{out}");
+        assert!(out.contains("next: \"ship it\""), "{out}");
+        assert!(out.contains("branch: feat/x"), "{out}");
+        assert!(out.contains("pr: 12"), "{out}");
+    }
+
+    #[test]
+    fn plans_text_names_the_scanned_root_when_nothing_is_in_flight() {
+        // The empty answer is a real answer, and it has to say *where* it
+        // looked — otherwise "no plans" is indistinguishable from "wrong repo".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = plans_text(tmp.path());
+        assert!(out.starts_with("no in-flight plans under "), "{out}");
+        assert!(out.contains("docs/plans"), "{out}");
+    }
+
+    #[test]
+    fn plans_text_skips_finished_plans() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_plan(
+            tmp.path(),
+            "2026-09-01-done.md",
+            "---\nstatus: done\n---\n\nbody\n",
+        );
+        assert!(plans_text(tmp.path()).starts_with("no in-flight plans under "));
+    }
 
     #[test]
     fn resolve_session_id_prefers_flag() {
