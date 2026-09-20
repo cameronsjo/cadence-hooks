@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`warn-unreviewed-ready-flip` pins the review marker's `head=` field to exactly 40 hex characters, matching its other consumer.** The regex accepted any hex length while `poll-prs.sh`'s `CADENCE_MARKER_RE` in cameronsjo/cadence pinned `{40}`, so the two parsers of the same marker accepted different sets of strings with nothing checking the gap; `cadence-forge:review-loop` § What "reviewed" means documents the 40-char form, so the guard was the side that disagreed with the contract it cites. No verdict changes: `is_reviewed` compares the captured SHA to the PR's full head for equality, so a truncated SHA never cleared the gate — the cap closes the shape drift before it stops being harmless. The module doc's `head=<sha>` spelling is corrected to `head=<40-char SHA>`, the same omission cameronsjo/cadence#1270 fixed in `poll-prs.sh`'s header. New `marker_head_is_pinned_to_forty_hex` pins both directions (40 matches; 39, 41, and a 7-char abbreviation do not). (cameronsjo/cadence-hooks#879)
+
 ## [0.101.0] - 2026-09-19
 
 ### Added

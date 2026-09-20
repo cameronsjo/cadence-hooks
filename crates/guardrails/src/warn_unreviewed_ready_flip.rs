@@ -4,7 +4,7 @@
 //! CodeRabbit's retirement (cameronsjo/cadence#1037) replaced the bot review
 //! with a convention: a dispatched reviewer's findings are posted on the PR
 //! as a COMMENT review whose body's first line is a machine-readable marker
-//! —`<!-- cadence-review: <reviewer> head=<sha> crit=<n> imp=<n> -->` — and
+//! —`<!-- cadence-review: <reviewer> head=<40-char SHA> crit=<n> imp=<n> -->` — and
 //! "reviewed" means that marker reads `crit=0 imp=0` on the current head, or
 //! a non-author human review is APPROVED on it
 //! (`cadence-forge:review-loop` § What "reviewed" means). This is the
@@ -26,8 +26,19 @@ use std::sync::LazyLock;
 /// The cadence-review marker: first line of a COMMENT review body.
 /// `crit` and `imp` must both be `0` and `head` must equal the PR's current
 /// head SHA for the marker to count as "reviewed".
+///
+/// `head` is pinned to exactly 40 hex characters, the same length the other
+/// consumer of this marker pins — `poll-prs.sh`'s `CADENCE_MARKER_RE` in
+/// cameronsjo/cadence — and the length
+/// `cadence-forge:review-loop` § What "reviewed" means documents ("the full
+/// 40-char SHA. Anything shorter never matches"). The cap changes no verdict
+/// on its own, because [`is_reviewed`] compares the captured SHA to the PR's
+/// full head for equality, so a short SHA never cleared the gate anyway. It
+/// exists so the two consumers accept the same set of strings: a shape
+/// contract that only one side enforces drifts again, and the next drift may
+/// not be harmless (cameronsjo/cadence-hooks#879).
 static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<!--\s*cadence-review:\s*(?P<reviewer>\S+)\s+head=(?P<head>[0-9a-fA-F]+)\s+crit=(?P<crit>\d+)\s+imp=(?P<imp>\d+)\s*-->")
+    Regex::new(r"^<!--\s*cadence-review:\s*(?P<reviewer>\S+)\s+head=(?P<head>[0-9a-fA-F]{40})\s+crit=(?P<crit>\d+)\s+imp=(?P<imp>\d+)\s*-->")
         .expect("pattern should compile")
 });
 
@@ -349,12 +360,74 @@ mod tests {
 
     #[test]
     fn marker_regex_extracts_fields() {
-        let body =
-            "<!-- cadence-review: cadence:code-reviewer head=abc123 crit=0 imp=0 -->\n\nfindings";
+        let body = "<!-- cadence-review: cadence:code-reviewer head=abc123abc123abc123abc123abc123abc123abc1 crit=0 imp=0 -->\n\nfindings";
         let c = MARKER_RE.captures(body).unwrap();
-        assert_eq!(&c["head"], "abc123");
+        assert_eq!(&c["head"], "abc123abc123abc123abc123abc123abc123abc1");
         assert_eq!(&c["crit"], "0");
         assert_eq!(&c["imp"], "0");
+    }
+
+    /// The marker's `head=` field is exactly 40 hex characters — the length
+    /// `cadence-forge:review-loop` § What "reviewed" means documents and the
+    /// length `poll-prs.sh`'s `CADENCE_MARKER_RE` pins. This regex accepted
+    /// any hex length, so the two consumers accepted different sets of
+    /// strings with nothing checking the gap (cadence-hooks#879).
+    ///
+    /// Both directions in one test: the documented 40-char marker matches,
+    /// and each off-by-one neighbour (39 and 41) does not.
+    #[test]
+    fn marker_head_is_pinned_to_forty_hex() {
+        let forty = "a".repeat(40);
+        let thirty_nine = "a".repeat(39);
+        let forty_one = "a".repeat(41);
+
+        let marker = |sha: &str| {
+            format!("<!-- cadence-review: code-reviewer head={sha} crit=0 imp=0 -->\n\nfindings")
+        };
+
+        assert!(
+            MARKER_RE.captures(&marker(&forty)).is_some(),
+            "the documented 40-char marker must match"
+        );
+        assert!(
+            MARKER_RE.captures(&marker(&thirty_nine)).is_none(),
+            "a 39-char SHA is not the documented marker"
+        );
+        assert!(
+            MARKER_RE.captures(&marker(&forty_one)).is_none(),
+            "a 41-char SHA is not the documented marker"
+        );
+        // The abbreviated SHA a human would paste from `git log --oneline`.
+        assert!(
+            MARKER_RE.captures(&marker("abc1234")).is_none(),
+            "a short SHA is not the documented marker"
+        );
+    }
+
+    /// The exact fixture `marker-shape.test.sh` in cameronsjo/cadence calls
+    /// the "documented divergence": a truncated SHA that its bash regex
+    /// rejects and its pinned copy of *this* regex accepted. After #879 both
+    /// sides reject it, so the divergence is closed rather than documented.
+    ///
+    /// This is the end-to-end verdict, not the regression test for #879 —
+    /// staging the break (putting `+` back in `MARKER_RE`) leaves it green,
+    /// because [`is_reviewed`]'s full-SHA equality already rejected a short
+    /// SHA one step later. `marker_head_is_pinned_to_forty_hex` is the test
+    /// that goes red for that break. Both are worth keeping: this one holds
+    /// the verdict if the equality check is ever refactored away.
+    #[test]
+    fn truncated_sha_marker_does_not_clear_the_gate() {
+        let gh = FakeGh::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "cameronsjo",
+            serde_json::json!([{
+                "user": {"login": "cameronsjo"},
+                "state": "COMMENTED",
+                "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "body": "<!-- cadence-review: code-reviewer head=aaaaaaaa crit=0 imp=0 -->\nfindings"
+            }]),
+        );
+        assert!(evaluate("owner/repo", "gh pr merge 5", &gh).is_some());
     }
 
     // --- evaluate: fake GhRunner ---
@@ -403,13 +476,13 @@ mod tests {
     #[test]
     fn marker_on_head_is_silent() {
         let gh = FakeGh::new(
-            "abc1234abc",
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
             "cameronsjo",
             serde_json::json!([{
                 "user": {"login": "cameronsjo"},
                 "state": "COMMENTED",
-                "commit_id": "abc1234abc",
-                "body": "<!-- cadence-review: cadence:code-reviewer head=abc1234abc crit=0 imp=0 -->\nfindings"
+                "commit_id": "abc1234abcabc1234abcabc1234abcabc1234abc",
+                "body": "<!-- cadence-review: cadence:code-reviewer head=abc1234abcabc1234abcabc1234abcabc1234abc crit=0 imp=0 -->\nfindings"
             }]),
         );
         assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
@@ -418,12 +491,12 @@ mod tests {
     #[test]
     fn human_approval_on_head_is_silent() {
         let gh = FakeGh::new(
-            "abc1234abc",
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
             "cameronsjo",
             serde_json::json!([{
                 "user": {"login": "someoneelse"},
                 "state": "APPROVED",
-                "commit_id": "abc1234abc",
+                "commit_id": "abc1234abcabc1234abcabc1234abcabc1234abc",
                 "body": ""
             }]),
         );
@@ -433,13 +506,13 @@ mod tests {
     #[test]
     fn marker_on_stale_head_nudges() {
         let gh = FakeGh::new(
-            "fed9999fed",
+            "fed9999fedfed9999fedfed9999fedfed9999fed",
             "cameronsjo",
             serde_json::json!([{
                 "user": {"login": "cameronsjo"},
                 "state": "COMMENTED",
-                "commit_id": "111aaa111a",
-                "body": "<!-- cadence-review: cadence:code-reviewer head=111aaa111a crit=0 imp=0 -->\nfindings"
+                "commit_id": "111aaa111a111aaa111a111aaa111a111aaa111a",
+                "body": "<!-- cadence-review: cadence:code-reviewer head=111aaa111a111aaa111a111aaa111a111aaa111a crit=0 imp=0 -->\nfindings"
             }]),
         );
         assert!(evaluate("owner/repo", "gh pr merge 5", &gh).is_some());
@@ -448,13 +521,13 @@ mod tests {
     #[test]
     fn marker_with_crit_nudges() {
         let gh = FakeGh::new(
-            "abc1234abc",
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
             "cameronsjo",
             serde_json::json!([{
                 "user": {"login": "cameronsjo"},
                 "state": "COMMENTED",
-                "commit_id": "abc1234abc",
-                "body": "<!-- cadence-review: cadence:code-reviewer head=abc1234abc crit=1 imp=0 -->\nfindings"
+                "commit_id": "abc1234abcabc1234abcabc1234abcabc1234abc",
+                "body": "<!-- cadence-review: cadence:code-reviewer head=abc1234abcabc1234abcabc1234abcabc1234abc crit=1 imp=0 -->\nfindings"
             }]),
         );
         assert!(evaluate("owner/repo", "gh pr merge 5", &gh).is_some());
@@ -462,19 +535,23 @@ mod tests {
 
     #[test]
     fn no_reviews_nudges() {
-        let gh = FakeGh::new("abc1234abc", "cameronsjo", serde_json::json!([]));
+        let gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
         assert!(evaluate("owner/repo", "gh pr merge 5", &gh).is_some());
     }
 
     #[test]
     fn author_self_approval_nudges() {
         let gh = FakeGh::new(
-            "abc1234abc",
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
             "cameronsjo",
             serde_json::json!([{
                 "user": {"login": "cameronsjo"},
                 "state": "APPROVED",
-                "commit_id": "abc1234abc",
+                "commit_id": "abc1234abcabc1234abcabc1234abcabc1234abc",
                 "body": ""
             }]),
         );
@@ -488,14 +565,22 @@ mod tests {
 
     #[test]
     fn malformed_reviews_json_is_silent() {
-        let mut gh = FakeGh::new("abc1234abc", "cameronsjo", serde_json::json!([]));
+        let mut gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
         gh.reviews_json = Some("not json".to_string());
         assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
     }
 
     #[test]
     fn unresolvable_pr_number_is_silent() {
-        let gh = FakeGh::new("abc1234abc", "cameronsjo", serde_json::json!([]));
+        let gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
         // No number in the command, and the bare `gh pr view --json number`
         // lookup returns None (FakeGh's default) — unresolvable.
         assert_eq!(evaluate("owner/repo", "gh pr merge --auto", &gh), None);
