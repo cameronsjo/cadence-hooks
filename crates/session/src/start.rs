@@ -868,8 +868,14 @@ mod tests {
             msg.contains("1 in-flight plan in docs/plans/"),
             "plan disclosure header present: {msg}"
         );
-        assert!(msg.contains("2026-07-25-x"), "slug named: {msg}");
-        assert!(msg.contains("ship it"), "next: text named: {msg}");
+        assert!(
+            msg.contains("Run `cadence-hooks session plans`"),
+            "tier-1 line names its tier-2 command: {msg}"
+        );
+        assert!(
+            !msg.contains("ship it"),
+            "the plan's next: step is tier-2 detail, not session-start context: {msg}"
+        );
         // The plan file above is untracked — the uncommitted-plan guard line
         // rides the same disclosure (living-plan-guards Task 3 guard 1).
         assert!(

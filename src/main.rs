@@ -52,7 +52,7 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
         (
             Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
-        ) | (Some("session"), Some("declare" | "status"))
+        ) | (Some("session"), Some("declare" | "status" | "plans"))
             // `metrics grade` is a CLI action, not a hook. Bypassed it would
             // exit 0 having printed nothing, and an operator piping it to `jq`
             // reads the absent output as "no cold restarts" rather than "the
@@ -535,6 +535,8 @@ enum SessionCommands {
     },
     /// List live and stale sessions registered in this repo
     Status,
+    /// List this repo's in-flight and blocked plans — the detail behind the SessionStart pointer
+    Plans,
 }
 
 /// Returns the kebab-case hook name for the resolved subcommand.
@@ -646,10 +648,12 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
             SessionCommands::LintPlanShape => "lint-plan-shape",
-            // declare and status are CLI actions, not hooks — no hooks.json
-            // wiring and not subject to CADENCE_DISABLE (same treatment as
-            // dismiss-main-branch-warn).
-            SessionCommands::Declare { .. } | SessionCommands::Status => return None,
+            // declare, status, and plans are CLI actions, not hooks — no
+            // hooks.json wiring and not subject to CADENCE_DISABLE (same
+            // treatment as dismiss-main-branch-warn).
+            SessionCommands::Declare { .. } | SessionCommands::Status | SessionCommands::Plans => {
+                return None;
+            }
         }),
         Commands::Try { .. }
         | Commands::List
@@ -1559,6 +1563,9 @@ fn main() {
             SessionCommands::Status => {
                 process::exit(cadence_hooks_session::cli::run_status().into());
             }
+            SessionCommands::Plans => {
+                process::exit(cadence_hooks_session::cli::run_plans().into());
+            }
         },
     }
 }
@@ -1598,6 +1605,10 @@ mod tests {
         assert!(is_bypass_exempt(Some("configure"), None));
         assert!(is_bypass_exempt(Some("doctor"), None));
         assert!(is_bypass_exempt(Some("session"), Some("status")));
+        // `session plans` is the tier-2 view of the SessionStart plan pointer:
+        // a read-only CLI action, and a bypass that silently printed nothing
+        // would read as "no plans in flight" rather than "the command never ran".
+        assert!(is_bypass_exempt(Some("session"), Some("plans")));
         // The one enforcement-path hook in the set (cadence-hooks#927).
         assert!(is_bypass_exempt(
             Some("guardrails"),
@@ -1777,6 +1788,7 @@ mod tests {
             "dismiss-enforce-worktree",
             "declare",
             "status",
+            "plans",
             "record-polish",
             "redact-scan",
             "grade",

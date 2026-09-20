@@ -1337,10 +1337,11 @@ struct RenderedOutput {
 ///   telemetry while delivering nothing.
 ///
 /// Structured block hints ([`BlockMetadata::fix`]) therefore ride the stderr
-/// channel: the `fix` is appended as a `Fix:` line *only when the prose doesn't
-/// already carry one*, so the machine-intended hint reaches Claude via the only
-/// channel exit 2 surfaces — without duplicating a fix the block message already
-/// spells out.
+/// channel: the `fix` is appended as a `Fix:` line *only when the clamped prose
+/// doesn't already carry one*, so the machine-intended hint reaches Claude via
+/// the only channel exit 2 surfaces — without duplicating a fix the block
+/// message already spells out, and without dropping it when the clamp is what
+/// removed the prose one.
 ///
 /// `footer` is the resolved feedback footer ([`feedback_footer`]); passing it in
 /// keeps this pure without touching process-global env.
@@ -1356,12 +1357,24 @@ fn render_output(
     };
     let event_name = event.name();
     match outcome {
+        // One emitter (`cadence markdown-lint`) clamps its own message first,
+        // so it can name a recovery command in the marker line that
+        // `CheckResult` has no field to carry. That is safe only while the
+        // budget here is the same `HOOK_OUTPUT_BUDGET_UTF16` it uses: the
+        // second clamp is then a no-op and exactly one marker line ships.
+        // Change this budget and you must change that one.
         Outcome::Nudge => RenderedOutput {
             stdout: Some(
                 serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
-                        "additionalContext": msg,
+                        "additionalContext":
+                            display::clamp_hook_output(
+                                msg,
+                                display::HOOK_OUTPUT_BUDGET_UTF16,
+                                None,
+                            )
+                            .as_ref(),
                     }
                 })
                 .to_string(),
@@ -1379,7 +1392,13 @@ fn render_output(
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "permissionDecision": "ask",
-                        "permissionDecisionReason": msg,
+                        "permissionDecisionReason":
+                            display::clamp_hook_output(
+                                msg,
+                                display::HOOK_OUTPUT_BUDGET_UTF16,
+                                None,
+                            )
+                            .as_ref(),
                     }
                 })
                 .to_string(),
@@ -1391,15 +1410,56 @@ fn render_output(
             // JSON-only) folds into the prose here, on the channel exit 2
             // surfaces — but only when the message doesn't already carry a
             // `Fix:` line, to avoid a duplicate.
-            let mut body = msg.to_string();
-            if let Some(meta) = block_metadata {
-                let has_fix_line = msg.lines().any(|l| l.trim_start().starts_with("Fix:"));
-                if !meta.fix.is_empty() && !has_fix_line {
-                    body.push_str(&format!("\n   Fix: {}", meta.fix));
+            //
+            // The budget question is whole-string here: on exit 2 the measured
+            // field is the entire stderr text, so the Fix line and the footer
+            // come out of the same 9,000 units the prose does. Both are
+            // appended *after* the clamp and their length is taken off the
+            // body's budget first — a clamp applied to the assembled string
+            // would cut the one line the block exists to deliver.
+            //
+            // Whether the structured fix is appended is decided on the
+            // **clamped** body, not the raw message: a message carrying its own
+            // `Fix:` line mid-body would otherwise suppress the structured one
+            // while the clamp drops the prose one, and the block would ship
+            // with no fix at all. The suffix length is reserved either way, so
+            // the decision cannot change how much body fits.
+            //
+            // The fix itself is capped at `MAX_BLOCK_FIX_UTF16` as it is
+            // built. A fix larger than the whole budget would otherwise
+            // saturate `body_budget` to zero and leave the last-resort clamp
+            // to drop the `Fix:` line whole — a truncated fix beats none.
+            let fix_suffix = block_metadata
+                .filter(|meta| !meta.fix.is_empty())
+                .map(|meta| {
+                    format!(
+                        "\n   Fix: {}",
+                        display::take_utf16(&meta.fix, display::MAX_BLOCK_FIX_UTF16)
+                    )
+                });
+            let reserved = fix_suffix.as_deref().map_or(0, display::utf16_len)
+                + footer.map_or(0, display::utf16_len)
+                + 1; // the trailing newline added below
+            let body_budget = display::HOOK_OUTPUT_BUDGET_UTF16.saturating_sub(reserved);
+            let mut body = display::clamp_hook_output(msg, body_budget, None).into_owned();
+            if let Some(fix) = fix_suffix {
+                let has_fix_line = body.lines().any(|l| l.trim_start().starts_with("Fix:"));
+                if !has_fix_line {
+                    body.push_str(&fix);
                 }
             }
             let mut full = apply_feedback_footer(Outcome::Block, &body, footer);
             if !full.ends_with('\n') {
+                full.push('\n');
+            }
+            // Last resort: a `fix` or footer big enough on its own saturates
+            // `body_budget` to zero and the assembled string can still be over.
+            // Clamping the whole thing costs the shape but keeps the contract —
+            // and never touches the decision or the exit code.
+            if display::utf16_len(&full) > display::HOOK_OUTPUT_BUDGET_UTF16 {
+                full =
+                    display::clamp_hook_output(&full, display::HOOK_OUTPUT_BUDGET_UTF16 - 1, None)
+                        .into_owned();
                 full.push('\n');
             }
             RenderedOutput {
@@ -2023,6 +2083,273 @@ mod tests {
         };
         let v = serde_json::to_value(meta).expect("serializes");
         assert_eq!(v["allowed_owners"], serde_json::json!([]));
+    }
+
+    // --- render_output: the hook-output budget (the platform's 10,000-char cap) ---
+
+    /// A message far past the platform cap, in the shape a runaway emitter
+    /// produces: many plausible lines, not one long one.
+    fn oversized_message() -> String {
+        (0..2_000)
+            .map(|i| format!("line {i}: a plausible finding about some file"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn nudge_additional_context_stays_under_the_platform_cap() {
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some(&oversized_message()),
+            None,
+            HookEvent::SessionStart,
+            None,
+        );
+        let stdout = rendered.stdout.expect("nudge writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let field = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext is a string");
+        assert!(
+            display::utf16_len(field) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "additionalContext is {} UTF-16 units",
+            display::utf16_len(field)
+        );
+        assert!(
+            field.contains(display::CLAMP_MARKER_PREFIX),
+            "marker present"
+        );
+    }
+
+    #[test]
+    fn ask_permission_reason_stays_under_the_platform_cap() {
+        let rendered = render_output(
+            Outcome::Ask,
+            Some(&oversized_message()),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        let stdout = rendered.stdout.expect("ask writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let field = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("reason is a string");
+        assert!(
+            display::utf16_len(field) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "reason is {} UTF-16 units",
+            display::utf16_len(field)
+        );
+    }
+
+    #[test]
+    fn block_stderr_stays_under_the_cap_with_the_fix_line_and_footer_intact() {
+        // The whole stderr string is the measured field on exit 2, so the Fix
+        // line and the feedback footer come out of the same budget — and both
+        // must still survive the clamp.
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&oversized_message()),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert!(
+            stderr.contains("Fix: -R owner/repo"),
+            "the Fix line survives the clamp"
+        );
+        assert!(stderr.contains("/cadence:feedback"), "the footer survives");
+        assert!(
+            stderr.contains(display::CLAMP_MARKER_PREFIX),
+            "marker present"
+        );
+    }
+
+    /// Every line of `s` that reads as a `Fix:` line to the same test the
+    /// renderer applies.
+    fn fix_lines(s: &str) -> Vec<&str> {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with("Fix:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_prose_fix_line_the_clamp_keeps_is_not_duplicated_by_the_structured_one() {
+        // The prose carries its own Fix: line at line 5 of 2,000 — well inside
+        // the head the clamp keeps, so the prose line survives and the
+        // structured fix must NOT be appended on top of it.
+        let mut lines: Vec<String> = (0..2_000)
+            .map(|i| format!("line {i}: a plausible finding about some file"))
+            .collect();
+        lines[4] = "   Fix: run the prose-suggested command".to_string();
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&lines.join("\n")),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "exactly one Fix: line ships: {:?}",
+            fix_lines(&stderr)
+        );
+    }
+
+    #[test]
+    fn a_fix_line_the_clamp_cuts_away_is_restored_from_the_metadata() {
+        // The prose's own Fix: line sits deep in the middle, where the clamp
+        // drops it. Deciding on the UNCLAMPED message would suppress the
+        // structured fix too and ship a block with no Fix: line at all.
+        let mut lines: Vec<String> = (0..2_000)
+            .map(|i| format!("line {i}: a plausible finding about some file"))
+            .collect();
+        lines[900] = "   Fix: run the prose-suggested command".to_string();
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&lines.join("\n")),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "exactly one Fix: line ships: {:?}",
+            fix_lines(&stderr)
+        );
+        assert!(
+            stderr.contains("Fix: -R owner/repo"),
+            "the structured fix is what survives: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_fix_longer_than_the_whole_budget_cannot_push_stderr_past_the_cap() {
+        // Fix line plus footer alone reach the budget: the body's budget
+        // saturates to zero and the assembled string must still be clamped.
+        // A truncated fix beats none, so the fix is capped when the suffix is
+        // built and a `Fix:` line still ships alongside the footer.
+        let meta = BlockMetadata {
+            rule_id: "x".to_string(),
+            fix: "f".repeat(9_500),
+            allowed_owners: vec![],
+            severity: "error",
+        };
+        let rendered = render_output(
+            Outcome::Block,
+            Some(&oversized_message()),
+            Some(&meta),
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        assert!(rendered.stdout.is_none(), "a block still writes no stdout");
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            display::utf16_len(&stderr) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "stderr is {} UTF-16 units",
+            display::utf16_len(&stderr)
+        );
+        assert_eq!(
+            fix_lines(&stderr).len(),
+            1,
+            "a truncated Fix: line still ships: {stderr}"
+        );
+        assert!(
+            stderr.contains("/cadence:feedback"),
+            "the footer survives: {stderr}"
+        );
+    }
+
+    #[test]
+    fn an_emitter_that_pre_clamps_with_a_hint_is_not_clamped_twice() {
+        // markdown-lint clamps its own message so it can name a recovery
+        // command in the marker; render_output's Nudge clamp then has to be a
+        // no-op. One marker, and the hint still there.
+        let hint = "Run `markdownlint x.md` for the full list.";
+        let pre = display::clamp_hook_output(
+            &oversized_message(),
+            display::HOOK_OUTPUT_BUDGET_UTF16,
+            Some(hint),
+        )
+        .into_owned();
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some(&pre),
+            None,
+            HookEvent::PostToolUse,
+            None,
+        );
+        let stdout = rendered.stdout.expect("nudge writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let field = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("string");
+        assert_eq!(
+            field.matches(display::CLAMP_MARKER_PREFIX).count(),
+            1,
+            "exactly one marker: {field}"
+        );
+        assert!(field.contains(hint), "the recovery hint survives");
+    }
+
+    #[test]
+    fn an_under_budget_message_is_unchanged_by_the_clamp() {
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some("a short nudge"),
+            None,
+            HookEvent::SessionStart,
+            None,
+        );
+        let stdout = rendered.stdout.expect("nudge writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"],
+            serde_json::json!("a short nudge")
+        );
+    }
+
+    #[test]
+    fn an_emoji_heavy_message_is_measured_in_utf16_units() {
+        // 8,000 astral chars are 8,000 Rust chars but 16,000 UTF-16 units — a
+        // char-counted budget would pass this straight through.
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some(&"🚀".repeat(8_000)),
+            None,
+            HookEvent::SessionStart,
+            None,
+        );
+        let stdout = rendered.stdout.expect("nudge writes stdout");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let field = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("string");
+        assert!(
+            display::utf16_len(field) <= display::HOOK_OUTPUT_BUDGET_UTF16,
+            "{} UTF-16 units",
+            display::utf16_len(field)
+        );
     }
 
     // --- render_output: exit-code × output-shape matrix (#165) ---
