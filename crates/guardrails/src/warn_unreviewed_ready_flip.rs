@@ -59,10 +59,23 @@ use std::sync::LazyLock;
 /// with two parsers needs the parsers to accept the same strings; a gap only
 /// one side enforces drifts again, and the next gap may not be harmless.
 ///
-/// One deliberate difference remains, and it is leniency in the safe
-/// direction: the caller matches against `body.trim_start()`, so invisible
-/// leading whitespace before the marker is tolerated here and rejected there.
-/// A marker that parses on the bash side always parses here.
+/// The pattern alone is not the contract. [`is_reviewed`] matches it against
+/// the body's **first line, untrimmed** — the same string `poll-prs.sh` gets
+/// from `split("\n")[0]` — and both halves of that close a divergence the
+/// pattern could not:
+///
+/// - It used to match `body.trim_start()`, so a marker behind a blank line or
+///   an indent cleared here and not there.
+/// - It used to match the whole body. A negated character class in this crate
+///   matches `\n` (only `.` excludes it), so `[^ ]+` on the reviewer field
+///   swallowed a newline and a marker spanning two lines parsed here while
+///   jq, handed one line, rejected it.
+///
+/// Both ran the same direction as the separators above: silence on a marker
+/// the review loop's own poller never accepts. Leniency on a *positive*
+/// signal is the under-nudging failure mode for a guard whose job is catching
+/// an unreviewed flip, and the contract's own rule is that the marker is the
+/// first line.
 static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^<!-- cadence-review: (?P<reviewer>[^ ]+) head=(?P<head>[0-9a-fA-F]{40}) crit=(?P<crit>[0-9]+) imp=(?P<imp>[0-9]+) -->",
@@ -208,8 +221,23 @@ fn is_reviewed(reviews: &[ParsedReview], head: &str, author: &str) -> bool {
         // is posted by the orchestrator's own token on the author's behalf,
         // never the PR author's, so it carries no author check.
         let formal_approved = r.login != author && r.state == "APPROVED" && r.commit_id == head;
+        // The first line, taken as received, and nothing else — the same
+        // string `poll-prs.sh` matches against (`split("\n")[0]`, untrimmed).
+        // Both halves are load-bearing, and neither is obvious:
+        //
+        // - No trim. A marker behind a blank line or an indent is not the
+        //   first line, and the bash side rejects it.
+        // - One line only. Matching the whole body is not equivalent even
+        //   with an identical pattern, because a negated character class in
+        //   this crate matches `\n` (only `.` excludes it). So `[^ ]+` on the
+        //   reviewer field would swallow a newline and let a marker spanning
+        //   two lines parse here while jq — handed one line — rejects it.
+        //
+        // Regex-text parity is not consumer parity: what the caller slices
+        // bounds the accepted language as much as the pattern does.
+        let first_line = r.body.split('\n').next().unwrap_or_default();
         let marker_clean = MARKER_RE
-            .captures(r.body.trim_start())
+            .captures(first_line)
             .is_some_and(|c| &c["head"] == head && &c["crit"] == "0" && &c["imp"] == "0");
         formal_approved || marker_clean
     })
@@ -491,6 +519,85 @@ mod tests {
             MARKER_RE.captures(&tabbed).is_some(),
             "a tab inside the reviewer token parses on both sides"
         );
+    }
+
+    /// A marker spanning two lines does not clear the gate. `[^ ]+` matches
+    /// `\n` in this crate, so while `MARKER_RE` alone accepts this string,
+    /// [`is_reviewed`] hands it only the first line — the same string
+    /// `poll-prs.sh` matches. Without that slice the guard went silent on a
+    /// marker jq rejects, which is the whole defect class this change is
+    /// about (cadence-hooks#879).
+    #[test]
+    fn a_marker_spanning_two_lines_does_not_clear_the_gate() {
+        let sha = "abc1234abcabc1234abcabc1234abcabc1234abc";
+        let body =
+            format!("<!-- cadence-review: rev\nSURPRISE head={sha} crit=0 imp=0 -->\nfindings");
+
+        // The pattern on its own accepts it — the newline lands inside the
+        // reviewer capture. This assertion is why the slice exists.
+        assert!(
+            MARKER_RE.captures(&body).is_some(),
+            "precondition: the pattern alone matches across the newline"
+        );
+
+        let gh = FakeGh::new(
+            sha,
+            "cameronsjo",
+            serde_json::json!([{
+                "user": {"login": "cameronsjo"},
+                "state": "COMMENTED",
+                "commit_id": sha,
+                "body": body
+            }]),
+        );
+        assert!(
+            evaluate("owner/repo", "gh pr merge 5", &gh).is_some(),
+            "a marker whose reviewer field swallows a newline is not a marker"
+        );
+    }
+
+    /// A marker that is not the body's first line does not clear the gate.
+    /// `is_reviewed` used to match `body.trim_start()`, which let a body
+    /// beginning with a blank line or an indent clear here while
+    /// `poll-prs.sh`'s untrimmed `split("\n")[0]` rejected it — leniency on
+    /// the positive signal, so an under-nudge (cadence-hooks#879).
+    #[test]
+    fn a_marker_behind_leading_whitespace_does_not_clear_the_gate() {
+        let sha = "abc1234abcabc1234abcabc1234abcabc1234abc";
+        let marker = format!("<!-- cadence-review: code-reviewer head={sha} crit=0 imp=0 -->");
+
+        for (label, body) in [
+            ("blank line first", format!("\n{marker}\nfindings")),
+            ("indented", format!("  {marker}\nfindings")),
+        ] {
+            let gh = FakeGh::new(
+                sha,
+                "cameronsjo",
+                serde_json::json!([{
+                    "user": {"login": "cameronsjo"},
+                    "state": "COMMENTED",
+                    "commit_id": sha,
+                    "body": body
+                }]),
+            );
+            assert!(
+                evaluate("owner/repo", "gh pr merge 5", &gh).is_some(),
+                "{label}: the marker is not the first line, so the gate is not clear"
+            );
+        }
+
+        // Positive control: the same marker as the first line stays silent.
+        let gh = FakeGh::new(
+            sha,
+            "cameronsjo",
+            serde_json::json!([{
+                "user": {"login": "cameronsjo"},
+                "state": "COMMENTED",
+                "commit_id": sha,
+                "body": format!("{marker}\nfindings")
+            }]),
+        );
+        assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
     }
 
     /// The exact fixture `marker-shape.test.sh` in cameronsjo/cadence calls
