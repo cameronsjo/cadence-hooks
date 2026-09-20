@@ -27,19 +27,47 @@ use std::sync::LazyLock;
 /// `crit` and `imp` must both be `0` and `head` must equal the PR's current
 /// head SHA for the marker to count as "reviewed".
 ///
-/// `head` is pinned to exactly 40 hex characters, the same length the other
-/// consumer of this marker pins — `poll-prs.sh`'s `CADENCE_MARKER_RE` in
-/// cameronsjo/cadence — and the length
-/// `cadence-forge:review-loop` § What "reviewed" means documents ("the full
-/// 40-char SHA. Anything shorter never matches"). The cap changes no verdict
-/// on its own, because [`is_reviewed`] compares the captured SHA to the PR's
-/// full head for equality, so a short SHA never cleared the gate anyway. It
-/// exists so the two consumers accept the same set of strings: a shape
-/// contract that only one side enforces drifts again, and the next drift may
-/// not be harmless (cameronsjo/cadence-hooks#879).
+/// This pattern is a **character-for-character translation** of the other
+/// consumer of the same marker — `poll-prs.sh`'s `CADENCE_MARKER_RE` in
+/// cameronsjo/cadence — with the bash ERE's positional groups given names:
+///
+/// ```text
+/// ^<!-- cadence-review: [^ ]+ head=([0-9a-fA-F]{40}) crit=([0-9]+) imp=([0-9]+) -->
+/// ```
+///
+/// Three things were looser here and are not any more
+/// (cameronsjo/cadence-hooks#879):
+///
+/// - `head=` took any hex length; the bash side and
+///   `cadence-forge:review-loop` § What "reviewed" means both say 40 ("the
+///   full 40-char SHA. Anything shorter never matches").
+/// - Every separator was `\s+` or `\s*`, so a tab, a double space, a newline
+///   mid-marker, or a missing space before `-->` parsed here and did not
+///   there. That direction is the dangerous one: this guard would read
+///   "reviewed" on a marker the review loop's own poller never accepts.
+/// - `\d` is Unicode-aware in this crate, so `crit=` accepted non-ASCII
+///   digits; the bash side takes `[0-9]+`.
+///
+/// `\S+` for the reviewer field becomes `[^ ]+` for the same reason, in the
+/// other direction: `\S` rejects a tab inside the reviewer token that the
+/// bash side accepts. That is the one divergence `marker-shape.test.sh`
+/// already conceded with "no fixture case"; it now has one, here.
+///
+/// None of this changes a verdict on a well-formed marker, and the `{40}` cap
+/// changes no verdict at all, because [`is_reviewed`] compares the captured
+/// SHA to the PR's full head for equality. The point is that one contract
+/// with two parsers needs the parsers to accept the same strings; a gap only
+/// one side enforces drifts again, and the next gap may not be harmless.
+///
+/// One deliberate difference remains, and it is leniency in the safe
+/// direction: the caller matches against `body.trim_start()`, so invisible
+/// leading whitespace before the marker is tolerated here and rejected there.
+/// A marker that parses on the bash side always parses here.
 static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^<!--\s*cadence-review:\s*(?P<reviewer>\S+)\s+head=(?P<head>[0-9a-fA-F]{40})\s+crit=(?P<crit>\d+)\s+imp=(?P<imp>\d+)\s*-->")
-        .expect("pattern should compile")
+    Regex::new(
+        r"^<!-- cadence-review: (?P<reviewer>[^ ]+) head=(?P<head>[0-9a-fA-F]{40}) crit=(?P<crit>[0-9]+) imp=(?P<imp>[0-9]+) -->",
+    )
+    .expect("pattern should compile")
 });
 
 /// Runs `gh` CLI commands, returning trimmed stdout on success or `None` on
@@ -236,7 +264,9 @@ pub fn evaluate(slug: &str, command: &str, gh: &dyn GhRunner) -> Option<String> 
          neither a non-author human APPROVED review nor a `cadence-review` marker with \
          `crit=0 imp=0` on this SHA. Post the dispatched reviewer's findings on the PR first \
          (`cadence-forge:review-loop` § What \"reviewed\" means). Advisory only.",
-        short_head = &head[..head.len().min(7)],
+        // `chars`, not a byte slice: `headRefOid` comes from `gh` and a
+        // non-hex value would panic a `&head[..7]` on a char boundary.
+        short_head = head.chars().take(7).collect::<String>(),
     ))
 }
 
@@ -401,6 +431,65 @@ mod tests {
         assert!(
             MARKER_RE.captures(&marker("abc1234")).is_none(),
             "a short SHA is not the documented marker"
+        );
+    }
+
+    /// Separators are literal single spaces, matching `poll-prs.sh`'s
+    /// `CADENCE_MARKER_RE`. Under the old `\s+`/`\s*` spelling each of these
+    /// parsed here and not there, so this guard would have read "reviewed" on
+    /// a marker the review loop's own poller never accepts
+    /// (cadence-hooks#879).
+    #[test]
+    fn marker_separators_are_literal_single_spaces() {
+        let sha = "a".repeat(40);
+        let canonical = format!("<!-- cadence-review: code-reviewer head={sha} crit=0 imp=0 -->");
+        assert!(
+            MARKER_RE.captures(&canonical).is_some(),
+            "the documented marker must match"
+        );
+
+        for (label, marker) in [
+            (
+                "no space after the opening comment",
+                format!("<!--cadence-review: code-reviewer head={sha} crit=0 imp=0 -->"),
+            ),
+            (
+                "double space between fields",
+                format!("<!-- cadence-review: code-reviewer  head={sha} crit=0 imp=0 -->"),
+            ),
+            (
+                "tab separator",
+                format!("<!-- cadence-review: code-reviewer\thead={sha} crit=0 imp=0 -->"),
+            ),
+            (
+                "newline mid-marker",
+                format!("<!-- cadence-review: code-reviewer head={sha}\ncrit=0 imp=0 -->"),
+            ),
+            (
+                "no space before the closing comment",
+                format!("<!-- cadence-review: code-reviewer head={sha} crit=0 imp=0-->"),
+            ),
+            (
+                "non-ASCII digit in crit",
+                format!("<!-- cadence-review: code-reviewer head={sha} crit=\u{0660} imp=0 -->"),
+            ),
+        ] {
+            assert!(
+                MARKER_RE.captures(&marker).is_none(),
+                "{label}: must not parse — the bash consumer rejects it"
+            );
+        }
+
+        // A tab *inside* the reviewer token has no case here on purpose:
+        // `[^ ]+` accepts it on both sides, so it is parity, not a rejection.
+        // The old `\S+` spelling rejected it — a divergence in the other
+        // direction, and the one `marker-shape.test.sh` conceded with "no
+        // fixture case". Asserting a rejection here failed, which is how the
+        // direction got settled rather than assumed.
+        let tabbed = format!("<!-- cadence-review: code\treviewer head={sha} crit=0 imp=0 -->");
+        assert!(
+            MARKER_RE.captures(&tabbed).is_some(),
+            "a tab inside the reviewer token parses on both sides"
         );
     }
 
