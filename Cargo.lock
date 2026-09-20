@@ -198,6 +198,7 @@ dependencies = [
  "cadence-hooks-session",
  "clap",
  "dialoguer",
+ "libc",
  "serde_json",
  "sha2",
  "tempfile",

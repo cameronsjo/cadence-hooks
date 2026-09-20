@@ -21,6 +21,10 @@ dialoguer = "0.11"
 jiff = "0.2"
 gethostname = "0.5"
 sha2 = "0.10"
+# Only for `signal(2)` — the SIGPIPE disposition has no std equivalent on
+# stable Rust. Already in the lock file as a transitive dependency, so this
+# adds no new code to the build.
+libc = "0.2"
 
 cadence-hooks-core = { path = "crates/core" }
 cadence-hooks-cadence = { path = "crates/cadence" }
@@ -61,3 +65,13 @@ cadence-hooks-metrics.workspace = true
 cadence-hooks-session.workspace = true
 sha2.workspace = true
 tempfile = "3"
+
+# `signal(2)` for the SIGPIPE disposition (see `src/sigpipe.rs`), and `pipe(2)`
+# plus `SIGPIPE` in `tests/broken_pipe.rs`. Unix-only: Windows has no SIGPIPE,
+# and `libc` does not define one there. Already in the lock file as a
+# transitive dependency, so this adds no new code to the build.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

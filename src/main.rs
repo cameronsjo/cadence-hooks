@@ -88,6 +88,7 @@ mod doctor;
 mod hook_latency;
 mod migrate;
 mod registry;
+mod sigpipe;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
 
@@ -769,6 +770,14 @@ fn print_hook_manifest(format: ManifestFormat) {
 }
 
 fn main() {
+    // Restore the default SIGPIPE disposition before anything can write to
+    // stdout. Rust leaves SIGPIPE ignored, which turns `cadence-hooks … | head`
+    // into a panic plus a false `"reason":"panic"` failopen row instead of a
+    // quiet exit. This must stay the first statement in `main`: the bypass
+    // notice and the panic hook below both write, and a fix installed after a
+    // write is a fix that missed one. See `sigpipe` for the trade-offs.
+    sigpipe::restore_default();
+
     // Pin the main thread before anything can spawn — the panic hook's guard
     // test below is only meaningful once this is set. The `Result` is
     // discarded because `main` runs once: an `Err` would mean the cell was
