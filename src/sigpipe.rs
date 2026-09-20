@@ -44,6 +44,15 @@
 //! `"reason":"panic"` failopen row. The fix removes the false ones and keeps
 //! the true ones.
 //!
+//! One consequence worth naming so nobody reads "silent death by `SIGPIPE`" as
+//! universally safe: a hard block reaches Claude Code as exit 2 through
+//! `dispatch::emit_and_exit`'s stdout write, and with stdout closed that exit
+//! becomes 141 instead — the enforcement decision is lost. This is not a
+//! regression (the write previously panicked to exit 1, equally non-blocking),
+//! and the ledger row is written before the emit either way, so the audit trail
+//! survives. But a future fail-*closed* path must not route its decision
+//! through a stdout write.
+//!
 //! # Windows
 //!
 //! Windows has no `SIGPIPE`. A write to a pipe whose reader has exited fails
@@ -55,18 +64,33 @@
 //! the panic hook or handling `BrokenPipe` at every write site. Tracked in
 //! cameronsjo/cadence-hooks#980 rather than guessed at here.
 
+/// Set `SIGPIPE`'s disposition, returning the previous one.
+///
+/// `signal(2)` rather than `sigaction(2)`: the differences between them
+/// (`SA_RESTART`, whether the handler resets after delivery) describe real
+/// handlers, and `SIG_DFL`/`SIG_IGN` have no such semantics. POSIX lists
+/// `signal()` as async-signal-safe.
+#[cfg(unix)]
+fn set(disposition: libc::sighandler_t) -> libc::sighandler_t {
+    // SAFETY: `signal(2)` is valid for `SIGPIPE` with either `SIG_DFL` or
+    // `SIG_IGN`, the only two values any caller here passes.
+    //
+    // The invariant is not "no threads exist" — `IgnoreGuard` below opens a
+    // window arbitrarily late in the process. It is that the disposition is
+    // process-wide, so a window is only safe while no *other* thread can write
+    // to a pipe or socket and so observe the changed disposition. The one
+    // production thread this binary spawns (`core::shell::run_bounded_with`'s
+    // stdout drain) only reads.
+    unsafe { libc::signal(libc::SIGPIPE, disposition) }
+}
+
 /// Restore `SIGPIPE` to its default disposition (`SIG_DFL`).
 ///
 /// Call once, first thing in `main`, before anything can write to stdout. A
 /// no-op off Unix, where there is no such signal.
 #[cfg(unix)]
 pub(crate) fn restore_default() {
-    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and valid for
-    // `SIGPIPE`. Called from `main` before any thread is spawned, so there is
-    // no concurrent reader of the disposition.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    set(libc::SIG_DFL);
 }
 
 #[cfg(not(unix))]
@@ -84,25 +108,27 @@ pub(crate) fn restore_default() {}
 /// `SIG_DFL` it would instead kill `try` itself, mid-diagnostic, with no
 /// output.
 ///
-/// Scope this around such a write and keep it as narrow as possible; `Drop`
-/// puts `SIG_DFL` back.
+/// Scope this around such a write and keep it as narrow as possible. `Drop`
+/// puts back whatever disposition was in force when the guard was created, not
+/// a hard-coded `SIG_DFL`, so nesting one guard inside another is correct and so
+/// is a future change to the ambient default.
 pub(crate) struct IgnoreGuard {
-    _private: (),
+    #[cfg(unix)]
+    previous: libc::sighandler_t,
 }
 
 impl IgnoreGuard {
     pub(crate) fn new() -> Self {
-        #[cfg(unix)]
-        // SAFETY: same contract as `restore_default`.
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        Self {
+            #[cfg(unix)]
+            previous: set(libc::SIG_IGN),
         }
-        Self { _private: () }
     }
 }
 
 impl Drop for IgnoreGuard {
     fn drop(&mut self) {
-        restore_default();
+        #[cfg(unix)]
+        set(self.previous);
     }
 }

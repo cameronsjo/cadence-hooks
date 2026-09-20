@@ -39,7 +39,8 @@ fn run_with_closed_stdout(args: &[&str]) -> (std::process::ExitStatus, String, S
     // SAFETY: `write_fd` is a fresh fd from `pipe(2)` that nothing else owns;
     // `Stdio` takes ownership and closes it.
     let child_stdout = unsafe { Stdio::from_raw_fd(write_fd) };
-    // SAFETY: same, for the read end — closed immediately by the drop below.
+    // SAFETY: same, for the read end — closed right here, before the spawn
+    // below, and never wrapped in an owning type.
     unsafe { libc::close(read_fd) };
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
@@ -120,10 +121,17 @@ fn closed_stdout_covers_other_writers_too() {
 ///
 /// A fix that simply stopped reporting panics would pass both tests above and
 /// be far worse than the bug. This arms the synthetic dispatch panic
-/// (`CADENCE_TEST_PANIC`, owned by `failopen_telemetry.rs`) **with stdout
-/// already closed** — the exact condition the fix changes — and requires the
-/// panic to be as loud as ever: the stderr notice, and a genuine
-/// `"reason":"panic"` row in the ledger.
+/// (`CADENCE_TEST_PANIC`, owned by `failopen_telemetry.rs`) with stdout wired to
+/// a closed pipe, and requires the panic to be as loud as ever: the stderr
+/// notice, and a genuine `"reason":"panic"` row in the ledger.
+///
+/// **This is a control, not a red-green pin.** It stays green under a revert of
+/// either half of the fix, because the panic fires in dispatch before anything
+/// writes to stdout, so the closed pipe is never touched. What it guards against
+/// is a *future* change that silences panic reporting to make the two tests
+/// above pass. It does not cover a stdout write and a panic interleaving; no
+/// reachable path in this binary panics after a partial stdout write, so there
+/// is nothing to arm.
 ///
 /// # What is not covered, and why
 ///
