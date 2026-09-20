@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **CLAUDE.md's platform-baseline upkeep step names the CI gate that now backs it, replacing the never-built follow-up note.** The step had read "A CI automation for this bump is a named follow-up, not yet built" for months while `cadence_hooks.current_version` went six releases stale (0.90 through 0.95) — a stale baseline fails open (ADR-0001), so the drift nudge and `doctor` both went quiet instead of erroring and every session in that window was told it was current. The cadence monorepo's `platform-baseline-drift` workflow now compares the recorded value against this repo's latest published release daily, files one deduplicated issue carrying the fix, and fails the run; it treats a too-high value as drift too, and exits non-zero on any input it could not read, so "could not compare" never reads as "in sync". The step names it as a **backstop, not a substitute** — bumping the baseline as part of the release is still the job, because the gate only notices the next day. No code changed. (cameronsjo/cadence#1369)
+
 ## [0.101.0] - 2026-09-19
 
 ### Added
