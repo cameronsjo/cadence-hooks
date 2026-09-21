@@ -118,6 +118,20 @@ pub fn run(
     if let Some(mut stdin) = child.stdin.take() {
         // Ignore write errors: a hook that exits before reading stdin (e.g.
         // bypassed) closes the pipe early, and that's not a try failure.
+        //
+        // `main` restores SIG_DFL for SIGPIPE so that `… | head` exits quietly
+        // instead of panicking. That is right for stdout and wrong here: this
+        // is a pipe `try` owns both ends of, and the early-exit case above is
+        // exactly the one SIG_DFL would turn into `try` being killed
+        // mid-diagnostic. Ignore SIGPIPE for the write only; the guard puts
+        // SIG_DFL back on drop, before any of the `println!`s below.
+        //
+        // It must also stay BELOW the `spawn` above: the child inherits the
+        // disposition in force at spawn time, so creating the guard any earlier
+        // would hand every hook `try` exercises an ignored SIGPIPE — the
+        // opposite of the production behavior `try` exists to demonstrate, and
+        // invisible in its output.
+        let _sigpipe = crate::sigpipe::IgnoreGuard::new();
         let _ = stdin.write_all(payload.as_bytes());
     }
 
