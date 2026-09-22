@@ -236,9 +236,9 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
 /// GitHub to auto-close them (sleeps injected via `clock`). The wait has two
 /// phases: after [`EARLY_CHECK_SECS`] the refs are checked (stopping at the
 /// first one not CLOSED), and if all read CLOSED the function returns `None`
-/// without sleeping further. Otherwise it
-/// sleeps the rest of `wait_secs` and checks each ref again; any still OPEN is
-/// closed via `gh issue close` with a commit-citing comment. When `wait_secs`
+/// without sleeping further. Otherwise it sleeps the rest of `wait_secs` and
+/// checks each ref again; any still OPEN is closed via `gh issue close` with a
+/// commit-citing comment. When `wait_secs`
 /// is at most [`EARLY_CHECK_SECS`] there is no early phase, only one sleep of
 /// `wait_secs` (none at 0). Returns a summary message naming the closed
 /// issues, or `None` when there was nothing to do. The caller routes the
