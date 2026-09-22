@@ -59,12 +59,17 @@ fn build_failopen_record(
 /// row from any session-level version stamp.
 ///
 /// `error` is the diagnostic the call site already holds and used to discard —
-/// the serde message, the panic payload and its location, the clap error kind.
-/// It is what makes `doctor`'s "inspect failopen.jsonl" guidance answerable
-/// (cameronsjo/cadence-hooks#398). Pass `None` where no error text exists (the
-/// deadline rows describe a timeout, not a failure with a message). Call sites
-/// pass only their own generated text, never the offending stdin — the
-/// no-payload privacy posture is unchanged.
+/// the parse failure's shape, the panic message and its location, the clap
+/// error kind. It is what makes `doctor`'s "inspect failopen.jsonl" guidance
+/// answerable (cameronsjo/cadence-hooks#398). Pass `None` where no error text
+/// exists (the deadline rows describe a timeout, not a failure with a message).
+/// Call sites pass only their own generated text, never payload-derived text,
+/// and two functions are why that holds (cameronsjo/cadence-hooks#959):
+/// `json_parse_failure` in `cadence-hooks-core` describes a parse failure by
+/// category, line, column, and byte length without formatting serde's error
+/// (which quotes the offending value), and `panic_row_error` in the binary
+/// keeps only compile-time `&str` panic messages and withholds formatted
+/// `String` ones.
 ///
 /// Fully fail-open (ADR-0001): a missing dir it can't create, or a failed open
 /// / write, degrades to a no-op — the caller's exit path is untouched.
