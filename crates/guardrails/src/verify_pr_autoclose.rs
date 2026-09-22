@@ -5,8 +5,8 @@
 //! `handle_merge` may close open issues via `gh issue close`.
 //!
 //! Config knob: `GH_AUTOCLOSE_WAIT_SECONDS` (default `10`), the maximum wait.
-//! The merge flow waits in two phases: it checks every referenced issue after
-//! [`EARLY_CHECK_SECS`] and returns when GitHub has already closed them all;
+//! The merge flow waits in two phases: after [`EARLY_CHECK_SECS`] it checks
+//! the referenced issues and returns when GitHub has already closed them all;
 //! otherwise it sleeps the rest of the wait and checks again.
 
 use cadence_hooks_core::shell::{git_command, host_and_repo_from_url};
@@ -234,8 +234,9 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
 ///
 /// Reads the merged PR's body and, only when it references issues, waits for
 /// GitHub to auto-close them (sleeps injected via `clock`). The wait has two
-/// phases: after [`EARLY_CHECK_SECS`] every ref is checked, and if all read
-/// CLOSED the function returns `None` without sleeping further. Otherwise it
+/// phases: after [`EARLY_CHECK_SECS`] the refs are checked (stopping at the
+/// first one not CLOSED), and if all read CLOSED the function returns `None`
+/// without sleeping further. Otherwise it
 /// sleeps the rest of `wait_secs` and checks each ref again; any still OPEN is
 /// closed via `gh issue close` with a commit-citing comment. When `wait_secs`
 /// is at most [`EARLY_CHECK_SECS`] there is no early phase, only one sleep of
