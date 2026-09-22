@@ -59,6 +59,19 @@ fn test_panic_trigger() {
         );
         panic!("CADENCE_TEST_PANIC: synthetic panic exercising the dispatch panic guard");
     }
+    // `formatted` panics with a runtime `String` payload, the shape that can
+    // carry hook data, so a test can prove the ledger row withholds it
+    // (cameronsjo/cadence-hooks#959).
+    if std::env::var("CADENCE_TEST_PANIC").as_deref() == Ok("formatted") {
+        eprintln!(
+            "⚠️  cadence-hooks: enforcement bypassed — CADENCE_TEST_PANIC=formatted is forcing a \
+             synthetic panic before this hook can decide (debug builds only)"
+        );
+        panic!(
+            "CADENCE_TEST_PANIC formatted: {}",
+            std::env::var("CADENCE_TEST_PANIC_TEXT").unwrap_or_default()
+        );
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -140,9 +153,11 @@ fn run_logged_check_inner(
             let unenumerable_patch = e.patch_targets_unenumerable;
             let e = e.message;
             eprintln!("cadence-hooks: {e}");
-            // `e` is this binary's own message ("Failed to parse hook JSON:
-            // <serde error>") — a line/column locator, never an echo of the
-            // payload, so recording it keeps the no-payload posture.
+            // `e` is this binary's own message: the error kind, line, column,
+            // and payload byte length only, built in `json_parse_failure`
+            // (crates/core/src/lib.rs) and never from serde's `Display`, which
+            // quotes the offending value. Recording it keeps the no-payload
+            // posture (cameronsjo/cadence-hooks#959).
             cadence_hooks_metrics::log_failopen(
                 "parse",
                 crate::registry::namespace_of(hook_name),
