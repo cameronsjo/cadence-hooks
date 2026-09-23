@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.102.0] - 2026-09-22
+
 ### Changed
 
 - **CLAUDE.md's platform-baseline upkeep step replaces its never-built follow-up note with the CI backstop now in review, and says plainly that the backstop is not yet live.** The step had read "A CI automation for this bump is a named follow-up, not yet built" for months while `cadence_hooks.current_version` went six releases stale (0.90 through 0.95) — a stale baseline fails open (ADR-0001), so the drift nudge and `doctor` both went quiet instead of erroring and every session in that window was told it was current. The step now names where the bump is edited and how it lands (a `cameronsjo/cadence` checkout, through a PR, since a direct push to that repo's main is rejected), tells the releaser to read the current value before writing so two parallel releases cannot both bump it, and names the tracker the backstop files to. The backstop itself is written as pending rather than live: bumping at release time is the defense, and a job that notices a miss within a day never replaces it. The redundant restatement of the fail-open direction was cut — the paragraph three lines below already carries it. No code changed. (cameronsjo/cadence#1369)
