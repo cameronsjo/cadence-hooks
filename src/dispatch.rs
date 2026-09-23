@@ -286,8 +286,9 @@ fn run_logged_check_inner(
         Ok(decided) => decided,
         Err(_) => {
             // The panic hook already printed the breadcrumb and wrote the
-            // `panic` failopen row with the payload and location — one row per
-            // panic. What is lost without this arm is the rest of the dispatch
+            // `panic` failopen row (a literal message, or "panic message
+            // withheld (formatted, N chars)", plus the source location) — one
+            // row per panic. What is lost without this arm is the rest of the dispatch
             // tail, so emit it before leaving.
             emit_telemetry_tail(false);
             // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
@@ -505,8 +506,9 @@ pub fn run_logged_logger(
             let _guard = PanicGuard::arm();
             // The `Err` is deliberately discarded: no `log_failopen` belongs
             // here, because the panic hook already wrote the `panic` row with
-            // the payload and source location this site never had. One row per
-            // panic. A logger has no result to report either way.
+            // what this site never had: a literal message, or "panic message
+            // withheld (formatted, N chars)", plus the source location. One
+            // row per panic. A logger has no result to report either way.
             //
             // Unlike the check path above, a panicking logger still exits 0 —
             // that is `run_logged_logger`'s documented contract, and a logger

@@ -22,15 +22,18 @@ use std::time::{Duration, SystemTime};
 const FAILOPEN_SCHEMA_VERSION: u32 = 2;
 
 /// Ceiling, in characters, on a recorded `error` string. Long enough for a
-/// serde line/column message or a panic payload plus its source location,
-/// short enough that a runaway message can't bloat the append-only ledger.
+/// parse message (kind, line, column, byte length) or a panic row (a literal
+/// message, or "panic message withheld (formatted, N chars)", plus the source
+/// location), short enough that a runaway message can't bloat the append-only
+/// ledger.
 const MAX_ERROR_CHARS: usize = 200;
 
 /// Build the `failopen.jsonl` record. Pure — no I/O.
 ///
-/// `error` is the diagnostic the degradation site already holds — the parser's
-/// message, the panic payload — sanitized on the way in so the stored ledger is
-/// clean at rest rather than only at display time.
+/// `error` is the diagnostic the degradation site already holds — the parse
+/// failure's kind and position, or a literal panic message or "panic message
+/// withheld (formatted, N chars)" with its location — sanitized on the way in
+/// so the stored ledger is clean at rest rather than only at display time.
 fn build_failopen_record(
     reason: &str,
     namespace: Option<&str>,
