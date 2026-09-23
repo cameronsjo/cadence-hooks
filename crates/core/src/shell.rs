@@ -1172,6 +1172,11 @@ struct GhPrInvocation<'a> {
     /// command was never retargeted, or was retargeted by a flag with no
     /// resolvable value (see [`scan_operands`]).
     repo_targets: Vec<String>,
+    /// The subset of `repo_targets` read before the subcommand: global-position
+    /// `-R`/`--repo` values and an inline `GH_REPO=`. [`ship_target`] reads the
+    /// post-subcommand values itself, with a grammar that skips other flags'
+    /// values, so it takes only these from here.
+    pre_subcommand_repo_targets: Vec<String>,
     /// A `GH_HOST=` assignment prefix was present. Distinct from
     /// `retargeted`: a host override is never own-repo-eligible regardless of
     /// what `repo_targets` compares to, because it can point the SAME
@@ -1194,6 +1199,7 @@ struct GhPrInvocation<'a> {
 /// | `is_repo_flag` (here) | prefix test, detect-only |
 /// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
 /// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
+/// | `scan_ship_flags` (here) | value, every operand, pflag clusters, per-subcommand grammar, `--`-aware |
 /// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
 /// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
 /// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
@@ -1270,14 +1276,17 @@ impl GhPrInvocation<'_> {
         if self.host_overridden {
             return false;
         }
-        let Some(origin) = origin else {
+        let Some((origin_host, origin_slug)) = origin.and_then(|o| o.split_once('/')) else {
             return false;
         };
+        // A bare `owner/repo` means github.com to gh (no `GH_HOST=` reaches
+        // here), so that is the host it implies. The comparison itself is
+        // the one the #995 resolver uses, so an SSH-alias origin matches on
+        // `owner/repo` alone at both sites.
         !self.repo_targets.is_empty()
-            && self
-                .repo_targets
-                .iter()
-                .all(|target| normalize_gh_target(target).as_deref() == Some(origin))
+            && self.repo_targets.iter().all(|target| {
+                repo_value_names_remote(target, Some(GH_DEFAULT_HOST), origin_host, origin_slug)
+            })
     }
 }
 
@@ -1340,13 +1349,8 @@ fn scan_operands(operands: &[String]) -> OperandScan {
                 repo_targets,
             };
         }
-        if is_redirect_token(token) {
-            // A bare operator (`>`, `2>`, `&>`) takes the NEXT token as its
-            // target; an attached one (`>log`, `2>&1`) carries its own.
-            if token.ends_with('>') || token.ends_with('<') {
-                i += 1;
-            }
-            i += 1;
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
             continue;
         }
         // `--` ends flag parsing; everything after it is a POSITIONAL to
@@ -1429,13 +1433,8 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
         if token == "#" {
             return false;
         }
-        if is_redirect_token(token) {
-            // A bare operator (`>`, `2>`, `<<<`) takes the NEXT token as its
-            // target; an attached one (`>log`, `2>&1`) carries its own.
-            if token.ends_with('>') || token.ends_with('<') {
-                i += 1;
-            }
-            i += 1;
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
             continue;
         }
         // EQUALITY, not a prefix or a `split('=')` normalization. The attached
@@ -1450,6 +1449,21 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
         i += 1;
     }
     false
+}
+
+/// The index after the redirection at `operands[i]`, or `None` when that
+/// token is not one. A bare operator (`>`, `2>`, `&>`, `<<<`) takes the NEXT
+/// token as its target; an attached one (`>log`, `2>&1`) carries its own.
+/// Shared by every operand scanner here ([`scan_operands`],
+/// [`carries_undo_flag`], [`scan_ship_flags`]), since gh never sees either
+/// the operator or its target.
+fn skip_redirect(operands: &[String], i: usize) -> Option<usize> {
+    let token = operands.get(i)?;
+    if !is_redirect_token(token) {
+        return None;
+    }
+    let bare = token.ends_with('>') || token.ends_with('<');
+    Some(i + if bare { 2 } else { 1 })
 }
 
 /// True for a shell redirection token in any spelling `tokenize` can produce:
@@ -1591,6 +1605,7 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
     if !scan.repo_targets.is_empty() {
         retargeted = true;
     }
+    let pre_subcommand_repo_targets = repo_targets.clone();
     repo_targets.extend(scan.repo_targets);
     Some(GhPrInvocation {
         subcommand: subcommand.as_str(),
@@ -1598,46 +1613,525 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         retargeted,
         operands_flags_only: scan.flags_only,
         repo_targets,
+        pre_subcommand_repo_targets,
         host_overridden,
     })
 }
 
-/// Canonical `(host, owner/repo)` triple, lowercased, for a `-R`/`--repo`/
-/// `GH_REPO=` VALUE — in every shape gh accepts (cadence-hooks#881): a bare
-/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (https, ssh,
-/// or SCP-style). Measured live against gh 2.96.0: `gh pr list -R
-/// https://github.com/cameronsjo/cadence-hooks` and `-R
-/// git@github.com:cameronsjo/cadence-hooks.git` both resolved, rc 0.
+/// The branch a ship command names as its PR head (cadence-hooks#995).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShipHead {
+    /// No `--head`: gh ships the branch checked out where the command runs.
+    #[default]
+    Current,
+    /// One `--head` value. Every spelling in the segment agreed on it.
+    Named(String),
+    /// Two different `--head` values, or a `--head` with no value. The branch
+    /// gh will ship cannot be read from the command text.
+    Ambiguous,
+}
+
+/// Where a ship command points gh, read from the anchoring segment only
+/// (cadence-hooks#995).
 ///
-/// A URL form is tried FIRST via [`host_and_repo_from_url`], because
-/// splitting on `/` would otherwise misparse a URL's path segments as a bare
-/// slug. Exactly two plain slash segments default the host to
-/// `github.com`, matching gh's own default — this branch is only reached
-/// when no `GH_HOST=` prefix is present, because that prefix already sets
-/// [`GhPrInvocation::host_overridden`] and suppresses eligibility before this
-/// runs. Three or more segments are `HOST/OWNER/REPO`; the first is the host,
-/// the next two are the slug, and anything after that (a subpath) is
-/// discarded — same as [`host_and_repo_from_url`] does for a URL's path.
-/// Anything else — one segment, an empty owner or repo — returns `None`,
-/// which suppresses the same way an unattributable target always has.
-fn normalize_gh_target(value: &str) -> Option<String> {
+/// This is a reading of the command text, with the same limits
+/// [`GhPrInvocation::targets_the_current_branch`] documents: an exported
+/// `GH_REPO` or `GH_HOST` leaves no token behind, so it cannot appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShipTarget {
+    /// Every repo value the segment carries: `-R`/`--repo` in global and
+    /// post-subcommand position (every spelling), and an inline `GH_REPO=`.
+    /// A repo flag with no value contributes an empty string, which matches
+    /// no remote.
+    pub repos: Vec<String>,
+    /// The value of an inline `GH_HOST=` assignment, when one is present. It
+    /// makes the host part of every repo comparison.
+    pub host: Option<String>,
+    /// The PR head. Only `gh pr create` has a `--head` flag, so `ready` and
+    /// `merge` are always [`ShipHead::Current`].
+    pub head: ShipHead,
+}
+
+impl ShipTarget {
+    /// True when resolving this target needs anything beyond the cwd's own
+    /// branch: a repo value to check against the remotes, or a named head to
+    /// find a worktree for. When false, no git process needs to run for it.
+    pub fn names_another_target(&self) -> bool {
+        !self.repos.is_empty() || self.head != ShipHead::Current
+    }
+}
+
+/// One anchoring segment of a ship command: the anchor it trips and where it
+/// points gh (cadence-hooks#995).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipSegment {
+    /// `"create"`, `"ready"`, or `"merge"`, as [`polish_ship_anchor`] names it.
+    pub anchor: &'static str,
+    /// The repo, host, and head this segment names.
+    pub target: ShipTarget,
+}
+
+/// Every segment of `command` that is a ship anchor, in [`command_segments`]
+/// order, each with its own [`ShipTarget`]. Empty when nothing anchors.
+///
+/// **Every** anchoring segment is returned, not only the first. One command
+/// can ship twice (`gh pr create --head a && gh pr create --head b`), and a
+/// caller that judged it on the first segment alone would let a polished
+/// first ship vouch for an unpolished second one (security review, #995 I1).
+/// The first element's `anchor` is the one [`polish_ship_anchor_for_origin`]
+/// reports, since both walk the same segments in the same order.
+///
+/// Each target is built from its own segment, never the whole command, so a
+/// sibling command's flags cannot retarget a ship: in `gh pr list --head
+/// feat/x && gh pr create`, the `--head` belongs to `list`.
+pub fn polish_ship_segments_for_origin(command: &str, origin: Option<&str>) -> Vec<ShipSegment> {
+    command_segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let anchor = segment_ship_anchor(segment, origin)?;
+            Some(ShipSegment {
+                anchor,
+                target: ship_target(&tokenize(strip_group_wrappers(segment))),
+            })
+        })
+        .collect()
+}
+
+/// Read the repo, host, and head a single `gh pr <sub>` segment names. A
+/// segment that is not a `gh pr` invocation yields the default (no target).
+///
+/// The post-subcommand scan ([`scan_ship_flags`]) runs over every operand of
+/// every subcommand, past positionals and other flags' values, so `gh pr
+/// create --title x -R o/r --head b` sees both flags and `gh pr ready 12 -R
+/// o/r` sees the repo after the PR number. [`scan_operands`] stops at the
+/// first positional, which is what the #325/#881 merge rules need, so it is
+/// left alone and this scan runs beside it. Only `create` has a `--head`
+/// flag, so only its grammar reads one.
+pub fn ship_target(segment_tokens: &[String]) -> ShipTarget {
+    let Some(invocation) = gh_pr_invocation(segment_tokens) else {
+        return ShipTarget::default();
+    };
+    let argv = skip_transparent_prefixes(segment_tokens);
+    let prefix = &segment_tokens[..segment_tokens.len() - argv.len()];
+    let host = prefix
+        .iter()
+        .find_map(|t| t.strip_prefix("GH_HOST="))
+        .map(str::to_string);
+    let scan = scan_ship_flags(flag_grammar(invocation.subcommand), invocation.operands);
+    // Only the pre-subcommand values come from the invocation. Its other
+    // values are `scan_operands`' reads, which do not skip other flags'
+    // values (`--body -Rx` would read a repo `x`).
+    let mut repos = invocation.pre_subcommand_repo_targets.clone();
+    repos.extend(scan.repos);
+    ShipTarget {
+        repos,
+        host,
+        head: combine_heads(&scan.heads),
+    }
+}
+
+/// Collapse every `--head` spelling a segment carried into one [`ShipHead`].
+/// A flag with no value (`None`) or an empty one is unreadable, and two
+/// different values are a conflict. Both are [`ShipHead::Ambiguous`].
+fn combine_heads(heads: &[Option<String>]) -> ShipHead {
+    let mut named: Option<&str> = None;
+    for head in heads {
+        match head.as_deref() {
+            None | Some("") => return ShipHead::Ambiguous,
+            Some(value) => match named {
+                Some(seen) if seen != value => return ShipHead::Ambiguous,
+                _ => named = Some(value),
+            },
+        }
+    }
+    named.map_or(ShipHead::Current, |value| {
+        ShipHead::Named(value.to_string())
+    })
+}
+
+/// The flags a `gh pr <sub>` subcommand accepts, split by whether they take a
+/// value, so [`scan_ship_flags`] can skip another flag's value instead of
+/// reading it as a head or repo. `-R`/`--repo` and `create`'s `-H`/`--head`
+/// are handled by the scan itself and are not listed.
+///
+/// Taken from `gh pr <sub> --help` (gh 2.101.0). gh adds flags over time; a
+/// flag missing from this table is read as **unknown**. After an unknown flag
+/// the scan can no longer tell which later tokens are values, so every head or
+/// repo spelling in the rest of that segment reads as unreadable rather than
+/// trusted. So a new gh flag can cost a spurious advisory, never a silent
+/// allow.
+struct FlagGrammar {
+    short_values: &'static str,
+    short_bools: &'static str,
+    long_values: &'static [&'static str],
+    long_bools: &'static [&'static str],
+    /// Only `create` has `--head`/`-H`.
+    reads_head: bool,
+}
+
+const CREATE_FLAGS: FlagGrammar = FlagGrammar {
+    short_values: "aBbFlmprTt",
+    short_bools: "defhw",
+    long_values: &[
+        "assignee",
+        "attach",
+        "base",
+        "body",
+        "body-file",
+        "label",
+        "milestone",
+        "project",
+        "recover",
+        "reviewer",
+        "template",
+        "title",
+    ],
+    long_bools: &[
+        "draft",
+        "dry-run",
+        "editor",
+        "fill",
+        "fill-first",
+        "fill-verbose",
+        "help",
+        "no-maintainer-edit",
+        "web",
+    ],
+    reads_head: true,
+};
+
+const READY_FLAGS: FlagGrammar = FlagGrammar {
+    short_values: "",
+    short_bools: "h",
+    long_values: &[],
+    long_bools: &["help", "undo"],
+    reads_head: false,
+};
+
+const MERGE_FLAGS: FlagGrammar = FlagGrammar {
+    short_values: "AbFt",
+    short_bools: "dhmrs",
+    long_values: &[
+        "author-email",
+        "body",
+        "body-file",
+        "match-head-commit",
+        "subject",
+    ],
+    long_bools: &[
+        "admin",
+        "auto",
+        "delete-branch",
+        "disable-auto",
+        "help",
+        "merge",
+        "rebase",
+        "squash",
+    ],
+    reads_head: false,
+};
+
+/// The grammar for a ship subcommand. Only `create`, `ready`, and `merge`
+/// anchor; anything else gets `ready`'s, which reads no head.
+fn flag_grammar(subcommand: &str) -> &'static FlagGrammar {
+    match subcommand {
+        "create" => &CREATE_FLAGS,
+        "merge" => &MERGE_FLAGS,
+        _ => &READY_FLAGS,
+    }
+}
+
+/// What [`scan_ship_flags`] collected from a `gh pr <sub>` operand list.
+#[derive(Default)]
+struct ShipFlagScan {
+    repos: Vec<String>,
+    /// One entry per `--head` spelling; `None` for one that cannot be read.
+    heads: Vec<Option<String>>,
+}
+
+/// A head or repo value read from one token.
+enum FlagValue {
+    /// `None` when the value cannot be read.
+    Head(Option<String>),
+    /// Empty when the value cannot be read; an empty value matches no remote.
+    Repo(String),
+}
+
+/// What one operand token contributed to the scan.
+struct TokenRead {
+    values: Vec<FlagValue>,
+    /// How many tokens this one consumed: 2 when its value is the next token.
+    consumed: usize,
+    /// The token was, or contained, a flag this grammar does not know whose
+    /// value is not certain (a long flag with no `=value`, or any unknown
+    /// shorthand). Which later tokens are values can no longer be told.
+    taints_rest: bool,
+}
+
+impl TokenRead {
+    fn plain(values: Vec<FlagValue>) -> Self {
+        TokenRead {
+            values,
+            consumed: 1,
+            taints_rest: false,
+        }
+    }
+}
+
+/// Scan every operand after the subcommand for repo and head flags, the way
+/// pflag parses them.
+///
+/// - Positionals and the values of other value-taking flags are skipped, so
+///   `-t "-Hfeat/x"` is a title, not a head.
+/// - A single-dash token is a shorthand cluster: `-fH x` is `--fill --head
+///   x`, and `-fRother/r` is `--fill --repo other/r`. On reaching `H` or `R`,
+///   the rest of the token (or the next token, when the rest is empty) is the
+///   value. Another value-taking shorthand swallows the rest of the token the
+///   same way, which ends the walk.
+/// - A value-taking flag consumes the next token whatever it looks like, so
+///   `--head --title` names a head of `--title`.
+/// - Where the scan cannot tell, the head or repo reads as unreadable, which
+///   resolves to the cannot-check advisory, never to a named branch. After an
+///   unknown flag whose value is not certain (a long flag with no `=value`,
+///   or any unknown shorthand), the rest of the segment cannot be aligned:
+///   `--newflag -t -Hx` may be `--newflag -t` then `--head x`, and `-zt -Hx`
+///   may be `-z -t -Hx` or `-z=t --head x`. So every later token is read on
+///   its own, and any head or repo spelling in it is unreadable.
+/// - Stops at `--` (cobra reads everything after it as positional) and at a
+///   comment. Redirect operators and their targets are skipped
+///   ([`skip_redirect`]), since gh never sees them.
+fn scan_ship_flags(grammar: &FlagGrammar, operands: &[String]) -> ShipFlagScan {
+    let mut scan = ShipFlagScan::default();
+    let mut tainted = false;
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        if token == "#" || token == "--" {
+            break;
+        }
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
+            continue;
+        }
+        let read = read_flag_token(grammar, token, operands.get(i + 1).map(String::as_str));
+        for value in read.values {
+            match value {
+                // An earlier unknown flag broke the alignment of flags and
+                // values, so what this token names cannot be trusted.
+                FlagValue::Head(_) if tainted => scan.heads.push(None),
+                FlagValue::Repo(_) if tainted => scan.repos.push(String::new()),
+                FlagValue::Head(head) => scan.heads.push(head),
+                FlagValue::Repo(repo) => scan.repos.push(repo),
+            }
+        }
+        // Once tainted, a token is never skipped as a value: each later token
+        // is read on its own, so a head or repo spelling hiding where the
+        // grammar expects a value is still seen (as unreadable).
+        i += if tainted { 1 } else { read.consumed };
+        tainted |= read.taints_rest;
+    }
+    scan
+}
+
+/// Read one operand token under `grammar`; `next` is the token after it.
+fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> TokenRead {
+    // The value of a value-taking flag: attached, or the next token.
+    let value_of = |attached: Option<&str>| -> (Option<String>, usize) {
+        match attached {
+            Some(value) => (Some(value.to_string()), 1),
+            None => (next.map(str::to_string), 2),
+        }
+    };
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, attached) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        return match name {
+            "repo" => {
+                let (value, consumed) = value_of(attached);
+                TokenRead {
+                    values: vec![FlagValue::Repo(value.unwrap_or_default())],
+                    consumed,
+                    taints_rest: false,
+                }
+            }
+            "head" if grammar.reads_head => {
+                let (value, consumed) = value_of(attached);
+                TokenRead {
+                    values: vec![FlagValue::Head(value)],
+                    consumed,
+                    taints_rest: false,
+                }
+            }
+            name if grammar.long_values.contains(&name) => TokenRead {
+                values: Vec::new(),
+                consumed: value_of(attached).1,
+                taints_rest: false,
+            },
+            name if grammar.long_bools.contains(&name) => TokenRead::plain(Vec::new()),
+            _ => TokenRead {
+                values: Vec::new(),
+                consumed: 1,
+                taints_rest: attached.is_none(),
+            },
+        };
+    }
+    // A positional, or a lone `-` (stdin to gh).
+    let Some(cluster) = token.strip_prefix('-').filter(|c| !c.is_empty()) else {
+        return TokenRead::plain(Vec::new());
+    };
+    for (idx, letter) in cluster.char_indices() {
+        let rest = &cluster[idx + letter.len_utf8()..];
+        let attached = (!rest.is_empty()).then(|| rest.strip_prefix('=').unwrap_or(rest));
+        let (value, consumed) = value_of(attached);
+        match letter {
+            'R' => {
+                return TokenRead {
+                    values: vec![FlagValue::Repo(value.unwrap_or_default())],
+                    consumed,
+                    taints_rest: false,
+                };
+            }
+            'H' if grammar.reads_head => {
+                return TokenRead {
+                    values: vec![FlagValue::Head(value)],
+                    consumed,
+                    taints_rest: false,
+                };
+            }
+            letter if grammar.short_values.contains(letter) => {
+                return TokenRead {
+                    values: Vec::new(),
+                    consumed,
+                    taints_rest: false,
+                };
+            }
+            letter if grammar.short_bools.contains(letter) => {}
+            _ => {
+                // An unknown shorthand may take a value: the rest of this
+                // token, or the next one. A head or repo after it cannot be
+                // read with confidence.
+                let mut values = Vec::new();
+                if rest.contains('R') {
+                    values.push(FlagValue::Repo(String::new()));
+                }
+                if grammar.reads_head && rest.contains('H') {
+                    values.push(FlagValue::Head(None));
+                }
+                return TokenRead {
+                    values,
+                    consumed: 1,
+                    // Whether this letter takes a value (the rest, or the next
+                    // token) or is a bool (so a later letter might take one),
+                    // what follows cannot be aligned either way.
+                    taints_rest: true,
+                };
+            }
+        }
+    }
+    TokenRead::plain(Vec::new())
+}
+
+/// Split a `-R`/`--repo`/`GH_REPO=` value into the host it names, if any, and
+/// its lowercased `owner/repo` slug (cadence-hooks#995).
+///
+/// A URL form (https, ssh, SCP-style) names its host. `HOST/OWNER/REPO` names
+/// the first segment as host. A bare `OWNER/REPO` names none, so the caller
+/// decides whether to default it. A trailing `.git` on the repo segment is
+/// dropped in every form, so `owner/repo.git` matches `owner/repo`. Anything
+/// else (one segment, an empty owner or repo) is `None`.
+pub fn gh_repo_value_parts(value: &str) -> Option<(Option<String>, String)> {
     if let Some((host, slug)) = host_and_repo_from_url(value) {
-        return Some(format!("{host}/{}", slug.to_ascii_lowercase()));
+        return Some((Some(host), slug.to_ascii_lowercase()));
     }
     let parts: Vec<&str> = value.split('/').filter(|s| !s.is_empty()).collect();
-    match parts.len() {
-        2 => Some(format!(
-            "github.com/{}/{}",
-            parts[0].to_ascii_lowercase(),
-            parts[1].to_ascii_lowercase()
-        )),
-        n if n >= 3 => Some(format!(
-            "{}/{}/{}",
-            parts[0].to_ascii_lowercase(),
-            parts[1].to_ascii_lowercase(),
-            parts[2].to_ascii_lowercase()
-        )),
-        _ => None,
+    let (host, owner, repo) = match parts.as_slice() {
+        [owner, repo] => (None, *owner, *repo),
+        [host, owner, repo, ..] => (Some(host.to_ascii_lowercase()), *owner, *repo),
+        _ => return None,
+    };
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if repo.is_empty() {
+        return None;
+    }
+    Some((
+        host,
+        format!(
+            "{}/{}",
+            owner.to_ascii_lowercase(),
+            repo.to_ascii_lowercase()
+        ),
+    ))
+}
+
+/// The host gh assumes for a bare `OWNER/REPO` when no `GH_HOST` is set.
+pub const GH_DEFAULT_HOST: &str = "github.com";
+
+/// True when the `-R`/`--repo`/`GH_REPO=` `value` names the remote at
+/// `remote_host`/`remote_slug` (both as [`remote_host_and_slug`] returns
+/// them). **The one comparison between a repo value and a remote**, shared by
+/// the #881 merge anchor ([`GhPrInvocation::targets_the_current_branch`]) and
+/// the #995 resolver (`markers::resolve_ship_target`), so the two cannot
+/// drift apart (security review, #995 round 2).
+///
+/// Every shape gh accepts is read ([`gh_repo_value_parts`]): a bare
+/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (measured
+/// against gh 2.96.0: `-R https://github.com/cameronsjo/cadence-hooks` and
+/// `-R git@github.com:cameronsjo/cadence-hooks.git` both resolved). The
+/// `owner/repo` slugs must be equal. The host is compared when the value
+/// names one, or else against `implied_host` (the host a bare slug means to
+/// the caller); `None` there compares the slug alone. A remote whose host is
+/// an SSH config alias ([`host_is_unknowable`]) matches on the slug alone,
+/// because the alias names no real host to compare.
+pub fn repo_value_names_remote(
+    value: &str,
+    implied_host: Option<&str>,
+    remote_host: &str,
+    remote_slug: &str,
+) -> bool {
+    let Some((value_host, slug)) = gh_repo_value_parts(value) else {
+        return false;
+    };
+    if slug != remote_slug {
+        return false;
+    }
+    let host = value_host
+        .or_else(|| implied_host.map(str::to_ascii_lowercase))
+        .map(forge_host);
+    host.is_none_or(|host| host_is_unknowable(remote_host) || host == remote_host)
+}
+
+/// A remote URL as `(host, owner/repo)`: the host mapped by [`forge_host`],
+/// the slug lowercased. Every caller that compares a repo value to a remote
+/// builds the remote side with this.
+pub fn remote_host_and_slug(url: &str) -> Option<(String, String)> {
+    let (host, slug) = host_and_repo_from_url(url)?;
+    Some((forge_host(host), slug.to_ascii_lowercase()))
+}
+
+/// The `host/owner/repo` origin string [`is_polish_ship_anchor_for_origin`]
+/// takes, built from the origin remote's URL by [`remote_host_and_slug`].
+pub fn origin_triple(url: &str) -> Option<String> {
+    let (host, slug) = remote_host_and_slug(url)?;
+    Some(format!("{host}/{slug}"))
+}
+
+/// A remote host that cannot be compared to a forge host: an SSH config alias
+/// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
+/// the `owner/repo` comparison applies to such a remote. A real dotless host
+/// (`localhost`, a LAN short name) is treated the same way.
+pub fn host_is_unknowable(remote_host: &str) -> bool {
+    !remote_host.contains('.')
+}
+
+/// The forge host a URL's host stands for. GitHub serves SSH over port 443 at
+/// `ssh.github.com`, which is still `github.com` to gh.
+pub fn forge_host(host: String) -> String {
+    if host == "ssh.github.com" {
+        GH_DEFAULT_HOST.to_string()
+    } else {
+        host
     }
 }
 
@@ -1676,7 +2170,8 @@ pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
         return None;
     }
 
-    let path = path.trim_end_matches(".git");
+    // Trailing slashes go first, or `owner/repo.git/` keeps its `.git`.
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
 
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
@@ -5583,6 +6078,63 @@ mod tests {
     }
 
     #[test]
+    fn is_polish_ship_anchor_for_origin_ssh_alias_and_443_origins_anchor() {
+        // #995 round 2: the origin goes through the same host mapping as the
+        // resolver's remotes. An SSH-alias origin names no real host, and
+        // `ssh.github.com` is github.com, so both spellings anchor.
+        for url in [
+            "git@github-work:own/repo.git",
+            "ssh://git@ssh.github.com:443/own/repo.git",
+        ] {
+            let origin = origin_triple(url).expect("origin parses");
+            for cmd in [
+                "gh pr merge -R own/repo",
+                "gh pr merge -R github.com/own/repo",
+            ] {
+                assert!(
+                    is_polish_ship_anchor_for_origin(cmd, Some(&origin)),
+                    "{cmd} with origin {url}"
+                );
+            }
+            assert!(
+                !is_polish_ship_anchor_for_origin("gh pr merge -R other/repo", Some(&origin)),
+                "a different slug must stay suppressed with origin {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_triple_maps_the_host() {
+        assert_eq!(
+            origin_triple("ssh://git@ssh.github.com:443/Own/Repo.git").as_deref(),
+            Some("github.com/own/repo")
+        );
+        assert_eq!(
+            origin_triple("git@github-work:own/repo.git").as_deref(),
+            Some("github-work/own/repo")
+        );
+    }
+
+    #[test]
+    fn repo_value_names_remote_keeps_the_merge_default_host() {
+        // A bare slug on the merge path still means github.com, so it does
+        // not match a real non-GitHub origin host.
+        assert!(!repo_value_names_remote(
+            "own/repo",
+            Some(GH_DEFAULT_HOST),
+            "ghe.example.com",
+            "own/repo"
+        ));
+        // The resolver passes no implied host, so the slug alone decides.
+        assert!(repo_value_names_remote(
+            "own/repo",
+            None,
+            "ghe.example.com",
+            "own/repo"
+        ));
+    }
+
+    #[test]
     fn merge_anchor_repo_targets_scopes_the_origin_spawn() {
         // #881: callers pay for `git remote get-url origin` only when this
         // returns `Some` — every shape that origin cannot change the answer
@@ -5603,6 +6155,274 @@ mod tests {
         assert_eq!(
             merge_anchor_repo_targets("gh pr merge -R cameronsjo/cadence-hooks"),
             Some(vec!["cameronsjo/cadence-hooks".to_string()])
+        );
+    }
+
+    // --- ship_target / polish_ship_segments_for_origin (cadence-hooks#995) ---
+
+    /// The target of the command's one anchoring segment.
+    fn target_of(command: &str) -> ShipTarget {
+        let segments = polish_ship_segments_for_origin(command, None);
+        assert_eq!(segments.len(), 1, "{command} should anchor once");
+        segments.into_iter().next().unwrap().target
+    }
+
+    fn named(branch: &str) -> ShipHead {
+        ShipHead::Named(branch.to_string())
+    }
+
+    #[test]
+    fn ship_target_reads_every_head_spelling() {
+        for command in [
+            "gh pr create --head feat/x",
+            "gh pr create --head=feat/x",
+            "gh pr create -H feat/x",
+            "gh pr create -Hfeat/x",
+            "gh pr create -H=feat/x",
+            // pflag shorthand clusters: `-f` (fill) and `-w` (web) are bools.
+            "gh pr create -fH feat/x",
+            "gh pr create -fHfeat/x",
+            "gh pr create -wfH feat/x",
+        ] {
+            assert_eq!(target_of(command).head, named("feat/x"), "{command}");
+        }
+    }
+
+    #[test]
+    fn ship_target_reads_flags_after_a_flag_value() {
+        // `scan_operands` stops at `x`, the value of `--title`; the ship scan
+        // must keep going and see both the repo and the head.
+        let target = target_of("gh pr create --title x -R own/repo --head feat/x");
+        assert_eq!(target.repos, vec!["own/repo".to_string()]);
+        assert_eq!(target.head, named("feat/x"));
+    }
+
+    #[test]
+    fn ship_target_reads_every_repo_spelling() {
+        let target =
+            target_of("GH_REPO=a/one gh -R b/two pr create --repo c/three --repo=d/four -Re/five");
+        for repo in ["a/one", "b/two", "c/three", "d/four", "e/five"] {
+            assert!(
+                target.repos.iter().any(|r| r == repo),
+                "{repo} missing from {:?}",
+                target.repos
+            );
+        }
+        assert_eq!(target.host, None);
+    }
+
+    #[test]
+    fn ship_target_records_an_inline_gh_host() {
+        let target = target_of("GH_HOST=ghe.example.com gh pr create -R own/repo");
+        assert_eq!(target.host.as_deref(), Some("ghe.example.com"));
+    }
+
+    #[test]
+    fn ship_target_two_different_heads_are_ambiguous() {
+        assert_eq!(
+            target_of("gh pr create --head a --head b").head,
+            ShipHead::Ambiguous
+        );
+        // The same value spelled twice is not a conflict.
+        assert_eq!(target_of("gh pr create --head a -H a").head, named("a"));
+    }
+
+    #[test]
+    fn ship_target_a_head_without_a_value_is_ambiguous() {
+        assert_eq!(target_of("gh pr create --head").head, ShipHead::Ambiguous);
+        assert_eq!(target_of("gh pr create --head=").head, ShipHead::Ambiguous);
+    }
+
+    #[test]
+    fn ship_target_a_repo_flag_without_a_value_records_an_empty_repo() {
+        // An empty value matches no remote, so the target cannot resolve to
+        // the cwd by accident.
+        assert_eq!(
+            target_of("gh pr create --title x -R").repos,
+            vec![String::new()]
+        );
+    }
+
+    #[test]
+    fn ship_target_stops_at_the_double_dash() {
+        let target = target_of("gh pr create --title x -- --head feat/x -R other/r");
+        assert_eq!(target.head, ShipHead::Current);
+        assert!(target.repos.is_empty());
+    }
+
+    #[test]
+    fn ship_target_skips_redirect_targets() {
+        assert_eq!(
+            target_of("gh pr create --title x > --head").head,
+            ShipHead::Current
+        );
+    }
+
+    #[test]
+    fn ship_target_ready_ignores_head() {
+        // `gh pr ready` has no `--head` flag; the token cannot retarget it.
+        let target = target_of("gh pr ready 12 --head x");
+        assert_eq!(target.head, ShipHead::Current);
+        assert!(!target.names_another_target());
+        // Its repo flags still count, including after the PR number.
+        assert_eq!(
+            target_of("gh pr ready 12 -R other/r").repos,
+            vec!["other/r".to_string()]
+        );
+    }
+
+    #[test]
+    fn ship_target_reads_only_the_anchoring_segment() {
+        // The `--head` belongs to `gh pr list`, which is not a ship.
+        let target = target_of("gh pr list --head feat/polished && gh pr create");
+        assert_eq!(target, ShipTarget::default());
+        // A draft create does not anchor, so its `--head` does not carry over
+        // to the real create after it.
+        let target = target_of("gh pr create --draft --head p; gh pr create");
+        assert_eq!(target, ShipTarget::default());
+    }
+
+    #[test]
+    fn ship_target_none_for_a_non_anchor() {
+        assert!(polish_ship_segments_for_origin("gh pr list --head x", None).is_empty());
+        assert!(polish_ship_segments_for_origin("gh pr create --draft --head x", None).is_empty());
+    }
+
+    #[test]
+    fn ship_target_reads_repo_values_in_shorthand_clusters() {
+        assert_eq!(
+            target_of("gh pr create -wR o/r").repos,
+            vec!["o/r".to_string()]
+        );
+        assert_eq!(
+            target_of("gh pr create -fRother/r").repos,
+            vec!["other/r".to_string()]
+        );
+    }
+
+    #[test]
+    fn ship_target_a_value_taking_shorthand_swallows_the_rest_of_its_cluster() {
+        // `-tH` is `--title H`; the H is the title, not a head flag.
+        let target = target_of("gh pr create -tH feat/x");
+        assert_eq!(target.head, ShipHead::Current);
+    }
+
+    #[test]
+    fn ship_target_skips_other_flags_values() {
+        for command in [
+            "gh pr create -t \"-Hfeat/pol\" -b b",
+            "gh pr create --title -Hotfix",
+            "gh pr create --title=x --body -Rother/r",
+            "gh pr create -B --head -F -H",
+            "gh pr create --reviewer --repo",
+        ] {
+            let target = target_of(command);
+            assert_eq!(target.head, ShipHead::Current, "{command}");
+            assert!(target.repos.is_empty(), "{command}: {:?}", target.repos);
+        }
+        // The head after a skipped value is still read.
+        assert_eq!(
+            target_of("gh pr create -t -Hx --head feat/x").head,
+            named("feat/x")
+        );
+    }
+
+    #[test]
+    fn ship_target_an_unknown_flag_makes_a_following_head_or_repo_unreadable() {
+        // gh may add a value-taking flag this table does not list; a head or
+        // repo right after it cannot be trusted, so it reads as unreadable.
+        let target = target_of("gh pr create --new-flag -Hfeat/x");
+        assert_eq!(target.head, ShipHead::Ambiguous);
+        let target = target_of("gh pr create --new-flag -R own/repo");
+        assert_eq!(target.repos, vec![String::new()]);
+        // An unknown shorthand with H or R after it in the cluster.
+        assert_eq!(
+            target_of("gh pr create -zH feat/x").head,
+            ShipHead::Ambiguous
+        );
+        assert_eq!(target_of("gh pr create -zRo/r").repos, vec![String::new()]);
+        // A known bool before the head stays readable.
+        assert_eq!(
+            target_of("gh pr create --fill --head feat/x").head,
+            named("feat/x")
+        );
+    }
+
+    #[test]
+    fn ship_target_an_unknown_flag_taints_the_rest_of_the_segment() {
+        // #995 round 2: the taint used to last one token. If `--newflag`
+        // takes a value it swallows `-t`, and `-Hfeat/x` is the head.
+        assert_eq!(
+            target_of("gh pr create --newflag -t -Hfeat/x").head,
+            ShipHead::Ambiguous
+        );
+        // If `-z` is a bool, `t` takes `-Hfeat/x` as the title; if it takes
+        // `t` as its value, `-Hfeat/x` is the head. Neither can be told.
+        assert_eq!(
+            target_of("gh pr create -zt -Hfeat/x").head,
+            ShipHead::Ambiguous
+        );
+        assert_eq!(
+            target_of("gh pr create --newflag x y z -R own/repo").repos,
+            vec![String::new()]
+        );
+        // An unknown flag with an attached value leaves the alignment intact.
+        assert_eq!(
+            target_of("gh pr create --newflag=x -t t -H feat/x").head,
+            named("feat/x")
+        );
+    }
+
+    #[test]
+    fn ship_target_merge_grammar_reads_its_own_flags() {
+        // On merge, `-r` is `--rebase` (a bool) and `-t` is `--subject`.
+        // Read through `ship_target` directly: a merge carrying a repo value
+        // anchors only against a resolved origin.
+        let target = ship_target(&tokenize("gh pr merge -rR own/repo"));
+        assert_eq!(target.repos, vec!["own/repo".to_string()]);
+        let target = ship_target(&tokenize("gh pr merge -t -Rother/r"));
+        assert!(target.repos.is_empty());
+    }
+
+    #[test]
+    fn polish_ship_segments_returns_every_anchoring_segment() {
+        let segments = polish_ship_segments_for_origin(
+            "gh pr create --head a -t x && gh pr create --head b -t x ; gh pr ready",
+            None,
+        );
+        let heads: Vec<_> = segments.iter().map(|s| s.target.head.clone()).collect();
+        assert_eq!(heads, vec![named("a"), named("b"), ShipHead::Current]);
+        let anchors: Vec<_> = segments.iter().map(|s| s.anchor).collect();
+        assert_eq!(anchors, vec!["create", "create", "ready"]);
+    }
+
+    #[test]
+    fn gh_repo_value_parts_normalizes_every_form() {
+        let own = |host: Option<&str>| Some((host.map(str::to_string), "own/repo".to_string()));
+        assert_eq!(gh_repo_value_parts("own/repo"), own(None));
+        assert_eq!(gh_repo_value_parts("Own/Repo.git"), own(None));
+        assert_eq!(
+            gh_repo_value_parts("github.com/own/repo.git"),
+            own(Some("github.com"))
+        );
+        assert_eq!(
+            gh_repo_value_parts("https://github.com/own/repo.git/"),
+            own(Some("github.com"))
+        );
+        assert_eq!(
+            gh_repo_value_parts("git@github.com:own/repo.git"),
+            own(Some("github.com"))
+        );
+        assert_eq!(gh_repo_value_parts("repo"), None);
+        assert_eq!(gh_repo_value_parts(""), None);
+        assert_eq!(gh_repo_value_parts("own/.git"), None);
+    }
+
+    #[test]
+    fn host_and_repo_from_url_strips_git_before_a_trailing_slash() {
+        assert_eq!(
+            host_and_repo_from_url("https://github.com/own/repo.git/"),
+            Some(("github.com".to_string(), "own/repo".to_string()))
         );
     }
 

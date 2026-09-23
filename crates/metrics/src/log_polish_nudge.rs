@@ -22,10 +22,10 @@
 //! Silent no-op on any failure — never blocks (it is a [`Logger`]).
 
 use crate::common;
-use cadence_hooks_core::markers::polish_marker_present;
+use cadence_hooks_core::markers::{polish_marker_present, resolve_ship_target};
 use cadence_hooks_core::shell::{
-    git_command, host_and_repo_from_url, merge_anchor_repo_targets, parse_work_dir,
-    polish_ship_anchor_for_origin,
+    git_command, merge_anchor_repo_targets, origin_triple, parse_work_dir,
+    polish_ship_segments_for_origin,
 };
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
@@ -62,9 +62,14 @@ impl Logger for LogPolishNudge {
             .filter(|_| merge_anchor_repo_targets(command).is_some())
             .map(|cwd| parse_work_dir(command, cwd))
             .and_then(|dir| git_command(&dir, &["remote", "get-url", "origin"]))
-            .and_then(|url| host_and_repo_from_url(&url))
-            .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
-        let Some(anchor) = polish_ship_anchor_for_origin(command, origin.as_deref()) else {
+            // The same host mapping the #995 resolver applies to every remote
+            // (an SSH alias, `ssh.github.com`), so both compare sites agree.
+            .and_then(|url| origin_triple(&url));
+        // One pass over the segments gives both the anchor kind (the first
+        // anchoring segment's, as `polish_ship_anchor_for_origin` reports it)
+        // and every segment's target.
+        let segments = polish_ship_segments_for_origin(command, origin.as_deref());
+        let Some(anchor) = segments.first().map(|segment| segment.anchor) else {
             return;
         };
         // Skip malformed payloads (mirrors the other loggers); session_id is
@@ -95,10 +100,21 @@ impl Logger for LogPolishNudge {
             .unwrap_or(false);
 
         // The branch-scoped marker signal the pre-PR gate actually acts on —
-        // the same [`polish_marker_present`] the gate calls, so the metric can
-        // never disagree with the gate (#177). Recorded alongside `polished`
-        // (the transcript scan) so scan-vs-marker drift is measurable.
-        let marker_present = polish_marker_present(command, input.cwd.as_deref());
+        // the same segments, [`resolve_ship_target`], and
+        // [`polish_marker_present`] the gate uses, so the metric can never
+        // disagree with the gate (#177). Recorded alongside `polished` (the
+        // transcript scan) so scan-vs-marker drift is measurable. The target
+        // kind rides along (cadence-hooks#995): a `cannot_check` row is a ship
+        // the gate could not look up, which is not the same as a nudged skip.
+        let work_dir = input.cwd.as_deref().map(|cwd| parse_work_dir(command, cwd));
+        let lookups: Vec<(&'static str, bool)> = segments
+            .iter()
+            .map(|segment| {
+                let target = resolve_ship_target(&segment.target, work_dir.as_deref());
+                (target.kind(), polish_marker_present(&target))
+            })
+            .collect();
+        let marker = combine_marker_lookups(&lookups);
 
         let dir = common::metrics_dir();
         if std::fs::create_dir_all(&dir).is_err() {
@@ -112,7 +128,7 @@ impl Logger for LogPolishNudge {
             &common::branch(input.cwd.as_deref()),
             &common::repo_basename(input.cwd.as_deref()),
             polished,
-            marker_present,
+            marker,
             anchor,
         );
 
@@ -130,6 +146,32 @@ impl Logger for LogPolishNudge {
     }
 }
 
+/// What the gate's marker lookup found: whether a marker exists, and which
+/// kind of target it was looked up for (`local`, `cannot_check`, `unknown`).
+struct MarkerSignal<'a> {
+    present: bool,
+    target: &'a str,
+}
+
+/// One row for a command whose anchoring segments were each looked up
+/// (`(target kind, marker present)` per segment, cadence-hooks#995).
+///
+/// - `markerPresent` is true only when **every** segment's marker is
+///   present. The gate nudges when any segment's is missing, so a row that
+///   said `true` there would disagree with the gate (#177).
+/// - `markerTarget` is the least-resolved kind across segments:
+///   `cannot_check`, then `unknown`, then `local`. A command with one
+///   cannot-check ship is not a clean local lookup, so it is not counted as
+///   one.
+fn combine_marker_lookups(lookups: &[(&'static str, bool)]) -> MarkerSignal<'static> {
+    let present = !lookups.is_empty() && lookups.iter().all(|(_, present)| *present);
+    let target = ["cannot_check", "unknown"]
+        .into_iter()
+        .find(|kind| lookups.iter().any(|(k, _)| k == kind))
+        .unwrap_or("local");
+    MarkerSignal { present, target }
+}
+
 /// Build the `polish_nudges.jsonl` record. Pure — no I/O.
 fn build_polish_nudge_record(
     ts: &str,
@@ -137,7 +179,7 @@ fn build_polish_nudge_record(
     branch: &str,
     repo: &str,
     polished: bool,
-    marker_present: bool,
+    marker: MarkerSignal<'_>,
     anchor: &str,
 ) -> Value {
     json!({
@@ -148,7 +190,8 @@ fn build_polish_nudge_record(
         "branch": branch,
         "repo": repo,
         "polished": polished,
-        "markerPresent": marker_present,
+        "markerPresent": marker.present,
+        "markerTarget": marker.target,
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
     })
@@ -180,7 +223,10 @@ mod tests {
             "feat/x",
             "myrepo",
             false,
-            false,
+            MarkerSignal {
+                present: false,
+                target: "local",
+            },
             "ready",
         );
         assert_eq!(rec["ts"], "2026-06-21T00:00:00Z");
@@ -195,6 +241,7 @@ mod tests {
         assert_eq!(rec["polished"], false);
         // The branch-scoped marker signal, recorded alongside `polished`.
         assert_eq!(rec["markerPresent"], false);
+        assert_eq!(rec["markerTarget"], "local");
         assert_eq!(rec["agentId"], "a1");
         // Main-thread field absent → null, not omitted.
         assert!(rec["parentSessionId"].is_null());
@@ -208,7 +255,10 @@ mod tests {
             "feat/x",
             "myrepo",
             true,
-            false,
+            MarkerSignal {
+                present: false,
+                target: "local",
+            },
             "create",
         );
         assert_eq!(rec["polished"], true);
@@ -224,10 +274,190 @@ mod tests {
             "feat/x",
             "myrepo",
             false,
-            true,
+            MarkerSignal {
+                present: true,
+                target: "local",
+            },
             "create",
         );
         assert_eq!(rec["markerPresent"], true);
         assert_eq!(rec["polished"], false);
+    }
+
+    #[test]
+    fn combine_marker_lookups_reports_the_worst_segment() {
+        let one = combine_marker_lookups(&[("local", true)]);
+        assert!(one.present);
+        assert_eq!(one.target, "local");
+        // Any missing marker makes the row a miss, as it makes the gate nudge.
+        let mixed = combine_marker_lookups(&[("local", true), ("local", false)]);
+        assert!(!mixed.present);
+        assert_eq!(mixed.target, "local");
+        // The least-resolved kind wins: cannot_check, then unknown, then local.
+        let worst =
+            combine_marker_lookups(&[("local", true), ("unknown", false), ("cannot_check", false)]);
+        assert_eq!(worst.target, "cannot_check");
+        assert_eq!(
+            combine_marker_lookups(&[("local", true), ("unknown", false)]).target,
+            "unknown"
+        );
+        assert!(!combine_marker_lookups(&[]).present);
+    }
+
+    /// Run `f` with `CADENCE_METRICS_DIR` set to `dir`, under the crate's one
+    /// env lock (`common::ENV_LOCK`), restoring the variable even if `f`
+    /// panics.
+    fn with_metrics_dir(dir: &std::path::Path, f: impl FnOnce()) {
+        let _guard = common::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other env-mutating test crate-wide
+        // via `common::ENV_LOCK`.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", dir);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: the same lock is still held.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn logged_rows(metrics: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(metrics.join("polish_nudges.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn run_logs_the_same_target_the_gate_resolves() {
+        // #177 on the logger side (#995): a `--head` ship from `main` whose
+        // only marker is for the head's worktree branch must log a present,
+        // local marker; a foreign `-R` must log `cannot_check`.
+        use cadence_hooks_core::ToolInput;
+        use cadence_hooks_core::gitstate::GitState;
+        use cadence_hooks_core::markers::{polish_marker, write_marker};
+        use cadence_hooks_core::test_builders::with_marker_dir;
+
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        git_in(repo.path(), &["config", "user.email", "t@t"]);
+        git_in(repo.path(), &["config", "user.name", "t"]);
+        git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/own/repo.git"],
+        );
+        git_in(repo.path(), &["branch", "feat/x"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git_in(
+            repo.path(),
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/x"],
+        );
+        let root = GitState::resolve(repo.path())
+            .unwrap()
+            .git_common_dir
+            .to_string_lossy()
+            .into_owned();
+
+        let input = |command: &str| MetricsInput {
+            session_id: Some("s1".into()),
+            cwd: Some(repo.path().to_str().unwrap().to_string()),
+            tool_input: Some(ToolInput {
+                command: Some(command.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let metrics = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        with_metrics_dir(metrics.path(), || {
+            with_marker_dir(markers.path(), || {
+                write_marker(&polish_marker(&root, "feat/x"), "{}").unwrap();
+                LogPolishNudge.run(&input("gh pr create --head feat/x -t a"));
+                LogPolishNudge.run(&input("gh pr create -R other/r -t a"));
+            });
+        });
+
+        let rows = logged_rows(metrics.path());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["markerTarget"], "local");
+        assert_eq!(rows[0]["markerPresent"], true);
+        assert_eq!(rows[1]["markerTarget"], "cannot_check");
+        assert_eq!(rows[1]["markerPresent"], false);
+    }
+
+    #[test]
+    fn run_logs_an_own_repo_merge_with_an_ssh_alias_origin() {
+        // #995 round 2: the logger builds the origin the same way as the
+        // gate, so an own-repo `-R` merge with an SSH-alias origin is a
+        // logged ship, as it is a nudged one.
+        use cadence_hooks_core::ToolInput;
+        use cadence_hooks_core::test_builders::with_marker_dir;
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "feat/x"]);
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "git@github-work:own/repo.git"],
+        );
+        let input = MetricsInput {
+            session_id: Some("s1".into()),
+            cwd: Some(repo.path().to_str().unwrap().to_string()),
+            tool_input: Some(ToolInput {
+                command: Some("gh pr merge -R own/repo".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The merge resolves a Local target, so keep the marker lookup off
+        // the real per-user dir and under the shared lock (#302, #369).
+        let metrics = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        with_metrics_dir(metrics.path(), || {
+            with_marker_dir(markers.path(), || LogPolishNudge.run(&input));
+        });
+        let rows = logged_rows(metrics.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["anchor"], "merge");
+    }
+
+    #[test]
+    fn record_carries_a_cannot_check_target() {
+        // #995: a ship the gate could not look up must not read as a nudged
+        // skip in the ledger.
+        let rec = build_polish_nudge_record(
+            "ts",
+            &sample_input(),
+            "main",
+            "myrepo",
+            false,
+            MarkerSignal {
+                present: false,
+                target: "cannot_check",
+            },
+            "create",
+        );
+        assert_eq!(rec["markerTarget"], "cannot_check");
+        assert_eq!(rec["markerPresent"], false);
     }
 }

@@ -1924,8 +1924,9 @@ mod tests {
 
             assert!(
                 cadence_hooks_core::markers::polish_marker_present(
-                    "gh pr create --title x",
-                    Some(primary.to_str().unwrap()),
+                    &cadence_hooks_core::markers::MarkerTarget::Local {
+                        work_dir: primary.to_str().unwrap().to_string(),
+                    }
                 ),
                 "a polish marker recorded from a linked worktree must satisfy a ship \
                  command run from the primary checkout on the same branch"
@@ -2024,8 +2025,9 @@ mod tests {
 
             assert!(
                 cadence_hooks_core::markers::polish_marker_present(
-                    "gh pr create --title x",
-                    Some(&wt_str),
+                    &cadence_hooks_core::markers::MarkerTarget::Local {
+                        work_dir: wt_str.to_string(),
+                    }
                 ),
                 "a marker recorded via --repo-root must be readable by the ship gate"
             );
