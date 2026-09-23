@@ -1229,17 +1229,22 @@ mod tests {
         ] {
             let (tmp, _root) =
                 init_repo_with_real_origin_remote("feat/alias-merge", url, &["src/lib.rs"]);
-            for cmd in [
-                "gh pr merge -R cameronsjo/cadence-hooks",
-                "gh pr merge -R github.com/cameronsjo/cadence-hooks",
-            ] {
-                let input = make_bash_with_cwd(cmd, tmp.path().to_str().unwrap());
-                assert_eq!(
-                    NudgePolishBeforePr.run(&input).outcome,
-                    Outcome::Nudge,
-                    "{cmd} with origin {url}"
-                );
-            }
+            // The merge resolves a Local target, so keep the marker lookup
+            // off the real per-user dir and under the shared lock (#302, #369).
+            let marker_tmp = tempfile::tempdir().unwrap();
+            with_marker_dir(marker_tmp.path(), || {
+                for cmd in [
+                    "gh pr merge -R cameronsjo/cadence-hooks",
+                    "gh pr merge -R github.com/cameronsjo/cadence-hooks",
+                ] {
+                    let input = make_bash_with_cwd(cmd, tmp.path().to_str().unwrap());
+                    assert_eq!(
+                        NudgePolishBeforePr.run(&input).outcome,
+                        Outcome::Nudge,
+                        "{cmd} with origin {url}"
+                    );
+                }
+            });
         }
     }
 
@@ -2599,11 +2604,14 @@ mod tests {
     #[test]
     fn two_different_heads_cannot_check() {
         let (tmp, _root) = init_repo_with_real_origin_remote("a", OWN_URL, &[]);
-        let result = run_at(
-            "gh pr create --head a --head b",
-            tmp.path().to_str().unwrap(),
-        );
-        assert_cannot_check(&result, "--head");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        let result = with_marker_dir(marker_tmp.path(), || {
+            run_at(
+                "gh pr create --head a --head b",
+                tmp.path().to_str().unwrap(),
+            )
+        });
+        assert_cannot_check(&result, "--head could not be read");
     }
 
     #[test]

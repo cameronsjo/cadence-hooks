@@ -293,7 +293,9 @@ fn decide_ship_target(
         ShipHead::Current => None,
         ShipHead::Ambiguous => {
             return cannot_check(
-                "the command names more than one --head, or a --head with no value".to_string(),
+                "the command's --head could not be read (conflicting values, no value, or a \
+                 --head after a flag this check does not know)"
+                    .to_string(),
             );
         }
         ShipHead::Named(value) => Some(value.as_str()),
@@ -1829,10 +1831,17 @@ mod tests {
 
     #[test]
     fn decide_ambiguous_head_cannot_check() {
-        assert!(is_cannot_check(&decide(
-            &target(&[], None, ShipHead::Ambiguous),
-            OWN
-        )));
+        let result = decide(&target(&[], None, ShipHead::Ambiguous), OWN);
+        let MarkerTarget::CannotCheck { reason } = result else {
+            panic!("expected CannotCheck, got {result:?}");
+        };
+        // Ambiguous covers conflicting heads, a missing value, and a head
+        // after an unknown flag; the reason must not claim only the first.
+        assert!(
+            reason.starts_with("the command's --head could not be read"),
+            "{reason}"
+        );
+        assert!(reason.contains("does not know"), "{reason}");
     }
 
     #[test]

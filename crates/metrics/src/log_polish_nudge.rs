@@ -413,6 +413,7 @@ mod tests {
         // gate, so an own-repo `-R` merge with an SSH-alias origin is a
         // logged ship, as it is a nudged one.
         use cadence_hooks_core::ToolInput;
+        use cadence_hooks_core::test_builders::with_marker_dir;
         let repo = tempfile::tempdir().unwrap();
         git_in(repo.path(), &["init", "-q", "-b", "feat/x"]);
         git_in(
@@ -428,8 +429,13 @@ mod tests {
             }),
             ..Default::default()
         };
+        // The merge resolves a Local target, so keep the marker lookup off
+        // the real per-user dir and under the shared lock (#302, #369).
         let metrics = tempfile::tempdir().unwrap();
-        with_metrics_dir(metrics.path(), || LogPolishNudge.run(&input));
+        let markers = tempfile::tempdir().unwrap();
+        with_metrics_dir(metrics.path(), || {
+            with_marker_dir(markers.path(), || LogPolishNudge.run(&input));
+        });
         let rows = logged_rows(metrics.path());
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["anchor"], "merge");
