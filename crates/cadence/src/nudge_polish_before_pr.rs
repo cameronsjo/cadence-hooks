@@ -130,7 +130,7 @@ use cadence_hooks_core::markers::{
     read_polish_marker, resolve_ship_target,
 };
 use cadence_hooks_core::shell::{
-    git_command, host_and_repo_from_url, merge_anchor_repo_targets, parse_work_dir,
+    git_command, merge_anchor_repo_targets, origin_triple, parse_work_dir,
     polish_ship_segments_for_origin,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -229,8 +229,9 @@ impl Check for NudgePolishBeforePr {
             .as_deref()
             .filter(|_| merge_anchor_repo_targets(command).is_some())
             .and_then(|dir| git_command(dir, &["remote", "get-url", "origin"]))
-            .and_then(|url| host_and_repo_from_url(&url))
-            .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
+            // The same host mapping the #995 resolver applies to every remote
+            // (an SSH alias, `ssh.github.com`), so both compare sites agree.
+            .and_then(|url| origin_triple(&url));
         // Every anchoring segment is judged, not only the first (security
         // review, #995 I1): `gh pr create --head polished && gh pr create
         // --head unpolished` ships twice, and a polished first ship must not
@@ -1216,6 +1217,30 @@ mod tests {
             tmp.path().to_str().unwrap(),
         );
         assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn run_own_repo_merge_with_an_ssh_alias_or_443_origin_nudges() {
+        // #995 round 2: with an SSH-alias origin or GitHub's SSH-over-443
+        // host, an own-repo `-R` merge never anchored and stayed silent.
+        for url in [
+            "git@github-work:cameronsjo/cadence-hooks.git",
+            "ssh://git@ssh.github.com:443/cameronsjo/cadence-hooks.git",
+        ] {
+            let (tmp, _root) =
+                init_repo_with_real_origin_remote("feat/alias-merge", url, &["src/lib.rs"]);
+            for cmd in [
+                "gh pr merge -R cameronsjo/cadence-hooks",
+                "gh pr merge -R github.com/cameronsjo/cadence-hooks",
+            ] {
+                let input = make_bash_with_cwd(cmd, tmp.path().to_str().unwrap());
+                assert_eq!(
+                    NudgePolishBeforePr.run(&input).outcome,
+                    Outcome::Nudge,
+                    "{cmd} with origin {url}"
+                );
+            }
+        }
     }
 
     #[test]

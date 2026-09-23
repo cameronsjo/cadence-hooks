@@ -21,7 +21,7 @@
 use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::{
-    ShipHead, ShipTarget, gh_repo_value_parts, git_command, host_and_repo_from_url,
+    ShipHead, ShipTarget, git_command, remote_host_and_slug, repo_value_names_remote,
 };
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
@@ -373,46 +373,24 @@ fn echo_safe(value: &str) -> String {
 }
 
 /// True when the `-R`/`--repo`/`GH_REPO=` `value` names one of `remotes`
-/// (`(host, owner/repo)` pairs, lowercased). The host is compared only when
-/// the value names one or `gh_host` (an inline `GH_HOST=`) set it.
+/// (`(host, owner/repo)` pairs from [`git_remotes`]). The comparison is
+/// [`repo_value_names_remote`], shared with the #881 merge anchor. A bare
+/// slug compares `owner/repo` alone unless `gh_host` (an inline `GH_HOST=`)
+/// names a host.
 fn repo_value_is_a_remote(
     value: &str,
     gh_host: Option<&str>,
     remotes: &[(String, String)],
 ) -> bool {
-    let Some((value_host, slug)) = gh_repo_value_parts(value) else {
-        return false;
-    };
-    let host = value_host.or_else(|| gh_host.map(str::to_ascii_lowercase));
     remotes.iter().any(|(remote_host, remote_slug)| {
-        *remote_slug == slug
-            && host
-                .as_deref()
-                .is_none_or(|h| host_is_unknowable(remote_host) || h == remote_host)
+        repo_value_names_remote(value, gh_host, remote_host, remote_slug)
     })
 }
 
-/// A remote host that cannot be compared to a forge host: an SSH config alias
-/// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
-/// the `owner/repo` comparison applies to such a remote.
-fn host_is_unknowable(remote_host: &str) -> bool {
-    !remote_host.contains('.')
-}
-
-/// The forge host a remote URL's host stands for. GitHub serves SSH over port
-/// 443 at `ssh.github.com`, which is still `github.com` to gh.
-fn forge_host(host: String) -> String {
-    if host == "ssh.github.com" {
-        "github.com".to_string()
-    } else {
-        host
-    }
-}
-
-/// Every remote of the repo at `dir`, as lowercased `(host, owner/repo)`
-/// pairs. A remote whose URL has no owner/repo shape (a local path) is
-/// skipped. A failed or timed-out git yields no remotes, which makes every
-/// repo value a non-match and the result an advisory, never a silent allow.
+/// Every remote of the repo at `dir`, as [`remote_host_and_slug`] pairs. A
+/// remote whose URL has no owner/repo shape (a local path) is skipped. A
+/// failed or timed-out git yields no remotes, which makes every repo value a
+/// non-match and the result an advisory, never a silent allow.
 fn git_remotes(dir: &str) -> Vec<(String, String)> {
     let Some(output) = git_command(dir, &["remote", "-v"]) else {
         return Vec::new();
@@ -420,8 +398,7 @@ fn git_remotes(dir: &str) -> Vec<(String, String)> {
     output
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
-        .filter_map(host_and_repo_from_url)
-        .map(|(host, slug)| (forge_host(host), slug.to_ascii_lowercase()))
+        .filter_map(remote_host_and_slug)
         .collect()
 }
 
@@ -1797,6 +1774,7 @@ mod tests {
 
     #[test]
     fn forge_host_maps_github_ssh_over_443() {
+        use crate::shell::forge_host;
         assert_eq!(forge_host("ssh.github.com".to_string()), "github.com");
         assert_eq!(forge_host("ghe.example.com".to_string()), "ghe.example.com");
     }

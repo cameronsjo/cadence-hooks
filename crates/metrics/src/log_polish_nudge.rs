@@ -24,7 +24,7 @@
 use crate::common;
 use cadence_hooks_core::markers::{polish_marker_present, resolve_ship_target};
 use cadence_hooks_core::shell::{
-    git_command, host_and_repo_from_url, merge_anchor_repo_targets, parse_work_dir,
+    git_command, merge_anchor_repo_targets, origin_triple, parse_work_dir,
     polish_ship_segments_for_origin,
 };
 use cadence_hooks_core::transcript::{
@@ -62,8 +62,9 @@ impl Logger for LogPolishNudge {
             .filter(|_| merge_anchor_repo_targets(command).is_some())
             .map(|cwd| parse_work_dir(command, cwd))
             .and_then(|dir| git_command(&dir, &["remote", "get-url", "origin"]))
-            .and_then(|url| host_and_repo_from_url(&url))
-            .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
+            // The same host mapping the #995 resolver applies to every remote
+            // (an SSH alias, `ssh.github.com`), so both compare sites agree.
+            .and_then(|url| origin_triple(&url));
         // One pass over the segments gives both the anchor kind (the first
         // anchoring segment's, as `polish_ship_anchor_for_origin` reports it)
         // and every segment's target.
@@ -404,6 +405,34 @@ mod tests {
         assert_eq!(rows[0]["markerPresent"], true);
         assert_eq!(rows[1]["markerTarget"], "cannot_check");
         assert_eq!(rows[1]["markerPresent"], false);
+    }
+
+    #[test]
+    fn run_logs_an_own_repo_merge_with_an_ssh_alias_origin() {
+        // #995 round 2: the logger builds the origin the same way as the
+        // gate, so an own-repo `-R` merge with an SSH-alias origin is a
+        // logged ship, as it is a nudged one.
+        use cadence_hooks_core::ToolInput;
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "feat/x"]);
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "git@github-work:own/repo.git"],
+        );
+        let input = MetricsInput {
+            session_id: Some("s1".into()),
+            cwd: Some(repo.path().to_str().unwrap().to_string()),
+            tool_input: Some(ToolInput {
+                command: Some("gh pr merge -R own/repo".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let metrics = tempfile::tempdir().unwrap();
+        with_metrics_dir(metrics.path(), || LogPolishNudge.run(&input));
+        let rows = logged_rows(metrics.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["anchor"], "merge");
     }
 
     #[test]

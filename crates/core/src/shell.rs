@@ -1276,14 +1276,17 @@ impl GhPrInvocation<'_> {
         if self.host_overridden {
             return false;
         }
-        let Some(origin) = origin else {
+        let Some((origin_host, origin_slug)) = origin.and_then(|o| o.split_once('/')) else {
             return false;
         };
+        // A bare `owner/repo` means github.com to gh (no `GH_HOST=` reaches
+        // here), so that is the host it implies. The comparison itself is
+        // the one the #995 resolver uses, so an SSH-alias origin matches on
+        // `owner/repo` alone at both sites.
         !self.repo_targets.is_empty()
-            && self
-                .repo_targets
-                .iter()
-                .all(|target| normalize_gh_target(target).as_deref() == Some(origin))
+            && self.repo_targets.iter().all(|target| {
+                repo_value_names_remote(target, Some(GH_DEFAULT_HOST), origin_host, origin_slug)
+            })
     }
 }
 
@@ -2051,30 +2054,74 @@ pub fn gh_repo_value_parts(value: &str) -> Option<(Option<String>, String)> {
     ))
 }
 
-/// Canonical `(host, owner/repo)` triple, lowercased, for a `-R`/`--repo`/
-/// `GH_REPO=` VALUE — in every shape gh accepts (cadence-hooks#881): a bare
-/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (https, ssh,
-/// or SCP-style). Measured live against gh 2.96.0: `gh pr list -R
-/// https://github.com/cameronsjo/cadence-hooks` and `-R
-/// git@github.com:cameronsjo/cadence-hooks.git` both resolved, rc 0.
+/// The host gh assumes for a bare `OWNER/REPO` when no `GH_HOST` is set.
+pub const GH_DEFAULT_HOST: &str = "github.com";
+
+/// True when the `-R`/`--repo`/`GH_REPO=` `value` names the remote at
+/// `remote_host`/`remote_slug` (both as [`remote_host_and_slug`] returns
+/// them). **The one comparison between a repo value and a remote**, shared by
+/// the #881 merge anchor ([`GhPrInvocation::targets_the_current_branch`]) and
+/// the #995 resolver (`markers::resolve_ship_target`), so the two cannot
+/// drift apart (security review, #995 round 2).
 ///
-/// A URL form is tried FIRST via [`host_and_repo_from_url`], because
-/// splitting on `/` would otherwise misparse a URL's path segments as a bare
-/// slug. Exactly two plain slash segments default the host to
-/// `github.com`, matching gh's own default — this branch is only reached
-/// when no `GH_HOST=` prefix is present, because that prefix already sets
-/// [`GhPrInvocation::host_overridden`] and suppresses eligibility before this
-/// runs. Three or more segments are `HOST/OWNER/REPO`; the first is the host,
-/// the next two are the slug, and anything after that (a subpath) is
-/// discarded — same as [`host_and_repo_from_url`] does for a URL's path.
-/// Anything else — one segment, an empty owner or repo — returns `None`,
-/// which suppresses the same way an unattributable target always has.
-fn normalize_gh_target(value: &str) -> Option<String> {
-    let (host, slug) = gh_repo_value_parts(value)?;
-    Some(format!(
-        "{}/{slug}",
-        host.as_deref().unwrap_or("github.com")
-    ))
+/// Every shape gh accepts is read ([`gh_repo_value_parts`]): a bare
+/// `OWNER/REPO`, a `HOST/OWNER/REPO`, or a full git remote URL (measured
+/// against gh 2.96.0: `-R https://github.com/cameronsjo/cadence-hooks` and
+/// `-R git@github.com:cameronsjo/cadence-hooks.git` both resolved). The
+/// `owner/repo` slugs must be equal. The host is compared when the value
+/// names one, or else against `implied_host` (the host a bare slug means to
+/// the caller); `None` there compares the slug alone. A remote whose host is
+/// an SSH config alias ([`host_is_unknowable`]) matches on the slug alone,
+/// because the alias names no real host to compare.
+pub fn repo_value_names_remote(
+    value: &str,
+    implied_host: Option<&str>,
+    remote_host: &str,
+    remote_slug: &str,
+) -> bool {
+    let Some((value_host, slug)) = gh_repo_value_parts(value) else {
+        return false;
+    };
+    if slug != remote_slug {
+        return false;
+    }
+    let host = value_host
+        .or_else(|| implied_host.map(str::to_ascii_lowercase))
+        .map(forge_host);
+    host.is_none_or(|host| host_is_unknowable(remote_host) || host == remote_host)
+}
+
+/// A remote URL as `(host, owner/repo)`: the host mapped by [`forge_host`],
+/// the slug lowercased. Every caller that compares a repo value to a remote
+/// builds the remote side with this.
+pub fn remote_host_and_slug(url: &str) -> Option<(String, String)> {
+    let (host, slug) = host_and_repo_from_url(url)?;
+    Some((forge_host(host), slug.to_ascii_lowercase()))
+}
+
+/// The `host/owner/repo` origin string [`is_polish_ship_anchor_for_origin`]
+/// takes, built from the origin remote's URL by [`remote_host_and_slug`].
+pub fn origin_triple(url: &str) -> Option<String> {
+    let (host, slug) = remote_host_and_slug(url)?;
+    Some(format!("{host}/{slug}"))
+}
+
+/// A remote host that cannot be compared to a forge host: an SSH config alias
+/// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
+/// the `owner/repo` comparison applies to such a remote. A real dotless host
+/// (`localhost`, a LAN short name) is treated the same way.
+pub fn host_is_unknowable(remote_host: &str) -> bool {
+    !remote_host.contains('.')
+}
+
+/// The forge host a URL's host stands for. GitHub serves SSH over port 443 at
+/// `ssh.github.com`, which is still `github.com` to gh.
+pub fn forge_host(host: String) -> String {
+    if host == "ssh.github.com" {
+        GH_DEFAULT_HOST.to_string()
+    } else {
+        host
+    }
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -6016,6 +6063,63 @@ mod tests {
         assert!(is_polish_ship_anchor_for_origin(
             "gh -R owner/r pr ready 12",
             Some(OWN_ORIGIN)
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_for_origin_ssh_alias_and_443_origins_anchor() {
+        // #995 round 2: the origin goes through the same host mapping as the
+        // resolver's remotes. An SSH-alias origin names no real host, and
+        // `ssh.github.com` is github.com, so both spellings anchor.
+        for url in [
+            "git@github-work:own/repo.git",
+            "ssh://git@ssh.github.com:443/own/repo.git",
+        ] {
+            let origin = origin_triple(url).expect("origin parses");
+            for cmd in [
+                "gh pr merge -R own/repo",
+                "gh pr merge -R github.com/own/repo",
+            ] {
+                assert!(
+                    is_polish_ship_anchor_for_origin(cmd, Some(&origin)),
+                    "{cmd} with origin {url}"
+                );
+            }
+            assert!(
+                !is_polish_ship_anchor_for_origin("gh pr merge -R other/repo", Some(&origin)),
+                "a different slug must stay suppressed with origin {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_triple_maps_the_host() {
+        assert_eq!(
+            origin_triple("ssh://git@ssh.github.com:443/Own/Repo.git").as_deref(),
+            Some("github.com/own/repo")
+        );
+        assert_eq!(
+            origin_triple("git@github-work:own/repo.git").as_deref(),
+            Some("github-work/own/repo")
+        );
+    }
+
+    #[test]
+    fn repo_value_names_remote_keeps_the_merge_default_host() {
+        // A bare slug on the merge path still means github.com, so it does
+        // not match a real non-GitHub origin host.
+        assert!(!repo_value_names_remote(
+            "own/repo",
+            Some(GH_DEFAULT_HOST),
+            "ghe.example.com",
+            "own/repo"
+        ));
+        // The resolver passes no implied host, so the slug alone decides.
+        assert!(repo_value_names_remote(
+            "own/repo",
+            None,
+            "ghe.example.com",
+            "own/repo"
         ));
     }
 
