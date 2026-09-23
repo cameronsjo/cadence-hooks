@@ -1755,10 +1755,11 @@ fn combine_heads(heads: &[Option<String>]) -> ShipHead {
 /// are handled by the scan itself and are not listed.
 ///
 /// Taken from `gh pr <sub> --help` (gh 2.101.0). gh adds flags over time; a
-/// flag missing from this table is read as **unknown**, and the scan treats a
-/// head or repo spelling right after an unknown flag as unreadable rather
-/// than trusting it. So a new gh flag can cost a spurious advisory, never a
-/// silent allow.
+/// flag missing from this table is read as **unknown**. After an unknown flag
+/// the scan can no longer tell which later tokens are values, so every head or
+/// repo spelling in the rest of that segment reads as unreadable rather than
+/// trusted. So a new gh flag can cost a spurious advisory, never a silent
+/// allow.
 struct FlagGrammar {
     short_values: &'static str,
     short_bools: &'static str,
@@ -1861,9 +1862,10 @@ struct TokenRead {
     values: Vec<FlagValue>,
     /// How many tokens this one consumed: 2 when its value is the next token.
     consumed: usize,
-    /// The token was a flag this grammar does not know, with no value
-    /// attached. It may take the next token as its value.
-    unknown_may_take_next: bool,
+    /// The token was, or contained, a flag this grammar does not know whose
+    /// value is not certain (a long flag with no `=value`, or any unknown
+    /// shorthand). Which later tokens are values can no longer be told.
+    taints_rest: bool,
 }
 
 impl TokenRead {
@@ -1871,7 +1873,7 @@ impl TokenRead {
         TokenRead {
             values,
             consumed: 1,
-            unknown_may_take_next: false,
+            taints_rest: false,
         }
     }
 }
@@ -1888,16 +1890,19 @@ impl TokenRead {
 ///   same way, which ends the walk.
 /// - A value-taking flag consumes the next token whatever it looks like, so
 ///   `--head --title` names a head of `--title`.
-/// - Where the scan cannot tell (an unknown flag that may have taken the next
-///   token, or an unknown shorthand with `H` or `R` after it), the head or
-///   repo reads as unreadable. That resolves to the cannot-check advisory,
-///   never to a named branch.
+/// - Where the scan cannot tell, the head or repo reads as unreadable, which
+///   resolves to the cannot-check advisory, never to a named branch. After an
+///   unknown flag whose value is not certain (a long flag with no `=value`,
+///   or any unknown shorthand), the rest of the segment cannot be aligned:
+///   `--newflag -t -Hx` may be `--newflag -t` then `--head x`, and `-zt -Hx`
+///   may be `-z -t -Hx` or `-z=t --head x`. So every later token is read on
+///   its own, and any head or repo spelling in it is unreadable.
 /// - Stops at `--` (cobra reads everything after it as positional) and at a
 ///   comment. Redirect operators and their targets are skipped
 ///   ([`skip_redirect`]), since gh never sees them.
 fn scan_ship_flags(grammar: &FlagGrammar, operands: &[String]) -> ShipFlagScan {
     let mut scan = ShipFlagScan::default();
-    let mut after_unknown = false;
+    let mut tainted = false;
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
@@ -1911,16 +1916,19 @@ fn scan_ship_flags(grammar: &FlagGrammar, operands: &[String]) -> ShipFlagScan {
         let read = read_flag_token(grammar, token, operands.get(i + 1).map(String::as_str));
         for value in read.values {
             match value {
-                // The unknown flag before this token may have taken it as
-                // its value, so what it names cannot be trusted.
-                FlagValue::Head(_) if after_unknown => scan.heads.push(None),
-                FlagValue::Repo(_) if after_unknown => scan.repos.push(String::new()),
+                // An earlier unknown flag broke the alignment of flags and
+                // values, so what this token names cannot be trusted.
+                FlagValue::Head(_) if tainted => scan.heads.push(None),
+                FlagValue::Repo(_) if tainted => scan.repos.push(String::new()),
                 FlagValue::Head(head) => scan.heads.push(head),
                 FlagValue::Repo(repo) => scan.repos.push(repo),
             }
         }
-        after_unknown = read.unknown_may_take_next;
-        i += read.consumed;
+        // Once tainted, a token is never skipped as a value: each later token
+        // is read on its own, so a head or repo spelling hiding where the
+        // grammar expects a value is still seen (as unreadable).
+        i += if tainted { 1 } else { read.consumed };
+        tainted |= read.taints_rest;
     }
     scan
 }
@@ -1945,7 +1953,7 @@ fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> To
                 TokenRead {
                     values: vec![FlagValue::Repo(value.unwrap_or_default())],
                     consumed,
-                    unknown_may_take_next: false,
+                    taints_rest: false,
                 }
             }
             "head" if grammar.reads_head => {
@@ -1953,19 +1961,19 @@ fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> To
                 TokenRead {
                     values: vec![FlagValue::Head(value)],
                     consumed,
-                    unknown_may_take_next: false,
+                    taints_rest: false,
                 }
             }
             name if grammar.long_values.contains(&name) => TokenRead {
                 values: Vec::new(),
                 consumed: value_of(attached).1,
-                unknown_may_take_next: false,
+                taints_rest: false,
             },
             name if grammar.long_bools.contains(&name) => TokenRead::plain(Vec::new()),
             _ => TokenRead {
                 values: Vec::new(),
                 consumed: 1,
-                unknown_may_take_next: attached.is_none(),
+                taints_rest: attached.is_none(),
             },
         };
     }
@@ -1982,21 +1990,21 @@ fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> To
                 return TokenRead {
                     values: vec![FlagValue::Repo(value.unwrap_or_default())],
                     consumed,
-                    unknown_may_take_next: false,
+                    taints_rest: false,
                 };
             }
             'H' if grammar.reads_head => {
                 return TokenRead {
                     values: vec![FlagValue::Head(value)],
                     consumed,
-                    unknown_may_take_next: false,
+                    taints_rest: false,
                 };
             }
             letter if grammar.short_values.contains(letter) => {
                 return TokenRead {
                     values: Vec::new(),
                     consumed,
-                    unknown_may_take_next: false,
+                    taints_rest: false,
                 };
             }
             letter if grammar.short_bools.contains(letter) => {}
@@ -2014,7 +2022,10 @@ fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> To
                 return TokenRead {
                     values,
                     consumed: 1,
-                    unknown_may_take_next: rest.is_empty(),
+                    // Whether this letter takes a value (the rest, or the next
+                    // token) or is a bool (so a later letter might take one),
+                    // what follows cannot be aligned either way.
+                    taints_rest: true,
                 };
             }
         }
@@ -6333,6 +6344,31 @@ mod tests {
         // A known bool before the head stays readable.
         assert_eq!(
             target_of("gh pr create --fill --head feat/x").head,
+            named("feat/x")
+        );
+    }
+
+    #[test]
+    fn ship_target_an_unknown_flag_taints_the_rest_of_the_segment() {
+        // #995 round 2: the taint used to last one token. If `--newflag`
+        // takes a value it swallows `-t`, and `-Hfeat/x` is the head.
+        assert_eq!(
+            target_of("gh pr create --newflag -t -Hfeat/x").head,
+            ShipHead::Ambiguous
+        );
+        // If `-z` is a bool, `t` takes `-Hfeat/x` as the title; if it takes
+        // `t` as its value, `-Hfeat/x` is the head. Neither can be told.
+        assert_eq!(
+            target_of("gh pr create -zt -Hfeat/x").head,
+            ShipHead::Ambiguous
+        );
+        assert_eq!(
+            target_of("gh pr create --newflag x y z -R own/repo").repos,
+            vec![String::new()]
+        );
+        // An unknown flag with an attached value leaves the alignment intact.
+        assert_eq!(
+            target_of("gh pr create --newflag=x -t t -H feat/x").head,
             named("feat/x")
         );
     }

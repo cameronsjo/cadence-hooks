@@ -2836,6 +2836,22 @@ mod tests {
     }
 
     #[test]
+    fn a_head_after_an_unknown_flag_is_never_an_allow() {
+        // #995 round 2: past an unknown flag the scan cannot tell values from
+        // flags, so a head spelling there gives the advisory, never a lookup
+        // on whichever branch it happened to read.
+        with_three_branch_fixture("feat/unpol", |cwd| {
+            assert_cannot_check(&run_at("gh pr create -zt -Hfeat/pol", cwd), "--head");
+        });
+        with_three_branch_fixture("feat/pol", |cwd| {
+            assert_cannot_check(
+                &run_at("gh pr create --newflag -t -Hfeat/unpol", cwd),
+                "--head",
+            );
+        });
+    }
+
+    #[test]
     fn a_shorthand_cluster_head_or_repo_is_read() {
         with_three_branch_fixture("feat/pol", |cwd| {
             assert_no_polish_nudge(&run_at("gh pr create -fH feat/unpol", cwd));
