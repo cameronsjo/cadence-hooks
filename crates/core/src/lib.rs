@@ -474,7 +474,7 @@ where
 /// Describe a hook-payload parse failure without echoing any of the payload.
 ///
 /// serde's `Display` is not safe to record: a data error quotes the offending
-/// value (`invalid type: integer `424242``, `invalid type: string "…"`), and
+/// value (``invalid type: integer `424242` ``, `invalid type: string "…"`), and
 /// that text reaches the durable `failopen.jsonl` ledger (cadence-hooks#959).
 /// So the message is built only from the error's *shape* — its category, its
 /// line and column, and the payload's byte length — and the error is never

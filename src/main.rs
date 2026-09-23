@@ -771,9 +771,12 @@ fn print_hook_manifest(format: ManifestFormat) {
 
 /// The `error` text a panic writes to the durable `failopen.jsonl` ledger.
 ///
-/// A `&str` payload is kept verbatim: it is a compile-time literal (`panic!`
-/// with no format arguments, `.expect("…")`), so the repo authored every byte
-/// of it. A `String` payload is withheld, because a formatted panic can carry
+/// A `&str` payload is kept verbatim: std produces one only when the message
+/// is a compile-time literal (`panic!` whose format arguments are all
+/// literals), so the repo authored every byte of it. `.expect("…")` on an
+/// `Option` or `Result` arrives as a `String` even with a literal message, so
+/// its text is withheld too; the source location still names the call site.
+/// A `String` payload is withheld, because a formatted panic can carry
 /// runtime data — Rust's own messages are designed to (`slice_error_fail`
 /// quotes the offending string, `Result::unwrap` prints `{:?}` of the error),
 /// and a panic anywhere in the process lands here, including inside `regex`,
@@ -781,8 +784,8 @@ fn print_hook_manifest(format: ManifestFormat) {
 /// (cadence-hooks#959). Only its length is kept. Running the text through
 /// `scan_secret_values` was rejected: it finds secrets, and misses the
 /// ordinary non-secret payload text (paths, commands, prose) that is just as
-/// private here. The source location is always appended; it is compile-time
-/// text too.
+/// private here. The source location is appended when std supplies one; it is
+/// compile-time text too.
 fn panic_row_error(
     payload: &(dyn std::any::Any + Send),
     loc: Option<&std::panic::Location<'_>>,
