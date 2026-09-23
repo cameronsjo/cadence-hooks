@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.102.1] - 2026-09-23
+
 ### Fixed
 
 - **`persist-plan-approval` no longer writes a second copy of a plan when an approve-and-clear session resumes after a reboot.** The injected-prompt arm scans once per session behind a marker in the temp dir. A reboot clears that dir, while the resumed session keeps its id and its transcript still starts with the same implement-prompt. So the arm scanned again and persisted the plan again. The copy was keyed to the new day's date, so the same-stem hash check did not see the first copy, and it also missed any copy moved or renamed since. Before writing, the hook now checks `plan-links.jsonl` for a row with the same `body_sha256` and `child_session_id`. When one exists and no same-day copy is on disk, it writes nothing and nudges with the earlier copy's path. This covers both the approve-and-clear arm and a same-session `ExitPlanMode` re-approval. A plan deleted on purpose and approved again in the same session is not rewritten, and the nudge says to save it by hand. A same-day re-fire whose file is still on disk keeps its existing nudge, and a different session approving the same text still persists. Before 0.82.0 a ledger check keyed on body and machine did this job; the new one is keyed on body and session.
