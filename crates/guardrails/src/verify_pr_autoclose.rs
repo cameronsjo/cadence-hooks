@@ -4,12 +4,23 @@
 //! PostToolUse Bash hook — **always exit 0** (never blocks). Side-effecting:
 //! `handle_merge` may close open issues via `gh issue close`.
 //!
-//! Config knob: `GH_AUTOCLOSE_WAIT_SECONDS` (default `10`).
+//! Config knob: `GH_AUTOCLOSE_WAIT_SECONDS` (default `10`), the maximum wait.
+//! The merge flow waits in two phases: after [`EARLY_CHECK_SECS`] it checks
+//! the referenced issues and returns when GitHub has already closed them all;
+//! otherwise it sleeps the rest of the wait and checks again.
 
 use cadence_hooks_core::shell::{git_command, host_and_repo_from_url};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
+
+/// Seconds into the merge wait at which referenced issues are first checked.
+///
+/// GitHub's auto-close landed 1-2 s after merge in every measured case, so a
+/// check at 2 s usually finds every ref closed already. The early check exits
+/// only when every ref reads CLOSED; otherwise the flow sleeps the remainder,
+/// so the total sleep still equals `wait_secs`.
+const EARLY_CHECK_SECS: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -221,10 +232,15 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
 
 /// Close straggler issues that GitHub's auto-close missed after a PR merge.
 ///
-/// Reads the merged PR's body and, only when it references issues, waits
-/// `wait_secs` (injected via `clock`) to give GitHub time to auto-close, then
-/// checks each referenced issue. If still OPEN, closes it via `gh issue close`
-/// with a commit-citing comment. Returns a summary message naming the closed
+/// Reads the merged PR's body and, only when it references issues, waits for
+/// GitHub to auto-close them (sleeps injected via `clock`). The wait has two
+/// phases: after [`EARLY_CHECK_SECS`] the refs are checked (stopping at the
+/// first one not CLOSED), and if all read CLOSED the function returns `None`
+/// without sleeping further. Otherwise it sleeps the rest of `wait_secs` and
+/// checks each ref again; any still OPEN is closed via `gh issue close` with a
+/// commit-citing comment. When `wait_secs`
+/// is at most [`EARLY_CHECK_SECS`] there is no early phase, only one sleep of
+/// `wait_secs` (none at 0). Returns a summary message naming the closed
 /// issues, or `None` when there was nothing to do. The caller routes the
 /// message through `CheckResult::nudge` so Claude sees it.
 pub fn handle_merge(
@@ -278,7 +294,22 @@ pub fn handle_merge(
 
     // Only now pay the auto-close wait: there are refs to verify, and GitHub
     // needs time to fire its own auto-close before we check issue states.
-    clock.sleep_secs(wait_secs);
+    // Check early, and skip the rest of the wait only when every ref is
+    // already CLOSED. `Missing` (which a `gh` failure also returns) never
+    // counts as closed, so a failed read falls through to the full wait.
+    let early = EARLY_CHECK_SECS.min(wait_secs);
+    if early > 0 && early < wait_secs {
+        clock.sleep_secs(early);
+        let all_closed = refs
+            .iter()
+            .all(|issue| fetch_issue_state(gh, *issue, slug) == IssueState::Closed);
+        if all_closed {
+            return None;
+        }
+        clock.sleep_secs(wait_secs - early);
+    } else if wait_secs > 0 {
+        clock.sleep_secs(wait_secs);
+    }
 
     let short_sha = if merge_sha.len() >= 7 {
         &merge_sha[..7]
@@ -402,7 +433,7 @@ mod tests {
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_post_tool_use};
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     // -----------------------------------------------------------------------
     // Pure layer tests (cases 1–10)
@@ -498,6 +529,10 @@ mod tests {
     struct FakeGh {
         /// Maps issue number → state string ("OPEN" | "CLOSED")
         issue_states: HashMap<u64, String>,
+        /// Per-issue sequence of `gh issue view` results, consumed in order;
+        /// the last value repeats. `None` simulates a `gh` failure. Checked
+        /// before `issue_states`.
+        issue_state_seq: RefCell<HashMap<u64, VecDeque<Option<String>>>>,
         /// PR body to return for `gh pr view <n> --json body,mergeCommit`
         pr_body: String,
         /// PR number to return for bare `gh pr view --json number`
@@ -514,6 +549,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 issue_states: HashMap::new(),
+                issue_state_seq: RefCell::new(HashMap::new()),
                 pr_body: String::new(),
                 pr_number: None,
                 merge_commit_oid: "abc1234def".to_string(),
@@ -524,6 +560,14 @@ mod tests {
 
         fn with_issue(mut self, num: u64, state: &str) -> Self {
             self.issue_states.insert(num, state.to_string());
+            self
+        }
+
+        /// Script successive `gh issue view` results for one issue. `None`
+        /// simulates a `gh` failure; the last value repeats once reached.
+        fn with_issue_seq(self, num: u64, states: &[Option<&str>]) -> Self {
+            let seq = states.iter().map(|s| s.map(str::to_string)).collect();
+            self.issue_state_seq.borrow_mut().insert(num, seq);
             self
         }
 
@@ -548,6 +592,13 @@ mod tests {
             {
                 // Check for state vs close subcommand
                 if args.contains(&"state") {
+                    if let Some(seq) = self.issue_state_seq.borrow_mut().get_mut(&num) {
+                        return if seq.len() > 1 {
+                            seq.pop_front().flatten()
+                        } else {
+                            seq.front().cloned().flatten()
+                        };
+                    }
                     return self.issue_states.get(&num).cloned();
                 }
             }
@@ -785,6 +836,93 @@ mod tests {
             "no refs to verify — the auto-close wait should be skipped"
         );
         assert!(gh.close_calls.borrow().is_empty());
+    }
+
+    // GitHub already closed every ref by the early check → skip the rest of
+    // the wait and close nothing.
+    #[test]
+    fn merge_all_refs_closed_at_early_check_skips_remaining_wait() {
+        let gh = FakeGh::new()
+            .with_issue(5, "CLOSED")
+            .with_pr_body("Closes #5")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+
+        assert_eq!(msg, None);
+        assert_eq!(*clock.sleep_calls.borrow(), vec![2u64]);
+        assert!(gh.close_calls.borrow().is_empty());
+    }
+
+    // A ref still OPEN at the early check and at the deadline → the full wait
+    // is paid in two sleeps and the hook closes it.
+    #[test]
+    fn merge_ref_open_through_deadline_sleeps_full_wait_and_closes() {
+        let gh = FakeGh::new()
+            .with_issue_seq(5, &[Some("OPEN"), Some("OPEN")])
+            .with_pr_body("Closes #5")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+
+        assert!(msg.is_some_and(|m| m.contains("#5")));
+        assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
+        let calls = gh.close_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 5);
+    }
+
+    // GitHub closes the ref between the early check and the deadline → the
+    // hook must not close it a second time.
+    #[test]
+    fn merge_ref_closes_after_early_check_is_not_closed_by_hook() {
+        let gh = FakeGh::new()
+            .with_issue_seq(5, &[Some("OPEN"), Some("CLOSED")])
+            .with_pr_body("Closes #5")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+
+        assert_eq!(msg, None);
+        assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
+        assert!(gh.close_calls.borrow().is_empty());
+    }
+
+    // A `gh` failure at the early check reads as Missing, not Closed → no
+    // early exit; the full wait runs and the still-OPEN ref is closed.
+    #[test]
+    fn merge_missing_at_early_check_does_not_exit_early() {
+        let gh = FakeGh::new()
+            .with_issue_seq(5, &[None, Some("OPEN")])
+            .with_pr_body("Closes #5")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+
+        assert!(msg.is_some_and(|m| m.contains("#5")));
+        assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
+        assert_eq!(gh.close_calls.borrow().len(), 1);
+    }
+
+    // A wait no longer than the early check has no early phase → one sleep of
+    // the whole wait, then the normal check.
+    #[test]
+    fn merge_wait_below_early_check_uses_single_sleep() {
+        let gh = FakeGh::new()
+            .with_issue(5, "OPEN")
+            .with_pr_body("Closes #5")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 1);
+
+        assert!(msg.is_some_and(|m| m.contains("#5")));
+        assert_eq!(*clock.sleep_calls.borrow(), vec![1u64]);
+        assert_eq!(gh.close_calls.borrow().len(), 1);
     }
 
     // Case 18: cmd is neither create nor merge → Check::run allows, no handler invoked
