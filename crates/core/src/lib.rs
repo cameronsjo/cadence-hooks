@@ -471,6 +471,47 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// Describe a hook-payload parse failure without echoing any of the payload.
+///
+/// serde's `Display` is not safe to record: a data error quotes the offending
+/// value (``invalid type: integer `424242` ``, `invalid type: string "…"`), and
+/// that text reaches the durable `failopen.jsonl` ledger (cadence-hooks#959).
+/// So the message is built only from the error's *shape* — its category, its
+/// line and column, and the payload's byte length — and the error is never
+/// formatted.
+///
+/// A `from_value` data error has no position (`line() == 0`), because a
+/// `serde_json::Value` carries no source offsets. `relocate` recovers one by
+/// re-parsing the raw text straight into the target type; it runs only on this
+/// error path. When it finds nothing, the message says a field had the wrong
+/// type or value, still without naming the value.
+fn json_parse_failure(
+    e: &serde_json::Error,
+    raw: &str,
+    relocate: impl FnOnce() -> Option<(usize, usize)>,
+) -> String {
+    let kind = match e.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    let bytes = raw.len();
+    let position = if e.line() == 0 {
+        relocate().filter(|(line, _)| *line != 0)
+    } else {
+        Some((e.line(), e.column()))
+    };
+    match position {
+        Some((line, column)) => format!(
+            "Failed to parse hook JSON: {kind} error at line {line} column {column} ({bytes} bytes)"
+        ),
+        None => format!(
+            "Failed to parse hook JSON: {kind} error (a field has the wrong type or value; {bytes} bytes)"
+        ),
+    }
+}
+
 /// Resolve every supported `apply_patch` body envelope without letting one
 /// recognized field shadow another. `patch` is the already-normalized internal
 /// form; retaining it here preserves existing compatibility while subjecting it
@@ -511,7 +552,10 @@ fn resolve_apply_patch_body(value: &serde_json::Value) -> Result<Option<&str>, &
 /// verdict (see `stale_signature` in the hook launcher).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseFailure {
-    /// This binary's own diagnostic. Never contains payload or patch content.
+    /// This binary's own diagnostic. Never contains payload or patch content:
+    /// a JSON failure is described by [`json_parse_failure`] from the error's
+    /// category, position, and the payload's byte length alone, never from
+    /// serde's `Display`, which quotes the offending value.
     pub message: String,
     /// True when an `apply_patch` body was present but could not be resolved to
     /// a set of targets.
@@ -558,8 +602,8 @@ impl HookInput {
             message,
             patch_targets_unenumerable: false,
         };
-        let mut value: serde_json::Value = serde_json::from_str(raw)
-            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| plain(json_parse_failure(&e, raw, || None)))?;
         let tool_name = value
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
@@ -576,8 +620,13 @@ impl HookInput {
                 value["tool_input"] = serde_json::json!({"patch": patch});
             }
         }
-        let mut input: HookInput = serde_json::from_value(value)
-            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
+        let mut input: HookInput = serde_json::from_value(value).map_err(|e| {
+            plain(json_parse_failure(&e, raw, || {
+                serde_json::from_str::<HookInput>(raw)
+                    .err()
+                    .map(|e| (e.line(), e.column()))
+            }))
+        })?;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1053,9 +1102,14 @@ impl MetricsInput {
     /// Parse metrics input from a JSON string, capturing the raw top-level keys.
     pub fn from_json(s: &str) -> Result<Self, String> {
         let value: serde_json::Value =
-            serde_json::from_str(s).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
-        let mut input: MetricsInput = serde_json::from_value(value.clone())
-            .map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+            serde_json::from_str(s).map_err(|e| json_parse_failure(&e, s, || None))?;
+        let mut input: MetricsInput = serde_json::from_value(value.clone()).map_err(|e| {
+            json_parse_failure(&e, s, || {
+                serde_json::from_str::<MetricsInput>(s)
+                    .err()
+                    .map(|e| (e.line(), e.column()))
+            })
+        })?;
         if let Some(obj) = value.as_object() {
             input.raw_keys = obj.keys().cloned().collect();
         }
@@ -3222,6 +3276,69 @@ mod tests {
     #[test]
     fn metrics_input_rejects_malformed_json() {
         assert!(MetricsInput::from_json("not json").is_err());
+    }
+
+    // --- parse diagnostics carry no payload text (cadence-hooks#959) ---
+    //
+    // Each canary is a value serde's own `Display` would quote back. The
+    // messages below reach the durable `failopen.jsonl` ledger, so none may
+    // contain it.
+
+    #[test]
+    fn hook_parse_failure_omits_a_mistyped_scalar_and_recovers_its_position() {
+        let error = HookInput::from_json(r#"{"cwd":959424242}"#).unwrap_err();
+        assert!(
+            !error.contains("959424242"),
+            "payload value leaked: {error}"
+        );
+        assert!(error.starts_with("Failed to parse hook JSON"), "{error}");
+        // `from_value` has no position; the relocation re-parse supplies it.
+        assert!(
+            error.contains("data error at line 1 column"),
+            "line and column are recovered for a data error: {error}"
+        );
+    }
+
+    #[test]
+    fn metrics_parse_failure_omits_a_mistyped_string() {
+        let error = MetricsInput::from_json(r#"{"duration_ms":"CNRY959ZQ"}"#).unwrap_err();
+        assert!(
+            !error.contains("CNRY959ZQ"),
+            "payload value leaked: {error}"
+        );
+        assert!(error.contains("data error"), "{error}");
+    }
+
+    #[test]
+    fn metrics_parse_failure_omits_an_out_of_range_integer() {
+        let error = MetricsInput::from_json(r#"{"duration_ms":-959424242}"#).unwrap_err();
+        assert!(
+            !error.contains("959424242"),
+            "payload value leaked: {error}"
+        );
+        assert!(error.contains("data error"), "{error}");
+    }
+
+    #[test]
+    fn syntax_failure_keeps_its_locator_and_omits_the_token() {
+        let error = HookInput::from_json(r#"{"a":CNRY959ZQ}"#).unwrap_err();
+        assert!(
+            !error.contains("CNRY959ZQ"),
+            "payload token leaked: {error}"
+        );
+        assert!(error.contains("syntax error at line 1 column"), "{error}");
+        assert!(error.contains("(15 bytes)"), "{error}");
+    }
+
+    #[test]
+    fn json_parse_failure_without_a_position_names_the_shape_only() {
+        let e = serde_json::from_value::<u64>(serde_json::json!("CNRY959ZQ")).unwrap_err();
+        assert_eq!(e.line(), 0, "a from_value error carries no position");
+        let message = json_parse_failure(&e, "0123456789", || None);
+        assert_eq!(
+            message,
+            "Failed to parse hook JSON: data error (a field has the wrong type or value; 10 bytes)"
+        );
     }
 
     #[test]

@@ -769,6 +769,43 @@ fn print_hook_manifest(format: ManifestFormat) {
     }
 }
 
+/// The `error` text a panic writes to the durable `failopen.jsonl` ledger.
+///
+/// A `&str` payload is kept verbatim: std produces one only when the message
+/// is a compile-time literal (`panic!` whose format arguments are all
+/// literals), so the repo authored every byte of it. `.expect("…")` on an
+/// `Option` or `Result` arrives as a `String` even with a literal message, so
+/// its text is withheld too; the source location still names the call site.
+/// A `String` payload is withheld, because a formatted panic can carry
+/// runtime data — Rust's own messages are designed to (`slice_error_fail`
+/// quotes the offending string, `Result::unwrap` prints `{:?}` of the error),
+/// and a panic anywhere in the process lands here, including inside `regex`,
+/// `serde_json`, and `brush-parser`, which is fed raw `tool_input.command`
+/// (cadence-hooks#959). Only its length is kept. Running the text through
+/// `scan_secret_values` was rejected: it finds secrets, and misses the
+/// ordinary non-secret payload text (paths, commands, prose) that is just as
+/// private here. The source location is appended when std supplies one; it is
+/// compile-time text too.
+fn panic_row_error(
+    payload: &(dyn std::any::Any + Send),
+    loc: Option<&std::panic::Location<'_>>,
+) -> String {
+    let message = if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        format!(
+            "panic message withheld (formatted, {} chars)",
+            msg.chars().count()
+        )
+    } else {
+        "unknown panic".to_string()
+    };
+    match loc {
+        Some(loc) => format!("{message} (at {}:{})", loc.file(), loc.line()),
+        None => message,
+    }
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition before anything can write to
     // stdout. Rust leaves SIGPIPE ignored, which turns `cadence-hooks … | head`
@@ -831,30 +868,16 @@ fn main() {
         let mut argv = std::env::args().skip(1);
         let namespace = argv.next();
         let subcommand = argv.next();
-        // The payload plus the source location — the two things that make this
-        // row answer "why did it panic?" instead of merely "it panicked"
-        // (cameronsjo/cadence-hooks#398).
-        //
-        // NO CURRENTLY-REACHABLE PATH LEAKS HOOK DATA HERE, but this is text
-        // the repo does not author, so the property is not structural. A panic
-        // anywhere in the process lands here, including inside `regex`,
-        // `serde_json`, `jiff`, and `brush-parser` — which is fed raw
-        // `tool_input.command` (crates/core/src/loop_analysis.rs). Rust's own
-        // panic messages are *designed* to embed data: `slice_error_fail`
-        // quotes the offending string, `Result::unwrap` prints `{:?}` of the
-        // error. So the first future `&s[..n]` on a payload-derived string
-        // would write up to 200 characters of hook input into a durable
-        // ledger. Today every production `panic!`/`.expect()` carries a static
-        // message, the config-driven regex compiles use `if let Ok(re)` rather
-        // than `.expect`, and every byte-index slice derives its offsets from
-        // ASCII-anchored searches. If that ever stops holding, redact through
-        // the same seam `crates/cadence/src/secret_patterns.rs`'s
-        // `scan_secret_values` uses — it returns a pattern *name*, never the
-        // matched value.
-        let error = match info.location() {
-            Some(loc) => format!("{payload} (at {}:{})", loc.file(), loc.line()),
-            None => payload,
-        };
+        // The row's message plus the source location — what makes it answer
+        // "why did it panic?" instead of merely "it panicked"
+        // (cameronsjo/cadence-hooks#398). `panic_row_error` keeps a `&str`
+        // payload (a compile-time literal) and withholds a `String` payload
+        // (formatted, so it can carry runtime data); its doc says why a
+        // `scan_secret_values` pass was rejected. The `eprintln!` above still
+        // prints the full payload: stderr goes back to the harness that sent
+        // the payload in the first place, while the durable ledger is the
+        // privacy boundary (cameronsjo/cadence-hooks#959).
+        let error = panic_row_error(info.payload(), info.location());
         cadence_hooks_metrics::log_failopen(
             "panic",
             namespace.as_deref(),
@@ -1607,6 +1630,20 @@ fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_row_error_keeps_literal_and_withholds_formatted_payloads() {
+        let loc = std::panic::Location::caller();
+        let literal: &str = "static message";
+        assert_eq!(
+            panic_row_error(&literal, Some(loc)),
+            format!("static message (at {}:{})", loc.file(), loc.line())
+        );
+        let formatted = String::from("CNRY959ZQ");
+        let row = panic_row_error(&formatted, None);
+        assert_eq!(row, "panic message withheld (formatted, 9 chars)");
+        assert_eq!(panic_row_error(&7_u8, None), "unknown panic");
+    }
 
     #[test]
     fn configure_guardrails_is_exempt_from_the_maintenance_bypass() {
