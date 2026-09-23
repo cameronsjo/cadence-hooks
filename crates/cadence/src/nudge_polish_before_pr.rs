@@ -108,18 +108,28 @@
 //! to `/polish docs`. A skip is legitimate only for a trivial one-liner or a
 //! branch already taken through `/polish`.
 //!
+//! **Which checkout (cadence-hooks#995).** The marker is looked up in the
+//! checkout that owns the PR's branch, resolved once per run by
+//! [`cadence_hooks_core::markers::resolve_ship_target`] from the anchoring
+//! segment's `-R`/`--repo`/`GH_REPO=` values and `create`'s `--head`. A repo
+//! that is not a remote of the cwd's checkout, a fork head, a head checked out
+//! nowhere, or a conflicting head yields the **cannot-check advisory** — never
+//! the clean allow, and never a lookup on the cwd's unrelated branch.
+//!
 //! CP1 is nudge-only during rollout (the marker restores reliable *detection*);
 //! CP2 escalates the absent-marker nudge to a block once the skill's marker
-//! write has propagated.
+//! write has propagated. **A CP2 escalation must rule on the cannot-check
+//! advisory separately**: it is not an absent marker. It means this checkout
+//! could not look, so blocking on it would block every cross-repo ship.
 
 use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files, working_tree_digest};
 use cadence_hooks_core::markers::{
-    POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
-    read_polish_marker,
+    MarkerTarget, POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
+    read_polish_marker, resolve_ship_target,
 };
 use cadence_hooks_core::shell::{
     git_command, host_and_repo_from_url, is_polish_ship_anchor_for_origin,
-    merge_anchor_repo_targets, parse_work_dir,
+    merge_anchor_repo_targets, parse_work_dir, polish_ship_target_for_origin,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -136,6 +146,13 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 pub enum MarkerState {
     /// No polish marker for this branch (or repo/branch/cwd unresolved).
     Absent,
+    /// The command names a repo or head this checkout cannot resolve
+    /// (cadence-hooks#995), so no marker can be looked up. Distinct from
+    /// [`MarkerState::Absent`]: nothing says polish was skipped, and nothing
+    /// says it ran. `reason` comes from
+    /// [`cadence_hooks_core::markers::MarkerTarget::CannotCheck`], which
+    /// bounds every command-derived value it echoes.
+    CannotCheck { reason: String },
     /// A marker exists but its `recorded_at` is past
     /// [`cadence_hooks_core::markers::POLISH_MARKER_TTL_DAYS`] — treated as
     /// unknown, i.e. as if absent, because nothing sweeps the marker family and
@@ -212,17 +229,29 @@ impl Check for NudgePolishBeforePr {
             .and_then(|dir| git_command(dir, &["remote", "get-url", "origin"]))
             .and_then(|url| host_and_repo_from_url(&url))
             .map(|(host, slug)| format!("{host}/{}", slug.to_ascii_lowercase()));
-        let present = is_polish_ship_anchor_for_origin(command, origin.as_deref())
-            && polish_marker_present(command, cwd);
+        // Every non-ship command stops here; `decide` would allow it anyway.
+        let Some(ship) = polish_ship_target_for_origin(command, origin.as_deref()) else {
+            return CheckResult::allow();
+        };
+        // Resolved ONCE (cadence-hooks#995): the checkout that owns the PR's
+        // branch, which may be a `--head` worktree rather than the cwd. The
+        // marker key, `touches_code`, and `digest_moved` all read this one
+        // `work_dir`, so a `--head` ship is measured against its own branch.
+        let target = resolve_ship_target(&ship, work_dir.as_deref());
+        let work_dir = target.work_dir().map(str::to_string);
+        let present = polish_marker_present(&target);
         let record = if present {
-            read_polish_marker(command, cwd)
+            read_polish_marker(&target)
         } else {
             None
         };
-        let marker = match (present, &record) {
-            (false, _) => MarkerState::Absent,
-            (true, Some(record)) if record.is_expired() => MarkerState::Expired,
-            (true, record) => MarkerState::Present {
+        let marker = match (&target, present, &record) {
+            (MarkerTarget::CannotCheck { reason }, _, _) => MarkerState::CannotCheck {
+                reason: reason.clone(),
+            },
+            (_, false, _) => MarkerState::Absent,
+            (_, true, Some(record)) if record.is_expired() => MarkerState::Expired,
+            (_, true, record) => MarkerState::Present {
                 security_ran: record.as_ref().and_then(|r| r.security_ran()),
                 security_model: record.as_ref().and_then(attested_security_family),
                 // Exactly `record.is_some()`: a degraded dir, garbled JSON, and
@@ -249,7 +278,8 @@ impl Check for NudgePolishBeforePr {
         // separate precedence table can drift from `decide`'s guards
         // (cadence-hooks#775 I2). A timed-out or unspawnable git yields no
         // evidence (`None`), which reads as "does not touch code" → allow
-        // (ADR-0001). `work_dir` is the one resolved above.
+        // (ADR-0001). `work_dir` is the resolved target's, never the cwd's
+        // when a `--head` named a different worktree.
         let touches_code = || {
             work_dir
                 .as_ref()
@@ -347,6 +377,8 @@ fn recorded_digest(record: Option<&cadence_hooks_core::markers::PolishRecord>) -
 ///   a PR or overrides the repo) → allow.
 /// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
+/// - ship anchor + a repo or head this checkout cannot resolve → the
+///   cannot-check advisory (#995).
 /// - ship anchor + marker whose roster affirmatively says the security arm did
 ///   not run, on a branch that touches code (polish's own definition — the
 ///   caller computes it) → the security nudge (#467).
@@ -363,7 +395,8 @@ fn recorded_digest(record: Option<&cadence_hooks_core::markers::PolishRecord>) -
 /// - ship anchor + a marker whose recorded change-set digest differs from the
 ///   live working tree → the stale-marker nudge (#874).
 ///
-/// **The match order IS the precedence, and it is total**: absent → expired →
+/// **The match order IS the precedence, and it is total**: absent →
+/// cannot-check → expired →
 /// security-skipped → wrong-family → digest-moved → unknown-roster → allow
 /// (+annotations).
 /// Each verdict names a strictly more specific gap than the one after it, so a
@@ -389,6 +422,9 @@ fn decide(
     }
     match marker {
         MarkerState::Absent => CheckResult::nudge(nudge_message()),
+        // Never the clean allow: the ship may be unpolished, and silence would
+        // read as "checked and fine" (cadence-hooks#995).
+        MarkerState::CannotCheck { reason } => CheckResult::nudge(cannot_check_message(&reason)),
         MarkerState::Expired => CheckResult::nudge(expired_nudge_message()),
         MarkerState::Present {
             security_ran: Some(false),
@@ -466,7 +502,27 @@ fn nudge_message() -> String {
          before this PR ships: a branch-scoped quality pass vs `origin/main`; it \
          records the marker when it completes. {SCOPE_CLAUSES} Skip ONLY for a \
          trivial one-liner or an already-polished branch — say so and why, don't \
-         skip silently."
+         skip silently. {RECORD_ELSEWHERE_HINT}"
+    )
+}
+
+/// The reviewer-arm route (cadence-hooks#973): a polish that ran in another
+/// checkout, or as dispatched reviewer subagents, can record its marker for
+/// the right checkout and branch explicitly. The roster arms stay in the
+/// command so the security-arm checks still apply to what it records.
+const RECORD_ELSEWHERE_HINT: &str = "If `/polish` completed in another checkout or \
+    ran as reviewer subagents, record it there after it completes: `cadence-hooks \
+    cadence record-polish --repo-root <checkout> --branch <branch> --arm \
+    security=ran|skipped ...`.";
+
+/// The cadence-hooks#995 advisory: the command names a repo or head this
+/// checkout cannot resolve, so the gate cannot look up a marker. It is never
+/// the clean allow, because the ship may be unpolished. `reason` is bounded by
+/// [`cadence_hooks_core::markers::MarkerTarget::CannotCheck`].
+fn cannot_check_message(reason: &str) -> String {
+    format!(
+        "Can't check polish for this PR: {reason}. Confirm `/polish` (with its security arm) \
+         completed in the checkout that owns the branch."
     )
 }
 
@@ -2290,6 +2346,311 @@ mod tests {
                 "a newline-separated `cd` into a marked worktree must satisfy the gate"
             );
         });
+    }
+
+    // --- cadence-hooks#995: resolve the PR's head checkout ---
+
+    const OWN_URL: &str = "https://github.com/own/repo.git";
+    const RAN: &str = r#"{"scope":"full","arms":{"security":"ran"}}"#;
+
+    /// A primary checkout on `main` (the session cwd) with a real `origin`
+    /// remote, and `feat/x` carrying `files` checked out in a separate linked
+    /// worktree. Returns the temp dirs (kept alive), the primary path, the
+    /// worktree path, and the shared marker root.
+    fn primary_on_main_with_head_worktree(
+        files: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, String, String) {
+        let (repo, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, files);
+        git_in(repo.path(), &["checkout", "-q", "main"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git_in(
+            repo.path(),
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/x"],
+        );
+        let primary = repo.path().to_str().unwrap().to_string();
+        let wt = wt.to_str().unwrap().to_string();
+        (repo, wt_parent, primary, wt, root)
+    }
+
+    fn run_at(command: &str, cwd: &str) -> CheckResult {
+        NudgePolishBeforePr.run(&make_bash_with_cwd(command, cwd))
+    }
+
+    fn assert_cannot_check(result: &CheckResult, needle: &str) {
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.clone().unwrap_or_default();
+        assert!(
+            msg.starts_with("Can't check polish for this PR:"),
+            "must be the cannot-check advisory: {msg}"
+        );
+        assert!(
+            msg.contains(needle),
+            "reason should mention {needle}: {msg}"
+        );
+        assert!(
+            msg.contains("security arm"),
+            "the advisory must ask about the security arm: {msg}"
+        );
+    }
+
+    fn assert_no_polish_nudge(result: &CheckResult) {
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.clone().unwrap_or_default();
+        assert!(msg.contains("No polish recorded"), "{msg}");
+    }
+
+    const ISSUE_995_COMMAND: &str =
+        "gh pr create -R own/repo --head feat/x --base main --title t --body-file /tmp/x.md";
+
+    #[test]
+    fn issue_995_cwd_on_the_head_branch_allows() {
+        let (tmp, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            let result = run_at(ISSUE_995_COMMAND, tmp.path().to_str().unwrap());
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
+    #[test]
+    fn issue_995_non_git_cwd_keeps_the_no_polish_nudge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            assert_no_polish_nudge(&run_at(ISSUE_995_COMMAND, tmp.path().to_str().unwrap()));
+        });
+    }
+
+    #[test]
+    fn issue_995_cwd_on_main_resolves_the_head_worktree() {
+        // The third #995 row, spelled with the head after a flag value.
+        let (_repo, _wt, primary, _wt_path, root) =
+            primary_on_main_with_head_worktree(&["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for command in [
+                ISSUE_995_COMMAND,
+                "gh pr create --title x -R own/repo --head feat/x",
+            ] {
+                let result = run_at(command, &primary);
+                assert_eq!(result.outcome, Outcome::Allow, "{command}");
+                assert!(result.message.is_none(), "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn head_worktree_security_skipped_marker_fires_the_security_nudge() {
+        // Security C1: the branch diff must come from the head's worktree. The
+        // cwd (`main`) has no diff, so reading it there would stay silent.
+        let (_repo, _wt, primary, _wt_path, root) =
+            primary_on_main_with_head_worktree(&["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/x"),
+                r#"{"scope":"full","arms":{"security":"skipped"}}"#,
+            )
+            .unwrap();
+            let result = run_at("gh pr create --head feat/x --title t", &primary);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(
+                result.message.unwrap_or_default().contains("SECURITY arm"),
+                "must be the security nudge"
+            );
+        });
+    }
+
+    #[test]
+    fn head_worktree_docs_marker_on_a_code_branch_fires() {
+        let (_repo, _wt, primary, _wt_path, root) =
+            primary_on_main_with_head_worktree(&["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), r#"{"scope":"docs"}"#).unwrap();
+            let result = run_at("gh pr create --head feat/x --title t", &primary);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(result.message.unwrap_or_default().contains("SECURITY arm"));
+        });
+    }
+
+    #[test]
+    fn head_worktree_moved_digest_fires_the_stale_nudge() {
+        let (_repo, _wt, primary, wt_path, root) =
+            primary_on_main_with_head_worktree(&["src/lib.rs"]);
+        let recorded = working_tree_digest(&wt_path).expect("digest resolves");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/x"),
+                &marker_with_digest(&format!(
+                    r#"{{"base":"{}","digest":"{}","files":{}}}"#,
+                    recorded.base, recorded.digest, recorded.files
+                )),
+            )
+            .unwrap();
+            let wt = std::path::Path::new(&wt_path);
+            std::fs::write(wt.join("src/added.rs"), "unreviewed\n").unwrap();
+            commit_all(wt, "unreviewed work");
+
+            let result = run_at("gh pr create --head feat/x --title t", &primary);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(
+                result
+                    .message
+                    .unwrap_or_default()
+                    .contains("reviewed change set has moved"),
+                "must be the stale-marker nudge"
+            );
+        });
+    }
+
+    #[test]
+    fn head_checked_out_nowhere_cannot_check() {
+        let (tmp, root) = init_repo_with_real_origin_remote("dev", OWN_URL, &[]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            // A marker for the cwd's branch must not answer for another one.
+            write_marker(&polish_marker(&root, "dev"), RAN).unwrap();
+            let result = run_at("gh pr create --head feat/x", tmp.path().to_str().unwrap());
+            assert_cannot_check(&result, "`feat/x` is not checked out here");
+        });
+    }
+
+    #[test]
+    fn two_different_heads_cannot_check() {
+        let (tmp, _root) = init_repo_with_real_origin_remote("a", OWN_URL, &[]);
+        let result = run_at(
+            "gh pr create --head a --head b",
+            tmp.path().to_str().unwrap(),
+        );
+        assert_cannot_check(&result, "--head");
+    }
+
+    #[test]
+    fn owner_prefixed_head() {
+        let (_repo, _wt, primary, _wt_path, root) =
+            primary_on_main_with_head_worktree(&["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            let own = run_at("gh pr create --head own:feat/x", &primary);
+            assert_eq!(own.outcome, Outcome::Allow);
+            let fork = run_at("gh pr create --head someone:feat/x", &primary);
+            assert_cannot_check(&fork, "someone:feat/x");
+        });
+    }
+
+    #[test]
+    fn sibling_segment_head_does_not_retarget_the_ship() {
+        // The cwd is on `feat/cwd` with no marker; `feat/polished` is marked
+        // and checked out in a worktree. Only the anchoring segment counts, so
+        // both commands key the cwd's branch and nudge.
+        let (repo, root) = init_repo_with_real_origin_remote("feat/polished", OWN_URL, &[]);
+        git_in(repo.path(), &["checkout", "-q", "-b", "feat/cwd"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "feat/polished",
+            ],
+        );
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/polished"), RAN).unwrap();
+            for command in [
+                "gh pr list --head feat/polished && gh pr create",
+                "gh pr create --draft --head feat/polished; gh pr create",
+            ] {
+                assert_no_polish_nudge(&run_at(command, repo.path().to_str().unwrap()));
+            }
+        });
+    }
+
+    #[test]
+    fn own_repo_in_every_remote_form_resolves() {
+        let (tmp, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, &[]);
+        git_in(
+            tmp.path(),
+            &["remote", "add", "upstream", "git@github.com:up/stream.git"],
+        );
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for command in [
+                "gh pr create -R own/repo.git",
+                "gh pr create -R https://github.com/own/repo.git/",
+                "gh pr create -R up/stream",
+            ] {
+                let result = run_at(command, tmp.path().to_str().unwrap());
+                assert_eq!(result.outcome, Outcome::Allow, "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn foreign_repo_cannot_check() {
+        let (tmp, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, &[]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            // The cwd's own marker must not answer for another repo's PR.
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            let dir = tmp.path().to_str().unwrap();
+            assert_cannot_check(
+                &run_at("gh pr create -R other/r --head feat/x", dir),
+                "`other/r`",
+            );
+            assert_cannot_check(&run_at("GH_REPO=other/r gh pr create", dir), "`other/r`");
+            // `ready` used to key the cwd for a retargeted ship; now it asks.
+            assert_cannot_check(&run_at("gh -R other/r pr ready 12", dir), "`other/r`");
+        });
+    }
+
+    #[test]
+    fn ready_ignores_a_head_token() {
+        let (tmp, root) = init_repo_on_branch("feat/ready");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/ready"), "{}").unwrap();
+            let result = run_at("gh pr ready 12 --head x", tmp.path().to_str().unwrap());
+            assert_eq!(result.outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn no_polish_nudge_names_the_record_elsewhere_route() {
+        // #973: the route for a polish that ran in another checkout.
+        let msg = nudge_message();
+        assert!(
+            msg.contains("record-polish --repo-root <checkout> --branch <branch>"),
+            "{msg}"
+        );
+        assert!(msg.contains("--arm security=ran|skipped"), "{msg}");
+    }
+
+    #[test]
+    fn decide_cannot_check_is_never_the_clean_allow() {
+        let result = decide(
+            "gh pr create --title x",
+            MarkerState::CannotCheck {
+                reason: "PR targets `other/r`, not a remote of this checkout".into(),
+            },
+            || false,
+            || None,
+            &[],
+            None,
+        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(result.message.is_some());
     }
 
     // --- preserved matcher tests (is_polish_ship_anchor) ---

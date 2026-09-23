@@ -22,10 +22,10 @@
 //! Silent no-op on any failure — never blocks (it is a [`Logger`]).
 
 use crate::common;
-use cadence_hooks_core::markers::polish_marker_present;
+use cadence_hooks_core::markers::{polish_marker_present, resolve_ship_target};
 use cadence_hooks_core::shell::{
     git_command, host_and_repo_from_url, merge_anchor_repo_targets, parse_work_dir,
-    polish_ship_anchor_for_origin,
+    polish_ship_anchor_for_origin, polish_ship_target_for_origin,
 };
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
@@ -67,6 +67,9 @@ impl Logger for LogPolishNudge {
         let Some(anchor) = polish_ship_anchor_for_origin(command, origin.as_deref()) else {
             return;
         };
+        let Some(ship) = polish_ship_target_for_origin(command, origin.as_deref()) else {
+            return;
+        };
         // Skip malformed payloads (mirrors the other loggers); session_id is
         // recorded as a JSON value, never used in a path, so this is hygiene.
         if !input
@@ -95,10 +98,15 @@ impl Logger for LogPolishNudge {
             .unwrap_or(false);
 
         // The branch-scoped marker signal the pre-PR gate actually acts on —
-        // the same [`polish_marker_present`] the gate calls, so the metric can
-        // never disagree with the gate (#177). Recorded alongside `polished`
-        // (the transcript scan) so scan-vs-marker drift is measurable.
-        let marker_present = polish_marker_present(command, input.cwd.as_deref());
+        // the same [`resolve_ship_target`] and [`polish_marker_present`] the
+        // gate calls, so the metric can never disagree with the gate (#177).
+        // Recorded alongside `polished` (the transcript scan) so
+        // scan-vs-marker drift is measurable. The target kind rides along
+        // (cadence-hooks#995): a `cannot_check` row is a ship the gate could
+        // not look up, which is not the same as a nudged skip.
+        let work_dir = input.cwd.as_deref().map(|cwd| parse_work_dir(command, cwd));
+        let target = resolve_ship_target(&ship, work_dir.as_deref());
+        let marker_present = polish_marker_present(&target);
 
         let dir = common::metrics_dir();
         if std::fs::create_dir_all(&dir).is_err() {
@@ -112,7 +120,10 @@ impl Logger for LogPolishNudge {
             &common::branch(input.cwd.as_deref()),
             &common::repo_basename(input.cwd.as_deref()),
             polished,
-            marker_present,
+            MarkerSignal {
+                present: marker_present,
+                target: target.kind(),
+            },
             anchor,
         );
 
@@ -130,6 +141,13 @@ impl Logger for LogPolishNudge {
     }
 }
 
+/// What the gate's marker lookup found: whether a marker exists, and which
+/// kind of target it was looked up for (`local`, `cannot_check`, `unknown`).
+struct MarkerSignal<'a> {
+    present: bool,
+    target: &'a str,
+}
+
 /// Build the `polish_nudges.jsonl` record. Pure — no I/O.
 fn build_polish_nudge_record(
     ts: &str,
@@ -137,7 +155,7 @@ fn build_polish_nudge_record(
     branch: &str,
     repo: &str,
     polished: bool,
-    marker_present: bool,
+    marker: MarkerSignal<'_>,
     anchor: &str,
 ) -> Value {
     json!({
@@ -148,7 +166,8 @@ fn build_polish_nudge_record(
         "branch": branch,
         "repo": repo,
         "polished": polished,
-        "markerPresent": marker_present,
+        "markerPresent": marker.present,
+        "markerTarget": marker.target,
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
     })
@@ -180,7 +199,10 @@ mod tests {
             "feat/x",
             "myrepo",
             false,
-            false,
+            MarkerSignal {
+                present: false,
+                target: "local",
+            },
             "ready",
         );
         assert_eq!(rec["ts"], "2026-06-21T00:00:00Z");
@@ -195,6 +217,7 @@ mod tests {
         assert_eq!(rec["polished"], false);
         // The branch-scoped marker signal, recorded alongside `polished`.
         assert_eq!(rec["markerPresent"], false);
+        assert_eq!(rec["markerTarget"], "local");
         assert_eq!(rec["agentId"], "a1");
         // Main-thread field absent → null, not omitted.
         assert!(rec["parentSessionId"].is_null());
@@ -208,7 +231,10 @@ mod tests {
             "feat/x",
             "myrepo",
             true,
-            false,
+            MarkerSignal {
+                present: false,
+                target: "local",
+            },
             "create",
         );
         assert_eq!(rec["polished"], true);
@@ -224,10 +250,33 @@ mod tests {
             "feat/x",
             "myrepo",
             false,
-            true,
+            MarkerSignal {
+                present: true,
+                target: "local",
+            },
             "create",
         );
         assert_eq!(rec["markerPresent"], true);
         assert_eq!(rec["polished"], false);
+    }
+
+    #[test]
+    fn record_carries_a_cannot_check_target() {
+        // #995: a ship the gate could not look up must not read as a nudged
+        // skip in the ledger.
+        let rec = build_polish_nudge_record(
+            "ts",
+            &sample_input(),
+            "main",
+            "myrepo",
+            false,
+            MarkerSignal {
+                present: false,
+                target: "cannot_check",
+            },
+            "create",
+        );
+        assert_eq!(rec["markerTarget"], "cannot_check");
+        assert_eq!(rec["markerPresent"], false);
     }
 }

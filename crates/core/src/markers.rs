@@ -20,7 +20,9 @@
 
 use crate::gitstate::GitState;
 use crate::paths;
-use crate::shell::parse_work_dir;
+use crate::shell::{
+    ShipHead, ShipTarget, gh_repo_value_parts, git_command, host_and_repo_from_url,
+};
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
 use std::collections::BTreeMap;
@@ -197,27 +199,257 @@ pub fn polish_marker(repo_root: &str, branch: &str) -> PathBuf {
     ))
 }
 
-/// True when a branch-scoped polish marker exists for the `(repo, branch)` a
-/// `gh pr create` command targets. Single source of truth for "did `/polish`
-/// record for this PR's branch" — the pre-PR gate acts on it and the
-/// polish-nudge metric records it, so the two cannot disagree (#177).
+/// Which checkout a ship command's polish marker lives in (cadence-hooks#995).
+///
+/// Built once per hook run by [`resolve_ship_target`] and handed to both
+/// [`polish_marker_present`] and [`read_polish_marker`], so the check and the
+/// logger read the same key (#177).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerTarget {
+    /// The PR's branch is checked out at `work_dir`. The marker key, the
+    /// branch diff, and the working-tree digest all come from there.
+    Local { work_dir: String },
+    /// The command names a repo or head this checkout cannot resolve: a repo
+    /// that is not one of its remotes, a fork head, a branch checked out
+    /// nowhere, or a conflicting `--head`. `reason` is safe to echo.
+    CannotCheck { reason: String },
+    /// No cwd, a cwd outside any repo, or a detached HEAD. Nothing names a
+    /// branch, so the gate keeps its no-marker nudge.
+    Unknown,
+}
+
+impl MarkerTarget {
+    /// The ledger spelling of this variant (`markerTarget` in
+    /// `polish_nudges.jsonl`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MarkerTarget::Local { .. } => "local",
+            MarkerTarget::CannotCheck { .. } => "cannot_check",
+            MarkerTarget::Unknown => "unknown",
+        }
+    }
+
+    /// The resolved checkout, for [`MarkerTarget::Local`] only.
+    pub fn work_dir(&self) -> Option<&str> {
+        match self {
+            MarkerTarget::Local { work_dir } => Some(work_dir),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve a ship command's [`ShipTarget`] to the checkout that owns its
+/// branch (cadence-hooks#995). `cwd_dir` is the `cd`-aware working directory
+/// ([`crate::shell::parse_work_dir`]).
+///
+/// - No cwd, not a repo, or a detached HEAD → [`MarkerTarget::Unknown`].
+/// - Every repo value must name one of the cwd repo's remotes (all of `git
+///   remote -v`, not only `origin`), compared on `owner/repo`. The host joins
+///   the comparison only when the value names one or an inline `GH_HOST=` set
+///   it. A value that matches no remote → [`MarkerTarget::CannotCheck`].
+/// - A `--head` resolves to the worktree that has the branch checked out: the
+///   cwd when its branch matches, else a `git worktree list` entry. A branch
+///   checked out nowhere, a fork `owner:` prefix, or a conflicting head →
+///   [`MarkerTarget::CannotCheck`]. It never falls back to the cwd, which is
+///   on a different branch and would answer for the wrong one.
+/// - Otherwise → [`MarkerTarget::Local`] at `cwd_dir`, the pre-#995 behavior.
+///
+/// Git runs for remotes or worktrees only when the target names one, so the
+/// common `gh pr create --title x` pays nothing beyond the cwd's own state.
+pub fn resolve_ship_target(target: &ShipTarget, cwd_dir: Option<&str>) -> MarkerTarget {
+    let Some(cwd_dir) = cwd_dir else {
+        return MarkerTarget::Unknown;
+    };
+    let Some(state) = GitState::resolve(Path::new(cwd_dir)) else {
+        return MarkerTarget::Unknown;
+    };
+    let Some(cwd_branch) = state.branch else {
+        return MarkerTarget::Unknown;
+    };
+    if !target.names_another_target() {
+        return MarkerTarget::Local {
+            work_dir: cwd_dir.to_string(),
+        };
+    }
+    decide_ship_target(
+        target,
+        cwd_dir,
+        &cwd_branch,
+        || git_remotes(cwd_dir),
+        |branch| worktree_for_branch(cwd_dir, branch),
+    )
+}
+
+/// The pure half of [`resolve_ship_target`]: every git read arrives as a
+/// closure, called only when a rule needs it.
+fn decide_ship_target(
+    target: &ShipTarget,
+    cwd_dir: &str,
+    cwd_branch: &str,
+    remotes: impl FnOnce() -> Vec<(String, String)>,
+    worktree_for: impl FnOnce(&str) -> Option<String>,
+) -> MarkerTarget {
+    let head = match &target.head {
+        ShipHead::Current => None,
+        ShipHead::Ambiguous => {
+            return cannot_check(
+                "the command names more than one --head, or a --head with no value".to_string(),
+            );
+        }
+        ShipHead::Named(value) => Some(value.as_str()),
+    };
+    let fork_owner = head.and_then(|h| h.split_once(':')).map(|(owner, _)| owner);
+    let remotes = if target.repos.is_empty() && fork_owner.is_none() {
+        Vec::new()
+    } else {
+        remotes()
+    };
+    for value in &target.repos {
+        if !repo_value_is_a_remote(value, target.host.as_deref(), &remotes) {
+            return cannot_check(format!(
+                "PR targets {}, not a remote of this checkout",
+                echo_safe(value)
+            ));
+        }
+    }
+    let Some(head) = head else {
+        return MarkerTarget::Local {
+            work_dir: cwd_dir.to_string(),
+        };
+    };
+    let branch = match head.split_once(':') {
+        Some((owner, branch)) => {
+            let owner = owner.to_ascii_lowercase();
+            let owned = remotes
+                .iter()
+                .any(|(_, slug)| slug.split('/').next() == Some(owner.as_str()));
+            if !owned {
+                return cannot_check(format!(
+                    "the PR head {} is on an owner that is not a remote of this checkout",
+                    echo_safe(head)
+                ));
+            }
+            branch
+        }
+        None => head,
+    };
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    if branch.is_empty() {
+        return cannot_check("the command's --head names no branch".to_string());
+    }
+    if branch == cwd_branch {
+        return MarkerTarget::Local {
+            work_dir: cwd_dir.to_string(),
+        };
+    }
+    match worktree_for(branch) {
+        Some(work_dir) => MarkerTarget::Local { work_dir },
+        None => cannot_check(format!("{} is not checked out here", echo_safe(branch))),
+    }
+}
+
+fn cannot_check(reason: String) -> MarkerTarget {
+    MarkerTarget::CannotCheck { reason }
+}
+
+/// The longest command-derived value a [`MarkerTarget::CannotCheck`] reason
+/// echoes verbatim.
+const MAX_ECHO_BYTES: usize = 128;
+
+/// A command-derived value made safe for a reason that reaches the session's
+/// `additionalContext`: ref-and-URL characters only (`[A-Za-z0-9/._:@-]`), at
+/// most [`MAX_ECHO_BYTES`]. Anything else is replaced, never transcoded.
+fn echo_safe(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.len() <= MAX_ECHO_BYTES
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._:@-".contains(c));
+    if safe {
+        format!("`{value}`")
+    } else {
+        "a value it could not read".to_string()
+    }
+}
+
+/// True when the `-R`/`--repo`/`GH_REPO=` `value` names one of `remotes`
+/// (`(host, owner/repo)` pairs, lowercased). The host is compared only when
+/// the value names one or `gh_host` (an inline `GH_HOST=`) set it.
+fn repo_value_is_a_remote(
+    value: &str,
+    gh_host: Option<&str>,
+    remotes: &[(String, String)],
+) -> bool {
+    let Some((value_host, slug)) = gh_repo_value_parts(value) else {
+        return false;
+    };
+    let host = value_host.or_else(|| gh_host.map(str::to_ascii_lowercase));
+    remotes.iter().any(|(remote_host, remote_slug)| {
+        *remote_slug == slug && host.as_deref().is_none_or(|h| h == remote_host)
+    })
+}
+
+/// Every remote of the repo at `dir`, as lowercased `(host, owner/repo)`
+/// pairs. A remote whose URL has no owner/repo shape (a local path) is
+/// skipped. A failed or timed-out git yields no remotes, which makes every
+/// repo value a non-match and the result an advisory, never a silent allow.
+fn git_remotes(dir: &str) -> Vec<(String, String)> {
+    let Some(output) = git_command(dir, &["remote", "-v"]) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(host_and_repo_from_url)
+        .map(|(host, slug)| (host, slug.to_ascii_lowercase()))
+        .collect()
+}
+
+/// The path of the worktree that has `branch` checked out, from `git worktree
+/// list --porcelain` run in `dir`. A listed worktree whose directory is gone
+/// is skipped.
+fn worktree_for_branch(dir: &str, branch: &str) -> Option<String> {
+    let listing = git_command(dir, &["worktree", "list", "--porcelain"])?;
+    worktree_in_listing(&listing, branch)
+}
+
+/// The pure half of [`worktree_for_branch`]: the porcelain format is blocks
+/// separated by blank lines, each opening with `worktree <path>` and carrying
+/// `branch refs/heads/<name>` when a branch is checked out.
+fn worktree_in_listing(listing: &str, branch: &str) -> Option<String> {
+    let wanted = format!("refs/heads/{branch}");
+    listing.split("\n\n").find_map(|block| {
+        let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
+        let checked_out = block
+            .lines()
+            .filter_map(|l| l.strip_prefix("branch "))
+            .any(|b| b == wanted);
+        (checked_out && Path::new(path).is_dir()).then(|| path.to_string())
+    })
+}
+
+/// True when a branch-scoped polish marker exists for the checkout `target`
+/// resolved to. Single source of truth for "did `/polish` record for this
+/// PR's branch" — the pre-PR gate acts on it and the polish-nudge metric
+/// records it, so the two cannot disagree (#177). Both callers pass the same
+/// [`resolve_ship_target`] result.
 ///
 /// Resolves the repo identity via [`crate::gitstate::GitState`] — keyed on the
 /// canonicalized `git rev-parse --git-common-dir`, not `--show-toplevel`
 /// (cadence-hooks#324) — so a linked worktree and its primary checkout key to
-/// the same marker; `branch` comes from `cwd` too, honoring a `cd`-prefixed
-/// command via [`parse_work_dir`] — mirrors the record side. Any missing piece
-/// (no cwd, not a repo, detached HEAD) yields `false` (fail-open, ADR-0001).
-pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
-    let Some(cwd) = cwd else { return false };
-    let dir = parse_work_dir(command, cwd);
-    let Some(state) = GitState::resolve(Path::new(&dir)) else {
-        return false;
-    };
-    let Some(branch) = state.branch else {
-        return false;
-    };
-    polish_marker(&state.git_common_dir.to_string_lossy(), &branch).is_file()
+/// the same marker; `branch` is the one checked out at the resolved
+/// `work_dir`, which mirrors the record side. Anything but a
+/// [`MarkerTarget::Local`] that resolves to a branch yields `false`
+/// (fail-open, ADR-0001).
+pub fn polish_marker_present(target: &MarkerTarget) -> bool {
+    marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
+}
+
+/// The `(repo_root, branch)` marker key for a [`MarkerTarget::Local`].
+fn marker_key(target: &MarkerTarget) -> Option<(String, String)> {
+    let state = GitState::resolve(Path::new(target.work_dir()?))?;
+    let branch = state.branch?;
+    Some((state.git_common_dir.to_string_lossy().into_owned(), branch))
 }
 
 /// Parsed content of a polish marker (cadence-hooks#467) — the record side's
@@ -393,12 +625,9 @@ impl PolishRecord {
 /// noise on a fully-polished branch, so a non-private dir degrades the same
 /// way everything else does: `None` → roster unknown → the presence bool
 /// alone decides, exactly the pre-#467 behavior.
-pub fn read_polish_marker(command: &str, cwd: Option<&str>) -> Option<PolishRecord> {
-    let cwd = cwd?;
-    let dir = parse_work_dir(command, cwd);
-    let state = GitState::resolve(Path::new(&dir))?;
-    let branch = state.branch?;
-    read_polish_record(&state.git_common_dir.to_string_lossy(), &branch)
+pub fn read_polish_marker(target: &MarkerTarget) -> Option<PolishRecord> {
+    let (root, branch) = marker_key(target)?;
+    read_polish_record(&root, &branch)
 }
 
 /// Read a polish record by its already-resolved `(repo_root, branch)` key.
@@ -1368,10 +1597,7 @@ mod tests {
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
             write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
-            assert!(polish_marker_present(
-                "gh pr create --title x",
-                Some(tmp.path().to_str().unwrap())
-            ));
+            assert!(polish_marker_present(&local(tmp.path().to_str().unwrap())));
         });
     }
 
@@ -1382,10 +1608,7 @@ mod tests {
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
             write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
-            assert!(!polish_marker_present(
-                "gh pr create --title x",
-                Some(tmp.path().to_str().unwrap())
-            ));
+            assert!(!polish_marker_present(&local(tmp.path().to_str().unwrap())));
         });
     }
 
@@ -1399,17 +1622,14 @@ mod tests {
         let (tmp, _root) = init_repo_on_branch("feat/unmarked");
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            assert!(!polish_marker_present(
-                "gh pr create --title x",
-                Some(tmp.path().to_str().unwrap())
-            ));
+            assert!(!polish_marker_present(&local(tmp.path().to_str().unwrap())));
         });
     }
 
     #[test]
     fn polish_marker_present_false_when_cwd_none() {
         // No cwd → unresolved → false (fail-open, ADR-0001).
-        assert!(!polish_marker_present("gh pr create --title x", None));
+        assert!(!polish_marker_present(&MarkerTarget::Unknown));
     }
 
     #[test]
@@ -1417,10 +1637,248 @@ mod tests {
         // A real directory that is not a git repo → GitState::resolve is None
         // → false (fail-open, ADR-0001) — still holds after the #324 re-key.
         let tmp = tempfile::tempdir().unwrap();
-        assert!(!polish_marker_present(
-            "gh pr create --title x",
-            Some(tmp.path().to_str().unwrap())
-        ));
+        assert!(!polish_marker_present(&local(tmp.path().to_str().unwrap())));
+    }
+
+    fn local(dir: &str) -> MarkerTarget {
+        MarkerTarget::Local {
+            work_dir: dir.to_string(),
+        }
+    }
+
+    // --- decide_ship_target / resolve_ship_target (cadence-hooks#995) ---
+
+    fn remotes(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(h, s)| (h.to_string(), s.to_string()))
+            .collect()
+    }
+
+    fn target(repos: &[&str], host: Option<&str>, head: ShipHead) -> ShipTarget {
+        ShipTarget {
+            repos: repos.iter().map(|r| r.to_string()).collect(),
+            host: host.map(str::to_string),
+            head,
+        }
+    }
+
+    fn named(branch: &str) -> ShipHead {
+        ShipHead::Named(branch.to_string())
+    }
+
+    /// Resolve against fixed remotes and one worktree (`feat/wt` at
+    /// `/wt`), from a cwd at `/cwd` on `main`.
+    fn decide(t: &ShipTarget, remote_pairs: &[(&str, &str)]) -> MarkerTarget {
+        decide_ship_target(
+            t,
+            "/cwd",
+            "main",
+            || remotes(remote_pairs),
+            |branch| (branch == "feat/wt").then(|| "/wt".to_string()),
+        )
+    }
+
+    fn is_cannot_check(t: &MarkerTarget) -> bool {
+        matches!(t, MarkerTarget::CannotCheck { .. })
+    }
+
+    const OWN: &[(&str, &str)] = &[("github.com", "own/repo")];
+
+    #[test]
+    fn decide_own_repo_in_every_form_resolves_to_the_cwd() {
+        for value in [
+            "own/repo",
+            "Own/Repo",
+            "own/repo.git",
+            "github.com/own/repo",
+            "https://github.com/own/repo.git/",
+            "git@github.com:own/repo.git",
+        ] {
+            assert_eq!(
+                decide(&target(&[value], None, ShipHead::Current), OWN),
+                local("/cwd"),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_matches_any_remote_not_only_origin() {
+        let both = &[("github.com", "me/fork"), ("github.com", "up/repo")];
+        assert_eq!(
+            decide(&target(&["up/repo"], None, ShipHead::Current), both),
+            local("/cwd")
+        );
+    }
+
+    #[test]
+    fn decide_foreign_repo_cannot_check_and_names_it() {
+        let result = decide(&target(&["other/r"], None, ShipHead::Current), OWN);
+        assert_eq!(
+            result,
+            MarkerTarget::CannotCheck {
+                reason: "PR targets `other/r`, not a remote of this checkout".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_one_foreign_value_among_own_ones_cannot_check() {
+        let t = target(&["own/repo", "other/r"], None, ShipHead::Current);
+        assert!(is_cannot_check(&decide(&t, OWN)));
+    }
+
+    #[test]
+    fn decide_host_counts_only_when_named() {
+        // A bare slug ignores the host...
+        let ghe = &[("ghe.example.com", "own/repo")];
+        assert_eq!(
+            decide(&target(&["own/repo"], None, ShipHead::Current), ghe),
+            local("/cwd")
+        );
+        // ...a value naming a host, or an inline GH_HOST, must match it.
+        assert!(is_cannot_check(&decide(
+            &target(&["github.com/own/repo"], None, ShipHead::Current),
+            ghe
+        )));
+        assert!(is_cannot_check(&decide(
+            &target(&["own/repo"], Some("github.com"), ShipHead::Current),
+            ghe
+        )));
+        assert_eq!(
+            decide(
+                &target(&["own/repo"], Some("GHE.example.com"), ShipHead::Current),
+                ghe
+            ),
+            local("/cwd")
+        );
+    }
+
+    #[test]
+    fn decide_empty_or_unparseable_repo_cannot_check() {
+        for value in ["", "repo", "a b/c d"] {
+            assert!(
+                is_cannot_check(&decide(&target(&[value], None, ShipHead::Current), OWN)),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_no_remotes_cannot_check_a_repo_value() {
+        assert!(is_cannot_check(&decide(
+            &target(&["own/repo"], None, ShipHead::Current),
+            &[]
+        )));
+    }
+
+    #[test]
+    fn decide_head_on_the_cwd_branch_resolves_to_the_cwd() {
+        assert_eq!(
+            decide(&target(&[], None, named("main")), OWN),
+            local("/cwd")
+        );
+        assert_eq!(
+            decide(&target(&[], None, named("refs/heads/main")), OWN),
+            local("/cwd")
+        );
+    }
+
+    #[test]
+    fn decide_head_checked_out_in_a_worktree_resolves_there() {
+        assert_eq!(
+            decide(&target(&[], None, named("feat/wt")), OWN),
+            local("/wt")
+        );
+    }
+
+    #[test]
+    fn decide_head_checked_out_nowhere_cannot_check() {
+        assert_eq!(
+            decide(&target(&[], None, named("feat/gone")), OWN),
+            MarkerTarget::CannotCheck {
+                reason: "`feat/gone` is not checked out here".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_ambiguous_head_cannot_check() {
+        assert!(is_cannot_check(&decide(
+            &target(&[], None, ShipHead::Ambiguous),
+            OWN
+        )));
+    }
+
+    #[test]
+    fn decide_owner_prefixed_head() {
+        // The checkout's own owner strips to the branch.
+        assert_eq!(
+            decide(&target(&[], None, named("Own:feat/wt")), OWN),
+            local("/wt")
+        );
+        // A fork owner is not resolvable here.
+        assert!(is_cannot_check(&decide(
+            &target(&[], None, named("someone:feat/wt")),
+            OWN
+        )));
+        assert!(is_cannot_check(&decide(
+            &target(&[], None, named("own:")),
+            OWN
+        )));
+    }
+
+    #[test]
+    fn decide_does_not_read_remotes_or_worktrees_it_does_not_need() {
+        let result = decide_ship_target(
+            &target(&[], None, named("main")),
+            "/cwd",
+            "main",
+            || panic!("no repo value and no owner prefix: remotes are not needed"),
+            |_| panic!("the head is the cwd's branch: worktrees are not needed"),
+        );
+        assert_eq!(result, local("/cwd"));
+    }
+
+    #[test]
+    fn decide_never_echoes_an_unsafe_value() {
+        let result = decide(&target(&["evil/`$(x)`"], None, ShipHead::Current), OWN);
+        let MarkerTarget::CannotCheck { reason } = result else {
+            panic!("expected CannotCheck, got {result:?}");
+        };
+        assert!(!reason.contains("$("), "{reason}");
+        assert!(reason.contains("a value it could not read"), "{reason}");
+    }
+
+    #[test]
+    fn worktree_in_listing_finds_the_checked_out_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().to_str().unwrap();
+        let listing = format!(
+            "worktree /nonexistent/primary\nHEAD abc\nbranch refs/heads/main\n\n\
+             worktree {wt}\nHEAD def\nbranch refs/heads/feat/x\n\n\
+             worktree /nonexistent/gone\nHEAD 123\nbranch refs/heads/feat/gone\n"
+        );
+        assert_eq!(
+            worktree_in_listing(&listing, "feat/x"),
+            Some(wt.to_string())
+        );
+        // A prefix of a checked-out branch is not that branch.
+        assert_eq!(worktree_in_listing(&listing, "feat"), None);
+        // A listed worktree whose directory is gone does not resolve.
+        assert_eq!(worktree_in_listing(&listing, "feat/gone"), None);
+    }
+
+    #[test]
+    fn resolve_ship_target_unknown_without_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = target(&["own/repo"], None, named("feat/x"));
+        assert_eq!(
+            resolve_ship_target(&t, Some(tmp.path().to_str().unwrap())),
+            MarkerTarget::Unknown
+        );
+        assert_eq!(resolve_ship_target(&t, None), MarkerTarget::Unknown);
     }
 
     // --- read_polish_marker / PolishRecord (#467) ---
@@ -1753,8 +2211,8 @@ mod tests {
                 r#"{"scope":"code","arms":{"security":"ran","tests":"skipped"}}"#,
             )
             .unwrap();
-            let rec = read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap()))
-                .expect("marker reads");
+            let rec =
+                read_polish_marker(&local(tmp.path().to_str().unwrap())).expect("marker reads");
             assert_eq!(rec.scope.as_deref(), Some("code"));
             assert_eq!(rec.security_ran(), Some(true));
         });
@@ -1768,9 +2226,7 @@ mod tests {
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
             write_marker(&polish_marker(&root, "feat/garbage"), "]]not json").unwrap();
-            assert!(
-                read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap())).is_none()
-            );
+            assert!(read_polish_marker(&local(tmp.path().to_str().unwrap())).is_none());
         });
     }
 
@@ -1786,7 +2242,7 @@ mod tests {
         std::fs::write(&not_a_dir, "").unwrap();
         with_marker_dir(&not_a_dir, || {
             assert!(!marker_dir_is_private(), "precondition: fail-open path");
-            assert!(read_polish_marker("gh pr create", Some("/tmp")).is_none());
+            assert!(read_polish_marker(&local("/tmp")).is_none());
         });
     }
 
@@ -1795,10 +2251,8 @@ mod tests {
         let (tmp, _root) = init_repo_on_branch("feat/none");
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            assert!(
-                read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap())).is_none()
-            );
-            assert!(read_polish_marker("gh pr create", None).is_none());
+            assert!(read_polish_marker(&local(tmp.path().to_str().unwrap())).is_none());
+            assert!(read_polish_marker(&MarkerTarget::Unknown).is_none());
         });
     }
 
