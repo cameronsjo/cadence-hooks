@@ -385,8 +385,28 @@ fn repo_value_is_a_remote(
     };
     let host = value_host.or_else(|| gh_host.map(str::to_ascii_lowercase));
     remotes.iter().any(|(remote_host, remote_slug)| {
-        *remote_slug == slug && host.as_deref().is_none_or(|h| h == remote_host)
+        *remote_slug == slug
+            && host
+                .as_deref()
+                .is_none_or(|h| host_is_unknowable(remote_host) || h == remote_host)
     })
+}
+
+/// A remote host that cannot be compared to a forge host: an SSH config alias
+/// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
+/// the `owner/repo` comparison applies to such a remote.
+fn host_is_unknowable(remote_host: &str) -> bool {
+    !remote_host.contains('.')
+}
+
+/// The forge host a remote URL's host stands for. GitHub serves SSH over port
+/// 443 at `ssh.github.com`, which is still `github.com` to gh.
+fn forge_host(host: String) -> String {
+    if host == "ssh.github.com" {
+        "github.com".to_string()
+    } else {
+        host
+    }
 }
 
 /// Every remote of the repo at `dir`, as lowercased `(host, owner/repo)`
@@ -401,7 +421,7 @@ fn git_remotes(dir: &str) -> Vec<(String, String)> {
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .filter_map(host_and_repo_from_url)
-        .map(|(host, slug)| (host, slug.to_ascii_lowercase()))
+        .map(|(host, slug)| (forge_host(host), slug.to_ascii_lowercase()))
         .collect()
 }
 
@@ -1753,6 +1773,32 @@ mod tests {
             ),
             local("/cwd")
         );
+    }
+
+    #[test]
+    fn decide_host_named_value_matches_an_ssh_alias_remote() {
+        // An SSH config alias names no real host, so only owner/repo counts.
+        let alias = &[("github-work", "own/repo")];
+        assert_eq!(
+            decide(
+                &target(&["github.com/own/repo"], None, ShipHead::Current),
+                alias
+            ),
+            local("/cwd")
+        );
+        assert_eq!(
+            decide(
+                &target(&["own/repo"], Some("github.com"), ShipHead::Current),
+                alias
+            ),
+            local("/cwd")
+        );
+    }
+
+    #[test]
+    fn forge_host_maps_github_ssh_over_443() {
+        assert_eq!(forge_host("ssh.github.com".to_string()), "github.com");
+        assert_eq!(forge_host("ghe.example.com".to_string()), "ghe.example.com");
     }
 
     #[test]
