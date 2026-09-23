@@ -27,15 +27,17 @@ use std::process::{Command, Stdio};
 /// child that wins the race completes every write and the test passes for the
 /// wrong reason.
 fn run_with_closed_stdout(args: &[&str]) -> (std::process::ExitStatus, String, String) {
-    run_with_closed_stdout_env(args, &[])
+    run_with_closed_stdout_env(args, &[], None)
 }
 
-/// [`run_with_closed_stdout`] with extra environment for the child — for a
-/// command such as `doctor` that reads the user's home and config directory,
-/// and so must be pointed at a temp dir to stay hermetic.
+/// [`run_with_closed_stdout`] with extra environment and a working directory
+/// for the child — for a command such as `doctor` that reads the user's home,
+/// config directory, and the checkout it runs in, and so must be pointed at a
+/// temp dir to stay hermetic.
 fn run_with_closed_stdout_env(
     args: &[&str],
     envs: &[(&str, &std::path::Path)],
+    current_dir: Option<&std::path::Path>,
 ) -> (std::process::ExitStatus, String, String) {
     let tmp = tempfile::tempdir().expect("create a temp metrics dir");
 
@@ -53,7 +55,11 @@ fn run_with_closed_stdout_env(
     // below, and never wrapped in an owning type.
     unsafe { libc::close(read_fd) };
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
+    }
+    let mut child = command
         .args(args)
         .env("CADENCE_METRICS_DIR", tmp.path())
         .envs(envs.iter().copied())
@@ -129,15 +135,17 @@ fn closed_stdout_covers_other_writers_too() {
 }
 
 /// `doctor | head -1` was the shape that produced the last recorded panic rows
-/// (cadence-hooks#956), so it gets its own pin. `doctor` reads the user's home
-/// and Claude config directory, so both point at an empty temp dir: the test
-/// never reads, or reports on, the real machine's state.
+/// (cadence-hooks#956), so it gets its own pin. `doctor` reads the user's home,
+/// the Claude config directory, and the checkout it runs in, so all three
+/// point at an empty temp dir. Ambient `CADENCE_*` variables still pass
+/// through; they cannot change whether a closed stdout kills the process.
 #[test]
 fn closed_stdout_covers_doctor() {
     let home = tempfile::tempdir().expect("create a temp home");
     let (status, stderr, failopen) = run_with_closed_stdout_env(
         &["doctor"],
         &[("HOME", home.path()), ("CLAUDE_CONFIG_DIR", home.path())],
+        Some(home.path()),
     );
 
     assert!(
