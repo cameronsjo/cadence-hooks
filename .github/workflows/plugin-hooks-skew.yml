@@ -17,12 +17,12 @@ permissions:
 
 jobs:
   doctor:
-    # Self-hosted, because a reusable workflow's runner minutes bill the CALLER,
-    # and every caller here is a private plugin repo. `ubuntu-latest` meant this
-    # gate consumed GitHub-hosted minutes on their accounts even though this
-    # repo is public and its own CI is free — enough to stop the job starting
-    # once a caller's Actions budget was reached.
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted: this repo is public, so ubuntu-latest minutes for this
+    # job are free. A reusable workflow's runner minutes bill whichever repo
+    # calls it, not this one, so callers see the same billing either way —
+    # this change only retires the self-hosted label set this gate used to
+    # require, not a cost decision for callers.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -33,18 +33,19 @@ jobs:
           set -euo pipefail
           tag="$(gh release view --repo cameronsjo/cadence-hooks --json tagName --jq .tagName)"
           echo "Latest released cadence-hooks: $tag"
-          # --clobber: on a self-hosted runner /tmp/ch survives between runs,
-          # and a leftover same-version tarball fails the download with
-          # "already exists" before any skew logic runs (observed 2026-08-03
-          # failing every hooks-touching cadence PR in ~5s).
+          # --clobber: a fresh GitHub-hosted runner has no prior /tmp/ch, but
+          # --clobber is cheap insurance against a re-run reusing the same
+          # job workspace, and a leftover same-version tarball failing the
+          # download with "already exists" before any skew logic runs was
+          # observed 2026-08-03 on the previous self-hosted runner.
           gh release download "$tag" --repo cameronsjo/cadence-hooks \
             --pattern "*linux-x86_64.tar.gz" --dir /tmp/ch --clobber
-          # Exact filename, never a glob: /tmp/ch survives between runs on the
-          # self-hosted runner, so after a version rollover TWO tarballs match
-          # *linux-x86_64.tar.gz and tar reads the older one as the archive
-          # with the newer one as a member name ("Not found in archive" —
-          # observed on the first rollover after the --clobber fix, v0.75.1 ->
-          # v0.76.0, 2026-08-12).
+          # Exact filename, never a glob: a re-run reusing /tmp/ch could leave
+          # TWO tarballs matching *linux-x86_64.tar.gz after a version
+          # rollover, and tar would read the older one as the archive with
+          # the newer one as a member name ("Not found in archive" — observed
+          # on the previous self-hosted runner's first rollover after the
+          # --clobber fix, v0.75.1 -> v0.76.0, 2026-08-12).
           tar -xzf "/tmp/ch/cadence-hooks-${tag}-linux-x86_64.tar.gz" -C /tmp/ch
           bin="$(find /tmp/ch -type f -name cadence-hooks | head -n1)"
           mkdir -p "$HOME/.local/bin"
