@@ -18,9 +18,9 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // `git_dir_for_input`, `is_claude_managed_dir`, and `is_plan_doc_dir` all live
 // in `cadence_hooks_core::worktree` now, so `warn-main-branch` and
@@ -109,44 +109,28 @@ impl Check for WarnMainBranch {
         // Edits inside a `.claude/` directory are tooling, config, or worktree
         // work, and plan docs under `docs/plans/` are mandated on the default
         // branch — never the branch-worthy product change this warns about. Skip
-        // the warning (and the git spawns below) entirely. (issues #33, #35, #226)
+        // the warning (and the git-state walk below) entirely. (issues #33, #35, #226)
         if is_claude_managed_dir(&dir) || is_plan_doc_dir(&dir) {
             return CheckResult::allow();
         }
 
-        let dir_arg = dir.to_string_lossy();
-
-        // Branch detection scoped to the edited file's repo, not CWD's repo.
-        // `git -C` walks upward to find `.git`, picking the nearest enclosing
-        // repository — which is what we want when editing inside a nested
-        // checkout from a session whose CWD is the outer parent.
-        let mut branch_cmd = Command::new("git");
-        branch_cmd.args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"]);
-        let branch = match cadence_hooks_core::shell::run_git_bounded(&mut branch_cmd) {
-            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            }
-            // Advisory: a truncated branch name is not a branch name.
-            cadence_hooks_core::shell::GitSpawn::Completed(_)
-            | cadence_hooks_core::shell::GitSpawn::Truncated(_)
-            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
-            | cadence_hooks_core::shell::GitSpawn::TimedOut => return CheckResult::allow(),
+        // Branch + repo root come from the shared `GitState` — a pure
+        // filesystem walk scoped to the edited file's repo, not CWD's repo, so a
+        // nested checkout under a parent session still resolves its own `.git`.
+        // This replaced two `git -C` spawns (`symbolic-ref --short HEAD` and
+        // `rev-parse --show-toplevel`) that ran on every Edit/Write and made
+        // this the slowest hook on the Write path. `repo_root` is canonicalized
+        // exactly as `--show-toplevel` is, so the session-marker keys are
+        // unchanged. Not in a repo, a missing parent dir, or a detached HEAD
+        // all resolve to no branch and fail open (ADR-0001) — the same verdicts
+        // the git spawns gave.
+        let Some(state) = GitState::resolve(&dir) else {
+            return CheckResult::allow();
         };
-
-        // Repo root for marker — same source as the branch query so the
-        // once-per-session suppression actually keys off the same repo.
-        let mut root_cmd = Command::new("git");
-        root_cmd.args(["-C", &dir_arg, "rev-parse", "--show-toplevel"]);
-        let repo_root = match cadence_hooks_core::shell::run_git_bounded(&mut root_cmd) {
-            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            }
-            // Advisory: a truncated path is a wrong path.
-            cadence_hooks_core::shell::GitSpawn::Completed(_)
-            | cadence_hooks_core::shell::GitSpawn::Truncated(_)
-            | cadence_hooks_core::shell::GitSpawn::SpawnFailed
-            | cadence_hooks_core::shell::GitSpawn::TimedOut => return CheckResult::allow(),
+        let Some(branch) = state.branch else {
+            return CheckResult::allow();
         };
+        let repo_root = state.repo_root.to_string_lossy().into_owned();
 
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
@@ -183,6 +167,7 @@ impl Check for WarnMainBranch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn main_branch_warns() {
@@ -629,8 +614,8 @@ mod tests {
     //
     // The `should_warn` tests above cover the pure decision; these exercise the
     // full `run()` path where a suppressed nudge is (or isn't) attributed to an
-    // active dismissal. A real git repo on `main` is needed because run() shells
-    // out for branch + toplevel.
+    // active dismissal. A real git repo on `main` is needed because run()
+    // resolves branch + toplevel from the on-disk `.git`.
 
     /// Init a git repo checked out on `main` in a fresh tempdir; return the
     /// tempdir plus the git-resolved (canonical) repo root.
@@ -835,5 +820,134 @@ mod tests {
             r.bypass.is_none(),
             "a by-design allow-main is a bare allow, not a bypass"
         );
+    }
+
+    // --- GitState resolution parity (replaced two `git -C` spawns) ---
+    //
+    // Each case pins the verdict AND the marker key the old git spawns
+    // produced: `repo_root` must equal `git rev-parse --show-toplevel` byte for
+    // byte, or a session already warned under the old key would be re-warned.
+
+    /// Run `f` with `CADENCE_ALLOW_MAIN` cleared, serialized crate-wide.
+    fn without_allow_main<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_MAIN");
+        }
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
+            }
+        }
+        out.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn edit_input_at(file: &Path, cwd: &Path, session: &str) -> HookInput {
+        let mut input = edit_input_in(cwd, session);
+        input.tool_input.as_mut().unwrap().file_path = Some(file.to_string_lossy().into_owned());
+        input
+    }
+
+    #[test]
+    fn main_edit_nudges_and_marks_git_toplevel() {
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-parity-main");
+        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        assert_eq!(r.outcome, Outcome::Nudge, "an edit on main nudges");
+        let marker = WarnMainBranch::marker_path(&input, &root);
+        assert!(
+            marker.exists(),
+            "the once-per-session marker is keyed on git's own --show-toplevel"
+        );
+    }
+
+    #[test]
+    fn subdirectory_edit_keys_marker_on_repo_root() {
+        let (tmp, root) = init_repo_on_main();
+        let sub = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let input = edit_input_at(&sub.join("f.rs"), tmp.path(), "warn-parity-sub");
+        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(WarnMainBranch::marker_path(&input, &root).exists());
+    }
+
+    #[test]
+    fn linked_worktree_reports_its_own_branch() {
+        // Primary on a feature branch, linked worktree on `main`: the edit in
+        // the worktree must read the worktree's HEAD, not the primary's.
+        let (tmp, _root) = init_repo_on_main();
+        git_in(tmp.path(), &["checkout", "-q", "-b", "feat/primary"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git_in(
+            tmp.path(),
+            &["worktree", "add", "-q", &wt.to_string_lossy(), "main"],
+        );
+        let wt_root = cadence_hooks_core::shell::git_command(
+            &wt.to_string_lossy(),
+            &["rev-parse", "--show-toplevel"],
+        )
+        .unwrap();
+
+        let in_wt = edit_input_in(&wt, "warn-parity-wt");
+        let r = without_allow_main(|| WarnMainBranch.run(&in_wt));
+        assert_eq!(r.outcome, Outcome::Nudge, "worktree on main nudges");
+        assert!(WarnMainBranch::marker_path(&in_wt, &wt_root).exists());
+
+        let in_primary = edit_input_in(tmp.path(), "warn-parity-wt-primary");
+        let r = without_allow_main(|| WarnMainBranch.run(&in_primary));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "primary on a feature branch allows"
+        );
+    }
+
+    #[test]
+    fn detached_head_allows() {
+        let (tmp, _root) = init_repo_on_main();
+        git_in(tmp.path(), &["checkout", "-q", "--detach"]);
+        let input = edit_input_in(tmp.path(), "warn-parity-detached");
+        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn missing_parent_dir_allows() {
+        // `git -C <missing>` failed → allow; the walk must fail the same way,
+        // not climb into the enclosing repo.
+        let (tmp, _root) = init_repo_on_main();
+        let file = tmp.path().join("not").join("yet").join("f.rs");
+        let input = edit_input_at(&file, tmp.path(), "warn-parity-missing");
+        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn outside_any_repo_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = edit_input_in(tmp.path(), "warn-parity-norepo");
+        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        assert_eq!(r.outcome, Outcome::Allow);
     }
 }

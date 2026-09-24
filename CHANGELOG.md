@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`plugin-hooks-skew.yml` takes an optional `runs-on` input.** It defaults to `ubuntu-latest`, so existing callers keep their current runner. A reusable workflow bills the calling repo, so a private caller can now run the gate on its own self-hosted label instead of paid hosted minutes.
 
+### Changed
+
+- **`warn-main-branch` no longer spawns `git`.** It read the branch and repo root through two `git -C` calls on every Edit and Write, which made it the slowest hook on the Write path (~24 ms per call, against a ~3 ms process floor). It now reads them from the on-disk `.git` through the shared `GitState` resolver, so it costs about the same as `--version`. The verdicts and the once-per-session marker keys are unchanged; new parity tests pin a nudge on `main`, a subdirectory edit, a linked worktree on `main`, a detached HEAD, a missing parent directory, and a path outside any repo.
+
 ## [0.102.1] - 2026-09-23
 
 ### Fixed
