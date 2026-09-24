@@ -10,19 +10,25 @@ name: plugin-hooks-skew
 # `doctor --root .` scans that plugin's hooks.json.
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner label for the doctor job. Defaults to ubuntu-latest, which is
+          free for a public caller. A private caller passes its own
+          self-hosted label, because a reusable workflow bills the caller.
+        type: string
+        default: ubuntu-latest
 
 permissions:
   contents: read
 
 jobs:
   doctor:
-    # GitHub-hosted: this repo is public, so ubuntu-latest minutes for this
-    # job are free. A reusable workflow's runner minutes bill whichever repo
-    # calls it, not this one, so callers see the same billing either way —
-    # this change only retires the self-hosted label set this gate used to
-    # require, not a cost decision for callers.
-    runs-on: ubuntu-latest
+    # The runner comes from the caller (the runs-on input). A reusable
+    # workflow bills the repo that calls it, so a public caller runs free on
+    # the ubuntu-latest default and a private caller passes its own label.
+    runs-on: ${{ inputs.runs-on }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 

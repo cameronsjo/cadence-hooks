@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`plugin-hooks-skew.yml` takes an optional `runs-on` input.** It defaults to `ubuntu-latest`, so existing callers keep their current runner. A reusable workflow bills the calling repo, so a private caller can now run the gate on its own self-hosted label instead of paid hosted minutes.
+
 ## [0.102.1] - 2026-09-23
 
 ### Fixed
