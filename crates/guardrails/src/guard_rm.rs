@@ -76,30 +76,29 @@
 //!   shell moves a variable through more routes than a parser at this altitude
 //!   can enumerate, so an unexpanded variable stays ASK.
 //!
-//! **Wiring: the binary is the filter, the `if:` prefilter is not.** The plugin
-//! registers this guard behind a case-sensitive substring glob, which matches
-//! over the whole command string with no word boundary and no command-head
-//! notion (the platform behaviour is measured in `docs/hooks.md` § Wiring
-//! prefilters; the registration itself lives in the plugin repo, and replacing
-//! it is tracked on cadence-hooks#597). Two consequences, opposite in direction
-//! and both load-bearing here:
+//! **Wiring: the binary is the only filter.** The plugin registers this guard
+//! on every Bash tool call with no `if:` prefilter (cadence#1359 dropped the
+//! five it used to carry; the registration lives in the plugin repo). The
+//! tokenized command-head verb match below is therefore the whole filter, and
+//! the ASCII case folding in it now runs on every spelling a command can take,
+//! because nothing upstream narrows the input.
 //!
-//! - **It over-fires.** `echo confirm`, `git format-patch`, `terraform apply`,
-//!   `npm run warm-cache` and `./perform-migration.sh` all carry a delete
-//!   verb's letters inside an ordinary word, and all spawn this guard. That
-//!   costs a process and nothing else *only because* the verb test below is a
-//!   tokenized command-head match: an ordinary command must reach a silent
-//!   ALLOW. `prefilter_false_positives_stay_silent` pins the corpus
+//! The prefilter it replaced was a case-sensitive substring glob (the platform
+//! behaviour is measured in `docs/hooks.md` § Wiring prefilters). It had two
+//! faults, now history:
+//!
+//! - **It over-fired.** `echo confirm`, `git format-patch`, `terraform apply`,
+//!   `npm run warm-cache` and `./perform-migration.sh` carry a delete verb's
+//!   letters inside an ordinary word and all spawned this guard. Every Bash
+//!   call reaches it now, so the same requirement holds more widely: an
+//!   ordinary command must reach a silent ALLOW.
+//!   `prefilter_false_positives_stay_silent` still pins that corpus
 //!   (cadence-hooks#597, whose own word list also named `chmod` — which
 //!   carries none of those letters and never matched anything).
-//! - **It under-fires.** The prefilter in the plugin wiring matches
-//!   case-sensitively, while this guard's verb match does not — so the ASCII
-//!   case folding below is exercised only on what the wiring hands the binary,
-//!   which is narrower than the set of spellings the guard itself judges
-//!   (cadence-hooks#577). Character classes are not supported either, so no
-//!   cleverer glob widens it. The fix is wiring-side: drop the `if:` and let
-//!   this binary filter, the way `obsidian::trash_guard` already does; that
-//!   wiring is tracked on cadence-hooks#597.
+//! - **It under-fired.** It matched case-sensitively while this guard's verb
+//!   match does not, so the case fold was exercised only on the spellings the
+//!   glob let through (cadence-hooks#577). Dropping the `if:` closed that gap
+//!   the way `obsidian::trash_guard` was already wired (cadence-hooks#597).
 //!
 //! The fold itself lives in `shell::fold_verb`, reached through
 //! `shell::command_word`, and this guard reads it from **two** independent
@@ -109,10 +108,6 @@
 //! `prefilter_true_positives_still_judge` was verified against. Worth knowing
 //! before reading a green case-fold test as proof that the call site you are
 //! looking at is the one carrying the behaviour.
-//!
-//! Neither the over-fire nor the under-fire is a verdict this guard produces.
-//! Read the prefilter as a cost hint; never as a statement about what reached
-//! the guard or what the guard decided.
 //!
 //! **Segment-aware parsing:** targets are collected by mirroring
 //! `enforce_worktree::collect_commit_targets` — walking `split_segments_with_ops`
