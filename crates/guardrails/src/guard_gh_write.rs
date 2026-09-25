@@ -4034,42 +4034,11 @@ mod tests {
     }
 
     #[test]
-    fn gh_host_env_resolution_survives_the_api_gate() {
-        // Process `GH_HOST` moves the default host, and a bare allowlist entry
-        // follows it — while `--hostname` still outranks it. Neither path reads
-        // a subcommand's flag table, so the gate must leave both intact.
-        with_env(
-            &[
-                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-                ("CADENCE_ALLOWED_REPOS", None),
-                ("CADENCE_EXTRA_HOSTS", None),
-                ("GH_HOST", Some("git.sjo.lol")),
-            ],
-            || {
-                for command in [
-                    "gh pr create -R cameronsjo/x -f --title t",
-                    "gh api repos/cameronsjo/x -X POST -f title=t",
-                ] {
-                    let input = input_with(command, "/tmp");
-                    let result = GhWriteGuard.run(&input);
-                    assert!(
-                        matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
-                        "bare owner follows the process GH_HOST: {command}"
-                    );
-                }
-                for command in [
-                    "gh pr create -R cameronsjo/x -f --hostname evil.example.com --title t",
-                    "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t",
-                ] {
-                    let input = input_with(command, "/tmp");
-                    let result = GhWriteGuard.run(&input);
-                    assert!(
-                        matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                        "--hostname outranks the process GH_HOST: {command}"
-                    );
-                }
-            },
-        );
+    fn inline_gh_host_assignment_is_not_trusted() {
+        // The process-`GH_HOST` half of this check lives in
+        // `tests/gh_host_env.rs`, in a child process. Setting `GH_HOST` here
+        // raced every unit test that reads `default_host()` without the env
+        // lock, and flipped their bare-owner verdicts mid-run.
         with_env(&owners_env(), || {
             let input = input_with(
                 "GH_HOST=evil.example.com gh pr create -R cameronsjo/x -f --title t",
