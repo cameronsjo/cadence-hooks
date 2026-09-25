@@ -103,50 +103,119 @@ impl Drop for PanicGuard {
     }
 }
 
+/// A hook check and the event it reports under: one row of `main::check_plan`,
+/// the table both the standalone and the `group` dispatch read.
+pub struct CheckPlan {
+    check: Box<dyn Check>,
+    event: HookEvent,
+    /// True for a subcommand wired on **more than one event**: the event it
+    /// reports (the output envelope's `hookEventName`, the denial row, the
+    /// timing row) follows the payload's own `hook_event_name` when that names
+    /// an event this binary models, and `event` is only the fallback. Emitting
+    /// the dispatch-time event instead would ship a `hookEventName` that
+    /// contradicts the event that actually fired — Claude Code reads that
+    /// field, so a mismatch is an output-schema failure, not a cosmetic one.
+    event_from_payload: bool,
+}
+
+impl CheckPlan {
+    /// A check that always reports under `event`.
+    pub fn new(check: Box<dyn Check>, event: HookEvent) -> Self {
+        Self {
+            check,
+            event,
+            event_from_payload: false,
+        }
+    }
+
+    /// A check wired on more than one event (see the field doc).
+    /// `fallback_event` covers a payload whose `hook_event_name` is absent or
+    /// unmodeled, and is what the pre-parse interactive-terminal guidance uses.
+    pub fn payload_event(check: Box<dyn Check>, fallback_event: HookEvent) -> Self {
+        Self {
+            check,
+            event: fallback_event,
+            event_from_payload: true,
+        }
+    }
+
+    /// The event this check is wired on (the fallback for a payload-event check).
+    pub fn event(&self) -> HookEvent {
+        self.event
+    }
+
+    /// Whether the reported event follows the payload (see the field doc).
+    pub fn is_payload_event(&self) -> bool {
+        self.event_from_payload
+    }
+}
+
+/// What one check decided, once its audit writes are done.
+enum MemberVerdict {
+    /// Nothing to emit: effort-skipped, or a duplicate nudge another process
+    /// already delivered (see [`claim_emission`]).
+    Silent,
+    /// The check panicked. The panic hook already printed the breadcrumb and
+    /// wrote the `panic` failopen row, and the dispatch tail has been emitted.
+    Panicked,
+    /// A decided result to emit under the given event. Boxed: a
+    /// `CheckResult` is large next to the empty variants.
+    Emit(Box<CheckResult>, HookEvent),
+}
+
 /// Run a single check from stdin, record its decision to `denials.jsonl` and its
 /// wall-clock time to `hooks.jsonl`, then emit and exit exactly as
 /// [`cadence_hooks_core::run_check_from_stdin`] would.
 ///
 /// `hook` is the canonical registry name from `main::hook_name`; when `None`
 /// (e.g. a subcommand with no registry mapping) it falls back to `check.name()`.
-pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>) -> ! {
-    run_logged_check_inner(check, event, hook, false)
-}
-
-/// [`run_logged_check`] for a subcommand wired on **more than one event**: the
-/// event it reports (the output envelope's `hookEventName`, the denial row, the
-/// timing row) follows the payload's own `hook_event_name` when that names an
-/// event this binary models.
-///
-/// `fallback_event` covers a payload whose `hook_event_name` is absent or
-/// unmodeled, and is what the pre-parse interactive-terminal guidance uses.
-/// Emitting the dispatch-time event instead would ship a `hookEventName` that
-/// contradicts the event that actually fired — Claude Code reads that field, so
-/// a mismatch is an output-schema failure, not a cosmetic one.
-pub fn run_logged_check_payload_event(
-    check: &dyn Check,
-    fallback_event: HookEvent,
-    hook: Option<&str>,
-) -> ! {
-    run_logged_check_inner(check, fallback_event, hook, true)
-}
-
-fn run_logged_check_inner(
-    check: &dyn Check,
-    event: HookEvent,
-    hook: Option<&str>,
-    event_from_payload: bool,
-) -> ! {
+pub fn run_logged_plan(plan: CheckPlan, hook: Option<&str>) -> ! {
     let started = Instant::now();
     // Arm the shared subprocess deadline before any guard logic can spawn git
     // (cadence-hooks#271): probes abandon at the internal budget so the guard
     // decides and self-reports instead of being killed by the external
     // hooks.json timeout, which is unloggable.
     cadence_hooks_core::deadline::arm();
-    guard_interactive_terminal(check.name(), Some(event), None);
+    guard_interactive_terminal(plan.check.name(), Some(plan.event), None);
     // Hoisted above the stdin parse so both the parse-failure arm and the
     // decided-result arm below can record against the same canonical name.
-    let hook_name = hook.unwrap_or_else(|| check.name());
+    let hook_name = hook.unwrap_or_else(|| plan.check.name());
+    let (input, normalized_inputs) = parse_or_exit(&[hook_name]);
+    match decide_member(&plan, hook_name, &input, &normalized_inputs, started) {
+        MemberVerdict::Silent => process::exit(Outcome::Allow.code()),
+        // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
+        // non-Block outcome to 0 — so the *user's* operation proceeds
+        // either way, and this arm does not need 0 to fail open. What 1
+        // buys is DETECTABILITY: Claude Code surfaces a hook's stderr on a
+        // non-zero, non-2 exit and discards it on 0. At 0, a check that
+        // panics on every invocation — total enforcement failure for a
+        // block-capable guard like `guard-gh-write` — is indistinguishable
+        // in real time from one that works, with the panic breadcrumb
+        // written to stderr and thrown away and the only record a
+        // `failopen.jsonl` row nobody reads until they run `doctor`.
+        // A panic is the loudest thing this binary can notice about itself;
+        // it keeps the louder exit.
+        MemberVerdict::Panicked => process::exit(1),
+        MemberVerdict::Emit(result, event) => emit_and_exit(&result, event),
+    }
+}
+
+/// True when any hook this process serves is security-critical.
+fn any_security_critical(hook_names: &[&str]) -> bool {
+    hook_names
+        .iter()
+        .any(|name| crate::registry::is_security_critical(name))
+}
+
+/// Parse the stdin payload once and normalize it, or exit.
+///
+/// A parse or normalization failure is recorded against **every** hook in
+/// `hook_names` (one for a standalone hook, one per member for a `group`), so
+/// the failopen ledger counts exactly what separate processes would have
+/// counted. The fail-closed arm fires when any of them is security-critical:
+/// a separate process for that hook would have blocked, and a group must not
+/// be a way around that.
+fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
     let input = match HookInput::from_stdin_detailed() {
         Ok(input) => input,
         Err(e) => {
@@ -158,13 +227,15 @@ fn run_logged_check_inner(
             // (crates/core/src/lib.rs) and never from serde's `Display`, which
             // quotes the offending value. Recording it keeps the no-payload
             // posture (cameronsjo/cadence-hooks#959).
-            cadence_hooks_metrics::log_failopen(
-                "parse",
-                crate::registry::namespace_of(hook_name),
-                Some(hook_name),
-                env!("CARGO_PKG_VERSION"),
-                Some(&e),
-            );
+            for hook_name in hook_names {
+                cadence_hooks_metrics::log_failopen(
+                    "parse",
+                    crate::registry::namespace_of(hook_name),
+                    Some(hook_name),
+                    env!("CARGO_PKG_VERSION"),
+                    Some(&e),
+                );
+            }
             // Fail CLOSED only for an `apply_patch` body whose targets could not
             // be enumerated, on a security-critical hook — the same pair of
             // conditions the pre-#1040 code fired on. That path LOOKED
@@ -176,7 +247,7 @@ fn run_logged_check_inner(
             // Verified against a binary built from the pre-change `main`:
             //   conflicting apply_patch bodies, no env -> exit 2
             //   plain unparseable JSON, no env         -> exit 0
-            if unenumerable_patch && crate::registry::is_security_critical(hook_name) {
+            if unenumerable_patch && any_security_critical(hook_names) {
                 eprintln!(
                     "cadence-hooks: blocked because security-critical patch targets \
                      could not be enumerated. Review the patch and retry with a \
@@ -187,28 +258,18 @@ fn run_logged_check_inner(
             process::exit(0);
         }
     };
-    // Resolve the reported event from the payload for a multi-event
-    // subcommand. Every later use — the output envelope, the denial row, the
-    // timing row — reads this rebinding, so the three cannot disagree.
-    let event = if event_from_payload {
-        input
-            .hook_event_name
-            .as_deref()
-            .and_then(HookEvent::from_name)
-            .unwrap_or(event)
-    } else {
-        event
-    };
     let normalized_inputs = match input.normalized_inputs() {
         Ok(inputs) => inputs,
         Err(error) => {
-            cadence_hooks_metrics::log_failopen(
-                "parse",
-                crate::registry::namespace_of(hook_name),
-                Some(hook_name),
-                env!("CARGO_PKG_VERSION"),
-                Some(&error),
-            );
+            for hook_name in hook_names {
+                cadence_hooks_metrics::log_failopen(
+                    "parse",
+                    crate::registry::namespace_of(hook_name),
+                    Some(hook_name),
+                    env!("CARGO_PKG_VERSION"),
+                    Some(&error),
+                );
+            }
             // The diagnostic names why normalization gave up without ever
             // echoing the patch body — `error` is this binary's own message and
             // every `patch::parse` error is a static string.
@@ -231,7 +292,7 @@ fn run_logged_check_inner(
             // Not an ADR-0001 violation: that rule protects the user from a
             // guard's OWN failure. This is the input being unparseable, so the
             // guard cannot prove the operation safe and says so.
-            if crate::registry::is_security_critical(hook_name) {
+            if any_security_critical(hook_names) {
                 eprintln!(
                     "cadence-hooks: blocked because security-critical patch targets \
                      could not be enumerated. Review the patch and retry with a \
@@ -241,6 +302,33 @@ fn run_logged_check_inner(
             }
             process::exit(0);
         }
+    };
+    (input, normalized_inputs)
+}
+
+/// Decide one check against an already-parsed payload and write its audit rows
+/// (`denials.jsonl`, `bypasses.jsonl`, `hooks.jsonl`), returning what to emit.
+///
+/// Shared by the standalone and the `group` dispatch, so a hook records the
+/// same rows either way. `started` is when this check's own timing began.
+fn decide_member(
+    plan: &CheckPlan,
+    hook_name: &str,
+    input: &HookInput,
+    normalized_inputs: &[HookInput],
+    started: Instant,
+) -> MemberVerdict {
+    // Resolve the reported event from the payload for a multi-event
+    // subcommand. Every later use — the output envelope, the denial row, the
+    // timing row — reads this rebinding, so the three cannot disagree.
+    let event = if plan.event_from_payload {
+        input
+            .hook_event_name
+            .as_deref()
+            .and_then(HookEvent::from_name)
+            .unwrap_or(plan.event)
+    } else {
+        plan.event
     };
     // A panicking check must not skip the telemetry writes or reach the user as
     // a hard exit. `PANIC_GUARDED` tells the global panic hook (src/main.rs) to
@@ -273,8 +361,8 @@ fn run_logged_check_inner(
         catch_unwind(AssertUnwindSafe(|| {
             test_panic_trigger();
             let mut results = Vec::new();
-            for target in &normalized_inputs {
-                let Some(result) = decide_check(check, target) else {
+            for target in normalized_inputs {
+                let Some(result) = decide_check(plan.check.as_ref(), target) else {
                     continue;
                 };
                 results.push(result);
@@ -291,24 +379,12 @@ fn run_logged_check_inner(
             // row per panic. What is lost without this arm is the rest of the dispatch
             // tail, so emit it before leaving.
             emit_telemetry_tail(false);
-            // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
-            // non-Block outcome to 0 — so the *user's* operation proceeds
-            // either way, and this arm does not need 0 to fail open. What 1
-            // buys is DETECTABILITY: Claude Code surfaces a hook's stderr on a
-            // non-zero, non-2 exit and discards it on 0. At 0, a check that
-            // panics on every invocation — total enforcement failure for a
-            // block-capable guard like `guard-gh-write` — is indistinguishable
-            // in real time from one that works, with the panic breadcrumb
-            // written to stderr and thrown away and the only record a
-            // `failopen.jsonl` row nobody reads until they run `doctor`.
-            // A panic is the loudest thing this binary can notice about itself;
-            // it keeps the louder exit.
-            process::exit(1);
+            return MemberVerdict::Panicked;
         }
     };
     match decided {
         // Effort-skipped → silent Allow, nothing to record.
-        None => process::exit(Outcome::Allow.code()),
+        None => MemberVerdict::Silent,
         Some(Aggregated {
             result,
             outcomes,
@@ -328,10 +404,10 @@ fn run_logged_check_inner(
             // deduped rather than aggregated: they are a different event class
             // with no strictest-wins ordering, and losing one loses the only
             // record that a guardrail was stepped outside of.
-            cadence_hooks_metrics::log_denial(hook_name, event, &input, &outcomes);
+            cadence_hooks_metrics::log_denial(hook_name, event, input, &outcomes);
             for provenance in &bypasses {
                 cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
-                    hook_name, &input, provenance,
+                    hook_name, input, provenance,
                 ));
             }
             // A Block/Ask outcome stopped the operation, so a timed-out probe
@@ -343,11 +419,173 @@ fn run_logged_check_inner(
             // is still a decision this hook made, so it stays counted in
             // `denials.jsonl` and `hooks.jsonl`. Only the operator-facing
             // emission is dropped.
-            if !claim_emission(&result, &input, event, hook_name) {
-                process::exit(Outcome::Nudge.code());
+            if !claim_emission(&result, input, event, hook_name) {
+                return MemberVerdict::Silent;
             }
-            emit_and_exit(&result, event);
+            MemberVerdict::Emit(Box::new(result), event)
         }
+    }
+}
+
+/// One member of a `group` run: its canonical registry name and its check.
+pub struct GroupMember {
+    pub hook: &'static str,
+    pub plan: CheckPlan,
+}
+
+/// Run several checks against **one** stdin payload in **one** process, then
+/// emit the single response Claude Code reads from a hook process.
+///
+/// The point is latency: Claude Code spawns one process per hooks.json entry,
+/// and on a Write that was a dozen processes whose checks each took well under
+/// a millisecond. Process launch was nearly all of the cost.
+///
+/// Every member goes through the same [`decide_member`] a standalone run uses,
+/// so each one writes its own `denials.jsonl`, `bypasses.jsonl`, and
+/// `hooks.jsonl` rows under its own name. Members run in order and all of them
+/// run, even after a block, so the ledgers match separate processes. What
+/// differs is only the merge, done by [`merge_group_output`].
+///
+/// Two things are shared that separate processes did not share:
+/// - **The git deadline budget.** It bounds the whole process under the one
+///   external hooks.json timeout, so a slow `git` in one member leaves less for
+///   the next. Each member's degradation is still reported under its own name
+///   ([`cadence_hooks_core::deadline::reset_flags`]), and a timed-out probe
+///   is logged, never silent.
+/// - **A panic.** It is caught per member, so one check's bug cannot stop the
+///   others from running.
+///
+/// `notices` are problems found while resolving the members (an unknown hook,
+/// a member on the wrong event). They are already on stderr; they ride the
+/// merged output so they stay visible when the group exits 0.
+pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
+    cadence_hooks_core::deadline::arm();
+    guard_interactive_terminal("group", members.first().map(|m| m.plan.event), None);
+    let names: Vec<&str> = members.iter().map(|m| m.hook).collect();
+    let (input, normalized_inputs) = parse_or_exit(&names);
+    let mut decided: Vec<CheckResult> = Vec::new();
+    let mut degraded = notices;
+    let mut event = members
+        .first()
+        .map_or(HookEvent::PreToolUse, |m| m.plan.event);
+    for member in &members {
+        cadence_hooks_core::deadline::reset_flags();
+        match decide_member(
+            &member.plan,
+            member.hook,
+            &input,
+            &normalized_inputs,
+            Instant::now(),
+        ) {
+            MemberVerdict::Silent => {}
+            MemberVerdict::Panicked => degraded.push(format!(
+                "cadence-hooks: '{}' hit an internal error (panic) and did not block; \
+                 see failopen.jsonl",
+                member.hook
+            )),
+            MemberVerdict::Emit(result, member_event) => {
+                event = member_event;
+                decided.push(*result);
+            }
+        }
+    }
+    let output = merge_group_output(event, &decided, &degraded);
+    if let Some(out) = output.stdout {
+        println!("{out}");
+    }
+    if let Some(err) = output.stderr {
+        eprint!("{err}");
+    }
+    process::exit(output.code);
+}
+
+/// What a `group` run writes and its exit code.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GroupOutput {
+    stdout: Option<String>,
+    stderr: Option<String>,
+    code: i32,
+}
+
+/// Pure: merge the members' results into one hook response, the way Claude
+/// Code would have combined separate processes.
+///
+/// - **Any `Block`** exits 2 with every blocker's stderr, each rendered exactly
+///   as its own process would have rendered it. Nudges and asks are dropped:
+///   exit 2 discards stdout, and the tool call they were about did not run.
+/// - **Otherwise** one exit-0 envelope carries every `Ask` reason as the
+///   `permissionDecisionReason` (Claude Code shows one prompt either way) and
+///   every nudge, plus the degraded notices, as `additionalContext`. Each field
+///   is clamped to the same budget a single hook's output is, since Claude
+///   Code caps the output of each hook process, not of each check.
+/// - **Nothing to say but degraded notices** exits 1 with them on stderr, the
+///   code a standalone panic or version mismatch exits with, so the problem
+///   still shows up in real time.
+fn merge_group_output(
+    event: HookEvent,
+    results: &[CheckResult],
+    degraded: &[String],
+) -> GroupOutput {
+    use cadence_hooks_core::display::{HOOK_OUTPUT_BUDGET_UTF16, clamp_hook_output};
+    let blocks: Vec<String> = results
+        .iter()
+        .filter(|r| r.outcome == Outcome::Block)
+        .filter_map(|r| cadence_hooks_core::render_result(r, event).1)
+        .collect();
+    if results.iter().any(|r| r.outcome == Outcome::Block) {
+        return GroupOutput {
+            stdout: None,
+            stderr: (!blocks.is_empty()).then(|| blocks.join("\n")),
+            code: Outcome::Block.code(),
+        };
+    }
+    let messages = |outcome: Outcome| -> Vec<&str> {
+        results
+            .iter()
+            .filter(|r| r.outcome == outcome)
+            .filter_map(|r| r.message.as_deref())
+            .filter(|m| !m.is_empty())
+            .collect()
+    };
+    let asks = messages(Outcome::Ask);
+    let mut context = messages(Outcome::Nudge);
+    context.extend(degraded.iter().map(String::as_str));
+    if asks.is_empty() && messages(Outcome::Nudge).is_empty() {
+        return if degraded.is_empty() {
+            GroupOutput::default()
+        } else {
+            GroupOutput {
+                stdout: None,
+                stderr: Some(format!("{}\n", degraded.join("\n"))),
+                code: 1,
+            }
+        };
+    }
+    let mut specific = serde_json::Map::new();
+    specific.insert("hookEventName".into(), event.name().into());
+    if !asks.is_empty() {
+        let reason = asks.join("\n\n");
+        specific.insert("permissionDecision".into(), "ask".into());
+        specific.insert(
+            "permissionDecisionReason".into(),
+            clamp_hook_output(&reason, HOOK_OUTPUT_BUDGET_UTF16, None)
+                .as_ref()
+                .into(),
+        );
+    }
+    if !context.is_empty() {
+        let joined = context.join("\n\n");
+        specific.insert(
+            "additionalContext".into(),
+            clamp_hook_output(&joined, HOOK_OUTPUT_BUDGET_UTF16, None)
+                .as_ref()
+                .into(),
+        );
+    }
+    GroupOutput {
+        stdout: Some(serde_json::json!({ "hookSpecificOutput": specific }).to_string()),
+        stderr: None,
+        code: 0,
     }
 }
 
@@ -482,7 +720,7 @@ pub fn run_logged_logger(
     hook: Option<&str>,
 ) -> ! {
     let started = Instant::now();
-    // Same arming as run_logged_check: loggers spawn git too (heartbeat,
+    // Same arming as run_logged_plan: loggers spawn git too (heartbeat,
     // backstop) and must decide inside the external hooks.json budget.
     cadence_hooks_core::deadline::arm();
     guard_interactive_terminal(logger.name(), None, sample_override);
@@ -593,6 +831,107 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- group output merge ---
+
+    fn parse_stdout(out: &GroupOutput) -> serde_json::Value {
+        serde_json::from_str(out.stdout.as_deref().expect("stdout envelope")).unwrap()
+    }
+
+    #[test]
+    fn group_all_allow_is_silent_exit_zero() {
+        let out = merge_group_output(
+            HookEvent::PreToolUse,
+            &[CheckResult::allow(), CheckResult::allow()],
+            &[],
+        );
+        assert_eq!(out, GroupOutput::default());
+    }
+
+    #[test]
+    fn group_block_wins_and_keeps_every_blocker_message() {
+        let results = [
+            CheckResult::nudge("a nudge"),
+            CheckResult::block("first blocker"),
+            CheckResult::block("second blocker"),
+        ];
+        let out = merge_group_output(HookEvent::PreToolUse, &results, &["degraded".into()]);
+        assert_eq!(out.code, 2);
+        assert!(
+            out.stdout.is_none(),
+            "exit 2 discards stdout, so write none"
+        );
+        let err = out.stderr.expect("blockers on stderr");
+        assert!(err.contains("first blocker") && err.contains("second blocker"));
+        assert!(!err.contains("a nudge"));
+    }
+
+    #[test]
+    fn group_block_stderr_matches_a_standalone_block() {
+        let block = CheckResult::block("only blocker");
+        let alone = cadence_hooks_core::render_result(&block, HookEvent::PreToolUse).1;
+        let out = merge_group_output(HookEvent::PreToolUse, &[block], &[]);
+        assert_eq!(out.stderr, alone);
+    }
+
+    #[test]
+    fn group_nudges_join_into_one_additional_context() {
+        let results = [CheckResult::nudge("one"), CheckResult::nudge("two")];
+        let out = merge_group_output(HookEvent::PreToolUse, &results, &[]);
+        assert_eq!(out.code, 0);
+        let v = parse_stdout(&out);
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "one\n\ntwo");
+        assert!(v["hookSpecificOutput"].get("permissionDecision").is_none());
+    }
+
+    #[test]
+    fn group_single_nudge_matches_a_standalone_nudge() {
+        let nudge = CheckResult::nudge("just me");
+        let alone = cadence_hooks_core::render_result(&nudge, HookEvent::PostToolUse).0;
+        let out = merge_group_output(HookEvent::PostToolUse, &[nudge], &[]);
+        assert_eq!(out.stdout, alone);
+    }
+
+    #[test]
+    fn group_ask_carries_nudges_alongside() {
+        let results = [CheckResult::nudge("context"), CheckResult::ask("confirm?")];
+        let v = parse_stdout(&merge_group_output(HookEvent::PreToolUse, &results, &[]));
+        let spec = &v["hookSpecificOutput"];
+        assert_eq!(spec["permissionDecision"], "ask");
+        assert_eq!(spec["permissionDecisionReason"], "confirm?");
+        assert_eq!(spec["additionalContext"], "context");
+    }
+
+    #[test]
+    fn group_degraded_notice_rides_output_or_exits_one() {
+        let notice = vec!["member panicked".to_string()];
+        let with_nudge =
+            merge_group_output(HookEvent::PreToolUse, &[CheckResult::nudge("n")], &notice);
+        let v = parse_stdout(&with_nudge);
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"],
+            "n\n\nmember panicked"
+        );
+        let alone = merge_group_output(HookEvent::PreToolUse, &[CheckResult::allow()], &notice);
+        assert_eq!(
+            alone.code, 1,
+            "a lone degradation keeps the standalone panic exit"
+        );
+        assert_eq!(alone.stderr.as_deref(), Some("member panicked\n"));
+    }
+
+    #[test]
+    fn group_context_is_clamped_to_one_hook_budget() {
+        use cadence_hooks_core::display::HOOK_OUTPUT_BUDGET_UTF16;
+        let big = "x".repeat(HOOK_OUTPUT_BUDGET_UTF16);
+        let results = [CheckResult::nudge(big.clone()), CheckResult::nudge(big)];
+        let v = parse_stdout(&merge_group_output(HookEvent::PreToolUse, &results, &[]));
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.encode_utf16().count() <= HOOK_OUTPUT_BUDGET_UTF16);
+    }
     use cadence_hooks_core::{BlockMetadata, BypassKind};
 
     #[test]

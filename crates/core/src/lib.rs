@@ -1582,6 +1582,23 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
     process::exit(result.outcome.code());
 }
 
+/// What [`emit_and_exit`] would write for `result`, as `(stdout, stderr)`,
+/// without writing it or exiting.
+///
+/// For the binary's `group` command, which runs several checks in one process
+/// and has to merge their outputs into the single response one hook process
+/// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
+pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
+    let rendered = render_output(
+        result.outcome,
+        result.message.as_deref(),
+        result.block_metadata.as_ref(),
+        event,
+        feedback_footer().as_deref(),
+    );
+    (rendered.stdout, rendered.stderr)
+}
+
 /// The generic fallback payload for fire-and-forget loggers ([`MetricsInput`]
 /// shape). Must deserialize as [`MetricsInput`] — enforced by unit test.
 ///
@@ -1670,7 +1687,7 @@ pub fn guard_interactive_terminal(
 /// Routes through [`HookInput::normalized_inputs`], so a harness payload that
 /// expands into several targets (a Codex `apply_patch` carrying N file
 /// operations) is judged per target and the strictest verdict wins — the same
-/// semantics the shipped binary gets from `dispatch::run_logged_check`.
+/// semantics the shipped binary gets from `dispatch::run_logged_plan`.
 ///
 /// It was left unnormalized when patch expansion landed, which made it a second,
 /// *weaker* entry point wearing the name "convenience wrapper": an `apply_patch`

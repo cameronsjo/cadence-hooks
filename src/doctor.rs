@@ -181,6 +181,37 @@ fn extract_invocation(command: &str) -> Option<(String, String)> {
     Some((namespace, subcommand))
 }
 
+/// Every `(namespace, subcommand)` a hook command dispatches.
+///
+/// One pair for an ordinary entry. For `cadence-hooks group ns/sub ...`, one
+/// pair per member, so each member is cross-referenced like its own entry. A
+/// member missing its `/` comes back as `("group", member)`, which the
+/// registry does not know, so it is reported instead of silently skipped.
+fn extract_invocations(command: &str) -> Vec<(String, String)> {
+    let Some((namespace, first)) = extract_invocation(command) else {
+        return Vec::new();
+    };
+    if namespace != "group" {
+        return vec![(namespace, first)];
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some(group_idx) = tokens
+        .iter()
+        .position(|t| t.trim_matches(|c| c == '\'' || c == '"') == "group")
+    else {
+        return Vec::new();
+    };
+    tokens[group_idx + 1..]
+        .iter()
+        .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
+        .filter(|t| !t.starts_with('-'))
+        .map(|member| match member.split_once('/') {
+            Some((ns, sub)) => (ns.to_string(), sub.to_string()),
+            None => ("group".to_string(), member.to_string()),
+        })
+        .collect()
+}
+
 /// Diagnosis for a version-skew finding.
 #[derive(Debug, PartialEq)]
 struct SkewDiagnosis {
@@ -470,19 +501,23 @@ fn scan_hooks_json(
 
                 // Check 2: subcommand cross-reference (Warning). Gated by
                 // `report_skew` — see this function's doc comment.
-                if report_skew
-                    && let Some((ns, sub)) = extract_invocation(cmd)
-                    && let Some(diag) = judge_invocation(&ns, &sub, channel)
-                {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        plugin: plugin.to_string(),
-                        file: path.to_path_buf(),
-                        line: find_line_number(raw, cmd),
-                        snippet: cmd.to_string(),
-                        diagnosis: diag.diagnosis,
-                        remediation: diag.remediation,
-                    });
+                // A `group` entry is judged member by member, so one stale
+                // member is reported by name instead of the whole entry.
+                if report_skew {
+                    for (ns, sub) in extract_invocations(cmd) {
+                        let Some(diag) = judge_invocation(&ns, &sub, channel) else {
+                            continue;
+                        };
+                        findings.push(Finding {
+                            severity: Severity::Warning,
+                            plugin: plugin.to_string(),
+                            file: path.to_path_buf(),
+                            line: find_line_number(raw, cmd),
+                            snippet: cmd.to_string(),
+                            diagnosis: diag.diagnosis,
+                            remediation: diag.remediation,
+                        });
+                    }
                 }
             }
         }
@@ -3892,6 +3927,44 @@ mod tests {
     fn does_not_flag_literal_dollar_in_single_quotes() {
         let cmd = "echo '$5 charge'";
         assert_eq!(detect_single_quoted_envvar(cmd), None);
+    }
+
+    #[test]
+    fn extract_invocations_expands_a_group_entry() {
+        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology guardrails/guard-rm"#;
+        assert_eq!(
+            extract_invocations(cmd),
+            vec![
+                ("cadence".to_string(), "terminology".to_string()),
+                ("guardrails".to_string(), "guard-rm".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_invocations_keeps_an_ordinary_entry_as_one_pair() {
+        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence terminology"#;
+        assert_eq!(
+            extract_invocations(cmd),
+            vec![("cadence".to_string(), "terminology".to_string())]
+        );
+        assert!(extract_invocations("echo hi").is_empty());
+    }
+
+    #[test]
+    fn a_stale_group_member_is_reported_and_a_good_one_is_not() {
+        let cmd = "cadence-hooks group cadence/terminology cadence/retired-hook bogus";
+        let judged: Vec<_> = extract_invocations(cmd)
+            .into_iter()
+            .filter(|(ns, sub)| judge_invocation(ns, sub, InstallChannel::Unknown).is_some())
+            .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("cadence".to_string(), "retired-hook".to_string()),
+                ("group".to_string(), "bogus".to_string()),
+            ]
+        );
     }
 
     // ── extract_invocation table tests ──────────────────────────────────────

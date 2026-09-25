@@ -135,6 +135,18 @@ pub fn suppressed_block() -> bool {
     SUPPRESSED_BLOCK.load(Ordering::Relaxed)
 }
 
+/// Clear the two degradation flags, leaving the shared budget clock running.
+///
+/// For the binary's `group` command, which runs several checks in one process
+/// and reports each one's degradation under its own name. Without the reset,
+/// one hook's timed-out probe would be charged to every hook after it. The
+/// budget itself is **not** reset: it bounds the whole process under the one
+/// external hooks.json timeout, however many checks share it.
+pub fn reset_flags() {
+    DEADLINE_HIT.store(false, Ordering::Relaxed);
+    SUPPRESSED_BLOCK.store(false, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

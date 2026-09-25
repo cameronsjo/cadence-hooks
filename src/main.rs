@@ -85,6 +85,7 @@ mod configure;
 mod configure_guardrails;
 mod dispatch;
 mod doctor;
+mod group;
 mod hook_latency;
 mod migrate;
 mod registry;
@@ -154,6 +155,17 @@ enum Commands {
         /// Echo user-supplied payloads in full (default: bounded preview)
         #[arg(long)]
         show_payload: bool,
+    },
+
+    /// Run several hook checks against one payload in one process
+    ///
+    /// For hooks.json wiring: one `group` entry replaces one entry per check,
+    /// which saves a process launch per check on every matching tool call.
+    /// Every member must be a PreToolUse or PostToolUse check on the same event.
+    Group {
+        /// Checks to run, in order, as <namespace>/<hook> (e.g. cadence/terminology)
+        #[arg(required = true, value_name = "NAMESPACE/HOOK")]
+        members: Vec<String>,
     },
 
     /// List all hooks with events, descriptions, and disable status
@@ -657,12 +669,293 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             }
         }),
         Commands::Try { .. }
+        | Commands::Group { .. }
         | Commands::List
         | Commands::Manifest { .. }
         | Commands::Configure { .. }
         | Commands::Doctor { .. }
         | Commands::MigrateConfig => None,
     }
+}
+
+/// The check a hook subcommand runs, and the event it reports under.
+///
+/// `None` for every subcommand that is not a hook *check*: loggers, CLI
+/// actions, and the diagnostic commands. Both `main`'s dispatch and the
+/// `group` command resolve checks through this one table, so the two paths
+/// cannot drift apart.
+fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
+    use dispatch::CheckPlan;
+    let pre = HookEvent::PreToolUse;
+    let post = HookEvent::PostToolUse;
+    let session = HookEvent::SessionStart;
+    Some(match cmd {
+        Commands::Cadence(cmd) => match cmd {
+            CadenceCommands::Terminology => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::terminology::TerminologyGuard),
+                pre,
+            ),
+            CadenceCommands::OrphanedTodos => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard),
+                pre,
+            ),
+            CadenceCommands::PreventSecretLeaks => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard::default()),
+                pre,
+            ),
+            CadenceCommands::PreventSecretWrites => CheckPlan::new(
+                Box::new(
+                    cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard::default(),
+                ),
+                pre,
+            ),
+            CadenceCommands::MemoryGuard => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::memory_guard::MemoryGuard),
+                pre,
+            ),
+            CadenceCommands::GitSafety => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::git_safety::GitSafetyGuard),
+                pre,
+            ),
+            CadenceCommands::LineEndings => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::validate_line_endings::LineEndingsGuard),
+                pre,
+            ),
+            CadenceCommands::EnvVars => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::validate_env_vars::EnvVarGuard),
+                pre,
+            ),
+            CadenceCommands::WarnDocsUpdate => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate),
+                pre,
+            ),
+            CadenceCommands::WarnChangelogEntry => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_changelog_entry::WarnChangelogEntry),
+                pre,
+            ),
+            CadenceCommands::WarnOvershare => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_overshare::WarnOvershare),
+                pre,
+            ),
+            CadenceCommands::NudgePolishBeforePr => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr),
+                pre,
+            ),
+            CadenceCommands::MarkdownLint => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::markdown_lint::MarkdownLint),
+                pre,
+            ),
+            CadenceCommands::RedactExternalContent => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::redact_external_content::RedactExternalContent),
+                pre,
+            ),
+            CadenceCommands::PlatformDrift { baseline } => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::platform_drift::PlatformDrift {
+                    baseline_path: baseline.clone(),
+                }),
+                session,
+            ),
+            // Wired on SessionStart *and* PostModelSwitch, so the emitted
+            // `hookEventName` has to follow the payload rather than a fixed
+            // event — see the payload-event dispatch in `src/dispatch.rs`.
+            CadenceCommands::ModelPosture => CheckPlan::payload_event(
+                Box::new(cadence_hooks_cadence::model_posture::ModelPosture),
+                session,
+            ),
+            _ => return None,
+        },
+        Commands::Guardrails(cmd) => match cmd {
+            GuardrailsCommands::GuardPushRemote => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_push_remote::PushRemoteGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardGhDangerous => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardGhWrite => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_gh_write::GhWriteGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardGitInit => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_git_init::GuardGitInit),
+                post,
+            ),
+            GuardrailsCommands::WarnMainBranch => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_main_branch::WarnMainBranch),
+                pre,
+            ),
+            GuardrailsCommands::WarnSubagentWorktree => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree),
+                pre,
+            ),
+            GuardrailsCommands::WarnBranchBase => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_branch_base::WarnBranchBase),
+                pre,
+            ),
+            GuardrailsCommands::WarnCronDatetime => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime),
+                pre,
+            ),
+            GuardrailsCommands::NudgeUpgradeAfterPush => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::nudge_upgrade_after_push::NudgeUpgradeAfterPush),
+                post,
+            ),
+            GuardrailsCommands::WarnUntracked => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles),
+                pre,
+            ),
+            GuardrailsCommands::WarnAmendPushed => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_amend_pushed::WarnAmendPushed),
+                pre,
+            ),
+            GuardrailsCommands::GuardDotfiles => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles),
+                pre,
+            ),
+            GuardrailsCommands::GuardRm => {
+                CheckPlan::new(Box::new(cadence_hooks_guardrails::guard_rm::GuardRm), pre)
+            }
+            GuardrailsCommands::GuardRmLiveness => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness),
+                session,
+            ),
+            GuardrailsCommands::GuardReadModel => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_read_model::GuardReadModel),
+                pre,
+            ),
+            GuardrailsCommands::WarnPrIssueLink => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink),
+                pre,
+            ),
+            GuardrailsCommands::WarnIssueTracker => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker),
+                pre,
+            ),
+            GuardrailsCommands::WarnGoingPublic => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_going_public::GoingPublicGuard),
+                pre,
+            ),
+            GuardrailsCommands::VerifyPrAutoclose => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose),
+                post,
+            ),
+            GuardrailsCommands::GuardOpVaultScan => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardSopsDecrypt => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_sops_decrypt::SopsDecryptGuard),
+                pre,
+            ),
+            GuardrailsCommands::WarnCurlAlias => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias),
+                pre,
+            ),
+            GuardrailsCommands::WarnGhMergePreflight => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight),
+                pre,
+            ),
+            GuardrailsCommands::WarnUnreviewedReadyFlip => CheckPlan::new(
+                Box::new(
+                    cadence_hooks_guardrails::warn_unreviewed_ready_flip::WarnUnreviewedReadyFlip,
+                ),
+                pre,
+            ),
+            GuardrailsCommands::WarnAliasParsing => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing),
+                pre,
+            ),
+            GuardrailsCommands::GuardBrowserDevice => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice),
+                pre,
+            ),
+            GuardrailsCommands::InjectGhWriteContext => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::inject_gh_write_context::InjectGhWriteContext),
+                pre,
+            ),
+            GuardrailsCommands::GuardBodyBudget { measure: None, .. } => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_body_budget::GuardBodyBudget),
+                pre,
+            ),
+            GuardrailsCommands::EnforceWorktree => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::enforce_worktree::EnforceWorktree),
+                pre,
+            ),
+            _ => return None,
+        },
+        Commands::Rules(cmd) => match cmd {
+            RulesCommands::ValidateFrontmatter => CheckPlan::new(
+                Box::new(cadence_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter),
+                pre,
+            ),
+            RulesCommands::SecurityPatterns => CheckPlan::new(
+                Box::new(cadence_hooks_rules::check_security_patterns::SecurityPatternScanner),
+                post,
+            ),
+            RulesCommands::WarnRecommendedOption => CheckPlan::new(
+                Box::new(cadence_hooks_rules::askuserquestion::WarnRecommendedOption),
+                pre,
+            ),
+            RulesCommands::WarnEmptyAnswers => CheckPlan::new(
+                Box::new(cadence_hooks_rules::askuserquestion::WarnEmptyAnswers),
+                post,
+            ),
+        },
+        Commands::Obsidian(cmd) => match cmd {
+            ObsidianCommands::TrashGuard => CheckPlan::new(
+                Box::new(cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard),
+                pre,
+            ),
+        },
+        // warn-stale is a SessionStart *check*, not a logger — it reads the
+        // metrics dir's mtimes rather than reacting to a tool event.
+        Commands::Metrics(MetricsCommands::WarnStale) => {
+            CheckPlan::new(Box::new(cadence_hooks_metrics::WarnStale), session)
+        }
+        Commands::Session(cmd) => match cmd {
+            SessionCommands::Start => {
+                CheckPlan::new(Box::new(cadence_hooks_session::start::Start), session)
+            }
+            SessionCommands::Guard => {
+                CheckPlan::new(Box::new(cadence_hooks_session::guard::Guard), pre)
+            }
+            SessionCommands::WarnBranchDrift => CheckPlan::new(
+                Box::new(cadence_hooks_session::branch_drift::WarnBranchDrift),
+                pre,
+            ),
+            SessionCommands::WarnBranchIntent => CheckPlan::new(
+                Box::new(cadence_hooks_session::branch_intent::WarnBranchIntent),
+                pre,
+            ),
+            SessionCommands::WarnCommitProvenance => CheckPlan::new(
+                Box::new(cadence_hooks_session::warn_commit_provenance::WarnCommitProvenance),
+                pre,
+            ),
+            SessionCommands::BackstopWarn => CheckPlan::new(
+                Box::new(cadence_hooks_session::backstop::BackstopWarn),
+                session,
+            ),
+            SessionCommands::PersistPlanApproval => CheckPlan::new(
+                Box::new(cadence_hooks_session::persist_plan::PersistPlanApproval),
+                post,
+            ),
+            SessionCommands::NudgePlanTick => CheckPlan::new(
+                Box::new(cadence_hooks_session::plan_guards::NudgePlanTick),
+                post,
+            ),
+            SessionCommands::WarnPlanReadyFlip => CheckPlan::new(
+                Box::new(cadence_hooks_session::plan_guards::WarnPlanReadyFlip),
+                pre,
+            ),
+            SessionCommands::LintPlanShape => CheckPlan::new(
+                Box::new(cadence_hooks_session::plan_guards::LintPlanShape),
+                pre,
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    })
 }
 
 /// Prints all hooks grouped by namespace, showing disable status.
@@ -1034,10 +1327,12 @@ fn main() {
     // never dispatch a check.
     let canonical_hook = hook_name(&cli.command);
 
-    // Event type aliases for readability at callsites.
-    let pre = HookEvent::PreToolUse;
-    let post = HookEvent::PostToolUse;
-    let session = HookEvent::SessionStart;
+    // Every hook *check* resolves through `check_plan`, the one table the
+    // `group` command reads too, so a grouped and a standalone run of the same
+    // hook can never dispatch different checks.
+    if let Some(plan) = check_plan(&cli.command) {
+        dispatch::run_logged_plan(plan, canonical_hook);
+    }
 
     match cli.command {
         Commands::Try {
@@ -1053,6 +1348,7 @@ fn main() {
                 show_payload,
             ));
         }
+        Commands::Group { members } => group::run(&members),
         Commands::List => {
             print_hook_list();
             process::exit(0);
@@ -1128,91 +1424,6 @@ fn main() {
             process::exit(migrate::run().into());
         }
         Commands::Cadence(cmd) => match cmd {
-            CadenceCommands::Terminology => dispatch::run_logged_check(
-                &cadence_hooks_cadence::terminology::TerminologyGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::OrphanedTodos => dispatch::run_logged_check(
-                &cadence_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::PreventSecretLeaks => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard::default(),
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::PreventSecretWrites => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard::default(),
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::MemoryGuard => dispatch::run_logged_check(
-                &cadence_hooks_cadence::memory_guard::MemoryGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::GitSafety => dispatch::run_logged_check(
-                &cadence_hooks_cadence::git_safety::GitSafetyGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::LineEndings => dispatch::run_logged_check(
-                &cadence_hooks_cadence::validate_line_endings::LineEndingsGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::EnvVars => dispatch::run_logged_check(
-                &cadence_hooks_cadence::validate_env_vars::EnvVarGuard,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::WarnDocsUpdate => dispatch::run_logged_check(
-                &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::WarnChangelogEntry => dispatch::run_logged_check(
-                &cadence_hooks_cadence::warn_changelog_entry::WarnChangelogEntry,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::WarnOvershare => dispatch::run_logged_check(
-                &cadence_hooks_cadence::warn_overshare::WarnOvershare,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::NudgePolishBeforePr => dispatch::run_logged_check(
-                &cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::MarkdownLint => dispatch::run_logged_check(
-                &cadence_hooks_cadence::markdown_lint::MarkdownLint,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::RedactExternalContent => dispatch::run_logged_check(
-                &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
-                pre,
-                canonical_hook,
-            ),
-            CadenceCommands::PlatformDrift { baseline } => dispatch::run_logged_check(
-                &cadence_hooks_cadence::platform_drift::PlatformDrift {
-                    baseline_path: baseline,
-                },
-                session,
-                canonical_hook,
-            ),
-            // Wired on SessionStart *and* PostModelSwitch, so the emitted
-            // `hookEventName` has to follow the payload rather than a fixed
-            // event — see the payload-event dispatch in `src/dispatch.rs`.
-            CadenceCommands::ModelPosture => dispatch::run_logged_check_payload_event(
-                &cadence_hooks_cadence::model_posture::ModelPosture,
-                session,
-                canonical_hook,
-            ),
             CadenceCommands::RecordPolish {
                 repo_root,
                 branch,
@@ -1252,159 +1463,17 @@ fn main() {
                         .into(),
                 );
             }
+            // Hook checks dispatched above, through `check_plan`.
+            _ => unreachable!("check subcommands dispatch through check_plan"),
         },
         Commands::Guardrails(cmd) => match cmd {
-            GuardrailsCommands::GuardPushRemote => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_push_remote::PushRemoteGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardGhDangerous => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardGhWrite => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_gh_write::GhWriteGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardGitInit => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_git_init::GuardGitInit,
-                post,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnMainBranch => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_main_branch::WarnMainBranch,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnSubagentWorktree => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnBranchBase => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_branch_base::WarnBranchBase,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnCronDatetime => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::NudgeUpgradeAfterPush => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::nudge_upgrade_after_push::NudgeUpgradeAfterPush,
-                post,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnUntracked => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnAmendPushed => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_amend_pushed::WarnAmendPushed,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardDotfiles => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardRm => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_rm::GuardRm,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardRmLiveness => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness,
-                session,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardReadModel => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_read_model::GuardReadModel,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnPrIssueLink => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink,
-                pre,
-                canonical_hook,
-            ),
             GuardrailsCommands::GuardBodyBudget { measure, surface } => match measure {
                 Some(file) => process::exit(
                     cadence_hooks_guardrails::guard_body_budget::run_measure(&file, &surface)
                         .into(),
                 ),
-                None => dispatch::run_logged_check(
-                    &cadence_hooks_guardrails::guard_body_budget::GuardBodyBudget,
-                    pre,
-                    canonical_hook,
-                ),
+                None => unreachable!("guard-body-budget dispatches through check_plan"),
             },
-            GuardrailsCommands::WarnIssueTracker => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnGoingPublic => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_going_public::GoingPublicGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::VerifyPrAutoclose => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose,
-                post,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardOpVaultScan => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardSopsDecrypt => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_sops_decrypt::SopsDecryptGuard,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnCurlAlias => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnGhMergePreflight => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnUnreviewedReadyFlip => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_unreviewed_ready_flip::WarnUnreviewedReadyFlip,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnAliasParsing => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::GuardBrowserDevice => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::InjectGhWriteContext => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::inject_gh_write_context::InjectGhWriteContext,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::EnforceWorktree => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::enforce_worktree::EnforceWorktree,
-                pre,
-                canonical_hook,
-            ),
             GuardrailsCommands::DismissMainBranchWarn { for_, reason } => {
                 finish_dismiss(
                     cadence_hooks_guardrails::dismiss_main_branch_warn::perform_dismiss(
@@ -1422,36 +1491,13 @@ fn main() {
                     ),
                 );
             }
+            // Hook checks dispatched above, through `check_plan`.
+            _ => unreachable!("check subcommands dispatch through check_plan"),
         },
-        Commands::Rules(cmd) => match cmd {
-            RulesCommands::ValidateFrontmatter => dispatch::run_logged_check(
-                &cadence_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
-                pre,
-                canonical_hook,
-            ),
-            RulesCommands::SecurityPatterns => dispatch::run_logged_check(
-                &cadence_hooks_rules::check_security_patterns::SecurityPatternScanner,
-                post,
-                canonical_hook,
-            ),
-            RulesCommands::WarnRecommendedOption => dispatch::run_logged_check(
-                &cadence_hooks_rules::askuserquestion::WarnRecommendedOption,
-                pre,
-                canonical_hook,
-            ),
-            RulesCommands::WarnEmptyAnswers => dispatch::run_logged_check(
-                &cadence_hooks_rules::askuserquestion::WarnEmptyAnswers,
-                post,
-                canonical_hook,
-            ),
-        },
-        Commands::Obsidian(cmd) => match cmd {
-            ObsidianCommands::TrashGuard => dispatch::run_logged_check(
-                &cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard,
-                pre,
-                canonical_hook,
-            ),
-        },
+        Commands::Rules(_) => unreachable!("every Rules subcommand dispatches through check_plan"),
+        Commands::Obsidian(_) => {
+            unreachable!("every Obsidian subcommand dispatches through check_plan")
+        }
         Commands::Metrics(cmd) => match cmd {
             MetricsCommands::Snapshot => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::Snapshot,
@@ -1497,13 +1543,6 @@ fn main() {
                 registry::sample_for("metrics", "log-skill"),
                 canonical_hook,
             ),
-            // warn-stale is a SessionStart *check*, not a logger — it reads the
-            // metrics dir's mtimes rather than reacting to a tool event.
-            MetricsCommands::WarnStale => dispatch::run_logged_check(
-                &cadence_hooks_metrics::WarnStale,
-                session,
-                canonical_hook,
-            ),
             MetricsCommands::Grade {
                 transcript,
                 session_id,
@@ -1514,13 +1553,10 @@ fn main() {
                         .into(),
                 );
             }
+            // Hook checks dispatched above, through `check_plan`.
+            _ => unreachable!("check subcommands dispatch through check_plan"),
         },
         Commands::Session(cmd) => match cmd {
-            SessionCommands::Start => dispatch::run_logged_check(
-                &cadence_hooks_session::start::Start,
-                session,
-                canonical_hook,
-            ),
             // Heartbeat/End/BackstopRecord run through the logged dispatcher so
             // the #271 subprocess deadline is armed (they spawn git) and its
             // degradation rows have an emission path — core cannot reach the
@@ -1528,26 +1564,6 @@ fn main() {
             SessionCommands::Heartbeat => dispatch::run_logged_logger(
                 &cadence_hooks_session::heartbeat::Heartbeat,
                 registry::sample_for("session", "heartbeat"),
-                canonical_hook,
-            ),
-            SessionCommands::Guard => dispatch::run_logged_check(
-                &cadence_hooks_session::guard::Guard,
-                pre,
-                canonical_hook,
-            ),
-            SessionCommands::WarnBranchDrift => dispatch::run_logged_check(
-                &cadence_hooks_session::branch_drift::WarnBranchDrift,
-                pre,
-                canonical_hook,
-            ),
-            SessionCommands::WarnBranchIntent => dispatch::run_logged_check(
-                &cadence_hooks_session::branch_intent::WarnBranchIntent,
-                pre,
-                canonical_hook,
-            ),
-            SessionCommands::WarnCommitProvenance => dispatch::run_logged_check(
-                &cadence_hooks_session::warn_commit_provenance::WarnCommitProvenance,
-                pre,
                 canonical_hook,
             ),
             SessionCommands::End => dispatch::run_logged_logger(
@@ -1558,31 +1574,6 @@ fn main() {
             SessionCommands::BackstopRecord => dispatch::run_logged_logger(
                 &cadence_hooks_session::backstop::BackstopRecord,
                 registry::sample_for("session", "backstop-record"),
-                canonical_hook,
-            ),
-            SessionCommands::BackstopWarn => dispatch::run_logged_check(
-                &cadence_hooks_session::backstop::BackstopWarn,
-                session,
-                canonical_hook,
-            ),
-            SessionCommands::PersistPlanApproval => dispatch::run_logged_check(
-                &cadence_hooks_session::persist_plan::PersistPlanApproval,
-                post,
-                canonical_hook,
-            ),
-            SessionCommands::NudgePlanTick => dispatch::run_logged_check(
-                &cadence_hooks_session::plan_guards::NudgePlanTick,
-                post,
-                canonical_hook,
-            ),
-            SessionCommands::WarnPlanReadyFlip => dispatch::run_logged_check(
-                &cadence_hooks_session::plan_guards::WarnPlanReadyFlip,
-                pre,
-                canonical_hook,
-            ),
-            SessionCommands::LintPlanShape => dispatch::run_logged_check(
-                &cadence_hooks_session::plan_guards::LintPlanShape,
-                pre,
                 canonical_hook,
             ),
             SessionCommands::Declare {
@@ -1598,6 +1589,8 @@ fn main() {
             SessionCommands::Plans => {
                 process::exit(cadence_hooks_session::cli::run_plans().into());
             }
+            // Hook checks dispatched above, through `check_plan`.
+            _ => unreachable!("check subcommands dispatch through check_plan"),
         },
     }
 }
@@ -1802,6 +1795,37 @@ mod tests {
     /// (issue #39 P1): it is filesystem-independent, so it runs on every
     /// bare-checkout `cargo test`, unlike the hooks.json audit test which
     /// skips when sibling plugin dirs are absent.
+    /// Every hook check reports under the event its registry entry declares.
+    /// `try`, `list`, and the manifest read the registry; the binary emits
+    /// what `check_plan` says. This keeps the two equal without reading
+    /// source text.
+    #[test]
+    fn check_plan_events_match_the_registry() {
+        let mut checked = 0;
+        for hook in HOOKS {
+            let Ok(cli) = Cli::try_parse_from(["cadence-hooks", hook.namespace, hook.name]) else {
+                continue;
+            };
+            let Some(plan) = check_plan(&cli.command) else {
+                continue;
+            };
+            assert_eq!(
+                Some(plan.event()),
+                hook.event,
+                "{} {}: check_plan dispatches under {:?}, registry says {:?}",
+                hook.namespace,
+                hook.name,
+                plan.event(),
+                hook.event
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 50,
+            "only {checked} checks resolved; the scan is vacuous"
+        );
+    }
+
     #[test]
     fn registry_matches_clap_dispatch() {
         let cli = Cli::command();

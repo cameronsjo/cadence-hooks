@@ -843,22 +843,21 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
                 let Some(cmd) = hook.get("command").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
-                let Some(pair) = extract_dispatch(cmd) else {
-                    continue;
-                };
-
                 let has_if = hook.get("if").and_then(serde_json::Value::as_str).is_some();
-                let plugin = pair.split_whitespace().next().unwrap_or("").to_string();
-
-                refs.push(HookRef {
-                    command: pair,
-                    plugin,
-                    expected_plugin: expected_plugin.to_string(),
-                    is_bash_matcher: is_bash,
-                    has_if_filter: has_if,
-                    event_type: event.clone(),
-                    matcher_index,
-                });
+                // A `group` entry wires each member as if it were its own
+                // entry, so it yields one ref per member.
+                for pair in extract_dispatches(cmd) {
+                    let plugin = pair.split_whitespace().next().unwrap_or("").to_string();
+                    refs.push(HookRef {
+                        command: pair,
+                        plugin,
+                        expected_plugin: expected_plugin.to_string(),
+                        is_bash_matcher: is_bash,
+                        has_if_filter: has_if,
+                        event_type: event.clone(),
+                        matcher_index,
+                    });
+                }
             }
         }
     }
@@ -892,6 +891,46 @@ fn extract_dispatch(command: &str) -> Option<String> {
         return None;
     }
     Some(identity.join(" "))
+}
+
+/// Every `<plugin> <subcommand>` a hook command dispatches: one for an ordinary
+/// entry, one per member for `run-cadence-hooks.sh group ns/sub ns/sub ...`.
+/// A member without a `/` comes back as `group <member>`, which names no real
+/// subcommand, so the audit reports it rather than skipping it.
+fn extract_dispatches(command: &str) -> Vec<String> {
+    let Some(pair) = extract_dispatch(command) else {
+        return Vec::new();
+    };
+    if !pair.starts_with("group ") {
+        return vec![pair];
+    }
+    let after = command.split("run-cadence-hooks.sh").last().unwrap_or("");
+    after
+        .trim()
+        .trim_start_matches(['\'', '"'])
+        .split_whitespace()
+        .skip(1)
+        .filter(|t| !t.starts_with('-'))
+        .map(|member| match member.split_once('/') {
+            Some((ns, sub)) => format!("{ns} {sub}"),
+            None => format!("group {member}"),
+        })
+        .collect()
+}
+
+#[test]
+fn extract_dispatches_expands_group_members() {
+    let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology cadence/git-safety"#;
+    assert_eq!(
+        extract_dispatches(cmd),
+        vec!["cadence terminology", "cadence git-safety"]
+    );
+    let plain = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-rm"#;
+    assert_eq!(extract_dispatches(plain), vec!["guardrails guard-rm"]);
+    assert_eq!(
+        extract_dispatches("x/run-cadence-hooks.sh group bogus"),
+        vec!["group bogus"]
+    );
 }
 
 /// Parse user-level settings.json and extract all hook shell script paths and
@@ -943,10 +982,11 @@ fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
                     continue;
                 };
 
-                if let Some(dispatch) = extract_dispatch(cmd) {
-                    binary_dispatches.push(dispatch);
-                } else {
+                let dispatches = extract_dispatches(cmd);
+                if dispatches.is_empty() {
                     shell_scripts.push(cmd.to_string());
+                } else {
+                    binary_dispatches.extend(dispatches);
                 }
             }
         }
@@ -2236,19 +2276,27 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
 
     let mut result = BTreeMap::new();
 
-    // Find `dispatch::run_logged_check(&module::Check, pre, canonical_hook)` (the
-    // logged-dispatch wrapper that records denials) or the legacy
-    // `run_check_from_stdin(&..., pre)` form. The event variable (`pre`/`post`/
-    // `session`) sits in the same position in both — the trailing `canonical_hook`
-    // arg lands beyond the 3-line correlation window, so the event scan is
-    // unaffected. We correlate with the match arm above to get the subcommand.
+    // Find each `check_plan` row, `CheckPlan::new(Box::new(module::Check), pre)`,
+    // or the legacy `run_check_from_stdin(&..., pre)` form. The event variable
+    // (`pre`/`post`/`session`) is the last argument in both. We correlate with
+    // the match arm above to get the subcommand.
     //
     // Strategy: scan for lines containing the dispatch call, extract the event
     // variable, then look backwards for the enum variant.
 
     let lines: Vec<&str> = content.lines().collect();
+    // A dispatch site is a `check_plan` row (`CheckPlan::new(` /
+    // `CheckPlan::payload_event(`, the table both the standalone and the
+    // `group` dispatch read), or a legacy direct `run_logged_check` /
+    // `run_check_from_stdin` call.
+    let is_dispatch_site = |line: &str| {
+        line.contains("CheckPlan::new(")
+            || line.contains("CheckPlan::payload_event(")
+            || line.contains("run_logged_check")
+            || line.contains("run_check_from_stdin")
+    };
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains("run_logged_check") && !line.contains("run_check_from_stdin") {
+        if !is_dispatch_site(line) {
             continue;
         }
 
@@ -2296,13 +2344,18 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
                 // Extract the variant name, convert to kebab-case subcommand.
                 //
                 // rustfmt collapses a single-expression arm onto one line
-                // (`CadenceCommands::Terminology => dispatch::run_logged_check(`),
-                // so the arm line also carries the `dispatch::run_logged_check`
-                // call — `split("::").last()` would grab the call token. Take the
+                // (`CadenceCommands::Terminology => CheckPlan::new(`), so the arm
+                // line also carries the `CheckPlan::new` call —
+                // `split("::").last()` would grab the call token. Take the
                 // identifier immediately after the FIRST `Commands::` instead;
                 // this reads the variant cleanly from both the collapsed form and
                 // the older `Variant => {` block form.
-                let after = prev.split("Commands::").nth(1).unwrap_or("");
+                // The pattern side only (before `=>`), then the identifier after
+                // its LAST `Commands::`: that reads a group arm
+                // (`CadenceCommands::Terminology => …`) and a nested pattern
+                // (`Commands::Metrics(MetricsCommands::WarnStale) => …`) alike.
+                let pattern = prev.split("=>").next().unwrap_or(prev);
+                let after = pattern.rsplit("Commands::").next().unwrap_or("");
                 let variant: String = after
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -2361,10 +2414,7 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
     // skips any command it cannot find. Counting the dispatch sites in the
     // file and demanding a mapping for each closes that by construction, and
     // needs no maintenance as hooks land.
-    let dispatch_sites = lines
-        .iter()
-        .filter(|line| line.contains("run_logged_check") || line.contains("run_check_from_stdin"))
-        .count();
+    let dispatch_sites = lines.iter().filter(|line| is_dispatch_site(line)).count();
     assert_eq!(
         result.len(),
         dispatch_sites,
