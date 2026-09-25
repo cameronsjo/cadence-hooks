@@ -12,6 +12,10 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `geteuid` only: the dubious-ownership check in warn-main-branch.
+libc.workspace = true
+
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 tempfile = "3"

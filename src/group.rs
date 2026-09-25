@@ -29,18 +29,12 @@ pub(crate) enum Rejected {
     /// A logger, a CLI action, or a SessionStart check: `group` runs only
     /// tool-event checks, which take no arguments and report one fixed event.
     NotAToolCheck,
-    /// Wired on a different event than the group's first member.
-    EventMismatch,
     /// Listed twice.
     Duplicate,
 }
 
 /// Resolve `spec` to its canonical name and check, or say why not.
-/// `event` is the group's event once the first member fixes it.
-pub(crate) fn resolve(
-    spec: &str,
-    event: Option<HookEvent>,
-) -> Result<(&'static str, dispatch::CheckPlan), Rejected> {
+pub(crate) fn resolve(spec: &str) -> Result<(&'static str, dispatch::CheckPlan), Rejected> {
     let (namespace, hook) = spec.split_once('/').ok_or(Rejected::Unknown)?;
     if namespace.is_empty() || hook.is_empty() || hook.contains('/') {
         return Err(Rejected::Unknown);
@@ -54,9 +48,6 @@ pub(crate) fn resolve(
     {
         return Err(Rejected::NotAToolCheck);
     }
-    if event.is_some_and(|e| e != plan.event()) {
-        return Err(Rejected::EventMismatch);
-    }
     Ok((name, plan))
 }
 
@@ -64,9 +55,8 @@ pub(crate) fn resolve(
 pub(crate) fn run(specs: &[String]) -> ! {
     let mut members: Vec<GroupMember> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
-    let mut event = None;
     for spec in specs {
-        let resolved = resolve(spec, event).and_then(|(name, plan)| {
+        let resolved = resolve(spec).and_then(|(name, plan)| {
             if members.iter().any(|m| m.hook == name) {
                 Err(Rejected::Duplicate)
             } else {
@@ -76,8 +66,10 @@ pub(crate) fn run(specs: &[String]) -> ! {
         let (name, plan) = match resolved {
             Ok(resolved) => resolved,
             Err(why) => {
+                // The notice rides the group's merged output (stderr on a
+                // block or when nothing else is said, context otherwise), so
+                // it is not also printed here.
                 let notice = rejection_notice(spec, &why);
-                eprintln!("{notice}");
                 if why == Rejected::Unknown {
                     // The row a standalone run of an unknown hook writes.
                     let (namespace, hook) = spec.split_once('/').unwrap_or((spec, ""));
@@ -107,7 +99,6 @@ pub(crate) fn run(specs: &[String]) -> ! {
             ),
             BypassState::Bypassed | BypassState::Enforced => {}
         }
-        event.get_or_insert(plan.event());
         members.push(GroupMember { hook: name, plan });
     }
     dispatch::run_logged_group(members, notices);
@@ -125,10 +116,6 @@ fn rejection_notice(spec: &str, why: &Rejected) -> String {
             "cadence-hooks: group member '{spec}' is not a tool-event check, so it \
              cannot run in a group; wire it as its own hook."
         ),
-        Rejected::EventMismatch => format!(
-            "cadence-hooks: group member '{spec}' fires on a different event than \
-             the rest of the group; wire it in its own group."
-        ),
         Rejected::Duplicate => {
             format!("cadence-hooks: group member '{spec}' is listed twice; it ran once.")
         }
@@ -141,7 +128,7 @@ mod tests {
 
     #[test]
     fn resolves_a_pre_tool_use_check_to_its_canonical_name() {
-        let (name, plan) = resolve("cadence/terminology", None).expect("resolves");
+        let (name, plan) = resolve("cadence/terminology").expect("resolves");
         assert_eq!(name, "terminology");
         assert_eq!(plan.event(), HookEvent::PreToolUse);
     }
@@ -158,7 +145,7 @@ mod tests {
             "cadence/terminology --flag",
         ] {
             assert_eq!(
-                resolve(spec, None).err(),
+                resolve(spec).err(),
                 Some(Rejected::Unknown),
                 "{spec} must not resolve"
             );
@@ -176,20 +163,11 @@ mod tests {
             "cadence/model-posture",
         ] {
             assert_eq!(
-                resolve(spec, None).err(),
+                resolve(spec).err(),
                 Some(Rejected::NotAToolCheck),
                 "{spec} must not join a group"
             );
         }
-    }
-
-    #[test]
-    fn rejects_a_member_on_another_event() {
-        assert_eq!(
-            resolve("guardrails/guard-git-init", Some(HookEvent::PreToolUse)).err(),
-            Some(Rejected::EventMismatch)
-        );
-        assert!(resolve("guardrails/guard-git-init", Some(HookEvent::PostToolUse)).is_ok());
     }
 
     /// Every registered PreToolUse/PostToolUse hook that is a check resolves.
@@ -207,7 +185,7 @@ mod tests {
                 continue;
             }
             let spec = format!("{}/{}", hook.namespace, hook.name);
-            let (name, _) = resolve(&spec, None)
+            let (name, _) = resolve(&spec)
                 .unwrap_or_else(|e| panic!("{spec} should resolve for a group, got {e:?}"));
             assert_eq!(name, hook.name);
         }

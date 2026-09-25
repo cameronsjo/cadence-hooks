@@ -181,35 +181,77 @@ fn extract_invocation(command: &str) -> Option<(String, String)> {
     Some((namespace, subcommand))
 }
 
-/// Every `(namespace, subcommand)` a hook command dispatches.
-///
-/// One pair for an ordinary entry. For `cadence-hooks group ns/sub ...`, one
-/// pair per member, so each member is cross-referenced like its own entry. A
-/// member missing its `/` comes back as `("group", member)`, which the
-/// registry does not know, so it is reported instead of silently skipped.
-fn extract_invocations(command: &str) -> Vec<(String, String)> {
-    let Some((namespace, first)) = extract_invocation(command) else {
-        return Vec::new();
-    };
+/// The raw member tokens of a `cadence-hooks group ...` hook command, or
+/// `None` when the command is not a group. Tokens run up to the first shell
+/// operator or redirection (`||`, `;`, `2>/dev/null`), which the shell consumes
+/// before the binary sees argv. Everything else comes back as written, flags
+/// and stray quotes included, for [`judge_group_member`] to rule on.
+fn group_members(command: &str) -> Option<Vec<String>> {
+    let (namespace, _) = extract_invocation(command)?;
     if namespace != "group" {
-        return vec![(namespace, first)];
+        return None;
     }
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let Some(group_idx) = tokens
+    let group_idx = tokens
         .iter()
-        .position(|t| t.trim_matches(|c| c == '\'' || c == '"') == "group")
-    else {
-        return Vec::new();
+        .position(|t| t.trim_matches(|c| c == '\'' || c == '"') == "group")?;
+    let is_shell_syntax = |t: &str| {
+        t.starts_with(['|', '&', ';', '>', '<'])
+            || t.trim_start_matches(|c: char| c.is_ascii_digit())
+                .starts_with(['>', '<'])
     };
-    tokens[group_idx + 1..]
-        .iter()
-        .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
-        .filter(|t| !t.starts_with('-'))
-        .map(|member| match member.split_once('/') {
-            Some((ns, sub)) => (ns.to_string(), sub.to_string()),
-            None => ("group".to_string(), member.to_string()),
-        })
-        .collect()
+    Some(
+        tokens[group_idx + 1..]
+            .iter()
+            .take_while(|t| !is_shell_syntax(t))
+            .map(|t| (*t).to_string())
+            .collect(),
+    )
+}
+
+/// Judge one `group` member token the way the binary will: through
+/// [`crate::group::resolve`], the same resolution a group run uses, so doctor
+/// cannot pass a member the binary then refuses.
+fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagnosis> {
+    let unquoted = token.trim_matches(|c| c == '\'' || c == '"');
+    if token.starts_with('-') {
+        return Some(SkewDiagnosis {
+            diagnosis: format!(
+                "group entry carries the flag '{token}'; `group` takes no flags, so the \
+                 whole entry fails to parse and none of its checks run"
+            ),
+            remediation: "remove the flag from the group entry".to_string(),
+        });
+    }
+    if unquoted.contains(char::is_whitespace)
+        || token.starts_with(['\'', '"']) != token.ends_with(['\'', '"'])
+    {
+        return Some(SkewDiagnosis {
+            diagnosis: format!(
+                "group member '{token}' is split or joined by quoting; each member must be \
+                 its own unquoted <namespace>/<hook> argument"
+            ),
+            remediation: "write each member as a separate, unquoted argument".to_string(),
+        });
+    }
+    match crate::group::resolve(unquoted) {
+        Ok(_) => None,
+        Err(crate::group::Rejected::NotAToolCheck) => Some(SkewDiagnosis {
+            diagnosis: format!(
+                "group member '{unquoted}' is not a tool-event check (a logger, a CLI \
+                 action, or a SessionStart hook), so a group run skips it"
+            ),
+            remediation: "wire it as its own hooks.json entry".to_string(),
+        }),
+        Err(_) => match unquoted.split_once('/') {
+            Some((ns, sub)) => judge_invocation(ns, sub, channel),
+            None => Some(SkewDiagnosis {
+                diagnosis: format!("group member '{unquoted}' is not in <namespace>/<hook> form"),
+                remediation: "write the member as <namespace>/<hook>, e.g. cadence/terminology"
+                    .to_string(),
+            }),
+        },
+    }
 }
 
 /// Diagnosis for a version-skew finding.
@@ -504,10 +546,17 @@ fn scan_hooks_json(
                 // A `group` entry is judged member by member, so one stale
                 // member is reported by name instead of the whole entry.
                 if report_skew {
-                    for (ns, sub) in extract_invocations(cmd) {
-                        let Some(diag) = judge_invocation(&ns, &sub, channel) else {
-                            continue;
-                        };
+                    let diagnoses: Vec<SkewDiagnosis> = match group_members(cmd) {
+                        Some(members) => members
+                            .iter()
+                            .filter_map(|member| judge_group_member(member, channel))
+                            .collect(),
+                        None => extract_invocation(cmd)
+                            .and_then(|(ns, sub)| judge_invocation(&ns, &sub, channel))
+                            .into_iter()
+                            .collect(),
+                    };
+                    for diag in diagnoses {
                         findings.push(Finding {
                             severity: Severity::Warning,
                             plugin: plugin.to_string(),
@@ -3929,42 +3978,61 @@ mod tests {
         assert_eq!(detect_single_quoted_envvar(cmd), None);
     }
 
+    fn group_findings(cmd: &str) -> Vec<String> {
+        group_members(cmd)
+            .expect("a group entry")
+            .iter()
+            .filter_map(|m| judge_group_member(m, InstallChannel::Unknown))
+            .map(|d| d.diagnosis)
+            .collect()
+    }
+
     #[test]
-    fn extract_invocations_expands_a_group_entry() {
-        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology guardrails/guard-rm"#;
+    fn group_members_are_listed_up_to_shell_syntax() {
+        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology guardrails/guard-rm 2>/dev/null || true"#;
         assert_eq!(
-            extract_invocations(cmd),
-            vec![
-                ("cadence".to_string(), "terminology".to_string()),
-                ("guardrails".to_string(), "guard-rm".to_string()),
-            ]
+            group_members(cmd),
+            Some(vec![
+                "cadence/terminology".to_string(),
+                "guardrails/guard-rm".to_string()
+            ])
+        );
+        assert_eq!(group_members("cadence-hooks cadence terminology"), None);
+        assert_eq!(group_members("echo hi"), None);
+    }
+
+    #[test]
+    fn a_clean_group_has_no_findings() {
+        assert!(
+            group_findings("cadence-hooks group cadence/terminology guardrails/guard-rm")
+                .is_empty()
         );
     }
 
     #[test]
-    fn extract_invocations_keeps_an_ordinary_entry_as_one_pair() {
-        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence terminology"#;
-        assert_eq!(
-            extract_invocations(cmd),
-            vec![("cadence".to_string(), "terminology".to_string())]
+    fn group_member_problems_are_each_reported() {
+        let findings = group_findings(
+            r#"cadence-hooks group cadence/terminology cadence/retired-hook bogus metrics/log-commit --fast "cadence/git-safety cadence/env-vars""#,
         );
-        assert!(extract_invocations("echo hi").is_empty());
-    }
-
-    #[test]
-    fn a_stale_group_member_is_reported_and_a_good_one_is_not() {
-        let cmd = "cadence-hooks group cadence/terminology cadence/retired-hook bogus";
-        let judged: Vec<_> = extract_invocations(cmd)
-            .into_iter()
-            .filter(|(ns, sub)| judge_invocation(ns, sub, InstallChannel::Unknown).is_some())
-            .collect();
-        assert_eq!(
-            judged,
-            vec![
-                ("cadence".to_string(), "retired-hook".to_string()),
-                ("group".to_string(), "bogus".to_string()),
-            ]
+        assert_eq!(findings.len(), 6, "{findings:#?}");
+        assert!(
+            findings[0].contains("not present in this binary"),
+            "{}",
+            findings[0]
         );
+        assert!(
+            findings[1].contains("not in <namespace>/<hook> form"),
+            "{}",
+            findings[1]
+        );
+        assert!(
+            findings[2].contains("not a tool-event check"),
+            "{}",
+            findings[2]
+        );
+        assert!(findings[3].contains("takes no flags"), "{}", findings[3]);
+        assert!(findings[4].contains("quoting"), "{}", findings[4]);
+        assert!(findings[5].contains("quoting"), "{}", findings[5]);
     }
 
     // ── extract_invocation table tests ──────────────────────────────────────

@@ -18,7 +18,6 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
-use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
 
@@ -59,6 +58,131 @@ fn is_main_allowed(repo_root: &Path) -> bool {
         && is_truthy(
             cadence_hooks_core::config::repo_env_flag(repo_root, "CADENCE_ALLOW_MAIN").as_deref(),
         )
+}
+
+/// What the on-disk read of `.git` can say about a directory.
+enum DiskRead {
+    /// The answer git would give: `Some((branch, repo_root))`, or `None` when
+    /// git would find no repository at all.
+    Certain(Option<(String, String)>),
+    /// A layout where the disk read and git can disagree. Ask git.
+    Uncertain,
+}
+
+/// The checked-out branch and repo root for `dir`, or `None` when git reports
+/// no branch (not a repo, detached HEAD, refused repo). Advisory, so every
+/// failure is `None` and the check allows (ADR-0001).
+///
+/// The common case reads `.git` from disk through the shared `GitState`
+/// resolver. That replaced two `git -C` spawns that ran on every Edit/Write
+/// and made this the slowest hook on the Write path (~24 ms against a ~3 ms
+/// process floor). `repo_root` is canonicalized exactly as `--show-toplevel`
+/// is, so session-marker keys are unchanged. Wherever the disk read could
+/// disagree with git ([`read_from_disk`] lists them), git answers instead, so
+/// the verdict is git's in every layout.
+fn branch_and_root(dir: &Path) -> Option<(String, String)> {
+    match read_from_disk(dir) {
+        DiskRead::Certain(answer) => answer,
+        DiskRead::Uncertain => ask_git(dir),
+    }
+}
+
+/// The disk read, and whether it is certain to match git. Uncertain when:
+/// - git's discovery is redirected by environment (`GIT_DIR`, `GIT_WORK_TREE`,
+///   `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`);
+/// - the path runs through a `.git` directory (git has no work tree there);
+/// - `GitState` finds nothing but some ancestor has a `.git` entry (git skips
+///   a `.git` without `HEAD` and keeps climbing; the walk stops);
+/// - HEAD is detached, names something other than a branch, or is the reftable
+///   placeholder `refs/heads/.invalid`;
+/// - a bare repository sits between the directory and the work tree root (git
+///   finds the bare repository first);
+/// - the work tree is owned by another user (git may refuse it as dubious
+///   ownership, depending on `safe.directory`).
+fn read_from_disk(dir: &Path) -> DiskRead {
+    use cadence_hooks_core::gitstate::GitState;
+    const DISCOVERY_ENV: [&str; 4] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+    if DISCOVERY_ENV.iter().any(|v| std::env::var_os(v).is_some()) {
+        return DiskRead::Uncertain;
+    }
+    // A directory that does not exist fails `git -C` too.
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return DiskRead::Certain(None);
+    };
+    if canonical.components().any(|c| c.as_os_str() == ".git") {
+        return DiskRead::Uncertain;
+    }
+    let Some(state) = GitState::resolve(&canonical) else {
+        let any_dot_git = canonical.ancestors().any(|a| a.join(".git").exists());
+        return if any_dot_git {
+            DiskRead::Uncertain
+        } else {
+            DiskRead::Certain(None)
+        };
+    };
+    let Some(branch) = state.branch.filter(|b| b != ".invalid") else {
+        return DiskRead::Uncertain;
+    };
+    let bare_in_between = canonical
+        .ancestors()
+        .take_while(|a| *a != state.repo_root.as_path())
+        .any(looks_like_bare_repo);
+    if bare_in_between || owned_by_someone_else(&state.repo_root) {
+        return DiskRead::Uncertain;
+    }
+    DiskRead::Certain(Some((
+        branch,
+        state.repo_root.to_string_lossy().into_owned(),
+    )))
+}
+
+/// The shape git's discovery accepts as a bare repository.
+fn looks_like_bare_repo(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+#[cfg(unix)]
+fn owned_by_someone_else(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    std::fs::metadata(path).is_ok_and(|m| m.uid() != me)
+}
+
+/// Windows ownership is SID-based and not checked here, so a repository git
+/// would refuse as dubious ownership still nudges on Windows. Advisory only.
+#[cfg(not(unix))]
+fn owned_by_someone_else(_path: &Path) -> bool {
+    false
+}
+
+/// The pre-`GitState` resolution: ask git for the branch and the root.
+fn ask_git(dir: &Path) -> Option<(String, String)> {
+    use cadence_hooks_core::shell::{GitSpawn, run_git_bounded};
+    use std::process::Command;
+    let dir_arg = dir.to_string_lossy();
+    let query = |args: &[&str]| -> Option<String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&*dir_arg).args(args);
+        match run_git_bounded(&mut cmd) {
+            GitSpawn::Completed(out) if out.status.success() => {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            }
+            // Advisory: a truncated answer is a wrong answer.
+            GitSpawn::Completed(_)
+            | GitSpawn::Truncated(_)
+            | GitSpawn::SpawnFailed
+            | GitSpawn::TimedOut => None,
+        }
+    };
+    let branch = query(&["symbolic-ref", "--short", "HEAD"])?;
+    let root = query(&["rev-parse", "--show-toplevel"])?;
+    Some((branch, root))
 }
 
 /// Pure decision: should we warn about editing on this branch?
@@ -114,23 +238,13 @@ impl Check for WarnMainBranch {
             return CheckResult::allow();
         }
 
-        // Branch + repo root come from the shared `GitState` — a pure
-        // filesystem walk scoped to the edited file's repo, not CWD's repo, so a
-        // nested checkout under a parent session still resolves its own `.git`.
-        // This replaced two `git -C` spawns (`symbolic-ref --short HEAD` and
-        // `rev-parse --show-toplevel`) that ran on every Edit/Write and made
-        // this the slowest hook on the Write path. `repo_root` is canonicalized
-        // exactly as `--show-toplevel` is, so the session-marker keys are
-        // unchanged. Not in a repo, a missing parent dir, or a detached HEAD
-        // all resolve to no branch and fail open (ADR-0001) — the same verdicts
-        // the git spawns gave.
-        let Some(state) = GitState::resolve(&dir) else {
+        // Branch detection scoped to the edited file's repo, not CWD's repo, so
+        // a nested checkout under a parent session still resolves its own
+        // `.git`. Read from disk when that answer is certain to match git's,
+        // else asked of git itself (see `branch_and_root`).
+        let Some((branch, repo_root)) = branch_and_root(&dir) else {
             return CheckResult::allow();
         };
-        let Some(branch) = state.branch else {
-            return CheckResult::allow();
-        };
-        let repo_root = state.repo_root.to_string_lossy().into_owned();
 
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
@@ -949,5 +1063,76 @@ mod tests {
         let input = edit_input_in(tmp.path(), "warn-parity-norepo");
         let r = without_allow_main(|| WarnMainBranch.run(&input));
         assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    /// The disk read must give git's answer in every layout the review of the
+    /// GitState switch found a disagreement in, plus the ordinary ones.
+    #[test]
+    fn branch_and_root_matches_git_across_layouts() {
+        let (tmp, _root) = init_repo_on_main();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        // A `.git` directory with no HEAD: git skips it, the walk must not stop.
+        std::fs::create_dir_all(repo.join("stray/.git")).unwrap();
+        std::fs::create_dir_all(repo.join("stray/inner")).unwrap();
+        // A bare repository nested in the work tree.
+        git_in(repo, &["init", "-q", "--bare", "nested.git"]);
+        std::fs::create_dir_all(repo.join("nested.git/objects/info")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dirs = [
+            repo.to_path_buf(),
+            repo.join("src/deep"),
+            repo.join(".git"),
+            repo.join(".git/hooks"),
+            repo.join("stray/inner"),
+            repo.join("nested.git"),
+            repo.join("nested.git/objects/info"),
+            repo.join("missing/dir"),
+            outside.path().to_path_buf(),
+        ];
+        let check = |label: &str| {
+            for dir in &dirs {
+                assert_eq!(
+                    branch_and_root(dir),
+                    ask_git(dir),
+                    "{label}: disk read disagrees with git for {}",
+                    dir.display()
+                );
+            }
+        };
+        check("on main");
+        git_in(repo, &["checkout", "-q", "--detach"]);
+        check("detached");
+        git_in(repo, &["tag", "main-tag"]);
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/tags/main-tag\n").unwrap();
+        check("HEAD naming a tag");
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        check("back on main");
+    }
+
+    #[test]
+    fn git_discovery_env_defers_to_git() {
+        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (tmp, _root) = init_repo_on_main();
+        let prev = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below.
+        unsafe {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path());
+        }
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let fast = matches!(read_from_disk(&sub), DiskRead::Uncertain);
+        let agrees = branch_and_root(&sub) == ask_git(&sub);
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("GIT_CEILING_DIRECTORIES", v),
+                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
+            }
+        }
+        assert!(fast, "a discovery-redirecting env var must defer to git");
+        assert!(agrees);
     }
 }

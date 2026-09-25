@@ -8,36 +8,35 @@
 
 use cadence_hooks_core::HookEvent;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use std::cell::Cell;
 use std::process;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::ThreadId;
 
-/// Set by [`dispatch`] around the region its `catch_unwind` covers, and read by
-/// the global panic hook below.
-///
-/// A panic hook runs **before** unwinding begins, so the hook's
-/// `process::exit(1)` terminated the process and no `catch_unwind` downstream
-/// ever regained control — every guard in the tree was dead code
-/// (cameronsjo/cadence-hooks#349). This flag lets the hook *return* instead,
-/// handing the unwind to the waiting guard, and only where a guard is actually
-/// waiting. Unguarded panics keep the historical exit-1 path exactly.
-///
-/// `Relaxed` is sufficient: the store and the panic hook's load happen on the
-/// same thread in program order, and a load from any *other* thread is
-/// short-circuited by the `MAIN_THREAD` test below before its value matters.
-pub(crate) static PANIC_GUARDED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Set by [`dispatch`] around the region its `catch_unwind` covers, and read
+    /// by the global panic hook below.
+    ///
+    /// A panic hook runs **before** unwinding begins, so the hook's
+    /// `process::exit(1)` terminated the process and no `catch_unwind`
+    /// downstream ever regained control — every guard in the tree was dead code
+    /// (cameronsjo/cadence-hooks#349). This flag lets the hook *return* instead,
+    /// handing the unwind to the waiting guard, and only where a guard is
+    /// actually waiting. Unguarded panics keep the historical exit-1 path
+    /// exactly.
+    ///
+    /// **Per thread**, because a `catch_unwind` only catches unwinds on its own
+    /// thread. A guarded region can spawn workers (`core::shell`'s stdout
+    /// drain), and a panic there unwinds that thread, where nothing waits: its
+    /// own flag is unset, so the hook takes the fail-open exit. The `group`
+    /// command runs each member check on its own thread with its own guard, so
+    /// one member's panic is caught for that member alone.
+    pub(crate) static PANIC_GUARDED: Cell<bool> = const { Cell::new(false) };
 
-/// The thread `main` runs on, pinned at entry.
-///
-/// `PANIC_GUARDED` is a process-global, but the `catch_unwind` it advertises
-/// only catches unwinds on the **main** thread. Guarded regions spawn worker
-/// threads (`core::shell::run_bounded_with`'s stdout drain), and a panic there
-/// unwinds that thread, not `main` — so without this test the hook would skip
-/// the exit for a panic nothing is positioned to catch, silently losing the
-/// fail-open exit. `OnceLock` rather than a constant because a thread id is
-/// only knowable at runtime.
-static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
+    /// The `(namespace, hook)` a `group` member thread is running, so the panic
+    /// hook's ledger row names that member. Unset on a standalone run, where
+    /// argv already names the hook.
+    pub(crate) static CURRENT_HOOK: Cell<Option<(&'static str, &'static str)>> =
+        const { Cell::new(None) };
+}
 
 /// True when the positional subcommand path names a CLI/diagnostic command
 /// that `CADENCE_BYPASS=1` must NOT short-circuit.
@@ -1108,13 +1107,6 @@ fn main() {
     // write is a fix that missed one. See `sigpipe` for the trade-offs.
     sigpipe::restore_default();
 
-    // Pin the main thread before anything can spawn — the panic hook's guard
-    // test below is only meaningful once this is set. The `Result` is
-    // discarded because `main` runs once: an `Err` would mean the cell was
-    // already set, which cannot happen, and failing open on it is right anyway
-    // (an unset cell just restores the unconditional exit-1 path).
-    let _ = MAIN_THREAD.set(std::thread::current().id());
-
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. It CAN be left on: any
     // settings file's `env` block sets it, a project's checked-in one included
@@ -1158,9 +1150,15 @@ fn main() {
         // `Logger`/`hook` context computed elsewhere in `main` (a panic can
         // strike anywhere), so it re-derives the attempted subcommand purely
         // for diagnostic tagging — not validated against the registry.
-        let mut argv = std::env::args().skip(1);
-        let namespace = argv.next();
-        let subcommand = argv.next();
+        // A `group` member thread says which member it is; argv would name
+        // `group` and whatever member happened to be listed first.
+        let (namespace, subcommand) = match CURRENT_HOOK.with(Cell::get) {
+            Some((namespace, hook)) => (Some(namespace.to_string()), Some(hook.to_string())),
+            None => {
+                let mut argv = std::env::args().skip(1);
+                (argv.next(), argv.next())
+            }
+        };
         // The row's message plus the source location — what makes it answer
         // "why did it panic?" instead of merely "it panicked"
         // (cameronsjo/cadence-hooks#398). `panic_row_error` keeps a `&str`
@@ -1181,8 +1179,7 @@ fn main() {
         // Exit only when nothing downstream is positioned to catch this unwind.
         // A panic hook runs before unwinding starts, so exiting here would make
         // every `catch_unwind` in the tree unreachable — see `PANIC_GUARDED`.
-        let on_main = MAIN_THREAD.get() == Some(&std::thread::current().id());
-        if !(on_main && PANIC_GUARDED.load(Ordering::Relaxed)) {
+        if !PANIC_GUARDED.with(Cell::get) {
             process::exit(1);
         }
     }));

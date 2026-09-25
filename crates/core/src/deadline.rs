@@ -1,4 +1,4 @@
-//! Per-process wall-clock budget for subprocess spawns (cadence-hooks#271).
+//! Per-invocation wall-clock budget for subprocess spawns (cadence-hooks#271).
 //!
 //! Every hook check runs as its own short-lived process with an external
 //! hooks.json timeout (typically 5s). When a spawned `git` stalls — cloud-synced
@@ -9,12 +9,16 @@
 //! exit, and record the degradation itself (`failopen.jsonl` via the binary
 //! layer — this crate cannot depend on metrics).
 //!
-//! The budget is shared across all spawns in one process: the second probe
-//! gets only what the first left. State is process-global (`OnceLock` /
-//! `AtomicBool`) — each hook invocation is a fresh process, so "process" and
-//! "invocation" coincide; CLI paths that never `arm()` fall back to a
-//! per-spawn cap instead of a shared budget (doctor's many sequential probes
-//! keep working, but none can hang forever).
+//! The budget is shared across all spawns in one hook invocation: the second
+//! probe gets only what the first left. The clock and the two degradation flags
+//! are **per thread**. A standalone hook runs on one thread, so thread and
+//! invocation coincide there. The binary's `group` command runs each member
+//! check on its own thread, and per-thread state gives each member the full
+//! budget a separate process had, instead of whatever an earlier member left.
+//! Every read and write of this state happens on the thread that decides the
+//! check (a bounded spawn's drain thread never touches it). CLI paths that
+//! never `arm()` fall back to a per-spawn cap instead of a shared budget
+//! (doctor's many sequential probes keep working, but none can hang forever).
 //!
 //! `CADENCE_HOOK_DEADLINE_MS` tunes the budget. It is security-relevant:
 //! guards treat a timed-out probe as fail-open, so a tiny value would be a
@@ -24,8 +28,8 @@
 //! deadline entirely — the *safe* direction: spawns revert to unbounded and
 //! fail-closed arms stay fail-closed.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default shared budget. Bounds only in-process git time — the wrapper /
@@ -46,10 +50,13 @@ const MIN_BUDGET_MS: u64 = 1000;
 /// the mitigation.
 const MAX_BUDGET_MS: u64 = 4500;
 
-static HOOK_START: OnceLock<Instant> = OnceLock::new();
 static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
-static DEADLINE_HIT: AtomicBool = AtomicBool::new(false);
-static SUPPRESSED_BLOCK: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static HOOK_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    static DEADLINE_HIT: Cell<bool> = const { Cell::new(false) };
+    static SUPPRESSED_BLOCK: Cell<bool> = const { Cell::new(false) };
+}
 
 /// What a spawn site should do with its next subprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +70,21 @@ pub enum BudgetState {
     Disabled,
 }
 
-/// Start the shared budget clock. Idempotent; called at the top of the hook
+/// The configured per-invocation budget, or `None` when
+/// `CADENCE_HOOK_DEADLINE_MS=0` disables it. For callers that size their own
+/// deadline from it (the binary's `group` command).
+pub fn configured_budget() -> Option<Duration> {
+    budget()
+}
+
+/// Start this thread's budget clock. Idempotent; called at the top of the hook
 /// dispatch paths (never on CLI paths).
 pub fn arm() {
-    HOOK_START.get_or_init(Instant::now);
+    HOOK_START.with(|start| {
+        if start.get().is_none() {
+            start.set(Some(Instant::now()));
+        }
+    });
 }
 
 /// The configured budget: `None` means disabled.
@@ -97,7 +115,7 @@ fn budget_from(raw: Option<&str>) -> Option<Duration> {
 pub fn state() -> BudgetState {
     match budget() {
         None => BudgetState::Disabled,
-        Some(total) => match HOOK_START.get() {
+        Some(total) => match HOOK_START.with(Cell::get) {
             None => BudgetState::Unarmed(total),
             Some(start) => BudgetState::Armed(remaining_at(total, start.elapsed())),
         },
@@ -112,12 +130,12 @@ fn remaining_at(total: Duration, elapsed: Duration) -> Duration {
 /// Record that a spawn was abandoned (or skipped) at the deadline. The binary
 /// layer reads this at exit to emit the loud fail-open row + breadcrumb.
 pub fn note_hit() {
-    DEADLINE_HIT.store(true, Ordering::Relaxed);
+    DEADLINE_HIT.with(|hit| hit.set(true));
 }
 
-/// Whether any spawn in this process was abandoned at the deadline.
+/// Whether any spawn on this thread was abandoned at the deadline.
 pub fn hit() -> bool {
-    DEADLINE_HIT.load(Ordering::Relaxed)
+    DEADLINE_HIT.with(Cell::get)
 }
 
 /// Record that a *fail-closed* guard arm downgraded its block to allow
@@ -126,25 +144,13 @@ pub fn hit() -> bool {
 /// "git checks were slow" and "an enforcement block was bypassed" stay
 /// distinguishable in telemetry.
 pub fn note_suppressed_block() {
-    SUPPRESSED_BLOCK.store(true, Ordering::Relaxed);
+    SUPPRESSED_BLOCK.with(|suppressed| suppressed.set(true));
 }
 
-/// Whether a fail-closed arm suppressed a block this process (see
+/// Whether a fail-closed arm suppressed a block on this thread (see
 /// [`note_suppressed_block`]).
 pub fn suppressed_block() -> bool {
-    SUPPRESSED_BLOCK.load(Ordering::Relaxed)
-}
-
-/// Clear the two degradation flags, leaving the shared budget clock running.
-///
-/// For the binary's `group` command, which runs several checks in one process
-/// and reports each one's degradation under its own name. Without the reset,
-/// one hook's timed-out probe would be charged to every hook after it. The
-/// budget itself is **not** reset: it bounds the whole process under the one
-/// external hooks.json timeout, however many checks share it.
-pub fn reset_flags() {
-    DEADLINE_HIT.store(false, Ordering::Relaxed);
-    SUPPRESSED_BLOCK.store(false, Ordering::Relaxed);
+    SUPPRESSED_BLOCK.with(Cell::get)
 }
 
 #[cfg(test)]
