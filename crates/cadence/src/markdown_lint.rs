@@ -4,7 +4,8 @@
 //! the tool is not installed, so this hook degrades gracefully.
 
 use cadence_hooks_core::display::{
-    HOOK_OUTPUT_BUDGET_UTF16, MAX_PATH_DISPLAY, clamp_hook_output, sanitize_field,
+    HOOK_OUTPUT_BUDGET_UTF16, MAX_PATH_DISPLAY, MAX_RECOVERY_HINT_UTF16, clamp_hook_output,
+    sanitize_field, shell_single_quote, utf16_len,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
@@ -89,6 +90,16 @@ impl Check for MarkdownLint {
 /// guard-authored text, including a line that looks like the clamp marker.
 /// `lint_output` is echoed tool output and is left alone — the clamp bounds it.
 ///
+/// **The two commands get a different treatment from the filename.** The
+/// displayed filename is sanitized *and* bounded to [`MAX_PATH_DISPLAY`]. The
+/// path inside `Fix:` and the recovery command is sanitized but never
+/// truncated — a shortened path names a file that does not exist — and then
+/// single-quoted, so a space, a quote, or shell syntax in it pastes as data
+/// (cadence-hooks#967). The marker line caps its hint at
+/// [`MAX_RECOVERY_HINT_UTF16`]; a quoted path too long for that cap would be
+/// cut mid-quote, so that case names the `Fix:` line's path instead of
+/// repeating it.
+///
 /// **This emitter clamps its own message**, unlike every other one, because it
 /// is the only one with a real recovery command to name in the marker line and
 /// `CheckResult` carries no recovery-hint field to pass it through. The
@@ -97,7 +108,7 @@ impl Check for MarkdownLint {
 /// the second clamp is a no-op on an already-clamped string and only one marker
 /// line ever ships. Change one budget and you must change the other.
 fn nudge_message(path: &str, lint_output: &str) -> String {
-    let safe_path = sanitize_field(path, MAX_PATH_DISPLAY);
+    let quoted_path = shell_single_quote(&sanitize_field(path, usize::MAX));
     let filename = sanitize_field(path.rsplit('/').next().unwrap_or(path), MAX_PATH_DISPLAY);
 
     // markdownlint prints one line per violation with no cap of its own, so
@@ -106,9 +117,14 @@ fn nudge_message(path: &str, lint_output: &str) -> String {
     // findings) and the tail (the Fix line).
     let message = format!(
         "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\
-         Fix: markdownlint --fix {safe_path}"
+         Fix: markdownlint --fix {quoted_path}"
     );
-    let hint = format!("Run `markdownlint {safe_path}` for the full list.");
+    let full_hint = format!("Run `markdownlint {quoted_path}` for the full list.");
+    let hint = if utf16_len(&full_hint) <= MAX_RECOVERY_HINT_UTF16 {
+        full_hint
+    } else {
+        "Run `markdownlint` on the Fix line's path for the full list.".to_string()
+    };
     clamp_hook_output(&message, HOOK_OUTPUT_BUDGET_UTF16, Some(&hint)).into_owned()
 }
 
@@ -223,8 +239,82 @@ mod tests {
             "exactly one marker"
         );
         assert!(
-            out.contains("Run `markdownlint /p/doc.md` for the full list."),
+            out.contains("Run `markdownlint '/p/doc.md'` for the full list."),
             "the recovery command is named: {out}"
+        );
+    }
+
+    /// The argument `sh` parses out of the command after `prefix` on the one
+    /// line that starts with it. Round-tripping through a real shell is the
+    /// only proof the quoting holds: equality means no split, no quote break,
+    /// and no substitution happened.
+    fn shell_arg_after(out: &str, prefix: &str) -> String {
+        let line = out
+            .lines()
+            .find(|l| l.contains(prefix))
+            .unwrap_or_else(|| panic!("no line with {prefix:?}: {out}"));
+        let start = line.find(prefix).expect("prefix on line") + prefix.len();
+        let rest = line[start..].trim_end_matches("` for the full list.");
+        let run = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s|' {rest}"))
+            .output()
+            .expect("spawn sh");
+        assert!(run.status.success(), "sh rejected {rest:?}: {run:?}");
+        String::from_utf8_lossy(&run.stdout).into_owned()
+    }
+
+    #[test]
+    fn printed_commands_paste_back_to_the_exact_path() {
+        let long = format!("/p/{}/doc.md", "d".repeat(MAX_PATH_DISPLAY + 50));
+        for path in [
+            "/p/a b/doc.md",
+            "/p/it's/doc.md",
+            "/p/a;touch pwned/doc.md",
+            "/p/$(echo INJECTED)/doc.md",
+            long.as_str(),
+        ] {
+            let out = nudge_message(path, "1: MD013 line too long\n");
+            assert_eq!(
+                shell_arg_after(&out, "Fix: markdownlint --fix "),
+                format!("{path}|"),
+                "Fix line must paste as one argument naming the file: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recovery_command_quotes_the_path_when_the_output_is_clamped() {
+        let lint_output: String = (0..3_000)
+            .map(|i| format!("{i}: MD013/line-length Line length [Expected 80]\n"))
+            .collect();
+        for path in ["/p/a b/doc.md", "/p/it's;x/doc.md"] {
+            let out = nudge_message(path, &lint_output);
+            assert_eq!(
+                shell_arg_after(&out, "Run `markdownlint "),
+                format!("{path}|"),
+                "recovery command must paste as one argument: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_hint_cap_points_at_the_fix_line() {
+        // A quoted path over the hint cap would be cut mid-quote by the clamp,
+        // leaving an unterminated command. The hint names the Fix line instead,
+        // and the Fix line (kept in the clamp's tail) carries the full path.
+        let long = format!("/p/{}/doc.md", "d".repeat(MAX_PATH_DISPLAY + 50));
+        let lint_output: String = (0..3_000)
+            .map(|i| format!("{i}: MD013/line-length Line length [Expected 80]\n"))
+            .collect();
+        let out = nudge_message(&long, &lint_output);
+        assert!(
+            out.contains("Run `markdownlint` on the Fix line's path for the full list."),
+            "{out}"
+        );
+        assert_eq!(
+            shell_arg_after(&out, "Fix: markdownlint --fix "),
+            format!("{long}|")
         );
     }
 

@@ -29,6 +29,28 @@ pub fn sanitize_field(s: &str, max: usize) -> String {
     out
 }
 
+/// Wrap `s` in single quotes for safe inclusion in a rendered shell command,
+/// escaping any embedded single quote via the POSIX `'\''` idiom (close, emit
+/// an escaped quote, reopen).
+///
+/// **Single quotes, not double.** Inside double quotes a shell still expands
+/// `$`, backticks and `\`, and a `"` ends the string outright — so a
+/// double-quoted path is safe against *spaces* and nothing else. Inside single
+/// quotes nothing is special but `'` itself, which this escapes; a literal
+/// newline stays inside the quotes as data rather than becoming a command
+/// separator.
+///
+/// Use this for **every** value interpolated into a command a human is invited
+/// to run: an env-derived directory in `doctor`, a tool call's `file_path` in
+/// the markdown-lint nudge. Plain diagnostic prose that merely names a path
+/// does not need it — nobody executes a sentence. It does not strip control
+/// characters; run [`sanitize_field`] first when the text reaches rendered
+/// hook output.
+#[must_use]
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// True for a character that must never reach rendered hook text or an agent's
 /// context: any **Cc** control, any **Cf** format character, or the Unicode
 /// line/paragraph separators U+2028/U+2029.
