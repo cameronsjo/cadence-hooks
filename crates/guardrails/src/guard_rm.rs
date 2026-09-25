@@ -55,10 +55,11 @@
 //!   `shred`/`truncate` (plus `find … -delete`), after transparent prefixes
 //!   (`command`/`env`/`VAR=x`/…). So `git rm`, `npm rm`, and a look-alike like
 //!   `charm` are correctly *not* deletions.
-//! - `sudo rm …` is out of scope: `sudo` is not a transparent prefix here, and
-//!   a settings `allow Bash(rm:*)` rule keys on the leading word too, so `sudo`
-//!   is consistently outside both. Adding `sudo`-flag parsing would risk a
-//!   misread; the miss is intentional.
+//! - `sudo rm …` (and `doas`, `timeout`, and the other `EXEC_RUNNERS`) ASKs
+//!   rather than judging the target. Each runner has its own flag grammar, and
+//!   a misread would skip past the delete verb, so the guard does not parse
+//!   them; it only refuses to call such a delete safe. Until #887 these
+//!   commands were a silent ALLOW.
 //! - A `..`-bearing target resolves ambiguously (symlinks, escapes), so it
 //!   downgrades to ASK rather than a guessed BLOCK/ALLOW.
 //! - The symlink carve-out above is applied to every path *operand*, not only
@@ -172,6 +173,80 @@ fn is_delete_verb(token: &str) -> bool {
 /// not the membership test, and [`wrapper_script_deletes`] needs the latter to
 /// find a wrapper sitting behind a prefix rather than in command position.
 const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// Commands that run their trailing argv as a new command, with flags of their
+/// own this guard does not parse: privilege escalation (`sudo`, `doas`,
+/// `run0`, `pkexec`) and process wrappers (`timeout`, `stdbuf`, `ionice`, …).
+/// A segment led by one that mentions a deletion asks instead of allowing
+/// (#887). Matched on the basename, so `/usr/bin/sudo` counts.
+const EXEC_RUNNERS: &[&str] = &[
+    "sudo",
+    "doas",
+    "run0",
+    "pkexec",
+    "timeout",
+    "stdbuf",
+    "ionice",
+    "chrt",
+    "taskset",
+    "setsid",
+    "unbuffer",
+    "caffeinate",
+    "systemd-run",
+    "flock",
+    "chroot",
+    "nsenter",
+    "unshare",
+    "su",
+    "runuser",
+    "firejail",
+    "bwrap",
+    "watch",
+    "script",
+    "sg",
+    "setpriv",
+    "busybox",
+    "gtimeout",
+    "parallel",
+    "proot",
+    "cpulimit",
+    "chpst",
+    "torsocks",
+    "strace",
+    "ltrace",
+    "valgrind",
+];
+
+/// A runner-led segment names a deletion: in its own words, or inside a
+/// quoted script one of its words carries. `su -c 'rm -rf ~'`, `sudo -s '…'`,
+/// `script -c '…'` and `flock <file> -c '…'` pass the script as one token,
+/// whose basename is its last path segment, so [`mentions_deletion`] alone
+/// never sees the verb inside it.
+///
+/// Each multi-word token is read as a script of its own, through the full
+/// [`collect_targets`] parse: it splits `;`/`&&`/`|`/newlines, walks
+/// substitutions and wrappers, and applies the flagged-prefix gate, so
+/// `su -c 'true;rm -rf ~'` is caught. Any target it finds counts. A bare word
+/// scan is not used here: it would ask on `sudo git commit -m 'fix rm'`.
+fn runner_mentions_deletion(tokens: &[String], depth: usize) -> bool {
+    if mentions_deletion(tokens, 0) {
+        return true;
+    }
+    let mut scripts = tokens
+        .iter()
+        .skip(1)
+        .filter(|t| t.contains(char::is_whitespace));
+    // Out of wrapper budget: an unread script behind a runner asks rather
+    // than passing unseen, the same way an oversized one does.
+    if depth >= MAX_WRAPPER_DEPTH {
+        return scripts.next().is_some();
+    }
+    scripts.any(|script| {
+        let mut found = Vec::new();
+        collect_targets(script, "/", false, depth + 1, &mut found);
+        !found.is_empty()
+    })
+}
 
 /// These tokens name a deletion the shell will actually perform, in any of the
 /// spellings the flagged-prefix gate has to arm on.
@@ -551,10 +626,18 @@ fn collect_targets(
         // `argv` still leads with the prefix, so the delete/xargs/find branches
         // below all miss — and `Outcome::merge` keeps the most severe verdict,
         // so a BLOCK from an already-recursed child script still wins.
-        if argv.first().is_some_and(|first| {
-            let word = command_word(first);
-            TRANSPARENT.contains(&word.as_ref()) || word == "eval"
-        }) && mentions_deletion(&tokens, 0)
+        //
+        // `EXEC_RUNNERS` joins for the same reason (#887): `sudo`, `doas`,
+        // `timeout` and the rest run their trailing argv, but none is in
+        // `TRANSPARENT`, so `sudo rm -rf ~` led with `sudo`, matched no verb,
+        // and allowed in silence. Their flag grammars are not parsed here
+        // either; the gate asks.
+        let head = argv.first().map(|first| command_word(first));
+        let head = head.as_deref();
+        let prefix_led = head.is_some_and(|w| TRANSPARENT.contains(&w) || w == "eval");
+        let runner_led = head.is_some_and(|w| EXEC_RUNNERS.contains(&w));
+        if (prefix_led && mentions_deletion(&tokens, 0))
+            || (runner_led && runner_mentions_deletion(argv, depth))
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -3819,15 +3902,75 @@ mod tests {
         }
     }
 
-    /// `sudo rm …` is a DOCUMENTED miss here, not an oversight — see the
-    /// module's scope notes. Pinned so a future widening of the prefilter is
-    /// not misread as having changed it, and so removing this carve-out is a
-    /// deliberate edit to a red test rather than a silent behaviour change.
-    /// `obsidian::trash_guard` does block the same command; the two guards
-    /// judge different things.
+    /// A delete behind an exec runner ASKs (#887). It was a silent ALLOW: the
+    /// segment led with the runner, which is not a transparent prefix, so no
+    /// delete verb was ever examined. Each row pairs a spelling from the issue
+    /// with the runner flags that previously hid the verb.
     #[test]
-    fn sudo_prefixed_delete_remains_a_documented_miss() {
-        assert_eq!(judge("sudo rm -rf important", &home()), Outcome::Allow);
+    fn a_delete_behind_an_exec_runner_asks() {
+        for command in [
+            "sudo rm -rf important",
+            "sudo rm -rf ~",
+            "sudo -u me rm -rf ~/Documents",
+            "sudo \\-u me rm -rf ~/Documents",
+            "sudo -E rm -rf ~/Documents",
+            "sudo -- rm -rf ~/Documents",
+            "/usr/bin/sudo rm -rf ~/Documents",
+            "doas rm -rf ~/Documents",
+            "doas -u me rm -rf ~/Documents",
+            "run0 rm -rf ~/Documents",
+            "pkexec rm -rf ~/Documents",
+            "timeout 5 rm -rf ~/Documents",
+            "stdbuf -o0 rm -rf ~/Documents",
+            "ionice -c3 rm -rf ~/Documents",
+            "sudo find ~/Documents -delete",
+            "sudo xargs rm -rf",
+            "sudo unlink ~/Documents/a",
+            "timeout 5 sudo rm -rf ~/Documents",
+            // The script arrives as one quoted token (security review).
+            "su -c 'rm -rf ~/Documents'",
+            "su me -c 'rm -rf ~/Documents'",
+            "sudo -s 'rm -rf ~/Documents'",
+            "sudo -i 'rm -rf ~/Documents'",
+            "sudo -u me -s -- 'rm -rf ~'",
+            "runuser -u me -c 'rm -rf ~/Documents'",
+            "sg wheel -c 'rm -rf ~/Documents'",
+            "script -qc 'rm -rf ~/Documents' /dev/null",
+            "flock /tmp/l -c 'rm -rf ~/Documents'",
+            "busybox rm -rf ~/Documents",
+            "watch rm -rf ~/Documents",
+            "parallel rm -rf ::: ~/Documents",
+            "setpriv --reuid=me rm -rf ~/Documents",
+            // A separator or substitution inside the quoted script (CodeRabbit
+            // on #1012): the verb follows `;`, `&&`, `|`, a newline, or `$(`.
+            "su -c 'true;rm -rf ~/Documents'",
+            "su -c 'true && rm -rf ~/Documents'",
+            "sudo -s 'cd /; rm -rf ~/Documents'",
+            "su -c 'true\nrm -rf ~/Documents'",
+            "su -c 'echo $(rm -rf ~/Documents)'",
+            "su -c 'env -i rm -rf ~/Documents'",
+        ] {
+            assert_eq!(judge(command, &home()), Outcome::Ask, "{command}");
+        }
+    }
+
+    /// The gate only arms on a deletion: a runner in front of anything else
+    /// stays silent, and a shell wrapper behind one keeps its BLOCK.
+    #[test]
+    fn an_exec_runner_without_a_deletion_stays_silent() {
+        for command in [
+            "sudo ls",
+            "sudo apt-get install jq",
+            "timeout 5 make test",
+            "sudo git status",
+            "su -c 'systemctl restart nginx'",
+            "watch 'ls -la'",
+            // A quoted word that only mentions a delete verb is not a script.
+            "sudo -u me git commit -m 'fix the rm bug'",
+        ] {
+            assert_eq!(judge(command, &home()), Outcome::Allow, "{command}");
+        }
+        assert_eq!(judge("sudo sh -c 'rm -rf ~'", &home()), Outcome::Block);
     }
 
     /// A command-less input that is NOT a delete stays a silent allow — the new

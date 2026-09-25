@@ -268,12 +268,27 @@ pub fn handle_merge(
         "view",
         &pr_num.to_string(),
         "--json",
-        "body,mergeCommit",
+        "body,mergeCommit,state,mergedAt",
         "-R",
         slug,
     ])?;
 
     let value: serde_json::Value = serde_json::from_str(&pr_json).ok()?;
+
+    // Act only on a PR GitHub reports as merged (#1004). This hook runs after
+    // every `gh pr merge`, including one that failed (a draft, a red required
+    // check, a ruleset refusal), only queued auto-merge, or entered a merge
+    // queue. Closing the PR's
+    // issues then marks unfinished work done, with nothing to announce it.
+    // A missing or unreadable field counts as not merged.
+    let merged = value.get("state").and_then(serde_json::Value::as_str) == Some("MERGED")
+        && value
+            .get("mergedAt")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|at| !at.is_empty());
+    if !merged {
+        return None;
+    }
 
     let body = value
         .get("body")
@@ -533,12 +548,16 @@ mod tests {
         /// the last value repeats. `None` simulates a `gh` failure. Checked
         /// before `issue_states`.
         issue_state_seq: RefCell<HashMap<u64, VecDeque<Option<String>>>>,
-        /// PR body to return for `gh pr view <n> --json body,mergeCommit`
+        /// PR body to return for the merge-path `gh pr view <n>`
         pr_body: String,
         /// PR number to return for bare `gh pr view --json number`
         pr_number: Option<u64>,
         /// merge commit OID
         merge_commit_oid: String,
+        /// `state` for the merge-path `gh pr view` ("MERGED" | "OPEN" | …)
+        pr_state: String,
+        /// `mergedAt` for the merge-path `gh pr view`; `None` renders as null
+        merged_at: Option<String>,
         /// Captures `gh issue close` calls: (issue_number, comment)
         close_calls: RefCell<Vec<(u64, String)>>,
         /// Captures `gh pr view <n> --json body` calls
@@ -553,6 +572,8 @@ mod tests {
                 pr_body: String::new(),
                 pr_number: None,
                 merge_commit_oid: "abc1234def".to_string(),
+                pr_state: "MERGED".to_string(),
+                merged_at: Some("2026-09-25T00:00:00Z".to_string()),
                 close_calls: RefCell::new(Vec::new()),
                 body_calls: RefCell::new(Vec::new()),
             }
@@ -578,6 +599,13 @@ mod tests {
 
         fn with_merge_commit(mut self, oid: &str) -> Self {
             self.merge_commit_oid = oid.to_string();
+            self
+        }
+
+        /// The PR as GitHub reports it after a merge that did not happen.
+        fn with_pr_state(mut self, state: &str, merged_at: Option<&str>) -> Self {
+            self.pr_state = state.to_string();
+            self.merged_at = merged_at.map(str::to_string);
             self
         }
     }
@@ -633,11 +661,13 @@ mod tests {
                                 let json = serde_json::json!({"body": self.pr_body});
                                 return Some(json.to_string());
                             }
-                            Some("body,mergeCommit") => {
-                                // body + mergeCommit fetch (handle_merge)
+                            Some("body,mergeCommit,state,mergedAt") => {
+                                // merge-path fetch (handle_merge)
                                 let json = serde_json::json!({
                                     "body": self.pr_body,
-                                    "mergeCommit": {"oid": self.merge_commit_oid}
+                                    "mergeCommit": {"oid": self.merge_commit_oid},
+                                    "state": self.pr_state,
+                                    "mergedAt": self.merged_at,
                                 });
                                 return Some(json.to_string());
                             }
@@ -776,6 +806,45 @@ mod tests {
             comment.contains("abc1234"),
             "comment should cite short commit SHA: {comment}"
         );
+    }
+
+    // #1004: a `gh pr merge` that failed (draft, red required check, ruleset)
+    // or only queued auto-merge leaves the PR open. Its issues must stay open,
+    // and the hook must not even pay the auto-close wait.
+    #[test]
+    fn merge_that_did_not_merge_closes_nothing() {
+        for (state, merged_at) in [
+            ("OPEN", None),
+            ("CLOSED", None),
+            ("OPEN", Some("")),
+            // `state` alone is not enough: both fields must agree.
+            ("MERGED", None),
+            ("", Some("2026-09-25T00:00:00Z")),
+        ] {
+            let gh = FakeGh::new()
+                .with_issue(5, "OPEN")
+                .with_pr_body("Closes #5")
+                .with_pr_state(state, merged_at);
+            let clock = FakeClock::new();
+
+            let msg = handle_merge(
+                "owner/repo",
+                "gh pr merge 8 --merge --admin",
+                &gh,
+                &clock,
+                10,
+            );
+
+            assert_eq!(msg, None, "state={state:?} mergedAt={merged_at:?}");
+            assert!(
+                gh.close_calls.borrow().is_empty(),
+                "closed an issue for an unmerged PR: state={state:?} mergedAt={merged_at:?}"
+            );
+            assert!(
+                clock.sleep_calls.borrow().is_empty(),
+                "no wait for an unmerged PR"
+            );
+        }
     }
 
     // Case 16: merge #8, body refs #5 already CLOSED → no close call
