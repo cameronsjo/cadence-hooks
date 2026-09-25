@@ -98,8 +98,15 @@ fn branch_and_root(dir: &Path) -> Option<(String, String)> {
 /// - a bare repository sits between the directory and the work tree root (git
 ///   finds the bare repository first);
 /// - the work tree is owned by another user (git may refuse it as dubious
-///   ownership, depending on `safe.directory`).
+///   ownership, depending on `safe.directory`);
+/// - the platform is Windows, where `std::fs::canonicalize` returns a
+///   `\\?\C:\…` path and git prints `C:/…`. The root keys the session marker
+///   and the `dismiss-main-branch-warn` snooze (written from git's form), so a
+///   different spelling of the same root would silently ignore a snooze.
 fn read_from_disk(dir: &Path) -> DiskRead {
+    if cfg!(windows) {
+        return DiskRead::Uncertain;
+    }
     use cadence_hooks_core::gitstate::GitState;
     const DISCOVERY_ENV: [&str; 4] = [
         "GIT_DIR",
@@ -154,8 +161,9 @@ fn owned_by_someone_else(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.uid() != me)
 }
 
-/// Windows ownership is SID-based and not checked here, so a repository git
-/// would refuse as dubious ownership still nudges on Windows. Advisory only.
+/// Non-Unix targets never reach the ownership check: Windows defers to git at
+/// the top of [`read_from_disk`], and this stub only keeps other targets
+/// compiling.
 #[cfg(not(unix))]
 fn owned_by_someone_else(_path: &Path) -> bool {
     false
