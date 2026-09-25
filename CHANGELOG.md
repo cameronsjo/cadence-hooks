@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.104.0] - 2026-09-25
+
 ### Fixed
 
 - **`guard-rm` asks on a delete behind `sudo`, `doas`, `su`, `timeout`, and other exec runners.** `sudo rm -rf ~` and `sudo -u me rm -rf ~/Documents` were a silent allow. The segment led with the runner, which is not a transparent prefix, so no delete verb was ever examined. A segment led by a listed runner (`EXEC_RUNNERS` in `guard_rm.rs`: privilege tools such as `sudo`, `doas`, `su`, `runuser`, `pkexec`, and wrappers such as `timeout`, `watch`, `flock`, `firejail`, `busybox`) now asks when it mentions a deletion. That includes a script passed as one quoted word, as in `su -c 'rm -rf ~'` or `sudo -s '…'`. The runners' flag grammars are not parsed, so the guard never judges a target behind one: `sudo rm -rf /tmp/x` asks too. A runner in front of anything else stays silent, and `sudo sh -c 'rm -rf ~'` still blocks. (cameronsjo/cadence-hooks#887)
