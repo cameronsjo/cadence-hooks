@@ -221,15 +221,31 @@ const EXEC_RUNNERS: &[&str] = &[
 /// quoted script one of its words carries. `su -c 'rm -rf ~'`, `sudo -s '…'`,
 /// `script -c '…'` and `flock <file> -c '…'` pass the script as one token,
 /// whose basename is its last path segment, so [`mentions_deletion`] alone
-/// never sees the verb inside it. Each multi-word token is re-tokenized and
-/// scanned one wrapper level down, on the shared depth budget.
-fn runner_mentions_deletion(tokens: &[String]) -> bool {
-    mentions_deletion(tokens, 0)
-        || tokens
-            .iter()
-            .skip(1)
-            .filter(|t| t.contains(char::is_whitespace))
-            .any(|t| mentions_deletion(&tokenize(t), 1))
+/// never sees the verb inside it.
+///
+/// Each multi-word token is read as a script of its own, through the full
+/// [`collect_targets`] parse: it splits `;`/`&&`/`|`/newlines, walks
+/// substitutions and wrappers, and applies the flagged-prefix gate, so
+/// `su -c 'true;rm -rf ~'` is caught. Any target it finds counts. A bare word
+/// scan is not used here: it would ask on `sudo git commit -m 'fix rm'`.
+fn runner_mentions_deletion(tokens: &[String], depth: usize) -> bool {
+    if mentions_deletion(tokens, 0) {
+        return true;
+    }
+    let mut scripts = tokens
+        .iter()
+        .skip(1)
+        .filter(|t| t.contains(char::is_whitespace));
+    // Out of wrapper budget: an unread script behind a runner asks rather
+    // than passing unseen, the same way an oversized one does.
+    if depth >= MAX_WRAPPER_DEPTH {
+        return scripts.next().is_some();
+    }
+    scripts.any(|script| {
+        let mut found = Vec::new();
+        collect_targets(script, "/", false, depth + 1, &mut found);
+        !found.is_empty()
+    })
 }
 
 /// These tokens name a deletion the shell will actually perform, in any of the
@@ -621,7 +637,7 @@ fn collect_targets(
         let prefix_led = head.is_some_and(|w| TRANSPARENT.contains(&w) || w == "eval");
         let runner_led = head.is_some_and(|w| EXEC_RUNNERS.contains(&w));
         if (prefix_led && mentions_deletion(&tokens, 0))
-            || (runner_led && runner_mentions_deletion(argv))
+            || (runner_led && runner_mentions_deletion(argv, depth))
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -3925,6 +3941,14 @@ mod tests {
             "watch rm -rf ~/Documents",
             "parallel rm -rf ::: ~/Documents",
             "setpriv --reuid=me rm -rf ~/Documents",
+            // A separator or substitution inside the quoted script (CodeRabbit
+            // on #1012): the verb follows `;`, `&&`, `|`, a newline, or `$(`.
+            "su -c 'true;rm -rf ~/Documents'",
+            "su -c 'true && rm -rf ~/Documents'",
+            "sudo -s 'cd /; rm -rf ~/Documents'",
+            "su -c 'true\nrm -rf ~/Documents'",
+            "su -c 'echo $(rm -rf ~/Documents)'",
+            "su -c 'env -i rm -rf ~/Documents'",
         ] {
             assert_eq!(judge(command, &home()), Outcome::Ask, "{command}");
         }
@@ -3941,6 +3965,8 @@ mod tests {
             "sudo git status",
             "su -c 'systemctl restart nginx'",
             "watch 'ls -la'",
+            // A quoted word that only mentions a delete verb is not a script.
+            "sudo -u me git commit -m 'fix the rm bug'",
         ] {
             assert_eq!(judge(command, &home()), Outcome::Allow, "{command}");
         }

@@ -1332,13 +1332,19 @@ fn shape_remediation(distinct_days: u64) -> String {
 
 /// Concatenate the files a hook command is usually wired from: each install's
 /// `hooks/hooks.json`, the user `settings.json`, and the current project's
-/// `.claude/settings.json` and `settings.local.json`. Unreadable files are
-/// skipped; the result is only ever searched for substrings.
+/// `.claude/settings.json` and `settings.local.json`. A missing file is
+/// skipped. Any other read error returns `None`: partial wiring could demote
+/// a wired invocation to a note, and `None` keeps the skew claim instead. The
+/// result is only ever searched for substrings.
 ///
 /// Not every source: another project's settings and managed policy settings
 /// are not read, so a pair wired only there is demoted to a note. The note
 /// still names it, so it is not lost, only no longer called a skew.
-fn collect_wiring(installs: &[(String, PathBuf)], config_dir: &Path, cwd: Option<&Path>) -> String {
+fn collect_wiring(
+    installs: &[(String, PathBuf)],
+    config_dir: &Path,
+    cwd: Option<&Path>,
+) -> Option<String> {
     let mut paths: Vec<PathBuf> = installs
         .iter()
         .map(|(_, dir)| dir.join("hooks/hooks.json"))
@@ -1348,11 +1354,15 @@ fn collect_wiring(installs: &[(String, PathBuf)], config_dir: &Path, cwd: Option
         paths.push(cwd.join(".claude/settings.json"));
         paths.push(cwd.join(".claude/settings.local.json"));
     }
-    paths
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut texts = Vec::new();
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => texts.push(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(texts.join("\n"))
 }
 
 /// Split `version_mismatch` pairs into `(wired, ad_hoc)` by whether any
@@ -1604,10 +1614,12 @@ fn failopen_findings_with_wiring(
     }
 
     if counts.version_mismatch >= 1 {
-        let named = recency
-            .get("version_mismatch")
+        let mismatch = recency.get("version_mismatch");
+        let named = mismatch
             .map(|r| r.subcommands.as_slice())
             .unwrap_or_default();
+        // A row with no pair is unclassified, so it may be the wired one.
+        let unpaired = mismatch.is_some_and(|r| r.unpaired_on_current);
         let (wired, adhoc) = split_by_wiring(named, wiring);
         if !adhoc.is_empty() {
             findings.push(adhoc_invocation_finding(dir, &adhoc));
@@ -1615,8 +1627,10 @@ fn failopen_findings_with_wiring(
         // Every named pair is ad hoc, and the list is not at its cap (so no
         // unnamed pair can hide behind it): nothing is skewed. A capped list
         // stays a warning — the fifth pair could be the wired one. Exactly
-        // four pairs looks the same as a capped list, so it warns too.
+        // four pairs looks the same as a capped list, so it warns too. So
+        // does any current-version row that names no pair at all.
         let all_adhoc = !named.is_empty()
+            && !unpaired
             && wired.is_empty()
             && named.len() < cadence_hooks_metrics::log_failopen::MAX_SUBCOMMANDS;
         if !all_adhoc {
@@ -2851,11 +2865,11 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                         cadence_hooks_core::paths::find_git_root(&cwd.to_string_lossy())
                             .unwrap_or(cwd)
                     });
-                    wiring = Some(collect_wiring(
+                    wiring = collect_wiring(
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
                         project_root.as_deref(),
-                    ));
+                    );
                     (findings, scanned)
                 }
                 None => {
@@ -4205,6 +4219,48 @@ mod tests {
         assert!(findings[0].diagnosis.contains("session list"));
     }
 
+    // A row with no pair is unclassified: it could be the wired invocation,
+    // so named ad hoc pairs beside it must not clear the warning (CodeRabbit
+    // on #1012).
+    #[test]
+    fn failopen_findings_version_mismatch_unpaired_row_keeps_the_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let mut rows = mismatch_rows(&[("session", "list")]);
+        rows.push_str(&format!(
+            "{{\"reason\":\"version_mismatch\",\"namespace\":\"--bogus\",\
+             \"subcommand\":null,\"binaryVersion\":\"1.0.0\",\"ts\":\"{ts}\"}}\n"
+        ));
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings_with_wiring(
+            tmp.path(),
+            WEEK,
+            SystemTime::now(),
+            "1.0.0",
+            Some("nothing wired here"),
+        );
+        assert!(
+            findings.iter().any(|f| f.severity == Severity::Warning),
+            "an unpaired row must keep the skew warning"
+        );
+        assert!(findings.iter().any(|f| f.severity == Severity::Note));
+    }
+
+    // Partial wiring could call a wired pair ad hoc, so a read error other
+    // than a missing file gives up on wiring instead (CodeRabbit on #1012).
+    #[test]
+    fn collect_wiring_gives_up_on_an_unreadable_file_but_skips_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        // No settings.json at all: skipped.
+        assert_eq!(collect_wiring(&[], &config, None).as_deref(), Some(""));
+        // A directory where the file should be cannot be read as text.
+        fs::create_dir_all(config.join("settings.json")).unwrap();
+        assert_eq!(collect_wiring(&[], &config, None), None);
+    }
+
     #[test]
     fn collect_wiring_reads_plugin_hooks_and_both_settings_scopes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4220,7 +4276,7 @@ mod tests {
         fs::write(project.join(".claude/settings.local.json"), "from-local").unwrap();
 
         let installs = vec![("p@m".to_string(), plugin)];
-        let wiring = collect_wiring(&installs, &config, Some(&project));
+        let wiring = collect_wiring(&installs, &config, Some(&project)).expect("all readable");
         for part in ["from-plugin", "from-user", "from-project", "from-local"] {
             assert!(wiring.contains(part), "missing {part}: {wiring}");
         }

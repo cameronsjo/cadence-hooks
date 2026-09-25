@@ -179,6 +179,11 @@ pub struct FailopenRecency {
     /// Empty when no windowed row on the current version records a pair (a
     /// bare `cadence-hooks` invocation logs neither).
     pub subcommands: Vec<String>,
+    /// Some windowed row on the current version carries no usable
+    /// `namespace subcommand` pair, so [`Self::subcommands`] does not account
+    /// for every row. A reader classifying the named pairs must not treat
+    /// them as the whole story when this is set.
+    pub unpaired_on_current: bool,
 }
 
 /// The `failopen.jsonl` rows matching `reason` within the window — the single
@@ -366,6 +371,7 @@ fn recency_from(
     // never rotated. Popping the largest once over capacity keeps the same
     // alphabetically-first four at O(MAX_SUBCOMMANDS) resident.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unpaired_on_current = false;
     for row in rows
         .iter()
         .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
@@ -380,15 +386,18 @@ fn recency_from(
         // `error`), so an argv-sized token would otherwise flood the printed
         // line and the paste-me command built from it.
         let Some(ns) = row.get("namespace").and_then(Value::as_str) else {
+            unpaired_on_current = true;
             continue;
         };
         let Some(sub) = row.get("subcommand").and_then(Value::as_str) else {
+            unpaired_on_current = true;
             continue;
         };
         let ns = common::display_safe_bounded(ns, MAX_PAIR_HALF_CHARS);
         let sub = common::display_safe_bounded(sub, MAX_PAIR_HALF_CHARS);
         let (ns, sub) = (ns.trim(), sub.trim());
         if ns.is_empty() || sub.is_empty() {
+            unpaired_on_current = true;
             continue;
         }
         seen.insert(format!("{ns} {sub}"));
@@ -405,6 +414,7 @@ fn recency_from(
         distinct_days,
         last_error,
         subcommands,
+        unpaired_on_current,
     })
 }
 
@@ -875,6 +885,23 @@ mod tests {
         let r =
             recency_from(rows, "2026-07-01T00:00:00Z", "parse", "1.0.0").expect("row is in window");
         assert!(r.subcommands.is_empty());
+        assert!(r.unpaired_on_current, "the pairless row is flagged");
+    }
+
+    #[test]
+    fn recency_unpaired_flag_is_clear_when_every_row_has_a_pair() {
+        let rows = concat!(
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"a","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":null,"binaryVersion":"0.9.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+        );
+        let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert!(
+            !r.unpaired_on_current,
+            "an older version's pairless row does not count"
+        );
     }
 
     #[test]
