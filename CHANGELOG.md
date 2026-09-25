@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.103.0] - 2026-09-25
+
 ### Added
 
 - **`cadence-hooks group <ns>/<hook>...` runs several checks against one payload in one process.** A Write used to start a dozen processes whose checks each decide in well under a millisecond. With one group entry per plugin it starts two: 14.6 → 6.0 ms wall and 45 → 11 ms CPU per Write, and 8.2 → 4.9 ms wall per Bash call (4-core Linux, release build). Members run in parallel, each with its own git budget, panic guard, `CADENCE_DISABLE` switch, and audit rows. Results merge the way separate processes would: any block exits 2 with every blocker's message. After the git budget plus one second the group emits what it has decided rather than being killed by the hooks.json timeout. `doctor` and the registration audit read group entries member by member. See `docs/hooks.md` § Grouped wiring. Adversarial security and code reviews found three ways a block could be lost in the first version (a shared git budget, a hung member, the first member fixing the event); all three are fixed and replayed as regression cases.
