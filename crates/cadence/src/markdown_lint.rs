@@ -4,8 +4,8 @@
 //! the tool is not installed, so this hook degrades gracefully.
 
 use cadence_hooks_core::display::{
-    HOOK_OUTPUT_BUDGET_UTF16, MAX_PATH_DISPLAY, MAX_RECOVERY_HINT_UTF16, clamp_hook_output,
-    sanitize_field, shell_single_quote, utf16_len,
+    HOOK_OUTPUT_BUDGET_UTF16, MAX_BLOCK_FIX_UTF16, MAX_PATH_DISPLAY, MAX_RECOVERY_HINT_UTF16,
+    clamp_hook_output, sanitize_field, shell_single_quote, utf16_len,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
@@ -97,8 +97,11 @@ impl Check for MarkdownLint {
 /// single-quoted, so a space, a quote, or shell syntax in it pastes as data
 /// (cadence-hooks#967). The marker line caps its hint at
 /// [`MAX_RECOVERY_HINT_UTF16`]; a quoted path too long for that cap would be
-/// cut mid-quote, so that case names the `Fix:` line's path instead of
-/// repeating it.
+/// cut mid-quote, so that case names "the file just written" instead of
+/// repeating the path, and the full path stays on the `Fix:` line. The clamp
+/// runs on the header and findings alone, with the `Fix:` line's length
+/// reserved, and the line is appended whole, so no clamp can drop it.
+/// A path too long for [`MAX_BLOCK_FIX_UTF16`] gets a path-less `Fix:` line.
 ///
 /// **This emitter clamps its own message**, unlike every other one, because it
 /// is the only one with a real recovery command to name in the marker line and
@@ -113,19 +116,27 @@ fn nudge_message(path: &str, lint_output: &str) -> String {
 
     // markdownlint prints one line per violation with no cap of its own, so
     // a 2,000-line document can push this nudge past Claude Code's hook
-    // limit on its own. The shared clamp keeps the head (the first
-    // findings) and the tail (the Fix line).
-    let message = format!(
-        "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\
-         Fix: markdownlint --fix {quoted_path}"
-    );
+    // limit on its own. Only the header and findings are clamped; the Fix
+    // line is appended whole afterwards, so a long path can never push it
+    // out of the kept tail while the hint still points at it.
+    let fix_line = format!("Fix: markdownlint --fix {quoted_path}");
+    let fix_line = if utf16_len(&fix_line) <= MAX_BLOCK_FIX_UTF16 {
+        fix_line
+    } else {
+        "Fix: run `markdownlint --fix` on the file just written (path too long to print)."
+            .to_string()
+    };
     let full_hint = format!("Run `markdownlint {quoted_path}` for the full list.");
     let hint = if utf16_len(&full_hint) <= MAX_RECOVERY_HINT_UTF16 {
         full_hint
     } else {
-        "Run `markdownlint` on the Fix line's path for the full list.".to_string()
+        "Run `markdownlint` on the file just written for the full list.".to_string()
     };
-    clamp_hook_output(&message, HOOK_OUTPUT_BUDGET_UTF16, Some(&hint)).into_owned()
+    let body = format!("⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}");
+    // The +1 is the newline that joins the body to the Fix line.
+    let body_budget = HOOK_OUTPUT_BUDGET_UTF16 - utf16_len(&fix_line) - 1;
+    let body = clamp_hook_output(&body, body_budget, Some(&hint));
+    format!("{body}\n{fix_line}")
 }
 
 #[cfg(test)]
@@ -309,12 +320,59 @@ mod tests {
             .collect();
         let out = nudge_message(&long, &lint_output);
         assert!(
-            out.contains("Run `markdownlint` on the Fix line's path for the full list."),
+            out.contains("Run `markdownlint` on the file just written for the full list."),
             "{out}"
         );
         assert_eq!(
             shell_arg_after(&out, "Fix: markdownlint --fix "),
             format!("{long}|")
+        );
+    }
+
+    #[test]
+    fn a_path_longer_than_the_clamp_tail_still_keeps_the_fix_line() {
+        // A ~1,100-character path makes a Fix line longer than the tail the
+        // clamp keeps. Clamping the whole message used to drop it while the
+        // hint still pointed at it (review on #1016).
+        let lint_output: String = (0..3_000)
+            .map(|i| format!("{i}: MD013/line-length Line length [Expected 80]\n"))
+            .collect();
+        for n in [1_100, 2_000] {
+            let long = format!("/p/{}/doc.md", "d".repeat(n));
+            let out = nudge_message(&long, &lint_output);
+            assert!(
+                cadence_hooks_core::display::utf16_len(&out) <= HOOK_OUTPUT_BUDGET_UTF16,
+                "over budget at n={n}"
+            );
+            assert_eq!(
+                shell_arg_after(&out, "Fix: markdownlint --fix "),
+                format!("{long}|"),
+                "n={n}"
+            );
+            assert!(
+                out.ends_with(&format!("'{long}'")),
+                "Fix line is last: n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_fix_cap_gets_a_pathless_fix_line() {
+        let long = format!("/p/{}/doc.md", "d".repeat(MAX_BLOCK_FIX_UTF16));
+        let lint_output: String = (0..3_000)
+            .map(|i| format!("{i}: MD013/line-length Line length [Expected 80]\n"))
+            .collect();
+        let out = nudge_message(&long, &lint_output);
+        assert!(
+            cadence_hooks_core::display::utf16_len(&out) <= HOOK_OUTPUT_BUDGET_UTF16,
+            "clamped"
+        );
+        assert!(
+            out.ends_with(
+                "Fix: run `markdownlint --fix` on the file just written (path too long to print)."
+            ),
+            "{}",
+            &out[out.len().saturating_sub(200)..]
         );
     }
 
