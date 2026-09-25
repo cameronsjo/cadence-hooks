@@ -103,7 +103,10 @@ fn block_message(found: &str) -> String {
          (`sops -d <file> | bash scripts/secret-keys.sh`); to USE a secret, hand it to \
          the consumer on stdin (`sops -d <file> | curl --config -`); to change a secret, \
          edit in place (`sops <file>`), which never decrypts to stdout.\n   \
-         Escape: CADENCE_ALLOW_SOPS_DECRYPT=1 allows it and records a bypass row."
+         Escape: CADENCE_ALLOW_SOPS_DECRYPT=1 in the repo's .claude/settings.json \"env\" \
+         block allows it and records a bypass row. The hook reads Claude Code's environment, \
+         not the command's, so an inline `CADENCE_ALLOW_SOPS_DECRYPT=1 sops …` prefix does \
+         nothing; the setting takes effect next session."
     )
 }
 
@@ -289,6 +292,16 @@ impl Check for SopsDecryptGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_hint_says_where_the_override_is_read() {
+        // #975: the override is read from the hook's environment, so the
+        // message must not imply an inline `VAR=1 cmd` prefix works.
+        let msg = block_message("sops -d x | cat");
+        assert!(msg.contains(".claude/settings.json"), "{msg}");
+        assert!(msg.contains("next session"), "{msg}");
+        assert!(msg.contains("inline"), "{msg}");
+    }
     use crate::with_env;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_bash;
