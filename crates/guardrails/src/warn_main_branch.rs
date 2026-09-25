@@ -99,6 +99,9 @@ fn branch_and_root(dir: &Path) -> Option<(String, String)> {
 ///   finds the bare repository first);
 /// - the work tree is owned by another user (git may refuse it as dubious
 ///   ownership, depending on `safe.directory`);
+/// - the repository config moves or removes the work tree (`core.worktree`,
+///   `core.bare = true`) or may do so from elsewhere (per-worktree config via
+///   `extensions.worktreeConfig`, or an `include`);
 /// - the platform is Windows, where `std::fs::canonicalize` returns a
 ///   `\\?\C:\…` path and git prints `C:/…`. The root keys the session marker
 ///   and the `dismiss-main-branch-warn` snooze (written from git's form), so a
@@ -139,13 +142,62 @@ fn read_from_disk(dir: &Path) -> DiskRead {
         .ancestors()
         .take_while(|a| *a != state.repo_root.as_path())
         .any(looks_like_bare_repo);
-    if bare_in_between || owned_by_someone_else(&state.repo_root) {
+    if bare_in_between
+        || owned_by_someone_else(&state.repo_root)
+        || config_moves_work_tree(&state.git_common_dir)
+    {
         return DiskRead::Uncertain;
     }
     DiskRead::Certain(Some((
         branch,
         state.repo_root.to_string_lossy().into_owned(),
     )))
+}
+
+/// Whether the repository's config could make git's work tree differ from
+/// the `.git` parent the disk walk found: `core.worktree` set, `core.bare`
+/// true, per-worktree config enabled, or any include (whose target this does
+/// not follow). Deliberately coarse; a false positive only costs a git call.
+/// An unreadable config (other than a missing one) is uncertain too.
+fn config_moves_work_tree(common_dir: &Path) -> bool {
+    let text = match std::fs::read_to_string(common_dir.join("config")) {
+        Ok(text) => text,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    let truthy = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1");
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            // `[core]`, `[include]`, `[includeIf "gitdir:..."]`: the section
+            // name is the first word, compared case-insensitively.
+            section = header
+                .trim_end_matches(']')
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if section == "include" || section == "includeif" {
+                return true;
+            }
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim()),
+            // A bare key is boolean true in git config.
+            None => (line.to_ascii_lowercase(), "true"),
+        };
+        match (section.as_str(), key.as_str()) {
+            ("core", "worktree") => return true,
+            ("core", "bare") if truthy(value) => return true,
+            ("extensions", "worktreeconfig") if truthy(value) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The shape git's discovery accepts as a bare repository.
@@ -743,17 +795,7 @@ mod tests {
     /// tempdir plus the git-resolved (canonical) repo root.
     fn init_repo_on_main() -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(tmp.path())
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
+        let git = |args: &[&str]| git_in(tmp.path(), args);
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
@@ -874,12 +916,7 @@ mod tests {
     fn feature_branch_edit_carries_no_bypass() {
         // Off a default branch there's nothing to bypass — bare allow.
         let (tmp, _root) = init_repo_on_main();
-        Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(["checkout", "-q", "-b", "feat/x"])
-            .output()
-            .unwrap();
+        git_in(tmp.path(), &["checkout", "-q", "-b", "feat/x"]);
         let input = edit_input_in(tmp.path(), "warn-bypass-feat");
         let r = WarnMainBranch.run(&input);
         assert_eq!(r.outcome, Outcome::Allow);
@@ -971,8 +1008,23 @@ mod tests {
         out.unwrap_or_else(|e| std::panic::resume_unwind(e))
     }
 
+    /// Run git in a fixture repo. Repository-location variables are removed:
+    /// set (as they are when `cargo test` runs from a git hook), they override
+    /// `-C` and would point these commands at the developer's real repo.
     fn git_in(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+        let mut cmd = Command::new("git");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            cmd.env_remove(var);
+        }
+        let ok = cmd
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -1116,6 +1168,43 @@ mod tests {
         check("HEAD naming a tag");
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         check("back on main");
+        let elsewhere = tempfile::tempdir().unwrap();
+        git_in(
+            repo,
+            &[
+                "config",
+                "core.worktree",
+                &elsewhere.path().to_string_lossy(),
+            ],
+        );
+        check("core.worktree pointing elsewhere");
+        git_in(repo, &["config", "--unset", "core.worktree"]);
+        git_in(repo, &["config", "core.bare", "true"]);
+        check("core.bare = true");
+        git_in(repo, &["config", "core.bare", "false"]);
+        check("core.bare = false again");
+    }
+
+    #[test]
+    fn config_moves_work_tree_reads_the_keys_that_matter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with = |config: &str| {
+            std::fs::write(tmp.path().join("config"), config).unwrap();
+            config_moves_work_tree(tmp.path())
+        };
+        assert!(!with("[core]\n\tbare = false\n\tfilemode = true\n"));
+        assert!(with("[core]\n\tworktree = /elsewhere\n"));
+        assert!(with("[Core]\n\tBare = TRUE\n"));
+        assert!(with("[core]\n\tbare\n"), "a bare key is boolean true");
+        assert!(with("[extensions]\n\tworktreeConfig = true\n"));
+        assert!(with("[include]\n\tpath = other.cfg\n"));
+        assert!(with("[includeIf \"gitdir:~/x/\"]\n\tpath = y\n"));
+        assert!(!with("[remote \"origin\"]\n\tworktree = not-core\n"));
+        std::fs::remove_file(tmp.path().join("config")).unwrap();
+        assert!(
+            !config_moves_work_tree(tmp.path()),
+            "no config file moves nothing"
+        );
     }
 
     #[test]

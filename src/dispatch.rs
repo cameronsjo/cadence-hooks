@@ -77,29 +77,34 @@ fn test_panic_trigger() {
 #[cfg(not(debug_assertions))]
 fn test_panic_trigger() {}
 
-/// Sets `main::PANIC_GUARDED` for as long as it is alive, clearing it on drop.
+/// Sets `main::PANIC_GUARDED` for as long as it is alive, restoring the previous
+/// value on drop.
 ///
-/// The flag must be cleared on **both** exits from a guarded region — the
+/// The flag must be restored on **both** exits from a guarded region — the
 /// ordinary return and the unwind — or a later panic outside the region would
 /// find a guard that is no longer there and be swallowed instead of taking the
 /// fail-open exit. A manual set/clear pair holds that invariant only by virtue
 /// of how the two call sites happen to be written today; an `?`, an early
 /// return, or a new branch slipped between them would break it silently, with
 /// no test to catch it. `Drop` cannot be skipped, and — the point here — it
-/// runs *during* the unwind, so the guarded and panicking paths clear the flag
+/// runs *during* the unwind, so the guarded and panicking paths restore the flag
 /// through the same line of code.
-struct PanicGuard;
+///
+/// Drop restores the value it found rather than clearing it, so guards nest:
+/// a `group` member thread guards its whole body, and the per-check guard in
+/// [`decide_member`] dropping must not unguard the audit tail that follows.
+struct PanicGuard(bool);
 
 impl PanicGuard {
     fn arm() -> Self {
-        crate::PANIC_GUARDED.with(|guarded| guarded.set(true));
-        PanicGuard
+        PanicGuard(crate::PANIC_GUARDED.with(|guarded| guarded.replace(true)))
     }
 }
 
 impl Drop for PanicGuard {
     fn drop(&mut self) {
-        crate::PANIC_GUARDED.with(|guarded| guarded.set(false));
+        let previous = self.0;
+        crate::PANIC_GUARDED.with(|guarded| guarded.set(previous));
     }
 }
 
@@ -507,10 +512,18 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
             .spawn(move || {
                 let namespace = crate::registry::namespace_of(hook).unwrap_or("unknown");
                 crate::CURRENT_HOOK.with(|current| current.set(Some((namespace, hook))));
-                cadence_hooks_core::deadline::arm();
-                let (input, normalized_inputs) = &*shared;
-                let verdict =
-                    decide_member(&member.plan, hook, input, normalized_inputs, Instant::now());
+                // Guard the whole member, audit tail included. `decide_member`
+                // guards only the check itself; an unguarded panic after it
+                // (a denial or telemetry write) would reach the global panic
+                // hook's exit and end the process, dropping every other
+                // member's block. Caught here, it costs only this member.
+                let _guard = PanicGuard::arm();
+                let verdict = catch_unwind(AssertUnwindSafe(|| {
+                    cadence_hooks_core::deadline::arm();
+                    let (input, normalized_inputs) = &*shared;
+                    decide_member(&member.plan, hook, input, normalized_inputs, Instant::now())
+                }))
+                .unwrap_or(MemberVerdict::Panicked);
                 let _ = tx.send((index, verdict));
             });
         if spawned.is_err() {
@@ -933,6 +946,27 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_guards_nest_without_unguarding_the_outer_region() {
+        let flag = || crate::PANIC_GUARDED.with(std::cell::Cell::get);
+        assert!(!flag());
+        {
+            let _outer = PanicGuard::arm();
+            {
+                let _inner = PanicGuard::arm();
+                assert!(flag());
+            }
+            assert!(
+                flag(),
+                "dropping the inner guard must leave the outer one armed"
+            );
+        }
+        assert!(
+            !flag(),
+            "dropping the outer guard restores the unguarded state"
+        );
+    }
 
     // --- group output merge ---
 

@@ -910,6 +910,14 @@ fn extract_dispatches(command: &str) -> Vec<String> {
         .trim_start_matches(['\'', '"'])
         .split_whitespace()
         .skip(1)
+        // The shell consumes an operator or redirection and everything after
+        // it (`2>/dev/null || true`), so the binary never sees those tokens.
+        // Same boundary as `group_members` in src/doctor.rs.
+        .take_while(|t| {
+            !(t.starts_with(['|', '&', ';', '>', '<'])
+                || t.trim_start_matches(|c: char| c.is_ascii_digit())
+                    .starts_with(['>', '<']))
+        })
         .filter(|t| !t.starts_with('-'))
         .map(|member| match member.split_once('/') {
             Some((ns, sub)) => format!("{ns} {sub}"),
@@ -930,6 +938,11 @@ fn extract_dispatches_expands_group_members() {
     assert_eq!(
         extract_dispatches("x/run-cadence-hooks.sh group bogus"),
         vec!["group bogus"]
+    );
+    assert_eq!(
+        extract_dispatches("x/run-cadence-hooks.sh group cadence/terminology 2>/dev/null || true"),
+        vec!["cadence terminology"],
+        "shell syntax after the members is not a member"
     );
 }
 
