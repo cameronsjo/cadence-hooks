@@ -277,7 +277,8 @@ pub fn handle_merge(
 
     // Act only on a PR GitHub reports as merged (#1004). This hook runs after
     // every `gh pr merge`, including one that failed (a draft, a red required
-    // check, a ruleset refusal) or only queued auto-merge. Closing the PR's
+    // check, a ruleset refusal), only queued auto-merge, or entered a merge
+    // queue. Closing the PR's
     // issues then marks unfinished work done, with nothing to announce it.
     // A missing or unreadable field counts as not merged.
     let merged = value.get("state").and_then(serde_json::Value::as_str) == Some("MERGED")

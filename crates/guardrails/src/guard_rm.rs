@@ -197,7 +197,40 @@ const EXEC_RUNNERS: &[&str] = &[
     "chroot",
     "nsenter",
     "unshare",
+    "su",
+    "runuser",
+    "firejail",
+    "bwrap",
+    "watch",
+    "script",
+    "sg",
+    "setpriv",
+    "busybox",
+    "gtimeout",
+    "parallel",
+    "proot",
+    "cpulimit",
+    "chpst",
+    "torsocks",
+    "strace",
+    "ltrace",
+    "valgrind",
 ];
+
+/// A runner-led segment names a deletion: in its own words, or inside a
+/// quoted script one of its words carries. `su -c 'rm -rf ~'`, `sudo -s '…'`,
+/// `script -c '…'` and `flock <file> -c '…'` pass the script as one token,
+/// whose basename is its last path segment, so [`mentions_deletion`] alone
+/// never sees the verb inside it. Each multi-word token is re-tokenized and
+/// scanned one wrapper level down, on the shared depth budget.
+fn runner_mentions_deletion(tokens: &[String]) -> bool {
+    mentions_deletion(tokens, 0)
+        || tokens
+            .iter()
+            .skip(1)
+            .filter(|t| t.contains(char::is_whitespace))
+            .any(|t| mentions_deletion(&tokenize(t), 1))
+}
 
 /// These tokens name a deletion the shell will actually perform, in any of the
 /// spellings the flagged-prefix gate has to arm on.
@@ -583,12 +616,12 @@ fn collect_targets(
         // `TRANSPARENT`, so `sudo rm -rf ~` led with `sudo`, matched no verb,
         // and allowed in silence. Their flag grammars are not parsed here
         // either; the gate asks.
-        if argv.first().is_some_and(|first| {
-            let word = command_word(first);
-            TRANSPARENT.contains(&word.as_ref())
-                || word == "eval"
-                || EXEC_RUNNERS.contains(&word.as_ref())
-        }) && mentions_deletion(&tokens, 0)
+        let head = argv.first().map(|first| command_word(first));
+        let head = head.as_deref();
+        let prefix_led = head.is_some_and(|w| TRANSPARENT.contains(&w) || w == "eval");
+        let runner_led = head.is_some_and(|w| EXEC_RUNNERS.contains(&w));
+        if (prefix_led && mentions_deletion(&tokens, 0))
+            || (runner_led && runner_mentions_deletion(argv))
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -3878,6 +3911,20 @@ mod tests {
             "sudo xargs rm -rf",
             "sudo unlink ~/Documents/a",
             "timeout 5 sudo rm -rf ~/Documents",
+            // The script arrives as one quoted token (security review).
+            "su -c 'rm -rf ~/Documents'",
+            "su me -c 'rm -rf ~/Documents'",
+            "sudo -s 'rm -rf ~/Documents'",
+            "sudo -i 'rm -rf ~/Documents'",
+            "sudo -u me -s -- 'rm -rf ~'",
+            "runuser -u me -c 'rm -rf ~/Documents'",
+            "sg wheel -c 'rm -rf ~/Documents'",
+            "script -qc 'rm -rf ~/Documents' /dev/null",
+            "flock /tmp/l -c 'rm -rf ~/Documents'",
+            "busybox rm -rf ~/Documents",
+            "watch rm -rf ~/Documents",
+            "parallel rm -rf ::: ~/Documents",
+            "setpriv --reuid=me rm -rf ~/Documents",
         ] {
             assert_eq!(judge(command, &home()), Outcome::Ask, "{command}");
         }
@@ -3892,6 +3939,8 @@ mod tests {
             "sudo apt-get install jq",
             "timeout 5 make test",
             "sudo git status",
+            "su -c 'systemctl restart nginx'",
+            "watch 'ls -la'",
         ] {
             assert_eq!(judge(command, &home()), Outcome::Allow, "{command}");
         }

@@ -1330,10 +1330,14 @@ fn shape_remediation(distinct_days: u64) -> String {
     }
 }
 
-/// Concatenate every file a hook command can be wired from: each install's
-/// `hooks/hooks.json`, the user `settings.json`, and the project's
-/// `.claude/settings.json` and `settings.local.json` under `cwd`. Unreadable
-/// files are skipped; the result is only ever searched for substrings.
+/// Concatenate the files a hook command is usually wired from: each install's
+/// `hooks/hooks.json`, the user `settings.json`, and the current project's
+/// `.claude/settings.json` and `settings.local.json`. Unreadable files are
+/// skipped; the result is only ever searched for substrings.
+///
+/// Not every source: another project's settings and managed policy settings
+/// are not read, so a pair wired only there is demoted to a note. The note
+/// still names it, so it is not lost, only no longer called a skew.
 fn collect_wiring(installs: &[(String, PathBuf)], config_dir: &Path, cwd: Option<&Path>) -> String {
     let mut paths: Vec<PathBuf> = installs
         .iter()
@@ -1358,8 +1362,10 @@ fn collect_wiring(installs: &[(String, PathBuf)], config_dir: &Path, cwd: Option
 ///
 /// A substring test on purpose. A false match keeps a pair in the skew
 /// warning, which is the pre-#917 behavior; only a pair no wiring mentions at
-/// all is demoted. A wired plugin invocation this binary lacks is also caught
-/// independently by the hooks.json scan's own cross-reference.
+/// all is demoted, and the note still names it. A wired plugin invocation this
+/// binary lacks is also caught independently by the hooks.json scan's own
+/// cross-reference; one wired only in a settings file [`collect_wiring`] does
+/// not read has no such second check.
 fn split_by_wiring(pairs: &[String], wiring: Option<&str>) -> (Vec<String>, Vec<String>) {
     let Some(wiring) = wiring else {
         return (pairs.to_vec(), Vec::new());
@@ -1399,6 +1405,7 @@ fn version_mismatch_finding(
     count: u64,
     current_version: &str,
     days: u64,
+    split_off_adhoc: bool,
 ) -> Finding {
     // Name the invocations, not just the count (#183). The count alone
     // leaves the operator auditing every installed plugin by hand; the
@@ -1408,6 +1415,12 @@ fn version_mismatch_finding(
         String::new()
     } else {
         format!(" — this binary does not recognize: {}", missing.join(", "))
+    };
+    // The count covers every row, the hand-typed ones in the note included.
+    let adhoc_clause = if split_off_adhoc {
+        ", counting the hand-typed invocations noted separately"
+    } else {
+        ""
     };
     let remediation = if missing.is_empty() {
         "compare installed plugin hooks.json subcommand references \
@@ -1476,8 +1489,8 @@ fn version_mismatch_finding(
         snippet: format!("version_mismatch: {}", count),
         diagnosis: format!(
             "{} version_mismatch failopen(s) on this binary's own version \
-             ({current_version}) in the last {days} days — a hooks.json/binary \
-             skew that hasn't resolved{missing_clause}",
+             ({current_version}) in the last {days} days{adhoc_clause} — a \
+             hooks.json/binary skew that hasn't resolved{missing_clause}",
             count
         ),
         remediation,
@@ -1601,7 +1614,8 @@ fn failopen_findings_with_wiring(
         }
         // Every named pair is ad hoc, and the list is not at its cap (so no
         // unnamed pair can hide behind it): nothing is skewed. A capped list
-        // stays a warning — the fifth pair could be the wired one.
+        // stays a warning — the fifth pair could be the wired one. Exactly
+        // four pairs looks the same as a capped list, so it warns too.
         let all_adhoc = !named.is_empty()
             && wired.is_empty()
             && named.len() < cadence_hooks_metrics::log_failopen::MAX_SUBCOMMANDS;
@@ -1612,6 +1626,7 @@ fn failopen_findings_with_wiring(
                 counts.version_mismatch,
                 current_version,
                 days,
+                !adhoc.is_empty(),
             ));
         }
     }
@@ -2830,10 +2845,16 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
                     ));
+                    // Project settings live at the repo root, not the cwd:
+                    // `doctor` run from a subdirectory still reads them.
+                    let project_root = std::env::current_dir().ok().map(|cwd| {
+                        cadence_hooks_core::paths::find_git_root(&cwd.to_string_lossy())
+                            .unwrap_or(cwd)
+                    });
                     wiring = Some(collect_wiring(
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
-                        std::env::current_dir().ok().as_deref(),
+                        project_root.as_deref(),
                     ));
                     (findings, scanned)
                 }
@@ -3023,10 +3044,10 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 
     println!(
         "cadence-hooks doctor: {} finding(s) in {scanned}:\n",
-        findings.len()
+        errors.len() + warnings.len()
     );
 
-    // Errors first, then warnings.
+    // Errors first, then warnings, then notes.
     for finding in errors.iter().chain(warnings.iter()).chain(notes.iter()) {
         finding.print();
         println!();
@@ -4123,6 +4144,13 @@ mod tests {
             !warning.remediation.contains("cadence nope"),
             "{}",
             warning.remediation
+        );
+        assert!(
+            warning
+                .diagnosis
+                .contains("hand-typed invocations noted separately"),
+            "the count includes the noted rows, so the warning says so: {}",
+            warning.diagnosis
         );
         let note = findings
             .iter()
