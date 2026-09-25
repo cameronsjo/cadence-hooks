@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::registry;
 use cadence_hooks_core::capability::on_path;
+use cadence_hooks_core::display::shell_single_quote;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
 use cadence_hooks_session::identity as session_identity;
@@ -1004,28 +1005,6 @@ fn telemetry_finding(
                       (`cadence-hooks list` shows what should be firing)"
             .to_string(),
     })
-}
-
-/// Wrap `s` in single quotes for safe inclusion in a rendered shell command,
-/// escaping any embedded single quote via the POSIX `'\''` idiom (close, emit
-/// an escaped quote, reopen).
-///
-/// **Single quotes, not double.** Inside double quotes a shell still expands
-/// `$`, backticks and `\`, and a `"` ends the string outright — so a
-/// double-quoted path is safe against *spaces* and nothing else. Every
-/// interpolated value here is env-derived (`CADENCE_METRICS_DIR`,
-/// `CLAUDE_CONFIG_DIR`) and Claude Code injects env vars from a project's
-/// checked-in `.claude/settings.json`, so a cloned repository can choose it.
-/// The operator then runs `doctor` and pastes what it prints — which is exactly
-/// the affordance these remediations added. Inside single quotes nothing is
-/// special but `'` itself, which this escapes; a literal newline stays inside
-/// the quotes as data rather than becoming a command separator.
-///
-/// Use this for **every** value interpolated into a command a human is invited
-/// to run. Plain diagnostic prose that merely names a path does not need it —
-/// nobody executes a sentence.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one

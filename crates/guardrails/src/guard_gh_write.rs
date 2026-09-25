@@ -2313,22 +2313,30 @@ mod tests {
     // is_allowed
     #[test]
     fn is_allowed_by_owner() {
-        assert!(is_allowed(
-            "github.com",
-            "cameronsjo/repo",
-            &owners(&["cameronsjo"]),
-            &[],
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            assert!(is_allowed(
+                "github.com",
+                "cameronsjo/repo",
+                &owners(&["cameronsjo"]),
+                &[],
+            ));
+        });
     }
 
     #[test]
     fn is_allowed_by_repo() {
-        assert!(is_allowed(
-            "github.com",
-            "other/repo",
-            &[],
-            &owners(&["other/repo"]),
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            assert!(is_allowed(
+                "github.com",
+                "other/repo",
+                &[],
+                &owners(&["other/repo"]),
+            ));
+        });
     }
 
     #[test]
@@ -2365,16 +2373,20 @@ mod tests {
 
     #[test]
     fn fork_both_owned_allowed() {
-        let o = owners(&["cameronsjo", "partner"]);
-        assert!(fork_allowed(
-            "github.com",
-            "cameronsjo/tool",
-            "github.com",
-            "partner/tool",
-            &o,
-            &[],
-            &[],
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameronsjo", "partner"]);
+            assert!(fork_allowed(
+                "github.com",
+                "cameronsjo/tool",
+                "github.com",
+                "partner/tool",
+                &o,
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
@@ -2423,31 +2435,39 @@ mod tests {
 
     #[test]
     fn fork_upstream_host_qualified_allowed() {
-        let o = owners(&["cameron", "gitea.internal/cameron"]);
-        assert!(fork_allowed(
-            "github.com",
-            "cameron/fork",
-            "gitea.internal",
-            "cameron/orig",
-            &o,
-            &[],
-            &[],
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameron", "gitea.internal/cameron"]);
+            assert!(fork_allowed(
+                "github.com",
+                "cameron/fork",
+                "gitea.internal",
+                "cameron/orig",
+                &o,
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
     fn fork_extra_hosts_allowed() {
-        let o = owners(&["cameron"]);
-        let extras = vec!["git.sjo.lol".to_string()];
-        assert!(fork_allowed(
-            "github.com",
-            "cameron/fork",
-            "git.sjo.lol",
-            "cameron/orig",
-            &o,
-            &[],
-            &extras,
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameron"]);
+            let extras = vec!["git.sjo.lol".to_string()];
+            assert!(fork_allowed(
+                "github.com",
+                "cameron/fork",
+                "git.sjo.lol",
+                "cameron/orig",
+                &o,
+                &[],
+                &extras,
+            ));
+        });
     }
 
     #[test]
@@ -2652,23 +2672,31 @@ mod tests {
 
     #[test]
     fn is_allowed_exact_repo_match() {
-        assert!(is_allowed(
-            "github.com",
-            "external/specific-repo",
-            &[],
-            &owners(&["external/specific-repo"]),
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            assert!(is_allowed(
+                "github.com",
+                "external/specific-repo",
+                &[],
+                &owners(&["external/specific-repo"]),
+            ));
+        });
     }
 
     #[test]
     fn is_allowed_owner_and_repo() {
-        // Both match — should still return true
-        assert!(is_allowed(
-            "github.com",
-            "cameronsjo/repo",
-            &owners(&["cameronsjo"]),
-            &owners(&["cameronsjo/repo"]),
-        ));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            // Both match — should still return true
+            assert!(is_allowed(
+                "github.com",
+                "cameronsjo/repo",
+                &owners(&["cameronsjo"]),
+                &owners(&["cameronsjo/repo"]),
+            ));
+        });
     }
 
     #[test]
@@ -2904,55 +2932,67 @@ mod tests {
 
     #[test]
     fn relaxed_deterministic_owned_loop_allows() {
-        let o = owners(&["cameronsjo"]);
-        let decision = judge_loop_write(
-            false,
-            Some(false),
-            &resolved("cameronsjo/repo"),
-            &o,
-            &[],
-            &[],
-        );
-        assert_eq!(decision, LoopWriteDecision::Allow);
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameronsjo"]);
+            let decision = judge_loop_write(
+                false,
+                Some(false),
+                &resolved("cameronsjo/repo"),
+                &o,
+                &[],
+                &[],
+            );
+            assert_eq!(decision, LoopWriteDecision::Allow);
+        });
     }
 
     #[test]
     fn strict_toggle_blocks_with_suggestion() {
-        let o = owners(&["cameronsjo"]);
-        let decision = judge_loop_write(
-            true,
-            Some(false),
-            &resolved("cameronsjo/repo"),
-            &o,
-            &[],
-            &[],
-        );
-        assert_eq!(
-            decision,
-            LoopWriteDecision::Block {
-                suggestion: Some("cameronsjo/repo".to_string())
-            }
-        );
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameronsjo"]);
+            let decision = judge_loop_write(
+                true,
+                Some(false),
+                &resolved("cameronsjo/repo"),
+                &o,
+                &[],
+                &[],
+            );
+            assert_eq!(
+                decision,
+                LoopWriteDecision::Block {
+                    suggestion: Some("cameronsjo/repo".to_string())
+                }
+            );
+        });
     }
 
     #[test]
     fn relaxed_cd_in_body_blocks_with_suggestion() {
-        // Loop body changes cwd — non-deterministic, block even though cwd is owned.
-        let o = owners(&["cameronsjo"]);
-        let decision = judge_loop_write(
-            false,
-            Some(true),
-            &resolved("cameronsjo/repo"),
-            &o,
-            &[],
-            &[],
-        );
-        assert_eq!(
-            decision,
-            LoopWriteDecision::Block {
-                suggestion: Some("cameronsjo/repo".to_string())
-            }
-        );
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            // Loop body changes cwd — non-deterministic, block even though cwd is owned.
+            let o = owners(&["cameronsjo"]);
+            let decision = judge_loop_write(
+                false,
+                Some(true),
+                &resolved("cameronsjo/repo"),
+                &o,
+                &[],
+                &[],
+            );
+            assert_eq!(
+                decision,
+                LoopWriteDecision::Block {
+                    suggestion: Some("cameronsjo/repo".to_string())
+                }
+            );
+        });
     }
 
     #[test]
@@ -3060,19 +3100,27 @@ mod tests {
 
     #[test]
     fn disallowed_message_includes_host_hint_for_self_hosted() {
-        let o = owners(&["cameron"]);
-        let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &[]);
-        assert!(msg.contains("CADENCE_EXTRA_HOSTS=git.sjo.lol"));
-        assert!(msg.contains("git.sjo.lol/stranger/repo"));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameron"]);
+            let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &[]);
+            assert!(msg.contains("CADENCE_EXTRA_HOSTS=git.sjo.lol"));
+            assert!(msg.contains("git.sjo.lol/stranger/repo"));
+        });
     }
 
     #[test]
     fn disallowed_message_no_hint_for_default_host() {
-        let o = owners(&["cameronsjo"]);
-        let msg = disallowed_message("github.com", "stranger/repo", &o, &[], &[]);
-        assert!(!msg.contains("Host scope"));
-        assert!(msg.contains("stranger/repo"));
-        assert!(msg.contains("cameronsjo"));
+        // GH_HOST moves the default host; read it under the env lock so a
+        // concurrent GH_HOST mutator cannot change it mid-test (#938).
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameronsjo"]);
+            let msg = disallowed_message("github.com", "stranger/repo", &o, &[], &[]);
+            assert!(!msg.contains("Host scope"));
+            assert!(msg.contains("stranger/repo"));
+            assert!(msg.contains("cameronsjo"));
+        });
     }
 
     #[test]
@@ -3469,11 +3517,14 @@ mod tests {
         });
     }
 
-    fn owners_env_212() -> [(&'static str, Option<&'static str>); 3] {
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 4] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // GH_HOST moves the default host a bare allowlist entry matches,
+            // so pin it under the same lock as the rest (#938).
+            ("GH_HOST", None),
         ]
     }
 
@@ -3543,11 +3594,14 @@ mod tests {
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-    fn owners_env() -> [(&'static str, Option<&'static str>); 3] {
+    fn owners_env() -> [(&'static str, Option<&'static str>); 4] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // GH_HOST moves the default host a bare allowlist entry matches,
+            // so pin it under the same lock as the rest (#938).
+            ("GH_HOST", None),
         ]
     }
 
