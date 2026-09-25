@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-rm` asks on a delete behind `sudo`, `doas`, `timeout`, and other exec runners.** `sudo rm -rf ~` and `sudo -u me rm -rf ~/Documents` were a silent allow. The segment led with the runner, which is not a transparent prefix, so no delete verb was ever examined. A segment led by one of `sudo`, `doas`, `run0`, `pkexec`, `timeout`, `stdbuf`, `ionice`, `chrt`, `taskset`, `setsid`, `unbuffer`, `caffeinate`, `systemd-run`, `flock`, `chroot`, `nsenter` or `unshare` that mentions a deletion now asks. The runners' flag grammars are not parsed, so the guard never guesses a target behind one. A runner in front of anything else stays silent. (cameronsjo/cadence-hooks#887)
+- **`verify-pr-autoclose` closes a PR's issues only after GitHub reports the PR merged.** It ran after every `gh pr merge`, including one that failed on a draft PR, a red required check, or a ruleset, and one that only queued auto-merge. It then closed the issues the PR claims to fix, though the work had not landed. The merge-path `gh pr view` now also reads `state` and `mergedAt`, and the hook does nothing unless the state is `MERGED` and `mergedAt` is set. (cameronsjo/cadence-hooks#1004)
+- **`doctor` no longer reports a hand-typed unknown subcommand as a hooks.json skew.** A session that guessed `cadence-hooks session list` left a `version_mismatch` row, and `doctor` folded it into the skew warning with a grep that could never match. `doctor` now checks each named invocation against the installed plugins' hooks.json and the user and project `settings.json`. Invocations none of them wire become a note (`unknown subcommand(s) invoked by hand`), which prints in a full run but never nags in `--quiet` and never changes the exit code. Wired invocations keep the warning, and the warning's grep names only them. When the pair list is at its four-entry cap, the warning stays, since an unnamed pair could be the wired one. Without an installed-plugins manifest, the old claim stands. (cameronsjo/cadence-hooks#917)
+
 ## [0.103.0] - 2026-09-25
 
 ### Added

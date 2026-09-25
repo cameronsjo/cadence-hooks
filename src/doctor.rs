@@ -32,6 +32,9 @@ enum Severity {
     Error,
     /// Version skew — subcommand reference unknown to this binary.
     Warning,
+    /// Context only: printed in verbose mode, never nags in `--quiet`, never
+    /// moves the exit code.
+    Note,
 }
 
 /// One detected issue in a hook command.
@@ -84,6 +87,7 @@ impl Finding {
         let level = match self.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
+            Severity::Note => "note",
         };
         let location_raw = match self.line {
             Some(n) => format!("{}:{n}", self.file.display()),
@@ -1326,11 +1330,180 @@ fn shape_remediation(distinct_days: u64) -> String {
     }
 }
 
+/// Concatenate every file a hook command can be wired from: each install's
+/// `hooks/hooks.json`, the user `settings.json`, and the project's
+/// `.claude/settings.json` and `settings.local.json` under `cwd`. Unreadable
+/// files are skipped; the result is only ever searched for substrings.
+fn collect_wiring(installs: &[(String, PathBuf)], config_dir: &Path, cwd: Option<&Path>) -> String {
+    let mut paths: Vec<PathBuf> = installs
+        .iter()
+        .map(|(_, dir)| dir.join("hooks/hooks.json"))
+        .collect();
+    paths.push(config_dir.join("settings.json"));
+    if let Some(cwd) = cwd {
+        paths.push(cwd.join(".claude/settings.json"));
+        paths.push(cwd.join(".claude/settings.local.json"));
+    }
+    paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split `version_mismatch` pairs into `(wired, ad_hoc)` by whether any
+/// collected wiring names them — `ns sub` as a standalone call, `ns/sub` as a
+/// `group` member. Without wiring every pair stays wired: doctor cannot tell,
+/// so it keeps the skew claim it made before #917.
+///
+/// A substring test on purpose. A false match keeps a pair in the skew
+/// warning, which is the pre-#917 behavior; only a pair no wiring mentions at
+/// all is demoted. A wired plugin invocation this binary lacks is also caught
+/// independently by the hooks.json scan's own cross-reference.
+fn split_by_wiring(pairs: &[String], wiring: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let Some(wiring) = wiring else {
+        return (pairs.to_vec(), Vec::new());
+    };
+    pairs.iter().cloned().partition(|pair| {
+        let grouped = pair.replacen(' ', "/", 1);
+        wiring.contains(pair.as_str()) || wiring.contains(grouped.as_str())
+    })
+}
+
+/// The note for unknown subcommands no hooks.json or settings.json wires: a
+/// caller typed them (#917). Nothing is stale, so it is not a skew warning.
+fn adhoc_invocation_finding(dir: &Path, adhoc: &[String]) -> Finding {
+    Finding {
+        severity: Severity::Note,
+        plugin: "cadence-metrics".to_string(),
+        file: dir.to_path_buf(),
+        line: None,
+        snippet: format!("version_mismatch (ad hoc): {}", adhoc.len()),
+        diagnosis: format!(
+            "unknown subcommand(s) invoked by hand, not wired in any installed \
+             hooks.json or settings.json: {}",
+            adhoc.join(", ")
+        ),
+        remediation: "nothing to fix in the wiring — these are guesses at a \
+                      subcommand name from an interactive caller. \
+                      `cadence-hooks list` shows the accepted set"
+            .to_string(),
+    }
+}
+
+/// The skew warning for `version_mismatch` rows on this binary's own version.
+/// `missing` holds the pairs to name; empty falls back to generic guidance.
+fn version_mismatch_finding(
+    dir: &Path,
+    missing: &[String],
+    count: u64,
+    current_version: &str,
+    days: u64,
+) -> Finding {
+    // Name the invocations, not just the count (#183). The count alone
+    // leaves the operator auditing every installed plugin by hand; the
+    // pairs turn it into one grep. Absent for rows written before the
+    // namespace/subcommand fields existed, so the clause simply drops.
+    let missing_clause = if missing.is_empty() {
+        String::new()
+    } else {
+        format!(" — this binary does not recognize: {}", missing.join(", "))
+    };
+    let remediation = if missing.is_empty() {
+        "compare installed plugin hooks.json subcommand references \
+         against 'cadence-hooks list' — this binary doesn't \
+         recognize something a plugin expects"
+            .to_string()
+    } else {
+        // EVERY pair, not just the first. The diagnosis names up to four,
+        // and an operator following a one-pair grep fixes one inert
+        // hooks.json and leaves the rest inert — the multi-pair case is
+        // precisely the skew #183 exists to resolve.
+        //
+        // `-F` with repeated `-e`: fixed strings, so a subcommand carrying
+        // a regex metacharacter cannot widen the search to everything, and
+        // no alternation needs escaping. The full `namespace subcommand`
+        // pair is the needle because that is how a hooks.json line spells
+        // the invocation.
+        let needles = missing
+            .iter()
+            .map(|pair| format!("-e {}", shell_single_quote(pair)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The RESOLVED cache dir, never a `~/.claude/...` literal.
+        // `plugins_dir` honors CLAUDE_CONFIG_DIR precisely because the
+        // config dir moves (the `claude-as` profile pattern), and a
+        // remediation that greps the wrong tree returns zero hits and reads
+        // as "no stale wiring" — a silent false negative inside the one
+        // command #183 exists to hand the operator.
+        //
+        // The two branches quote DIFFERENTLY, on purpose. A resolved path
+        // is data, so it is single-quoted. The fallback is a literal
+        // authored here whose whole job is to expand — single-quoting it
+        // would emit `'~/.claude/plugins/cache'`, and the shell does not
+        // expand `~` inside single quotes, so the paste would search a
+        // nonexistent relative directory and return zero hits: the same
+        // silent "reads as no stale wiring" false negative this branch
+        // exists to prevent, just wearing the other face. Double quotes
+        // let `$HOME` expand while still surviving a spaced home dir.
+        // The fallback is a BARE tilde, not `'~/…'` and not `"$HOME/…"`.
+        // Single quotes suppress tilde expansion, so the paste would search
+        // a nonexistent relative dir and read as "no stale wiring" — the
+        // same false negative this branch exists to prevent. `$HOME` is no
+        // better: this branch is reached only when `user_home()` fails,
+        // which is precisely when `$HOME` is likely unset in the operator's
+        // shell too, expanding to `/.claude/…`. A bare `~` falls back to the
+        // passwd entry when `$HOME` is missing, so it is the one form that
+        // still resolves here. Safe unquoted: a hardcoded literal with no
+        // spaces and no metacharacters.
+        let cache = match plugins_cache_dir() {
+            Some(dir) => shell_single_quote(&dir.display().to_string()),
+            None => "~/.claude/plugins/cache".to_string(),
+        };
+        format!(
+            "grep the installed plugins for the named invocation(s) — \
+             `grep -rlF {needles} {cache}` finds every hooks.json carrying \
+             a named invocation; either upgrade this binary or drop the \
+             stale wiring. `cadence-hooks list` shows what this build \
+             accepts"
+        )
+    };
+    Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-metrics".to_string(),
+        file: dir.to_path_buf(),
+        line: None,
+        snippet: format!("version_mismatch: {}", count),
+        diagnosis: format!(
+            "{} version_mismatch failopen(s) on this binary's own version \
+             ({current_version}) in the last {days} days — a hooks.json/binary \
+             skew that hasn't resolved{missing_clause}",
+            count
+        ),
+        remediation,
+    }
+}
+
+#[cfg(test)]
 fn failopen_findings(
     dir: &Path,
     window: Duration,
     now: SystemTime,
     current_version: &str,
+) -> Vec<Finding> {
+    failopen_findings_with_wiring(dir, window, now, current_version, None)
+}
+
+/// `wiring` is the raw text of every hooks.json and settings.json this
+/// machine's hooks can come from, or `None` when doctor could not collect it.
+/// It splits `version_mismatch` pairs into wired ones (a real skew) and ones no
+/// wiring names (a hand-typed guess at a subcommand name, #917).
+fn failopen_findings_with_wiring(
+    dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    current_version: &str,
+    wiring: Option<&str>,
 ) -> Vec<Finding> {
     // One read of failopen.jsonl yields the per-reason counts plus the recency
     // context for every reason whose finding shows one.
@@ -1418,92 +1591,29 @@ fn failopen_findings(
     }
 
     if counts.version_mismatch >= 1 {
-        // Name the invocations, not just the count (#183). The count alone
-        // leaves the operator auditing every installed plugin by hand; the
-        // pairs turn it into one grep. Absent for rows written before the
-        // namespace/subcommand fields existed, so the clause simply drops.
-        let missing = recency
+        let named = recency
             .get("version_mismatch")
             .map(|r| r.subcommands.as_slice())
             .unwrap_or_default();
-        let missing_clause = if missing.is_empty() {
-            String::new()
-        } else {
-            format!(" — this binary does not recognize: {}", missing.join(", "))
-        };
-        let remediation = if missing.is_empty() {
-            "compare installed plugin hooks.json subcommand references \
-             against 'cadence-hooks list' — this binary doesn't \
-             recognize something a plugin expects"
-                .to_string()
-        } else {
-            // EVERY pair, not just the first. The diagnosis names up to four,
-            // and an operator following a one-pair grep fixes one inert
-            // hooks.json and leaves the rest inert — the multi-pair case is
-            // precisely the skew #183 exists to resolve.
-            //
-            // `-F` with repeated `-e`: fixed strings, so a subcommand carrying
-            // a regex metacharacter cannot widen the search to everything, and
-            // no alternation needs escaping. The full `namespace subcommand`
-            // pair is the needle because that is how a hooks.json line spells
-            // the invocation.
-            let needles = missing
-                .iter()
-                .map(|pair| format!("-e {}", shell_single_quote(pair)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            // The RESOLVED cache dir, never a `~/.claude/...` literal.
-            // `plugins_dir` honors CLAUDE_CONFIG_DIR precisely because the
-            // config dir moves (the `claude-as` profile pattern), and a
-            // remediation that greps the wrong tree returns zero hits and reads
-            // as "no stale wiring" — a silent false negative inside the one
-            // command #183 exists to hand the operator.
-            //
-            // The two branches quote DIFFERENTLY, on purpose. A resolved path
-            // is data, so it is single-quoted. The fallback is a literal
-            // authored here whose whole job is to expand — single-quoting it
-            // would emit `'~/.claude/plugins/cache'`, and the shell does not
-            // expand `~` inside single quotes, so the paste would search a
-            // nonexistent relative directory and return zero hits: the same
-            // silent "reads as no stale wiring" false negative this branch
-            // exists to prevent, just wearing the other face. Double quotes
-            // let `$HOME` expand while still surviving a spaced home dir.
-            // The fallback is a BARE tilde, not `'~/…'` and not `"$HOME/…"`.
-            // Single quotes suppress tilde expansion, so the paste would search
-            // a nonexistent relative dir and read as "no stale wiring" — the
-            // same false negative this branch exists to prevent. `$HOME` is no
-            // better: this branch is reached only when `user_home()` fails,
-            // which is precisely when `$HOME` is likely unset in the operator's
-            // shell too, expanding to `/.claude/…`. A bare `~` falls back to the
-            // passwd entry when `$HOME` is missing, so it is the one form that
-            // still resolves here. Safe unquoted: a hardcoded literal with no
-            // spaces and no metacharacters.
-            let cache = match plugins_cache_dir() {
-                Some(dir) => shell_single_quote(&dir.display().to_string()),
-                None => "~/.claude/plugins/cache".to_string(),
-            };
-            format!(
-                "grep the installed plugins for the named invocation(s) — \
-                 `grep -rlF {needles} {cache}` finds every hooks.json carrying \
-                 a named invocation; either upgrade this binary or drop the \
-                 stale wiring. `cadence-hooks list` shows what this build \
-                 accepts"
-            )
-        };
-        findings.push(Finding {
-            severity: Severity::Warning,
-            plugin: "cadence-metrics".to_string(),
-            file: dir.to_path_buf(),
-            line: None,
-            snippet: format!("version_mismatch: {}", counts.version_mismatch),
-            diagnosis: format!(
-                "{} version_mismatch failopen(s) on this binary's own version \
-                 ({current_version}) in the last {days} days — a hooks.json/binary \
-                 skew that hasn't resolved{missing_clause}",
-                counts.version_mismatch
-            ),
-            remediation,
-        });
+        let (wired, adhoc) = split_by_wiring(named, wiring);
+        if !adhoc.is_empty() {
+            findings.push(adhoc_invocation_finding(dir, &adhoc));
+        }
+        // Every named pair is ad hoc, and the list is not at its cap (so no
+        // unnamed pair can hide behind it): nothing is skewed. A capped list
+        // stays a warning — the fifth pair could be the wired one.
+        let all_adhoc = !named.is_empty()
+            && wired.is_empty()
+            && named.len() < cadence_hooks_metrics::log_failopen::MAX_SUBCOMMANDS;
+        if !all_adhoc {
+            findings.push(version_mismatch_finding(
+                dir,
+                &wired,
+                counts.version_mismatch,
+                current_version,
+                days,
+            ));
+        }
     }
 
     if counts.deadline >= 3 {
@@ -2681,6 +2791,10 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
     // Resolve the install channel once — it's process-invariant, so the scan
     // below shouldn't re-probe current_exe() per hook entry.
     let channel = install_channel();
+    // The raw wiring text `failopen_findings_with_wiring` checks unknown
+    // subcommands against. Only the manifest branch collects it; elsewhere it
+    // stays `None` and the skew claim is made as before.
+    let mut wiring: Option<String> = None;
     let (mut findings, scanned) = match root_override {
         Some(root) => {
             if !root.exists() {
@@ -2715,6 +2829,11 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                     findings.extend(unenabled_plugin_findings(
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
+                    ));
+                    wiring = Some(collect_wiring(
+                        &installs,
+                        &cadence_hooks_core::paths::claude_config_dir(),
+                        std::env::current_dir().ok().as_deref(),
                     ));
                     (findings, scanned)
                 }
@@ -2756,11 +2875,12 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         let now = SystemTime::now();
         let window = Duration::from_secs(7 * 24 * 60 * 60);
 
-        findings.extend(failopen_findings(
+        findings.extend(failopen_findings_with_wiring(
             &metrics_dir,
             window,
             now,
             env!("CARGO_PKG_VERSION"),
+            wiring.as_deref(),
         ));
         findings.extend(hook_latency_findings(
             &crate::hook_latency::projects_dir(),
@@ -2851,8 +2971,14 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         }
     }
 
-    let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
-        findings.iter().partition(|f| f.severity == Severity::Error);
+    let of = |severity: Severity| -> Vec<&Finding> {
+        findings.iter().filter(|f| f.severity == severity).collect()
+    };
+    let (errors, warnings, notes) = (
+        of(Severity::Error),
+        of(Severity::Warning),
+        of(Severity::Note),
+    );
 
     if quiet {
         if errors.is_empty() && warnings.is_empty() {
@@ -2885,9 +3011,13 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         return 0;
     }
 
-    // Default (verbose) mode.
-    if findings.is_empty() {
+    // Default (verbose) mode. Notes alone still read as clean.
+    if errors.is_empty() && warnings.is_empty() {
         println!("cadence-hooks doctor: clean ({scanned} scanned)");
+        for note in &notes {
+            println!();
+            note.print();
+        }
         return 0;
     }
 
@@ -2897,14 +3027,18 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
     );
 
     // Errors first, then warnings.
-    for finding in errors.iter().chain(warnings.iter()) {
+    for finding in errors.iter().chain(warnings.iter()).chain(notes.iter()) {
         finding.print();
         println!();
     }
 
     let n_err = errors.len();
     let n_warn = warnings.len();
-    println!("cadence-hooks doctor: {n_err} error(s), {n_warn} warning(s)");
+    let n_note = match notes.len() {
+        0 => String::new(),
+        n => format!(", {n} note(s)"),
+    };
+    println!("cadence-hooks doctor: {n_err} error(s), {n_warn} warning(s){n_note}");
 
     if n_err > 0 { 2 } else { 1 }
 }
@@ -3911,6 +4045,157 @@ mod tests {
             r.contains("-e 'lab persona-nudge'"),
             "covers the second: {r}"
         );
+    }
+
+    fn mismatch_rows(pairs: &[(&str, &str)]) -> String {
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        pairs
+            .iter()
+            .map(|(ns, sub)| {
+                format!(
+                    "{{\"reason\":\"version_mismatch\",\"namespace\":\"{ns}\",\
+                     \"subcommand\":\"{sub}\",\"binaryVersion\":\"1.0.0\",\"ts\":\"{ts}\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    // #917: a subcommand typed by hand is not a hooks.json skew. With wiring
+    // that names none of the pairs, the only finding is a note.
+    #[test]
+    fn failopen_findings_version_mismatch_unwired_pairs_are_a_note_not_a_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = mismatch_rows(&[("session", "list"), ("cadence", "status")]);
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+        let wiring = r#"{"command": "run-cadence-hooks.sh cadence prevent-secret-leaks"}"#;
+
+        let findings = failopen_findings_with_wiring(
+            tmp.path(),
+            WEEK,
+            SystemTime::now(),
+            "1.0.0",
+            Some(wiring),
+        );
+        assert_eq!(findings.len(), 1, "one note, no warning");
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Note);
+        assert!(f.diagnosis.contains("cadence status"), "{}", f.diagnosis);
+        assert!(f.diagnosis.contains("session list"), "{}", f.diagnosis);
+        assert!(!f.diagnosis.contains("skew"), "{}", f.diagnosis);
+        assert!(f.remediation.contains("cadence-hooks list"));
+    }
+
+    // A wired pair, as a standalone call or a `group` member, keeps the skew
+    // warning and is the only pair the warning and its grep name.
+    #[test]
+    fn failopen_findings_version_mismatch_splits_wired_from_ad_hoc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = mismatch_rows(&[("lab", "gate"), ("cadence", "nope"), ("guardrails", "late")]);
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+        let wiring = "run-cadence-hooks.sh lab gate\nrun-cadence-hooks.sh group guardrails/late";
+
+        let findings = failopen_findings_with_wiring(
+            tmp.path(),
+            WEEK,
+            SystemTime::now(),
+            "1.0.0",
+            Some(wiring),
+        );
+        let warning = findings
+            .iter()
+            .find(|f| f.severity == Severity::Warning)
+            .expect("wired pairs keep the skew warning");
+        assert!(
+            warning.diagnosis.contains("lab gate"),
+            "{}",
+            warning.diagnosis
+        );
+        assert!(
+            warning.diagnosis.contains("guardrails late"),
+            "group member counts as wired"
+        );
+        assert!(
+            !warning.diagnosis.contains("cadence nope"),
+            "{}",
+            warning.diagnosis
+        );
+        assert!(
+            !warning.remediation.contains("cadence nope"),
+            "{}",
+            warning.remediation
+        );
+        let note = findings
+            .iter()
+            .find(|f| f.severity == Severity::Note)
+            .expect("the typo is a note");
+        assert!(
+            note.diagnosis.contains("cadence nope"),
+            "{}",
+            note.diagnosis
+        );
+    }
+
+    // The pair list stops at four. When it is full, an unnamed fifth pair may
+    // be the wired one, so the warning stays even if every named pair is ad hoc.
+    #[test]
+    fn failopen_findings_version_mismatch_capped_list_keeps_the_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = mismatch_rows(&[
+            ("a", "one"),
+            ("b", "two"),
+            ("c", "three"),
+            ("d", "four"),
+            ("z", "wired"),
+        ]);
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings_with_wiring(
+            tmp.path(),
+            WEEK,
+            SystemTime::now(),
+            "1.0.0",
+            Some("run-cadence-hooks.sh z wired"),
+        );
+        assert!(
+            findings.iter().any(|f| f.severity == Severity::Warning),
+            "a capped list must not clear the skew warning"
+        );
+    }
+
+    // No wiring collected (the cache-walk fallback): the old claim stands.
+    #[test]
+    fn failopen_findings_version_mismatch_without_wiring_keeps_the_old_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("failopen.jsonl"),
+            mismatch_rows(&[("session", "list")]),
+        )
+        .unwrap();
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].diagnosis.contains("session list"));
+    }
+
+    #[test]
+    fn collect_wiring_reads_plugin_hooks_and_both_settings_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        fs::create_dir_all(plugin.join("hooks")).unwrap();
+        fs::write(plugin.join("hooks/hooks.json"), "from-plugin").unwrap();
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("settings.json"), "from-user").unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        fs::write(project.join(".claude/settings.json"), "from-project").unwrap();
+        fs::write(project.join(".claude/settings.local.json"), "from-local").unwrap();
+
+        let installs = vec![("p@m".to_string(), plugin)];
+        let wiring = collect_wiring(&installs, &config, Some(&project));
+        for part in ["from-plugin", "from-user", "from-project", "from-local"] {
+            assert!(wiring.contains(part), "missing {part}: {wiring}");
+        }
     }
 
     // A row set with no namespace/subcommand (a bare invocation) must degrade

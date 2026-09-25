@@ -126,7 +126,7 @@ pub struct FailopenCounts {
 /// it stops. A skew is nearly always one or two invocations repeated; past a
 /// handful the line stops being a diagnosis and starts being a dump, and the
 /// operator has enough to grep with either way.
-const MAX_SUBCOMMANDS: usize = 4;
+pub const MAX_SUBCOMMANDS: usize = 4;
 
 /// Ceiling, in characters, on each half of a `namespace subcommand` pair.
 /// Unlike `error`, these fields are written to the ledger uncapped, and a
