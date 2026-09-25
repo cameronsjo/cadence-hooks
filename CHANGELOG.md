@@ -8,7 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`cadence-hooks group <ns>/<hook>...` runs several checks against one payload in one process.** A Write used to start a dozen processes whose checks each decide in well under a millisecond. With one group entry per plugin it starts two: 14.6 → 6.0 ms wall and 45 → 11 ms CPU per Write, and 8.2 → 4.9 ms wall per Bash call (4-core Linux, release build). Members run in parallel, each with its own git budget, panic guard, `CADENCE_DISABLE` switch, and audit rows. Results merge the way separate processes would: any block exits 2 with every blocker's message. After the git budget plus one second the group emits what it has decided rather than being killed by the hooks.json timeout. `doctor` and the registration audit read group entries member by member. See `docs/hooks.md` § Grouped wiring. Adversarial security and code reviews found three ways a block could be lost in the first version (a shared git budget, a hung member, the first member fixing the event); all three are fixed and replayed as regression cases.
 - **`plugin-hooks-skew.yml` takes an optional `runs-on` input.** It defaults to `ubuntu-latest`, so existing callers keep their current runner. A reusable workflow bills the calling repo, so a private caller can now run the gate on its own self-hosted label instead of paid hosted minutes.
+
+### Changed
+
+- **`warn-main-branch` no longer spawns `git` in the common case on macOS and Linux.** It read the branch and repo root through two `git -C` calls on every Edit and Write, which made it the slowest hook on the Write path (~24 ms per call, against a ~3 ms process floor). It now reads them from the on-disk `.git` through the shared `GitState` resolver, so it costs about the same as `--version`. Wherever that read could disagree with git, it asks git instead: a path inside `.git/`, a detached or non-branch HEAD, a reftable repo, a bare repo in the path, a repo owned by another user, or `GIT_DIR`-style discovery variables. A parity test pins the read to git's answer across those layouts, and the once-per-session marker keys are unchanged. Windows always asks git: there `canonicalize` spells the root `\\?\C:\…` while git prints `C:/…`, and the snooze marker is keyed on git's spelling.
+- **The git probe deadline is per thread.** A standalone hook runs on one thread, so nothing changes there. It is what lets `group` give each member its own full budget.
 
 ## [0.102.1] - 2026-09-23
 

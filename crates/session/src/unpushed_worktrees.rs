@@ -548,8 +548,12 @@ detached
 
     #[test]
     fn a_non_repository_directory_reports_nothing() {
-        let scratch = Scratch::new(&scratch_root(), "not-a-repo");
-        let scan = scan(&scratch.path().to_string_lossy());
+        // Not `Scratch`: its root is under this checkout's `target/`, so git
+        // discovers the enclosing cadence-hooks repo from there, and the test
+        // failed whenever the checkout had an unpushed commit. A system temp
+        // dir is outside every repository, which is what this test needs.
+        let outside = tempfile::tempdir().unwrap();
+        let scan = scan(&outside.path().to_string_lossy());
         assert_eq!(scan, WorktreeScan::default());
     }
 

@@ -34,6 +34,35 @@ Four properties follow, and each one has burned someone:
 
 **The rule this leaves.** A guard whose job is to see every spelling of a dangerous command should carry **no `if:` at all** and let the binary filter — the pattern `trash-guard` has always used. A guard's binary must therefore stay a cheap, silent no-op on arbitrary input; `guard-rm` and `trash-guard` both pin that with table tests over ordinary commands. Reserve `if:` for hooks whose subject genuinely is a literal substring (`Bash(*gh pr create*)`), and never read one as a safety boundary.
 
+## Grouped wiring: several checks, one process
+
+Claude Code starts one process per hooks.json entry, and on a Write that used to be a dozen processes. Each check decides in well under a millisecond, so process launch is nearly all the cost. `cadence-hooks group` runs several checks against one payload in one process:
+
+```json
+{ "type": "command", "timeout": 10,
+  "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/terminology cadence/orphaned-todos cadence/prevent-secret-writes" }
+```
+
+Each member keeps what its own process gave it:
+
+- **Its own thread and git budget.** Members run in parallel, and each has the full `CADENCE_HOOK_DEADLINE_MS` budget. One slow member cannot use up another's budget.
+- **Its own audit rows.** Every member writes the same `denials.jsonl`, `bypasses.jsonl`, and `hooks.jsonl` rows under its own name.
+- **Its own switches.** `CADENCE_DISABLE` applies per member, protected guards still refuse it, and a panic is caught for that member alone. `CADENCE_BYPASS=1` still skips everything.
+
+The results merge the way Claude Code combines separate processes:
+
+- **Any block** exits 2 with every blocker's message on stderr, followed by any nudges that fired.
+- **Otherwise** one exit-0 envelope carries the ask reasons and the nudges.
+
+The group emits whatever has been decided once the git budget plus one second has passed (4 s by default). A member still running then fails open for that call and is logged as `group_deadline` in `failopen.jsonl`. Set the entry's hooks.json `timeout` above that; 10 is the convention.
+
+Rules for wiring:
+
+- **Members are `<namespace>/<hook>`** and must be PreToolUse or PostToolUse checks. Loggers, CLI actions, and SessionStart hooks are refused, and `doctor` reports them.
+- **Only group hooks with the same matcher and no `if:`.** A group entry has one matcher and one `if:`, so a hook whose prefilter differs from the others keeps its own entry.
+- **Keep a hook that starts a slow external tool in its own entry** (`markdown-lint` runs the Node `markdownlint` CLI). Grouping saves it nothing, and its own entry keeps its own timeout.
+- **A binary older than `group`** is handled by `run-cadence-hooks.sh`: it replays the payload to each member in turn, so every guard still runs and still blocks until the binary is upgraded.
+
 ## cadence
 
 | Hook | Event | What it does |
