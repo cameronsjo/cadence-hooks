@@ -1671,6 +1671,28 @@ fn graphql_is_safe_mutation(segment: &str) -> bool {
     }
 }
 
+/// Top-level REST endpoints that name no owner or repository at all, so no
+/// `repos/<owner>/<repo>` spelling of them exists. Used only to word the block:
+/// the guard still refuses the write, but the "use `repos/<owner>/<repo>/…`"
+/// fix is unsatisfiable for these and must not be offered (#971).
+const REPOLESS_API_ROOTS: &[&str] = &["markdown", "rate_limit", "meta", "emojis", "zen", "octocat"];
+
+/// The first path segment of a relative `gh api` endpoint when it is one of
+/// [`REPOLESS_API_ROOTS`]. Reads the path only, like [`api_repos_target`]; a
+/// URL-form endpoint returns `None` and keeps the generic wording.
+fn repoless_api_root(segment: &str) -> Option<&'static str> {
+    let endpoint = gh_api_endpoint(segment)?;
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    if path.contains("://") {
+        return None;
+    }
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    REPOLESS_API_ROOTS
+        .iter()
+        .copied()
+        .find(|root| *root == first)
+}
+
 /// Build the block message for a `gh api` write whose target owner can't be
 /// verified (graphql, `orgs/…`, `user/…`, anything that isn't
 /// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
@@ -1685,6 +1707,15 @@ fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String
     };
     // graphql has no `-R`/`repos/<owner>/<repo>` form, so the generic
     // "use gh api repos/…" fix is unsatisfiable there — state the reality (#317).
+    if let Some(root) = repoless_api_root(segment) {
+        return format!(
+            "🚫 git-guardrails: gh api write to `/{root}`, an endpoint with no owner or repo \
+             in its path — there is no ownership to check\n   \
+             Command: {segment}\n   \
+             Fix: `/{root}` has no `repos/<owner>/<repo>` form, so this guard cannot clear it. \
+             Do the work locally, or ask the user to run the command themselves.{note}"
+        );
+    }
     let fix = if is_graphql {
         "Fix: `gh api graphql` has no `-R` or `repos/<owner>/<repo>` form to make ownership \
          checkable. `resolveReviewThread`/`unresolveReviewThread` mutations are auto-allowed; \
@@ -1711,7 +1742,11 @@ fn api_unverifiable_block(
 ) -> CheckResult {
     // graphql has no -R/repos form, so its structured fix states the reality
     // rather than the unsatisfiable "use gh api repos/…" (#317).
-    let fix = if segment_is_graphql(segment) {
+    let fix = if let Some(root) = repoless_api_root(segment) {
+        format!(
+            "/{root} has no owner or repo in its path, so no repos/<owner>/<repo> form exists; do the work locally or ask the user to run it"
+        )
+    } else if segment_is_graphql(segment) {
         "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
     } else {
         "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user".to_string()
@@ -3618,6 +3653,40 @@ mod tests {
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn repoless_endpoint_write_blocks_without_the_unsatisfiable_repos_hint() {
+        // #971: `/markdown` has no owner, so the `repos/<owner>/<repo>` fix can
+        // never apply. The write still blocks; only the wording changes.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api /markdown --input /tmp/notes.md",
+                "gh api markdown/raw -X POST --input notes.md",
+                "gh api rate_limit -f x=1",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "still blocks: {command}"
+                );
+                let msg = result.message.clone().unwrap_or_default();
+                assert!(msg.contains("no owner or repo"), "{command}: {msg}");
+                assert!(!msg.contains("use `gh api repos/"), "{command}: {msg}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+                assert!(!meta.fix.contains("use gh api repos/"), "{}", meta.fix);
+            }
+            // An owner-scoped non-repo endpoint keeps the generic wording.
+            let result = GhWriteGuard.run(&input_with("gh api orgs/acme/teams -X POST", "/tmp"));
+            let msg = result.message.clone().unwrap_or_default();
+            assert!(msg.contains("use `gh api repos/"), "{msg}");
+            // A repo named `markdown` is not the endpoint.
+            assert_eq!(
+                repoless_api_root("gh api repos/evil/markdown -X POST"),
+                None
+            );
         });
     }
 

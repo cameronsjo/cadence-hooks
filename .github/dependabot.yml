@@ -4,3 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Replaces Dependabot's default dependencies/github_actions labels, which
+    # the estate label rollout folds into kind:chore (cadence-ecosystem#553).
+    labels:
+      - "kind:chore"

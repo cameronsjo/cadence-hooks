@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` names a repo-less endpoint instead of offering an impossible fix.** `gh api /markdown` (and `/rate_limit`, `/meta`, `/emojis`, `/zen`, `/octocat`) has no owner in its path, but a write to it was refused with "use `gh api repos/<owner>/<repo>/…`", which no form of that endpoint can satisfy. The write still blocks; the message now says the endpoint has no owner to check and to do the work locally or ask the user. (cameronsjo/cadence-hooks#971)
+- **`guard-sops-decrypt` says where its override is read.** The block offered `CADENCE_ALLOW_SOPS_DECRYPT=1`, but an inline `CADENCE_ALLOW_SOPS_DECRYPT=1 sops …` prefix does nothing: the hook reads Claude Code's environment, not the command's. The message now points at a personal settings `env` block (`.claude/settings.local.json` or `~/.claude/settings.json`, never the shared `.claude/settings.json`, which would turn the bypass on for every teammate) and says it takes effect next session. (cameronsjo/cadence-hooks#975)
+
 ## [0.104.0] - 2026-09-25
 
 ### Fixed
