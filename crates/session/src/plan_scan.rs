@@ -252,8 +252,9 @@ pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
     ## Tasks\n\n- [ ] task\n";
 
 /// The ONE plan-shape detector both gates consume: the plan template's
-/// mandatory stanzas `body` lacks, in template order (`Panel:` line,
-/// `## Alternatives declined`, checkbox tasks). Empty for a template-shaped
+/// stanzas `body` lacks, in template order (`Panel:` line through checkbox
+/// tasks). Only the `Panel:` line blocks at call time; the rest nudge
+/// (cadence-hooks#1019). Empty for a template-shaped
 /// plan. Two scanners drifted once already (the #675 polish), which is why
 /// persist-time and call-time share this single entry point rather than
 /// each composing the list inline.

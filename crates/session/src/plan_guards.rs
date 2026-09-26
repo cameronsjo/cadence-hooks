@@ -158,9 +158,9 @@ fn plan_text(input: &HookInput) -> Option<String> {
 }
 
 /// The pure decision: block on an unsettled `Panel:` line (naming both
-/// escapes, with any other missing stanza listed as advice), nudge on a settled line with other
-/// stanzas missing, nudge just the presentation reminders on a
-/// template-shaped plan — every outcome carries both reminders.
+/// escapes, with any other missing stanza listed as advice), nudge on a
+/// settled line with other stanzas missing, nudge just the presentation
+/// reminders on a template-shaped plan — every outcome carries both reminders.
 fn judge_plan_shape(plan: &str) -> CheckResult {
     let missing = plan_scan::missing_stanzas(plan);
     if missing.is_empty() {
