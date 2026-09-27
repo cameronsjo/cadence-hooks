@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.104.1] - 2026-09-27
+
 ### Fixed
 
 - **`warn-unreviewed-ready-flip` takes half as long and sees a PR's newest reviews.** It made two `gh` calls in sequence on every `gh pr ready` and `gh pr merge`, about 0.4s each, which made it the slowest hook in the suite (median 1.1s over a week of session logs). One GraphQL request now fetches the head, the author, and the reviews, and a flip that names its PR number takes about 0.5s instead of 1s on the same PRs with the same verdicts (one without a number still resolves it first). The old reviews request returned the first 30 reviews, oldest first, so on a PR with more than 30 reviews a clean marker on the current head was never read and the hook nudged anyway. The request now asks for the newest 100.
