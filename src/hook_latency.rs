@@ -105,7 +105,9 @@ fn record_hook(tallies: &mut Vec<HookLatency>, obj: &serde_json::Map<String, Val
     };
     let dur = obj.get("durationMs").and_then(Value::as_u64);
     let cancelled = obj.get("type").and_then(Value::as_str) == Some("hook_cancelled");
-    let is_slow = dur.is_some_and(|d| d >= SLOW_MS);
+    // Disjoint from `cancelled`: a killed run often logs a long duration too,
+    // and counting it twice would push a hook's rate past its run count.
+    let is_slow = !cancelled && dur.is_some_and(|d| d >= SLOW_MS);
     if dur.is_none() && !cancelled {
         return;
     }
@@ -434,6 +436,15 @@ mod tests {
         assert!(flip < rm, "{s}");
         assert!(s.contains("12 of 20 runs"), "{s}");
         assert!(s.contains("10 of 100 runs"), "{s}");
+    }
+
+    #[test]
+    fn a_cancelled_run_with_a_long_duration_counts_once() {
+        let line = r#"{"type":"hook_cancelled","command":"x/run-cadence-hooks.sh guardrails guard-rm","durationMs":5941}"#;
+        let got = scan_lines(std::iter::once(line));
+        assert_eq!(got[0].runs, 1);
+        assert_eq!(got[0].cancelled, 1);
+        assert_eq!(got[0].slow, 0, "a cancelled run is not also slow");
     }
 
     #[test]

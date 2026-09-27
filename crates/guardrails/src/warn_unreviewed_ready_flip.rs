@@ -203,6 +203,11 @@ fn parse_pr_state(json: &str) -> Option<PrState> {
             .to_string()
     };
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    // GraphQL can answer with partial `data` next to `errors`; a verdict
+    // built from part of the reviews is worse than none, so fail open.
+    if value.get("errors").is_some() {
+        return None;
+    }
     let pr = value.get("data")?.get("repository")?.get("pullRequest")?;
     let head = pr.get("headRefOid")?.as_str()?.to_string();
     let reviews = pr
@@ -813,6 +818,22 @@ mod tests {
             serde_json::json!([]),
         );
         gh.state_json = Some(r#"{"data":{"repository":{"pullRequest":null}}}"#.to_string());
+        assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
+    }
+
+    #[test]
+    fn graphql_errors_beside_partial_data_are_silent() {
+        let mut gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
+        gh.state_json = Some(
+            r#"{"data":{"repository":{"pullRequest":{"headRefOid":"abc1234abcabc1234abcabc1234abcabc1234abc",
+                "author":{"login":"cameronsjo"},"reviews":{"nodes":[]}}}},
+                "errors":[{"message":"rate limited"}]}"#
+                .to_string(),
+        );
         assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
     }
 
