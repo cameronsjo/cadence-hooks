@@ -1513,7 +1513,8 @@ fn failopen_findings(
 
 /// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
 /// none when all counts are below their thresholds. `panic` and `parse` are
-/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
+/// reported on any/moderate occurrence (`panic` as a Note when no row is on the
+/// current version, see below); the #271 deadline pair is load-correlated
 /// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
 /// because each one is an enforcement block that did not fire;
 /// `version_mismatch` only counts rows
