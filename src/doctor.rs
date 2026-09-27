@@ -1020,28 +1020,6 @@ fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
     format!(r#"grep '"reason":"{reason}"' {path} | tail -5"#)
 }
 
-/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
-/// none when all counts are below their thresholds. `panic` and `parse` are
-/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
-/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
-/// because each one is an enforcement block that did not fire;
-/// `version_mismatch` only counts rows
-/// tagged with the CURRENT binary's own version (see
-/// `log_failopen::counts_from`'s doc) — an older-version row is the
-/// sanctioned release-transition case and is excluded by construction.
-///
-/// Counts and the `parse`/`panic` recency come from a single
-/// `recent_failopen_report` read. Both of those findings name the last recorded
-/// `error` — the field that makes the "inspect failopen.jsonl" guidance
-/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
-/// existed simply omit the clause. The `parse` finding additionally carries
-/// recency + version context: when it last fired, on which binary version,
-/// and how many of the windowed rows are on the CURRENT version. Its *count*
-/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
-/// not version-specific, so filtering the count would under-report a live one —
-/// but zero on the current version disambiguates a burst whose fix already
-/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
-/// the bare count could not.
 /// Words that occupy command position while the thing that actually has to
 /// exist is their ARGUMENT. [`referenced_clis`] walks past these.
 ///
@@ -1309,6 +1287,18 @@ fn shape_remediation(distinct_days: u64) -> String {
     }
 }
 
+/// How many windowed rows for a `reason` are on the running binary's own
+/// version, next to that version — `none on current 1.2.3` or `4 on current
+/// 1.2.3`. Shared by the `parse` finding and both `panic` arms, so the two
+/// stay worded identically wherever they report the same fact.
+fn current_version_clause(on_current: u64, current_version: &str) -> String {
+    if on_current == 0 {
+        format!("none on current {current_version}")
+    } else {
+        format!("{on_current} on current {current_version}")
+    }
+}
+
 /// Concatenate the files a hook command is usually wired from: each install's
 /// `hooks/hooks.json`, the user `settings.json`, and the current project's
 /// `.claude/settings.json` and `settings.local.json`. A missing file is
@@ -1496,6 +1486,32 @@ fn failopen_findings(
     failopen_findings_with_wiring(dir, window, now, current_version, None)
 }
 
+/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
+/// none when all counts are below their thresholds. `panic` and `parse` are
+/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
+/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
+/// because each one is an enforcement block that did not fire;
+/// `version_mismatch` only counts rows
+/// tagged with the CURRENT binary's own version (see
+/// `log_failopen::counts_from`'s doc) — an older-version row is the
+/// sanctioned release-transition case and is excluded by construction.
+///
+/// Counts and the `parse`/`panic` recency come from a single
+/// `recent_failopen_report` read. Both of those findings name the last recorded
+/// `error` — the field that makes the "inspect failopen.jsonl" guidance
+/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
+/// existed simply omit the clause. The `parse` finding additionally carries
+/// recency + version context: when it last fired, on which binary version,
+/// and how many of the windowed rows are on the CURRENT version. Its *count*
+/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
+/// not version-specific, so filtering the count would under-report a live one —
+/// but zero on the current version disambiguates a burst whose fix already
+/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
+/// the bare count could not. `panic` recency also selects the finding's
+/// *severity*: a panic row on the current binary version still warns, while
+/// one only from another version drops to a Note that says no action is
+/// needed (cameronsjo/cadence-hooks#917, #956, #1007).
+///
 /// `wiring` is the raw text of every hooks.json and settings.json this
 /// machine's hooks can come from, or `None` when doctor could not collect it.
 /// It splits `version_mismatch` pairs into wired ones (a real skew) and ones no
@@ -1520,27 +1536,76 @@ fn failopen_findings_with_wiring(
     let mut findings = Vec::new();
 
     if counts.panic >= 1 {
-        let last_error = recency
-            .get("panic")
-            .and_then(|r| r.last_error.as_deref())
+        let panic_recency = recency.get("panic");
+        let last_ts = panic_recency
+            .map(|r| r.last_ts.as_str())
+            .unwrap_or_default();
+        let last_version = panic_recency
+            .map(|r| r.last_version.as_str())
+            .unwrap_or_default();
+        let last_error = panic_recency.and_then(|r| r.last_error.as_deref());
+        let last_error_clause = last_error
             .map(|e| format!("; last error: {e}"))
             .unwrap_or_default();
+        // `recency["panic"]` is always present when `counts.panic >= 1`,
+        // because both come from one `windowed_rows` pass. The `u64::MAX`
+        // default is therefore unreachable; it only steers a missing entry
+        // to the conservative Warning arm.
+        let current_panics = panic_recency.map_or(u64::MAX, |r| r.on_current_version);
+
+        let (severity, diagnosis, remediation) = if current_panics == 0 {
+            (
+                Severity::Note,
+                format!(
+                    "{} panic(s) in the last {days} days, {} (last: {last_ts} on \
+                     {last_version}{last_error_clause})",
+                    counts.panic,
+                    current_version_clause(current_panics, current_version)
+                ),
+                format!(
+                    "no action needed: these rows came from a different binary \
+                     ({last_version}) and age out of the {days}-day window; a fix for the \
+                     last error is usually in the CHANGELOG between {last_version} and \
+                     {current_version}. Do not file an issue unless doctor warns about a \
+                     panic on {current_version}."
+                ),
+            )
+        } else {
+            let search_clause = last_error
+                .map(|e| {
+                    let excerpt: String = e.chars().take(60).collect();
+                    format!(
+                        ", search open issues for the last error first (`gh issue list -R \
+                         cameronsjo/cadence-hooks --search {}`)",
+                        shell_single_quote(&excerpt)
+                    )
+                })
+                .unwrap_or_default();
+            (
+                Severity::Warning,
+                format!(
+                    "{} panic(s) in the last {days} days (failopen.jsonl; last: {last_ts} on \
+                     {last_version} — {}{last_error_clause})",
+                    counts.panic,
+                    current_version_clause(current_panics, current_version)
+                ),
+                format!(
+                    "a panic in a check/logger is always a bug — list the rows with \
+                     `{}`{search_clause}, and file one at \
+                     https://github.com/cameronsjo/cadence-hooks/issues only if none matches",
+                    failopen_inspect_cmd(dir, "panic")
+                ),
+            )
+        };
+
         findings.push(Finding {
-            severity: Severity::Warning,
+            severity,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
             snippet: format!("panic: {}", counts.panic),
-            diagnosis: format!(
-                "{} panic(s) in the last {days} days (failopen.jsonl{last_error})",
-                counts.panic
-            ),
-            remediation: format!(
-                "a panic in a check/logger is always a bug — list the rows with \
-                 `{}` and file an issue at \
-                 https://github.com/cameronsjo/cadence-hooks/issues",
-                failopen_inspect_cmd(dir, "panic")
-            ),
+            diagnosis,
+            remediation,
         });
     }
 
@@ -1550,11 +1615,7 @@ fn failopen_findings_with_wiring(
         let recency_clause = recency
             .get("parse")
             .map(|r| {
-                let current_clause = if r.on_current_version == 0 {
-                    format!("none on current {current_version}")
-                } else {
-                    format!("{} on current {current_version}", r.on_current_version)
-                };
+                let current_clause = current_version_clause(r.on_current_version, current_version);
                 let error_clause = r
                     .last_error
                     .as_deref()
@@ -3504,13 +3565,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ts = cadence_hooks_core::time::utc_timestamp();
         let rows = format!(
-            "{}\n{}\n",
-            format!(
-                r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","ts":"{ts}"}}"#
-            ),
-            format!(
-                r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
-            )
+            "{{\"reason\":\"panic\",\"namespace\":\"cadence\",\"subcommand\":\"terminology\",\"binaryVersion\":\"0.9.0\",\"ts\":\"{ts}\"}}\n\
+             {{\"reason\":\"panic\",\"namespace\":\"cadence\",\"subcommand\":\"terminology\",\"binaryVersion\":\"1.0.0\",\"error\":\"index out of bounds\",\"ts\":\"{ts}\"}}\n"
         );
         fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
 
