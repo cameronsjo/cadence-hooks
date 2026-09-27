@@ -18,6 +18,9 @@
 //! — is degraded whether or not it was ultimately killed; a `hook_cancelled`
 //! is surfaced separately as a probable kill.
 //!
+//! Every run is counted, fast ones included, so each hook's slow share can be
+//! ranked (see `rank`). A raw slow count ranks whichever hook runs most often.
+//!
 //! Read-only, bounded to the most-recent [`MAX_FILES`] logs by mtime. Output
 //! carries only subcommand names, counts, and durations — never command
 //! contents, cwd, or transcript text.
