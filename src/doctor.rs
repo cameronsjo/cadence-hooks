@@ -1299,6 +1299,31 @@ fn current_version_clause(on_current: u64, current_version: &str) -> String {
     }
 }
 
+/// The search terms for a panic's `last_error`: the message without the
+/// ` (at file:line)` location suffix the panic hook appends, cut back to whole
+/// words within 60 characters. GitHub search ANDs its terms, so a token cut
+/// mid-word would match nothing — not even the issue that reports this panic.
+fn issue_search_excerpt(error: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let message = error.rfind(" (at ").map_or(error, |i| &error[..i]).trim();
+    let mut excerpt = String::new();
+    for word in message.split_whitespace() {
+        let sep = usize::from(!excerpt.is_empty());
+        if excerpt.chars().count() + sep + word.chars().count() > MAX_CHARS {
+            break;
+        }
+        if sep == 1 {
+            excerpt.push(' ');
+        }
+        excerpt.push_str(word);
+    }
+    if excerpt.is_empty() {
+        // A first word longer than the cap: a cut token beats an empty query.
+        return message.chars().take(MAX_CHARS).collect();
+    }
+    excerpt
+}
+
 /// Concatenate the files a hook command is usually wired from: each install's
 /// `hooks/hooks.json`, the user `settings.json`, and the current project's
 /// `.claude/settings.json` and `settings.local.json`. A missing file is
@@ -1563,21 +1588,25 @@ fn failopen_findings_with_wiring(
                     current_version_clause(current_panics, current_version)
                 ),
                 format!(
-                    "no action needed: these rows came from a different binary \
-                     ({last_version}) and age out of the {days}-day window; a fix for the \
-                     last error is usually in the CHANGELOG between {last_version} and \
-                     {current_version}. Do not file an issue unless doctor warns about a \
-                     panic on {current_version}."
+                    "no action needed: these rows came from binaries other than \
+                     {current_version} (latest: {last_version}) and age out of the \
+                     {days}-day window; a fix for the last error is usually in the \
+                     CHANGELOG between {last_version} and {current_version}. Do not file an \
+                     issue unless doctor warns about a panic on {current_version}."
                 ),
             )
         } else {
-            let search_clause = last_error
+            // With no recorded error there is nothing to search for, so the
+            // filing clause must not refer back to a search it never offered.
+            let (search_clause, file_condition) = last_error
                 .map(|e| {
-                    let excerpt: String = e.chars().take(60).collect();
-                    format!(
-                        ", search open issues for the last error first (`gh issue list -R \
-                         cameronsjo/cadence-hooks --search {}`)",
-                        shell_single_quote(&excerpt)
+                    (
+                        format!(
+                            ", search open issues for the last error first (`gh issue list -R \
+                             cameronsjo/cadence-hooks --search {}`)",
+                            shell_single_quote(&issue_search_excerpt(e))
+                        ),
+                        " only if none matches",
                     )
                 })
                 .unwrap_or_default();
@@ -1592,7 +1621,7 @@ fn failopen_findings_with_wiring(
                 format!(
                     "a panic in a check/logger is always a bug — list the rows with \
                      `{}`{search_clause}, and file one at \
-                     https://github.com/cameronsjo/cadence-hooks/issues only if none matches",
+                     https://github.com/cameronsjo/cadence-hooks/issues{file_condition}",
                     failopen_inspect_cmd(dir, "panic")
                 ),
             )
@@ -3583,6 +3612,43 @@ mod tests {
             "{}",
             findings[0].remediation
         );
+    }
+
+    #[test]
+    fn panic_on_current_version_without_error_does_not_say_none_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        let remediation = &findings[0].remediation;
+        assert!(!remediation.contains("search open issues"), "{remediation}");
+        assert!(!remediation.contains("none matches"), "{remediation}");
+        assert!(remediation.contains("file one at"), "{remediation}");
+    }
+
+    #[test]
+    fn issue_search_excerpt_drops_the_location_and_keeps_whole_words() {
+        // The real EPIPE row behind cameronsjo/cadence-hooks#1007.
+        let error = "failed printing to stdout: Broken pipe (os error 32) \
+                     (at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/stdio.rs:1166)";
+        assert_eq!(
+            issue_search_excerpt(error),
+            "failed printing to stdout: Broken pipe (os error 32)"
+        );
+
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        assert_eq!(
+            issue_search_excerpt(long),
+            "one two three four five six seven eight nine ten eleven"
+        );
+
+        let one_token = "x".repeat(80);
+        assert_eq!(issue_search_excerpt(&one_token).chars().count(), 60);
     }
 
     #[test]
