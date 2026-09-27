@@ -45,6 +45,9 @@ const MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HookLatency {
     pub subcommand: String,
+    /// Every recorded run, fast, slow, or cancelled — the denominator that
+    /// turns `slow` into a rate.
+    pub runs: u64,
     /// Runs with `durationMs >= SLOW_MS`.
     pub slow: u64,
     /// `hook_cancelled` records — a probable external kill.
@@ -103,7 +106,7 @@ fn record_hook(tallies: &mut Vec<HookLatency>, obj: &serde_json::Map<String, Val
     let dur = obj.get("durationMs").and_then(Value::as_u64);
     let cancelled = obj.get("type").and_then(Value::as_str) == Some("hook_cancelled");
     let is_slow = dur.is_some_and(|d| d >= SLOW_MS);
-    if !cancelled && !is_slow {
+    if dur.is_none() && !cancelled {
         return;
     }
     let entry = match tallies.iter_mut().find(|t| t.subcommand == sub) {
@@ -116,6 +119,7 @@ fn record_hook(tallies: &mut Vec<HookLatency>, obj: &serde_json::Map<String, Val
             tallies.last_mut().expect("just pushed")
         }
     };
+    entry.runs += 1;
     if cancelled {
         entry.cancelled += 1;
     }
@@ -159,9 +163,37 @@ fn walk(value: &Value, tallies: &mut Vec<HookLatency>, depth: u32) {
     }
 }
 
+/// A hook needs this many runs before its slow rate is trusted for ranking.
+const MIN_RUNS_FOR_RATE: u64 = 20;
+
+/// Order tallies worst-first by the share of runs that were slow or
+/// cancelled, not the raw count. A count ranks whichever hook runs most
+/// often: a week of logs put guard-rm (2% of 39,000 runs) above a hook that
+/// was slow on 61% of its 250. Hooks with too few runs for a rate follow,
+/// by count.
+fn rank(tallies: &mut [HookLatency]) {
+    let bad = |t: &HookLatency| t.slow + t.cancelled;
+    tallies.sort_by(|a, b| {
+        let a_rated = a.runs >= MIN_RUNS_FOR_RATE;
+        let b_rated = b.runs >= MIN_RUNS_FOR_RATE;
+        b_rated
+            .cmp(&a_rated)
+            .then_with(|| {
+                if a_rated && b_rated {
+                    // bad(b)/runs(b) vs bad(a)/runs(a), without floats.
+                    (u128::from(bad(b)) * u128::from(a.runs))
+                        .cmp(&(u128::from(bad(a)) * u128::from(b.runs)))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then(bad(b).cmp(&bad(a)))
+            .then(b.max_ms.cmp(&a.max_ms))
+    });
+}
+
 /// Pure core: fold session-log JSONL lines into a per-subcommand latency
-/// tally, sorted worst-first (most slow runs, then highest max). Unparsable
-/// lines are skipped.
+/// tally, ranked by [`rank`]. Unparsable lines are skipped.
 pub fn scan_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<HookLatency> {
     let mut tallies: Vec<HookLatency> = Vec::new();
     for line in lines {
@@ -173,12 +205,7 @@ pub fn scan_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<HookLatency> 
         };
         walk(&value, &mut tallies, 0);
     }
-    tallies.sort_by(|a, b| {
-        b.slow
-            .cmp(&a.slow)
-            .then(b.cancelled.cmp(&a.cancelled))
-            .then(b.max_ms.cmp(&a.max_ms))
-    });
+    rank(&mut tallies);
     tallies
 }
 
@@ -241,6 +268,7 @@ pub fn scan_recent(projects: &Path, window: Duration, now: SystemTime) -> Vec<Ho
                 .find(|t| t.subcommand == found.subcommand)
             {
                 Some(e) => {
+                    e.runs += found.runs;
                     e.slow += found.slow;
                     e.cancelled += found.cancelled;
                     e.max_ms = e.max_ms.max(found.max_ms);
@@ -249,12 +277,7 @@ pub fn scan_recent(projects: &Path, window: Duration, now: SystemTime) -> Vec<Ho
             }
         }
     }
-    tallies.sort_by(|a, b| {
-        b.slow
-            .cmp(&a.slow)
-            .then(b.cancelled.cmp(&a.cancelled))
-            .then(b.max_ms.cmp(&a.max_ms))
-    });
+    rank(&mut tallies);
     tallies
 }
 
@@ -266,15 +289,18 @@ pub fn summary(tallies: &[HookLatency], days: u64) -> Option<String> {
     if total_slow == 0 && total_cancelled == 0 {
         return None;
     }
-    // Top few offenders by the sort order scan_recent already applied.
+    // Top few offenders in the order `rank` already applied; a hook with no
+    // slow or cancelled run is counted for its rate but never listed.
     let detail = tallies
         .iter()
+        .filter(|t| t.slow + t.cancelled > 0)
         .take(4)
         .map(|t| {
             format!(
-                "{} ({} slow{}, max {}ms)",
+                "{} ({} of {} runs slow{}, max {}ms)",
                 t.subcommand,
                 t.slow,
+                t.runs,
                 if t.cancelled > 0 {
                     format!(", {} cancelled", t.cancelled)
                 } else {
@@ -288,7 +314,8 @@ pub fn summary(tallies: &[HookLatency], days: u64) -> Option<String> {
     Some(format!(
         "{total_slow} cadence hook run(s) ≥{SLOW_MS}ms{} in the last {days} days \
          (Claude Code session logs) — hooks are degrading under slow subprocess \
-         I/O and may be exceeding their hooks.json timeout. Worst: {detail}",
+         I/O and may be exceeding their hooks.json timeout. Slowest by share of \
+         runs: {detail}",
         if total_cancelled > 0 {
             format!(" and {total_cancelled} cancelled")
         } else {
@@ -361,6 +388,7 @@ mod tests {
         // Sorted worst-first: prevent-secret-writes has 2 slow.
         assert_eq!(got[0].subcommand, "cadence prevent-secret-writes");
         assert_eq!(got[0].slow, 2);
+        assert_eq!(got[0].runs, 3, "the fast run counts toward the rate");
         assert_eq!(got[0].cancelled, 0);
         assert_eq!(got[0].max_ms, 6100);
         assert_eq!(got[1].subcommand, "guardrails enforce-worktree");
@@ -379,11 +407,51 @@ mod tests {
         assert_eq!(got[0].slow, 1);
     }
 
+    fn runs(sub: &str, total: usize, slow: usize) -> Vec<String> {
+        (0..total)
+            .map(|i| {
+                let ms = if i < slow { 2000 } else { 50 };
+                format!(
+                    r#"{{"type":"hook_success","command":"x/run-cadence-hooks.sh {sub}","durationMs":{ms}}}"#
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_hook_slow_most_often_ranks_first_not_the_one_run_most_often() {
+        // The shape of a real week: guard-rm runs on every Bash call, so it
+        // had the most slow runs at the lowest slow rate, while the hook that
+        // is slow on every run was listed below it.
+        let mut lines = runs("guardrails guard-rm", 100, 10);
+        lines.extend(runs("guardrails warn-unreviewed-ready-flip", 20, 12));
+        let got = scan_lines(lines.iter().map(String::as_str));
+        assert_eq!(got[0].subcommand, "guardrails warn-unreviewed-ready-flip");
+
+        let s = summary(&got, 7).unwrap();
+        let flip = s.find("warn-unreviewed-ready-flip").unwrap();
+        let rm = s.find("guard-rm").unwrap();
+        assert!(flip < rm, "{s}");
+        assert!(s.contains("12 of 20 runs"), "{s}");
+        assert!(s.contains("10 of 100 runs"), "{s}");
+    }
+
+    #[test]
+    fn a_hook_with_too_few_runs_for_a_rate_ranks_after_the_rest() {
+        // 2 of 2 is 100%, but two runs say nothing about the hook.
+        let mut lines = runs("guardrails guard-rm", 100, 10);
+        lines.extend(runs("cadence git-safety", 2, 2));
+        let got = scan_lines(lines.iter().map(String::as_str));
+        assert_eq!(got[0].subcommand, "guardrails guard-rm");
+        assert_eq!(got[1].subcommand, "cadence git-safety");
+    }
+
     #[test]
     fn summary_none_when_all_fast() {
         assert!(summary(&[], 7).is_none());
         let fast = vec![HookLatency {
             subcommand: "cadence git-safety".into(),
+            runs: 40,
             slow: 0,
             cancelled: 0,
             max_ms: 240,
@@ -395,6 +463,7 @@ mod tests {
     fn summary_names_offenders_and_counts() {
         let t = vec![HookLatency {
             subcommand: "cadence prevent-secret-writes".into(),
+            runs: 400,
             slow: 21,
             cancelled: 0,
             max_ms: 5500,
