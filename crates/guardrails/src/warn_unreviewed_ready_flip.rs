@@ -173,38 +173,55 @@ struct ParsedReview {
     body: String,
 }
 
-/// Parse the `gh api repos/{owner}/{repo}/pulls/{n}/reviews` JSON array.
-/// Returns `None` on any parse failure — the caller reads that as fail-open.
-fn parse_reviews(json: &str) -> Option<Vec<ParsedReview>> {
+/// The PR's head, author, and its newest reviews in one GraphQL request.
+///
+/// `last: 100`, not the REST reviews list: that list is oldest-first and
+/// returns 30 per page, so on a PR with more than 30 reviews the newest ones —
+/// the ones that can match the current head — were never fetched.
+const PR_STATE_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
+    repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+    headRefOid author { login } \
+    reviews(last: 100) { nodes { author { login } state commit { oid } body } } } } }";
+
+/// The fields [`evaluate`] needs from [`PR_STATE_QUERY`]'s response.
+struct PrState {
+    head: String,
+    author: String,
+    reviews: Vec<ParsedReview>,
+}
+
+/// Parse a [`PR_STATE_QUERY`] response. `None` on any parse failure or a
+/// missing pull request — the caller reads that as fail-open. A deleted
+/// account (`author: null`) or a review with no commit reads as an empty
+/// string, which matches no login and no head.
+fn parse_pr_state(json: &str) -> Option<PrState> {
+    let str_at = |v: &serde_json::Value, path: &[&str]| -> String {
+        path.iter()
+            .try_fold(v, |acc, key| acc.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let arr = value.as_array()?;
-    Some(
-        arr.iter()
-            .map(|r| ParsedReview {
-                login: r
-                    .get("user")
-                    .and_then(|u| u.get("login"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                state: r
-                    .get("state")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                commit_id: r
-                    .get("commit_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                body: r
-                    .get("body")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-            .collect(),
-    )
+    let pr = value.get("data")?.get("repository")?.get("pullRequest")?;
+    let head = pr.get("headRefOid")?.as_str()?.to_string();
+    let reviews = pr
+        .get("reviews")?
+        .get("nodes")?
+        .as_array()?
+        .iter()
+        .map(|r| ParsedReview {
+            login: str_at(r, &["author", "login"]),
+            state: str_at(r, &["state"]),
+            commit_id: str_at(r, &["commit", "oid"]),
+            body: str_at(r, &["body"]),
+        })
+        .collect();
+    Some(PrState {
+        head,
+        author: str_at(pr, &["author", "login"]),
+        reviews,
+    })
 }
 
 /// Does `reviews` carry a signal that counts as "reviewed" for `head`,
@@ -257,35 +274,29 @@ pub fn evaluate(slug: &str, command: &str, gh: &dyn GhRunner) -> Option<String> 
         }
     };
 
-    let pr_json = gh.run(&[
-        "pr",
-        "view",
-        &pr_num.to_string(),
-        "--json",
-        "headRefOid,author",
-        "-R",
-        slug,
-    ])?;
-    let pr_value: serde_json::Value = serde_json::from_str(&pr_json).ok()?;
-    let head = pr_value
-        .get("headRefOid")
-        .and_then(serde_json::Value::as_str)?;
-    let author = pr_value
-        .get("author")
-        .and_then(|a| a.get("login"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-
+    // One request for the head, the author, and the reviews. Each `gh` call is
+    // a process start plus a network round trip (~0.4s), and this used to make
+    // two in sequence. Owner, name, and number go in as GraphQL variables, so
+    // nothing from the remote URL is spliced into the query text.
     let (owner, repo) = slug.split_once('/')?;
-    let reviews_json = gh.run(&[
+    let state_json = gh.run(&[
         "api",
-        &format!("repos/{owner}/{repo}/pulls/{pr_num}/reviews"),
+        "graphql",
+        "-f",
+        &format!("query={PR_STATE_QUERY}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={repo}"),
+        "-F",
+        &format!("number={pr_num}"),
     ])?;
-    let reviews = parse_reviews(&reviews_json)?;
+    let state = parse_pr_state(&state_json)?;
 
-    if is_reviewed(&reviews, head, author) {
+    if is_reviewed(&state.reviews, &state.head, &state.author) {
         return None;
     }
+    let head = state.head.as_str();
 
     Some(format!(
         "warn-unreviewed-ready-flip: PR #{pr_num} has no reviewed signal on head {short_head} — \
@@ -629,34 +640,58 @@ mod tests {
     // --- evaluate: fake GhRunner ---
 
     struct FakeGh {
-        pr_json: Option<String>,
-        reviews_json: Option<String>,
+        /// The `gh api graphql` response.
+        state_json: Option<String>,
         bare_pr_number: Option<String>,
+        calls: std::cell::Cell<u32>,
+        graphql_args: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakeGh {
+        /// `reviews` is written in the REST review shape (`user.login`,
+        /// `commit_id`) the fixtures have always used, and converted here to
+        /// the GraphQL shape the hook now reads.
         fn new(head: &str, author: &str, reviews: serde_json::Value) -> Self {
+            let nodes: Vec<serde_json::Value> = reviews
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "author": {"login": r["user"]["login"]},
+                                "state": r["state"],
+                                "commit": {"oid": r["commit_id"]},
+                                "body": r["body"],
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Self {
-                pr_json: Some(
-                    serde_json::json!({"headRefOid": head, "author": {"login": author}})
-                        .to_string(),
+                state_json: Some(
+                    serde_json::json!({"data": {"repository": {"pullRequest": {
+                        "headRefOid": head,
+                        "author": {"login": author},
+                        "reviews": {"nodes": nodes},
+                    }}}})
+                    .to_string(),
                 ),
-                reviews_json: Some(reviews.to_string()),
                 bare_pr_number: None,
+                calls: std::cell::Cell::new(0),
+                graphql_args: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
 
     impl GhRunner for FakeGh {
         fn run(&self, args: &[&str]) -> Option<String> {
+            self.calls.set(self.calls.get() + 1);
             if args.first() == Some(&"pr") && args.get(1) == Some(&"view") {
-                if args.contains(&"number") {
-                    return self.bare_pr_number.clone();
-                }
-                return self.pr_json.clone();
+                return self.bare_pr_number.clone();
             }
-            if args.first() == Some(&"api") {
-                return self.reviews_json.clone();
+            if args.first() == Some(&"api") && args.get(1) == Some(&"graphql") {
+                *self.graphql_args.borrow_mut() = args.iter().map(ToString::to_string).collect();
+                return self.state_json.clone();
             }
             None
         }
@@ -766,8 +801,63 @@ mod tests {
             "cameronsjo",
             serde_json::json!([]),
         );
-        gh.reviews_json = Some("not json".to_string());
+        gh.state_json = Some("not json".to_string());
         assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
+    }
+
+    #[test]
+    fn missing_pull_request_is_silent() {
+        let mut gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
+        gh.state_json = Some(r#"{"data":{"repository":{"pullRequest":null}}}"#.to_string());
+        assert_eq!(evaluate("owner/repo", "gh pr merge 5", &gh), None);
+    }
+
+    #[test]
+    fn deleted_author_and_commitless_review_parse_as_empty() {
+        let state = parse_pr_state(
+            r#"{"data":{"repository":{"pullRequest":{"headRefOid":"h","author":null,
+                "reviews":{"nodes":[{"author":null,"state":"COMMENTED","commit":null,"body":"x"}]}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.author, "");
+        assert_eq!(state.reviews[0].login, "");
+        assert_eq!(state.reviews[0].commit_id, "");
+    }
+
+    #[test]
+    fn query_asks_for_the_newest_reviews_and_takes_the_repo_as_variables() {
+        let gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
+        let _ = evaluate("some-owner/some-repo", "gh pr merge 5", &gh);
+        let args = gh.graphql_args.borrow();
+        let query = args.iter().find(|a| a.starts_with("query=")).unwrap();
+        // Newest first: the oldest-first REST list stopped at 30 reviews.
+        assert!(query.contains("reviews(last: 100)"), "{query}");
+        // The repo reaches gh only as variables, never inside the query text.
+        assert!(!query.contains("some-owner"), "{query}");
+        assert!(args.contains(&"owner=some-owner".to_string()), "{args:?}");
+        assert!(args.contains(&"name=some-repo".to_string()), "{args:?}");
+        assert!(args.contains(&"number=5".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn a_numbered_flip_costs_one_gh_call() {
+        // Each `gh` call is a process start plus a network round trip, about
+        // 0.4s. Two sequential calls made this the slowest hook in the suite.
+        let gh = FakeGh::new(
+            "abc1234abcabc1234abcabc1234abcabc1234abc",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
+        let _ = evaluate("owner/repo", "gh pr merge 5", &gh);
+        assert_eq!(gh.calls.get(), 1);
     }
 
     #[test]
