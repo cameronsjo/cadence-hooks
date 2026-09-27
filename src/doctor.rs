@@ -1597,14 +1597,18 @@ fn failopen_findings_with_wiring(
                 ),
             )
         } else {
-            // With no recorded error there is nothing to search for, so the
-            // filing clause must not refer back to a search it never offered.
-            let (search_clause, file_condition) = last_error
+            // Search on the current version's own error: an older binary that
+            // wrote after it would otherwise steer the search to a panic a
+            // release already fixed. With no recorded error there is nothing to
+            // search for, so the filing clause must not refer back to a search
+            // it never offered.
+            let (search_clause, file_condition) = panic_recency
+                .and_then(|r| r.last_current_error.as_deref())
                 .map(|e| {
                     (
                         format!(
-                            ", search open issues for the last error first (`gh issue list -R \
-                             cameronsjo/cadence-hooks --search {}`)",
+                            ", search open issues for the last error on {current_version} first \
+                             (`gh issue list -R cameronsjo/cadence-hooks --search {}`)",
                             shell_single_quote(&issue_search_excerpt(e))
                         ),
                         " only if none matches",
@@ -3613,6 +3617,29 @@ mod tests {
             "{}",
             findings[0].remediation
         );
+    }
+
+    #[test]
+    fn panic_warning_searches_the_current_version_error_not_a_newer_old_one() {
+        // A stale binary writing after the current one's panic must not steer
+        // the search to its own, already-fixed error.
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = [
+            r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","error":"index out of bounds","ts":"2000-01-01T00:00:00Z"}"#,
+            r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","error":"broken pipe","ts":"2000-01-02T00:00:00Z"}"#,
+        ]
+        .join("\n");
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{rows}\n")).unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(946_857_600); // 2000-01-03
+
+        let findings = failopen_findings(tmp.path(), WEEK, now, "1.0.0");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        let remediation = &findings[0].remediation;
+        assert!(
+            remediation.contains("'index out of bounds'"),
+            "{remediation}"
+        );
+        assert!(!remediation.contains("broken pipe"), "{remediation}");
     }
 
     #[test]
