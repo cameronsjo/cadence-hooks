@@ -3458,6 +3458,78 @@ mod tests {
     }
 
     #[test]
+    fn panic_rows_only_from_other_versions_are_a_note_without_file_an_issue() {
+        // cameronsjo/cadence-hooks#917, #956, #1007: three filings of the same
+        // panic, each already fixed by the time it was reported, because
+        // doctor warned on a row no shipped binary could still write.
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Note);
+        assert!(
+            findings[0].diagnosis.contains("none on current 1.0.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].diagnosis.contains("0.9.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].remediation.contains("no action needed"),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("file one"),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("always a bug"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn panic_row_on_current_version_still_warns_and_says_search_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows = format!(
+            "{}\n{}\n",
+            format!(
+                r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","ts":"{ts}"}}"#
+            ),
+            format!(
+                r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+            )
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].diagnosis.contains("1 on current 1.0.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].remediation.contains("search open issues"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
     fn failopen_findings_parse_below_threshold_is_silent() {
         let tmp = tempfile::tempdir().unwrap();
         let ts = cadence_hooks_core::time::utc_timestamp();
