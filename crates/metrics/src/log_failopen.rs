@@ -163,6 +163,12 @@ pub struct FailopenRecency {
     /// explicit JSON null — all three are the same "no diagnostic here" to a
     /// reader, so they collapse deliberately.
     pub last_error: Option<String>,
+    /// The `error` on the most recent windowed row that carries the CURRENT
+    /// binary's version, under the same `None` rules as [`Self::last_error`].
+    /// It differs from `last_error` when an older binary wrote after the
+    /// current one: a reader asking "is this binary's panic already filed?"
+    /// needs this binary's error, not the older one's.
+    pub last_current_error: Option<String>,
     /// Distinct `"<namespace> <subcommand>"` pairs among the windowed rows
     /// **on the current version**, sorted, capped at `MAX_SUBCOMMANDS` (a
     /// private constant, so it is named rather than intra-doc linked — the
@@ -318,17 +324,20 @@ fn recency_from(
     current_version: &str,
 ) -> Option<FailopenRecency> {
     let rows: Vec<Value> = windowed_rows(jsonl, cutoff, reason).collect();
+    let is_current =
+        |v: &Value| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version);
 
     // Comparator form, not `max_by_key`: the key borrows from the row, which a
     // `-> B` key closure can't outlive. On a `ts` tie (two rows in the same
     // second, plausible under a burst) `max_by` keeps the later row in file
     // order — an arbitrary but deterministic winner, which is all a recency
     // display needs.
-    let last = rows.iter().max_by(|a, b| {
+    let by_ts = |a: &&Value, b: &&Value| {
         let ta = a.get("ts").and_then(Value::as_str).unwrap_or("");
         let tb = b.get("ts").and_then(Value::as_str).unwrap_or("");
         ta.cmp(tb)
-    })?;
+    };
+    let last = rows.iter().max_by(by_ts)?;
     // display_safe: these land verbatim in a terminal-printed doctor diagnosis.
     // The values are this binary's own `ts`/`binaryVersion`, so only a
     // hand-tampered failopen.jsonl could smuggle ANSI/control bytes through —
@@ -341,15 +350,19 @@ fn recency_from(
     );
     // Absent (v1 row), JSON null, or non-string all collapse to `None` — a
     // reader has no diagnostic in any of the three cases.
-    let last_error = last
-        .get("error")
-        .and_then(Value::as_str)
-        .map(common::display_safe)
-        .filter(|e| !e.is_empty());
-    let on_current_version = rows
+    let row_error = |row: &Value| {
+        row.get("error")
+            .and_then(Value::as_str)
+            .map(common::display_safe)
+            .filter(|e| !e.is_empty())
+    };
+    let last_error = row_error(last);
+    let last_current_error = rows
         .iter()
-        .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
-        .count() as u64;
+        .filter(|v| is_current(v))
+        .max_by(by_ts)
+        .and_then(row_error);
+    let on_current_version = rows.iter().filter(|v| is_current(v)).count() as u64;
     // The DATE prefix of the fixed-width `%Y-%m-%dT%H:%M:%SZ` stamp. A count of
     // distinct days is the shape signal a bare total cannot carry: 120 rows on
     // one day is an episode to correlate with a release or a config change,
@@ -372,10 +385,7 @@ fn recency_from(
     // alphabetically-first four at O(MAX_SUBCOMMANDS) resident.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut unpaired_on_current = false;
-    for row in rows
-        .iter()
-        .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
-    {
+    for row in rows.iter().filter(|v| is_current(v)) {
         // Both halves are validated INDEPENDENTLY. A combined-string emptiness
         // test passes `namespace: ""` with `subcommand: "hook"`, which renders
         // as a leading-space " hook" — a malformed row dressed up as an
@@ -413,6 +423,7 @@ fn recency_from(
         on_current_version,
         distinct_days,
         last_error,
+        last_current_error,
         subcommands,
         unpaired_on_current,
     })
@@ -1022,6 +1033,29 @@ mod tests {
             recency.last_error.as_deref(),
             Some("Failed to parse hook JSON: expected value at line 1 column 1")
         );
+    }
+
+    #[test]
+    fn recency_from_last_current_error_ignores_a_newer_other_version_row() {
+        // An older binary still running (a stale install, a workload machine)
+        // can write a row AFTER the current binary's panic. `last_error` follows
+        // the newest row; `last_current_error` must stay on the current one.
+        let jsonl = [
+            r#"{"schemaVersion":2,"reason":"panic","binaryVersion":"1.0.0","error":"older current panic","ts":"2026-07-18T00:00:00Z"}"#,
+            r#"{"schemaVersion":2,"reason":"panic","binaryVersion":"1.0.0","error":"current panic","ts":"2026-07-19T00:00:00Z"}"#,
+            r#"{"schemaVersion":2,"reason":"panic","binaryVersion":"0.9.0","error":"fixed panic","ts":"2026-07-20T00:00:00Z"}"#,
+        ]
+        .join("\n");
+        let recency = recency_from(&jsonl, "2026-07-01T00:00:00Z", "panic", "1.0.0").unwrap();
+        assert_eq!(recency.last_error.as_deref(), Some("fixed panic"));
+        assert_eq!(recency.last_current_error.as_deref(), Some("current panic"));
+    }
+
+    #[test]
+    fn recency_from_last_current_error_is_none_without_a_current_row() {
+        let jsonl = r#"{"schemaVersion":2,"reason":"panic","binaryVersion":"0.9.0","error":"fixed panic","ts":"2026-07-20T00:00:00Z"}"#;
+        let recency = recency_from(jsonl, "2026-07-01T00:00:00Z", "panic", "1.0.0").unwrap();
+        assert_eq!(recency.last_current_error, None);
     }
 
     #[test]

@@ -1020,28 +1020,6 @@ fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
     format!(r#"grep '"reason":"{reason}"' {path} | tail -5"#)
 }
 
-/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
-/// none when all counts are below their thresholds. `panic` and `parse` are
-/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
-/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
-/// because each one is an enforcement block that did not fire;
-/// `version_mismatch` only counts rows
-/// tagged with the CURRENT binary's own version (see
-/// `log_failopen::counts_from`'s doc) — an older-version row is the
-/// sanctioned release-transition case and is excluded by construction.
-///
-/// Counts and the `parse`/`panic` recency come from a single
-/// `recent_failopen_report` read. Both of those findings name the last recorded
-/// `error` — the field that makes the "inspect failopen.jsonl" guidance
-/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
-/// existed simply omit the clause. The `parse` finding additionally carries
-/// recency + version context: when it last fired, on which binary version,
-/// and how many of the windowed rows are on the CURRENT version. Its *count*
-/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
-/// not version-specific, so filtering the count would under-report a live one —
-/// but zero on the current version disambiguates a burst whose fix already
-/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
-/// the bare count could not.
 /// Words that occupy command position while the thing that actually has to
 /// exist is their ARGUMENT. [`referenced_clis`] walks past these.
 ///
@@ -1309,6 +1287,43 @@ fn shape_remediation(distinct_days: u64) -> String {
     }
 }
 
+/// How many windowed rows for a `reason` are on the running binary's own
+/// version, next to that version — `none on current 1.2.3` or `4 on current
+/// 1.2.3`. Shared by the `parse` finding and both `panic` arms, so the two
+/// stay worded identically wherever they report the same fact.
+fn current_version_clause(on_current: u64, current_version: &str) -> String {
+    if on_current == 0 {
+        format!("none on current {current_version}")
+    } else {
+        format!("{on_current} on current {current_version}")
+    }
+}
+
+/// The search terms for a panic's `last_error`: the message without the
+/// ` (at file:line)` location suffix the panic hook appends, cut back to whole
+/// words within 60 characters. GitHub search ANDs its terms, so a token cut
+/// mid-word would match nothing — not even the issue that reports this panic.
+fn issue_search_excerpt(error: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let message = error.rfind(" (at ").map_or(error, |i| &error[..i]).trim();
+    let mut excerpt = String::new();
+    for word in message.split_whitespace() {
+        let sep = usize::from(!excerpt.is_empty());
+        if excerpt.chars().count() + sep + word.chars().count() > MAX_CHARS {
+            break;
+        }
+        if sep == 1 {
+            excerpt.push(' ');
+        }
+        excerpt.push_str(word);
+    }
+    if excerpt.is_empty() {
+        // A first word longer than the cap: a cut token beats an empty query.
+        return message.chars().take(MAX_CHARS).collect();
+    }
+    excerpt
+}
+
 /// Concatenate the files a hook command is usually wired from: each install's
 /// `hooks/hooks.json`, the user `settings.json`, and the current project's
 /// `.claude/settings.json` and `settings.local.json`. A missing file is
@@ -1496,6 +1511,33 @@ fn failopen_findings(
     failopen_findings_with_wiring(dir, window, now, current_version, None)
 }
 
+/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
+/// none when all counts are below their thresholds. `panic` and `parse` are
+/// reported on any/moderate occurrence (`panic` as a Note when no row is on the
+/// current version, see below); the #271 deadline pair is load-correlated
+/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
+/// because each one is an enforcement block that did not fire;
+/// `version_mismatch` only counts rows
+/// tagged with the CURRENT binary's own version (see
+/// `log_failopen::counts_from`'s doc) — an older-version row is the
+/// sanctioned release-transition case and is excluded by construction.
+///
+/// Counts and the `parse`/`panic` recency come from a single
+/// `recent_failopen_report` read. Both of those findings name the last recorded
+/// `error` — the field that makes the "inspect failopen.jsonl" guidance
+/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
+/// existed simply omit the clause. The `parse` finding additionally carries
+/// recency + version context: when it last fired, on which binary version,
+/// and how many of the windowed rows are on the CURRENT version. Its *count*
+/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
+/// not version-specific, so filtering the count would under-report a live one —
+/// but zero on the current version disambiguates a burst whose fix already
+/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
+/// the bare count could not. `panic` recency also selects the finding's
+/// *severity*: a panic row on the current binary version still warns, while
+/// one only from another version drops to a Note that says no action is
+/// needed (cameronsjo/cadence-hooks#917, #956, #1007).
+///
 /// `wiring` is the raw text of every hooks.json and settings.json this
 /// machine's hooks can come from, or `None` when doctor could not collect it.
 /// It splits `version_mismatch` pairs into wired ones (a real skew) and ones no
@@ -1520,27 +1562,89 @@ fn failopen_findings_with_wiring(
     let mut findings = Vec::new();
 
     if counts.panic >= 1 {
-        let last_error = recency
-            .get("panic")
+        let panic_recency = recency.get("panic");
+        let last_ts = panic_recency
+            .map(|r| r.last_ts.as_str())
+            .unwrap_or_default();
+        let last_version = panic_recency
+            .map(|r| r.last_version.as_str())
+            .unwrap_or_default();
+        // The Note describes the newest row of any version; the Warning is about
+        // the current version, so it quotes and searches that version's error.
+        let last_error_clause = panic_recency
             .and_then(|r| r.last_error.as_deref())
             .map(|e| format!("; last error: {e}"))
             .unwrap_or_default();
+        let current_error = panic_recency.and_then(|r| r.last_current_error.as_deref());
+        let current_error_clause = current_error
+            .map(|e| format!("; last error on {current_version}: {e}"))
+            .unwrap_or_default();
+        // `recency["panic"]` is always present when `counts.panic >= 1`,
+        // because both come from one `windowed_rows` pass. The `u64::MAX`
+        // default is therefore unreachable; it only steers a missing entry
+        // to the conservative Warning arm.
+        let current_panics = panic_recency.map_or(u64::MAX, |r| r.on_current_version);
+
+        let (severity, diagnosis, remediation) = if current_panics == 0 {
+            (
+                Severity::Note,
+                format!(
+                    "{} panic(s) in the last {days} days, {} (last: {last_ts} on \
+                     {last_version}{last_error_clause})",
+                    counts.panic,
+                    current_version_clause(current_panics, current_version)
+                ),
+                format!(
+                    "no action needed: these rows came from binaries other than \
+                     {current_version} (latest: {last_version}) and age out of the \
+                     {days}-day window; a fix for the last error is usually in the \
+                     CHANGELOG between {last_version} and {current_version}. Do not file an \
+                     issue unless doctor warns about a panic on {current_version}."
+                ),
+            )
+        } else {
+            // Search on the current version's own error: an older binary that
+            // wrote after it would otherwise steer the search to a panic a
+            // release already fixed. With no recorded error there is nothing to
+            // search for, so the filing clause must not refer back to a search
+            // it never offered.
+            let (search_clause, file_condition) = current_error
+                .map(|e| {
+                    (
+                        format!(
+                            ", search open issues for the last error on {current_version} first \
+                             (`gh issue list -R cameronsjo/cadence-hooks --search {}`)",
+                            shell_single_quote(&issue_search_excerpt(e))
+                        ),
+                        " only if none matches",
+                    )
+                })
+                .unwrap_or_default();
+            (
+                Severity::Warning,
+                format!(
+                    "{} panic(s) in the last {days} days (failopen.jsonl; last: {last_ts} on \
+                     {last_version} — {}{current_error_clause})",
+                    counts.panic,
+                    current_version_clause(current_panics, current_version)
+                ),
+                format!(
+                    "a panic in a check/logger is always a bug — list the rows with \
+                     `{}`{search_clause}, and file one at \
+                     https://github.com/cameronsjo/cadence-hooks/issues{file_condition}",
+                    failopen_inspect_cmd(dir, "panic")
+                ),
+            )
+        };
+
         findings.push(Finding {
-            severity: Severity::Warning,
+            severity,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
             snippet: format!("panic: {}", counts.panic),
-            diagnosis: format!(
-                "{} panic(s) in the last {days} days (failopen.jsonl{last_error})",
-                counts.panic
-            ),
-            remediation: format!(
-                "a panic in a check/logger is always a bug — list the rows with \
-                 `{}` and file an issue at \
-                 https://github.com/cameronsjo/cadence-hooks/issues",
-                failopen_inspect_cmd(dir, "panic")
-            ),
+            diagnosis,
+            remediation,
         });
     }
 
@@ -1550,11 +1654,7 @@ fn failopen_findings_with_wiring(
         let recency_clause = recency
             .get("parse")
             .map(|r| {
-                let current_clause = if r.on_current_version == 0 {
-                    format!("none on current {current_version}")
-                } else {
-                    format!("{} on current {current_version}", r.on_current_version)
-                };
+                let current_clause = current_version_clause(r.on_current_version, current_version);
                 let error_clause = r
                     .last_error
                     .as_deref()
@@ -3458,6 +3558,139 @@ mod tests {
     }
 
     #[test]
+    fn panic_rows_only_from_other_versions_are_a_note_without_file_an_issue() {
+        // cameronsjo/cadence-hooks#917, #956, #1007: three filings of the same
+        // panic, each already fixed by the time it was reported, because
+        // doctor warned on a row no shipped binary could still write.
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Note);
+        assert!(
+            findings[0].diagnosis.contains("none on current 1.0.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].diagnosis.contains("0.9.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].remediation.contains("no action needed"),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("file one"),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("always a bug"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn panic_row_on_current_version_still_warns_and_says_search_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows = format!(
+            "{{\"reason\":\"panic\",\"namespace\":\"cadence\",\"subcommand\":\"terminology\",\"binaryVersion\":\"0.9.0\",\"ts\":\"{ts}\"}}\n\
+             {{\"reason\":\"panic\",\"namespace\":\"cadence\",\"subcommand\":\"terminology\",\"binaryVersion\":\"1.0.0\",\"error\":\"index out of bounds\",\"ts\":\"{ts}\"}}\n"
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].diagnosis.contains("1 on current 1.0.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].remediation.contains("search open issues"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn panic_warning_searches_the_current_version_error_not_a_newer_old_one() {
+        // A stale binary writing after the current one's panic must not steer
+        // the search to its own, already-fixed error.
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = [
+            r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","error":"index out of bounds","ts":"2000-01-01T00:00:00Z"}"#,
+            r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"0.9.0","error":"broken pipe","ts":"2000-01-02T00:00:00Z"}"#,
+        ]
+        .join("\n");
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{rows}\n")).unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(946_857_600); // 2000-01-03
+
+        let findings = failopen_findings(tmp.path(), WEEK, now, "1.0.0");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        let remediation = &findings[0].remediation;
+        assert!(
+            remediation.contains("'index out of bounds'"),
+            "{remediation}"
+        );
+        assert!(!remediation.contains("broken pipe"), "{remediation}");
+        let diagnosis = &findings[0].diagnosis;
+        assert!(
+            diagnosis.contains("last error on 1.0.0: index out of bounds"),
+            "{diagnosis}"
+        );
+        assert!(!diagnosis.contains("broken pipe"), "{diagnosis}");
+    }
+
+    #[test]
+    fn panic_on_current_version_without_error_does_not_say_none_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        let remediation = &findings[0].remediation;
+        assert!(!remediation.contains("search open issues"), "{remediation}");
+        assert!(!remediation.contains("none matches"), "{remediation}");
+        assert!(remediation.contains("file one at"), "{remediation}");
+    }
+
+    #[test]
+    fn issue_search_excerpt_drops_the_location_and_keeps_whole_words() {
+        // The real EPIPE row behind cameronsjo/cadence-hooks#1007.
+        let error = "failed printing to stdout: Broken pipe (os error 32) \
+                     (at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/stdio.rs:1166)";
+        assert_eq!(
+            issue_search_excerpt(error),
+            "failed printing to stdout: Broken pipe (os error 32)"
+        );
+
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        assert_eq!(
+            issue_search_excerpt(long),
+            "one two three four five six seven eight nine ten eleven"
+        );
+
+        let one_token = "x".repeat(80);
+        assert_eq!(issue_search_excerpt(&one_token).chars().count(), 60);
+    }
+
+    #[test]
     fn failopen_findings_parse_below_threshold_is_silent() {
         let tmp = tempfile::tempdir().unwrap();
         let ts = cadence_hooks_core::time::utc_timestamp();
@@ -3850,7 +4083,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].diagnosis.contains(
-                "last error: index out of bounds (at crates/cadence/src/terminology.rs:88)"
+                "last error on 1.0.0: index out of bounds (at crates/cadence/src/terminology.rs:88)"
             ),
             "{}",
             findings[0].diagnosis
