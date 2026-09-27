@@ -1569,9 +1569,15 @@ fn failopen_findings_with_wiring(
         let last_version = panic_recency
             .map(|r| r.last_version.as_str())
             .unwrap_or_default();
-        let last_error = panic_recency.and_then(|r| r.last_error.as_deref());
-        let last_error_clause = last_error
+        // The Note describes the newest row of any version; the Warning is about
+        // the current version, so it quotes and searches that version's error.
+        let last_error_clause = panic_recency
+            .and_then(|r| r.last_error.as_deref())
             .map(|e| format!("; last error: {e}"))
+            .unwrap_or_default();
+        let current_error = panic_recency.and_then(|r| r.last_current_error.as_deref());
+        let current_error_clause = current_error
+            .map(|e| format!("; last error on {current_version}: {e}"))
             .unwrap_or_default();
         // `recency["panic"]` is always present when `counts.panic >= 1`,
         // because both come from one `windowed_rows` pass. The `u64::MAX`
@@ -1602,8 +1608,7 @@ fn failopen_findings_with_wiring(
             // release already fixed. With no recorded error there is nothing to
             // search for, so the filing clause must not refer back to a search
             // it never offered.
-            let (search_clause, file_condition) = panic_recency
-                .and_then(|r| r.last_current_error.as_deref())
+            let (search_clause, file_condition) = current_error
                 .map(|e| {
                     (
                         format!(
@@ -1619,7 +1624,7 @@ fn failopen_findings_with_wiring(
                 Severity::Warning,
                 format!(
                     "{} panic(s) in the last {days} days (failopen.jsonl; last: {last_ts} on \
-                     {last_version} — {}{last_error_clause})",
+                     {last_version} — {}{current_error_clause})",
                     counts.panic,
                     current_version_clause(current_panics, current_version)
                 ),
@@ -3640,6 +3645,12 @@ mod tests {
             "{remediation}"
         );
         assert!(!remediation.contains("broken pipe"), "{remediation}");
+        let diagnosis = &findings[0].diagnosis;
+        assert!(
+            diagnosis.contains("last error on 1.0.0: index out of bounds"),
+            "{diagnosis}"
+        );
+        assert!(!diagnosis.contains("broken pipe"), "{diagnosis}");
     }
 
     #[test]
@@ -4072,7 +4083,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].diagnosis.contains(
-                "last error: index out of bounds (at crates/cadence/src/terminology.rs:88)"
+                "last error on 1.0.0: index out of bounds (at crates/cadence/src/terminology.rs:88)"
             ),
             "{}",
             findings[0].diagnosis
