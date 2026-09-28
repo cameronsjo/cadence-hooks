@@ -9,7 +9,9 @@
 //! Scope is deliberately narrow to avoid false positives: the nudge fires only
 //! when an aliased tool is a *producer* in a pipeline (a non-final pipe stage).
 //! Interactive use (`ls -la`) and consumer position (`git diff | cat`) stay
-//! silent.
+//! silent. Producers inside `$(…)`, backticks, and `( … )` subshells are
+//! judged at their own command position, so `f=$(command ls | head -1)` stays
+//! silent and `f=$(ls | head -1)` nudges.
 
 use cadence_hooks_core::shell::strip_quotes;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -36,10 +38,47 @@ static CHAIN_SPLIT: LazyLock<Regex> =
 /// Nudges to use `command <tool>` when piping aliased tool output to parsers.
 pub struct WarnAliasParsing;
 
+/// The part of a pipe stage where its producing command actually starts.
+///
+/// The check splits a command into pipe stages before it sees any `$(…)`,
+/// backtick, or `( … )` structure, so `f=$(command ls | head -1)` yields the
+/// stage `f=$(command ls`. An opener left unclosed within a stage marks the
+/// real command position: the command after it is the one whose output feeds
+/// the pipe. This returns the slice after the innermost such opener, or the
+/// whole stage when every opener closes inside it.
+///
+/// A `)` pops only a `(`, and an unmatched `)` is ignored, so a `case`
+/// pattern or the `head -1)` tail of a substitution never panics or
+/// misplaces the position. A backtick closes an open backtick, else opens one.
+fn command_position(stage: &str) -> &str {
+    // Byte offset just past each still-open opener, with the opener itself.
+    let mut open: Vec<(char, usize)> = Vec::new();
+    for (idx, ch) in stage.char_indices() {
+        match ch {
+            '(' => open.push(('(', idx + 1)),
+            ')' => {
+                if matches!(open.last(), Some(('(', _))) {
+                    open.pop();
+                }
+            }
+            '`' => {
+                if matches!(open.last(), Some(('`', _))) {
+                    open.pop();
+                } else {
+                    open.push(('`', idx + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Openers are ASCII, so `idx + 1` is always a char boundary.
+    open.last().map_or(stage, |&(_, start)| &stage[start..])
+}
+
 /// If this pipe stage's producing command is a bare aliased tool, return the
 /// (tool, replacement) pair.
 fn stage_aliased_tool(stage: &str) -> Option<(&'static str, &'static str)> {
-    let tokens: Vec<&str> = stage.split_whitespace().collect();
+    let tokens: Vec<&str> = command_position(stage).split_whitespace().collect();
 
     // Skip through wrappers (`xargs ls`, `sudo du`) and env assignments
     // (`LC_ALL=C find`) to reach the real tool.
@@ -254,6 +293,60 @@ mod tests {
     fn middle_pipe_stage_producer_nudges() {
         // Aliased tool in the middle of a pipeline still produces parsed output
         let result = WarnAliasParsing.run(&make_bash("echo /tmp | xargs ls | grep log"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    // --- command substitution and subshells (cameronsjo/cadence-hooks#1029) ---
+
+    #[test]
+    fn command_inside_dollar_paren_assignment_allowed() {
+        let result = WarnAliasParsing.run(&make_bash("f=$(command ls -t x | head -1)"));
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn command_inside_backtick_assignment_allowed() {
+        let result = WarnAliasParsing.run(&make_bash("f=`command ls -t x | head -1`"));
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn nested_command_inside_substitution_allowed() {
+        let result = WarnAliasParsing.run(&make_bash("x=$(echo $(command ls | head -1))"));
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn aliased_producer_inside_substitution_nudges() {
+        let result = WarnAliasParsing.run(&make_bash("f=$(ls -t x | head -1)"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn aliased_producer_inside_bare_substitution_nudges() {
+        let result = WarnAliasParsing.run(&make_bash("echo $(ls | head -1)"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn aliased_producer_in_subshell_nudges() {
+        let result = WarnAliasParsing.run(&make_bash("(ls | grep x)"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn closed_substitution_before_producer_still_nudges() {
+        // The `$(date)` closes inside the stage, so the command position is the
+        // whole stage: the assignment is skipped and `ls` is the producer.
+        let result = WarnAliasParsing.run(&make_bash("FOO=$(date) ls | grep x"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn unmatched_close_paren_is_total() {
+        // A stray `)` is ignored rather than popping an empty stack or
+        // slicing out of bounds; the later `ls` producer is still judged.
+        let result = WarnAliasParsing.run(&make_bash("echo a) | ls | grep x"));
         assert_eq!(result.outcome, Outcome::Nudge);
     }
 }
