@@ -284,7 +284,7 @@ With `CADENCE_BYPASS=1` also set, a named hook is reported as **moot** instead: 
 
 **Bypass-exempt hooks.** `CADENCE_BYPASS=1` skips every enforcement hook except the SessionStart status check `enforcement-status`. Its entire job is to report that guards have been switched off, and `CADENCE_BYPASS=1` is a switch it reports on — bypassing it would suppress the report of the bypass itself. It reports the bypass, and any `CADENCE_DISABLE` naming a protected guard other than itself, at session start. `cadence-hooks list` and `cadence-hooks doctor` both name the exception in their bypass banner. Disabling the `cadence-guardrails` plugin is the remaining way to stop it.
 
-`doctor` reports all of this at session start, `--quiet` included — that route prints the suppression lines to stdout and stays completely silent when enforcement is on, so a session running with guards switched off cannot look like a clean one.
+`doctor` reports all four outcomes. `doctor --quiet`, the session-start route, prints only what is really off: the `CADENCE_BYPASS=1` banner and the `Disabled via CADENCE_DISABLE` line, to stdout. It stays silent when enforcement is on, so a session running with guards switched off cannot look like a clean one. Refused, moot, and unrecognized entries switch nothing off, so they appear only in the full report; `guardrails enforcement-status` reports refused protected-guard disables at session start.
 
 ### Allowlist host scoping
 
@@ -350,7 +350,7 @@ cadence-hooks doctor
 # Audit a specific tree (handy in CI before publishing a plugin)
 cadence-hooks doctor --root ./plugins
 
-# Preflight mode for SessionStart hooks — one summary line, non-zero only on errors
+# Preflight mode for SessionStart hooks — blockers only, non-zero only on errors
 cadence-hooks doctor --quiet
 ```
 
@@ -372,14 +372,20 @@ warning [cadence@workbench] ~/.claude/plugins/cache/workbench/cadence/174e3eb0de
 cadence-hooks doctor: 0 error(s), 1 warning(s)
 ```
 
-**`--quiet` mode** is suitable for SessionStart preflight wiring. When clean it produces no output and exits 0; on warnings it prints one summary line to stdout and exits 0 (so a `set -euo pipefail` script won't abort); on errors it writes one line to stderr and exits 2. If `CADENCE_BYPASS` or `CADENCE_DISABLE` is switching anything off, the suppression lines ([What a disable request resolves to](#what-a-disable-request-resolves-to)) go to **stdout** ahead of all of that, and do not affect the exit code.
+**`--quiet` mode** is the SessionStart preflight shape. It reports only **blockers**: findings that mean a wired hook is not running. Those are shell-expansion errors, a wiring that names a subcommand or namespace this binary does not have (in a plugin `hooks.json`, in `settings.json`, or in a plugin removed upstream), a `group` entry the binary cannot parse or run, a hook whose CLI dependency is not on `PATH`, a plugin that ships hooks but has no `enabledPlugins` entry, and a pinned plugin cache dir that is missing or empty. A plugin set to `false` in `enabledPlugins` never blocks. Everything else — hook latency, stale telemetry, orphaned cache dirs, identity — waits for a full `cadence-hooks doctor` run, which `cadence:outro` makes at session end.
 
-The stream split is deliberate: warnings go to **stdout** (a caller capturing stdout gets the skew nudge to inject), errors go to **stderr** (a caller redirecting stderr to `/dev/null` still fails on the exit code). Redirect accordingly — `>/dev/null` silences the skew nudge, `2>/dev/null` silences error detail but not the failure.
+- **No blockers:** no output, exit 0.
+- **Blockers:** one fixed `<cadence-system-message>` envelope on stdout, with counts only (`N error(s) and M inert hook wiring(s)`) and the upgrade hint when a subcommand is missing. It prints at most once a day per distinct blocker set. Exit 2 when any blocker is an error, else 0 (so a `set -euo pipefail` script won't abort on inert wiring alone).
+- **Configuration errors** (`$HOME` unset, no manifest and no plugin cache): the same envelope as one error on stdout, the detail on stderr, exit 2.
+- **Enforcement really off:** the `CADENCE_BYPASS=1` banner and the `Disabled via CADENCE_DISABLE` line ([What a disable request resolves to](#what-a-disable-request-resolves-to)) go to stdout ahead of everything above and do not affect the exit code.
+
+Everything the session must see goes to **stdout**, because the documented wiring below discards stderr. The envelope never carries plugin-supplied text: finding specifics stay in the full report.
 
 ```bash
-# In a SessionStart hook — detect skew without blocking on warnings
+# In a SessionStart hook — surface blockers without failing the hook
+# stdout at exit 0 becomes session context; stderr does not reach the model.
 if msg=$(cadence-hooks doctor --quiet 2>/dev/null); [ -n "$msg" ]; then
-  echo "$msg" >&2
+  printf '%s\n' "$msg"
 fi
 ```
 

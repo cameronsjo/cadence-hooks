@@ -38,9 +38,28 @@ enum Severity {
     Note,
 }
 
+/// Whether a finding means wired hooks are not running — the only class
+/// `doctor --quiet` reports at SessionStart. Everything else waits for a full
+/// `doctor` run (the `cadence:outro` step).
+///
+/// Set by the construction site, never derived from `diagnosis` text: a
+/// diagnosis interpolates plugin-controlled `hooks.json` names, so matching on
+/// it would let a plugin promote or demote its own finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocker {
+    /// Advisory. Full `doctor` reports it; SessionStart does not.
+    No,
+    /// A wired hook is not running as wired.
+    Yes,
+    /// As [`Blocker::Yes`], and a binary upgrade is the fix: the wiring names
+    /// a subcommand this binary does not have.
+    YesUpgrade,
+}
+
 /// One detected issue in a hook command.
 struct Finding {
     severity: Severity,
+    blocker: Blocker,
     plugin: String,
     file: PathBuf,
     line: Option<usize>,
@@ -113,6 +132,12 @@ impl Finding {
     fn print(&self) {
         println!("{}", self.render());
     }
+}
+
+/// Whether `finding` belongs in the SessionStart (`--quiet`) report. Reads the
+/// typed [`Blocker`] only — see its doc for why never the diagnosis text.
+fn is_session_start_blocker(finding: &Finding) -> bool {
+    finding.blocker != Blocker::No
 }
 
 /// Single-quoted env-var pattern: `'${SOMETHING}'` or `'$SOMETHING'` won't
@@ -221,6 +246,7 @@ fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagno
     let unquoted = token.trim_matches(|c| c == '\'' || c == '"');
     if token.starts_with('-') {
         return Some(SkewDiagnosis {
+            blocker: Blocker::Yes,
             diagnosis: format!(
                 "group entry carries the flag '{token}'; `group` takes no flags, so the \
                  whole entry fails to parse and none of its checks run"
@@ -232,6 +258,7 @@ fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagno
         || token.starts_with(['\'', '"']) != token.ends_with(['\'', '"'])
     {
         return Some(SkewDiagnosis {
+            blocker: Blocker::Yes,
             diagnosis: format!(
                 "group member '{token}' is split or joined by quoting; each member must be \
                  its own unquoted <namespace>/<hook> argument"
@@ -242,6 +269,7 @@ fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagno
     match crate::group::resolve(unquoted) {
         Ok(_) => None,
         Err(crate::group::Rejected::NotAToolCheck) => Some(SkewDiagnosis {
+            blocker: Blocker::Yes,
             diagnosis: format!(
                 "group member '{unquoted}' is not a tool-event check (a logger, a CLI \
                  action, or a SessionStart hook), so a group run skips it"
@@ -251,6 +279,7 @@ fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagno
         Err(_) => match unquoted.split_once('/') {
             Some((ns, sub)) => judge_invocation(ns, sub, channel),
             None => Some(SkewDiagnosis {
+                blocker: Blocker::Yes,
                 diagnosis: format!("group member '{unquoted}' is not in <namespace>/<hook> form"),
                 remediation: "write the member as <namespace>/<hook>, e.g. cadence/terminology"
                     .to_string(),
@@ -262,6 +291,7 @@ fn judge_group_member(token: &str, channel: InstallChannel) -> Option<SkewDiagno
 /// Diagnosis for a version-skew finding.
 #[derive(Debug, PartialEq)]
 struct SkewDiagnosis {
+    blocker: Blocker,
     diagnosis: String,
     remediation: String,
 }
@@ -339,22 +369,25 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
     }
 }
 
-/// Build the once-daily enveloped SessionStart warning nag. Wrapped in a
-/// `<cadence-system-message>` envelope and phrased as a `MUST` directive
-/// addressed to the hosting session (never the human directly) — the
-/// envelope tags are what let a downstream reader (or the session itself)
-/// recognize this as machine-directed instruction text rather than a plain
-/// status line. The version-skew upgrade hint is appended to the count line
-/// only when a skew warning is present — stale-telemetry-only warnings carry
-/// no upgrade to suggest.
+/// Build the SessionStart blocker envelope: the only thing `doctor --quiet`
+/// reports about findings. Wrapped in a `<cadence-system-message>` envelope and
+/// addressed to the hosting session (never the human directly), so a reader
+/// can tell machine-directed instruction text from a plain status line.
+///
+/// It fires only for [`Blocker`] findings — wired hooks that are not running —
+/// and never for advisory warnings (hook latency, stale telemetry, orphans),
+/// which a full `doctor` run at session end reports instead. `n_errors` counts
+/// `Severity::Error` blockers (and configuration errors); `n_inert` counts the
+/// rest. The upgrade hint appears only when a blocker names a subcommand this
+/// binary lacks, the one case an upgrade fixes.
 ///
 /// Pure and print-free by design: the call site owns the once-daily gate
 /// (`cadence_hooks_core::markers::claim_today`, keyed on
-/// [`warning_set_token`]) and the actual `println!`, so this shape is
+/// [`blocker_set_token`]) and the actual `println!`, so this shape is
 /// unit-testable without touching the marker filesystem.
 ///
 /// **Invariant: no untrusted text.** Everything interpolated here is
-/// binary-controlled (the compile-time version, a count, the static upgrade
+/// binary-controlled (the compile-time version, two counts, the static upgrade
 /// hints). The envelope is trust-elevated instruction text addressed to the
 /// hosting session, so interpolating a plugin-controlled `diagnosis` into it
 /// would hand plugin metadata a prompt-injection channel — keep specifics in
@@ -363,40 +396,74 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
 /// **Known degraded mode:** the gate is content-keyed, not date-keyed, and it
 /// is skipped entirely (every call fires) whenever
 /// `cadence_hooks_core::markers::marker_dir_is_private` is false — a
-/// non-private marker dir (e.g. a world-writable fallback base) means the nag
-/// simply repeats every session rather than risk a co-tenant muting it. A
-/// `$TMPDIR` reboot that clears the marker dir re-arms the gate the same way:
-/// the next session after a reboot sees "first sighting" again even for an
-/// unchanged warning set.
-fn quiet_warning_envelope(
+/// non-private marker dir (e.g. a world-writable fallback base) means the
+/// envelope simply repeats every session rather than risk a co-tenant muting
+/// it. A `$TMPDIR` reboot that clears the marker dir re-arms the gate the same
+/// way.
+fn quiet_blocker_envelope(
     version: &str,
-    n_warn: usize,
-    has_skew: bool,
+    n_errors: usize,
+    n_inert: usize,
+    upgrade_fixes: bool,
     channel: InstallChannel,
 ) -> String {
-    let mut count_line = format!("cadence-hooks {version}: {n_warn} plugin warning(s).");
-    if has_skew {
-        count_line.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+    let mut action_line =
+        "Run 'cadence-hooks doctor' and tell the user in one line before other work.".to_string();
+    if upgrade_fixes {
+        action_line.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
     }
     format!(
         "<cadence-system-message>\n\
-         This appears only on the first session of the day. You MUST run 'cadence-hooks doctor',\n\
-         triage, and surface anything actionable to the user in one line before session work ends.\n\
-         {count_line}\n\
+         cadence-hooks {version}: {n_errors} error(s) and {n_inert} inert hook wiring(s) \
+         — hooks are not running as wired.\n\
+         {action_line}\n\
          </cadence-system-message>"
     )
 }
 
-/// Deterministic content token for a warning set: a SHA-256 digest over the
-/// running binary's version plus every warning's `diagnosis`, sorted before
+/// Print the blocker envelope to stdout, at most once per calendar day per
+/// distinct blocker set (#632). The I/O wrapper around
+/// [`quiet_blocker_envelope`] and [`blocker_set_token`].
+fn print_quiet_blockers(
+    n_errors: usize,
+    n_inert: usize,
+    upgrade_fixes: bool,
+    channel: InstallChannel,
+    diagnoses: &[&str],
+) {
+    let version = env!("CARGO_PKG_VERSION");
+    let token = blocker_set_token(version, diagnoses);
+    if cadence_hooks_core::markers::claim_today("doctor-blockers", &token) {
+        println!(
+            "{}",
+            quiet_blocker_envelope(version, n_errors, n_inert, upgrade_fixes, channel)
+        );
+    }
+}
+
+/// A configuration error under `--quiet`: the same envelope, as one error.
+///
+/// The detail stays on stderr, which the SessionStart wiring discards; the
+/// envelope on stdout is what reaches the session. `kind` is a fixed,
+/// binary-authored label that only keys the daily gate.
+fn print_quiet_config_error(channel: InstallChannel, kind: &'static str) {
+    print_quiet_blockers(1, 0, false, channel, &[kind]);
+}
+
+/// Deterministic content token for a blocker set: a SHA-256 digest over the
+/// running binary's version plus every blocker's `diagnosis`, sorted before
 /// hashing so the token is order-insensitive — the scan order of `findings`
-/// is not part of the identity of "today's warning set". Feeds
+/// is not part of the identity of "today's blocker set". Feeds
 /// `cadence_hooks_core::markers::claim_today`'s once-daily gate: the same
-/// warning set (same version, same diagnoses) always claims the same slot,
-/// while a genuinely different set — a new diagnosis, a dropped one, or a
-/// version bump — mints a new token so the gate re-fires the same day instead
-/// of waiting until tomorrow (mirrors `warn-stale`'s `verdict_token`
-/// precedent, per `claim_today`'s own doc comment).
+/// set (same version, same diagnoses) always claims the same slot, while a
+/// genuinely different set — a new diagnosis, a dropped one, or a version
+/// bump — mints a new token so the gate re-fires the same day instead of
+/// waiting until tomorrow (mirrors `warn-stale`'s `verdict_token` precedent,
+/// per `claim_today`'s own doc comment).
+///
+/// Only blocker diagnoses go in. Advisory diagnoses such as the hook-latency
+/// summary embed rolling counts, so hashing them minted a new token nearly
+/// every session and the "once a day" gate re-fired all day.
 ///
 /// **MUST** stay stable across the many separate `cadence-hooks` processes one
 /// SessionStart's worth of hooks spans — `std::collections::hash_map::
@@ -405,7 +472,7 @@ fn quiet_warning_envelope(
 /// distinct concern from `crate::gitstate`'s or `markers::hash_of`'s
 /// same-process marker-name hashing, which never needs cross-process
 /// stability).
-fn warning_set_token(version: &str, diagnoses: &[&str]) -> String {
+fn blocker_set_token(version: &str, diagnoses: &[&str]) -> String {
     // Bag, not set: duplicates are kept deliberately — a warning set gaining or
     // losing a duplicate diagnosis is a genuine change and should re-fire.
     let mut sorted: Vec<&str> = diagnoses.to_vec();
@@ -445,6 +512,7 @@ fn judge_invocation(
     if let Some(actual_ns) = registry::namespace_of(subcommand) {
         // The subcommand exists but under a different namespace.
         Some(SkewDiagnosis {
+            blocker: Blocker::Yes,
             diagnosis: format!(
                 "subcommand '{subcommand}' is in namespace '{actual_ns}', not '{namespace}'"
             ),
@@ -455,6 +523,7 @@ fn judge_invocation(
         // for *this* binary's install channel, not an unconditional
         // `brew upgrade` that no-ops when the tap is already current (#223).
         Some(SkewDiagnosis {
+            blocker: Blocker::YesUpgrade,
             diagnosis: format!(
                 "subcommand '{namespace} {subcommand}' is not present in this binary (v{version})"
             ),
@@ -535,6 +604,7 @@ fn scan_hooks_json(
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
                     findings.push(Finding {
                         severity: Severity::Error,
+                        blocker: Blocker::Yes,
                         plugin: plugin.to_string(),
                         file: path.to_path_buf(),
                         line: find_line_number(raw, cmd),
@@ -564,6 +634,7 @@ fn scan_hooks_json(
                     for diag in diagnoses {
                         findings.push(Finding {
                             severity: Severity::Warning,
+                            blocker: diag.blocker,
                             plugin: plugin.to_string(),
                             file: path.to_path_buf(),
                             line: find_line_number(raw, cmd),
@@ -640,6 +711,61 @@ fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
         }
     }
     Some(out)
+}
+
+/// Install dirs that only project-scope entries for **other** projects pin.
+///
+/// A `scope: "project"` install is wired only in sessions under its
+/// `projectPath`, so a defect in it (a missing pin dir, a skewed hooks.json)
+/// is not a wired hook failing to run in *this* session. A dir any in-scope
+/// entry also pins (user scope, or a project containing `cwd`) is left out, so
+/// it still blocks. Missing or unreadable manifest: empty set (nothing demoted).
+fn out_of_scope_install_dirs(manifest: &Path, cwd: &Path) -> std::collections::HashSet<PathBuf> {
+    let mut in_scope = std::collections::HashSet::new();
+    let mut out_of_scope = std::collections::HashSet::new();
+    let Some(json) = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    else {
+        return out_of_scope;
+    };
+    let installs = json
+        .get("plugins")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flat_map(|plugins| plugins.values())
+        .filter_map(|v| v.as_array())
+        .flatten();
+    for install in installs {
+        let Some(dir) = install.get("installPath").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let other_project = install.get("scope").and_then(|v| v.as_str()) == Some("project")
+            && install
+                .get("projectPath")
+                .and_then(|v| v.as_str())
+                .is_some_and(|project| !cwd.starts_with(project));
+        if other_project {
+            out_of_scope.insert(PathBuf::from(dir));
+        } else {
+            in_scope.insert(PathBuf::from(dir));
+        }
+    }
+    out_of_scope.retain(|dir| !in_scope.contains(dir));
+    out_of_scope
+}
+
+/// Demote to advisory every blocker whose file sits under an install dir
+/// [`out_of_scope_install_dirs`] returns. Full `doctor` still reports it.
+fn demote_out_of_scope_blockers(
+    findings: &mut [Finding],
+    out_of_scope: &std::collections::HashSet<PathBuf>,
+) {
+    for f in findings.iter_mut() {
+        if out_of_scope.iter().any(|dir| f.file.starts_with(dir)) {
+            f.blocker = Blocker::No;
+        }
+    }
 }
 
 /// Every `enabledPlugins` entry across `settings.json` and
@@ -730,6 +856,8 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .filter(|(label, _)| seen.insert(label.as_str()))
         .map(|(label, hooks)| Finding {
             severity: Severity::Warning,
+            // None of its hooks can fire: a wired hook that is not running.
+            blocker: Blocker::Yes,
             // The label is an `installed_plugins.json` key — third-party
             // influenced. Every `Finding` field is sanitized once, at the
             // display boundary (`Finding::render`, cameronsjo/cadence-hooks#440),
@@ -753,6 +881,21 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
             ),
         })
         .collect()
+}
+
+/// Demote to advisory every blocker attributed to a plugin the operator set
+/// to `false` in `enabledPlugins`. Its hooks are not wired, so a defect in its
+/// `hooks.json` is not a wired hook failing to run — full `doctor` still
+/// reports it.
+fn demote_disabled_plugin_blockers(findings: &mut [Finding], config_dir: &Path) {
+    let Some(enabled) = enabled_plugin_map(config_dir) else {
+        return;
+    };
+    for f in findings.iter_mut() {
+        if enabled.get(f.plugin.as_str()) == Some(&false) {
+            f.blocker = Blocker::No;
+        }
+    }
 }
 
 /// Where `/cadence-groundwork:initializing-cadence` deploys the cadence rules,
@@ -827,6 +970,8 @@ fn rules_drift_finding(config_dir: &Path, installs: &[(String, PathBuf)]) -> Opt
     }
     Some(Finding {
         severity: Severity::Warning,
+        // Advisory: the rules differ, but every wired hook still runs.
+        blocker: Blocker::No,
         // An `installed_plugins.json` key — sanitized once at display
         // (`Finding::render`, cameronsjo/cadence-hooks#440).
         plugin: label.clone(),
@@ -958,10 +1103,16 @@ fn marketplace_status(label: &str, known_marketplaces: &Path) -> MarketplaceStat
 /// binary" and points the operator at `cargo install --git` to chase
 /// subcommands that were intentionally retired — the exact misdiagnosis
 /// this finding exists to prevent.
-fn removed_upstream_finding(label: &str, install_dir: &Path) -> Finding {
+///
+/// `inert` is whether the plugin's cached wiring still names subcommands this
+/// binary lacks. The skew findings themselves stay suppressed (they would
+/// misdiagnose), but a delisted plugin whose hooks cannot run is still a
+/// SessionStart blocker — delisting must not silence it.
+fn removed_upstream_finding(label: &str, install_dir: &Path, inert: bool) -> Finding {
     let marketplace = label.split_once('@').map(|(_, m)| m).unwrap_or(label);
     Finding {
         severity: Severity::Warning,
+        blocker: if inert { Blocker::Yes } else { Blocker::No },
         plugin: label.to_string(),
         file: install_dir.to_path_buf(),
         line: None,
@@ -999,7 +1150,11 @@ fn manifest_scan_findings(
             |(label, dir)| match marketplace_status(label, known_marketplaces) {
                 MarketplaceStatus::RemovedUpstream => {
                     let mut findings = scan_plugin_dir(label, dir, channel, false);
-                    findings.push(removed_upstream_finding(label, dir));
+                    let blockers =
+                        |f: &Vec<Finding>| f.iter().filter(|x| is_session_start_blocker(x)).count();
+                    let inert =
+                        blockers(&scan_plugin_dir(label, dir, channel, true)) > blockers(&findings);
+                    findings.push(removed_upstream_finding(label, dir, inert));
                     findings
                 }
                 MarketplaceStatus::DirectorySourced | MarketplaceStatus::Resolved => {
@@ -1089,6 +1244,7 @@ fn telemetry_finding(
     };
     Some(Finding {
         severity: Severity::Warning,
+        blocker: Blocker::No,
         plugin: "cadence-metrics".to_string(),
         file: dir.to_path_buf(),
         line: None,
@@ -1229,6 +1385,7 @@ fn missing_cli_findings(
         .filter(|name| !on_path(name))
         .map(|name| Finding {
             severity: Severity::Warning,
+            blocker: Blocker::Yes,
             plugin: plugin.to_string(),
             file: path.to_path_buf(),
             line,
@@ -1314,6 +1471,7 @@ fn cloud_sync_findings(candidates: &[(&str, PathBuf)]) -> Vec<Finding> {
             let provider = cloud_sync_marker(path)?;
             Some(Finding {
                 severity: Severity::Warning,
+                blocker: Blocker::No,
                 plugin: "cadence-hooks".to_string(),
                 file: path.clone(),
                 line: None,
@@ -1479,6 +1637,7 @@ fn split_by_wiring(pairs: &[String], wiring: Option<&str>) -> (Vec<String>, Vec<
 fn adhoc_invocation_finding(dir: &Path, adhoc: &[String]) -> Finding {
     Finding {
         severity: Severity::Note,
+        blocker: Blocker::No,
         plugin: "cadence-metrics".to_string(),
         file: dir.to_path_buf(),
         line: None,
@@ -1504,6 +1663,7 @@ fn version_mismatch_finding(
     current_version: &str,
     days: u64,
     split_off_adhoc: bool,
+    wiring_known: bool,
 ) -> Finding {
     // Name the invocations, not just the count (#183). The count alone
     // leaves the operator auditing every installed plugin by hand; the
@@ -1581,10 +1741,24 @@ fn version_mismatch_finding(
     };
     Finding {
         severity: Severity::Warning,
+        // A named pair some hooks.json or settings.json wires is a hook that
+        // cannot run. The snippet carries no count, so the daily gate keys on
+        // the pairs and stays stable as the count rolls.
+        // Without collected wiring every pair counts as wired, hand-typed ones
+        // included, so only a wiring-backed pair may block.
+        blocker: if missing.is_empty() || !wiring_known {
+            Blocker::No
+        } else {
+            Blocker::YesUpgrade
+        },
         plugin: "cadence-metrics".to_string(),
         file: dir.to_path_buf(),
         line: None,
-        snippet: format!("version_mismatch: {}", count),
+        snippet: if missing.is_empty() {
+            format!("version_mismatch: {count}")
+        } else {
+            format!("version_mismatch (wired): {}", missing.join(", "))
+        },
         diagnosis: format!(
             "{} version_mismatch failopen(s) on this binary's own version \
              ({current_version}) in the last {days} days{adhoc_clause} — a \
@@ -1733,6 +1907,7 @@ fn failopen_findings_with_wiring(
 
         findings.push(Finding {
             severity,
+            blocker: Blocker::No,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
@@ -1768,6 +1943,7 @@ fn failopen_findings_with_wiring(
             .unwrap_or_default();
         findings.push(Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
@@ -1814,6 +1990,7 @@ fn failopen_findings_with_wiring(
                 current_version,
                 days,
                 !adhoc.is_empty(),
+                wiring.is_some(),
             ));
         }
     }
@@ -1821,6 +1998,7 @@ fn failopen_findings_with_wiring(
     if counts.deadline >= 3 {
         findings.push(Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
@@ -1842,6 +2020,7 @@ fn failopen_findings_with_wiring(
     if counts.deadline_block_suppressed >= 1 {
         findings.push(Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: "cadence-metrics".to_string(),
             file: dir.to_path_buf(),
             line: None,
@@ -1880,6 +2059,7 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
         None => Vec::new(),
         Some(diagnosis) => vec![Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: "cadence-hooks".to_string(),
             file: projects.to_path_buf(),
             line: None,
@@ -2238,6 +2418,8 @@ fn orphan_findings(
         if content_missing {
             findings.push(Finding {
                 severity: Severity::Warning,
+                // Nothing loads from an empty pin, hooks included.
+                blocker: Blocker::Yes,
                 plugin: label.clone(),
                 file: install_path.clone(),
                 line: None,
@@ -2282,6 +2464,7 @@ fn orphan_findings(
         let mib = orphan_bytes as f64 / (1024.0 * 1024.0);
         findings.push(Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: label.clone(),
             file: parent.clone(),
             line: None,
@@ -2775,6 +2958,7 @@ fn canonical_remote_finding(
 
     Some(Finding {
         severity: Severity::Warning,
+        blocker: Blocker::No,
         plugin: marketplace.to_string(),
         file: install_dir.to_path_buf(),
         line: None,
@@ -2808,6 +2992,7 @@ fn legacy_config_findings(root: &Path) -> Vec<Finding> {
             }
             Some(Finding {
                 severity: Severity::Warning,
+                blocker: Blocker::No,
                 plugin: "cadence-hooks".to_string(),
                 file: path.clone(),
                 line: None,
@@ -2855,6 +3040,7 @@ fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
     };
     Some(Finding {
         severity: Severity::Warning,
+        blocker: Blocker::No,
         plugin: "cadence-hooks".to_string(),
         file: path,
         line: None,
@@ -2913,6 +3099,7 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 
     Some(Finding {
         severity: Severity::Warning,
+        blocker: Blocker::No,
         plugin: "cadence-guardrails".to_string(),
         file: settings_path.to_path_buf(),
         line: None,
@@ -2927,9 +3114,9 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
-/// Exit codes:
+/// Exit codes (full report; `--quiet` below differs for warnings):
 ///   0  clean
-///   1  warnings only (version skew)
+///   1  warnings only
 ///   2  errors — shell-expansion bugs (regardless of warnings), or internal /
 ///      configuration errors (unset `$HOME`, nonexistent scan root)
 ///
@@ -2938,30 +3125,32 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 /// (active installs only), falling back to a recursive walk of
 /// `~/.claude/plugins/cache` when the manifest is absent.
 ///
-/// `quiet=true` is suitable for SessionStart preflight wiring:
-///   - Clean: no output, exit 0
-///   - Warnings only: ONE summary line to stdout, exit 0
-///   - Errors (with or without warnings): one line to stderr, exit 2 — the
-///     warning summary is suppressed; errors take precedence
-///   - Enforcement suppressed (`CADENCE_BYPASS=1`, and/or any `CADENCE_DISABLE`
-///     entry): the suppression lines to **stdout**, ahead of everything above,
-///     and independent of the exit code — a bypassed session is a fact about
-///     the session, not a finding about the plugin cache
+/// `quiet=true` is the SessionStart preflight shape. It reports only what the
+/// session must know before work starts, all on **stdout**:
+///   - No blockers: no findings output, exit 0. Advisory findings (latency,
+///     stale telemetry, orphans, identity) never print here; a full `doctor`
+///     run at session end reports them.
+///   - Blockers ([`Blocker`] — wired hooks that are not running): one fixed
+///     envelope with counts only ([`quiet_blocker_envelope`]), at most once a
+///     day per blocker set. Exit 2 when any is a `Severity::Error`, else 0.
+///   - Configuration errors (unset `$HOME`, no manifest and no cache): the same
+///     envelope as one error, detail on stderr, exit 2.
+///   - Enforcement really off (`CADENCE_BYPASS=1`, or a `CADENCE_DISABLE`
+///     entry the binary honours): the bypass banner and the honoured-disable
+///     line, ahead of everything above and independent of the exit code — a
+///     bypassed session is a fact about the session, not a finding about the
+///     plugin cache. Refused, moot, and unrecognized disable entries switch
+///     nothing off, so they stay in the full report
+///     ([`crate::bypass_report::quiet_status_lines`]).
 ///
-/// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
-/// capturing stdout gets the skew nudge to inject), errors go to stderr (a
-/// caller redirecting stderr to /dev/null still fails on the exit code).
-///
-/// The suppression lines are the fourth emitter, and they take **stdout** for
-/// the same reason the warnings do. The documented SessionStart wiring
+/// Everything goes to stdout because the documented SessionStart wiring
 /// (`docs/configuration.md`) is `if msg=$(cadence-hooks doctor --quiet
-/// 2>/dev/null)`, so stderr is discarded there — a stderr route would leave a
-/// fully-bypassed session silent at exactly the moment the operator and the
-/// agent are told what the session's posture is. Nothing is printed when
-/// enforcement is fully active, so a clean session's quiet output stays
-/// byte-identical; the "enforcement active" line is an unquiet-mode statement
-/// only. Every operator-supplied byte in these lines goes through
-/// `bypass_report`'s allowlist sanitizer before it reaches that stdout.
+/// 2>/dev/null)`: stderr is discarded there, so a stderr route would leave a
+/// broken or bypassed session silent at exactly the moment the operator and
+/// the agent are told what the session's posture is. Nothing on this route
+/// carries plugin- or operator-supplied bytes: the envelope interpolates only
+/// the version and counts, and the disclosure lines only static text and
+/// registry names.
 ///
 /// `prune` switches to the orphaned-cache-dir listing/removal mode (see
 /// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
@@ -2985,7 +3174,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
     // it. Printed first because a bypassed session makes every finding below it
     // a statement about hooks that are not currently running.
     if quiet {
-        crate::bypass_report::print_suppression_only();
+        crate::bypass_report::print_quiet_status();
     } else {
         crate::bypass_report::print_bypass_status();
     }
@@ -3015,6 +3204,9 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                 // Internal error, not version skew — exit 2 so callers never
                 // misread it as "warnings present".
                 eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
+                if quiet {
+                    print_quiet_config_error(channel, "home-unset");
+                }
                 return 2;
             };
 
@@ -3032,6 +3224,10 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
                     ));
+                    demote_disabled_plugin_blockers(
+                        &mut findings,
+                        &cadence_hooks_core::paths::claude_config_dir(),
+                    );
                     // Project settings live at the repo root, not the cwd:
                     // `doctor` run from a subdirectory still reads them.
                     let project_root = std::env::current_dir().ok().map(|cwd| {
@@ -3053,6 +3249,9 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                             "cadence-hooks doctor: no installed-plugins manifest and no plugin cache under {}",
                             plugins.display()
                         );
+                        if quiet {
+                            print_quiet_config_error(channel, "no-manifest-no-cache");
+                        }
                         return 2;
                     }
                     (scan_root(&cache, channel), cache.display().to_string())
@@ -3184,6 +3383,16 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         }
     }
 
+    // Project-scope installs for other projects are not wired here: their
+    // defects are advisory in this session. Live-machine read, so default mode
+    // only, like the checks above.
+    if root_override.is_none()
+        && let (Some(plugins), Ok(cwd)) = (plugins_dir(), std::env::current_dir())
+    {
+        let out_of_scope = out_of_scope_install_dirs(&plugins.join("installed_plugins.json"), &cwd);
+        demote_out_of_scope_blockers(&mut findings, &out_of_scope);
+    }
+
     let of = |severity: Severity| -> Vec<&Finding> {
         findings.iter().filter(|f| f.severity == severity).collect()
     };
@@ -3194,34 +3403,36 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
     );
 
     if quiet {
-        if errors.is_empty() && warnings.is_empty() {
+        // Blockers only: wired hooks that are not running. Advisory findings
+        // wait for a full `doctor` run, which `cadence:outro` makes.
+        let blockers: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| is_session_start_blocker(f))
+            .collect();
+        if blockers.is_empty() {
             return 0;
         }
-        if !errors.is_empty() {
-            eprintln!(
-                "cadence-hooks doctor: {} shell-expansion error(s) found — run 'cadence-hooks doctor' for details",
-                errors.len()
-            );
-            return 2;
-        }
-        // Warnings only in quiet mode: an enveloped nag to stdout, gated to at
-        // most once per calendar day per distinct warning set (#632).
-        // Warnings are now version skew (missing subcommands) and/or stale
-        // telemetry, so the summary stays generic and defers the specifics to a
-        // full `cadence-hooks doctor` run.
-        let version = env!("CARGO_PKG_VERSION");
-        let has_skew = warnings
+        let n_errors = blockers
             .iter()
-            .any(|w| w.diagnosis.contains("not present in this binary"));
-        let diagnoses: Vec<&str> = warnings.iter().map(|w| w.diagnosis.as_str()).collect();
-        let token = warning_set_token(version, &diagnoses);
-        if cadence_hooks_core::markers::claim_today("doctor-warnings", &token) {
-            println!(
-                "{}",
-                quiet_warning_envelope(version, warnings.len(), has_skew, channel)
-            );
-        }
-        return 0;
+            .filter(|f| f.severity == Severity::Error)
+            .count();
+        let upgrade_fixes = blockers.iter().any(|f| f.blocker == Blocker::YesUpgrade);
+        // Keyed on plugin + snippet: both are count-free for every blocker
+        // class, where a diagnosis may carry rolling counts. Length-prefixed
+        // so the join has no in-band delimiter a plugin could forge.
+        let identities: Vec<String> = blockers
+            .iter()
+            .map(|f| format!("{}:{}{}", f.plugin.len(), f.plugin, f.snippet))
+            .collect();
+        let diagnoses: Vec<&str> = identities.iter().map(String::as_str).collect();
+        print_quiet_blockers(
+            n_errors,
+            blockers.len() - n_errors,
+            upgrade_fixes,
+            channel,
+            &diagnoses,
+        );
+        return if n_errors > 0 { 2 } else { 0 };
     }
 
     // Default (verbose) mode. Notes alone still read as clean.
@@ -3267,6 +3478,7 @@ mod tests {
     fn hostile_finding(text: &str) -> Finding {
         Finding {
             severity: Severity::Warning,
+            blocker: Blocker::No,
             plugin: text.to_string(),
             file: PathBuf::from(text),
             line: None,
@@ -3435,6 +3647,67 @@ mod tests {
     // entry is exactly the fingerprint the audit found: the metrics plugin was
     // absent from the map entirely and its loggers had been inert for months.
     #[test]
+    fn a_project_install_for_another_project_never_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("installed_plugins.json");
+        fs::write(
+            &manifest,
+            serde_json::json!({ "version": 2, "plugins": {
+                "a@m": [
+                    { "scope": "project", "projectPath": "/work/other", "installPath": "/cache/a/old" },
+                    { "scope": "project", "projectPath": "/work/here", "installPath": "/cache/a/here" }
+                ],
+                "b@m": [
+                    { "scope": "user", "installPath": "/cache/b/shared" },
+                    { "scope": "project", "projectPath": "/work/other", "installPath": "/cache/b/shared" }
+                ]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let out = out_of_scope_install_dirs(&manifest, Path::new("/work/here/sub"));
+        assert_eq!(
+            out,
+            [PathBuf::from("/cache/a/old")].into_iter().collect(),
+            "only a dir no in-scope entry also pins is out of scope"
+        );
+
+        let mut findings = vec![hostile_finding("x"), hostile_finding("y")];
+        findings[0].file = PathBuf::from("/cache/a/old/hooks/hooks.json");
+        findings[1].file = PathBuf::from("/cache/a/here");
+        for f in &mut findings {
+            f.blocker = Blocker::Yes;
+        }
+        demote_out_of_scope_blockers(&mut findings, &out);
+        assert_eq!(findings[0].blocker, Blocker::No, "another project's pin");
+        assert_eq!(
+            findings[1].blocker,
+            Blocker::Yes,
+            "this project's pin still blocks"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_disabled_plugin_never_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(
+            &config,
+            r#"{"enabledPlugins":{"off@workbench":false,"on@workbench":true}}"#,
+        );
+        let mut findings = vec![
+            hostile_finding("off@workbench"),
+            hostile_finding("on@workbench"),
+        ];
+        for f in &mut findings {
+            f.blocker = Blocker::YesUpgrade;
+        }
+        demote_disabled_plugin_blockers(&mut findings, &config);
+        assert_eq!(findings[0].blocker, Blocker::No, "its hooks are not wired");
+        assert_eq!(findings[1].blocker, Blocker::YesUpgrade);
+    }
+
+    #[test]
     fn absent_enabled_entry_is_a_finding() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config");
@@ -3445,6 +3718,11 @@ mod tests {
         let findings = unenabled_plugin_findings(&installs, &config);
         assert_eq!(findings.len(), 1, "the absent plugin must be reported");
         assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(
+            findings[0].blocker,
+            Blocker::Yes,
+            "none of its hooks can fire, so it blocks at session start"
+        );
         assert!(
             findings[0].diagnosis.contains("cadence-metrics@workbench"),
             "names the plugin: {}",
@@ -4451,6 +4729,16 @@ mod tests {
             .iter()
             .find(|f| f.severity == Severity::Warning)
             .expect("wired pairs keep the skew warning");
+        assert_eq!(
+            warning.blocker,
+            Blocker::YesUpgrade,
+            "a wired pair cannot run"
+        );
+        assert!(
+            !warning.snippet.chars().any(|c| c.is_ascii_digit()),
+            "the gate identity must carry no rolling count: {}",
+            warning.snippet
+        );
         assert!(
             warning.diagnosis.contains("lab gate"),
             "{}",
@@ -4528,6 +4816,11 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].diagnosis.contains("session list"));
+        assert_eq!(
+            findings[0].blocker,
+            Blocker::No,
+            "without wiring a hand-typed pair looks wired, so it must not block"
+        );
     }
 
     // A row with no pair is unclassified: it could be the wired invocation,
@@ -5203,6 +5496,7 @@ mod tests {
             "only the missing-dir warning fires quiet"
         );
         assert!(findings[0].diagnosis.contains("missing or empty"));
+        assert_eq!(findings[0].blocker, Blocker::Yes, "nothing loads from it");
     }
 
     #[test]
@@ -5466,6 +5760,11 @@ mod tests {
             &tmp.path().join("known_marketplaces.json"),
         );
 
+        assert_eq!(
+            findings.iter().map(|f| f.blocker).collect::<Vec<_>>(),
+            vec![Blocker::Yes],
+            "delisting must not silence wiring that cannot run"
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -5897,39 +6196,31 @@ mod tests {
         assert!(!h.contains("brew"), "{h}");
     }
 
-    // ── quiet_warning_envelope (#306, #632) ─────────────────────────────────
+    // ── quiet_blocker_envelope (#306, #632) ─────────────────────────────────
 
     #[test]
-    fn quiet_envelope_carries_tags_must_sentence_and_count_line() {
-        let s = quiet_warning_envelope("0.60.0", 2, false, InstallChannel::Unknown);
-        assert!(
-            s.starts_with("<cadence-system-message>\n"),
-            "must open with the envelope tag: {s}"
-        );
-        assert!(
-            s.trim_end().ends_with("</cadence-system-message>"),
-            "must close with the envelope tag: {s}"
-        );
-        assert!(
-            s.contains("You MUST run 'cadence-hooks doctor'"),
-            "must carry the MUST directive: {s}"
-        );
-        assert!(
-            s.contains("cadence-hooks 0.60.0: 2 plugin warning(s)."),
-            "must carry the version/count line: {s}"
+    fn quiet_envelope_carries_tags_counts_and_directive() {
+        let s = quiet_blocker_envelope("0.60.0", 1, 2, false, InstallChannel::Unknown);
+        assert_eq!(
+            s,
+            "<cadence-system-message>\n\
+             cadence-hooks 0.60.0: 1 error(s) and 2 inert hook wiring(s) — hooks are not \
+             running as wired.\n\
+             Run 'cadence-hooks doctor' and tell the user in one line before other work.\n\
+             </cadence-system-message>"
         );
     }
 
     #[test]
-    fn quiet_envelope_no_skew_omits_upgrade_hint() {
-        let s = quiet_warning_envelope("0.60.0", 1, false, InstallChannel::Homebrew);
+    fn quiet_envelope_without_skew_omits_upgrade_hint() {
+        let s = quiet_blocker_envelope("0.60.0", 0, 1, false, InstallChannel::Homebrew);
         assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
         assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
     }
 
     #[test]
     fn quiet_envelope_skew_includes_upgrade_hint() {
-        let s = quiet_warning_envelope("0.60.0", 1, true, InstallChannel::Homebrew);
+        let s = quiet_blocker_envelope("0.60.0", 0, 1, true, InstallChannel::Homebrew);
         assert!(s.contains("Version skew"), "skew clause expected: {s}");
         assert!(
             s.contains("brew upgrade cadence-hooks"),
@@ -5937,12 +6228,126 @@ mod tests {
         );
     }
 
-    // ── warning_set_token (#632) ─────────────────────────────────────────────
+    // ── is_session_start_blocker ─────────────────────────────────────────────
+
+    /// The first finding `scan_hooks_json` produces for one `hooks.json`
+    /// command, or `None` when the command is clean.
+    fn first_scan_finding(command: &str) -> Option<Finding> {
+        let raw = serde_json::json!({
+            "hooks": { "PreToolUse": [{ "hooks": [{ "command": command }] }] }
+        });
+        scan_hooks_json(
+            "p",
+            Path::new("hooks.json"),
+            &raw.to_string(),
+            &raw,
+            InstallChannel::Unknown,
+            true,
+        )
+        .into_iter()
+        .next()
+    }
+
+    /// Every "hooks are not running as wired" class is a blocker, set at
+    /// construction; an advisory finding — the real hook-latency diagnosis
+    /// included — is not.
+    #[test]
+    fn blocker_table() {
+        let blocker = |cmd: &str| {
+            let f = first_scan_finding(cmd).unwrap_or_else(|| panic!("no finding for {cmd}"));
+            (is_session_start_blocker(&f), f.blocker)
+        };
+        let cases: [(&str, &str, Blocker); 7] = [
+            (
+                "shell-expansion error",
+                "'${CLAUDE_PLUGIN_ROOT}/hooks/run.sh' arg",
+                Blocker::Yes,
+            ),
+            (
+                "unknown subcommand",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence no-such-hook",
+                Blocker::YesUpgrade,
+            ),
+            (
+                "namespace mismatch",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-push-remote",
+                Blocker::Yes,
+            ),
+            (
+                "group entry with a flag",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group --verbose cadence/terminology",
+                Blocker::Yes,
+            ),
+            (
+                "group member that is not a tool-event check",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group metrics/log-commit",
+                Blocker::Yes,
+            ),
+            (
+                "group member split by quoting",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group 'cadence/terminology",
+                Blocker::Yes,
+            ),
+            (
+                "group member not in ns/hook form",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group terminology",
+                Blocker::Yes,
+            ),
+        ];
+        for (label, cmd, want) in cases {
+            assert_eq!(blocker(cmd), (true, want), "{label}");
+        }
+
+        let missing = missing_cli_findings(
+            "cadence-hooks-test-no-such-cli-7c1f --x",
+            "p",
+            Path::new("hooks.json"),
+            None,
+        );
+        assert!(!missing.is_empty(), "the extractor must see the CLI");
+        for f in &missing {
+            assert!(is_session_start_blocker(f), "missing CLI is a blocker");
+        }
+
+        let latency = crate::hook_latency::summary(
+            &[crate::hook_latency::HookLatency {
+                subcommand: "cadence prevent-secret-writes".into(),
+                runs: 40,
+                slow: 7,
+                cancelled: 1,
+                max_ms: 6100,
+            }],
+            7,
+        )
+        .expect("a slow tally yields a summary");
+        let advisory = Finding {
+            severity: Severity::Warning,
+            blocker: Blocker::No,
+            plugin: "cadence-hooks".into(),
+            file: PathBuf::from("projects"),
+            line: None,
+            snippet: String::new(),
+            diagnosis: latency,
+            remediation: String::new(),
+        };
+        assert!(!is_session_start_blocker(&advisory), "latency is advisory");
+    }
+
+    /// Plugin-controlled text cannot promote a finding: the verdict reads the
+    /// typed flag, so a diagnosis carrying blocker wording stays advisory.
+    #[test]
+    fn diagnosis_text_cannot_promote_a_finding() {
+        let mut f = hostile_finding("subcommand 'x y' is not present in this binary");
+        f.blocker = Blocker::No;
+        assert!(!is_session_start_blocker(&f));
+    }
+
+    // ── blocker_set_token (#632) ─────────────────────────────────────────────
 
     #[test]
     fn warning_set_token_is_order_insensitive() {
-        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
-        let b = warning_set_token("0.60.0", &["diag-b", "diag-a"]);
+        let a = blocker_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = blocker_set_token("0.60.0", &["diag-b", "diag-a"]);
         assert_eq!(
             a, b,
             "sort order of the input slice must not change the token"
@@ -5951,34 +6356,34 @@ mod tests {
 
     #[test]
     fn warning_set_token_changes_when_a_diagnosis_changes() {
-        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
-        let b = warning_set_token("0.60.0", &["diag-a", "diag-c"]);
+        let a = blocker_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = blocker_set_token("0.60.0", &["diag-a", "diag-c"]);
         assert_ne!(a, b, "a changed diagnosis must mint a different token");
     }
 
     #[test]
     fn warning_set_token_changes_when_version_changes() {
-        let a = warning_set_token("0.60.0", &["diag-a"]);
-        let b = warning_set_token("0.61.0", &["diag-a"]);
+        let a = blocker_set_token("0.60.0", &["diag-a"]);
+        let b = blocker_set_token("0.61.0", &["diag-a"]);
         assert_ne!(a, b, "a version bump must mint a different token");
     }
 
-    // ── doctor-warnings daily gate (#632) ────────────────────────────────────
+    // ── doctor-blockers daily gate (#632) ────────────────────────────────────
 
     #[test]
-    fn doctor_warnings_gate_suppresses_second_call_with_same_token() {
+    fn doctor_blockers_gate_suppresses_second_call_with_same_token() {
         // Mirrors the marker-family's own `with_marker_dir` pattern
         // (crates/core/src/markers.rs) so the stamp lands in a fresh private
         // tempdir rather than the real per-user marker directory.
         let marker_tmp = tempfile::tempdir().unwrap();
         cadence_hooks_core::test_builders::with_marker_dir(marker_tmp.path(), || {
-            let token = warning_set_token("0.60.0", &["diag-a"]);
+            let token = blocker_set_token("0.60.0", &["diag-a"]);
             assert!(
-                cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                cadence_hooks_core::markers::claim_today("doctor-blockers", &token),
                 "first sighting today must fire"
             );
             assert!(
-                !cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                !cadence_hooks_core::markers::claim_today("doctor-blockers", &token),
                 "the same token must be silent for the rest of the day"
             );
         });
