@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor` warns when the deployed cadence rules differ from the pinned plugin's copy.** `/cadence-groundwork:initializing-cadence` copies the `cadence` plugin's `rules/cadence-rules.md` to `<config dir>/rules/cadence/cadence-rules.md` once, and nothing refreshed it after a plugin update, so sessions kept loading rules the installed plugin no longer ships. `doctor` now compares the deployed file with each user-scope `cadence` install's copy and warns (exit 1) when none matches. The warning says the files differ, not which is newer, and its fix names both paths for a `diff` first, then says to copy the pinned file over or re-run the initializer, and to update a dotfiles manager's source too so its next back-sync does not revert the copy. A deployed file without its `managed by cadence` line is treated as the operator's own and never checked. `doctor` reports only; it does not rewrite the file. (cameronsjo/cadence#1339)
+
+### Fixed
+
+- **`doctor`'s hook-latency finding no longer drops hooks with too few runs to rate.** The summary listed at most four hooks, and hooks with at least 20 runs rank first, so four rated slow hooks pushed out a hook that was cancelled on every one of its five runs. Hooks with too few runs now get their own "Too few runs to rate" clause. The finding also says "N of M recorded runs slow", since Claude Code records the runs that produced output, not every invocation. (cameronsjo/cadence-hooks#1027)
+
 ## [0.104.1] - 2026-09-27
 
 ### Fixed
