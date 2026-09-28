@@ -307,15 +307,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
-    // Deliberately unwired, not awaiting a wiring PR: guard-rm is being retired
-    // (cameronsjo/cadence-ecosystem#582). cameronsjo/cadence#1479 removed its
-    // wiring; the subcommands stay in the binary until the deletion release,
-    // which removes both entries along with the code.
-    ("guardrails guard-rm", "cameronsjo/cadence-ecosystem#582"),
-    (
-        "guardrails guard-rm-liveness",
-        "cameronsjo/cadence-ecosystem#582",
-    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -935,8 +926,11 @@ fn extract_dispatches_expands_group_members() {
         extract_dispatches(cmd),
         vec!["cadence terminology", "cadence git-safety"]
     );
-    let plain = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-rm"#;
-    assert_eq!(extract_dispatches(plain), vec!["guardrails guard-rm"]);
+    let plain = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails warn-main-branch"#;
+    assert_eq!(
+        extract_dispatches(plain),
+        vec!["guardrails warn-main-branch"]
+    );
     assert_eq!(
         extract_dispatches("x/run-cadence-hooks.sh group bogus"),
         vec!["group bogus"]

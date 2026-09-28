@@ -15,30 +15,6 @@ run() { # run <label> <subcmd> <hook> <command>
   printf '%-46s rc=%s  %s\n' "$label" "$rc" "$(printf '%s' "$out" | head -c 90 | tr '\n' ' ')"
 }
 
-echo "===== guard-rm (block-capable; rc=2 means BLOCK) ====="
-run "CONTROL bare rm"                guardrails guard-rm 'rm -rf ~/Documents'
-run "CONTROL after ;"                guardrails guard-rm 'echo hi ; rm -rf ~/Documents'
-run "CONTROL comment, no apostrophe" guardrails guard-rm 'echo hi # fine
-rm -rf ~/Documents'
-run "#490 apostrophe in comment"     guardrails guard-rm "echo hi # it's fine
-rm -rf ~/Documents"
-run "CONTROL plain pipe"             guardrails guard-rm 'echo hi | rm -rf ~/Documents'
-run "#491 escaped > before pipe"     guardrails guard-rm 'echo hi \>| rm -rf ~/Documents'
-run "CONTROL bash -c"                guardrails guard-rm "bash -c 'rm -rf ~/Documents'"
-run "#496 bash -c -- script"         guardrails guard-rm "bash -c -- 'rm -rf ~/Documents'"
-run "CONTROL sudo bash -c"           guardrails guard-rm "sudo bash -c 'rm -rf ~/Documents'"
-run "#497 sudo -E bash -c"           guardrails guard-rm "sudo -E bash -c 'rm -rf ~/Documents'"
-run "#497 sudo -u root bash -c"      guardrails guard-rm "sudo -u root bash -c 'rm -rf ~/Documents'"
-run "#499 span, cmd on earlier line" guardrails guard-rm 'cat <<EOF
-prose $(rm -rf ~/Documents
-echo a)
-EOF'
-run "#499 span, cmd on LAST line"    guardrails guard-rm 'cat <<EOF
-prose $(echo a
-rm -rf ~/Documents)
-EOF'
-
-echo
 echo "===== prevent-secret-leaks (block-capable) ====="
 run "CONTROL bare cat .env"           cadence prevent-secret-leaks 'cat .env'
 run "CONTROL after ;"                 cadence prevent-secret-leaks 'echo hi ; cat .env'

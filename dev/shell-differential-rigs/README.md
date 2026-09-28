@@ -16,6 +16,8 @@ bypasses sat in the diff. Neither of the two Criticals appeared in any of six
 harnesses — grepping all fifty-one hand-built rows for the triggering shape
 (a `)` inside a `${…}` default) returns zero.
 
+**2026-09-28:** the six `shellcluster-*.sh` harnesses counted above probed only the recursive-delete guard and were deleted with it (cameronsjo/cadence-ecosystem#582; they remain in tag `v0.105.0`). The numbers above describe that history. Rebuilding an equivalent real-bash differential against a live guard is tracked separately.
+
 That is the argument #510 makes: a harness whose rows grow by adversarial search
 rather than by authorship.
 
@@ -23,12 +25,6 @@ rather than by authorship.
 
 | File | What it does |
 |---|---|
-| `shellcluster-regression.sh` | The bypass rows from rounds 1 and 2, plus controls |
-| `shellcluster-adversarial.sh` | Braces, ANSI-C quoting, CRLF, backslash runs 0–4, wrapper walks |
-| `shellcluster-differential.sh` | The original #490/#491/#496 class |
-| `shellcluster-direction.sh` | Unbalanced openers/closers — proves which way each malformed input fails |
-| `shellcluster-crit2.sh` | The comment-continuation (`#;\`) family |
-| `shellcluster-isolate.sh` | Narrows the trailing-backtick residual to `guard-rm` operand parsing |
 | `oracle.py`, `run1.py`–`run3.py` | Bash-as-oracle comparison drivers |
 | `fuzz.py`, `fuzz2.py` | Random-fragment sweeps; ~16k fragments across 5 seeds in use |
 | `probe-guards.sh`, `probe-radius.sh`, `probe-499.sh` | Per-guard blast-radius probes |
@@ -37,9 +33,6 @@ rather than by authorship.
 
 ## Caveats — read before trusting any of them
 
-- **`shellcluster-adversarial.sh` exits 1 today.** One row (`hash inside
-  backticks multiline`) is a known pre-existing miss, tracked in #509. That is
-  expected, not a regression.
 - **`harness/` path-depends on `crates/core` and must be rebuilt** after any
   change to the parser, or its results are stale. Its `Cargo.toml` path was
   written for an out-of-tree location and needs fixing before use here.

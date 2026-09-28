@@ -61,15 +61,12 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             // The one ENFORCEMENT-path hook that must survive the bypass, and
             // deliberately its own arm rather than a widened `guardrails`
             // alternation — namespace-wide exemption would run every guardrails
-            // hook during a maintenance bypass. Its entire job is to report
-            // that a guard is switched off, and `CADENCE_BYPASS=1` is one of
-            // the two switches it reports on, so bypassing it suppresses the
-            // report of the bypass (cadence-hooks#927). Kept in lockstep with
+            // hook during a maintenance bypass. It reports CADENCE_BYPASS=1
+            // (and a CADENCE_DISABLE naming a protected guard) at SessionStart,
+            // so bypassing it would suppress the report of the bypass
+            // (cadence-hooks#927). Kept in lockstep with
             // `bypass::BYPASS_EXEMPT_HOOKS` by the two drift guards in this
             // file's test module.
-            | (Some("guardrails"), Some("guard-rm-liveness"))
-            // Same reason, broader subject: it reports CADENCE_BYPASS=1 itself
-            // (and a CADENCE_DISABLE naming a protected guard) at SessionStart.
             | (Some("guardrails"), Some("enforcement-status"))
     )
 }
@@ -98,10 +95,10 @@ use registry::{HOOKS, HookEntry};
 /// The list of guards `CADENCE_DISABLE` may not switch off, and the resolver
 /// that decides what either switch does to a named hook.
 ///
-/// Both live in `core` rather than here since #567: `guard-rm-liveness` is a
-/// library check whose entire job is to report that `guard-rm` was switched
-/// off, and while this logic lived in `main` it could only do that by keeping
-/// its own copy of the parse. Four copies with no shared source of truth made
+/// Both live in `core` rather than here since #567: library checks (today
+/// `enforcement-status`) report what the switches did, and while this logic
+/// lived in `main` they could only do that by keeping their own copy of the
+/// parse. Four copies with no shared source of truth made
 /// drift fail toward the detector reporting healthy while the binary skipped
 /// the guard. See `cadence_hooks_core::bypass` for the precedence table.
 use cadence_hooks_core::bypass::{self, BypassState, PROTECTED_GUARDS};
@@ -376,10 +373,6 @@ enum GuardrailsCommands {
     WarnAmendPushed,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
-    /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
-    GuardRm,
-    /// SessionStart assertion that guard-rm is present and classifying deletes as contracted
-    GuardRmLiveness,
     /// SessionStart report of CADENCE_BYPASS=1 or a CADENCE_DISABLE naming a protected guard
     EnforcementStatus,
     /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
@@ -596,8 +589,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::WarnAmendPushed => "warn-amend-pushed",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
-            GuardrailsCommands::GuardRm => "guard-rm",
-            GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
             GuardrailsCommands::EnforcementStatus => "enforcement-status",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
@@ -817,13 +808,6 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             GuardrailsCommands::GuardDotfiles => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles),
                 pre,
-            ),
-            GuardrailsCommands::GuardRm => {
-                CheckPlan::new(Box::new(cadence_hooks_guardrails::guard_rm::GuardRm), pre)
-            }
-            GuardrailsCommands::GuardRmLiveness => CheckPlan::new(
-                Box::new(cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness),
-                session,
             ),
             GuardrailsCommands::EnforcementStatus => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::enforcement_status::EnforcementStatus),
@@ -1658,10 +1642,6 @@ mod tests {
         // The one enforcement-path hook in the set (cadence-hooks#927).
         assert!(is_bypass_exempt(
             Some("guardrails"),
-            Some("guard-rm-liveness")
-        ));
-        assert!(is_bypass_exempt(
-            Some("guardrails"),
             Some("enforcement-status")
         ));
     }
@@ -1672,9 +1652,13 @@ mod tests {
             Some("guardrails"),
             Some("guard-push-remote")
         ));
-        // The watched guard, beside its watcher: goes red if the
-        // `guard-rm-liveness` arm is ever widened to the whole namespace.
-        assert!(!is_bypass_exempt(Some("guardrails"), Some("guard-rm")));
+        // A protected guard in the same namespace as the exempt status check:
+        // goes red if the `enforcement-status` arm is ever widened to the
+        // whole `guardrails` namespace.
+        assert!(!is_bypass_exempt(
+            Some("guardrails"),
+            Some("guard-sops-decrypt")
+        ));
         // Position, not presence: an argument spelled like an exempt command
         // must not buy an exemption.
         assert!(!is_bypass_exempt(Some("cadence"), Some("configure")));

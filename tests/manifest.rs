@@ -20,12 +20,13 @@ fn manifest_json_exports_complete_registry_and_criticality() {
         .expect("push guard");
     assert_eq!(push["criticality"], "security-critical");
     assert_eq!(push["protected"], true);
-    let rm = hooks
+    // Security-critical but deliberately unprotected from CADENCE_DISABLE.
+    let worktree = hooks
         .iter()
-        .find(|row| row["name"] == "guard-rm")
-        .expect("rm guard");
-    assert_eq!(rm["criticality"], "security-critical");
-    assert_eq!(rm["protected"], false);
+        .find(|row| row["name"] == "enforce-worktree")
+        .expect("worktree guard");
+    assert_eq!(worktree["criticality"], "security-critical");
+    assert_eq!(worktree["protected"], false);
     assert!(hooks.iter().all(|row| {
         row["plugin"].is_string() && row["event"].is_string() && row["criticality"].is_string()
     }));

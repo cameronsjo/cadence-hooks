@@ -203,10 +203,10 @@ fn collect_push_invocations(
         // So: a `}` in the trailing trim run whose preceding character is
         // neither whitespace nor `;` is a real word byte the trim is about to
         // eat. Fixed locally rather than in the shared primitive, which is
-        // byte-identical to `origin/main` and shared with `guard_rm` and
-        // `enforce_worktree` — teaching the tokenizer that a trailing `}` is a
-        // word character belongs behind its own issue (cadence-hooks#237
-        // security review, F28/F29/F30).
+        // byte-identical to `origin/main` and shared with `enforce_worktree` —
+        // teaching the tokenizer that a trailing `}` is a word character
+        // belongs behind its own issue (cadence-hooks#237 security review,
+        // F28/F29/F30).
         let trailing_trim_run =
             trimmed.len() - trimmed.trim_end_matches([')', '}', ';', ' ', '\t']).len();
         //
@@ -342,8 +342,9 @@ fn collect_push_invocations(
 /// ordinary spellings with no escape anywhere, ran under bash, zsh and sh
 /// (measured) while this module reported nothing at all.
 ///
-/// This is `guard_rm`'s fallback (`guard_rm.rs`, cadence-hooks#426/#443) at the
-/// push position: when `argv` still leads with a prefix and the segment names a
+/// This mirrors the same fallback pattern the delete guard removed in
+/// cadence-ecosystem#582 used at its own position (cadence-hooks#426/#443):
+/// when `argv` still leads with a prefix and the segment names a
 /// push anywhere in its token stream, emit an **unresolvable** push rather than
 /// nothing. An unresolvable push is a refusal a caller can explain; an absent one
 /// is a silent allow. Parsing each prefix's flag grammar instead would mean
@@ -360,8 +361,9 @@ fn hides_a_push_behind_a_prefix(
     let leads_with_a_prefix = argv.first().is_some_and(|first| {
         // **`command_word`, not `names_transparent_prefix` — the membership test
         // has to BASENAME here.** Every sibling asking this question already
-        // does: `guard_rm`'s fallback and `peel_command_runners`' runner test
-        // both go through `command_word`. The shared primitive unescapes and
+        // does: `peel_command_runners`'s runner test goes through
+        // `command_word`, and so does the fallback this mirrors
+        // (cameronsjo/cadence-ecosystem#582). The shared primitive unescapes and
         // folds and stops there, so `/usr/bin/nohup -- git push origin main` and
         // `/usr/bin/time -p git push` — real binaries, ordinary spellings,
         // running under bash, zsh and sh (measured) — answered false and the
@@ -374,9 +376,9 @@ fn hides_a_push_behind_a_prefix(
         // The gap is recorded in the plan's documented-miss paragraph and filed
         // (cadence-hooks#237 security review, F22).
         let word = command_word(first);
-        // `eval` joins the prefix set for the same reason `guard_rm` admits it:
-        // it is in neither `TRANSPARENT` nor `COMMAND_RUNNERS`, so nothing else
-        // in this walk will ever get past it.
+        // `eval` joins the prefix set for the same reason: it is in neither
+        // `TRANSPARENT` nor `COMMAND_RUNNERS`, so nothing else in this walk
+        // will ever get past it.
         TRANSPARENT.contains(&word.as_ref()) || word == "eval"
     });
     leads_with_a_prefix && names_a_push(tokens, unquoted_prefix_lens, effective_dir)
@@ -2072,9 +2074,9 @@ mod tests {
     fn a_path_spelled_transparent_prefix_still_refuses() {
         // The fallback asked `names_transparent_prefix`, which unescapes and
         // folds but does NOT basename — while every sibling asking the same
-        // question basenames (`guard_rm` and `peel_command_runners` both go
-        // through `command_word`). `nohup` and `time` are real binaries in
-        // /usr/bin, so this is not a theoretical spelling: each row below runs
+        // question basenames (`peel_command_runners` and the fallback this
+        // mirrors both go through `command_word`). `nohup` and `time` are real
+        // binaries in /usr/bin, so this is not a theoretical spelling: each row below runs
         // under bash, zsh and sh (measured) and yielded nothing at all.
         for command in [
             "/usr/bin/nohup -- git push origin main",

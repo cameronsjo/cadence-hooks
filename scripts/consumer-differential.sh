@@ -271,7 +271,6 @@ AFFECTED=(
     "guardrails guard-gh-dangerous"
     "guardrails guard-gh-write"
     "guardrails guard-op-vault-scan"
-    "guardrails guard-rm"
     "guardrails inject-gh-write-context"
     "guardrails warn-gh-merge-preflight"
     "guardrails warn-going-public"

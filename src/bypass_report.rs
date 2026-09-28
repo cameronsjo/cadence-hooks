@@ -57,9 +57,9 @@ fn render_unknown(name: &str) -> String {
 /// Append `name` unless the bucket already holds it, preserving first-seen
 /// order.
 ///
-/// A disable list may name the same hook twice — `guard-rm,guard-rm` is one
+/// A disable list may name the same hook twice — `enforce-worktree,enforce-worktree` is one
 /// ask, and the resolver treats it as one. Without this the report rendered it
-/// as `guard-rm, guard-rm`, which reads as two distinct hooks and makes a
+/// as `enforce-worktree, enforce-worktree`, which reads as two distinct hooks and makes a
 /// pasted-twice settings value look like a wider disable than it is. Linear
 /// scan: a bucket holds at most the registry's few dozen names, and the cost is
 /// paid once per diagnostic command.
@@ -480,15 +480,15 @@ mod tests {
     /// the detector is off, in the session where it is the only thing running.
     #[test]
     fn a_bypass_exempt_hook_is_refused_not_moot() {
-        let lines = disable_summary_lines(Some("1"), Some("guard-rm-liveness,git-safety"));
+        let lines = disable_summary_lines(Some("1"), Some("enforcement-status,git-safety"));
         let refused = lines
             .iter()
             .find(|l| l.starts_with("Protected — disable refused, these still run:"))
             .unwrap_or_else(|| panic!("no refusal line: {lines:?}"));
-        assert!(refused.contains("guard-rm-liveness"), "{lines:?}");
+        assert!(refused.contains("enforcement-status"), "{lines:?}");
         let moot = lines.iter().find(|l| l.contains("moot"));
         assert!(
-            moot.is_some_and(|l| l.contains("git-safety") && !l.contains("guard-rm-liveness")),
+            moot.is_some_and(|l| l.contains("git-safety") && !l.contains("enforcement-status")),
             "the exempt hook must not be reported as moot: {lines:?}"
         );
     }
@@ -520,19 +520,19 @@ mod tests {
     /// the refusal line must name it.
     #[test]
     fn doctor_names_the_bypass_exempt_hook_as_still_running() {
-        let lines = bypass_status_lines(Some("1"), Some("guard-rm-liveness"));
+        let lines = bypass_status_lines(Some("1"), Some("enforcement-status"));
         let banner = lines
             .iter()
             .find(|l| l.contains("CADENCE_BYPASS=1"))
             .unwrap_or_else(|| panic!("no bypass banner: {lines:?}"));
         assert!(
-            banner.contains("guard-rm-liveness"),
+            banner.contains("enforcement-status"),
             "the banner claims a universal it no longer has: {lines:?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("these still run:") && l.contains("guard-rm-liveness")),
+                .any(|l| l.contains("these still run:") && l.contains("enforcement-status")),
             "{lines:?}"
         );
     }
@@ -552,13 +552,14 @@ mod tests {
     /// successful disable.
     #[test]
     fn an_unknown_name_is_reported_as_disabling_nothing() {
-        let lines = disable_summary_lines(None, Some("guard_rm,Guard-Rm,not-a-hook"));
+        let lines =
+            disable_summary_lines(None, Some("enforce_worktree,Enforce-Worktree,not-a-hook"));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with("Named in CADENCE_DISABLE but not a hook"),
             "{lines:?}"
         );
-        for name in ["guard_rm", "Guard-Rm", "not-a-hook"] {
+        for name in ["enforce_worktree", "Enforce-Worktree", "not-a-hook"] {
             assert!(lines[0].contains(name), "{name} missing from {lines:?}");
         }
     }
@@ -902,30 +903,25 @@ mod tests {
     #[test]
     fn the_two_security_lists_diverge_only_where_intended() {
         /// Security-critical, deliberately NOT protected from `CADENCE_DISABLE`.
-        /// Both are workflow guards over recoverable state, and both have a
-        /// legitimate reason to be switched off per session.
-        const CRITICAL_BUT_UNPROTECTED: &[&str] = &["guard-rm", "enforce-worktree"];
+        /// A workflow guard over recoverable state, with a legitimate reason
+        /// to be switched off per session.
+        const CRITICAL_BUT_UNPROTECTED: &[&str] = &["enforce-worktree"];
         /// Protected from `CADENCE_DISABLE` but not security-critical. Two
         /// different reasons, one per entry:
         ///
         /// - `redact-external-content` carries a fail-closed identity tier
         ///   alongside advisory ones, so protection is broader than the
         ///   criticality classification.
-        /// - `guard-rm-liveness` is a **detector**, not a guard. It is
-        ///   protected because hiding it is the harm — it reports whether
-        ///   `guard-rm` is switched off — while it must stay advisory in every
+        /// - `enforcement-status` is a **detector**, not a guard. It is
+        ///   protected because hiding it is the harm — it reports whether the
+        ///   guards are switched off — while it must stay advisory in every
         ///   state. Adding it to `SECURITY_CRITICAL_HOOKS` to settle this test
         ///   is the WRONG fix: `src/dispatch.rs` exits **2** for a
         ///   security-critical hook on an unparseable or unenumerable payload,
         ///   which would turn a SessionStart advisory into a blocker. The test
         ///   below pins that.
-        /// - `enforcement-status` is the same kind of detector, reporting the
-        ///   switches themselves, and stays advisory for the same reason.
-        const PROTECTED_BUT_NOT_CRITICAL: &[&str] = &[
-            "redact-external-content",
-            "guard-rm-liveness",
-            "enforcement-status",
-        ];
+        const PROTECTED_BUT_NOT_CRITICAL: &[&str] =
+            &["redact-external-content", "enforcement-status"];
 
         // The two records above are claims about the source lists, so assert
         // them against those lists before using either as an exemption. A
@@ -998,17 +994,16 @@ mod tests {
     ///
     /// `src/dispatch.rs` exits 2 for a security-critical hook whose payload
     /// cannot be parsed or whose patch targets cannot be enumerated. Classifying
-    /// `guard-rm-liveness` as security-critical — the tempting way to settle
+    /// `enforcement-status` as security-critical — the tempting way to settle
     /// `the_two_security_lists_diverge_only_where_intended` — would therefore
     /// convert a SessionStart nudge into a hard block on a malformed payload,
     /// which is the opposite of what a fail-open detector is for (ADR-0001).
     /// Protection from `CADENCE_DISABLE` and criticality are separate
     /// properties, and this hook deliberately has only the first.
     #[test]
-    fn the_liveness_detector_is_protected_but_never_security_critical() {
+    fn the_status_detector_is_protected_but_never_security_critical() {
         // Every bypass-exempt hook is a status check by definition, so the
-        // exempt list is the detector list — and survives guard-rm-liveness's
-        // deletion without an edit here.
+        // exempt list is the detector list.
         for detector in bypass::BYPASS_EXEMPT_HOOKS {
             assert!(
                 bypass::is_protected(detector),

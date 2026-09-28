@@ -1204,9 +1204,9 @@ mod tests {
         };
 
         let aggregated = aggregate_results(vec![
-            carrying("dismiss-guard-rm"),
-            carrying("dismiss-guard-rm"),
-            carrying("dismiss-guard-rm"),
+            carrying("dismiss-main-branch"),
+            carrying("dismiss-main-branch"),
+            carrying("dismiss-main-branch"),
             carrying("CADENCE_ALLOW_MAIN"),
         ])
         .expect("aggregate");
@@ -1217,7 +1217,7 @@ mod tests {
                 .iter()
                 .map(|provenance| provenance.mechanism.as_str())
                 .collect::<Vec<_>>(),
-            ["dismiss-guard-rm", "CADENCE_ALLOW_MAIN"],
+            ["dismiss-main-branch", "CADENCE_ALLOW_MAIN"],
             "three rides of one dismissal are one event; a second mechanism is another"
         );
     }
