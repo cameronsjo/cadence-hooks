@@ -1112,10 +1112,11 @@ pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
 }
 
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
-/// create` carrying no `--draft`/`-d` flag *in that same segment*. Scoping the
-/// draft-flag scan to one segment is what keeps an unrelated sibling command's
-/// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
-/// splits first rather than scanning the whole token stream).
+/// create` that gh reads as no draft ([`create_is_draft`]) *in that same
+/// segment*. Scoping the draft-flag scan to one segment is what keeps an
+/// unrelated sibling command's `-d` from suppressing a real ship (the reason
+/// [`is_polish_ship_anchor`] splits first rather than scanning the whole token
+/// stream).
 ///
 /// Group wrappers are stripped before tokenizing, the same order the other
 /// guards use (`enforce_worktree`), because [`tokenize`] fuses the punctuation
@@ -1145,7 +1146,10 @@ fn segment_ship_anchor(segment: &str, origin: Option<&str>) -> Option<&'static s
         // 12` is a real ship and must keep anchoring, and requiring the current
         // branch would kill the canonical `gh pr ready <n>` spelling.
         "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
-        "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
+        // Draft is read with `create`'s flag grammar (cadence-hooks#998), so
+        // another flag's value (`-t -d`) or a redirect target (`> -d`) is not
+        // a draft, and a shorthand cluster (`-fd`, `-dH x`) is.
+        "create" if !create_is_draft(invocation.operands) => Some("create"),
         "merge" if invocation.targets_the_current_branch(origin) => Some("merge"),
         _ => None,
     }
@@ -1442,8 +1446,8 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
         // form is left deliberately unhandled and errs toward the FALSE NUDGE:
         // `--undo=false` is a real ship, and a prefix match would suppress it
         // (the costly direction), while `--undo=true` merely anchors wrongly —
-        // one spurious nudge on a fail-open advisory, the same accepted gap the
-        // `create` arm carries for `--draft=true`.
+        // one spurious nudge on a fail-open advisory. (The `create` arm no
+        // longer carries that gap: [`create_is_draft`] reads `--draft=V`.)
         if token == "--undo" {
             return true;
         }
@@ -2053,6 +2057,91 @@ fn scan_ship_flags(grammar: &FlagGrammar, operands: &[String]) -> ShipFlagScan {
         tainted |= read.taints_rest;
     }
     scan
+}
+
+/// True when gh reads the `gh pr create` `operands` as a draft
+/// (cadence-hooks#998). Only [`segment_ship_anchor`] calls this, and every
+/// consumer of that anchor (`nudge-polish-before-pr`, `warn-changelog-entry`,
+/// `log-polish-nudge`) is advisory: no block decision reads it.
+///
+/// The walk is [`scan_ship_flags`]' walk over [`CREATE_FLAGS`], so a token is
+/// a draft flag only where pflag would parse one:
+///
+/// - `--draft`, or a shorthand cluster that reaches `d` before any
+///   value-taking letter (`-d`, `-fd`, `-dH x`).
+/// - `--draft=V` and `-d=V` take `V` as a bool the way pflag's
+///   `strconv.ParseBool` does; only a true spelling is a draft. An unreadable
+///   `V` is not a draft (gh rejects it, and the direction is a nudge).
+/// - Another flag's value (`-t -d`), a redirect target (`> -d`), anything
+///   after `--` or a `#` comment, and a positional are never a draft.
+/// - The last setting wins, as in pflag (`--draft --draft=false` is no
+///   draft).
+///
+/// **Ambiguity reads as no draft**, so the create anchors and the advisory
+/// nudges: once a flag this grammar does not know makes the alignment of
+/// flags and values unreadable, the walk stops and only draft settings seen
+/// before it count. A spurious nudge on a draft is the accepted cost; a
+/// silent real ship is not.
+fn create_is_draft(operands: &[String]) -> bool {
+    let mut draft = false;
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        if token == "#" || token == "--" {
+            break;
+        }
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
+            continue;
+        }
+        if let Some(setting) = draft_setting(token) {
+            draft = setting;
+        }
+        let read = read_flag_token(
+            &CREATE_FLAGS,
+            token,
+            operands.get(i + 1).map(String::as_str),
+        );
+        if read.taints_rest {
+            break;
+        }
+        i += read.consumed;
+    }
+    draft
+}
+
+/// What one `gh pr create` flag token sets `--draft` to, or `None` when it
+/// does not set it. See [`create_is_draft`] for the grammar.
+fn draft_setting(token: &str) -> Option<bool> {
+    if let Some(long) = token.strip_prefix("--") {
+        return match long.split_once('=') {
+            Some(("draft", value)) => Some(parse_bool_true(value)),
+            None if long == "draft" => Some(true),
+            _ => None,
+        };
+    }
+    let cluster = token.strip_prefix('-').filter(|c| !c.is_empty())?;
+    for (idx, letter) in cluster.char_indices() {
+        if letter == 'd' {
+            // pflag: a `=` right after a bool shorthand gives it the rest of
+            // the token as its value (`-d=false`).
+            let rest = &cluster[idx + 1..];
+            return Some(rest.strip_prefix('=').is_none_or(parse_bool_true));
+        }
+        // Only a known bool shorthand lets the walk go on to a later letter;
+        // a value-taking letter swallows the rest of the token, and an
+        // unknown one leaves it unreadable.
+        if !CREATE_FLAGS.short_bools.contains(letter) {
+            return None;
+        }
+    }
+    None
+}
+
+/// True for the spellings Go's `strconv.ParseBool` reads as true, which is
+/// what pflag uses for a bool flag's `=value`.
+fn parse_bool_true(value: &str) -> bool {
+    matches!(value, "1" | "t" | "T" | "true" | "TRUE" | "True")
 }
 
 /// Read one operand token under `grammar`; `next` is the token after it.
@@ -5863,6 +5952,41 @@ mod tests {
         assert!(!is_polish_ship_anchor("gh pr create --draft"));
         assert!(!is_polish_ship_anchor("gh pr create --draft --title x"));
         assert!(!is_polish_ship_anchor("gh pr create -d --fill"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_reads_draft_with_the_create_grammar() {
+        // cadence-hooks#998: a `-d` that is another flag's value or a
+        // redirect target is no draft, so these real creates anchor.
+        for command in [
+            "gh pr create -t -d --head feat/unpol -b b",
+            "gh pr create --head feat/unpol -t a -b b > -d",
+            "gh pr create --title --draft",
+            "gh pr create -b x -- --draft",
+            "gh pr create --draft=false",
+            "gh pr create -d=false -t x",
+            "gh pr create --draft --draft=false",
+            "gh pr create -td",
+            // An unknown flag makes the rest unreadable: ambiguity anchors.
+            "gh pr create --newflag --draft",
+            "gh pr create -z -d",
+        ] {
+            assert!(is_polish_ship_anchor(command), "{command} should anchor");
+        }
+        // Real drafts in every spelling pflag accepts do not anchor.
+        for command in [
+            "gh pr create -d",
+            "gh pr create --draft",
+            "gh pr create -fd",
+            "gh pr create -dH feat/x",
+            "gh pr create -t x -d",
+            "gh pr create --draft=true",
+            "gh pr create -d=1",
+            "gh pr create --draft --newflag",
+            "gh pr create -d > out.log",
+        ] {
+            assert!(!is_polish_ship_anchor(command), "{command} is a draft");
+        }
     }
 
     #[test]

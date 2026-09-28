@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **`nudge-polish-before-pr` no longer says "No polish recorded" when the command runs outside a repo.** A session rooted outside any git checkout (`~/.claude`, say) that ships with `-R`/`--head` has no checkout to look the marker up in, so the gate now gives the cannot-check advisory instead of claiming polish never ran. The `log-polish-nudge` row records `markerTarget: cannot_check` for the same case. No cwd at all, and a detached HEAD, keep the no-marker nudge. (cameronsjo/cadence-hooks#453)
+- **The polish ship anchor reads `gh pr create`'s draft flag the way gh does.** It compared whole tokens to `-d`/`--draft`, so a title of `-d` (`-t -d`) or a redirect target (`> -d`) made a real create read as a draft and the nudge stayed silent, while the real drafts `-fd` and `-dH feat/x` drew a spurious nudge. The anchor now walks `create`'s flag grammar: it skips other flags' values and redirect targets, reads shorthand clusters, and honors `--draft=false` and `-d=false`. A flag the grammar does not know stops the walk, and only a draft seen before it counts, so an unreadable command nudges. `warn-changelog-entry` and `log-polish-nudge` share the anchor. (cameronsjo/cadence-hooks#998)
 
 ## [0.108.0] - 2026-09-28
 
