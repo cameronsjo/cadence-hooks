@@ -18,11 +18,19 @@
 //! The PR is resolved the way gh resolves it, not from `origin`
 //! (cadence-hooks#1028, #920). A PR URL names its own repo. A number goes
 //! to the `-R`/`--repo` repo when the command names one, and
-//! otherwise to gh's `{owner}`/`{repo}` placeholders, run in the command's
-//! cwd so gh picks the repo it would pick. No selector, or a branch name, is
-//! looked up with `gh pr view` first (two calls). A repo flag with no
-//! selector, conflicting repo values, or an unreadable selector stays silent:
-//! each is a deliberate fail-open allow.
+//! otherwise to gh's `{owner}`/`{repo}` placeholders, run in the session cwd
+//! (the hook payload's `cwd`; a leading `cd x &&` is not tracked) so gh picks
+//! the repo it would pick there. No selector, or a branch name, is looked up
+//! with `gh pr view` first (two calls). A repo flag with no selector,
+//! conflicting repo values, or an unreadable selector stays silent: each is a
+//! deliberate fail-open allow.
+//!
+//! The hook runs before the user approves the command, so it never sends a
+//! request to a host the command text names unless that host is `github.com`
+//! or `origin`'s host (local config). Any other host (from a PR URL, an
+//! `-R HOST/OWNER/REPO`, or a URL-shaped selector) stays silent: gh would
+//! otherwise contact a host the user has not approved, and send it
+//! `GH_ENTERPRISE_TOKEN` when that is set.
 
 use cadence_hooks_core::shell::{
     PrSelector, carries_undo_flag, command_segments, command_word, gh_repo_value_parts,
@@ -104,9 +112,9 @@ pub trait GhRunner {
 }
 
 /// Production `gh` runner: shells out to the system `gh` binary in the
-/// flipped command's cwd, so gh resolves the default repo and branch from the
-/// same checkout the command runs in, with `env` (such as `GH_HOST`) scoped
-/// to the spawned process.
+/// session cwd, so gh resolves the default repo and branch from the checkout
+/// the command starts in, with `env` (such as `GH_HOST`) scoped to the
+/// spawned process.
 pub struct RealGhRunner {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -183,45 +191,121 @@ pub enum RepoChoice {
 pub struct FlipTarget {
     pub repo: RepoChoice,
     pub selector: PrSelector,
+    /// The host `GH_HOST` is set to: a PR URL's, else an `-R HOST/…` one,
+    /// else an inline `GH_HOST=`.
     pub host: Option<String>,
+    /// Every host the command text names, lowercased, from any of those
+    /// sources plus a URL-shaped `Other` selector. [`evaluate`] queries none
+    /// of them unless each is trusted ([`hosts_are_trusted`]).
+    pub named_hosts: Vec<String>,
+}
+
+/// The host of a URL-shaped selector gh would contact (`scheme://HOST/…`).
+/// `Some(None)` when the token has a `://` but no bare hostname can be read
+/// from it (userinfo, a port, an odd character), `None` when it is not
+/// URL-shaped at all.
+fn url_shaped_host(token: &str) -> Option<Option<String>> {
+    static URL_HOST_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://([A-Za-z0-9.-]+)(?:/|$)")
+            .expect("pattern should compile")
+    });
+    if !token.contains("://") {
+        return None;
+    }
+    Some(
+        URL_HOST_RE
+            .captures(token)
+            .map(|c| c[1].to_ascii_lowercase()),
+    )
+}
+
+/// True when every repo value is empty and each one comes from a spelling
+/// that names an empty value on purpose: `--repo=`, `-R=`, or `-R ""` /
+/// `--repo ""`. gh reads an empty `-R` as "no override" and flips the cwd
+/// repo's PR. An empty value from anything else (the scan's placeholder after
+/// an unknown flag, or a flag with nothing after it) is not counted, so the
+/// caller stays silent for it.
+fn repo_values_are_deliberately_empty(tokens: &[String], repos: &[String]) -> bool {
+    if repos.is_empty() || repos.iter().any(|r| !r.is_empty()) {
+        return false;
+    }
+    let spelled = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            matches!(t.as_str(), "--repo=" | "-R=")
+                || (matches!(t.as_str(), "--repo" | "-R")
+                    && tokens.get(i + 1).is_some_and(String::is_empty))
+        })
+        .count();
+    spelled == repos.len()
+}
+
+/// True when every host in `named` is `github.com` or `origin_host`.
+/// `origin_host` comes from local git config, so it is trusted; a host the
+/// command text alone names is not.
+pub fn hosts_are_trusted(named: &[String], origin_host: Option<&str>) -> bool {
+    named.iter().all(|h| {
+        h.eq_ignore_ascii_case("github.com")
+            || origin_host.is_some_and(|o| h.eq_ignore_ascii_case(o))
+    })
 }
 
 impl FlipTarget {
     /// Read the target from one flip segment's tokens. `None` when the repo
-    /// values disagree or one does not parse: gh's target is then unknown,
-    /// and staying silent is a deliberate fail-open allow (ADR-0001).
+    /// values disagree or one does not parse, or when a URL-shaped selector
+    /// has no readable host: gh's target is then unknown, and staying silent
+    /// is a deliberate fail-open allow (ADR-0001).
     fn from_tokens(tokens: &[String]) -> Option<Self> {
         let ship = ship_target(tokens);
         let selector = pr_selector(tokens);
         let mut repo_host: Option<String> = None;
-        let repo = if ship.repos.is_empty() {
-            RepoChoice::GhDefault
-        } else {
-            let mut parsed = ship
-                .repos
-                .iter()
-                .map(|value| gh_repo_value_parts(value))
-                .collect::<Option<Vec<_>>>()?;
-            parsed.dedup();
-            let [(host, slug)] = parsed.as_slice() else {
-                return None;
+        let repo =
+            if ship.repos.is_empty() || repo_values_are_deliberately_empty(tokens, &ship.repos) {
+                RepoChoice::GhDefault
+            } else {
+                let mut parsed = ship
+                    .repos
+                    .iter()
+                    .map(|value| gh_repo_value_parts(value))
+                    .collect::<Option<Vec<_>>>()?;
+                parsed.dedup();
+                let [(host, slug)] = parsed.as_slice() else {
+                    return None;
+                };
+                let (owner, name) = slug.split_once('/')?;
+                repo_host.clone_from(host);
+                RepoChoice::Explicit {
+                    value: ship.repos[0].clone(),
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                }
             };
-            let (owner, name) = slug.split_once('/')?;
-            repo_host.clone_from(host);
-            RepoChoice::Explicit {
-                value: ship.repos[0].clone(),
-                owner: owner.to_string(),
-                name: name.to_string(),
-            }
-        };
         let url_host = match &selector {
             PrSelector::Url { host, .. } => Some(host.clone()),
             _ => None,
         };
+        // A selector gh would read as a URL of some other shape (`http://`,
+        // a non-PR path) still makes `gh pr view` contact its host.
+        let other_url_host = match &selector {
+            PrSelector::Other(sel) => match url_shaped_host(sel) {
+                None => None,
+                Some(Some(host)) => Some(host),
+                // URL-shaped with no readable host: fail-open allow.
+                Some(None) => return None,
+            },
+            _ => None,
+        };
+        let named_hosts = [&url_host, &repo_host, &ship.host, &other_url_host]
+            .into_iter()
+            .flatten()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
         Some(FlipTarget {
             repo,
             selector,
             host: url_host.or(repo_host).or(ship.host),
+            named_hosts,
         })
     }
 }
@@ -361,10 +445,21 @@ fn resolve_with_pr_view(
 /// `Some(message)` to nudge, `None` to stay silent (reviewed, or any
 /// fetch/parse/resolution failure — fail open).
 ///
-/// The runner is expected to run gh in the flipped command's cwd, with the
-/// command's host, so the placeholder and `pr view` rows resolve the repo the
-/// flip itself would.
-pub fn evaluate(target: &FlipTarget, gh: &dyn GhRunner) -> Option<String> {
+/// The runner is expected to run gh in the session cwd, with the command's
+/// host, so the placeholder and `pr view` rows resolve the repo the flip
+/// itself would. `origin_host` is `origin`'s host from local git config, or
+/// `None` when it cannot be read.
+pub fn evaluate(
+    target: &FlipTarget,
+    origin_host: Option<&str>,
+    gh: &dyn GhRunner,
+) -> Option<String> {
+    // Fail-open allow (ADR-0001): this runs before the user approves the
+    // command, so a host only the command text names must not receive a
+    // request. Only `github.com` and origin's host are queried.
+    if !hosts_are_trusted(&target.named_hosts, origin_host) {
+        return None;
+    }
     let (query_repo, pr_num) = match (&target.selector, &target.repo) {
         // A URL names its own repo; gh ignores `-R` for it.
         (
@@ -472,18 +567,30 @@ impl Check for WarnUnreviewedReadyFlip {
             .unwrap_or_else(|| ".".to_string());
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
 
-        // Host: what the command names, else origin's host when it is not
-        // github.com. The origin lookup is host-only and runs only when gh
-        // picks the repo from the cwd; an explicit bare `OWNER/REPO` goes to
-        // gh's own default host, so no override is added for it. A failed
-        // lookup proceeds without `GH_HOST`.
+        // Origin's host, from local git config. It is read only when needed:
+        // to vet a non-github.com host the command names, or to set
+        // `GH_HOST` when gh picks the repo from the cwd. A failed lookup
+        // leaves it `None`.
+        let needs_origin = target
+            .named_hosts
+            .iter()
+            .any(|h| !h.eq_ignore_ascii_case("github.com"))
+            || (target.host.is_none() && target.repo == RepoChoice::GhDefault);
+        let origin_host = needs_origin
+            .then(|| git_command(cwd, &["remote", "get-url", "origin"]))
+            .flatten()
+            .and_then(|url| host_and_repo_from_url(&url))
+            .map(|(host, _slug)| host);
+
+        // Host: what the command names (vetted in `evaluate`), else origin's
+        // host when gh picks the repo from the cwd and origin is not on
+        // github.com. An explicit bare `OWNER/REPO` goes to gh's own default
+        // host, so no override is added for it.
         let host = target.host.clone().or_else(|| {
             if target.repo != RepoChoice::GhDefault {
                 return None;
             }
-            let remote_url = git_command(cwd, &["remote", "get-url", "origin"])?;
-            let (host, _slug) = host_and_repo_from_url(&remote_url)?;
-            (host != "github.com").then_some(host)
+            origin_host.clone().filter(|h| h != "github.com")
         });
         let gh = RealGhRunner {
             cwd: PathBuf::from(cwd),
@@ -492,7 +599,7 @@ impl Check for WarnUnreviewedReadyFlip {
                 .unwrap_or_default(),
         };
 
-        match evaluate(&target, &gh) {
+        match evaluate(&target, origin_host.as_deref(), &gh) {
             Some(msg) => CheckResult::nudge(msg),
             None => CheckResult::allow(),
         }
@@ -785,8 +892,17 @@ mod tests {
 
     /// Run the hook's decision on a flip command, the way `run` builds it.
     fn eval(command: &str, gh: &dyn GhRunner) -> Option<String> {
+        eval_with_origin(command, None, gh)
+    }
+
+    /// As [`eval`], with origin's host as `run` would read it.
+    fn eval_with_origin(
+        command: &str,
+        origin_host: Option<&str>,
+        gh: &dyn GhRunner,
+    ) -> Option<String> {
         let tokens = flip_segment_tokens(command).expect("fixture must be a flip command");
-        evaluate(&FlipTarget::from_tokens(&tokens)?, gh)
+        evaluate(&FlipTarget::from_tokens(&tokens)?, origin_host, gh)
     }
 
     struct FakeGh {
@@ -1175,6 +1291,113 @@ mod tests {
     fn disagreeing_repo_flags_are_silent() {
         let gh = unreviewed_gh();
         assert_eq!(eval("gh pr merge 5 -R a/b -R c/d", &gh), None);
+        assert_eq!(gh.call_count(), 0);
+    }
+
+    // --- hosts the command names (security review I1) ---
+
+    #[test]
+    fn url_selector_on_an_unknown_host_makes_no_call() {
+        // The hook runs before the user approves the command; a request to
+        // this host would reach it (with GH_ENTERPRISE_TOKEN when set).
+        let gh = unreviewed_gh();
+        assert_eq!(
+            eval("gh pr merge https://attacker.example/o/r/pull/1", &gh),
+            None
+        );
+        assert_eq!(gh.call_count(), 0);
+    }
+
+    #[test]
+    fn repo_flag_on_an_unknown_host_makes_no_call() {
+        let gh = unreviewed_gh();
+        assert_eq!(eval("gh pr merge 5 -R otherhost.example/o/r", &gh), None);
+        assert_eq!(gh.call_count(), 0);
+        let gh = unreviewed_gh();
+        assert_eq!(
+            eval("gh pr merge my-branch -R otherhost.example/o/r", &gh),
+            None
+        );
+        assert_eq!(gh.call_count(), 0);
+    }
+
+    #[test]
+    fn url_shaped_selector_on_an_unknown_host_makes_no_call() {
+        // Not a PR URL, but `gh pr view` would still contact its host.
+        for command in [
+            "gh pr merge http://attacker.example/o/r/pull/1",
+            "gh pr merge https://attacker.example/o/r/issues/1",
+            "gh pr merge https://evil@github.com/o/r/pull/1",
+            "gh pr merge https://github.com:443/o/r/pull/1",
+        ] {
+            let gh = unreviewed_gh();
+            assert_eq!(eval(command, &gh), None, "{command}");
+            assert_eq!(gh.call_count(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn github_com_and_origin_hosts_are_still_queried() {
+        for (command, origin) in [
+            ("gh pr merge 5 -R github.com/o/r", None),
+            ("gh pr merge https://GitHub.com/o/r/pull/5", None),
+            (
+                "gh pr merge 5 -R ghe.corp.example/o/r",
+                Some("ghe.corp.example"),
+            ),
+            (
+                "gh pr merge https://ghe.corp.example/o/r/pull/5",
+                Some("ghe.corp.example"),
+            ),
+        ] {
+            let gh = unreviewed_gh();
+            assert!(
+                eval_with_origin(command, origin, &gh).is_some(),
+                "{command}"
+            );
+            assert_eq!(gh.call_count(), 1, "{command}");
+            let args = gh.graphql_args.borrow();
+            assert!(has(&args, "owner=o"), "{command}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn host_trust_is_github_com_or_origin() {
+        let named = |hosts: &[&str]| hosts.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(hosts_are_trusted(&named(&[]), None));
+        assert!(hosts_are_trusted(&named(&["github.com"]), None));
+        assert!(hosts_are_trusted(&named(&["ghe.x"]), Some("GHE.x")));
+        assert!(!hosts_are_trusted(&named(&["ghe.x"]), None));
+        assert!(!hosts_are_trusted(
+            &named(&["github.com", "evil.x"]),
+            Some("ghe.x")
+        ));
+    }
+
+    // --- an empty repo value (security review N2) ---
+
+    #[test]
+    fn empty_repo_value_is_the_gh_default() {
+        // gh reads an empty `-R` as no override and flips the cwd repo's PR.
+        for command in [
+            "gh pr merge --repo= 5",
+            "gh pr merge -R= 5",
+            "gh pr merge 5 -R ''",
+        ] {
+            let gh = unreviewed_gh();
+            assert!(eval(command, &gh).is_some(), "{command}");
+            let args = gh.graphql_args.borrow();
+            assert!(has(&args, "owner={owner}"), "{command}: {args:?}");
+            assert!(has(&args, "number=5"), "{command}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn repo_value_hidden_by_an_unknown_flag_stays_silent() {
+        // After `--newflag` the scan cannot tell whether `o/r` is a repo, so
+        // it records an empty value. That is not a deliberate empty `-R`.
+        let gh = unreviewed_gh();
+        assert_eq!(eval("gh pr merge 5 --newflag -R o/r", &gh), None);
         assert_eq!(gh.call_count(), 0);
     }
 

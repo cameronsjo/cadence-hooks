@@ -1761,8 +1761,12 @@ static PR_NUMBER_RE: LazyLock<Regex> =
 /// A pull-request URL: `https://HOST/OWNER/REPO/pull/NUMBER`, optionally
 /// followed by a sub-page (`/files`). Anchored at both ends. Public so a
 /// caller parsing gh's own `url` field reads it with the same pattern.
+///
+/// HOST is a bare hostname (letters, digits, `.`, `-`). Userinfo
+/// (`user@github.com`) and a port (`github.com:443`) do not match, so a
+/// caller never takes either for a host name.
 pub static PR_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$")
+    Regex::new(r"^https://([A-Za-z0-9.-]+)/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$")
         .expect("pattern should compile")
 });
 
@@ -6565,6 +6569,23 @@ mod tests {
             selector_of("gh pr merge https://github.com/o/r/issues/511"),
             PrSelector::Other("https://github.com/o/r/issues/511".to_string())
         );
+    }
+
+    #[test]
+    fn pr_url_host_is_a_bare_hostname() {
+        // Userinfo and a port are not part of a host name, so neither URL
+        // parses as a PR URL.
+        for url in [
+            "https://evil@github.com/o/r/pull/1",
+            "https://github.com:443/o/r/pull/1",
+        ] {
+            assert_eq!(pr_url_parts(url), None, "{url}");
+            assert_eq!(
+                selector_of(&format!("gh pr merge {url}")),
+                PrSelector::Other(url.to_string())
+            );
+        }
+        assert!(pr_url_parts("https://ghe.example-corp.com/o/r/pull/1").is_some());
     }
 
     #[test]
