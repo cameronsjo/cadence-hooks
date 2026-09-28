@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.107.0] - 2026-09-28
+
 ### Changed
 
 - **Folder trust is the documented boundary.** `docs/configuration.md` and the `bypass.rs` module docs now say that a trusted repository's settings `env` block can switch off every guard, including through `CADENCE_HOOKS_BIN` and `PATH` in the plugin wrapper, and that `enforcement-status` makes `CADENCE_BYPASS` and refused `CADENCE_DISABLE` visible without defending against a hostile trusted repository (cameronsjo/cadence-hooks#1031, closed not planned). The environment-variable table gains every variable that changes a guard decision, with the ones that weaken a protected guard marked.
