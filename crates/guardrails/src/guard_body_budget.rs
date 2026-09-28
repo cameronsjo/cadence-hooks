@@ -333,6 +333,10 @@ pub fn extract_escape(body: &str) -> Option<String> {
 /// `Content-Disposition` and a carrier signal are ordinary prose, and the table
 /// fired on bodies that were about exactly those things.
 ///
+/// `this session` is exempt in one shape only: `for`/`of this session` on a line
+/// that names a session mechanic in a code span, where it is subject matter
+/// rather than narration (see `exempt_session_subject`).
+///
 /// Em-dashes and emoji are deliberately not measured: both are ordinary prose,
 /// and a guard that policed them would be policing style, not length.
 const NARRATION: &[(&str, &str)] = &[
@@ -370,6 +374,10 @@ static LINK_TARGET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\]\([^)\n]*\)").expect("pattern should compile"));
 static CODE_SPAN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("pattern should compile"));
+/// `this session` as the object of `for` / `of` — see [`exempt_session_subject`].
+static SESSION_SUBJECT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:for|of) this session\b").expect("pattern should compile")
+});
 /// A finding bullet: a bullet carrying a PATH-LIKE token immediately before the
 /// `:<line>`. Either a token with a file extension (`y.rs:42`) or one holding a
 /// path separator (`src/main:12`). A bare `token:digits` is not enough — that
@@ -448,6 +456,37 @@ pub fn strip_fences(body: &str) -> String {
     out.join("\n")
 }
 
+/// Drop `for this session` / `of this session` from any line that also names a
+/// session mechanic in a code span (`session declare`, `session_id`, …). "Names
+/// a session mechanic" is a case-insensitive substring test on the span, so
+/// `SessionStart` or `CADENCE_SESSION` count too — loose on purpose, since the
+/// check only nudges.
+///
+/// On such a line the phrase is the object of a technical noun — "the
+/// `session declare` record for this session" names the Claude Code session a
+/// hook runs in — not the author narrating their work (cadence-hooks#994). Both
+/// conditions are required so the exemption stays narrow: "In this session I
+/// fixed X" still fires (no `for`/`of`), and so does "the plan for this
+/// session" on a line with no session code span. Runs before code spans are
+/// stripped, since it reads them.
+///
+/// Pure.
+fn exempt_session_subject(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let names_session_mechanic = CODE_SPAN_RE
+                .find_iter(line)
+                .any(|span| span.as_str().to_ascii_lowercase().contains("session"));
+            if names_session_mechanic {
+                SESSION_SUBJECT_RE.replace_all(line, "").into_owned()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Strip everything that is not prose, then count what is left.
 ///
 /// Strip order matters and is fixed: fenced code blocks first (a fence can
@@ -463,6 +502,9 @@ pub fn measure(body: &str) -> Measurement {
     let stripped = ROBOT_RE.replace_all(&stripped, "");
     // The link TEXT stays (it is prose the reader reads); only the target goes.
     let stripped = LINK_TARGET_RE.replace_all(&stripped, "]");
+    let narration_text = CODE_SPAN_RE
+        .replace_all(&exempt_session_subject(&stripped), "")
+        .into_owned();
     let stripped = CODE_SPAN_RE.replace_all(&stripped, "");
 
     let mut m = Measurement::default();
@@ -480,7 +522,7 @@ pub fn measure(body: &str) -> Measurement {
             .count();
     }
     for (name, re) in NARRATION_RES.iter() {
-        if let Some(hit) = re.find(&stripped) {
+        if let Some(hit) = re.find(&narration_text) {
             m.narration.push((*name, hit.as_str().to_string()));
         }
     }
@@ -1660,6 +1702,38 @@ mod tests {
         // The reviewer's nit: both fired on a body that was about exactly them.
         let m = measure("The Content-Disposition header is set. The carrier signal is fine.");
         assert!(m.narration.is_empty(), "{:?}", m.narration);
+    }
+
+    #[test]
+    fn this_session_as_session_mechanic_subject_is_not_narration() {
+        // cadence-hooks#994: the phrase names the session a hook runs in.
+        let m = measure("- the `session declare` record for this session");
+        assert!(m.narration.is_empty(), "{:?}", m.narration);
+        let m = measure("Read the `session_id` of this session from the payload.");
+        assert!(m.narration.is_empty(), "{:?}", m.narration);
+    }
+
+    #[test]
+    fn this_session_narration_still_fires() {
+        for body in [
+            "In this session I fixed the parser.",
+            // A session code span alone does not exempt a narrating shape.
+            "In this session I ran `session declare` twice.",
+            // `for this session` with no session mechanic on the line.
+            "The plan for this session was to fix the parser.",
+        ] {
+            let m = measure(body);
+            assert_eq!(m.narration.len(), 1, "{body}: {:?}", m.narration);
+            assert_eq!(m.narration[0].0, "this session", "{body}");
+        }
+    }
+
+    #[test]
+    fn session_subject_exemption_is_scoped_to_its_own_line() {
+        let body = "- the `session declare` record for this session\n\nIn this session I fixed X.";
+        let m = measure(body);
+        assert_eq!(m.narration.len(), 1, "{:?}", m.narration);
+        assert_eq!(m.narration[0].1, "this session");
     }
 
     #[test]

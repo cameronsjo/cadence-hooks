@@ -179,14 +179,22 @@ impl Check for PersistPlanApproval {
         // Narrow defense-in-depth on top of the dispatch-layer panic guard
         // (cameronsjo/cadence-hooks#349): this fires on every PostToolUse
         // call, and a bug here must not eat the approval (or the tool call).
-        std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(|| {
             if input.tool_name() == Some("ExitPlanMode") {
                 run_persist_plan_approval(input, &utc_now, &local_date, &host)
             } else {
                 run_injected_plan_persist(input, &utc_now, &local_date, &host)
             }
         })
-        .unwrap_or_else(|_| CheckResult::allow())
+        .unwrap_or_else(|_| CheckResult::allow());
+        // Liveness refresh, throttled, riding this every-PostToolUse process so
+        // the heartbeat costs no spawn of its own (cameronsjo/cadence-hooks#902).
+        // After the persist, so its git probes never spend the persist's share
+        // of the per-process git deadline; panic-isolated for the same reason.
+        let _ = std::panic::catch_unwind(|| {
+            crate::heartbeat::beat_if_due(input.session_id(), input.cwd.as_deref())
+        });
+        result
     }
 }
 

@@ -312,10 +312,11 @@ Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is h
 
 ## Auditing installed plugins
 
-`doctor` scans every installed plugin's `hooks.json` for two classes of problems:
+`doctor` checks the installed plugins for problems, including:
 
-- **Shell-expansion bugs** (exit 2): single-quoted `'${CLAUDE_PLUGIN_ROOT}'` won't expand in `/bin/sh` — the harness reports a silent non-blocking failure and nothing surfaces to the user.
-- **Subcommand skew** (exit 1): a hook references a subcommand this binary doesn't have — typically a plugin built for a newer version of cadence-hooks.
+- **Shell-expansion bugs** (exit 2): single-quoted `'${CLAUDE_PLUGIN_ROOT}'` in a `hooks.json` won't expand in `/bin/sh` — the harness reports a silent non-blocking failure and nothing surfaces to the user.
+- **Subcommand skew** (exit 1): a `hooks.json` hook references a subcommand this binary doesn't have — typically a plugin built for a newer version of cadence-hooks.
+- **Rules drift** (exit 1): the deployed `<config dir>/rules/cadence/cadence-rules.md` differs from the pinned `cadence` plugin's `rules/cadence-rules.md`. The fix names both paths so you can `diff` them first. Removing the `managed by cadence` line from the deployed copy marks it as yours and silences the check.
 
 By default the scan is driven by `~/.claude/plugins/installed_plugins.json`, so only **active** installs are checked (the cache keeps stale plugin versions around — scanning those would report skew in code that no longer runs). With `--root`, the given tree is walked recursively, so both flat layouts (`<root>/<plugin>/hooks/hooks.json`) and the real cache layout (`<root>/<marketplace>/<plugin>/<sha>/hooks/hooks.json`) work.
 
