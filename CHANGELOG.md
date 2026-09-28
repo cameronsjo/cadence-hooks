@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`nudge-polish-before-pr` no longer says "No polish recorded" when the command runs outside a repo.** A session rooted outside any git checkout (`~/.claude`, say) that ships with `-R`/`--head` has no checkout to look the marker up in, so the gate now gives the cannot-check advisory instead of claiming polish never ran. The `log-polish-nudge` row records `markerTarget: cannot_check` for the same case. No cwd at all, and a detached HEAD, keep the no-marker nudge. (cameronsjo/cadence-hooks#453)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed

@@ -213,8 +213,9 @@ pub enum MarkerTarget {
     /// that is not one of its remotes, a fork head, a branch checked out
     /// nowhere, or a conflicting `--head`. `reason` is safe to echo.
     CannotCheck { reason: String },
-    /// No cwd, a cwd outside any repo, or a detached HEAD. Nothing names a
-    /// branch, so the gate keeps its no-marker nudge.
+    /// No cwd, or a detached HEAD. Nothing names a branch, so the gate keeps
+    /// its no-marker nudge. A cwd outside any repo is
+    /// [`MarkerTarget::CannotCheck`] instead (cadence-hooks#453).
     Unknown,
 }
 
@@ -242,7 +243,13 @@ impl MarkerTarget {
 /// branch (cadence-hooks#995). `cwd_dir` is the `cd`-aware working directory
 /// ([`crate::shell::parse_work_dir`]).
 ///
-/// - No cwd, not a repo, or a detached HEAD → [`MarkerTarget::Unknown`].
+/// - No cwd, or a detached HEAD → [`MarkerTarget::Unknown`].
+/// - A cwd outside any repo → [`MarkerTarget::CannotCheck`]
+///   (cadence-hooks#453). A session rooted outside the repo (`~/.claude`)
+///   that ships with `-R`/`--head` names a branch this check has no checkout
+///   to look it up in, so "no polish recorded" would be a claim it cannot
+///   make. Nothing is tried in place of the cwd: a guessed checkout could
+///   answer for a different repo's same-named branch.
 /// - Every repo value must name one of the cwd repo's remotes (all of `git
 ///   remote -v`, not only `origin`), compared on `owner/repo`. The host joins
 ///   the comparison only when the value names one or an inline `GH_HOST=` set
@@ -261,7 +268,10 @@ pub fn resolve_ship_target(target: &ShipTarget, cwd_dir: Option<&str>) -> Marker
         return MarkerTarget::Unknown;
     };
     let Some(state) = GitState::resolve(Path::new(cwd_dir)) else {
-        return MarkerTarget::Unknown;
+        return cannot_check(
+            "the command runs outside a git checkout, so the branch it ships cannot be looked up"
+                .to_string(),
+        );
     };
     let Some(cwd_branch) = state.branch else {
         return MarkerTarget::Unknown;
@@ -1908,14 +1918,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ship_target_unknown_without_a_repo() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn resolve_ship_target_unknown_without_a_cwd() {
         let t = target(&["own/repo"], None, named("feat/x"));
-        assert_eq!(
-            resolve_ship_target(&t, Some(tmp.path().to_str().unwrap())),
-            MarkerTarget::Unknown
-        );
         assert_eq!(resolve_ship_target(&t, None), MarkerTarget::Unknown);
+    }
+
+    #[test]
+    fn resolve_ship_target_cannot_check_outside_a_repo() {
+        // cadence-hooks#453: a session rooted outside any repo has no
+        // checkout to look the branch up in, so the answer is the advisory,
+        // never the no-marker nudge. Holds with and without a named target.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        for t in [
+            target(&["own/repo"], None, named("feat/x")),
+            ShipTarget::default(),
+        ] {
+            let result = resolve_ship_target(&t, Some(dir));
+            let MarkerTarget::CannotCheck { reason } = result else {
+                panic!("{t:?} outside a repo should be cannot-check, got {result:?}");
+            };
+            assert!(reason.contains("outside a git checkout"), "{reason}");
+        }
+        // A cwd that does not exist (a `cd` to a missing dir) reads the same.
+        let gone = tmp.path().join("gone");
+        assert!(matches!(
+            resolve_ship_target(&ShipTarget::default(), Some(gone.to_str().unwrap())),
+            MarkerTarget::CannotCheck { .. }
+        ));
     }
 
     // --- read_polish_marker / PolishRecord (#467) ---
