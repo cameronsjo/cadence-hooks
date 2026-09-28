@@ -173,6 +173,12 @@ impl Check for PersistPlanApproval {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        // Liveness refresh, throttled, riding this every-PostToolUse process so
+        // the heartbeat costs no spawn of its own (cameronsjo/cadence-hooks#902).
+        // Guarded separately: a heartbeat bug must not cost the plan persist.
+        let _ = std::panic::catch_unwind(|| {
+            crate::heartbeat::beat_if_due(input.session_id(), input.cwd.as_deref())
+        });
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let utc_now = cadence_hooks_core::time::utc_timestamp();
         let local_date = cadence_hooks_core::time::local_date();

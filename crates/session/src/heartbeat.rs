@@ -108,6 +108,65 @@ pub fn run_heartbeat(
     }
 }
 
+/// Throttled liveness refresh for callers already running on every tool call.
+///
+/// The per-call `session heartbeat` hook was unwired (cameronsjo/cadence-hooks#902)
+/// to save a process spawn per tool call. Its liveness job did not move with it:
+/// only `session guard`, on git checkout/switch/add/commit, still touched the
+/// record, so a session busy with anything else read as stale after
+/// [`registry::stale_minutes`] and the `doctor --prune --apply` gate deleted
+/// version dirs under it. This restores the refresh without a spawn by riding
+/// the `persist-plan-approval` process that already runs on every `PostToolUse`.
+///
+/// Throttled: when this session's record is younger than a third of the stale
+/// window, the call is one `stat` and returns. Otherwise it runs the full
+/// [`run_heartbeat`] (record write, branch probe, stale sweep). Returns whether
+/// it wrote. Never errors.
+pub fn beat_if_due(session_id: Option<&str>, cwd: Option<&str>) -> bool {
+    let Some(sid) = session_id.filter(|s| identity::is_safe_session_id(s)) else {
+        return false;
+    };
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    let Some(dir) = registry::sessions_dir(cwd) else {
+        return false;
+    };
+    let stale_secs = registry::stale_minutes() * 60;
+    if !is_due(&dir, sid, stale_secs, std::time::SystemTime::now()) {
+        return false;
+    }
+    let branch = git_command(cwd, &["branch", "--show-current"]);
+    run_heartbeat(
+        &dir,
+        Some(registry::global_sessions_dir().as_path()),
+        sid,
+        branch,
+        None,
+        stale_secs,
+    );
+    true
+}
+
+/// Whether this session's record needs a refresh: absent, unreadable, or older
+/// than a third of `stale_secs`. A third leaves two missed windows of slack
+/// before a reader would call the session stale.
+fn is_due(
+    dir: &std::path::Path,
+    session_id: &str,
+    stale_secs: u64,
+    now: std::time::SystemTime,
+) -> bool {
+    let Some(path) = registry::find_own(dir, session_id) else {
+        return true;
+    };
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return true;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age.as_secs() >= stale_secs / 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +490,35 @@ mod tests {
 
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(!peers[0].stale, "heartbeat resets liveness");
+    }
+
+    // ── beat_if_due / is_due (cameronsjo/cadence-hooks#902) ─────────────────
+
+    #[test]
+    fn is_due_when_no_record_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(is_due(
+            tmp.path(),
+            "sess-none",
+            1800,
+            std::time::SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn is_due_only_after_a_third_of_the_stale_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        registry::touch_own(&dir, None, "sess-fresh", None, false).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(
+            !is_due(&dir, "sess-fresh", 1800, now),
+            "fresh record is not due"
+        );
+        let later = now + std::time::Duration::from_secs(600);
+        assert!(
+            is_due(&dir, "sess-fresh", 1800, later),
+            "10 min into a 30 min window is due"
+        );
     }
 }
