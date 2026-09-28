@@ -77,7 +77,8 @@
 //! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
 //! stronger of the two a repository can set. Either switch leaves a stderr
 //! line per affected invocation, and both are reported at session start by
-//! `guard-rm-liveness` (for the guard it watches) and on request by `list`,
+//! `enforcement-status` (a bypass, or a disable naming a protected guard) and
+//! `guard-rm-liveness` (for the guard it watches), and on request by `list`,
 //! `doctor`, and `configure --list`.
 //!
 //! The same channel writes every other `CADENCE_*` variable the binary reads,
@@ -89,7 +90,13 @@
 //! both leaves no durable record where the operator's tooling reads
 //! (cadence-hooks#963 holds the design call). `CADENCE_ALLOW_MAIN` and
 //! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR`
-//! relocates the marker state other checks key on. The identity tier already
+//! relocates the marker state other checks key on. `CADENCE_ALLOWED_OWNERS`,
+//! `CADENCE_ALLOWED_REPOS` and `CADENCE_EXTRA_HOSTS` widen what
+//! `guard-push-remote` and `guard-gh-write` accept as the operator's own, and
+//! `CADENCE_ALLOW_SOPS_DECRYPT` lets `guard-sops-decrypt` allow a decrypt (it
+//! still writes a bypass row). All three guards are protected, and none of
+//! these variables is reported at session start: `enforcement-status` covers
+//! only the two switches above (widening it: cameronsjo/cadence-hooks#1031). The identity tier already
 //! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this
 //! reason; see the "Why no environment override in production" note on
 //! `terms_path` in the `cadence` crate. Protection here is per-switch, not
@@ -174,6 +181,11 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     // — the watched guard stays unprotected by charter (see `guard_rm.rs`),
     // which is precisely why the watcher may not be.
     "guard-rm-liveness",
+    // The detector of the switches themselves: `enforcement-status` reports at
+    // SessionStart when CADENCE_BYPASS=1 is set or CADENCE_DISABLE names a
+    // protected guard. Disabling it would hide the report of an attempt to
+    // disarm everything above, so it is protected for the same reason.
+    "enforcement-status",
 ];
 
 /// Hooks the blanket [`BYPASS_VAR`] escape does **not** switch off.
@@ -183,7 +195,7 @@ pub const PROTECTED_GUARDS: &[&str] = &[
 /// enforcement state — `CADENCE_BYPASS=1` included — so bypassing it would
 /// suppress the report of the very switch that suppressed it. Anything that
 /// *enforces* belongs to the bypass; a detector of the bypass cannot.
-pub const BYPASS_EXEMPT_HOOKS: &[&str] = &["guard-rm-liveness"];
+pub const BYPASS_EXEMPT_HOOKS: &[&str] = &["guard-rm-liveness", "enforcement-status"];
 
 /// Whether [`BYPASS_VAR`] may not switch this hook off.
 #[must_use]
