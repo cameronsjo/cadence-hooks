@@ -220,7 +220,7 @@ kept unprefixed because it's a cross-tool convention.
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `guard-rm,warn-main-branch`). Not every name is honoured — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
-| `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so does `guard-rm-liveness` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
+| `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so do the status checks `guard-rm-liveness` and `enforcement-status` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_NO_FEEDBACK_FOOTER` | all hooks | Set to any non-empty value to suppress the `If this fired in error: /cadence:feedback` footer appended to hard blocks |
 | `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs |
@@ -259,7 +259,7 @@ A name in `CADENCE_DISABLE` is not automatically honoured. Every name resolves t
 
 With `CADENCE_BYPASS=1` also set, a named hook is reported as **moot** instead: the blanket bypass has already switched it off, so neither "disabled" nor "still runs" would be a true statement about it. A **bypass-exempt** hook is the exception at both ends — `CADENCE_BYPASS=1` does not switch it off, so it is reported as refused and still running, never moot.
 
-**Bypass-exempt hooks.** `CADENCE_BYPASS=1` skips every enforcement hook except `guard-rm-liveness`. Its entire job is to report that a guard has been switched off, and `CADENCE_BYPASS=1` is one of the two switches it reports on — bypassing it would suppress the report of the bypass itself. `cadence-hooks list` and `cadence-hooks doctor` both name the exception in their bypass banner. Disabling the `cadence-guardrails` plugin is the remaining way to stop it.
+**Bypass-exempt hooks.** `CADENCE_BYPASS=1` skips every enforcement hook except the two SessionStart status checks, `guard-rm-liveness` and `enforcement-status`. Their entire job is to report that guards have been switched off, and `CADENCE_BYPASS=1` is a switch they report on — bypassing them would suppress the report of the bypass itself. `enforcement-status` reports the bypass, and any `CADENCE_DISABLE` naming a protected guard other than the status checks themselves, at SessionStart once the `cadence-guardrails` plugin wires it. `cadence-hooks list` and `cadence-hooks doctor` both name the exception in their bypass banner. Disabling the `cadence-guardrails` plugin is the remaining way to stop them.
 
 `doctor` reports all of this at session start, `--quiet` included — that route prints the suppression lines to stdout and stays completely silent when enforcement is on, so a session running with guards switched off cannot look like a clean one.
 
