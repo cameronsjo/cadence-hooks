@@ -225,6 +225,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::SessionStart),
     },
     HookEntry {
+        name: "enforcement-status",
+        description: "Report at SessionStart when CADENCE_BYPASS=1 or CADENCE_DISABLE names a protected guard",
+        namespace: "guardrails",
+        event: Some(HookEvent::SessionStart),
+    },
+    HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         namespace: "guardrails",

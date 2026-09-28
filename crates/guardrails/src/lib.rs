@@ -97,6 +97,8 @@ pub mod dismiss_enforce_worktree;
 pub mod dismiss_main_branch_warn;
 /// Block mutations in a primary checkout of a branch-mode repo.
 pub mod enforce_worktree;
+/// SessionStart report of a switch that disarmed, or tried to disarm, the protected guards.
+pub mod enforcement_status;
 /// Shared renderer for the gh-write allowlist + `-R` rule context line.
 pub mod gh_context;
 /// Measure `gh` pr/issue bodies against a per-surface word budget.

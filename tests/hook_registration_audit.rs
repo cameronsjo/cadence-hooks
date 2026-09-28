@@ -306,6 +306,14 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
+    // Replaces guard-rm-liveness's CADENCE_BYPASS report. The cadence-guardrails
+    // SessionStart wiring lands in the cadence PR that follows this release;
+    // the guard-rm deletion PR refreshes the fixture and removes this entry
+    // (cameronsjo/cadence-ecosystem#582).
+    (
+        "guardrails enforcement-status",
+        "cameronsjo/cadence-ecosystem#582",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
