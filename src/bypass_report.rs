@@ -1006,7 +1006,10 @@ mod tests {
     /// properties, and this hook deliberately has only the first.
     #[test]
     fn the_liveness_detector_is_protected_but_never_security_critical() {
-        for detector in ["guard-rm-liveness", "enforcement-status"] {
+        // Every bypass-exempt hook is a status check by definition, so the
+        // exempt list is the detector list — and survives guard-rm-liveness's
+        // deletion without an edit here.
+        for detector in bypass::BYPASS_EXEMPT_HOOKS {
             assert!(
                 bypass::is_protected(detector),
                 "'{detector}' must be protected from CADENCE_DISABLE"

@@ -11,10 +11,10 @@
 //! stderr of an exit-0 hook, so without a SessionStart report a bypassed
 //! session looks exactly like a guarded one.
 //!
-//! `guard-rm-liveness` carried this report until guard-rm was retired
-//! (cameronsjo/cadence-ecosystem#582). This check keeps that one job and drops
-//! the rest: it says nothing about any single guard, and it is silent in a
-//! normal session.
+//! `guard-rm-liveness` carries this report today, and it is retired with
+//! guard-rm (cameronsjo/cadence-ecosystem#582). This check keeps that one job
+//! and drops the rest: it says nothing about any single guard, and it is
+//! silent in a normal session.
 //!
 //! # What it reports
 //!
@@ -28,6 +28,12 @@
 //! but it means something tried to switch them off, which is worth one line.
 //! `CADENCE_DISABLE` naming only unprotected hooks is an ordinary, intended
 //! setting and stays silent.
+//!
+//! The row names protected *guards* only, never the status checks in
+//! [`BYPASS_EXEMPT_HOOKS`]. A refused disable of a status check changes
+//! nothing — it still runs and speaks for itself — and reporting it would turn
+//! the estate's standing `CADENCE_DISABLE=guard-rm,guard-rm-liveness` into a
+//! daily nag until guard-rm-liveness is deleted.
 //!
 //! # Why it cannot be switched off
 //!
@@ -72,9 +78,9 @@ pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> O
             .collect();
         return Some(format!(
             "{var}={on} is set: every cadence-hooks guard is switched off for this session, \
-             including the protected ones ({guards}). Only the status checks ({exempt}) still \
-             run. If you did not set it, check this project's .claude/settings.json env block. \
-             Unset {var} to restore the guards.",
+             including the protected ones ({guards}). Only the status checks ({exempt}) and \
+             the diagnostic commands still run. If you did not set it, check this project's \
+             .claude/settings.json env block. Unset {var} to restore the guards.",
             var = bypass::BYPASS_VAR,
             on = bypass::BYPASS_ON,
             guards = switched_off.join(", "),
@@ -86,6 +92,7 @@ pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> O
         Some(raw) => PROTECTED_GUARDS
             .iter()
             .copied()
+            .filter(|guard| !bypass::is_bypass_exempt_hook(guard))
             .filter(|guard| bypass::disable_list(raw).any(|entry| entry == *guard))
             .collect(),
         None => Vec::new(),
@@ -212,8 +219,26 @@ mod tests {
     }
 
     #[test]
-    fn disabling_this_check_is_itself_reported() {
-        let report = report_from(None, Some(HOOK_NAME)).expect("reports");
-        assert!(report.contains(HOOK_NAME), "{report}");
+    fn a_refused_disable_of_a_status_check_is_silent() {
+        // The status checks still run; naming them in CADENCE_DISABLE changes
+        // nothing worth a line.
+        for check in bypass::BYPASS_EXEMPT_HOOKS {
+            assert_eq!(report_from(None, Some(check)), None, "{check}");
+        }
+    }
+
+    #[test]
+    fn the_standing_guard_rm_overlay_is_silent() {
+        // Every estate machine carries this value until the guard-rm
+        // retirement's dotfiles step (cameronsjo/cadence-ecosystem#582).
+        assert_eq!(report_from(None, Some("guard-rm,guard-rm-liveness")), None);
+    }
+
+    #[test]
+    fn a_status_check_beside_a_protected_guard_is_left_out_of_the_report() {
+        let report =
+            report_from(None, Some("guard-rm-liveness,trash-guard")).expect("reports trash-guard");
+        assert!(report.contains("trash-guard"), "{report}");
+        assert!(!report.contains("guard-rm-liveness"), "{report}");
     }
 }

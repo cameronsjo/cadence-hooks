@@ -94,9 +94,17 @@ fn a_disable_naming_a_protected_guard_is_reported() {
 }
 
 #[test]
-fn disabling_the_report_itself_is_refused_and_reported() {
-    let context = context_of(&run(None, Some("enforcement-status")));
-    assert!(context.contains("enforcement-status"), "{context}");
+fn disabling_the_report_itself_is_refused_and_it_still_reports_a_bypass() {
+    let context = context_of(&run(Some("1"), Some("enforcement-status")));
+    assert!(context.contains("CADENCE_BYPASS=1"), "{context}");
+}
+
+#[test]
+fn the_standing_guard_rm_overlay_prints_nothing() {
+    let output = run(None, Some("guard-rm,guard-rm-liveness"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.trim().is_empty(), "expected silence, got: {stdout}");
 }
 
 #[test]
