@@ -1017,8 +1017,18 @@ fn resolve_cd_segment(
 /// Command words that cannot rebind HOME in the shell running the command —
 /// the allowlist behind [`dollar_home`]. Kept deliberately small: every entry
 /// is a builtin or external command that takes no variable NAME as an operand
-/// and does no arithmetic evaluation.
-const HOME_SAFE_WORDS: &[&str] = &["cd", "git", "ls", "echo", "pwd", "true", "test", "["];
+/// and evaluates no argument arithmetically.
+///
+/// - `cd`, `pwd`: take a path and `-L`/`-P`/`-e`/`-@` flags only (a `CDPATH`
+///   lookup changes where cd lands, never HOME).
+/// - `echo`, `true`: print or ignore their arguments.
+/// - `git`, `ls`: external processes, which cannot write the parent shell's
+///   variables (`git -c alias.x='!…'` runs in git's own child).
+///
+/// `test` and `[` are deliberately ABSENT: `test -v 'a[HOME=7]'` makes bash
+/// evaluate the array subscript arithmetically, which assigns HOME in the
+/// running shell (gate-2 delta review).
+const HOME_SAFE_WORDS: &[&str] = &["cd", "git", "ls", "echo", "pwd", "true"];
 
 /// The home a `$HOME` cd target in this top-level `command` expands against,
 /// or `None` when the guard cannot show the command leaves HOME alone.
@@ -2908,6 +2918,14 @@ mod tests {
         "(true) && ",
         "{ true; } && ",
         "echo {a,b} && ",
+        // Gate-2 delta review Critical: `test -v` evaluates an array
+        // subscript arithmetically, assigning HOME in the running shell.
+        "test -v 'a[HOME=7]'; ",
+        "test -v a[HOME=7]; ",
+        "[ -v 'a[HOME=7]' ]; ",
+        "test -v 'a[HOME=7]' || ",
+        "test -v 'a[HOME=7]' && ",
+        "test -d .git && ",
     ];
 
     #[test]
@@ -2984,7 +3002,7 @@ mod tests {
             r#"cd "$HOME/wt" && git add . && git commit -m x"#,
             r#"cd "$HOME/wt" && git commit -m "fix(scope): thing {1}""#,
             r#"cd "${HOME}/wt" && echo "$HOME" && pwd && ls && git commit -m x"#,
-            r#"cd $HOME/wt && test -d .git && [ -d .git ] && true && git commit -m x"#,
+            r#"cd $HOME/wt && true && git commit -m x"#,
             "cd \"$HOME/wt\" && git commit -F - <<'EOF'\nfix(scope): body (with parens)\nEOF",
         ] {
             assert!(command_leaves_home_alone(cmd), "{cmd}");
@@ -3526,6 +3544,10 @@ mod tests {
             ),
             format!(r#"env -i bash -c 'cd "{target}" && git commit -m x'"#),
             format!(r#"sudo bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"test -v 'a[HOME=7]'; cd "{target}" && git commit -m x"#),
+            format!(r#"test -v a[HOME=7]; cd "{target}" && git commit -m x"#),
+            format!(r#"[ -v 'a[HOME=7]' ]; cd "{target}" && git commit -m x"#),
+            format!(r#"test -v 'a[HOME=7]' || cd "{target}" && git commit -m x"#),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
