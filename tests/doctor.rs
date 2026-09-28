@@ -191,10 +191,10 @@ fn doctor_runs_under_cadence_bypass() {
 // ── --quiet stdout contract (SessionStart preflight depends on it) ─────────
 
 #[test]
-fn doctor_quiet_warnings_print_summary_to_stdout() {
-    // The README's SessionStart preflight wiring captures stdout as the skew
-    // nudge. Warnings-only in quiet mode MUST emit a non-empty stdout line
-    // and exit 0.
+fn doctor_quiet_skew_prints_blocker_envelope_to_stdout() {
+    // A wiring that names a subcommand this binary lacks is a hook that is not
+    // running: the one class `--quiet` reports. It goes to stdout (the
+    // SessionStart wiring discards stderr) and exits 0 (no error).
     let tmp = tempfile::tempdir().unwrap();
     write_plugin(tmp.path(), "skewed-plugin", SKEW_HOOKS_JSON);
 
@@ -211,17 +211,136 @@ fn doctor_quiet_warnings_print_summary_to_stdout() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "warnings-only in quiet mode exits 0.\nstderr: {}",
+        "inert wiring without errors exits 0.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.trim().is_empty(),
-        "quiet mode with warnings must print a one-line summary to stdout"
+        stdout.contains("0 error(s) and 1 inert hook wiring(s)"),
+        "envelope must count the inert wiring: {stdout}"
+    );
+    assert!(stdout.contains("Version skew"), "{stdout}");
+}
+
+#[test]
+fn doctor_quiet_error_prints_envelope_to_stdout_and_exits_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(tmp.path(), "buggy-plugin", BUGGY_HOOKS_JSON);
+    let markers = tempfile::tempdir().unwrap();
+    let output = cadence_hooks()
+        .args(["doctor", "--quiet", "--root"])
+        .arg(tmp.path())
+        .env("CADENCE_MARKER_DIR", markers.path())
+        .env("CADENCE_NO_DAILY_GATE", "1")
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 error(s) and 0 inert hook wiring(s)"),
+        "errors now reach stdout, which SessionStart keeps: {stdout}"
+    );
+}
+
+/// Plugin-controlled bytes — the plugin directory, the command, the namespace,
+/// the subcommand, and a `CADENCE_DISABLE` entry — never reach `--quiet`
+/// stdout. That stdout becomes SessionStart `additionalContext`, so any of them
+/// arriving there would be a prompt-injection channel.
+#[test]
+fn doctor_quiet_never_echoes_plugin_controlled_text() {
+    const CANARY: &str = "CANARY-IGNORE-PRIOR";
+    let canary_hooks = format!(
+        r#"{{ "hooks": {{ "PreToolUse": [{{ "hooks": [
+            {{ "command": "'${{CLAUDE_PLUGIN_ROOT}}/{c}' {c}" }},
+            {{ "command": "\"${{CLAUDE_PLUGIN_ROOT}}/hooks/run-cadence-hooks.sh\" {c} {c}-sub" }},
+            {{ "command": "cadence-hooks {c} guard-push-remote" }},
+            {{ "command": "cadence-hooks group {c}" }}
+        ] }}] }} }}"#,
+        c = CANARY
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(tmp.path(), CANARY, &canary_hooks);
+    let markers = tempfile::tempdir().unwrap();
+
+    // Control: the full report does carry the canary, so the fixture reached
+    // the scan and the quiet assertion below is not vacuous.
+    let full = cadence_hooks()
+        .args(["doctor", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+    assert!(
+        String::from_utf8_lossy(&full.stdout).contains(CANARY),
+        "fixture must produce findings that name the canary"
+    );
+
+    let output = cadence_hooks()
+        .args(["doctor", "--quiet", "--root"])
+        .arg(tmp.path())
+        .env("CADENCE_MARKER_DIR", markers.path())
+        .env("CADENCE_NO_DAILY_GATE", "1")
+        .env("CADENCE_DISABLE", CANARY)
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("inert hook wiring(s)"),
+        "the blockers must still be reported: {stdout}"
     );
     assert!(
-        stdout.contains("warning"),
-        "summary should describe the plugin warning(s): {stdout}"
+        !stdout.contains(CANARY),
+        "canary leaked to quiet stdout: {stdout}"
+    );
+}
+
+/// Advisory findings stay out of SessionStart. A real slow-hook record in the
+/// session logs makes full `doctor` warn about latency; `--quiet` prints
+/// nothing. This is the test a blocker predicate that says yes to everything
+/// turns red.
+#[test]
+fn doctor_quiet_is_silent_on_hook_latency() {
+    let home = home_with_empty_cache();
+    let metrics = tempfile::tempdir().unwrap();
+    std::fs::write(metrics.path().join("subagents.jsonl"), "{}\n").unwrap();
+    let project = home.path().join(".claude/projects/-tmp-demo");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("session.jsonl"),
+        concat!(
+            r#"{"type":"hook_success","command":"x/run-cadence-hooks.sh cadence prevent-secret-writes","durationMs":6100}"#,
+            "\n",
+            r#"{"type":"hook_cancelled","command":"x/run-cadence-hooks.sh guardrails enforce-worktree","durationMs":null}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let markers = tempfile::tempdir().unwrap();
+
+    // Control: the full report warns, so the fixture reached the scan.
+    let full = doctor_in_home(home.path(), metrics.path())
+        .current_dir(home.path())
+        .output()
+        .expect("failed to execute");
+    let full_stdout = String::from_utf8_lossy(&full.stdout);
+    assert_eq!(full.status.code(), Some(1), "{full_stdout}");
+    assert!(
+        full_stdout.contains("prevent-secret-writes"),
+        "the latency fixture must reach the scan: {full_stdout}"
+    );
+
+    let output = doctor_in_home(home.path(), metrics.path())
+        .arg("--quiet")
+        .current_dir(home.path())
+        .env("CADENCE_MARKER_DIR", markers.path())
+        .env("CADENCE_NO_DAILY_GATE", "1")
+        .output()
+        .expect("failed to execute");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "an advisory finding must not reach SessionStart: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

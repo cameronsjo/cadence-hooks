@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`doctor --quiet` reports only blockers at session start.** A blocker is a finding that means a wired hook is not running: a shell-expansion error, a wiring that names a subcommand or namespace the binary lacks, a `group` entry the binary cannot parse or run, or a hook whose CLI is not on `PATH`. The quiet route prints one fixed envelope with counts and exits 2 only on errors. Hook latency, stale telemetry, orphaned cache dirs, unenabled plugins, and identity findings no longer print there; a full `cadence-hooks doctor` run reports them, and `cadence:outro` makes that run at session end. The old once-a-day nag hashed every warning's text, and the hook-latency warning embeds rolling counts, so it re-fired most sessions and asked for a triage of findings nobody could fix at session start. The daily gate now hashes blocker diagnoses only.
+- **Errors and configuration errors now reach session start.** `doctor --quiet` wrote them to stderr, which the documented SessionStart wiring discards, so the one class that should interrupt a session never did. The envelope goes to stdout; the detail stays on stderr.
+- **`doctor --quiet` discloses only switches that are really off.** It prints the `CADENCE_BYPASS=1` banner and the `Disabled via CADENCE_DISABLE:` line. Refused, moot, and unrecognized `CADENCE_DISABLE` entries switch nothing off, so they appear only in the full `doctor` report; `guardrails enforcement-status` reports refused protected-guard disables at session start.
+
 ## [0.104.1] - 2026-09-27
 
 ### Fixed
