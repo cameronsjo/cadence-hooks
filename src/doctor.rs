@@ -713,6 +713,61 @@ fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
     Some(out)
 }
 
+/// Install dirs that only project-scope entries for **other** projects pin.
+///
+/// A `scope: "project"` install is wired only in sessions under its
+/// `projectPath`, so a defect in it (a missing pin dir, a skewed hooks.json)
+/// is not a wired hook failing to run in *this* session. A dir any in-scope
+/// entry also pins (user scope, or a project containing `cwd`) is left out, so
+/// it still blocks. Missing or unreadable manifest: empty set (nothing demoted).
+fn out_of_scope_install_dirs(manifest: &Path, cwd: &Path) -> std::collections::HashSet<PathBuf> {
+    let mut in_scope = std::collections::HashSet::new();
+    let mut out_of_scope = std::collections::HashSet::new();
+    let Some(json) = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    else {
+        return out_of_scope;
+    };
+    let installs = json
+        .get("plugins")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flat_map(|plugins| plugins.values())
+        .filter_map(|v| v.as_array())
+        .flatten();
+    for install in installs {
+        let Some(dir) = install.get("installPath").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let other_project = install.get("scope").and_then(|v| v.as_str()) == Some("project")
+            && install
+                .get("projectPath")
+                .and_then(|v| v.as_str())
+                .is_some_and(|project| !cwd.starts_with(project));
+        if other_project {
+            out_of_scope.insert(PathBuf::from(dir));
+        } else {
+            in_scope.insert(PathBuf::from(dir));
+        }
+    }
+    out_of_scope.retain(|dir| !in_scope.contains(dir));
+    out_of_scope
+}
+
+/// Demote to advisory every blocker whose file sits under an install dir
+/// [`out_of_scope_install_dirs`] returns. Full `doctor` still reports it.
+fn demote_out_of_scope_blockers(
+    findings: &mut [Finding],
+    out_of_scope: &std::collections::HashSet<PathBuf>,
+) {
+    for f in findings.iter_mut() {
+        if out_of_scope.iter().any(|dir| f.file.starts_with(dir)) {
+            f.blocker = Blocker::No;
+        }
+    }
+}
+
 /// Every `enabledPlugins` entry across `settings.json` and
 /// `settings.local.json`, keyed by plugin ID (`<plugin>@<marketplace>` — the
 /// same key shape `installed_plugins.json` uses, so the two join directly).
@@ -3328,6 +3383,16 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         }
     }
 
+    // Project-scope installs for other projects are not wired here: their
+    // defects are advisory in this session. Live-machine read, so default mode
+    // only, like the checks above.
+    if root_override.is_none()
+        && let (Some(plugins), Ok(cwd)) = (plugins_dir(), std::env::current_dir())
+    {
+        let out_of_scope = out_of_scope_install_dirs(&plugins.join("installed_plugins.json"), &cwd);
+        demote_out_of_scope_blockers(&mut findings, &out_of_scope);
+    }
+
     let of = |severity: Severity| -> Vec<&Finding> {
         findings.iter().filter(|f| f.severity == severity).collect()
     };
@@ -3581,6 +3646,47 @@ mod tests {
     // THE #397 REGRESSION TEST. A hook-shipping plugin with no enabledPlugins
     // entry is exactly the fingerprint the audit found: the metrics plugin was
     // absent from the map entirely and its loggers had been inert for months.
+    #[test]
+    fn a_project_install_for_another_project_never_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("installed_plugins.json");
+        fs::write(
+            &manifest,
+            serde_json::json!({ "version": 2, "plugins": {
+                "a@m": [
+                    { "scope": "project", "projectPath": "/work/other", "installPath": "/cache/a/old" },
+                    { "scope": "project", "projectPath": "/work/here", "installPath": "/cache/a/here" }
+                ],
+                "b@m": [
+                    { "scope": "user", "installPath": "/cache/b/shared" },
+                    { "scope": "project", "projectPath": "/work/other", "installPath": "/cache/b/shared" }
+                ]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let out = out_of_scope_install_dirs(&manifest, Path::new("/work/here/sub"));
+        assert_eq!(
+            out,
+            [PathBuf::from("/cache/a/old")].into_iter().collect(),
+            "only a dir no in-scope entry also pins is out of scope"
+        );
+
+        let mut findings = vec![hostile_finding("x"), hostile_finding("y")];
+        findings[0].file = PathBuf::from("/cache/a/old/hooks/hooks.json");
+        findings[1].file = PathBuf::from("/cache/a/here");
+        for f in &mut findings {
+            f.blocker = Blocker::Yes;
+        }
+        demote_out_of_scope_blockers(&mut findings, &out);
+        assert_eq!(findings[0].blocker, Blocker::No, "another project's pin");
+        assert_eq!(
+            findings[1].blocker,
+            Blocker::Yes,
+            "this project's pin still blocks"
+        );
+    }
+
     #[test]
     fn an_explicitly_disabled_plugin_never_blocks() {
         let tmp = tempfile::tempdir().unwrap();
