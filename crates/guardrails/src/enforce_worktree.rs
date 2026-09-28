@@ -2820,6 +2820,9 @@ mod tests {
 
     // --- #1018: `$HOME` in a cd target ---
 
+    /// The process home, raw. Compare resolved targets against
+    /// `normalize_target` of a path built from it: on Windows the resolver
+    /// lowercases the drive and folds separators (`C:\Users\x` → `c:/users/x`).
     fn process_home() -> String {
         cadence_hooks_core::paths::user_home_lossy_or_default()
     }
@@ -2831,7 +2834,7 @@ mod tests {
         // must land on the same directory the tilde form does.
         let home = process_home();
         let tilde = git_commit_targets("cd ~/src/repo-b && git commit -m x", "/cwd");
-        assert_eq!(tilde, vec![format!("{home}/src/repo-b")]);
+        assert_eq!(tilde, vec![normalize_target(&format!("{home}/src/repo-b"))]);
         for cmd in [
             r#"cd "$HOME/src/repo-b" && git commit -m x"#,
             "cd $HOME/src/repo-b && git commit -m x",
@@ -2843,7 +2846,7 @@ mod tests {
         }
         assert_eq!(
             git_commit_targets(r#"cd "$HOME" && git commit -m x"#, "/cwd"),
-            vec![home],
+            vec![normalize_target(&home)],
         );
     }
 
@@ -2985,7 +2988,7 @@ mod tests {
         // the resolution it always had, so no verdict main already gave a
         // tilde spelling changes (withholding it could only flip ALLOW→BLOCK,
         // but a behavior change there is not this fix's to make).
-        let want = vec![format!("{}/wt", process_home())];
+        let want = vec![normalize_target(&format!("{}/wt", process_home()))];
         for prefix in ["export FOO=1 && ", "HOME=/elsewhere; "] {
             let cmd = format!("{prefix}cd ~/wt && git commit -m x");
             assert_eq!(git_commit_targets(&cmd, "/cwd"), want, "{cmd}");
@@ -2997,7 +3000,7 @@ mod tests {
         // Positive controls: the ordinary shapes the fix exists for must
         // resolve, or the allowlist silently undoes it — a conventional-commit
         // message's quoted parens and a heredoc body's included.
-        let want = vec![format!("{}/wt", process_home())];
+        let want = vec![normalize_target(&format!("{}/wt", process_home()))];
         for cmd in [
             r#"cd "$HOME/wt" && git add . && git commit -m x"#,
             r#"cd "$HOME/wt" && git commit -m "fix(scope): thing {1}""#,
