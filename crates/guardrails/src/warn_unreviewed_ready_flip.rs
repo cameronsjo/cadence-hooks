@@ -17,7 +17,7 @@
 //!
 //! The PR is resolved the way gh resolves it, not from `origin`
 //! (cadence-hooks#1028, #920). A PR URL names its own repo. A number goes
-//! to the `-R`/`--repo`/`GH_REPO=` repo when the command names one, and
+//! to the `-R`/`--repo` repo when the command names one, and
 //! otherwise to gh's `{owner}`/`{repo}` placeholders, run in the command's
 //! cwd so gh picks the repo it would pick. No selector, or a branch name, is
 //! looked up with `gh pr view` first (two calls). A repo flag with no
@@ -133,7 +133,9 @@ impl GhRunner for RealGhRunner {
 /// second flip in the same compound command is not checked.
 ///
 /// The global-flag spelling `gh -R o/r pr merge` does not match: the second
-/// token must be `pr` (cadence-hooks#778 tracks it).
+/// token must be `pr` (cadence-hooks#778 tracks it). A prefixed `gh`
+/// (`GH_REPO=o/r gh pr merge 5`, `env … gh pr merge 5`) does not match
+/// either: the first token must be `gh`.
 ///
 /// `gh pr ready --undo` is excluded: it flips the PR back to DRAFT, the exact
 /// retreat from the ship this guard's reviewed-signal nudge is about, so the
@@ -166,7 +168,7 @@ fn flip_segment_tokens(command: &str) -> Option<Vec<String>> {
 pub enum RepoChoice {
     /// The command names no repo: gh picks it from the cwd's git remotes.
     GhDefault,
-    /// Every `-R`/`--repo`/`GH_REPO=` value names this one repo. `value` is
+    /// Every `-R`/`--repo` value names this one repo. `value` is
     /// the first spelling as typed, passed back to gh unchanged.
     Explicit {
         value: String,
