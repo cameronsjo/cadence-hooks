@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`warn-alias-parsing` reads the command inside `$(…)`, backticks, and subshells, and prints once per command.** It split a command at `|` before it saw any substitution, so `f=$(command ls | head -1)` read `f=$(command` as the producer and nudged about `ls` despite the `command` prefix, while `f=$(ls | head -1)` and `(ls | grep x)` stayed silent. It now judges the command after the innermost opener still open in each pipe stage: the first form is silent and the other two nudge. The plugin wires this check once per aliased tool, so a command naming several of them printed the same nudge once per match; it now prints once. (cameronsjo/cadence-hooks#1029)
+
 ## [0.104.1] - 2026-09-27
 
 ### Fixed

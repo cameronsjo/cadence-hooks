@@ -1311,6 +1311,30 @@ mod tests {
         });
     }
 
+    /// cameronsjo/cadence-hooks#1029: `warn-alias-parsing` is wired under one
+    /// `if:` glob per aliased tool, so `ls | grep x && cat f | jq .` spawns it
+    /// once per matching glob with an identical payload. Two such runs must
+    /// print the nudge once.
+    #[test]
+    fn dedupe_collapses_warn_alias_parsing_fan_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("ls | grep x && cat f | jq .");
+            let nudge = CheckResult::nudge("`ls` is aliased to `eza` on this machine");
+
+            let emissions = (0..2)
+                .filter(|_| {
+                    claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-alias-parsing")
+                })
+                .count();
+
+            assert_eq!(
+                emissions, 1,
+                "two identical warn-alias-parsing runs of one tool event must nudge once"
+            );
+        });
+    }
+
     /// The narrowing that makes the gate safe: a hook that is NOT a known
     /// fan-out offender is never gated, so two same-event nudges from it both
     /// reach the operator even when their payload fingerprints identically.
