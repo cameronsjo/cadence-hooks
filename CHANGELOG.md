@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-body-budget` no longer calls "this session" narration when it names a session mechanic.** A body line like "the `session declare` record for this session" drew a nudge to "say what changed instead", though the phrase named the session a hook runs in. `for this session` and `of this session` are now exempt on a line that names a session mechanic in a code span. "In this session I fixed X" still fires. (cameronsjo/cadence-hooks#994)
+
 ## [0.106.0] - 2026-09-28
 
 ### Added
