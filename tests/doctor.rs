@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 ///
 /// `doctor` now reports its resolved bypass state on **both** the unquiet and
 /// the `--quiet` route (#567), and a child process inherits the parent's
-/// environment. A developer shell carrying `CADENCE_DISABLE=guard-rm` — which
+/// environment. A developer shell carrying `CADENCE_DISABLE=warn-main-branch` — which
 /// this repo's own sessions routinely do — would otherwise add a suppression
 /// line to stdout and turn `doctor_quiet_clean_prints_nothing` into a confident
 /// false failure about the plugin scan. Cleared here rather than per test, so a

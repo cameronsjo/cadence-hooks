@@ -126,7 +126,8 @@ fn render_found(segment: &str, consumer: Option<&str>) -> String {
 /// Walk one script, returning the first decrypt whose plaintext is not handed
 /// to an allowed consumer.
 ///
-/// Mirrors `guard_rm::collect_targets`' traversal rather than flattening with
+/// Mirrors the traversal the deleted delete guard's target collector once used
+/// (cameronsjo/cadence-ecosystem#582) rather than flattening with
 /// `command_segments`: this guard's whole question is *what the next segment in
 /// the pipeline is*, and a flat view splices a substitution body into the
 /// parent's stream, inventing pipeline neighbours that do not exist. Child

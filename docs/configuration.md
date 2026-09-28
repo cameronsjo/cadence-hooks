@@ -219,8 +219,8 @@ kept unprefixed because it's a cross-tool convention.
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `guard-rm,warn-main-branch`). Not every name is honoured — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
-| `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so do the status checks `guard-rm-liveness` and `enforcement-status` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
+| `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `warn-main-branch,warn-overshare`). Not every name is honoured — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
+| `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so does the status check `enforcement-status` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_NO_FEEDBACK_FOOTER` | all hooks | Set to any non-empty value to suppress the `If this fired in error: /cadence:feedback` footer appended to hard blocks |
 | `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs |
@@ -246,6 +246,27 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_DOCTOR_PRUNE_FORCE` | `doctor --prune` | Set to `1` or `true` to bypass the live-session gate and let `doctor --prune --apply` delete orphaned plugin-cache version dirs even while peer sessions are running. The gate's refusal message names this override; otherwise run `/reload-plugins` in the live session first to release the retired dirs |
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Maximum seconds to wait after `gh pr merge` before checking for straggler issues; returns early after 2 s once every referenced issue is closed (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
+| `CADENCE_ALLOW_SOPS_DECRYPT` | `guard-sops-decrypt` | Set truthy (`1`/`true`/`yes`) to let a decrypt through; the allow is recorded as a bypass row. **Weakens a protected guard** |
+| `CADENCE_ALLOW_SENSITIVE_TERMS` | `redact-external-content`, `redact-scan` | Any value except empty or `0` downgrades the identity-tier block to a nudge. **Weakens a protected guard** |
+| `CADENCE_AUDIENCE` | `redact-external-content` | `owned-internal`, `private-external`, or `public` (unknown values mean `public`); a lower tier redacts less in the advisory tier |
+| `CADENCE_READ_MODEL_GUARD_MODELS` | `guard-read-model` | Model list that turns the opt-in guard on; empty means off |
+| `CADENCE_READ_MODEL_GUARD_MODE` | `guard-read-model` | `allow` treats the list as an allowlist; anything else denies the listed models |
+| `CADENCE_READ_MODEL_GUARD_ON_UNKNOWN` | `guard-read-model` | `block` refuses reads when the session model is unknown; anything else allows |
+| `CADENCE_HOOK_DEADLINE_MS` | every guard that runs git | Time budget for a guard's git probes, clamped to 1000–4500; `0` disables the deadline. A probe that times out fails open |
+| `CADENCE_MARKER_DIR` | marker-keyed checks, `guard-browser-device` | Where one-time markers live. Pointing it at a directory that already holds a marker makes `guard-browser-device` allow without its first-use block. **Weakens a protected guard** |
+| `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` | `warn-subagent-worktree` | Set to silence the nudge for a repo |
+| `CADENCE_ALLOW_BRANCH_INTENT` | `warn-branch-intent` | Set to silence the stale-branch nudge |
+| `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public |
+| `CADENCE_NO_OUTRO_BACKSTOP` | `backstop-record`, `backstop-warn` | Set to turn off the loose-ends backstop |
+| `CADENCE_NO_PERSIST_PLAN` | `persist-plan-approval` | Set to stop writing approved plans to disk |
+| `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
+| `CLAUDE_EFFORT` | every hook (latent) | A check can skip itself at a given effort level; no check does today |
+
+### Folder trust is the boundary
+
+A trusted repository's `.claude/settings.json` `env` block reaches every hook process and can set any variable above. Some of those weaken a protected guard (marked **Weakens a protected guard**), and `CADENCE_BYPASS=1` switches every guard off. `CADENCE_HOOKS_BIN` or `PATH` can replace the binary itself, so no check inside it runs to report the change. `HOME`, `CLAUDE_CONFIG_DIR` and child-process variables such as `GIT_CONFIG_*`, `GIT_DIR`, `XDG_CONFIG_HOME` and `GH_CONFIG_DIR` also change what the guards see.
+
+The control is Claude Code's folder-trust prompt: trusting a repository lets it turn these guards off. `enforcement-status` reports `CADENCE_BYPASS=1` and a refused `CADENCE_DISABLE` at session start so those two are visible, but it is not a defence against a hostile trusted repository. Decided 2026-09-28 (cameronsjo/cadence-hooks#1031, closed not planned).
 
 ### What a disable request resolves to
 
@@ -253,13 +274,13 @@ A name in `CADENCE_DISABLE` is not automatically honoured. Every name resolves t
 
 - **Disabled via CADENCE_DISABLE** (`configure --list`: `Disabled hooks:`) — honoured. The hook does not run.
 - **Protected — disable refused, these still run** (`configure --list`: `Refused (protected) — named in CADENCE_DISABLE, these still run:`) — the name is a guard against irreversible harm (secret exposure, data loss, destructive git/gh/remote/vault operations), **or the detector that reports such a guard's own state**. A detector prevents no harm by itself; what it prevents is the harm happening unobserved, and switching it off does nothing except hide the report. `CADENCE_DISABLE` cannot switch either class off, because it is selective and persistent and can be set in a repository's committed `settings.json`. The hook runs anyway. Use `CADENCE_BYPASS=1` as the maintenance escape — except for the hooks named below, which it does not switch off either. Note that a repository's committed `settings.json` `env` block can set `CADENCE_BYPASS` too, and from there it switches off even this protected class, because the resolver checks the bypass before the protected refusal; the binary cannot tell a project-scope value from a user-scope one. The bypass resolver's module docs (`crates/core/src/bypass.rs`) record that channel and the other `CADENCE_*` variables it reaches.
-- **Named in CADENCE_DISABLE but not a hook, so nothing was disabled** — the name matches no registered hook. Matching is exact and case-sensitive, so `Guard-Rm`, `guard_rm` and `guard-rm-live` are near-misses, not fuzzy matches, and they disable nothing. Run `cadence-hooks list` for the canonical names. Note that `guard-rm-liveness` is **not** a near-miss — it is a real hook, the SessionStart check that reports whether `guard-rm` itself has been switched off — so naming it names that hook, and because hiding that report is the whole harm, the request is refused and the check runs.
+- **Named in CADENCE_DISABLE but not a hook, so nothing was disabled** — the name matches no registered hook. Matching is exact and case-sensitive, so `Enforce-Worktree`, `enforce_worktree` and `enforce-work` are near-misses, not fuzzy matches, and they disable nothing. Run `cadence-hooks list` for the canonical names. A longer name that is itself registered (`log-session-start`) names that hook, not the shorter one.
 
 `configure --list` now also reports `CADENCE_BYPASS`, the same way `list` and `doctor` do — the moot/bypass-exempt paragraph below applies to all three surfaces. The wizard itself still reads and writes `settings.json` only; pre-selecting an environment-sourced name in the interactive picker would let one confirmation persist a session variable into a committed file, so it deliberately consults only what is already written there.
 
 With `CADENCE_BYPASS=1` also set, a named hook is reported as **moot** instead: the blanket bypass has already switched it off, so neither "disabled" nor "still runs" would be a true statement about it. A **bypass-exempt** hook is the exception at both ends — `CADENCE_BYPASS=1` does not switch it off, so it is reported as refused and still running, never moot.
 
-**Bypass-exempt hooks.** `CADENCE_BYPASS=1` skips every enforcement hook except the two SessionStart status checks, `guard-rm-liveness` and `enforcement-status`. Their entire job is to report that guards have been switched off, and `CADENCE_BYPASS=1` is a switch they report on — bypassing them would suppress the report of the bypass itself. `enforcement-status` reports the bypass, and any `CADENCE_DISABLE` naming a protected guard other than the status checks themselves, at SessionStart once the `cadence-guardrails` plugin wires it. `cadence-hooks list` and `cadence-hooks doctor` both name the exception in their bypass banner. Disabling the `cadence-guardrails` plugin is the remaining way to stop them.
+**Bypass-exempt hooks.** `CADENCE_BYPASS=1` skips every enforcement hook except the SessionStart status check `enforcement-status`. Its entire job is to report that guards have been switched off, and `CADENCE_BYPASS=1` is a switch it reports on — bypassing it would suppress the report of the bypass itself. It reports the bypass, and any `CADENCE_DISABLE` naming a protected guard other than itself, at session start. `cadence-hooks list` and `cadence-hooks doctor` both name the exception in their bypass banner. Disabling the `cadence-guardrails` plugin is the remaining way to stop it.
 
 `doctor` reports all of this at session start, `--quiet` included — that route prints the suppression lines to stdout and stays completely silent when enforcement is on, so a session running with guards switched off cannot look like a clean one.
 

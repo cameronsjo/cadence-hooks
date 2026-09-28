@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **`guardrails guard-rm` and `guardrails guard-rm-liveness` are gone.** The path-aware recursive-delete guard and its SessionStart liveness check are deleted from the binary, with their registry rows, clap subcommands, tests and docs (cameronsjo/cadence-ecosystem#582). The `cadence-guardrails` plugin stopped calling them in cameronsjo/cadence#1479. **Other installs lose `guard-rm`:** recursive deletes now rely on Claude Code's own permission rules and folder trust, not on this binary. A plugin pin older than cameronsjo/cadence#1479 still calls the removed subcommands; the wrapper sees "unrecognized subcommand" and exits 0 with a once-a-day "binary is stale" notice until the plugin updates. `doctor` may list those calls as "unknown subcommand(s) invoked by hand" until they age out of the metrics window.
+- **`guard-rm-liveness` leaves `PROTECTED_GUARDS` and `BYPASS_EXEMPT_HOOKS`.** `enforcement-status` is now the only bypass-exempt hook. A stale `CADENCE_DISABLE=guard-rm,guard-rm-liveness` names no hook, disables nothing, and prints `Named in CADENCE_DISABLE but not a hook` in `doctor`.
+
+### Changed
+
+- **Folder trust is the documented boundary.** `docs/configuration.md` and the `bypass.rs` module docs now say that a trusted repository's settings `env` block can switch off every guard, including through `CADENCE_HOOKS_BIN` and `PATH` in the plugin wrapper, and that `enforcement-status` makes `CADENCE_BYPASS` and refused `CADENCE_DISABLE` visible without defending against a hostile trusted repository (cameronsjo/cadence-hooks#1031, closed not planned). The environment-variable table gains every variable that changes a guard decision, with the ones that weaken a protected guard marked.
+
 ### Fixed
 
 - **`guard-body-budget` no longer calls "this session" narration when it names a session mechanic.** A body line like "the `session declare` record for this session" drew a nudge to "say what changed instead", though the phrase named the session a hook runs in. `for this session` and `of this session` are now exempt on a line that names a session mechanic in a code span. "In this session I fixed X" still fires. (cameronsjo/cadence-hooks#994)

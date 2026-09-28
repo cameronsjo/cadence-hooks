@@ -384,13 +384,13 @@ fn list_works_during_bypass() {
     // universal it no longer has, and the exempt hook's own row must carry no
     // `(disabled)` suffix while the hook still runs.
     assert!(
-        stdout.contains("all hooks bypassed except guard-rm-liveness"),
+        stdout.contains("all hooks bypassed except enforcement-status"),
         "the banner still claims every hook is bypassed: {stdout}"
     );
     let liveness_line = stdout
         .lines()
-        .find(|line| line.trim_start().starts_with("guard-rm-liveness "))
-        .unwrap_or_else(|| panic!("no guard-rm-liveness row: {stdout}"));
+        .find(|line| line.trim_start().starts_with("enforcement-status "))
+        .unwrap_or_else(|| panic!("no enforcement-status row: {stdout}"));
     assert!(
         !liveness_line.contains("(disabled)"),
         "the bypass-exempt hook is rendered as disabled while it runs: {liveness_line}"
@@ -437,15 +437,15 @@ fn session_status_works_during_bypass() {
 }
 
 #[test]
-fn guard_rm_liveness_still_runs_during_bypass() {
-    // The binary-level half of cadence-hooks#927: `guard-rm-liveness` is the
+fn enforcement_status_still_runs_during_bypass() {
+    // The binary-level half of cadence-hooks#927: `enforcement-status` is the
     // one enforcement-path hook exempt from CADENCE_BYPASS, so the process must
     // no longer exit at the argv bypass check in `main`. Asserting the exit
     // code alone would prove nothing — every state of this hook exits 0 — so
     // this reads the stdout the hook only produces by running: the SessionStart
     // `additionalContext` carrying the nudge that names the bypass.
     let mut cmd = cadence_hooks();
-    cmd.args(["guardrails", "guard-rm-liveness"]);
+    cmd.args(["guardrails", "enforcement-status"]);
     cmd.env("CADENCE_BYPASS", "1");
 
     let output = run_with_stdin(

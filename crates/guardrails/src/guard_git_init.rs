@@ -16,7 +16,8 @@
 //! temp root. Position matters in both directions — a `cd` after the init cannot
 //! reclassify it, and a temp-rooted fixture cannot vouch for a real repo created
 //! later in the same command. Classification reuses [`path_under_temp_root`],
-//! the same primitive `guard_rm` classifies delete targets with.
+//! the same primitive the delete guard removed in cameronsjo/cadence-ecosystem#582
+//! used to classify delete targets with.
 //!
 //! A "zero commits, no remote" predicate was considered for this and REJECTED:
 //! it is true of *every* repo one millisecond after `git init`, so it would
@@ -109,7 +110,8 @@ fn resolve_against(candidate: &str, base: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The directory a `cd` segment moves the shell to, or `None` when it cannot be
-/// named. Mirrors `guard_rm::collect_targets`' conventions: cd's own flags are
+/// named. Mirrors the conventions the deleted delete guard's target collector
+/// once used (cameronsjo/cadence-ecosystem#582): cd's own flags are
 /// skipped, and a bare `-`, a `$VAR`, or a missing target makes the new
 /// directory UNKNOWN rather than silently keeping the old one.
 fn cd_destination(segment: &[&str], base: Option<&Path>) -> Option<PathBuf> {
@@ -248,7 +250,8 @@ impl Check for GuardGitInit {
         let creates_remote = is_gh_repo_create(&stripped);
 
         if is_git_init(&stripped) || creates_remote {
-            // Read the env once, guard_rm's convention, and hand both values to
+            // Read the env once, the same convention the deleted delete guard
+            // (cameronsjo/cadence-ecosystem#582) used, and hand both values to
             // the pure decision. `home` feeds `path_under_temp_root`'s veto on a
             // `$TMPDIR` that swallows the home directory (cadence-hooks#569) —
             // without it, `TMPDIR=$HOME` would silence the nudge estate-wide.

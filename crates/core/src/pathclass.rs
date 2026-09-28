@@ -3,14 +3,16 @@
 //! Repo-root resolution, path-class membership, and the lexical `..`
 //! normalization every carve-out depends on were each re-derived and
 //! inconsistently applied across `enforce_worktree`, `warn_main_branch`,
-//! `warn_subagent_worktree`, and `guard_rm` — the root gap behind a string of
-//! false-positive incidents (cadence-hooks#164). This module is the single,
-//! tested notion of "what kind of path is this?" It exposes **facts, not
-//! policy**: it returns a [`PathClass`], and each guard keeps its own policy
-//! (and its own fail-direction) over that fact.
+//! `warn_subagent_worktree`, and the delete guard removed in
+//! cadence-ecosystem#582 — the root gap behind a string of false-positive
+//! incidents (cadence-hooks#164). This module is the single, tested notion of
+//! "what kind of path is this?" It exposes **facts, not policy**: it returns
+//! a [`PathClass`], and each guard keeps its own policy (and its own
+//! fail-direction) over that fact.
 //!
-//! The prototype is `guard_rm`'s `classify_path`/`TargetClass` (shipped 0.53.0),
-//! which this generalizes and makes reusable. `guard_rm` is the first consumer.
+//! The prototype was the deleted delete-guard's `classify_path`/`TargetClass`
+//! (shipped 0.53.0, removed in cadence-ecosystem#582), which this generalizes
+//! and makes reusable.
 //!
 //! **ALLOW-before-BLOCK ordering is load-bearing.** A scratch target under a
 //! protected ancestor — a git worktree under `.claude`, a repo checked out in
@@ -26,9 +28,10 @@
 //! **v1 scope (cadence-hooks#164 D5): live-consumer classes only.** Ships
 //! [`PathClass::Temp`], [`PathClass::ClaudeScratch`], [`PathClass::DocsPlans`],
 //! [`PathClass::HomeChild`], [`PathClass::GitRoot`], and the residual
-//! [`PathClass::Source`]. The `memory` and `vault` classes are deferred to land
-//! with their second consumer — `guard_rm` is their only consumer today, so
-//! those stay guard-local (YAGNI) until a second guard needs them.
+//! [`PathClass::Source`]. The `memory` and `vault` classes stay deferred. This
+//! module has had no consumer since the recursive-delete guard was removed
+//! (cameronsjo/cadence-ecosystem#582); a new consumer must re-review the
+//! classes here rather than trust them as reviewed.
 //!
 //! **The `.claude` carve-out is an allowlist of session scratch, not the whole
 //! tree.** It once granted the ALLOW class to *any* path under a `.claude`
@@ -44,10 +47,9 @@
 //! **Case folding follows the verdict direction, not consistency.** A path
 //! compare folds ASCII case only when folding can move a path into a *stricter*
 //! class: `.claude` (#726), `.git` (#657), and the home-child prefix (#732) all
-//! feed BLOCK or ASK, so they fold. [`under_claude_scratch`],
-//! `worktree::path_under_temp_root`, and `guard_rm::is_transient_scratch` each
-//! grant a silent ALLOW, so all three stay byte-exact. The per-predicate
-//! reasoning lives on [`under_claude_dir`].
+//! feed BLOCK or ASK, so they fold. [`under_claude_scratch`] and
+//! `worktree::path_under_temp_root` each grant a silent ALLOW, so both stay
+//! byte-exact. The per-predicate reasoning lives on [`under_claude_dir`].
 //!
 //! **Non-goals of the #732 fold, recorded so a later pass does not re-derive
 //! them:**
@@ -73,13 +75,14 @@ use std::path::Path;
 ///
 /// [`classify`] returns exactly one class per path, resolved by a load-bearing
 /// precedence (see the module docs): the allow-granting carve-outs
-/// ([`Temp`](PathClass::Temp), [`ClaudeScratch`](PathClass::ClaudeScratch)) —
-/// the two with a live ALLOW consumer — resolve first, then the structural
-/// classes ([`HomeChild`](PathClass::HomeChild), [`GitRoot`](PathClass::GitRoot)),
-/// then [`DocsPlans`](PathClass::DocsPlans), then the residual
-/// [`Source`](PathClass::Source). `DocsPlans` sits *below* `GitRoot` on purpose:
-/// it has no ALLOW consumer yet, so a `docs/plans` path that is also a git root
-/// must report the git-root fact (or guard_rm would downgrade a BLOCK to ASK).
+/// ([`Temp`](PathClass::Temp), [`ClaudeScratch`](PathClass::ClaudeScratch))
+/// resolve first, then the structural classes ([`HomeChild`](PathClass::HomeChild),
+/// [`GitRoot`](PathClass::GitRoot)), then [`DocsPlans`](PathClass::DocsPlans),
+/// then the residual [`Source`](PathClass::Source). `DocsPlans` sits *below*
+/// `GitRoot` on purpose: a `docs/plans` path that is also a git root must
+/// report the git-root fact, not the plans fact — a consumer that maps
+/// `DocsPlans` to a softer verdict than `GitRoot` would otherwise downgrade a
+/// real git-root delete target to the ambiguous middle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClass {
     /// Under a temp root (`/tmp`, `/private/tmp`, `$TMPDIR`).
@@ -111,17 +114,17 @@ pub enum PathClass {
     /// trail, skills, rules, hooks, agents, plugins, and both memory trees.
     ///
     /// Distinct from [`Source`] on purpose. Both mean "not proven safe", but a
-    /// consumer that *softens* its `Source` verdict — guard_rm allows a
-    /// single-file delete in the ambiguous middle — must not soften this one: a
-    /// lone session transcript is still the only copy of that transcript.
-    /// Separating them is what keeps a softening rule from silently re-opening
-    /// the subtree the scratch allowlist just closed.
+    /// consumer that *softens* its `Source` verdict for a single-file delete in
+    /// the ambiguous middle must not soften this one: a lone session transcript
+    /// is still the only copy of that transcript. Separating them is what keeps
+    /// a softening rule from silently re-opening the subtree the scratch
+    /// allowlist just closed.
     ///
     /// Sits below the structural classes, so `~/.claude/.git` still reports
     /// [`GitRoot`](PathClass::GitRoot) and `~/.claude` itself still reports
     /// [`HomeChild`](PathClass::HomeChild) — but **above**
-    /// [`DocsPlans`](PathClass::DocsPlans), which has no ALLOW consumer and so
-    /// reads as the ambiguous middle to guard_rm.
+    /// [`DocsPlans`](PathClass::DocsPlans), which carries no ALLOW mapping and
+    /// so reads as the ambiguous middle to a consumer.
     ClaudeState,
     /// The residual: an ordinary path matching no more-specific class.
     Source,
@@ -178,12 +181,12 @@ pub fn classify(
 ) -> PathClass {
     let norm = normalize(path);
 
-    // Allow-granting carve-outs first — `Temp` and `ClaudeScratch` are the only
-    // classes with a live ALLOW consumer (guard_rm), so they must out-rank the
-    // escalating structural classes: a scratch target under a protected
-    // ancestor (a worktree under `.claude`, a repo in `/tmp`) resolves to its
-    // allow-class before git-root can match. This ordering is load-bearing and
-    // locked by `claude_scratch_wins_over_git_root_probe`.
+    // Allow-granting carve-outs first — `Temp` and `ClaudeScratch` are the
+    // classes a consumer maps to ALLOW, so they must out-rank the escalating
+    // structural classes: a scratch target under a protected ancestor (a
+    // worktree under `.claude`, a repo in `/tmp`) resolves to its allow-class
+    // before git-root can match. This ordering is load-bearing and locked by
+    // `claude_scratch_wins_over_git_root_probe`.
     if path_under_temp_root(Path::new(&norm), ctx.tmpdir, Some(ctx.home)) {
         return PathClass::Temp;
     }
@@ -198,12 +201,12 @@ pub fn classify(
         return PathClass::HomeChild;
     }
     // GitRoot resolves BEFORE DocsPlans, unlike the allow-classes above.
-    // `DocsPlans` has no live ALLOW consumer yet (guard_rm treats it as the
-    // ambiguous middle, exactly like `Source`), so a path that is *both* under
-    // `docs/plans/` and a git root must report the git-root fact — otherwise
-    // guard_rm, which has no `DocsPlans` arm, would downgrade a real
-    // `.git`-bearing delete target from BLOCK to ASK, breaking the
-    // byte-identical contract (a docs/plans path that is also a git repo).
+    // `DocsPlans` has no ALLOW mapping (a consumer treats it as the ambiguous
+    // middle, exactly like `Source`), so a path that is *both* under
+    // `docs/plans/` and a git root must report the git-root fact — otherwise a
+    // consumer with no `DocsPlans` arm would downgrade a real `.git`-bearing
+    // delete target from BLOCK to ASK, breaking the byte-identical contract (a
+    // docs/plans path that is also a git repo).
     // Locked by `git_root_under_docs_plans_reports_git_root`.
     if has_git_component(&norm) || is_git_root(&norm) {
         return PathClass::GitRoot;
@@ -211,10 +214,10 @@ pub fn classify(
     // Everything else under `.claude` is durable state. Below the structural
     // classes — so `~/.claude/.git` still reports git-root and `~/.claude`
     // itself still reports home-child — but ABOVE `DocsPlans`, which has no
-    // ALLOW consumer and therefore reads as the ambiguous middle to guard_rm.
+    // ALLOW mapping and therefore reads as the ambiguous middle to a consumer.
     // With the order reversed, `~/.claude/docs/plans/x.md` reported `DocsPlans`
-    // and rode guard_rm's single-file softening to a silent ALLOW, defeating
-    // this class for exactly the subtree it was added to protect.
+    // and rode a single-file-delete softening rule to a silent ALLOW,
+    // defeating this class for exactly the subtree it was added to protect.
     if under_claude_dir(&norm) {
         return PathClass::ClaudeState;
     }
@@ -237,27 +240,24 @@ pub fn classify(
 /// **The predicates that fold, because they are protective** — folding can only
 /// move a path *into* a stricter class:
 ///
-/// - This one feeds [`PathClass::ClaudeState`] — guard_rm maps it to ASK, while
-///   the fall-through (`Source`) rides the single-file softening to a silent
-///   ALLOW. On a case-insensitive volume (the APFS default)
+/// - This one feeds [`PathClass::ClaudeState`] — a consumer maps it to ASK,
+///   while the fall-through (`Source`) rides a single-file softening rule to a
+///   silent ALLOW. On a case-insensitive volume (the APFS default)
 ///   `~/.CLAUDE/projects/t.jsonl` and `~/.claude/projects/t.jsonl` are the same
 ///   transcript, and before the fold the case variant took the silent ALLOW.
 /// - [`has_git_component`] feeds [`PathClass::GitRoot`] → BLOCK (#657).
 /// - [`is_first_level_home_child`] feeds [`PathClass::HomeChild`] → BLOCK, and
-///   guard_rm's own home-equality and vault compares fold for the same reason
-///   (#732). All three feed **BLOCK**, not ALLOW.
+///   a consumer's own home-equality and vault compares fold for the same
+///   reason (#732). All three feed **BLOCK**, not ALLOW.
 ///
 /// **The predicates that stay byte-exact, because they grant an ALLOW** —
 /// folding would widen a silent allow:
 ///
-/// - [`under_claude_scratch`] feeds [`PathClass::ClaudeScratch`], and guard_rm's
-///   #576 rule reads it *negated*. Locked by
+/// - [`under_claude_scratch`] feeds [`PathClass::ClaudeScratch`], and a former
+///   consumer's #576 rule read it *negated*. Locked by
 ///   `claude_scratch_carve_out_stays_byte_exact`.
-/// - `worktree::path_under_temp_root` feeds [`PathClass::Temp`], guard_rm's
-///   other silent ALLOW. `/TMP/x` is therefore not a temp root here.
-/// - `guard_rm::is_transient_scratch` (guard-local, so not linkable from here)
-///   demotes a home child to an ALLOW on a `.tmp`/`.swp`/`.swo` suffix, which
-///   is why `~/notes.TMP` still blocks.
+/// - `worktree::path_under_temp_root` feeds [`PathClass::Temp`], another
+///   silent ALLOW. `/TMP/x` is therefore not a temp root here.
 fn under_claude_dir(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     match segs.iter().position(|s| s.eq_ignore_ascii_case(".claude")) {
@@ -297,7 +297,7 @@ pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
 ///
 /// Public because [`classify`] tests `Temp` FIRST, so a scratch path that also
 /// lives under a temp root reports [`PathClass::Temp`] and the scratch fact is
-/// unreachable from the returned class. `guardrails::guard_rm` needs that fact
+/// unreachable from the returned class. A delete guard once needed that fact
 /// to keep worktree cleanup allowed while blocking a plain repo under `/tmp`
 /// (cadence-hooks#576), and asking here is cheaper and safer than reordering a
 /// precedence three tests already lock.
@@ -305,10 +305,10 @@ pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
 /// **Both compares stay byte-exact on purpose (#726)** — do not "make this
 /// consistent" with [`under_claude_dir`], which folds case. This predicate
 /// grants an ALLOW at both of its call sites: `classify` returns
-/// [`PathClass::ClaudeScratch`] (guard_rm ALLOW), and guard_rm's #576 rule reads
-/// it *negated* to decline the git-repo BLOCK. Folding here would widen a silent
-/// ALLOW in both — the wrong safety direction — where folding `under_claude_dir`
-/// only ever tightens ALLOW into ASK. Locked by
+/// [`PathClass::ClaudeScratch`] (an ALLOW class), and a consumer's #576 rule
+/// once read it *negated* to decline the git-repo BLOCK. Folding here would
+/// widen a silent ALLOW in both — the wrong safety direction — where folding
+/// `under_claude_dir` only ever tightens ALLOW into ASK. Locked by
 /// `claude_scratch_carve_out_stays_byte_exact`.
 pub fn under_claude_scratch(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
@@ -331,8 +331,8 @@ fn under_docs_plans(norm: &str) -> bool {
 /// `norm` is a first-level entry directly under `home` (one component below).
 ///
 /// The `home` compare folds ASCII case (#732), for the same reason
-/// [`under_claude_dir`] does: this feeds [`PathClass::HomeChild`], which
-/// guard-rm maps to BLOCK, so folding can only move a path from ALLOW/ASK to
+/// [`under_claude_dir`] does: this feeds [`PathClass::HomeChild`], which a
+/// consumer maps to BLOCK, so folding can only move a path from ALLOW/ASK to
 /// BLOCK. On a case-insensitive volume `/USERS/x/Documents` names exactly the
 /// same directory as `/Users/x/Documents`, and before the fold the case variant
 /// escaped the protection entirely.
@@ -500,7 +500,7 @@ mod tests {
     fn durable_claude_state_is_not_scratch() {
         // The narrowing (#361 cluster F follow-up): `.claude` holds durable,
         // untracked state that a silent ALLOW would destroy. Each of these was
-        // a verified silent-ALLOW hole in guard-rm before the allowlist.
+        // a verified silent-ALLOW hole before this allowlist landed.
         for path in [
             "/Users/x/.claude/projects",
             "/Users/x/.claude/projects/some-proj/memory/note.md",
@@ -537,10 +537,10 @@ mod tests {
 
     /// #726: a case-insensitive volume resolves `.CLAUDE` to the real `.claude`,
     /// so the protective `ClaudeState` compare folds case — otherwise
-    /// `~/.CLAUDE/projects/t.jsonl` fell through to `Source` and rode guard_rm's
-    /// single-file softening to a silent ALLOW while the canonical spelling
-    /// asked. The negative controls prove the fold did not widen into substring
-    /// matching.
+    /// `~/.CLAUDE/projects/t.jsonl` fell through to `Source` and rode a
+    /// single-file softening rule to a silent ALLOW while the canonical
+    /// spelling asked. The negative controls prove the fold did not widen into
+    /// substring matching.
     #[test]
     fn claude_dir_case_variants_are_claude_state() {
         assert_eq!(
@@ -618,9 +618,9 @@ mod tests {
     #[test]
     fn git_root_under_docs_plans_reports_git_root() {
         // Precedence lock (code-review finding): `DocsPlans` has no ALLOW
-        // consumer, so a path that is BOTH under `docs/plans/` and a git root
-        // must report GitRoot — otherwise guard_rm (no DocsPlans arm) would
-        // downgrade a `.git`-bearing delete target from BLOCK to ASK, breaking
+        // mapping, so a path that is BOTH under `docs/plans/` and a git root
+        // must report GitRoot — otherwise a consumer with no DocsPlans arm
+        // would downgrade a `.git`-bearing delete target from BLOCK to ASK, breaking
         // the byte-identical contract. Both the literal `.git` component and the
         // injected probe must resolve to GitRoot, not DocsPlans.
         assert_eq!(
@@ -687,8 +687,8 @@ mod tests {
     /// #732: a case-insensitive volume (the APFS default) resolves
     /// `/USERS/x/Documents` to the very same directory as `/Users/x/Documents`,
     /// so the protective home-child prefix folds ASCII case. Folding moves a
-    /// path only from `Source` (which rides guard_rm's single-file softening to
-    /// a silent ALLOW) into `HomeChild` (BLOCK).
+    /// path only from `Source` (which rides a single-file softening rule to a
+    /// silent ALLOW) into `HomeChild` (BLOCK).
     #[test]
     fn home_child_case_variants_are_home_child() {
         assert_eq!(
@@ -912,9 +912,9 @@ mod tests {
         // This does NOT re-open #35. That incident's live consumer is
         // warn-main-branch, which reads `worktree::is_claude_managed_dir` (the
         // coarse `.claude`-anywhere match, unchanged and separately tested
-        // there) — never this classifier. `pathclass` has exactly one consumer,
-        // `guard_rm`, and for it the correct fact about the memory tree is
-        // "not proven disposable".
+        // there) — never this classifier. `pathclass` had exactly one consumer,
+        // the delete guard removed in cadence-ecosystem#582, and for it the
+        // correct fact about the memory tree was "not proven disposable".
         assert_eq!(
             class("/Users/x/.claude/projects/some-proj/memory", "/Users/x"),
             PathClass::ClaudeState
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn claude_state_outranks_docs_plans() {
-        // `DocsPlans` has no guard-rm arm, so it reads as the ambiguous middle
+        // `DocsPlans` has no ALLOW mapping, so it reads as the ambiguous middle
         // and would ride a softening rule. A plan doc under `.claude` must
         // report the durable-state fact instead.
         assert_eq!(

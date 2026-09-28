@@ -300,8 +300,9 @@ fn check_destructive_in_vault(
 /// renames as deletions would leave a Codex session unable to comply with the
 /// message it was just shown. `mv` is likewise outside the command scanner's
 /// verb set on the Bash route, so the two harnesses agree. Same call, same
-/// reasoning, and the fuller derivation as `guard_rm::judge_delete_path`; pinned
-/// by `normalized_patch_rename_inside_vault_is_not_a_delete`.
+/// reasoning as the deleted delete guard's own path judgment
+/// (cameronsjo/cadence-ecosystem#582); pinned by
+/// `normalized_patch_rename_inside_vault_is_not_a_delete`.
 fn check_delete_in_vault(path: &str, cwd: &str, vault: &str) -> CheckResult {
     let vault = normalize_path(vault);
     let cwd = normalize_path(cwd);

@@ -11,9 +11,9 @@
 //! stderr of an exit-0 hook, so without a SessionStart report a bypassed
 //! session looks exactly like a guarded one.
 //!
-//! `guard-rm-liveness` carries this report today, and it is retired with
-//! guard-rm (cameronsjo/cadence-ecosystem#582). This check keeps that one job
-//! and drops the rest: it says nothing about any single guard, and it is
+//! A since-retired liveness detector carried this report until
+//! cameronsjo/cadence-ecosystem#582. This check keeps that one job and drops
+//! the rest: it says nothing about any single guard, and it is
 //! silent in a normal session. It covers these two switches only: the other
 //! project-settable `CADENCE_*` variables that weaken a guard are listed in
 //! `cadence_hooks_core::bypass` and are not reported here.
@@ -33,9 +33,8 @@
 //!
 //! The row names protected *guards* only, never the status checks in
 //! [`BYPASS_EXEMPT_HOOKS`]. A refused disable of a status check changes
-//! nothing — it still runs and speaks for itself — and reporting it would turn
-//! the estate's standing `CADENCE_DISABLE=guard-rm,guard-rm-liveness` into a
-//! daily nag until guard-rm-liveness is deleted.
+//! nothing — it still runs and speaks for itself — so reporting it would be
+//! noise.
 //!
 //! # Why it cannot be switched off
 //!
@@ -211,7 +210,10 @@ mod tests {
 
     #[test]
     fn a_disable_naming_only_unprotected_hooks_is_silent() {
-        assert_eq!(report_from(None, Some("warn-main-branch,guard-rm")), None);
+        assert_eq!(
+            report_from(None, Some("warn-main-branch,enforce-worktree")),
+            None
+        );
     }
 
     #[test]
@@ -249,17 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn the_standing_guard_rm_overlay_is_silent() {
-        // Every estate machine carries this value until the guard-rm
-        // retirement's dotfiles step (cameronsjo/cadence-ecosystem#582).
-        assert_eq!(report_from(None, Some("guard-rm,guard-rm-liveness")), None);
+    fn names_that_match_no_registered_hook_are_silent() {
+        // A stale CADENCE_DISABLE naming retired hooks disables nothing and
+        // reports nothing.
+        assert_eq!(report_from(None, Some("retired-hook,retired-check")), None);
     }
 
     #[test]
     fn a_status_check_beside_a_protected_guard_is_left_out_of_the_report() {
-        let report =
-            report_from(None, Some("guard-rm-liveness,trash-guard")).expect("reports trash-guard");
-        assert!(report.contains("trash-guard"), "{report}");
-        assert!(!report.contains("guard-rm-liveness"), "{report}");
+        let report = report_from(None, Some(&format!("{HOOK_NAME},trash-guard")))
+            .expect("reports trash-guard");
+        let body = report
+            .strip_prefix(REPORT_PREFIX)
+            .expect("the report leads with the prefix");
+        assert!(body.contains("trash-guard"), "{report}");
+        assert!(!body.contains(HOOK_NAME), "{report}");
     }
 }

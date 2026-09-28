@@ -4669,12 +4669,12 @@ mod tests {
 
     #[test]
     fn group_members_are_listed_up_to_shell_syntax() {
-        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology guardrails/guard-rm 2>/dev/null || true"#;
+        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology guardrails/warn-main-branch 2>/dev/null || true"#;
         assert_eq!(
             group_members(cmd),
             Some(vec![
                 "cadence/terminology".to_string(),
-                "guardrails/guard-rm".to_string()
+                "guardrails/warn-main-branch".to_string()
             ])
         );
         assert_eq!(group_members("cadence-hooks cadence terminology"), None);
@@ -4684,7 +4684,7 @@ mod tests {
     #[test]
     fn a_clean_group_has_no_findings() {
         assert!(
-            group_findings("cadence-hooks group cadence/terminology guardrails/guard-rm")
+            group_findings("cadence-hooks group cadence/terminology guardrails/warn-main-branch")
                 .is_empty()
         );
     }

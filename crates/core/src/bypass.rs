@@ -5,11 +5,10 @@
 //!
 //! Before cameronsjo/cadence-hooks#567 the resolution was written out four
 //! times — the `list` display, the blanket bypass in `main`, the selective
-//! disable in `main`, and `guard-rm-liveness`'s own copy in the `guardrails`
-//! crate. The liveness check is the one component whose job is to report that
-//! `guard-rm` has been switched off, and it could only observe that state by
-//! re-implementing the parse, because the enforcement logic lived in `main`
-//! where a library crate cannot reach it.
+//! disable in `main`, and a copy in a since-retired `guardrails` liveness
+//! detector that reported when a guard had been switched off. A library check
+//! could only observe that state by re-implementing the parse, because the
+//! enforcement logic lived in `main` where a library crate cannot reach it. `enforcement-status` now reads this resolver directly.
 //!
 //! That made the duplication load-bearing in an asymmetric way: if one copy
 //! ever accepted a form another rejected, the binary could skip a guard while
@@ -77,9 +76,8 @@
 //! in [`BYPASS_EXEMPT_HOOKS`] survive it. The blanket escape is therefore the
 //! stronger of the two a repository can set. Either switch leaves a stderr
 //! line per affected invocation, and both are reported at session start by
-//! `enforcement-status` (a bypass, or a disable naming a protected guard) and
-//! `guard-rm-liveness` (for the guard it watches), and on request by `list`,
-//! `doctor`, and `configure --list`.
+//! `enforcement-status` (a bypass, or a disable naming a protected guard), and
+//! on request by `list`, `doctor`, and `configure --list`.
 //!
 //! The same channel writes every other `CADENCE_*` variable the binary reads,
 //! and some of those weaken a guard the two switches above do not touch.
@@ -96,7 +94,7 @@
 //! `CADENCE_ALLOW_SOPS_DECRYPT` lets `guard-sops-decrypt` allow a decrypt (it
 //! still writes a bypass row). All three guards are protected, and none of
 //! these variables is reported at session start: `enforcement-status` covers
-//! only the two switches above (widening it: cameronsjo/cadence-hooks#1031). The identity tier already
+//! only the two switches above. The identity tier already
 //! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this
 //! reason; see the "Why no environment override in production" note on
 //! `terms_path` in the `cadence` crate. Protection here is per-switch, not
@@ -110,11 +108,20 @@
 //! cameronsjo/cadence-ecosystem#567 (a different issue from the
 //! cameronsjo/cadence-hooks#567 cited above).
 //!
-//! `guard-rm` is left out of [`PROTECTED_GUARDS`] on purpose — the operator
-//! disables it estate-wide through their own `CADENCE_DISABLE` (2026-08-12), so
-//! protecting it would refuse an intended disable. This channel is therefore an
-//! accepted, documented exposure for every guard but the bypass-exempt ones,
-//! rather than an oversight.
+//! # Folder trust is the boundary
+//!
+//! A trusted project's settings `env` block can disarm every guard in this
+//! binary, and no check inside the binary can fully report it. Beyond the two
+//! switches and the variables above, the plugin wrapper honours
+//! `CADENCE_HOOKS_BIN` and falls back to `PATH`, so `CADENCE_HOOKS_BIN=/usr/bin/true`
+//! replaces the binary itself and `enforcement-status` never runs. `HOME` and
+//! `CLAUDE_CONFIG_DIR` move where config and identity terms are read from, and
+//! child-process variables (`GIT_CONFIG_*`, `GIT_DIR`, `XDG_CONFIG_HOME`,
+//! `GH_CONFIG_DIR`) change what git and gh report to the guards that call them.
+//! Claude Code's folder-trust prompt is the control: a repository you trust can
+//! turn these guards off. `enforcement-status` makes the two named switches
+//! visible; it is not a defence against a hostile trusted project. Decided
+//! 2026-09-28 (cameronsjo/cadence-hooks#1031, closed not planned).
 //!
 //! # Unknown values fail toward ENFORCED
 //!
@@ -125,15 +132,12 @@
 //!   The variable is a switch with one on-position, not a truthiness test, so a
 //!   value nobody defined can never silently disarm the binary.
 //! - A `CADENCE_DISABLE` entry that matches no registered hook disables
-//!   nothing. A near-miss (`Guard-Rm`, `guard_rm`, `guard-rm-live` when
-//!   `guard-rm` was meant) is a near-miss, not a fuzzy match.
+//!   nothing. A near-miss (`Enforce-Worktree`, `enforce_worktree`,
+//!   `enforce-work` when `enforce-worktree` was meant) is a near-miss, not a
+//!   fuzzy match.
 //! - A name that *extends* a hook name is a different hook, not a near-miss:
-//!   `guard-rm-liveness` is registered, so naming it names **it** and leaves
-//!   `guard-rm` running. Never cite it as an example of a name that disables
-//!   nothing — it is the check that reports `guard-rm`'s own switch, and
-//!   because hiding that report is the whole harm, the name is *refused*
-//!   rather than honoured (it is in [`PROTECTED_GUARDS`]). Either way it says
-//!   nothing about `guard-rm`, whose name it merely extends.
+//!   `log-session-start` is registered, so naming it names **it** and leaves
+//!   `log-session` running.
 //! - Either variable holding non-UTF-8 bytes reads as unset.
 //!
 //! The direction is deliberate and is the whole point of the extraction:
@@ -152,8 +156,8 @@
 ///
 /// The second class is the later addition. A detector prevents no harm by
 /// itself; what it prevents is the harm happening *unobserved*, and the one
-/// thing switching it off accomplishes is hiding the report that the watched
-/// guard is gone. That makes it exactly as attractive a target as the guard.
+/// thing switching it off accomplishes is hiding the report that the guards
+/// are gone. That makes it exactly as attractive a target as the guard.
 pub const PROTECTED_GUARDS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
@@ -174,13 +178,6 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     "guard-dotfiles",
     "guard-read-model",
     "trash-guard",
-    // The detector, not a guard: `guard-rm-liveness` is the SessionStart check
-    // that reports whether `guard-rm` has been switched off. `CADENCE_DISABLE`
-    // is selective and persistent, so one line in a committed settings file could
-    // otherwise disarm `guard-rm` and hide the report of it in the same breath
-    // — the watched guard stays unprotected by charter (see `guard_rm.rs`),
-    // which is precisely why the watcher may not be.
-    "guard-rm-liveness",
     // The detector of the switches themselves: `enforcement-status` reports at
     // SessionStart when CADENCE_BYPASS=1 is set or CADENCE_DISABLE names a
     // protected guard. Disabling it would hide the report of an attempt to
@@ -195,7 +192,7 @@ pub const PROTECTED_GUARDS: &[&str] = &[
 /// enforcement state — `CADENCE_BYPASS=1` included — so bypassing it would
 /// suppress the report of the very switch that suppressed it. Anything that
 /// *enforces* belongs to the bypass; a detector of the bypass cannot.
-pub const BYPASS_EXEMPT_HOOKS: &[&str] = &["guard-rm-liveness", "enforcement-status"];
+pub const BYPASS_EXEMPT_HOOKS: &[&str] = &["enforcement-status"];
 
 /// Whether [`BYPASS_VAR`] may not switch this hook off.
 #[must_use]
@@ -365,11 +362,11 @@ mod tests {
     /// A protected guard and an unprotected one, so the table below can say
     /// which column it is exercising without repeating the const.
     const PROTECTED: &str = "git-safety";
-    const UNPROTECTED: &str = "guard-rm";
+    const UNPROTECTED: &str = "enforce-worktree";
 
     #[test]
     fn protected_sample_hooks_are_classified_as_the_table_assumes() {
-        // Self-guarding fixture: if `guard-rm` is ever promoted into
+        // Self-guarding fixture: if `enforce-worktree` is ever promoted into
         // PROTECTED_GUARDS, every `Disabled` row below would silently start
         // asserting the wrong branch. This fails first and names why.
         assert!(is_protected(PROTECTED), "{PROTECTED} must be protected");
@@ -401,11 +398,11 @@ mod tests {
             // switch alone it enforces; named in CADENCE_DISABLE as well, it
             // falls through to row 2 and is refused — which is what keeps the
             // report visible in the one state where it matters most.
-            (Some("1"), None, "guard-rm-liveness", BypassState::Enforced),
+            (Some("1"), None, "enforcement-status", BypassState::Enforced),
             (
                 Some("1"),
-                Some("guard-rm-liveness"),
-                "guard-rm-liveness",
+                Some("enforcement-status"),
+                "enforcement-status",
                 BypassState::DisableRefused,
             ),
             // Row 2: a protected guard named in the disable list still runs.
@@ -450,23 +447,38 @@ mod tests {
             // enforcing — no case-folding, no separator fuzzing, no prefix
             // matching.
             //
-            // The `guard-rm-liveness` row is the odd one out and the reason
+            // The `log-session-start` row is the odd one out and the reason
             // this comment does not say "unknown": that name IS a registered
             // hook. Naming it disables that hook; what the row pins is that it
-            // does not also disable `guard-rm`, whose name it merely extends.
+            // does not also disable `log-session`, whose name it merely extends.
             (None, Some(""), UNPROTECTED, BypassState::Enforced),
             (None, Some(","), UNPROTECTED, BypassState::Enforced),
             (None, Some("  "), UNPROTECTED, BypassState::Enforced),
-            (None, Some("Guard-Rm"), UNPROTECTED, BypassState::Enforced),
-            (None, Some("GUARD-RM"), UNPROTECTED, BypassState::Enforced),
-            (None, Some("guard_rm"), UNPROTECTED, BypassState::Enforced),
             (
                 None,
-                Some("guard-rm-liveness"),
+                Some("Enforce-Worktree"),
                 UNPROTECTED,
                 BypassState::Enforced,
             ),
-            (None, Some("guard"), UNPROTECTED, BypassState::Enforced),
+            (
+                None,
+                Some("ENFORCE-WORKTREE"),
+                UNPROTECTED,
+                BypassState::Enforced,
+            ),
+            (
+                None,
+                Some("enforce_worktree"),
+                UNPROTECTED,
+                BypassState::Enforced,
+            ),
+            (
+                None,
+                Some("log-session-start"),
+                "log-session",
+                BypassState::Enforced,
+            ),
+            (None, Some("enforce"), UNPROTECTED, BypassState::Enforced),
             (None, Some("*"), UNPROTECTED, BypassState::Enforced),
             (None, Some("all"), UNPROTECTED, BypassState::Enforced),
             // A duplicate entry is still one ask, and resolves the same way it
@@ -509,7 +521,12 @@ mod tests {
             // caller passes in. A caller handing over a padded name is asking
             // about a hook that does not exist, and gets the fail-toward-
             // enforced answer rather than a fuzzy match.
-            (None, Some(UNPROTECTED), " guard-rm", BypassState::Enforced),
+            (
+                None,
+                Some(UNPROTECTED),
+                " enforce-worktree",
+                BypassState::Enforced,
+            ),
         ];
 
         for (bypass, disable, hook, expected) in rows {
@@ -522,7 +539,7 @@ mod tests {
     }
 
     /// The four previously-divergent call sites, replayed against the one
-    /// resolver. Before #567 the `list` summary line and `guard-rm-liveness`
+    /// resolver. Before #567 the `list` summary line and the liveness detector
     /// were protection-blind while the `list` per-hook row and the enforcement
     /// path were not, so `CADENCE_DISABLE=git-safety` produced two different
     /// answers to "is git-safety disabled?" in one binary.
@@ -556,7 +573,7 @@ mod tests {
         assert_eq!(state.as_str(), "disabled");
         assert_eq!(
             state.switch(UNPROTECTED).as_deref(),
-            Some("CADENCE_DISABLE=guard-rm")
+            Some("CADENCE_DISABLE=enforce-worktree")
         );
     }
 

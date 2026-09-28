@@ -119,10 +119,6 @@ pub mod guard_op_vault_scan;
 pub mod guard_push_remote;
 /// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
 pub mod guard_read_model;
-/// Path-aware triage of rm-family delete commands (allow/ask/block).
-pub mod guard_rm;
-/// SessionStart assertion that `guard-rm` is present and classifying correctly.
-pub mod guard_rm_liveness;
 /// Block a `sops` decrypt whose plaintext would reach the transcript.
 pub mod guard_sops_decrypt;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.

@@ -779,7 +779,7 @@ mod tests {
                     cadence_hooks_metrics::log_failopen(
                         "deadline",
                         Some("guardrails"),
-                        Some("guard-rm"),
+                        Some("guard-push-remote"),
                         "1.0.0",
                         None,
                     );

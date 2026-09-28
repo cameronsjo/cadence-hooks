@@ -100,8 +100,8 @@ fn disabling_the_report_itself_is_refused_and_it_still_reports_a_bypass() {
 }
 
 #[test]
-fn the_standing_guard_rm_overlay_prints_nothing() {
-    let output = run(None, Some("guard-rm,guard-rm-liveness"));
+fn a_disable_naming_only_retired_hooks_prints_nothing() {
+    let output = run(None, Some("retired-hook,retired-check"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout.trim().is_empty(), "expected silence, got: {stdout}");

@@ -742,7 +742,7 @@ mod tests {
         let (_dir, path) = settings(
             r#"{
               "model": "opus",
-              "env": { "SOMETHING_ELSE": "keep-me", "CADENCE_DISABLE": "guard-rm" }
+              "env": { "SOMETHING_ELSE": "keep-me", "CADENCE_DISABLE": "warn-main-branch" }
             }"#,
         );
 
@@ -756,7 +756,7 @@ mod tests {
         assert_eq!(env.get("SOMETHING_ELSE").unwrap().as_str(), Some("keep-me"));
         assert_eq!(
             env.get("CADENCE_DISABLE").unwrap().as_str(),
-            Some("guard-rm")
+            Some("warn-main-branch")
         );
         assert_eq!(env.get(OWNERS_KEY).unwrap().as_str(), Some("cameronsjo"));
         assert!(env.get(REPOS_KEY).is_none(), "empty repos removes the key");
