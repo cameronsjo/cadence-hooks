@@ -166,9 +166,9 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_segments, command_word,
-    expand_leading_home, is_transparent_prefix_word, looks_absolute, redirect_targets,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
+    is_transparent_prefix_word, looks_absolute, redirect_targets, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, strip_heredoc_bodies, tokenize,
     tokenize_marked,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
@@ -658,7 +658,7 @@ fn is_shell_absolute(path: &str) -> bool {
 fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
     let mut commits = Vec::new();
     let mut mutations = Vec::new();
-    let home = cd_home(command);
+    let home = dollar_home(command);
     collect_targets(
         command,
         cwd,
@@ -903,7 +903,9 @@ fn collect_targets(
                     targets,
                     mutations,
                     (env_work_tree, env_git_dir),
-                    home,
+                    // A child shell's HOME is whatever its launcher left it
+                    // (`env -i bash -c`, `sudo`, `ssh`): never the process home.
+                    None,
                 );
             }
         }
@@ -952,21 +954,32 @@ fn collect_targets(
 /// argument. Unresolvable, and so left as `None`: a bare `-` (go to
 /// `$OLDPWD`), no path argument at all (bare `cd`, or all flags with nothing
 /// after), any shell variable other than a leading `$HOME`/`${HOME}`, a
-/// `~user`/`~+`/`~-` tilde form, a quoted `~`, and every `~`/`$HOME` form when
-/// `home` is `None` because the command may rebind HOME (see [`cd_home`]).
-/// Keeping the pre-cd directory is the fail-CLOSED direction from a primary:
-/// building a bogus path string instead would resolve to no repo and fail open
-/// downstream (`assess_dir`'s ADR-0001 Allow is correct for "not a repo", not
-/// for "the cd's real target was never examined").
+/// `$HOME` target when `dollar_home` is `None` (see [`dollar_home`]), a
+/// `~user`/`~+`/`~-` tilde form, and a quoted `"~/…"`. Keeping the pre-cd
+/// directory is the fail-CLOSED direction from a primary: building a bogus
+/// path string instead would resolve to no repo and fail open downstream
+/// (`assess_dir`'s ADR-0001 Allow is correct for "not a repo", not for "the
+/// cd's real target was never examined").
 ///
-/// A leading `$HOME` / `${HOME}` expands exactly as `~/` does — against the
-/// same process home — but only when bash would expand it: `'$HOME/x'` is a
-/// literal directory, and [`expand_leading_home`] declines it, so it stays
-/// unresolved rather than being joined onto `effective_dir`. Before this, a
+/// A leading `$HOME` / `${HOME}` expands against `dollar_home` — only when
+/// bash would expand it (`'$HOME/x'` is a literal directory, and
+/// [`expand_leading_home`] declines it). Before this, a
 /// `cd "$HOME/…/worktree" && git commit` from another repo's primary was judged
 /// against that primary and blocked, while the same target spelled `~/…`
 /// passed (cadence-hooks#1018).
-fn resolve_cd_segment(segment: &str, effective_dir: &str, home: Option<&str>) -> Option<String> {
+///
+/// An unquoted `~` / `~/…` keeps its long-standing resolution against the
+/// process home, unconditionally — the allowlist gating `$HOME` is NOT applied
+/// to it, because withholding it would change verdicts the tilde form has
+/// always had. A quoted `"~/…"` is a cwd-relative `./~/…` to bash; it is left
+/// unresolved rather than joined, because that directory almost never exists
+/// (so the cd fails and the commit runs in the pre-cd directory anyway), and a
+/// joined nonexistent path would fail open where the pre-cd directory blocks.
+fn resolve_cd_segment(
+    segment: &str,
+    effective_dir: &str,
+    dollar_home: Option<&str>,
+) -> Option<String> {
     let tokens = tokenize_marked(segment);
     let mut idx = 1;
     while tokens
@@ -981,11 +994,10 @@ fn resolve_cd_segment(segment: &str, effective_dir: &str, home: Option<&str>) ->
         return None;
     }
     if text.starts_with('$') {
-        let expanded = expand_leading_home(target, home?)?;
+        let expanded = expand_leading_home(target, dollar_home?)?;
         return Some(resolve_cd_target(&expanded, effective_dir));
     }
     if let Some(after_tilde) = text.strip_prefix('~') {
-        let home = home?;
         // Only `~` and `~/…`, with the tilde (and its slash) unquoted, mean
         // "HOME" to bash. `~user` names another account's home, which the
         // plain HOME substitution in `resolve_cd_target` would mangle into
@@ -998,113 +1010,88 @@ fn resolve_cd_segment(segment: &str, effective_dir: &str, home: Option<&str>) ->
         if !unquoted_tilde {
             return None;
         }
-        return Some(format!("{home}{after_tilde}"));
     }
     Some(resolve_cd_target(text, effective_dir))
 }
 
-/// The home directory a `cd` target's `~` / `$HOME` expands against for this
-/// `command`, or `None` when the command may rebind HOME before its cd runs.
+/// Command words that cannot rebind HOME in the shell running the command —
+/// the allowlist behind [`dollar_home`]. Kept deliberately small: every entry
+/// is a builtin or external command that takes no variable NAME as an operand
+/// and does no arithmetic evaluation.
+const HOME_SAFE_WORDS: &[&str] = &["cd", "git", "ls", "echo", "pwd", "true", "test", "["];
+
+/// The home a `$HOME` cd target in this top-level `command` expands against,
+/// or `None` when the guard cannot show the command leaves HOME alone.
 ///
-/// A cd target is expanded with the hook process's HOME — the same assumption
-/// the `~` arm always made. That is only sound while the command itself leaves
-/// HOME alone: `HOME=/x; cd "$HOME/y"` (or `export HOME=…`, `read HOME`,
-/// `unset HOME`, …) lands in `/x/y`, and judging `<process home>/y` instead
-/// would let a command steer the guard onto a directory it never enters. So
-/// any sign of a rebind withdraws the home altogether, and every `~`/`$HOME`
-/// target in the command is left unresolved — the pre-cd directory is kept,
-/// which is the behavior before `$HOME` expansion existed (cadence-hooks#1018).
+/// Bash expands `$HOME` against whatever HOME holds when the cd runs, and a
+/// command can rebind it first in more ways than any denylist enumerates —
+/// brace expansion (`export {HO,}ME=…`), a function body, `read`/`mapfile`,
+/// arithmetic, `eval`, a child shell that starts with no HOME at all (`env -i
+/// bash -c …`). Judging `<process home>/…` for such a command would let it
+/// steer the guard onto a directory it never enters. So this is an ALLOWLIST:
+/// the process home is used only when
 ///
-/// The test is deliberately coarse, since a false "may rebind" costs only that
-/// pre-fix behavior. It fires on:
+/// - every top-level segment (heredoc bodies aside) starts with a
+///   [`HOME_SAFE_WORDS`] command word — so no assignment word, `export`,
+///   `read`, `eval`, `source`, wrapper shell, or function call;
+/// - nothing outside quotes is a `(`, `)`, `{`, or `}` — no subshell,
+///   function definition, brace expansion, or arithmetic command;
+/// - nowhere, quoted or not and heredoc bodies included, is there a `$(`, a
+///   backtick, a `$[`, a `${` other than a plain `${HOME}`, or a `$'…'`
+///   string — each expands (or, for `$'…'`, quotes) in ways this scan does not
+///   model.
 ///
-/// - any `HOME` word other than a plain `$HOME`/`${HOME}` reference, read with
-///   quotes and backslashes removed (so `"H"OME=`, `HO\ME=` count) in the raw
-///   command and in every expanded segment;
-/// - a segment running `eval`, `source`, `.`, or `let`, which can bind a name
-///   this scan never sees spelled out;
-/// - a binding builtin (`declare`, `export`, `read`, `printf`, …) whose segment
-///   carries a `$` or backtick, since the NAME it binds may be computed;
-/// - arithmetic (`((`, `$[`), which assigns through expanded names.
-///
-/// Not modelled: a name computed and assigned inside other arithmetic contexts
-/// (an array subscript, a `[[ … -eq … ]]` operand, a `${x:off}` offset). Those
-/// need a deliberately obfuscated command, and the resolver's floor there is
-/// no lower than the long-standing unresolved-variable case (`cd "$X"`).
-fn cd_home(command: &str) -> Option<String> {
-    if command_may_rebind_home(command) {
+/// Anything else leaves every `$HOME` target unresolved: the pre-cd directory
+/// is kept, which is the behavior before `$HOME` expansion existed. Child
+/// scripts never get a home at all — [`collect_targets`] passes `None` down —
+/// since a child shell's HOME is whatever its launcher left it (cadence-hooks#1018).
+fn dollar_home(command: &str) -> Option<String> {
+    if !command_leaves_home_alone(command) {
         return None;
     }
     let home = cadence_hooks_core::paths::user_home_lossy_or_default();
     (!home.is_empty()).then_some(home)
 }
 
-/// The rebind test behind [`cd_home`].
-fn command_may_rebind_home(command: &str) -> bool {
-    const DYNAMIC: &[&str] = &["eval", "source", ".", "let"];
-    const BINDERS: &[&str] = &[
-        "declare",
-        "typeset",
-        "export",
-        "local",
-        "readonly",
-        "read",
-        "readarray",
-        "mapfile",
-        "printf",
-        "getopts",
-        "unset",
-    ];
-    if names_home_outside_reference(command) || command.contains("((") || command.contains("$[") {
-        return true;
+/// The allowlist test behind [`dollar_home`].
+fn command_leaves_home_alone(command: &str) -> bool {
+    let rest = command.replace("${HOME}", "");
+    if ["$(", "`", "$[", "${", "$'"]
+        .iter()
+        .any(|needle| rest.contains(needle))
+    {
+        return false;
     }
-    command_segments(command).iter().any(|segment| {
-        if names_home_outside_reference(segment) {
-            return true;
-        }
-        let tokens = tokenize(strip_group_wrappers(segment));
-        let argv = skip_transparent_prefixes(&tokens);
-        [tokens.first(), argv.first()]
-            .into_iter()
-            .flatten()
-            .any(|word| {
-                let word = command_word(word);
-                DYNAMIC.contains(&word.as_ref())
-                    || (BINDERS.contains(&word.as_ref())
-                        && (segment.contains('$') || segment.contains('`')))
-            })
-    })
+    let script = strip_heredoc_bodies(&rest);
+    if has_unquoted_grouping(&script) {
+        return false;
+    }
+    split_segments_with_ops(&script)
+        .iter()
+        .map(|(segment, _)| tokenize(segment))
+        .filter(|tokens| !tokens.is_empty())
+        .all(|tokens| HOME_SAFE_WORDS.contains(&tokens[0].as_str()))
 }
 
-/// Does `text` name the variable `HOME` anywhere other than in a plain `$HOME`
-/// or `${HOME}` read? Quotes and backslashes are dropped first, because bash
-/// removes them before it decides what a word binds.
-fn names_home_outside_reference(text: &str) -> bool {
-    let flat: String = text
-        .chars()
-        .filter(|c| !matches!(c, '\\' | '\'' | '"'))
-        .collect();
-    let bytes = flat.as_bytes();
-    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut from = 0;
-    while let Some(offset) = flat[from..].find("HOME") {
-        let start = from + offset;
-        let end = start + "HOME".len();
-        from = end;
-        if (start > 0 && is_name(bytes[start - 1])) || bytes.get(end).is_some_and(|&b| is_name(b)) {
-            // Part of a longer name (`MY_HOME`, `HOMEDIR`) — not HOME.
-            continue;
-        }
-        let plain_read = (start >= 1 && bytes[start - 1] == b'$')
-            || (start >= 2
-                && bytes[start - 2] == b'$'
-                && bytes[start - 1] == b'{'
-                && bytes.get(end) == Some(&b'}'));
-        if !plain_read {
-            return true;
+/// Does `script` carry a `(`, `)`, `{`, or `}` outside quotes? An unterminated
+/// quote counts as yes. Only `'…'` and `"…"` are tracked — the caller has
+/// already refused any `$'…'`, the one quoting form whose escapes differ.
+fn has_unquoted_grouping(script: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut chars = script.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '\\' if !single => {
+                chars.next();
+            }
+            '(' | ')' | '{' | '}' if !single && !double => return true,
+            _ => {}
         }
     }
-    false
+    single || double
 }
 
 /// Resolve a git path operand against a base directory, with the same shell
@@ -1290,7 +1277,7 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
     // breaks the chain.
     let mut active: HashMap<CommitTarget, Option<String>> = HashMap::new();
     let mut effective_dir = cwd.to_string();
-    let home = cd_home(command);
+    let home = dollar_home(command);
 
     for (segment, next_op) in split_segments_with_ops(command) {
         let segment = strip_group_wrappers(&segment);
@@ -1440,7 +1427,7 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
 /// ignored the cd (cadence-hooks#1018). Message-only: the verdict is untouched,
 /// and an unreadable cd keeps blocking — letting it through would be a bypass.
 fn with_unresolved_cd_hint(mut result: CheckResult, command: &str, cwd: &str) -> CheckResult {
-    let home = cd_home(command);
+    let home = dollar_home(command);
     let mut effective_dir = cwd.to_string();
     let mut unresolved: Option<String> = None;
     for (segment, _) in split_segments_with_ops(command) {
@@ -1464,10 +1451,10 @@ fn with_unresolved_cd_hint(mut result: CheckResult, command: &str, cwd: &str) ->
     ) {
         let target = sanitize_field(&target, MAX_PATH_DISPLAY);
         message.push_str(&format!(
-            "\nNote: `cd {target}` could not be resolved (a variable other than $HOME, `cd -`, \
-             or a HOME this command reassigns), so the commit was judged from the directory \
-             before that cd. If it really lands elsewhere, name the path literally or use \
-             `git -C <path> commit`."
+            "\nNote: `cd {target}` could not be resolved (a shell variable, `cd -`, or \
+             `$HOME` in a command the guard cannot confirm leaves HOME alone), so the commit \
+             was judged from the directory before that cd. If it really lands elsewhere, name \
+             the path literally or use `git -C <path> commit`."
         ));
     }
     result
@@ -2887,29 +2874,51 @@ mod tests {
         }
     }
 
+    /// Every command in this list could leave HOME holding something other
+    /// than the process home when its cd runs — or hands the cd to a child
+    /// shell with its own HOME — so `$HOME` there must stay unresolved.
+    const HOME_UNSAFE_PREFIXES: &[&str] = &[
+        "HOME=/elsewhere; ",
+        "HOME=/elsewhere && ",
+        "export HOME=/elsewhere && ",
+        "declare -x HOME=/elsewhere; ",
+        "read -r HOME < f; ",
+        "unset HOME; ",
+        r#"export "H"OME=/elsewhere; "#,
+        r"HO\ME=/elsewhere; ",
+        r#"eval "HO""ME=/elsewhere"; "#,
+        r#"n=HO; declare "${n}ME=/elsewhere"; "#,
+        r#"n=HO; (( ${n}ME = 1 )); "#,
+        "source ./env.sh && ",
+        ". ./env.sh && ",
+        // Gate-2 review Criticals: brace expansion builds the name `HOME`
+        // with no `HOME` substring and no `$` anywhere in the segment.
+        "export {HO,}ME=/elsewhere && ",
+        "declare -x {HO,}ME=/elsewhere; ",
+        "read {HO,}ME <<< /elsewhere; ",
+        "mapfile -t {HO,}ME <<< /elsewhere; ",
+        "f(){ export {HO,}ME=/elsewhere; }; f && ",
+        "export FOO=1 && ",
+        "MY_HOME=/x; ",
+        "echo $(true) && ",
+        "echo `true` && ",
+        "echo ${X:=1} && ",
+        "echo $[1] && ",
+        "echo $'x' && ",
+        "(true) && ",
+        "{ true; } && ",
+        "echo {a,b} && ",
+    ];
+
     #[test]
-    fn cd_home_rebind_withdraws_home_expansion() {
-        // A command that may rebind HOME before its cd must not be expanded
-        // against the PROCESS home — that would let the command steer the guard
-        // onto a directory it never enters. The target stays unresolved (the
-        // pre-#1018 fallback), for `~` as well as `$HOME`.
-        for prefix in [
-            "HOME=/elsewhere; ",
-            "HOME=/elsewhere && ",
-            "export HOME=/elsewhere && ",
-            "declare -x HOME=/elsewhere; ",
-            "read -r HOME < f; ",
-            "unset HOME; ",
-            r#"export "H"OME=/elsewhere; "#,
-            r"HO\ME=/elsewhere; ",
-            r#"eval "HO""ME=/elsewhere"; "#,
-            r#"n=HO; declare "${n}ME=/elsewhere"; "#,
-            r#"n=HO; (( ${n}ME = 1 )); "#,
-            "source ./env.sh && ",
-            ". ./env.sh && ",
-            "sh -c 'HOME=/elsewhere'; ",
-        ] {
-            for target in [r#""$HOME/wt""#, "${HOME}/wt", "~/wt"] {
+    fn dollar_home_outside_the_allowlist_stays_unresolved() {
+        // `$HOME` expands against the process home only for a command the
+        // allowlist can show leaves HOME alone. Anything else keeps the pre-cd
+        // directory — the pre-#1018 fail-closed fallback — so no rebinding
+        // spelling, known or not, can steer the guard onto a directory the
+        // command never enters.
+        for prefix in HOME_UNSAFE_PREFIXES {
+            for target in [r#""$HOME/wt""#, "${HOME}/wt"] {
                 let cmd = format!("{prefix}cd {target} && git commit -m x");
                 assert_eq!(
                     git_commit_targets(&cmd, "/cwd"),
@@ -2932,24 +2941,70 @@ mod tests {
     }
 
     #[test]
-    fn home_rebind_detector_ignores_plain_reads_and_other_names() {
-        // Negative controls: the ordinary shapes the fix exists for must keep
-        // expanding, or the detector silently undoes it.
+    fn dollar_home_in_a_child_shell_stays_unresolved() {
+        // A child shell's HOME is whatever its launcher left it: `env -i`
+        // clears it (bash then lands in `/wt`), `sudo`/`su` swap it. The child
+        // never inherits the process home, even though the child's own script
+        // would pass the allowlist on its own; the child starts from the
+        // directory in effect at the wrapper, as every wrapped cd does.
         for cmd in [
-            r#"cd "$HOME/wt" && git add . && git commit -m x"#,
-            r#"cd "${HOME}/wt" && echo "$HOME" && git commit -m x"#,
-            "MY_HOME=/x; HOMEDIR=/y; cd $HOME/wt && git commit -m x",
-            "export FOO=1 && cd $HOME/wt && git commit -m x",
+            r#"env -i bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"sudo bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"sh -c 'cd ${HOME}/wt && git commit -m x'"#,
         ] {
-            assert!(!command_may_rebind_home(cmd), "{cmd}");
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{cmd}"
+            );
         }
     }
 
     #[test]
+    fn tilde_keeps_its_process_home_resolution_outside_the_allowlist() {
+        // Deliberate asymmetry: the allowlist gates `$HOME` only. `~/…` keeps
+        // the resolution it always had, so no verdict main already gave a
+        // tilde spelling changes (withholding it could only flip ALLOW→BLOCK,
+        // but a behavior change there is not this fix's to make).
+        let want = vec![format!("{}/wt", process_home())];
+        for prefix in ["export FOO=1 && ", "HOME=/elsewhere; "] {
+            let cmd = format!("{prefix}cd ~/wt && git commit -m x");
+            assert_eq!(git_commit_targets(&cmd, "/cwd"), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn home_allowlist_accepts_the_ordinary_shapes() {
+        // Positive controls: the ordinary shapes the fix exists for must
+        // resolve, or the allowlist silently undoes it — a conventional-commit
+        // message's quoted parens and a heredoc body's included.
+        let want = vec![format!("{}/wt", process_home())];
+        for cmd in [
+            r#"cd "$HOME/wt" && git add . && git commit -m x"#,
+            r#"cd "$HOME/wt" && git commit -m "fix(scope): thing {1}""#,
+            r#"cd "${HOME}/wt" && echo "$HOME" && pwd && ls && git commit -m x"#,
+            r#"cd $HOME/wt && test -d .git && [ -d .git ] && true && git commit -m x"#,
+            "cd \"$HOME/wt\" && git commit -F - <<'EOF'\nfix(scope): body (with parens)\nEOF",
+        ] {
+            assert!(command_leaves_home_alone(cmd), "{cmd}");
+            assert_eq!(git_commit_targets(cmd, "/cwd"), want, "{cmd}");
+        }
+        // An unquoted heredoc body still expands `$((…))` in the current shell,
+        // so a substitution there disqualifies even though the body is data.
+        assert!(!command_leaves_home_alone(
+            "cd \"$HOME/wt\" && git commit -F - <<EOF\n$((HOME=1))\nEOF"
+        ));
+    }
+
+    #[test]
     fn cd_tilde_other_user_and_quoted_tilde_stay_unresolved() {
-        // `~user/…` names another account's home and `"~/…"` is a literal `~`
-        // directory; substituting the process home would build a path that
-        // names no repo (fail-open), so both keep the pre-cd directory.
+        // `~user/…` names another account's home: substituting the process
+        // home would build a path that names no repo (fail-open). A quoted
+        // `"~/…"` is a cwd-relative `./~/…` to bash — a directory that almost
+        // never exists, so the cd fails and the commit runs in the pre-cd
+        // directory; joining it instead would fail open on the nonexistent
+        // path. Both keep the pre-cd directory (fail-closed from a primary).
         for cmd in [
             "cd ~bob/src/repo && git commit -m x",
             "cd ~+/x && git commit -m x",
@@ -2966,12 +3021,14 @@ mod tests {
     #[test]
     fn inchain_dismiss_resolves_dollar_home_cd_like_the_commit_walk() {
         // Parity: the dismiss map is keyed by the resolved target string, so
-        // the in-chain scan's cd must expand `$HOME` exactly as the commit
+        // the in-chain scan's cd must resolve `$HOME` exactly as the commit
         // walk does, or `cd "$HOME/…" && dismiss && git commit` half-matches.
+        // `cadence-hooks` is outside the HOME allowlist, so here both walks
+        // must agree on leaving the `$HOME` cd unresolved.
         let cmd = r#"cd "$HOME/src/repo" && cadence-hooks guardrails dismiss-enforce-worktree --for 30m && git commit -m x"#;
         let dismissed = inchain_dismissed_commits(cmd, "/cwd");
         let targets = git_commit_targets(cmd, "/cwd");
-        assert_eq!(targets, vec![format!("{}/src/repo", process_home())]);
+        assert_eq!(targets, vec!["/cwd".to_string()]);
         assert!(dismissed.contains_key(&targets[0]), "{dismissed:?}");
     }
 
@@ -3446,19 +3503,30 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cd_dollar_home_after_home_rebind_blocks_from_primary() {
-        // A command that rebinds HOME first gets no process-home expansion:
-        // the target stays unresolved and the primary it started in is judged,
-        // however the rebind is spelled.
+        // Live form of the allowlist: a command that could rebind HOME — or
+        // hands the cd to a child shell — gets no process-home expansion, so the
+        // `$HOME` cd stays unresolved and the primary it started in is judged.
+        // Includes the gate-2 review Criticals (brace-built names, a function
+        // body, `env -i`/`sudo` child shells), each of which committed into the
+        // primary before the allowlist replaced the rebind denylist.
         let scratch = scratch("home-cd-rebind");
         let (primary, wt) = primary_and_worktree(&scratch);
         let target = via_dollar_home(&wt);
 
-        for prefix in [
-            "HOME=/elsewhere; ",
-            "export HOME=/elsewhere && ",
-            "HOME=/elsewhere ",
+        for cmd in [
+            format!(r#"HOME=/elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"export HOME=/elsewhere && cd "{target}" && git commit -m x"#),
+            format!(r#"HOME=/elsewhere cd "{target}" && git commit -m x"#),
+            format!(r#"export {{HO,}}ME=/elsewhere && cd "{target}" && git commit -m x"#),
+            format!(r#"declare -x {{HO,}}ME=/elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"read {{HO,}}ME <<< /elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"mapfile -t {{HO,}}ME <<< /elsewhere; cd "{target}" && git commit -m x"#),
+            format!(
+                r#"f(){{ export {{HO,}}ME=/elsewhere; }}; f && cd "{target}" && git commit -m x"#
+            ),
+            format!(r#"env -i bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"sudo bash -c 'cd "{target}" && git commit -m x'"#),
         ] {
-            let cmd = format!(r#"{prefix}cd "{target}" && git commit -m x"#);
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
             let r = run_enforce(&input, &cfg(false, false));
