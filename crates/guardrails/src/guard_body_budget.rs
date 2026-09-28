@@ -457,7 +457,10 @@ pub fn strip_fences(body: &str) -> String {
 }
 
 /// Drop `for this session` / `of this session` from any line that also names a
-/// session mechanic in a code span (`session declare`, `session_id`, …).
+/// session mechanic in a code span (`session declare`, `session_id`, …). "Names
+/// a session mechanic" is a case-insensitive substring test on the span, so
+/// `SessionStart` or `CADENCE_SESSION` count too — loose on purpose, since the
+/// check only nudges.
 ///
 /// On such a line the phrase is the object of a technical noun — "the
 /// `session declare` record for this session" names the Claude Code session a
