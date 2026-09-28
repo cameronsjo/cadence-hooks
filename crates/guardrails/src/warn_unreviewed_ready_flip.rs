@@ -33,9 +33,8 @@
 //! `GH_ENTERPRISE_TOKEN` when that is set.
 
 use cadence_hooks_core::shell::{
-    PrSelector, carries_undo_flag, command_segments, command_word, gh_repo_value_parts,
-    git_command, host_and_repo_from_url, pr_selector, pr_url_parts, ship_target,
-    strip_group_wrappers, tokenize,
+    PrSelector, carries_undo_flag, command_segments, command_word, git_command,
+    host_and_repo_from_url, pr_selector, pr_url_parts, ship_target, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -176,13 +175,83 @@ fn flip_segment_tokens(command: &str) -> Option<Vec<String>> {
 pub enum RepoChoice {
     /// The command names no repo: gh picks it from the cwd's git remotes.
     GhDefault,
-    /// Every `-R`/`--repo` value names this one repo. `value` is
-    /// the first spelling as typed, passed back to gh unchanged.
+    /// Every `-R`/`--repo` value names this one repo. Each part passed
+    /// [`parse_repo_value`]'s charset check; gh gets them re-serialised
+    /// ([`RepoChoice::repo_arg`]), never the value as typed.
     Explicit {
-        value: String,
+        host: Option<String>,
         owner: String,
         name: String,
     },
+}
+
+impl RepoChoice {
+    /// The `-R` argument for gh, built only from parsed parts.
+    fn repo_arg(&self) -> Option<String> {
+        match self {
+            RepoChoice::GhDefault => None,
+            RepoChoice::Explicit {
+                host: Some(host),
+                owner,
+                name,
+            } => Some(format!("{host}/{owner}/{name}")),
+            RepoChoice::Explicit {
+                host: None,
+                owner,
+                name,
+            } => Some(format!("{owner}/{name}")),
+        }
+    }
+}
+
+/// An owner or repo name the hook will pass to gh: ASCII letters, digits,
+/// `.`, `_`, `-`, and no leading `-`.
+fn is_safe_name(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A host name the hook will pass to gh: ASCII letters, digits, `.`, `-`,
+/// and no leading `-`.
+fn is_safe_host(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+}
+
+/// Parse a `-R`/`--repo` value into `(host, owner, name)` the way go-gh does,
+/// or `None` when the hook cannot be sure it reads it as gh does
+/// (security review I1, round 2).
+///
+/// go-gh reads a value as a URL only when it starts with `git@` or a scheme;
+/// otherwise it splits on `/` into `[HOST/]OWNER/REPO`. The hook does not
+/// model the URL forms, so any value that could be one (`git@`, or any `:`)
+/// is refused. So is any part outside the safe charsets, which rules out
+/// `@`, `%`, whitespace, and non-ASCII. `github.com:x@evil.example/o/r` is the
+/// case this closes: a remote-URL parser reads its host as `github.com`,
+/// while gh splits it on `/` and connects to `evil.example`.
+fn parse_repo_value(value: &str) -> Option<(Option<String>, String, String)> {
+    if value.starts_with("git@") || value.contains(':') {
+        return None;
+    }
+    let (host, owner, name) = match value.split('/').collect::<Vec<_>>().as_slice() {
+        [owner, name] => (None, *owner, *name),
+        [host, owner, name] => (Some(*host), *owner, *name),
+        _ => return None,
+    };
+    if !is_safe_name(owner) || !is_safe_name(name) || !host.is_none_or(is_safe_host) {
+        return None;
+    }
+    Some((
+        host.map(str::to_ascii_lowercase),
+        owner.to_string(),
+        name.to_string(),
+    ))
 }
 
 /// Where a flip points gh: the repo, the PR selector, and the host the
@@ -264,23 +333,29 @@ impl FlipTarget {
             if ship.repos.is_empty() || repo_values_are_deliberately_empty(tokens, &ship.repos) {
                 RepoChoice::GhDefault
             } else {
-                let mut parsed = ship
+                let parsed = ship
                     .repos
                     .iter()
-                    .map(|value| gh_repo_value_parts(value))
+                    .map(|value| parse_repo_value(value))
                     .collect::<Option<Vec<_>>>()?;
-                parsed.dedup();
-                let [(host, slug)] = parsed.as_slice() else {
-                    return None;
+                // GitHub owner and repo names are case-insensitive.
+                let key = |(h, o, n): &(Option<String>, String, String)| {
+                    (h.clone(), o.to_ascii_lowercase(), n.to_ascii_lowercase())
                 };
-                let (owner, name) = slug.split_once('/')?;
-                repo_host.clone_from(host);
-                RepoChoice::Explicit {
-                    value: ship.repos[0].clone(),
-                    owner: owner.to_string(),
-                    name: name.to_string(),
+                let (host, owner, name) = parsed.first()?.clone();
+                if parsed.iter().any(|p| key(p) != key(&parsed[0])) {
+                    return None;
                 }
+                repo_host.clone_from(&host);
+                RepoChoice::Explicit { host, owner, name }
             };
+        // A PR URL's owner and repo reach gh as GraphQL variables; hold them
+        // to the same charset as a repo value.
+        if matches!(&selector, PrSelector::Url { owner, repo, .. }
+            if !(is_safe_name(owner) && is_safe_name(repo)))
+        {
+            return None;
+        }
         let url_host = match &selector {
             PrSelector::Url { host, .. } => Some(host.clone()),
             _ => None,
@@ -421,16 +496,24 @@ enum QueryRepo {
 }
 
 /// Ask gh which PR a selector-less or non-numeric flip names:
-/// `gh pr view --json number,url [-R value] [-- selector]`. gh answers with
+/// `gh pr view --json number,url [-R repo] [-- selector]`. gh answers with
 /// the PR's URL, which names its repo and number. `None` on any failure.
+///
+/// `repo` is [`RepoChoice::repo_arg`], built from parsed parts. `selector` is
+/// the one command string that reaches gh as typed. It is safe there: it
+/// follows `--`, so gh never reads it as a flag, and gh contacts a host for
+/// it only when it is an `http(s)` URL. [`FlipTarget::from_tokens`] has
+/// already read the host of any URL-shaped selector (stopping on userinfo, a
+/// port, `%`, or non-ASCII) and [`evaluate`] has checked it against the
+/// trusted set.
 fn resolve_with_pr_view(
     gh: &dyn GhRunner,
-    repo_value: Option<&str>,
+    repo: Option<&str>,
     selector: Option<&str>,
 ) -> Option<(QueryRepo, u64)> {
     let mut args = vec!["pr", "view", "--json", "number,url"];
-    if let Some(value) = repo_value {
-        args.extend(["-R", value]);
+    if let Some(repo) = repo {
+        args.extend(["-R", repo]);
     }
     if let Some(sel) = selector {
         args.extend(["--", sel]);
@@ -438,6 +521,9 @@ fn resolve_with_pr_view(
     let json = gh.run(&args)?;
     let value: serde_json::Value = serde_json::from_str(&json).ok()?;
     let (_host, owner, name, number) = pr_url_parts(value.get("url")?.as_str()?)?;
+    if !(is_safe_name(&owner) && is_safe_name(&name)) {
+        return None;
+    }
     Some((QueryRepo::Named { owner, name }, number))
 }
 
@@ -492,8 +578,8 @@ pub fn evaluate(
         (PrSelector::Other(sel), RepoChoice::GhDefault) => {
             resolve_with_pr_view(gh, None, Some(sel))?
         }
-        (PrSelector::Other(sel), RepoChoice::Explicit { value, .. }) => {
-            resolve_with_pr_view(gh, Some(value), Some(sel))?
+        (PrSelector::Other(sel), repo @ RepoChoice::Explicit { .. }) => {
+            resolve_with_pr_view(gh, repo.repo_arg().as_deref(), Some(sel))?
         }
         // Fail-open allow (ADR-0001): gh refuses a `-R` with no selector
         // ("argument required when using the --repo flag"), so the flip
@@ -1372,6 +1458,110 @@ mod tests {
             &named(&["github.com", "evil.x"]),
             Some("ghe.x")
         ));
+    }
+
+    // --- gh argv built only from parsed parts (security review I1, round 2) ---
+
+    #[test]
+    fn scp_shaped_repo_value_naming_another_host_makes_no_call() {
+        // A remote-URL parser reads this host as github.com; go-gh splits it
+        // on `/` and connects to evil.example. It must never reach gh.
+        for command in [
+            "gh pr merge my-branch -R github.com:x@evil.example/o/r",
+            "gh pr merge 5 -R github.com:x@evil.example/o/r",
+        ] {
+            let gh = unreviewed_gh();
+            assert_eq!(eval(command, &gh), None, "{command}");
+            assert_eq!(gh.call_count(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn repo_argv_is_built_from_parsed_parts() {
+        let mut gh = unreviewed_gh();
+        gh.pr_view_json = Some(r#"{"number":3,"url":"https://github.com/o/r/pull/3"}"#.to_string());
+        let _ = eval("gh pr merge my-branch -R o/r", &gh);
+        assert_eq!(
+            gh.calls.borrow()[0],
+            vec![
+                "pr",
+                "view",
+                "--json",
+                "number,url",
+                "-R",
+                "o/r",
+                "--",
+                "my-branch"
+            ]
+        );
+
+        // The host is lowercased on the way through: gh gets the parsed
+        // parts, not the spelling in the command.
+        let mut gh = unreviewed_gh();
+        gh.pr_view_json = Some(r#"{"number":3,"url":"https://github.com/o/r/pull/3"}"#.to_string());
+        let _ = eval("gh pr merge my-branch -R GitHub.com/o/r", &gh);
+        assert_eq!(
+            gh.calls.borrow()[0],
+            vec![
+                "pr",
+                "view",
+                "--json",
+                "number,url",
+                "-R",
+                "github.com/o/r",
+                "--",
+                "my-branch"
+            ]
+        );
+
+        let gh = unreviewed_gh();
+        let _ = eval("gh pr merge 5 -R o/r", &gh);
+        assert_eq!(
+            *gh.graphql_args.borrow(),
+            vec![
+                "api".to_string(),
+                "graphql".to_string(),
+                "-f".to_string(),
+                format!("query={PR_STATE_QUERY}"),
+                "-f".to_string(),
+                "owner=o".to_string(),
+                "-f".to_string(),
+                "name=r".to_string(),
+                "-F".to_string(),
+                "number=5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn url_form_repo_values_are_silent() {
+        // go-gh reads these as git URLs; the hook does not model that
+        // parser, so it stays silent rather than guess.
+        for command in [
+            "gh pr merge 5 -R git@github.com:o/r.git",
+            "gh pr merge 5 -R https://github.com/o/r",
+            "gh pr merge 5 -R ssh://git@github.com/o/r",
+        ] {
+            let gh = unreviewed_gh();
+            assert_eq!(eval(command, &gh), None, "{command}");
+            assert_eq!(gh.call_count(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn repo_value_outside_the_charset_is_silent() {
+        for command in [
+            "gh pr merge 5 -R o/r%2f",
+            "gh pr merge 5 -R 'o /r'",
+            "gh pr merge 5 -R o@x/r",
+            "gh pr merge 5 -R a/b/c/d",
+            "gh pr merge 5 -R o/-r",
+            "gh pr merge 5 -R 'o/r\u{e9}'",
+        ] {
+            let gh = unreviewed_gh();
+            assert_eq!(eval(command, &gh), None, "{command}");
+            assert_eq!(gh.call_count(), 0, "{command}");
+        }
     }
 
     // --- an empty repo value (security review N2) ---
