@@ -454,6 +454,133 @@ fn doctor_default_scan_reads_installed_plugins_manifest() {
     );
 }
 
+// ── Cadence rules drift (cameronsjo/cadence#1339) ──────────────────────────
+
+const PINNED_RULES: &str = "# Cadence Rules\n\n<!-- managed by cadence -->\n\n- pinned rule\n";
+const DRIFTED_RULES: &str = "# Cadence Rules\n\n<!-- managed by cadence -->\n\n- old rule\n";
+
+/// Sibling of [`doctor_in_home`] that points `CLAUDE_CONFIG_DIR` at `config`
+/// instead of removing it, for tests that pin the config-dir resolution.
+fn doctor_in_config_dir(
+    home: &std::path::Path,
+    config: &std::path::Path,
+    metrics: &std::path::Path,
+) -> Command {
+    let mut cmd = doctor_in_home(home, metrics);
+    cmd.env("CLAUDE_CONFIG_DIR", config);
+    cmd
+}
+
+/// Under `config` (a Claude config dir): a manifest pinning a user-scope
+/// `cadence@workbench` install whose `rules/cadence-rules.md` is
+/// [`PINNED_RULES`], and a deployed `rules/cadence/cadence-rules.md` carrying
+/// `deployed`. Returns `(pinned_path, deployed_path)`.
+fn write_cadence_rules_fixture(
+    config: &std::path::Path,
+    deployed: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let install = config.join("plugins/cache/workbench/cadence/abc123");
+    std::fs::create_dir_all(install.join("rules")).unwrap();
+    let pinned = install.join("rules/cadence-rules.md");
+    std::fs::write(&pinned, PINNED_RULES).unwrap();
+    let manifest = serde_json::json!({
+        "version": 2,
+        "plugins": {
+            "cadence@workbench": [
+                { "scope": "user", "installPath": install, "version": "abc123" }
+            ]
+        }
+    });
+    std::fs::write(
+        config.join("plugins/installed_plugins.json"),
+        manifest.to_string(),
+    )
+    .unwrap();
+    let deployed_path = config.join("rules/cadence/cadence-rules.md");
+    std::fs::create_dir_all(deployed_path.parent().unwrap()).unwrap();
+    std::fs::write(&deployed_path, deployed).unwrap();
+    (pinned, deployed_path)
+}
+
+#[test]
+fn doctor_warns_on_cadence_rules_drift_then_goes_quiet_when_restored() {
+    let home = home_with_empty_cache();
+    let metrics = tempfile::tempdir().unwrap();
+    std::fs::write(metrics.path().join("subagents.jsonl"), "{}\n").unwrap();
+    let (pinned, deployed) =
+        write_cadence_rules_fixture(&home.path().join(".claude"), DRIFTED_RULES);
+
+    let first = doctor_in_home(home.path(), metrics.path())
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert_eq!(
+        first.status.code(),
+        Some(1),
+        "drifted rules are a warning → exit 1.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        stdout.contains("cadence-rules.md"),
+        "finding names the file: {stdout}"
+    );
+    assert!(
+        stdout.contains("initializing-cadence"),
+        "finding names the re-deploy path: {stdout}"
+    );
+
+    std::fs::copy(&pinned, &deployed).unwrap();
+
+    let second = doctor_in_home(home.path(), metrics.path())
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "restored rules → clean.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        stdout.contains("clean"),
+        "clean run reports clean: {stdout}"
+    );
+    assert!(
+        !stdout.contains("cadence-rules.md"),
+        "no rules finding once restored: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_rules_drift_reads_claude_config_dir() {
+    let home = home_with_empty_cache();
+    let metrics = tempfile::tempdir().unwrap();
+    std::fs::write(metrics.path().join("subagents.jsonl"), "{}\n").unwrap();
+    let config = home.path().join("cfg");
+    let (pinned, _) = write_cadence_rules_fixture(&config, DRIFTED_RULES);
+    // An identical decoy at the $HOME/.claude location: a doctor that
+    // resolved the deployed path from HOME instead of CLAUDE_CONFIG_DIR
+    // would read this, find a match, and stay silent.
+    let decoy = home.path().join(".claude/rules/cadence/cadence-rules.md");
+    std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+    std::fs::copy(&pinned, &decoy).unwrap();
+
+    let output = doctor_in_config_dir(home.path(), &config, metrics.path())
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "drift under CLAUDE_CONFIG_DIR must warn.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("cadence-rules.md") && stdout.contains("initializing-cadence"),
+        "finding names the config-dir copy: {stdout}"
+    );
+}
+
 // ── Telemetry staleness surface (default scan only) ────────────────────────
 
 #[test]

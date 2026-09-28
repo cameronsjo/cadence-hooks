@@ -755,6 +755,100 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .collect()
 }
 
+/// Where `/cadence-groundwork:initializing-cadence` deploys the cadence rules,
+/// relative to the Claude config dir.
+const CADENCE_RULES_DEPLOYED: &str = "rules/cadence/cadence-rules.md";
+
+/// Where the cadence plugin ships those rules, relative to its install dir.
+const CADENCE_RULES_SOURCE: &str = "rules/cadence-rules.md";
+
+/// Text the deployed copy carries while cadence still manages it. An operator
+/// who takes ownership of the file removes that line, and the drift check
+/// then stays silent.
+const CADENCE_RULES_MANAGED_MARKER: &str = "managed by cadence";
+
+/// User-scope installs of exactly `plugin` from `installed_plugins.json`, as
+/// `(label, install_path)` pairs.
+///
+/// The key's plugin half must equal `plugin` exactly, so `cadence` never
+/// matches `cadence-rules@…` or `cadence-forge@…`. Only `scope: "user"` rows
+/// count: the deployed rules file is user-global, and a project-scope pin
+/// says nothing about it. Any read or parse failure yields an empty list, so
+/// the caller stays silent (fail open, ADR-0001).
+fn user_scope_installs(manifest: &Path, plugin: &str) -> Vec<(String, PathBuf)> {
+    let Some(content) = cadence_hooks_core::paths::read_untrusted_config(manifest) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(plugins) = json.get("plugins").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    plugins
+        .iter()
+        .filter(|(key, _)| key.split_once('@').map(|(p, _)| p) == Some(plugin))
+        .filter_map(|(key, installs)| Some((key, installs.as_array()?)))
+        .flat_map(|(key, installs)| {
+            installs.iter().filter_map(move |install| {
+                if install.get("scope").and_then(|v| v.as_str()) != Some("user") {
+                    return None;
+                }
+                let path = install.get("installPath").and_then(|v| v.as_str())?;
+                Some((key.clone(), PathBuf::from(path)))
+            })
+        })
+        .collect()
+}
+
+/// A warning when the deployed cadence rules file differs from every pinned
+/// copy the user-scope cadence installs ship (cameronsjo/cadence#1339).
+///
+/// Silent when the deployed file is absent, unreadable, or not a regular
+/// file; when it no longer carries [`CADENCE_RULES_MANAGED_MARKER`] (the
+/// operator owns it now); when no install ships a readable source; or when
+/// any install's source matches byte for byte. The finding says the file
+/// *differs*, never that it is older: the check compares bytes and cannot
+/// tell which side moved.
+fn rules_drift_finding(config_dir: &Path, installs: &[(String, PathBuf)]) -> Option<Finding> {
+    let deployed_path = config_dir.join(CADENCE_RULES_DEPLOYED);
+    let deployed = cadence_hooks_core::paths::read_untrusted_config(&deployed_path)?;
+    if !deployed.contains(CADENCE_RULES_MANAGED_MARKER) {
+        return None;
+    }
+    let mut readable = installs.iter().filter_map(|(label, dir)| {
+        let source_path = dir.join(CADENCE_RULES_SOURCE);
+        cadence_hooks_core::paths::read_untrusted_config(&source_path)
+            .map(|source| (label, source_path, source))
+    });
+    let (label, pinned_path, first_source) = readable.next()?;
+    if first_source == deployed || readable.any(|(_, _, source)| source == deployed) {
+        return None;
+    }
+    Some(Finding {
+        severity: Severity::Warning,
+        // An `installed_plugins.json` key — sanitized once at display
+        // (`Finding::render`, cameronsjo/cadence-hooks#440).
+        plugin: label.clone(),
+        file: deployed_path.clone(),
+        line: None,
+        snippet: CADENCE_RULES_DEPLOYED.to_string(),
+        diagnosis: format!(
+            "the deployed cadence rules differ from the pinned cadence plugin's copy at {}, \
+             so sessions load rules the installed plugin does not ship",
+            pinned_path.display()
+        ),
+        remediation: format!(
+            "compare first with `diff -- {pinned} {deployed}` and move any deliberate local \
+             edit upstream, then copy the pinned file over the deployed one or re-run \
+             /cadence-groundwork:initializing-cadence. If a dotfiles manager tracks the \
+             deployed file, update its source too, or the next back-sync reverts the copy",
+            pinned = shell_single_quote(&pinned_path.to_string_lossy()),
+            deployed = shell_single_quote(&deployed_path.to_string_lossy()),
+        ),
+    })
+}
+
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
 /// `report_skew` is forwarded to [`scan_hooks_json`] — see its doc comment.
 fn scan_plugin_dir(
@@ -3050,6 +3144,11 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             ));
         }
 
+        findings.extend(rules_drift_finding(
+            &cadence_hooks_core::paths::claude_config_dir(),
+            &user_scope_installs(&plugins.join("installed_plugins.json"), "cadence"),
+        ));
+
         for (marketplace, install_dir, declared_repo) in
             known_marketplace_sources(&plugins.join("known_marketplaces.json"))
         {
@@ -4765,6 +4864,168 @@ mod tests {
         let manifest = tmp.path().join("installed_plugins.json");
         fs::write(&manifest, "{ not json").unwrap();
         assert!(manifest_install_paths(&manifest).is_none());
+    }
+
+    // ── rules drift (cameronsjo/cadence#1339) ────────────────────────────────
+
+    const PINNED_RULES: &str = "# Cadence Rules\n\n<!-- managed by cadence -->\n\n- pinned rule\n";
+    const DRIFTED_RULES: &str = "# Cadence Rules\n\n<!-- managed by cadence -->\n\n- old rule\n";
+
+    /// A config dir with `deployed` at the deployed path (skipped when `None`)
+    /// and one install dir per `sources` entry, each shipping that text at
+    /// the source path (skipped when `None`).
+    fn rules_fixture(
+        tmp: &Path,
+        deployed: Option<&str>,
+        sources: &[Option<&str>],
+    ) -> (PathBuf, Vec<(String, PathBuf)>) {
+        let config = tmp.join("cfg");
+        fs::create_dir_all(&config).unwrap();
+        if let Some(text) = deployed {
+            let path = config.join(CADENCE_RULES_DEPLOYED);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let installs = sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| {
+                let dir = tmp.join(format!("cache/workbench/cadence/v{i}"));
+                fs::create_dir_all(&dir).unwrap();
+                if let Some(text) = source {
+                    let path = dir.join(CADENCE_RULES_SOURCE);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, text).unwrap();
+                }
+                ("cadence@workbench".to_string(), dir)
+            })
+            .collect();
+        (config, installs)
+    }
+
+    #[test]
+    fn rules_drift_identical_copy_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) =
+            rules_fixture(tmp.path(), Some(PINNED_RULES), &[Some(PINNED_RULES)]);
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn rules_drift_differing_copy_warns_with_both_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) =
+            rules_fixture(tmp.path(), Some(DRIFTED_RULES), &[Some(PINNED_RULES)]);
+        let finding = rules_drift_finding(&config, &installs).expect("drift must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.plugin, "cadence@workbench");
+        assert_eq!(finding.file, config.join(CADENCE_RULES_DEPLOYED));
+        assert_eq!(finding.snippet, CADENCE_RULES_DEPLOYED);
+        let pinned = installs[0].1.join(CADENCE_RULES_SOURCE);
+        let deployed = config.join(CADENCE_RULES_DEPLOYED);
+        for needle in [
+            pinned.to_string_lossy().as_ref(),
+            deployed.to_string_lossy().as_ref(),
+            "initializing-cadence",
+            "back-sync",
+            // `--` ends diff's options, so a path starting with `-` stays a path.
+            "`diff -- '",
+        ] {
+            assert!(
+                finding.remediation.contains(needle),
+                "remediation must name {needle}: {}",
+                finding.remediation
+            );
+        }
+        // Judge the prose, not the path: a macOS tempdir sits under
+        // `/var/folders/`, which contains "older".
+        let prose = finding
+            .diagnosis
+            .replace(pinned.to_string_lossy().as_ref(), "");
+        assert!(prose.contains("differ"), "{}", finding.diagnosis);
+        assert!(!prose.contains("older"), "{}", finding.diagnosis);
+    }
+
+    #[test]
+    fn rules_drift_missing_deployed_file_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) = rules_fixture(tmp.path(), None, &[Some(PINNED_RULES)]);
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn rules_drift_install_without_rules_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) = rules_fixture(tmp.path(), Some(DRIFTED_RULES), &[None]);
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn rules_drift_match_on_second_install_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) = rules_fixture(
+            tmp.path(),
+            Some(PINNED_RULES),
+            &[Some(DRIFTED_RULES), Some(PINNED_RULES)],
+        );
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn rules_drift_without_managed_marker_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owned = "# My Rules\n\n- my own rule\n";
+        assert!(!owned.contains(CADENCE_RULES_MANAGED_MARKER));
+        let (config, installs) = rules_fixture(tmp.path(), Some(owned), &[Some(PINNED_RULES)]);
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn rules_drift_directory_at_deployed_path_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, installs) = rules_fixture(tmp.path(), None, &[Some(PINNED_RULES)]);
+        fs::create_dir_all(config.join(CADENCE_RULES_DEPLOYED)).unwrap();
+        assert!(rules_drift_finding(&config, &installs).is_none());
+    }
+
+    #[test]
+    fn user_scope_installs_matches_exact_plugin_at_user_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("installed_plugins.json");
+        fs::write(
+            &manifest,
+            r#"{
+  "version": 2,
+  "plugins": {
+    "cadence@workbench": [
+      { "scope": "user", "installPath": "/c/user" },
+      { "scope": "project", "projectPath": "/p", "installPath": "/c/project" }
+    ],
+    "cadence@other": [ { "scope": "user", "installPath": "/c/other" } ],
+    "cadence-rules@workbench": [ { "scope": "user", "installPath": "/c/rules" } ],
+    "cadence-forge@x": [ { "scope": "user", "installPath": "/c/forge" } ]
+  }
+}"#,
+        )
+        .unwrap();
+        let mut got = user_scope_installs(&manifest, "cadence");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("cadence@other".to_string(), PathBuf::from("/c/other")),
+                ("cadence@workbench".to_string(), PathBuf::from("/c/user")),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_scope_installs_empty_on_missing_or_invalid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("installed_plugins.json");
+        assert!(user_scope_installs(&manifest, "cadence").is_empty());
+        fs::write(&manifest, "{ not json").unwrap();
+        assert!(user_scope_installs(&manifest, "cadence").is_empty());
     }
 
     // ── dir_size_bytes ───────────────────────────────────────────────────────
