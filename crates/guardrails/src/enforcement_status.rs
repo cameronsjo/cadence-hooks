@@ -14,7 +14,9 @@
 //! `guard-rm-liveness` carries this report today, and it is retired with
 //! guard-rm (cameronsjo/cadence-ecosystem#582). This check keeps that one job
 //! and drops the rest: it says nothing about any single guard, and it is
-//! silent in a normal session.
+//! silent in a normal session. It covers these two switches only: the other
+//! project-settable `CADENCE_*` variables that weaken a guard are listed in
+//! `cadence_hooks_core::bypass` and are not reported here.
 //!
 //! # What it reports
 //!
@@ -61,6 +63,11 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 /// `PROTECTED_GUARDS`.
 pub const HOOK_NAME: &str = "enforcement-status";
 
+/// Fixed lead on every report. A project can register its own SessionStart
+/// hook and write beside this one; the prefix is the one part of the text a
+/// reader can match against this binary.
+pub const REPORT_PREFIX: &str = "[cadence-hooks enforcement-status]";
+
 /// The report for explicit variable values, or `None` when there is nothing
 /// to say.
 ///
@@ -77,7 +84,7 @@ pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> O
             .filter(|guard| !bypass::is_bypass_exempt_hook(guard))
             .collect();
         return Some(format!(
-            "{var}={on} is set: every cadence-hooks guard is switched off for this session, \
+            "{REPORT_PREFIX} {var}={on} is set: every cadence-hooks guard is switched off for this session, \
              including the protected ones ({guards}). Only the status checks ({exempt}) and \
              the diagnostic commands still run. If you did not set it, check this project's \
              .claude/settings.json env block. Unset {var} to restore the guards.",
@@ -101,7 +108,7 @@ pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> O
         return None;
     }
     Some(format!(
-        "{var} names protected guard(s): {guards}. The disable was refused and they still run. \
+        "{REPORT_PREFIX} {var} names protected guard(s): {guards}. The disable was refused and they still run. \
          If you did not set it, check this project's .claude/settings.json env block; otherwise \
          remove them from {var}.",
         var = bypass::DISABLE_VAR,
@@ -133,6 +140,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_report_leads_with_the_fixed_prefix() {
+        for report in [
+            report_from(Some("1"), None),
+            report_from(None, Some("trash-guard")),
+        ] {
+            let report = report.expect("reports");
+            assert!(report.starts_with(REPORT_PREFIX), "{report}");
+        }
+    }
+
+    #[test]
     fn a_clean_environment_is_silent() {
         assert_eq!(report_from(None, None), None);
     }
@@ -149,7 +167,10 @@ mod tests {
     #[test]
     fn the_bypass_report_never_lists_an_exempt_check_as_switched_off() {
         let report = report_from(Some("1"), None).expect("a bypass reports");
-        let (off, still_running) = report
+        let body = report
+            .strip_prefix(REPORT_PREFIX)
+            .expect("the report leads with the prefix");
+        let (off, still_running) = body
             .split_once("Only the status checks")
             .expect("the report names what still runs");
         for exempt in bypass::BYPASS_EXEMPT_HOOKS {
@@ -161,7 +182,8 @@ mod tests {
     #[test]
     fn the_bypass_outranks_a_disable_list() {
         let report = report_from(Some("1"), Some("trash-guard")).expect("reports");
-        assert!(report.starts_with("CADENCE_BYPASS=1"), "{report}");
+        assert!(report.contains("CADENCE_BYPASS=1"), "{report}");
+        assert!(!report.contains("CADENCE_DISABLE"), "{report}");
     }
 
     #[test]
