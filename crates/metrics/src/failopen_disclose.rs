@@ -217,7 +217,13 @@ mod tests {
             std::env::set_var("CADENCE_METRICS_DIR", dir);
         }
         for _ in 0..n {
-            log_failopen(reason, Some("guardrails"), Some("guard-rm"), "1.0.0", None);
+            log_failopen(
+                reason,
+                Some("guardrails"),
+                Some("guard-push-remote"),
+                "1.0.0",
+                None,
+            );
         }
         // SAFETY: serialized against every other env-mutating test via ENV_LOCK.
         unsafe {

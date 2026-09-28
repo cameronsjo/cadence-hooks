@@ -1204,9 +1204,9 @@ mod tests {
         };
 
         let aggregated = aggregate_results(vec![
-            carrying("dismiss-guard-rm"),
-            carrying("dismiss-guard-rm"),
-            carrying("dismiss-guard-rm"),
+            carrying("dismiss-main-branch"),
+            carrying("dismiss-main-branch"),
+            carrying("dismiss-main-branch"),
             carrying("CADENCE_ALLOW_MAIN"),
         ])
         .expect("aggregate");
@@ -1217,7 +1217,7 @@ mod tests {
                 .iter()
                 .map(|provenance| provenance.mechanism.as_str())
                 .collect::<Vec<_>>(),
-            ["dismiss-guard-rm", "CADENCE_ALLOW_MAIN"],
+            ["dismiss-main-branch", "CADENCE_ALLOW_MAIN"],
             "three rides of one dismissal are one event; a second mechanism is another"
         );
     }
@@ -1307,6 +1307,30 @@ mod tests {
             assert_eq!(
                 emissions, 1,
                 "three overlapping registrations of one tool event must nudge once"
+            );
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1029: `warn-alias-parsing` is wired under one
+    /// `if:` glob per aliased tool, so `ls | grep x && cat f | jq .` spawns it
+    /// once per matching glob with an identical payload. Two such runs must
+    /// print the nudge once.
+    #[test]
+    fn dedupe_collapses_warn_alias_parsing_fan_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("ls | grep x && cat f | jq .");
+            let nudge = CheckResult::nudge("`ls` is aliased to `eza` on this machine");
+
+            let emissions = (0..2)
+                .filter(|_| {
+                    claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-alias-parsing")
+                })
+                .count();
+
+            assert_eq!(
+                emissions, 1,
+                "two identical warn-alias-parsing runs of one tool event must nudge once"
             );
         });
     }

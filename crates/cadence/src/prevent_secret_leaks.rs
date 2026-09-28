@@ -48,8 +48,9 @@ const METADATA_SAFE_COMMANDS: &[&str] = &[
 /// looks; see the `xargs` exclusion below for what happens when it is relaxed.
 ///
 /// Deliberately a LOCAL set, not `core::shell::TRANSPARENT`. That constant is
-/// shared by `enforce_worktree` and `guard_rm` and says so in its own doc
-/// comment: "Unifying them would widen two gates that can block."
+/// shared by `enforce_worktree`, `core::push`, and the polish ship anchor and
+/// says so in its own doc comment: "Unifying them would widen the two
+/// consumers that can block."
 ///
 /// **Before copying a prefix set from anywhere, ask whether the copy feeds a
 /// DETECTOR or an EXEMPTION.** The distinction decides the safety direction and

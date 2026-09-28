@@ -13,37 +13,6 @@ run() {
   printf '%-52s rc=%s  %s\n' "$label" "$rc" "$(printf '%s' "$out" | head -c 70 | tr '\n' ' ')"
 }
 
-echo "=== guard-rm: exact-path rules, delimiter glued vs not ==="
-run "CONTROL bare        rm -rf /"            guardrails guard-rm 'rm -rf /'
-run "CONTROL bare        rm -rf /)"           guardrails guard-rm 'rm -rf /)'
-run "span EARLIER line   rm -rf /"            guardrails guard-rm 'cat <<EOF
-p $(rm -rf /
-echo a)
-EOF'
-run "span LAST line      rm -rf /"            guardrails guard-rm 'cat <<EOF
-p $(echo a
-rm -rf /)
-EOF'
-run "CONTROL bare        rm -rf ~"            guardrails guard-rm 'rm -rf ~'
-run "CONTROL bare        rm -rf ~)"           guardrails guard-rm 'rm -rf ~)'
-run "span LAST line      rm -rf ~"            guardrails guard-rm 'cat <<EOF
-p $(echo a
-rm -rf ~)
-EOF'
-run "CONTROL bare        rm -rf .git"          guardrails guard-rm 'rm -rf .git'
-run "CONTROL bare        rm -rf .git)"         guardrails guard-rm 'rm -rf .git)'
-run "span LAST line      rm -rf .git"          guardrails guard-rm 'cat <<EOF
-p $(echo a
-rm -rf .git)
-EOF'
-echo
-echo "=== backtick form (no paren; trailing char is a backtick) ==="
-run "CONTROL bare        rm -rf ~/Documents\`" guardrails guard-rm 'rm -rf ~/Documents`'
-run "span LAST line btick rm -rf ~/Documents"  guardrails guard-rm 'cat <<EOF
-p `echo a
-rm -rf ~/Documents`
-EOF'
-echo
 echo "=== git-safety / enforce-worktree, same asymmetry ==="
 run "CONTROL bare        git reset --hard"     cadence git-safety 'git reset --hard HEAD~1'
 run "CONTROL bare        ...HEAD~1)"           cadence git-safety 'git reset --hard HEAD~1)'

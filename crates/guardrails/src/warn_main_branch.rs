@@ -1024,7 +1024,12 @@ mod tests {
         ] {
             cmd.env_remove(var);
         }
+        // A global `tag.gpgSign=true` turns the fixture's lightweight
+        // `git tag` into a signed one that needs a key and a message, and it
+        // fails (cameronsjo/cadence-hooks#1026). Pin signing off per command so
+        // the operator's global config cannot reach the fixture.
         let ok = cmd
+            .args(["-c", "tag.gpgSign=false", "-c", "commit.gpgSign=false"])
             .arg("-C")
             .arg(dir)
             .args(args)

@@ -213,18 +213,6 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "guard-rm",
-        description: "Path-aware rm triage: allow temp/managed, block home/vault/repo, ask the rest",
-        namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
-    },
-    HookEntry {
-        name: "guard-rm-liveness",
-        description: "Assert at SessionStart that guard-rm is present and classifying as contracted",
-        namespace: "guardrails",
-        event: Some(HookEvent::SessionStart),
-    },
-    HookEntry {
         name: "enforcement-status",
         description: "Report at SessionStart when CADENCE_BYPASS=1 or CADENCE_DISABLE names a protected guard",
         namespace: "guardrails",
@@ -509,7 +497,6 @@ pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "guard-sops-decrypt",
     "guard-browser-device",
     "guard-dotfiles",
-    "guard-rm",
     "enforce-worktree",
     "guard-read-model",
     "trash-guard",
@@ -687,13 +674,6 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("guardrails", "guard-read-model") => {
             Some(r#"{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},"cwd":"/tmp"}"#)
         }
-        // guard-rm only engages on an rm-family Bash command; the generic
-        // `git status` sample would find no delete target and no-op. Carry an
-        // absolute /tmp target so the smoke run resolves ALLOW independent of
-        // the process cwd `try` substitutes.
-        ("guardrails", "guard-rm") => Some(
-            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/scratch/foo"},"cwd":"/tmp"}"#,
-        ),
         _ => None,
     }
 }

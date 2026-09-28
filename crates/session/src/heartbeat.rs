@@ -108,6 +108,71 @@ pub fn run_heartbeat(
     }
 }
 
+/// Throttled liveness refresh for callers already running on every tool call.
+///
+/// The per-call `session heartbeat` hook was unwired (cameronsjo/cadence-hooks#902)
+/// to save a process spawn per tool call. Its liveness job did not move with it:
+/// only `session guard`, on git checkout/switch/add/commit, still touched the
+/// record, so a session busy with anything else read as stale after
+/// [`registry::stale_minutes`] and the `doctor --prune --apply` gate deleted
+/// version dirs under it. This restores the refresh without a spawn by riding
+/// the `persist-plan-approval` process that already runs on every `PostToolUse`.
+///
+/// The throttle reads the machine-wide mirror record, whose path needs no git:
+/// when it is younger than [`beat_interval_secs`], the call is one `stat` and
+/// returns. Only a due beat resolves the repo and runs [`run_heartbeat`]
+/// (local and mirror write, branch probe, stale sweep). Returns whether it
+/// wrote. Never errors.
+///
+/// Not covered: a session idle at the prompt (no tool calls), a cwd outside
+/// any git repo (no registry dir), and a session with `persist-plan-approval`
+/// switched off by `CADENCE_BYPASS=1` or `CADENCE_DISABLE`.
+pub fn beat_if_due(session_id: Option<&str>, cwd: Option<&str>) -> bool {
+    let Some(sid) = session_id.filter(|s| identity::is_safe_session_id(s)) else {
+        return false;
+    };
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    let global = registry::global_sessions_dir();
+    let mirror = global.join(identity::filename(sid));
+    if !is_due(&mirror, beat_interval_secs(), std::time::SystemTime::now()) {
+        return false;
+    }
+    let Some(dir) = registry::sessions_dir(cwd) else {
+        return false;
+    };
+    let branch = git_command(cwd, &["branch", "--show-current"]);
+    run_heartbeat(
+        &dir,
+        Some(global.as_path()),
+        sid,
+        branch,
+        None,
+        registry::stale_minutes() * 60,
+    );
+    true
+}
+
+/// A third of the smaller of this session's stale window and the default one.
+/// Peers sweep the mirror on the default window whatever this session's
+/// override, so a beat interval past a third of it could let a peer reap this
+/// session's mirror record between beats.
+fn beat_interval_secs() -> u64 {
+    (registry::stale_minutes() * 60).min(registry::default_stale_secs()) / 3
+}
+
+/// Whether the record at `path` needs a refresh: absent, unreadable, dated in
+/// the future (readers treat that as maximally stale), or at least
+/// `interval_secs` old.
+fn is_due(path: &std::path::Path, interval_secs: u64, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return true;
+    };
+    now.duration_since(modified)
+        .map_or(true, |age| age.as_secs() >= interval_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +496,45 @@ mod tests {
 
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(!peers[0].stale, "heartbeat resets liveness");
+    }
+
+    // ── beat_if_due / is_due (cameronsjo/cadence-hooks#902) ─────────────────
+
+    #[test]
+    fn is_due_when_no_record_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(is_due(
+            &tmp.path().join("none.json"),
+            600,
+            std::time::SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn is_due_only_after_the_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.json");
+        std::fs::write(&path, "{}").unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(!is_due(&path, 600, now), "a fresh record is not due");
+        let later = now + std::time::Duration::from_secs(600);
+        assert!(is_due(&path, 600, later), "at the interval it is due");
+    }
+
+    /// Readers treat a future mtime as maximally stale, so it must be due, or
+    /// the session stays invisible until a peer reaps its record.
+    #[test]
+    fn a_future_mtime_is_due() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.json");
+        std::fs::write(&path, "{}").unwrap();
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(86_400);
+        assert!(is_due(&path, 600, past), "record dated after `now` is due");
+    }
+
+    #[test]
+    fn the_beat_interval_stays_under_a_third_of_the_default_window() {
+        assert!(beat_interval_secs() <= registry::default_stale_secs() / 3);
     }
 }

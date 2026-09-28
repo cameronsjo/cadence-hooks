@@ -137,9 +137,10 @@ pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
 /// too, for macOS's `/var/folders` vs `/private/var` split). The one non-pure
 /// step is a `canonicalize` of the `$TMPDIR` value.
 ///
-/// This is the generic predicate behind [`is_temp_root`]; `guardrails::guard_rm`
-/// reuses it to classify an `rm` target path (cadence-hooks#261), while
-/// `is_temp_root` keeps its repo-root-focused name for the enforce-worktree
+/// This is the generic predicate behind [`is_temp_root`]; the delete guard
+/// removed in cadence-ecosystem#582 used to reuse it to classify an `rm`
+/// target path (cadence-hooks#261), while `is_temp_root` keeps its
+/// repo-root-focused name for the enforce-worktree
 /// carve-out. Canonicalizes `tmpdir` on every call — fine for a single check,
 /// but see [`path_under_temp_root_with_canonical`] when a caller checks
 /// several candidate paths against the same `$TMPDIR` in one pass.

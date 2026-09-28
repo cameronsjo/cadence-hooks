@@ -295,9 +295,10 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     // Deliberately unwired, not awaiting a wiring PR: the per-tool-call
     // `PostToolUse: *` registration was removed as a trial while the hook's
     // cost is evaluated (cadence plugin CHANGELOG, cameronsjo/cadence-hooks#902).
-    // The subcommand stays in the binary so the trial is reversible. #902
-    // retires this entry either way — by rewiring the hook, or by removing the
-    // subcommand.
+    // The subcommand stays in the binary so the trial is reversible. Its
+    // liveness job now rides `session persist-plan-approval`
+    // (`heartbeat::beat_if_due`); #902 retires this entry when the subcommand
+    // is removed or rewired.
     ("session heartbeat", "cameronsjo/cadence-hooks#902"),
     // The `cadence-guardrails` hooks.json entry lands in the monorepo wiring PR
     // that follows this one; the fixture refresh + this entry's removal ride the
@@ -305,14 +306,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     (
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
-    ),
-    // Replaces guard-rm-liveness's CADENCE_BYPASS report. The cadence-guardrails
-    // SessionStart wiring lands in the cadence PR that follows this release;
-    // the guard-rm deletion PR refreshes the fixture and removes this entry
-    // (cameronsjo/cadence-ecosystem#582).
-    (
-        "guardrails enforcement-status",
-        "cameronsjo/cadence-ecosystem#582",
     ),
 ];
 
@@ -338,14 +331,6 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
-    // Same shape, one plugin over: no single `if:` glob expresses "a delete
-    // verb", wherever it appears in a command. The prefilter matcher is
-    // case-sensitive and has no notion of a command head, so a glob written
-    // against the lowercase verb misses the capitalized spelling and a
-    // head-anchored form misses the verb after a shell operator. The guard
-    // therefore inspects every Bash call and lets the binary's tokenizer decide
-    // (cameronsjo/cadence-hooks#597; docs/hooks.md § Wiring prefilters).
-    "guardrails guard-rm",
 ];
 
 /// Entries of [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] whose wiring still carries
@@ -941,8 +926,11 @@ fn extract_dispatches_expands_group_members() {
         extract_dispatches(cmd),
         vec!["cadence terminology", "cadence git-safety"]
     );
-    let plain = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-rm"#;
-    assert_eq!(extract_dispatches(plain), vec!["guardrails guard-rm"]);
+    let plain = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails warn-main-branch"#;
+    assert_eq!(
+        extract_dispatches(plain),
+        vec!["guardrails warn-main-branch"]
+    );
     assert_eq!(
         extract_dispatches("x/run-cadence-hooks.sh group bogus"),
         vec!["group bogus"]
@@ -2937,4 +2925,40 @@ fn hook_list_parse_groups_by_plugin_and_excludes_cli_actions() {
         "the fixture for this assertion is stale — `guardrails \
          dismiss-enforce-worktree` is no longer a subcommand at all"
     );
+}
+
+/// Session liveness rides `session persist-plan-approval` (the throttled
+/// heartbeat in `crates/session/src/heartbeat.rs`, cameronsjo/cadence-hooks#902),
+/// so that entry must stay on every `PostToolUse`: matcher `*`, no `if:`.
+/// Narrowing it to `ExitPlanMode` — which its name invites — would make busy
+/// sessions read as stale and let `doctor --prune --apply` delete plugin dirs
+/// under them, with every other test green.
+#[test]
+fn persist_plan_approval_stays_on_every_post_tool_use() {
+    for subject in audit_subjects() {
+        let label = subject.label;
+        let hint = subject.hint;
+        let path = plugin_hooks_json(&subject.root, "cadence")
+            .unwrap_or_else(|| panic!("[{label}] cadence hooks.json not found\n\n{hint}"));
+        let manifest = read_json(&path);
+        let catch_all = manifest["hooks"]["PostToolUse"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| matches!(entry["matcher"].as_str(), None | Some("*") | Some("")))
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .any(|hook| {
+                hook["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("session persist-plan-approval"))
+                    && hook.get("if").is_none()
+            });
+        assert!(
+            catch_all,
+            "[{label}] `session persist-plan-approval` must be wired on PostToolUse \
+             with matcher `*` and no `if:` — session liveness depends on it \
+             (#902). {}\n\n{hint}",
+            path.display()
+        );
+    }
 }

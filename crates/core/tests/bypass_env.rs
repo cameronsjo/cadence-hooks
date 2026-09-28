@@ -58,7 +58,7 @@ fn set_env(bypass: Option<&str>, disable: Option<&str>) {
 }
 
 const PROTECTED: &str = "git-safety";
-const UNPROTECTED: &str = "guard-rm";
+const UNPROTECTED: &str = "enforce-worktree";
 
 /// All four outcomes, through the real environment rather than the pure
 /// resolver — the wiring `resolve_from`'s own tests cannot see. A `resolve`

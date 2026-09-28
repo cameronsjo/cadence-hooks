@@ -18,8 +18,10 @@
 //! — is degraded whether or not it was ultimately killed; a `hook_cancelled`
 //! is surfaced separately as a probable kill.
 //!
-//! Every run is counted, fast ones included, so each hook's slow share can be
-//! ranked (see `rank`). A raw slow count ranks whichever hook runs most often.
+//! Every recorded run is counted, fast ones included, so each hook's slow share
+//! can be ranked (see `rank`). A raw slow count ranks whichever hook runs most
+//! often. Claude Code records the runs that produced output, so the
+//! denominator is recorded runs, not every invocation.
 //!
 //! Read-only, bounded to the most-recent [`MAX_FILES`] logs by mtime. Output
 //! carries only subcommand names, counts, and durations — never command
@@ -173,7 +175,7 @@ const MIN_RUNS_FOR_RATE: u64 = 20;
 
 /// Order tallies worst-first by the share of runs that were slow or
 /// cancelled, not the raw count. A count ranks whichever hook runs most
-/// often: a week of logs put guard-rm (2% of 39,000 runs) above a hook that
+/// often: a week of logs put a hook that ran on every Bash call (2% of 39,000 runs) above a hook that
 /// was slow on 61% of its 250. Hooks with too few runs for a rate follow,
 /// by count.
 fn rank(tallies: &mut [HookLatency]) {
@@ -294,33 +296,47 @@ pub fn summary(tallies: &[HookLatency], days: u64) -> Option<String> {
     if total_slow == 0 && total_cancelled == 0 {
         return None;
     }
-    // Top few offenders in the order `rank` already applied; a hook with no
-    // slow or cancelled run is counted for its rate but never listed.
-    let detail = tallies
+    // Offenders in the order `rank` already applied; a hook with no slow or
+    // cancelled run is counted for its rate but never listed. Hooks too new
+    // or too rare to rate get their own clause: under one shared cap, four
+    // rated hooks would push them out of the summary entirely, and a hook
+    // cancelled on every one of its few runs is exactly what the operator
+    // needs to see (cameronsjo/cadence-hooks#1027).
+    let describe = |t: &&HookLatency| {
+        format!(
+            "{} ({} of {} recorded runs slow{}, max {}ms)",
+            t.subcommand,
+            t.slow,
+            t.runs,
+            if t.cancelled > 0 {
+                format!(", {} cancelled", t.cancelled)
+            } else {
+                String::new()
+            },
+            t.max_ms
+        )
+    };
+    let (rated, unrated): (Vec<&HookLatency>, Vec<&HookLatency>) = tallies
         .iter()
         .filter(|t| t.slow + t.cancelled > 0)
-        .take(4)
-        .map(|t| {
-            format!(
-                "{} ({} of {} runs slow{}, max {}ms)",
-                t.subcommand,
-                t.slow,
-                t.runs,
-                if t.cancelled > 0 {
-                    format!(", {} cancelled", t.cancelled)
-                } else {
-                    String::new()
-                },
-                t.max_ms
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
+        .partition(|t| t.runs >= MIN_RUNS_FOR_RATE);
+    let mut clauses = Vec::new();
+    if !rated.is_empty() {
+        let listed: Vec<String> = rated.iter().take(4).map(describe).collect();
+        clauses.push(format!(
+            "Slowest by share of recorded runs: {}",
+            listed.join("; ")
+        ));
+    }
+    if !unrated.is_empty() {
+        let listed: Vec<String> = unrated.iter().take(3).map(describe).collect();
+        clauses.push(format!("Too few runs to rate: {}", listed.join("; ")));
+    }
+    let detail = clauses.join(". ");
     Some(format!(
         "{total_slow} cadence hook run(s) ≥{SLOW_MS}ms{} in the last {days} days \
          (Claude Code session logs) — hooks are degrading under slow subprocess \
-         I/O and may be exceeding their hooks.json timeout. Slowest by share of \
-         runs: {detail}",
+         I/O and may be exceeding their hooks.json timeout. {detail}",
         if total_cancelled > 0 {
             format!(" and {total_cancelled} cancelled")
         } else {
@@ -425,25 +441,26 @@ mod tests {
 
     #[test]
     fn the_hook_slow_most_often_ranks_first_not_the_one_run_most_often() {
-        // The shape of a real week: guard-rm runs on every Bash call, so it
+        // The shape of a real week: a hook that runs on every Bash call
         // had the most slow runs at the lowest slow rate, while the hook that
         // is slow on every run was listed below it.
-        let mut lines = runs("guardrails guard-rm", 100, 10);
+        let mut lines = runs("cadence warn-overshare", 100, 10);
         lines.extend(runs("guardrails warn-unreviewed-ready-flip", 20, 12));
         let got = scan_lines(lines.iter().map(String::as_str));
         assert_eq!(got[0].subcommand, "guardrails warn-unreviewed-ready-flip");
 
         let s = summary(&got, 7).unwrap();
         let flip = s.find("warn-unreviewed-ready-flip").unwrap();
-        let rm = s.find("guard-rm").unwrap();
+        let rm = s.find("warn-overshare").unwrap();
         assert!(flip < rm, "{s}");
-        assert!(s.contains("12 of 20 runs"), "{s}");
-        assert!(s.contains("10 of 100 runs"), "{s}");
+        assert!(s.contains("12 of 20 recorded runs"), "{s}");
+        assert!(s.contains("10 of 100 recorded runs"), "{s}");
+        assert!(s.contains("Slowest by share of recorded runs"), "{s}");
     }
 
     #[test]
     fn a_cancelled_run_with_a_long_duration_counts_once() {
-        let line = r#"{"type":"hook_cancelled","command":"x/run-cadence-hooks.sh guardrails guard-rm","durationMs":5941}"#;
+        let line = r#"{"type":"hook_cancelled","command":"x/run-cadence-hooks.sh cadence warn-overshare","durationMs":5941}"#;
         let got = scan_lines(std::iter::once(line));
         assert_eq!(got[0].runs, 1);
         assert_eq!(got[0].cancelled, 1);
@@ -453,11 +470,39 @@ mod tests {
     #[test]
     fn a_hook_with_too_few_runs_for_a_rate_ranks_after_the_rest() {
         // 2 of 2 is 100%, but two runs say nothing about the hook.
-        let mut lines = runs("guardrails guard-rm", 100, 10);
+        let mut lines = runs("cadence warn-overshare", 100, 10);
         lines.extend(runs("cadence git-safety", 2, 2));
         let got = scan_lines(lines.iter().map(String::as_str));
-        assert_eq!(got[0].subcommand, "guardrails guard-rm");
+        assert_eq!(got[0].subcommand, "cadence warn-overshare");
         assert_eq!(got[1].subcommand, "cadence git-safety");
+    }
+
+    #[test]
+    fn a_small_sample_hook_is_not_crowded_out_of_the_summary() {
+        // Four rated slow hooks used to fill the one shared cap of four, so a
+        // hook cancelled on every one of its five runs never reached the
+        // summary (cameronsjo/cadence-hooks#1027).
+        let mut lines = runs("cadence warn-overshare", 100, 10);
+        lines.extend(runs("guardrails enforce-worktree", 50, 5));
+        lines.extend(runs("cadence prevent-secret-writes", 40, 4));
+        lines.extend(runs("cadence prevent-secret-leaks", 30, 3));
+        lines.extend((0..5).map(|_| {
+            r#"{"type":"hook_cancelled","command":"x/run-cadence-hooks.sh cadence git-safety","durationMs":5000}"#
+                .to_string()
+        }));
+        let got = scan_lines(lines.iter().map(String::as_str));
+        let s = summary(&got, 7).unwrap();
+        assert!(s.contains("git-safety"), "{s}");
+        assert!(s.contains("Too few runs to rate"), "{s}");
+        assert!(s.contains("5 cancelled"), "{s}");
+        for rated in [
+            "warn-overshare",
+            "enforce-worktree",
+            "prevent-secret-writes",
+            "prevent-secret-leaks",
+        ] {
+            assert!(s.contains(rated), "rated hook {rated} still listed: {s}");
+        }
     }
 
     #[test]

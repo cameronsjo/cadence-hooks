@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm-liveness",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails enforcement-status",
             "timeout": 5
           }
         ]
@@ -199,21 +199,6 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
             "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "^Edit$|^mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm",
             "timeout": 5
           }
         ]

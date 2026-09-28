@@ -390,8 +390,8 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
 ///
 /// Lets a path-qualified command word (`/bin/unlink`) match the same as a bare
 /// one. A plain filename token is its own basename, so `shredder.md` ≠ `shred`
-/// still holds. Shared flag-vs-verb primitive for the destructive-command
-/// guards (obsidian trash-guard, guardrails guard-rm).
+/// still holds. Shared flag-vs-verb primitive for destructive-command guards
+/// (obsidian trash-guard).
 pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
@@ -402,9 +402,10 @@ pub fn basename(token: &str) -> &str {
 ///
 /// **The one place the verb fold is spelled**, shared by [`command_word`] and
 /// by the one guard that still keeps a deliberately divergent local command
-/// word (`warn_going_public`, which is basename-only). `guard_rm` used to be
-/// the second, repeating the backslash strip; its shadow was a measured miss
-/// (`r\m` passed the guard) and is gone — it uses [`command_word`] now
+/// word (`warn_going_public`, which is basename-only). The delete guard
+/// removed in cadence-ecosystem#582 used to be the second, repeating the
+/// backslash strip; its shadow was a measured miss (`r\m` passed the guard)
+/// before it was fixed to use [`command_word`] instead
 /// (cadence-hooks#237 security review, F8). That divergence is about the
 /// *path/escape* handling and is documented where it lives — the fold is not
 /// one of them, and hand-rolled copies of it would be more normalizations of
@@ -480,8 +481,7 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// `GIT` to the `git` binary and runs it. Every gate here compared against a
 /// lowercase literal, so `GIT commit` produced no commit target and `RM -rf`
 /// named no delete verb: measured silent Allows, and the `enforce_worktree`
-/// commit gate has no settings-rule mitigation behind it the way `guard_rm`
-/// does.
+/// commit gate has no settings-rule mitigation behind it.
 ///
 /// **Unconditional, not filesystem-aware.** Deciding "will the shell find
 /// `GIT`?" honestly means probing the case-sensitivity of whichever `$PATH`
@@ -503,8 +503,7 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 ///
 /// - **Detectors** — [`peel_command_runners`] and [`shell_c_argument_tokens`]
 ///   here; `enforce_worktree`'s commit gate, `is_package_mutation` and
-///   `file_mutation_targets`; `guard_rm`'s delete-verb, `find`, and
-///   shell-wrapper arms; `guard_gh_write::token_is_gh`. Folding widens what
+///   `file_mutation_targets`; `guard_gh_write::token_is_gh`. Folding widens what
 ///   they find, which only ever ADDS a block, an ask, or a nudge.
 /// - **The one exemption** — `prevent_secret_leaks`' `METADATA_SAFE_COMMANDS`
 ///   lookup, reached via that file's `resolve_command`. `fold_verb` is an
@@ -533,8 +532,9 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// origin main` runs git under bash, zsh and sh alike, and `basename` splits on
 /// `\` for the Windows branch, so `g\it` resolved to `it` and `gi\t` to `t`.
 /// Neither folded to `git`, so the segment was dropped and every guard that
-/// gates on a verb — push-remote, `guard_rm`, `enforce_worktree` — saw nothing
-/// at all. An empty result is the strongest allow shape there is
+/// gates on a verb — push-remote, `enforce_worktree`, and the delete guard
+/// removed in cadence-ecosystem#582 — saw nothing at all. An empty result is
+/// the strongest allow shape there is
 /// (cadence-hooks#237 security review, F6).
 ///
 /// **`\\git` still does NOT resolve to `git`, and that is load-bearing.** The
@@ -903,8 +903,8 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 
 /// Words that stand in front of a real command without being the command.
 ///
-/// Shared by `enforce_worktree`, `guard_rm`, and the polish ship anchor, so the
-/// set cannot drift between the code that skips these and the code that asks
+/// Shared by `enforce_worktree`, `core::push` (`guard-push-remote`), and the
+/// polish ship anchor (a nudge), so the set cannot drift between the code that skips these and the code that asks
 /// whether a word is one. **It is not the repo's only prefix set, and is not
 /// meant to become one** — three others answer adjacent questions with
 /// deliberately different membership, and each admits words this set excludes:
@@ -917,7 +917,7 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 ///   shell is about to run
 ///
 /// So `sudo` and `xargs` ARE transparent to some checks and deliberately not to
-/// these. Unifying them would widen two gates that can block, on the strength
+/// these. Unifying them would widen the two consumers that can block, on the strength
 /// of a question neither was asked — see this constant's consumers before
 /// adding a word to it.
 pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
@@ -1117,8 +1117,8 @@ pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
 /// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
 /// splits first rather than scanning the whole token stream).
 ///
-/// Group wrappers are stripped before tokenizing, the same order the guards use
-/// (`enforce_worktree`, `guard_rm`), because [`tokenize`] fuses the punctuation
+/// Group wrappers are stripped before tokenizing, the same order the other
+/// guards use (`enforce_worktree`), because [`tokenize`] fuses the punctuation
 /// to the adjacent word — without it `{ gh pr create; }` presents `{` as the
 /// command word and the index-0 gate never fires.
 fn segment_ship_anchor(segment: &str, origin: Option<&str>) -> Option<&'static str> {
@@ -1200,6 +1200,7 @@ struct GhPrInvocation<'a> {
 /// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
 /// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
 /// | `scan_ship_flags` (here) | value, every operand, pflag clusters, per-subcommand grammar, `--`-aware |
+/// | `pr_selector` (here) | skips the value via `read_flag_token` to find the PR positional, `--`-aware |
 /// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
 /// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
 /// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
@@ -1501,18 +1502,19 @@ pub(crate) fn is_redirect_token(token: &str) -> bool {
 ///    deliberately: each prefix has its own flag grammar, and guessing wrong
 ///    would skip past the real command word.
 /// 2. A prefix outside [`TRANSPARENT`] — `sudo`, `timeout`, `xargs`, `stdbuf`,
-///    and `eval` (which `guard_rm` special-cases separately). Widening that set
-///    to catch them would widen `enforce_worktree` and `guard_rm` too, which
-///    share it; a nudge is not worth touching a block-capable gate's model of
-///    what runs a command.
+///    and `eval` (special-cased separately elsewhere in this crate). Widening
+///    that set to catch them would widen `enforce_worktree` too, which shares
+///    it; a nudge is not worth touching a block-capable gate's model of what
+///    runs a command.
 /// 3. A shell keyword in command position — `if ! gh pr create; then …`,
 ///    `for r in a b; do gh pr create; done`. The keyword is the segment's
 ///    leading word and nothing strips it.
 /// 4. A path-qualified command word — `/opt/homebrew/bin/gh pr create`,
 ///    `./gh pr create`. The comparison is against the literal token `gh`, as
 ///    the positional scan's was, so this is pre-existing rather than new.
-///    [`basename`] would close it in one call — `guard_rm` applies it to its
-///    delete verb — but it is left alone here because it would ADD nudges
+///    [`basename`] would close it in one call — the destructive-command
+///    guards apply it to their delete verbs — but it is left alone here
+///    because it would ADD nudges
 ///    rather than restore them, which is past what #419 asked for. Note
 ///    `enforce_worktree`'s own commit gate compares the literal `git` the
 ///    same way, so this spelling is unmodeled there too.
@@ -1728,6 +1730,126 @@ pub fn ship_target(segment_tokens: &[String]) -> ShipTarget {
         host,
         head: combine_heads(&scan.heads),
     }
+}
+
+/// The PR a `gh pr <sub>` segment names as its positional argument
+/// (cadence-hooks#1028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrSelector {
+    /// No positional: gh picks the PR for the branch checked out in the cwd.
+    None,
+    /// A PR number, bare (`12`) or with gh's `#` prefix (`#12`).
+    Number(u64),
+    /// A pull-request URL. It names its own host and repo, so gh ignores
+    /// any `-R` for it.
+    Url {
+        host: String,
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    /// Anything else gh accepts, such as a branch name. Only gh can resolve it.
+    Other(String),
+    /// The positional cannot be told apart from a flag value: an unknown flag
+    /// came first, or the argument is a lone `-`.
+    Unreadable,
+}
+
+/// A PR number as gh accepts one: digits, optionally behind a `#`.
+static PR_NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^#?([0-9]+)$").expect("pattern should compile"));
+
+/// A pull-request URL: `https://HOST/OWNER/REPO/pull/NUMBER`, optionally
+/// followed by a sub-page (`/files`). Anchored at both ends. Public so a
+/// caller parsing gh's own `url` field reads it with the same pattern.
+///
+/// HOST is a bare hostname (letters, digits, `.`, `-`). Userinfo
+/// (`user@github.com`) and a port (`github.com:443`) do not match, so a
+/// caller never takes either for a host name.
+pub static PR_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^https://([A-Za-z0-9.-]+)/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$")
+        .expect("pattern should compile")
+});
+
+/// Read a PR URL into its host, owner, repo, and number, or `None` when
+/// `value` is not one ([`PR_URL_RE`]).
+pub fn pr_url_parts(value: &str) -> Option<(String, String, String, u64)> {
+    let caps = PR_URL_RE.captures(value)?;
+    Some((
+        caps[1].to_string(),
+        caps[2].to_string(),
+        caps[3].to_string(),
+        caps[4].parse().ok()?,
+    ))
+}
+
+/// The PR selector of a single `gh pr <sub>` segment (cadence-hooks#1028).
+/// A segment that is not a `gh pr` invocation yields [`PrSelector::None`].
+///
+/// The walk uses the same flag grammar as [`scan_ship_flags`]
+/// ([`flag_grammar`], [`read_flag_token`]), so a flag's value is never read
+/// as the selector: `-R o/r 5` and `-b 7 5` both select `5`. A `#` comment
+/// ends the walk, redirects are skipped, and after `--` the next token is the
+/// selector whatever it looks like. An unknown flag, or a lone `-`, makes the
+/// selector [`PrSelector::Unreadable`], because which later token is a value
+/// can no longer be told.
+///
+/// This reads one segment. A caller that passes only the first flip segment
+/// of a compound command (`gh pr ready 1 && gh pr merge 2`) examines only
+/// that one.
+pub fn pr_selector(segment_tokens: &[String]) -> PrSelector {
+    let Some(invocation) = gh_pr_invocation(segment_tokens) else {
+        return PrSelector::None;
+    };
+    let grammar = flag_grammar(invocation.subcommand);
+    let operands = invocation.operands;
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        if token == "#" {
+            break;
+        }
+        if token == "--" {
+            return operands
+                .get(i + 1)
+                .map_or(PrSelector::None, |t| classify_pr_selector(t));
+        }
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
+            continue;
+        }
+        if token == "-" {
+            return PrSelector::Unreadable;
+        }
+        if !token.starts_with('-') {
+            return classify_pr_selector(token);
+        }
+        let read = read_flag_token(grammar, token, operands.get(i + 1).map(String::as_str));
+        if read.taints_rest {
+            return PrSelector::Unreadable;
+        }
+        i += read.consumed;
+    }
+    PrSelector::None
+}
+
+/// Classify one positional token as a PR number, a PR URL, or anything else.
+fn classify_pr_selector(token: &str) -> PrSelector {
+    if let Some(caps) = PR_NUMBER_RE.captures(token) {
+        // A number too large for u64 is no PR gh can find; gh resolves it.
+        return caps[1]
+            .parse()
+            .map_or_else(|_| PrSelector::Other(token.to_string()), PrSelector::Number);
+    }
+    if let Some((host, owner, repo, number)) = pr_url_parts(token) {
+        return PrSelector::Url {
+            host,
+            owner,
+            repo,
+            number,
+        };
+    }
+    PrSelector::Other(token.to_string())
 }
 
 /// Collapse every `--head` spelling a segment carried into one [`ShipHead`].
@@ -4295,8 +4417,9 @@ pub const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeo
 /// command that will actually execute" view — an over-eager skip costs an extra
 /// segment to inspect, a missed one costs the inner script's visibility to every
 /// guard that segments. [`TRANSPARENT`] is the opposite case and must stay
-/// narrow: it decides *which verb runs* for `enforce_worktree` and `guard_rm`,
-/// where a wrong skip resolves the wrong command word, so it excludes `sudo`
+/// narrow: it decides *which verb runs* for `enforce_worktree` and every
+/// other verb-gating guard, where a wrong skip resolves the wrong command
+/// word, so it excludes `sudo`
 /// deliberately. Same question, different consequence — ask which one you are in
 /// before reusing either.
 ///
@@ -5447,7 +5570,7 @@ mod tests {
 
     #[test]
     fn skip_transparent_prefixes_folds_the_prefix_verb() {
-        // `TRANSPARENT` was tested against the RAW token while `guard_rm`
+        // `TRANSPARENT` was tested against the RAW token while a delete guard
         // folded before its own `TRANSPARENT` test — the two disagreed, so
         // `COMMAND rm -rf ~` resolved its leading word to `COMMAND` and the
         // delete verb behind it was never reached (cadence-hooks#488).
@@ -6384,6 +6507,119 @@ mod tests {
         assert!(target.repos.is_empty());
     }
 
+    // --- pr_selector (cadence-hooks#1028) ---
+
+    fn selector_of(command: &str) -> PrSelector {
+        pr_selector(&tokenize(command))
+    }
+
+    #[test]
+    fn pr_selector_reads_a_bare_number() {
+        assert_eq!(selector_of("gh pr merge 5"), PrSelector::Number(5));
+        // Moved from the hook's old `pr_number_from_command` test.
+        assert_eq!(
+            selector_of("gh pr merge 42 --squash"),
+            PrSelector::Number(42)
+        );
+        assert_eq!(selector_of("gh pr ready 7"), PrSelector::Number(7));
+        assert_eq!(selector_of("gh pr merge --auto --squash"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_skips_the_repo_value_before_the_number() {
+        // The old whitespace scan stopped at `o/r` and read no number.
+        assert_eq!(selector_of("gh pr merge -R o/r 5"), PrSelector::Number(5));
+        assert_eq!(selector_of("gh pr merge 5 -R o/r"), PrSelector::Number(5));
+    }
+
+    #[test]
+    fn pr_selector_skips_another_flags_value() {
+        // `-b` is `--body` on merge: `7` is its value, `5` is the PR.
+        assert_eq!(selector_of("gh pr merge -b 7 5"), PrSelector::Number(5));
+    }
+
+    #[test]
+    fn pr_selector_none_without_a_positional() {
+        assert_eq!(selector_of("gh pr merge --squash"), PrSelector::None);
+        assert_eq!(selector_of("gh pr ready"), PrSelector::None);
+        assert_eq!(selector_of("git status"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_reads_the_token_after_double_dash() {
+        assert_eq!(selector_of("gh pr merge -- 5"), PrSelector::Number(5));
+        assert_eq!(
+            selector_of("gh pr merge -- -weird-branch"),
+            PrSelector::Other("-weird-branch".to_string())
+        );
+        assert_eq!(selector_of("gh pr merge --"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_reads_a_pull_request_url() {
+        assert_eq!(
+            selector_of("gh pr merge https://github.com/o/r/pull/511/files"),
+            PrSelector::Url {
+                host: "github.com".to_string(),
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                number: 511,
+            }
+        );
+        // An issue URL is not a PR URL.
+        assert_eq!(
+            selector_of("gh pr merge https://github.com/o/r/issues/511"),
+            PrSelector::Other("https://github.com/o/r/issues/511".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_url_host_is_a_bare_hostname() {
+        // Userinfo and a port are not part of a host name, so neither URL
+        // parses as a PR URL.
+        for url in [
+            "https://evil@github.com/o/r/pull/1",
+            "https://github.com:443/o/r/pull/1",
+        ] {
+            assert_eq!(pr_url_parts(url), None, "{url}");
+            assert_eq!(
+                selector_of(&format!("gh pr merge {url}")),
+                PrSelector::Other(url.to_string())
+            );
+        }
+        assert!(pr_url_parts("https://ghe.example-corp.com/o/r/pull/1").is_some());
+    }
+
+    #[test]
+    fn pr_selector_reads_a_hash_prefixed_number() {
+        assert_eq!(selector_of("gh pr merge '#12'"), PrSelector::Number(12));
+    }
+
+    #[test]
+    fn pr_selector_reads_a_branch_as_other() {
+        assert_eq!(
+            selector_of("gh pr merge my-branch --squash"),
+            PrSelector::Other("my-branch".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_selector_unreadable_after_an_unknown_flag() {
+        // `--newflag` may take `x` as its value or not, so `x` or `5` could
+        // be the selector.
+        assert_eq!(
+            selector_of("gh pr merge --newflag x 5"),
+            PrSelector::Unreadable
+        );
+        assert_eq!(selector_of("gh pr merge -"), PrSelector::Unreadable);
+    }
+
+    #[test]
+    fn pr_selector_skips_redirects() {
+        assert_eq!(selector_of("gh pr ready 12 > log"), PrSelector::Number(12));
+        assert_eq!(selector_of("gh pr ready > log 12"), PrSelector::Number(12));
+    }
+
     #[test]
     fn polish_ship_segments_returns_every_anchoring_segment() {
         let segments = polish_ship_segments_for_origin(
@@ -6525,9 +6761,9 @@ mod tests {
     fn is_polish_ship_anchor_misses_non_transparent_prefixes_and_keywords() {
         // Pinned as KNOWN MISSES, not as desired behavior, so a future widening
         // has to delete an assertion and explain itself. Catching these means
-        // either widening `TRANSPARENT` — which `enforce_worktree` and
-        // `guard_rm` share, so a nudge would be buying a change to a
-        // block-capable gate's model of what runs a command — or teaching the
+        // either widening `TRANSPARENT` — which `enforce_worktree` shares, so
+        // a nudge would be buying a change to a block-capable gate's model of
+        // what runs a command — or teaching the
         // anchor about shell keywords. Neither is worth it for a nudge; each
         // costs one un-nudged ship and shrinks the #409 denominator.
         assert!(!is_polish_ship_anchor("sudo gh pr create --title x"));

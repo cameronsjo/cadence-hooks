@@ -7,7 +7,7 @@
 //!
 //! `crates/core/src/patch.rs` stayed. It normalizes an `apply_patch` body into
 //! one Claude-shaped input per target, which is what lets `prevent-secret-writes`,
-//! `guard-dotfiles`, `guard-rm`, and `trash-guard` judge a patched file at all.
+//! `guard-dotfiles`, and `trash-guard` judge a patched file at all.
 //! `patch.rs` has only 7 unit tests and none spawn the binary, so this file is
 //! that path's sole end-to-end coverage — which is why it was split rather than
 //! deleted with the rest.
@@ -29,10 +29,11 @@ use std::process::Command;
 /// integration test in this directory pins it; these must too.
 ///
 /// The two enforcement switches are scrubbed here for the same class of reason.
-/// A launching shell carrying `CADENCE_DISABLE=guard-rm` (a documented, common
-/// ambient value) made every guard-reachability test in this file fail with a
-/// message blaming the guard's reachability, while the real cause sat one line
-/// lower in the same stderr as `'guard-rm' disabled via CADENCE_DISABLE`
+/// A launching shell carrying a `CADENCE_DISABLE` that names the guard under
+/// test (a documented, common ambient value) made every guard-reachability test
+/// in this file fail with a message blaming the guard's reachability, while the
+/// real cause sat one line lower in the same stderr as `'<guard>' disabled via
+/// CADENCE_DISABLE`
 /// (cadence-hooks#927). `CADENCE_BYPASS` is scrubbed for the identical reason.
 /// `tests/configure.rs` scrubs `CLAUDECODE` alongside these two; this file does
 /// not, because nothing here reads it and a scrub nothing needs is a claim the
@@ -178,23 +179,19 @@ fn patch_target_reaches_guard_dotfiles() {
 /// asserted against the binary rather than restated as prose.
 #[test]
 fn codex_local_function_call_reaches_a_security_critical_guard() {
-    // Not `std::env::var("HOME")` — that is unset on Windows, where the home
-    // directory comes from USERPROFILE. The guards resolve it through this
-    // helper, so the test asks the same way they do.
-    let home = cadence_hooks_core::paths::user_home_lossy_or_default();
     let payload = serde_json::json!({
         "tool_name": "exec_command",
         "cwd": "/private/tmp",
-        "tool_input": {"cmd": format!("rm -rf {home}/Documents")},
+        "tool_input": {"cmd": "git push --force origin main"},
     })
     .to_string();
-    let (code, stderr) = run_hook(&["guardrails", "guard-rm"], &[], &payload);
+    let (code, stderr) = run_hook(&["cadence", "git-safety"], &[], &payload);
     assert_eq!(
         code,
         Some(2),
-        "a Codex local function call must reach guard-rm: {stderr}"
+        "a Codex local function call must reach git-safety: {stderr}"
     );
-    assert!(stderr.contains("guard-rm"));
+    assert!(stderr.contains("git-safety"));
 }
 
 /// `ObsidianTrashGuard`'s delete-detection branch, driven through the binary.

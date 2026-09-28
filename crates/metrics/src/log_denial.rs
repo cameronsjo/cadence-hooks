@@ -399,7 +399,7 @@ mod tests {
     fn tally_omits_allow_while_targets_still_counts_it() {
         let outcomes = [Outcome::Block, Outcome::Allow, Outcome::Allow];
         let rec = build_denial_record(
-            "guard-rm",
+            "trash-guard",
             HookEvent::PreToolUse,
             &edit_input(),
             "deny",
