@@ -741,7 +741,8 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(
-            active, 1,
+            active,
+            bypass::BYPASS_EXEMPT_HOOKS.len(),
             "only the bypass-exempt hook is enforcing under a blanket bypass: {lines:?}"
         );
     }
@@ -763,7 +764,8 @@ mod tests {
         assert!(joined.contains("git-safety"), "{lines:?}");
         assert!(joined.contains("warn-main-branch"), "{lines:?}");
         assert_eq!(
-            active, 1,
+            active,
+            bypass::BYPASS_EXEMPT_HOOKS.len(),
             "only the bypass-exempt hook is enforcing: {lines:?}"
         );
     }
@@ -917,8 +919,13 @@ mod tests {
         ///   security-critical hook on an unparseable or unenumerable payload,
         ///   which would turn a SessionStart advisory into a blocker. The test
         ///   below pins that.
-        const PROTECTED_BUT_NOT_CRITICAL: &[&str] =
-            &["redact-external-content", "guard-rm-liveness"];
+        /// - `enforcement-status` is the same kind of detector, reporting the
+        ///   switches themselves, and stays advisory for the same reason.
+        const PROTECTED_BUT_NOT_CRITICAL: &[&str] = &[
+            "redact-external-content",
+            "guard-rm-liveness",
+            "enforcement-status",
+        ];
 
         // The two records above are claims about the source lists, so assert
         // them against those lists before using either as an exemption. A
@@ -999,15 +1006,17 @@ mod tests {
     /// properties, and this hook deliberately has only the first.
     #[test]
     fn the_liveness_detector_is_protected_but_never_security_critical() {
-        assert!(
-            bypass::is_protected("guard-rm-liveness"),
-            "the detector must be protected from CADENCE_DISABLE"
-        );
-        assert!(
-            !crate::registry::is_security_critical("guard-rm-liveness"),
-            "classifying the detector security-critical makes dispatch exit 2 on an unparseable \
-             payload — record the divergence in PROTECTED_BUT_NOT_CRITICAL instead"
-        );
+        for detector in ["guard-rm-liveness", "enforcement-status"] {
+            assert!(
+                bypass::is_protected(detector),
+                "'{detector}' must be protected from CADENCE_DISABLE"
+            );
+            assert!(
+                !crate::registry::is_security_critical(detector),
+                "classifying '{detector}' security-critical makes dispatch exit 2 on an \
+                 unparseable payload — record the divergence in PROTECTED_BUT_NOT_CRITICAL instead"
+            );
+        }
     }
 
     // ── doctor status lines ─────────────────────────────────────────────────

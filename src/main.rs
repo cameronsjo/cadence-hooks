@@ -68,6 +68,9 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             // `bypass::BYPASS_EXEMPT_HOOKS` by the two drift guards in this
             // file's test module.
             | (Some("guardrails"), Some("guard-rm-liveness"))
+            // Same reason, broader subject: it reports CADENCE_BYPASS=1 itself
+            // (and a CADENCE_DISABLE naming a protected guard) at SessionStart.
+            | (Some("guardrails"), Some("enforcement-status"))
     )
 }
 
@@ -377,6 +380,8 @@ enum GuardrailsCommands {
     GuardRm,
     /// SessionStart assertion that guard-rm is present and classifying deletes as contracted
     GuardRmLiveness,
+    /// SessionStart report of CADENCE_BYPASS=1 or a CADENCE_DISABLE naming a protected guard
+    EnforcementStatus,
     /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
@@ -593,6 +598,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::GuardRm => "guard-rm",
             GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
+            GuardrailsCommands::EnforcementStatus => "enforcement-status",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             // `--measure` is a CLI action, not a hook: it reads a file the
@@ -817,6 +823,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             }
             GuardrailsCommands::GuardRmLiveness => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness),
+                session,
+            ),
+            GuardrailsCommands::EnforcementStatus => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::enforcement_status::EnforcementStatus),
                 session,
             ),
             GuardrailsCommands::GuardReadModel => CheckPlan::new(
@@ -1649,6 +1659,10 @@ mod tests {
         assert!(is_bypass_exempt(
             Some("guardrails"),
             Some("guard-rm-liveness")
+        ));
+        assert!(is_bypass_exempt(
+            Some("guardrails"),
+            Some("enforcement-status")
         ));
     }
 
