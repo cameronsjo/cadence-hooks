@@ -282,7 +282,7 @@ fn resolve_command<'a>(tokens: &'a [String]) -> Option<(Cow<'a, str>, &'a [Strin
 /// costs nothing: a genuine command word (`cat`, `ls`) never classifies as a
 /// dangerous secret token, so the only tokens this adds to the scan are the
 /// ones that should have been there.
-fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
+fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, String)> {
     let tokens = tokenize(segment);
     let Some(first) = tokens.first() else {
         return Vec::new();
@@ -339,11 +339,244 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     } else {
         Filename::Unqualified
     };
+    // `jq`'s FILTER is a program, not a file: `jq '.env.foo' x.json` reads a
+    // JSON key named `env` (#947). Only that one argv index is exempted, and
+    // only under the same byte-exact head rule as `forgectl` above — a
+    // `./jq` or `sudo jq` could be anything, so it keeps the full scan. The
+    // whole command must also be a plain pipeline that cannot rebind the name
+    // `jq` ([`command_is_plain_jq_pipeline`]).
+    let jq_filter =
+        (cmd_word == "jq" && plain_jq_pipeline && tokens.first().is_some_and(|head| head == "jq"))
+            .then(|| jq_filter_index(argv))
+            .flatten();
     argv.iter()
-        .filter_map(|t| dangerous_secret_operand(t, position))
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != jq_filter)
+        .filter_map(|(_, t)| dangerous_secret_operand(t, position))
         .map(|value| (cmd_word.to_string(), value.to_string()))
         .collect()
 }
+
+/// Heads a command may use anywhere and still let the jq filter exemption
+/// apply. Every one runs a program or builtin that cannot rebind a name, PATH,
+/// the hash table, an alias, or a function — so a `jq` head later in the same
+/// command still means the jq on PATH.
+///
+/// Kept small on purpose; widening it is a security change. Absent by design:
+/// `echo`/`printf` (`printf -v PATH …` assigns), `read` (assigns), `cp`/`mv`/
+/// `ln`/`install` (can create an executable `jq` in a PATH directory — `cp`
+/// keeps `/bin/cat`'s exec bit), `test`/`[` (bash evaluates a `-v 'a[…]'`
+/// subscript arithmetically, so `test -v 'a[PATH=7]'` assigns PATH), and every
+/// keyword, wrapper, and definer; and `cd`, because a relative or empty PATH
+/// entry makes the directory part of `jq`'s resolution; and `sort`, whose
+/// `--compress-program` executes an arbitrary program that could plant a `jq`
+/// earlier on PATH. (Every listed head can still WRITE through a shell
+/// redirection; [`command_is_plain_jq_pipeline`] refuses `>`/`<` for that.) No listed head evaluates its arguments arithmetically: the
+/// builtins among them (`pwd`, `true`) take nothing that bash evaluates.
+const PLAIN_PIPELINE_HEADS: &[&str] = &[
+    "jq", "cat", "head", "tail", "wc", "grep", "ls", "pwd", "true",
+];
+
+/// Is `command` a plain pipeline in which the word `jq` can only mean the jq
+/// binary? The jq filter exemption (#947) applies only when this holds.
+///
+/// An ALLOWLIST, after five rounds of denylist patches each met a new way to
+/// rebind `jq` in the same command line (function and alias definitions,
+/// dot-source behind keywords, `BASH_CMDS[jq]=…`, `BASH_ALIASES[jq]=…`,
+/// `printf -v PATH` / `read PATH`). This is the forgectl name-is-not-an-identity
+/// residual (cadence-hooks#843) in its same-command form. Every condition must
+/// hold:
+///
+/// 1. every segment from [`split_segments`] (newline, `;`, `&&`, `||`, `|`,
+///    `&`) has a head that is byte-exactly one of [`PLAIN_PIPELINE_HEADS`] —
+///    raw splitting, not [`command_segments`], so a `bash -c` wrapper or a
+///    prefix assignment stays visible as its own head and refuses;
+/// 2. no segment's head is an assignment word (`NAME=`, `NAME[k]=`, `NAME+=`)
+///    — already implied by (1), checked explicitly so it survives any future
+///    widening of the set;
+/// 3. outside single quotes (double quotes tracked, so a `'` inside `"…"`
+///    cannot open a phantom region) the raw command has no `$`, backtick, `(`, `)`,
+///    `{`, `}`, or backslash (a backslash would make the quote scan's state
+///    ambiguous), no unquoted `#` (a comment can carry an unbalanced quote
+///    that bash never parses but this scan would), no `>` or `<` redirection
+///    (truncating an EXISTING executable `jq` keeps its mode, so
+///    `cat /usr/bin/cat > /usr/bin/jq` would re-point the name), and nowhere a
+///    `<<` heredoc or here-string;
+/// 4. the tokenizer's word boundaries match bash's for the whole command
+///    ([`tokenizer_word_boundaries_match_bash`]).
+///
+/// Anything else refuses the exemption, which is the pre-#947 full scan. A
+/// `.` argument is no longer special: a dot-SOURCE needs `.` as a head, which
+/// (1) refuses, so `jq '.env.foo' x.json | jq .` is allowed.
+///
+/// What no same-command check can close: a `jq` planted on PATH by an EARLIER
+/// Bash call, since the filesystem persists across calls; and the user's own
+/// profile, which the Bash tool sources into every call, so `jq`, `cat`, or
+/// `grep` may already be an alias or function (for example `grep` aliased to a
+/// tool with a preprocessor hook). Both are ambient state rather than anything
+/// the command line sets, the same residual the forgectl exemption documents.
+fn command_is_plain_jq_pipeline(command: &str) -> bool {
+    static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=").expect("assignment pattern")
+    });
+    if !tokenizer_word_boundaries_match_bash(command) || command.contains("<<") {
+        return false;
+    }
+    // Double quotes are tracked too: a `'` inside `"…"` is literal, and
+    // treating it as an opener would mask everything after it.
+    let (mut in_single, mut in_double) = (false, false);
+    for c in command.chars() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '$' | '`' | '(' | ')' | '{' | '}' | '\\' | '<' | '>' if !in_single => return false,
+            // A comment can hold an unbalanced quote bash never parses.
+            '#' if !in_single && !in_double => return false,
+            _ => {}
+        }
+    }
+    split_segments(command).iter().all(|segment| {
+        tokenize(segment).first().is_some_and(|head| {
+            PLAIN_PIPELINE_HEADS.contains(&head.as_str()) && !ASSIGNMENT.is_match(head)
+        })
+    })
+}
+
+/// Can [`tokenize`]'s word boundaries be trusted to be bash's for `text`?
+///
+/// The jq exemption (#947) skips one argv INDEX, so it is only sound when the
+/// tokenizer's argv equals the argv bash hands to jq. An index into a different
+/// argv exempts a different word: bash splits only on space, tab, and newline,
+/// while [`tokenize`] splits on every `char::is_whitespace`, so a vertical tab,
+/// form feed, carriage return, NBSP, or U+2003 inside an option value
+/// (`--rawfile a<VT>b .env.local .x`) is one word to bash and two to the
+/// tokenizer, and the dotenv that bash passes to `--rawfile` lands in the
+/// model's filter slot.
+///
+/// Rather than enumerate which Unicode spaces and format characters diverge,
+/// this accepts only printable ASCII plus space, tab, and newline — a strict
+/// superset of the whitespace, control, and `Cf` cases. The cost is a false
+/// block on a jq filter with a non-ASCII key next to a dotenv-shaped word.
+///
+/// The other known divergences are refused elsewhere, by
+/// [`JQ_SHELL_METACHARS`] on every token up to the filter: a backslash
+/// (`a\ b` is one word to bash; backslash-newline joins two lines) and glued
+/// operators. Adjacent quotes (`'a'"b"`) and empty quotes (`''`) already
+/// tokenize to bash's word count.
+fn tokenizer_word_boundaries_match_bash(text: &str) -> bool {
+    text.chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n') || (c.is_ascii() && !c.is_ascii_control()))
+}
+
+/// `jq` options that take no value. Anything not listed here — and every
+/// short cluster containing a letter outside [`JQ_VALUELESS_SHORT`] — is an
+/// option this model does not understand, and [`jq_filter_index`] refuses.
+const JQ_VALUELESS_LONG: &[&str] = &[
+    "--null-input",
+    "--raw-input",
+    "--slurp",
+    "--compact-output",
+    "--raw-output",
+    "--raw-output0",
+    "--join-output",
+    "--ascii-output",
+    "--sort-keys",
+    "--color-output",
+    "--monochrome-output",
+    "--tab",
+    "--unbuffered",
+    "--stream",
+    "--stream-errors",
+    "--seq",
+    "--exit-status",
+    "--args",
+    "--jsonargs",
+];
+
+/// Short flags that take no value; a cluster like `-nr` must be made only of
+/// these. `f` (`--from-file`) and `L` (`-L dir`) are deliberately absent.
+const JQ_VALUELESS_SHORT: &str = "nRscrjaSCMe";
+
+/// The argv index of `jq`'s FILTER argument — the first positional — or `None`
+/// when that cannot be located with confidence (cadence-hooks#947).
+///
+/// Only the filter is a jq program; every other positional is an input FILE
+/// jq opens, and every option value stays in the scan too — `--slurpfile` and
+/// `--rawfile` read theirs into the program. The caller exempts exactly the
+/// index returned here and nothing else.
+///
+/// `None` is the fail-closed answer, returned when:
+///
+/// - `-f`/`--from-file` appears ANYWHERE (jq parses options after positionals
+///   too, including inside a short cluster like `-rf`). jq 1.7 treats it as a
+///   flag that turns the first positional into a PROGRAM FILE (measured:
+///   `jq -f x.json p.jq` loads `x.json` as the program), while 1.8 gives it a
+///   value; under either grammar the "filter" is a file jq reads.
+/// - an option is unknown, or a value-taking option runs off the end of argv.
+/// - the first positional is not shaped like a jq path: it must start with `.`
+///   and contain no `/` and no [`JQ_SHELL_METACHARS`] character.
+/// - any token BEFORE the filter carries a [`JQ_SHELL_METACHARS`] character.
+///
+/// The last two exist because this argv is post-[`tokenize`], which has
+/// already stripped quotes, so an unquoted expansion is indistinguishable from
+/// a quoted literal. The shell can turn one such token into zero or several
+/// words, shifting which word jq actually sees as its filter:
+/// `V='x .'; jq -R --arg a $V .env.local` makes `.` the filter and the dotenv
+/// an INPUT FILE, and `jq -R .env*` globs into a filter plus a file. The same
+/// quote loss is why redirections are not skipped: a quoted `'2>1,.'` is a
+/// valid jq program that the tokenizer cannot tell from a redirection, so any
+/// redirection-looking first positional simply fails the shape test. Refusing
+/// costs a false block on a quoted `"$V"` option value; accepting would be a
+/// bypass.
+fn jq_filter_index(argv: &[String]) -> Option<usize> {
+    let from_file = |t: &String| {
+        t.starts_with("--from-file")
+            || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+    };
+    if argv.iter().skip(1).any(from_file) {
+        return None;
+    }
+    let expands = |t: &str| t.contains(JQ_SHELL_METACHARS);
+    let mut i = 1;
+    let mut options_done = false;
+    while let Some(token) = argv.get(i) {
+        let t = token.as_str();
+        if !options_done && t.starts_with('-') && t != "-" {
+            i += match t {
+                "--" => {
+                    options_done = true;
+                    1
+                }
+                "--arg" | "--argjson" | "--slurpfile" | "--rawfile" => 3,
+                "--indent" | "-L" | "--library-path" => 2,
+                _ if JQ_VALUELESS_LONG.contains(&t) => 1,
+                _ if t.starts_with("-L") && !t.starts_with("--") => 1,
+                _ if !t.starts_with("--")
+                    && t[1..].chars().all(|c| JQ_VALUELESS_SHORT.contains(c)) =>
+                {
+                    1
+                }
+                _ => return None,
+            };
+            continue;
+        }
+        let shaped = t.starts_with('.') && !t.contains('/') && !expands(t);
+        let prefix_is_literal = argv[1..i].iter().all(|p| !expands(p));
+        return (shaped && prefix_is_literal).then_some(i);
+    }
+    None
+}
+
+/// Characters that let the shell turn one token into zero or several words (or
+/// a different word): parameter/command substitution, globbing, brace
+/// expansion, and escapes — plus the operators the shell splits on WITHOUT
+/// whitespace. [`tokenize`] splits only on whitespace, so `.env.local<.env`
+/// arrives as one filter-shaped token while the shell runs filter `.env.local`
+/// with a dotenv on stdin; `|`, `;`, `&`, `(`, `)` glue on the same way.
+/// [`jq_filter_index`] refuses around any of them.
+const JQ_SHELL_METACHARS: &[char] = &[
+    '$', '`', '*', '?', '[', '{', '\\', '<', '>', '|', ';', '&', '(', ')',
+];
 
 /// `find`'s exec-family flags (`-exec`, `-execdir`, `-ok`, `-okdir`) run their
 /// following token as a command on each matched file. Return the leak when
@@ -1314,13 +1547,16 @@ fn bash_leaks_secrets(
         // that needs case-insensitivity (`command_word`'s verb fold,
         // `is_dangerous_secret_token`, `METADATA_SAFE_COMMANDS`) folds at its
         // own comparison site rather than depending on pre-lowered input.
+        // #947: computed once over the FULL command — a rebinding in one
+        // segment shadows `jq` in every later one.
+        let plain_jq_pipeline = command_is_plain_jq_pipeline(command);
         for segment in command_segments(command) {
             // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
             // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
             // proven pure-loader `.envrc`; any other dangerous operand in the
             // same segment still falls through to the block below, exactly as
             // it did before the #193 carve-out existed.
-            for (cmd_word, token) in segment_env_reads(&segment) {
+            for (cmd_word, token) in segment_env_reads(&segment, plain_jq_pipeline) {
                 // `token` is already the real, original-case substring of
                 // `command` — it was tokenized from an un-lowered segment —
                 // so it resolves the `.envrc` carve-out directly. No
@@ -4955,5 +5191,185 @@ mod tests {
             result.outcome, Block,
             "$() early close + unmatched quote bypassed with a different head"
         );
+    }
+
+    fn assert_bash(commands: &[&str], expected: cadence_hooks_core::Outcome, why: &str) {
+        for command in commands {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(result.outcome, expected, "{command}: {why}");
+        }
+    }
+
+    #[test]
+    fn jq_filter_path_into_env_key_is_allowed() {
+        // #947: the FILTER is a jq program, so `.env.foo` there names a JSON
+        // key, not a file. It used to block as "an operand of `jq`".
+        assert_bash(
+            &[
+                "jq '.env.foo' x.json",
+                "jq '.env.X = \"0\"' settings.json",
+                "jq -r '.env.foo' x.json",
+                "jq -nr .env x.json",
+                "jq --arg k v --indent 2 '.env.foo' x.json",
+                "jq -L mods -- .env.foo x.json",
+                "jq --args .env.foo a b",
+                "true && jq .env.foo x.json",
+                // A `.` argument is not a dot-source: that needs `.` as a head.
+                "jq '.env.foo' x.json | jq .",
+                "cat x.json | jq -r '.env.foo' | head -1",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a jq filter is not a file",
+        );
+    }
+
+    #[test]
+    fn jq_file_operands_still_block() {
+        // Only the filter is exempt: every input file and every option value
+        // stays in the scan. `--rawfile`/`--slurpfile` read their file into the
+        // program, and `-f` makes a positional a PROGRAM FILE.
+        assert_bash(
+            &[
+                "jq . .env",
+                "jq -r .x .env.local",
+                "jq --rawfile s .env '.x' f.json",
+                "jq --slurpfile s .env.prod . f.json",
+                "jq -f .env x.json",
+                "jq --from-file .env x.json",
+                "jq '.env.foo' .env",
+                "jq '.env.foo' x.json .env.local",
+                "jq .x < .env",
+                "jq .env.foo <.env",
+                "cat .env.foo",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a secret file jq or cat opens must block",
+        );
+    }
+
+    #[test]
+    fn jq_filter_exemption_does_not_cover_a_chained_read() {
+        assert_bash(
+            &[
+                "jq '.a' x.json && cat .env",
+                "jq '.env.foo' x.json | cat .env.local",
+                "jq .env.foo x.json; cat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "the exemption is one argv index of one jq segment",
+        );
+    }
+
+    #[test]
+    fn jq_filter_exemption_refuses_when_the_filter_position_is_uncertain() {
+        // Each of these can make the dotenv an INPUT FILE, so the exemption
+        // must refuse and the full scan runs.
+        assert_bash(
+            &[
+                // `-f` anywhere, including after positionals and in a cluster.
+                "jq .env.foo x.json -f",
+                "jq -rf .env.foo x.json",
+                // An unquoted expansion before the filter can shift it:
+                // `V='x .'` turns this into filter `.` and file `.env.local`.
+                "V='x .'; jq -R --arg a $V .env.local",
+                "jq $F .env.foo",
+                // Brace expansion splits the filter into filter + file.
+                "jq -R .env.{a,b}",
+                // Quote loss: `'2>1,.'` is a valid jq program that the
+                // tokenizer cannot tell from a redirection.
+                "jq -R '2>1,.' .env.foo",
+                // The tokenizer splits only on whitespace; the shell also
+                // splits on unspaced operators, making the dotenv stdin.
+                "jq -R .env.local<.env.prod",
+                "jq -R .env.local<.env",
+                "jq -R .env.x<>.env.local",
+                "jq -R .env.local<x.json",
+                "jq -R .env.local|cat .env",
+                "jq -R .env.local;cat .env",
+                // Non-bash whitespace inside an option value: bash sees one
+                // word, the tokenizer two, so the dotenv bash hands to
+                // `--rawfile`/`--slurpfile` would sit in the filter slot.
+                "jq -n --rawfile a\u{0b}b .env.local .x",
+                "jq -n --rawfile a\u{0c}b .env.local .x",
+                "jq -n --rawfile a\u{a0}b .env.local .x",
+                "jq -n --rawfile a\u{2003}b .env.local .x",
+                "jq -n --slurpfile a\u{0b}b .env.local .x",
+                "jq -n --slurpfile a\u{0c}b .env.local .x",
+                "jq -n --slurpfile a\u{a0}b .env.local .x",
+                "jq -n --slurpfile a\u{2003}b .env.local .x",
+                "jq -n --rawfile a\rb .env.local .x",
+                // A backslash-escaped space and a line continuation are one
+                // word to bash.
+                "jq -n --rawfile a\\ b .env.local .x",
+                "jq -n --rawfile a\\\nb .env.local .x",
+                // Same-command shadowing of the name `jq` (#843's analogue).
+                "jq(){ cat \"$1\"; }; jq .env.local",
+                "jq () { cat \"$1\"; }; jq .env.local",
+                "function jq { cat $1; }; jq .env.local",
+                "alias jq=cat; jq .env.local",
+                "eval 'jq(){ cat $1;}'; jq .env.local",
+                "source defs.sh; jq .env.local",
+                ". defs.sh && jq .env.local",
+                "declare -f jq; jq .env.local",
+                "hash -p /bin/cat jq; jq .env.local",
+                "PATH=/tmp/x:$PATH; jq .env.local",
+                "BASH_ENV=defs.sh bash -c 'jq .env.local'",
+                // Dot-source behind keywords and command prefixes, and a
+                // not-found handler standing in for an absent jq.
+                "if true; then . ./d.sh; fi; jq .env.local",
+                "! . ./d.sh; jq .env.local",
+                "for x in 1; do . ./d.sh; done; jq .env.local",
+                "builtin . ./d.sh; jq .env.local",
+                "command . ./d.sh; jq .env.local",
+                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
+                "exec jq .env.local",
+                // Rebinding without a definer word (review of 0f93e8d):
+                // the hash table and alias table written through their
+                // arrays, and PATH set without `PATH=`.
+                "BASH_CMDS[jq]=/bin/cat; jq .env.local",
+                "shopt -s expand_aliases; BASH_ALIASES[jq]=cat\njq .env.local",
+                "printf -v PATH %s /tmp/x; jq .env.local",
+                "read PATH <<< /tmp/x; jq .env.local",
+                "cp /bin/cat /root/.cargo/bin/jq; jq .env.local",
+                // `test`/`[` evaluate a `-v` subscript arithmetically.
+                "test -v 'a[PATH=7]'; jq .env.local",
+                "[ -v 'a[PATH=7]' ]; jq .env.local",
+                // A relative or empty PATH entry resolves `jq` from the cwd.
+                "cd /tmp/x && jq .env.local",
+                // `sort --compress-program` executes a program of the caller's choosing.
+                "sort -S 1 --compress-program=sh x; jq .env.local",
+                // Truncating an existing executable `jq` keeps its mode.
+                "cat /usr/bin/cat > /usr/bin/jq; jq .env.local",
+                "cat /usr/bin/cat >> /usr/bin/jq; jq .env.local",
+                "head -c 99999999 /usr/bin/cat > /usr/bin/jq && jq .env.local",
+                "grep -h '' x.sh > /usr/bin/jq; jq .env.local",
+                "cat x 1<>/usr/bin/jq; jq .env.local",
+                // A `'` inside double quotes must not mask what follows.
+                "cat \"it's\"; jq .env.local $(cp /bin/cat /tmp/x/jq)",
+                "cat x #'\njq .env.local $(cp /bin/cat /tmp/x/jq)\ncat \"'\"",
+                // Unknown options, and path-shaped filters.
+                "jq --unknown .env.foo x.json",
+                "jq ../.env",
+                // A head that is not byte-exactly `jq` could be any program.
+                "./jq .env.foo",
+                "sudo jq .env.foo x.json",
+                "env PATH=/tmp/x jq .env.foo x.json",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "an uncertain filter position must keep blocking",
+        );
+    }
+
+    #[test]
+    fn jq_filter_index_locates_only_the_first_positional() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(jq_filter_index(&argv("jq .env.foo x.json")), Some(1));
+        assert_eq!(
+            jq_filter_index(&argv("jq --slurpfile s .env.prod .x f.json")),
+            Some(4)
+        );
+        assert_eq!(jq_filter_index(&argv("jq -- -r")), None);
+        assert_eq!(jq_filter_index(&argv("jq --arg a")), None);
+        assert_eq!(jq_filter_index(&argv("jq -f p.jq x.json")), None);
     }
 }
