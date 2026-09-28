@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`warn-unreviewed-ready-flip` checks the PR gh actually flips.** It took the repo from `origin` and read the PR number with a whitespace scan. So `gh pr merge 511 -R other/repo` checked PR 511 in origin's repo, `-R other/repo 511` read no number at all, and a fork's flip checked the fork instead of the upstream gh resolves. It now reads `-R`/`--repo` in any position, reads PR URLs (whose repo wins) and branch selectors, and lets gh fill in the default repo from the session cwd (a leading `cd x &&` is not tracked). An empty `--repo=` counts as no repo, as gh reads it. Because the hook runs before the command is approved, it sends no request to a host the command names unless that host is `github.com` or `origin`'s host: a PR URL, `-R HOST/OWNER/REPO`, or URL-shaped selector on any other host stays silent. gh is given the repo the hook parsed, never the `-R` value as typed, and a `-R` value in git-URL form (`git@…`, `https://…`) or with characters outside a plain owner/repo set also stays silent. Unnumbered flips (`gh pr ready` with no argument) are now actually checked: the old lookup passed `-R` with no selector, which gh refuses, so the hook stayed silent every time. This corrects the 0.104.1 entry's claim that a flip without a number "still resolves it first". A flip with no number, or with a branch name, now costs two `gh` calls (a `gh pr view`, then the review query); a numbered one still costs one. A repo flag with no selector, disagreeing repo values, or an unreadable selector stays silent. (cameronsjo/cadence-hooks#1028, #920)
+
 ## [0.105.0] - 2026-09-28
 
 ### Added
