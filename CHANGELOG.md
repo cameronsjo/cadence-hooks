@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Errors and configuration errors now reach session start.** `doctor --quiet` wrote them to stderr, which the documented SessionStart wiring discards, so the one class that should interrupt a session never did. The envelope goes to stdout; the detail stays on stderr.
 - **`doctor --quiet` discloses only switches that are really off.** It prints the `CADENCE_BYPASS=1` banner and the `Disabled via CADENCE_DISABLE:` line. Refused, moot, and unrecognized `CADENCE_DISABLE` entries switch nothing off, so they appear only in the full `doctor` report; `guardrails enforcement-status` reports refused protected-guard disables at session start.
 
+## [0.105.0] - 2026-09-28
+
+### Added
+
+- **`guardrails enforcement-status` reports at session start when the guards are switched off.** It prints one line of context when `CADENCE_BYPASS=1` is set (every guard is off, the protected ones by name) or when `CADENCE_DISABLE` names a protected guard (the disable was refused, and they still run). A normal session gets nothing, and so does a `CADENCE_DISABLE` naming only unprotected hooks or the status checks themselves, such as the estate's standing `guard-rm,guard-rm-liveness`. A repository's checked-in `.claude/settings.json` can set either variable, and until now only `guard-rm-liveness` reported the bypass at session start. This check takes over that job ahead of `guard-rm`'s retirement. Like `guard-rm-liveness`, it is protected from `CADENCE_DISABLE` and exempt from `CADENCE_BYPASS`, and it never blocks. The report names guards only from the built-in protected list, never the raw environment value. The plugin wiring ships in a following `cadence-guardrails` change. (cameronsjo/cadence-ecosystem#582)
+
 ## [0.104.1] - 2026-09-27
 
 ### Fixed

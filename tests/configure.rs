@@ -366,8 +366,11 @@ fn configure_list_reports_bypass_with_settings_list_as_moot() {
         .collect();
     assert_eq!(numbers.len(), 2, "expected two numbers in: {count_line}");
     assert_eq!(
-        numbers[0], "1",
-        "only the bypass-exempt hook is enforcing: {count_line}"
+        numbers[0],
+        cadence_hooks_core::bypass::BYPASS_EXEMPT_HOOKS
+            .len()
+            .to_string(),
+        "only the bypass-exempt hooks are enforcing: {count_line}"
     );
 }
 
