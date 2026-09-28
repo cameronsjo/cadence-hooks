@@ -222,9 +222,9 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `warn-main-branch,warn-overshare`). Not every name is honoured — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so does the status check `enforcement-status` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_NO_FEEDBACK_FOOTER` | all hooks | Set to any non-empty value to suppress the `If this fired in error: /cadence:feedback` footer appended to hard blocks |
-| `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames |
-| `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs |
-| `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
+| `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames; any entry the operator did not intend widens what counts as theirs. **Weakens a protected guard** |
+| `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs. **Weakens a protected guard** |
+| `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host. **Weakens a protected guard** |
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/cadence-ecosystem`, plus its pre-rename alias `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them, scoped to owners that appear in this set |
 | `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset. Also moves the owner-scope for the nudge |
@@ -238,7 +238,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_SKIP_OVERSHARE_AUDIT` | `warn-overshare` | Set to `1` to skip the audit in repos that legitimately hold personal context (settable from any settings `env` block, like every other switch here) |
 | `CADENCE_NO_DAILY_GATE` | daily-gated nudges (`platform-drift`) | Set to any non-empty value to disable the once-per-calendar-day gate so a gated nudge fires every session again — for debugging a nudge you would otherwise have to wait until tomorrow to see. The gate keys on the nudge's *content*, not just the date, so a genuinely changed state (a partial upgrade) already re-fires the same day without this |
 | `CADENCE_METRICS_PRICES` | `log-commit`, `log-session`, `grade` | Path to a model price-table JSON; takes precedence over the `--prices` flag and the embedded default. Each model entry takes `inputPerMTok`, `outputPerMTok`, `cacheWritePerMTok` (5-minute TTL), `cacheReadPerMTok`, and the optional `cacheWrite1hPerMTok` (1-hour TTL) — omitting the last one falls back to `inputPerMTok * 2`, which is right only for models on the standard multiplier. An unreadable or unparseable file degrades silently to the embedded table |
-| `CADENCE_METRICS_DIR` | metrics loggers | When set non-empty, the metrics root (JSONL files and the `state/` subdir live directly inside it); otherwise `<config_dir>/metrics` (honoring `CLAUDE_CONFIG_DIR`) |
+| `CADENCE_METRICS_DIR` | metrics loggers | When set non-empty, the metrics root (JSONL files and the `state/` subdir live directly inside it); otherwise `<config_dir>/metrics` (honoring `CLAUDE_CONFIG_DIR`). Moving it also moves the bypass and fail-open ledgers away from where `doctor` and your tooling read them |
 | `CADENCE_METRICS_DEBUG` | `log-subagent` | Set to `1` to append a `_keys` array of the raw payload's top-level keys to subagent records — surfaces schema additions across Claude Code releases |
 | `CADENCE_LOG_NUDGES` | denial log | Nudge-fire rows in `denials.jsonl` are ON by default (#420); set `0`/`false`/`off` (case-insensitive) or set-but-empty to opt out. Any other value, including the legacy opt-in `1`, keeps them on. Deny/Ask rows are unconditional either way |
 | `CADENCE_METRICS_STALE_DAYS` | `warn-stale` | Days of metrics-write silence before the SessionStart alarm fires and `doctor` reports staleness (default 4); zero or unparseable falls back to the default |
@@ -254,17 +254,19 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_READ_MODEL_GUARD_ON_UNKNOWN` | `guard-read-model` | `block` refuses reads when the session model is unknown; anything else allows |
 | `CADENCE_HOOK_DEADLINE_MS` | every guard that runs git | Time budget for a guard's git probes, clamped to 1000–4500; `0` disables the deadline. A probe that times out fails open |
 | `CADENCE_MARKER_DIR` | marker-keyed checks, `guard-browser-device` | Where one-time markers live. Pointing it at a directory that already holds a marker makes `guard-browser-device` allow without its first-use block. **Weakens a protected guard** |
-| `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` | `warn-subagent-worktree` | Set to silence the nudge for a repo |
-| `CADENCE_ALLOW_BRANCH_INTENT` | `warn-branch-intent` | Set to silence the stale-branch nudge |
+| `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` | `warn-subagent-worktree` | Set to `1`/`true`/`yes` to silence the nudge for a repo |
+| `CADENCE_ALLOW_BRANCH_INTENT` | `warn-branch-intent` | Set to `1`/`true`/`yes` to silence the stale-branch nudge |
 | `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public |
 | `CADENCE_NO_OUTRO_BACKSTOP` | `backstop-record`, `backstop-warn` | Set to turn off the loose-ends backstop |
 | `CADENCE_NO_PERSIST_PLAN` | `persist-plan-approval` | Set to stop writing approved plans to disk |
-| `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
+| `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook; any value that is not an absolute path to an executable makes the wrapper inert (every hook exits 0, one notice per day) — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
 | `CLAUDE_EFFORT` | every hook (latent) | A check can skip itself at a given effort level; no check does today |
+| `CADENCE_FAILOPEN_DISCLOSE_MIN` | `session start` fail-open disclosure | How many fail-open events before the session-start disclosure fires; a large value hides it |
+| `GH_HOST` | `guard-push-remote`, `guard-gh-write` | The host bare allowlist entries match; changing it moves which forge counts as the operator's own. **Weakens a protected guard** |
 
 ### Folder trust is the boundary
 
-A trusted repository's `.claude/settings.json` `env` block reaches every hook process and can set any variable above. Some of those weaken a protected guard (marked **Weakens a protected guard**), and `CADENCE_BYPASS=1` switches every guard off. `CADENCE_HOOKS_BIN` or `PATH` can replace the binary itself, so no check inside it runs to report the change. `HOME`, `CLAUDE_CONFIG_DIR` and child-process variables such as `GIT_CONFIG_*`, `GIT_DIR`, `XDG_CONFIG_HOME` and `GH_CONFIG_DIR` also change what the guards see.
+A trusted repository's `.claude/settings.json` `env` block reaches every hook process and can set any variable above. Some of those weaken a protected guard (marked **Weakens a protected guard**), and `CADENCE_BYPASS=1` switches every guard off. `CADENCE_HOOKS_BIN` or `PATH` can replace the binary itself, so no check inside it runs to report the change. A `CADENCE_HOOKS_BIN` that is not an absolute path to an executable makes the wrapper inert: every hook exits 0. `HOME`, `CLAUDE_CONFIG_DIR` and child-process variables such as `GIT_CONFIG_*`, `GIT_DIR`, `XDG_CONFIG_HOME` and `GH_CONFIG_DIR` also change what the guards see.
 
 The control is Claude Code's folder-trust prompt: trusting a repository lets it turn these guards off. `enforcement-status` reports `CADENCE_BYPASS=1` and a refused `CADENCE_DISABLE` at session start so those two are visible, but it is not a defence against a hostile trusted repository. Decided 2026-09-28 (cameronsjo/cadence-hooks#1031, closed not planned).
 

@@ -111,7 +111,7 @@ fn resolve_against(candidate: &str, base: Option<&Path>) -> Option<PathBuf> {
 
 /// The directory a `cd` segment moves the shell to, or `None` when it cannot be
 /// named. Mirrors the conventions the deleted delete guard's target collector
-/// once used (cameronsjo/cadence-ecosystem#582): cd's own flags are
+/// once used (cameronsjo/cadence-ecosystem#582; the code is in tag `v0.105.0`): cd's own flags are
 /// skipped, and a bare `-`, a `$VAR`, or a missing target makes the new
 /// directory UNKNOWN rather than silently keeping the old one.
 fn cd_destination(segment: &[&str], base: Option<&Path>) -> Option<PathBuf> {
@@ -251,7 +251,7 @@ impl Check for GuardGitInit {
 
         if is_git_init(&stripped) || creates_remote {
             // Read the env once, the same convention the deleted delete guard
-            // (cameronsjo/cadence-ecosystem#582) used, and hand both values to
+            // (cameronsjo/cadence-ecosystem#582; the code is in tag `v0.105.0`) used, and hand both values to
             // the pure decision. `home` feeds `path_under_temp_root`'s veto on a
             // `$TMPDIR` that swallows the home directory (cadence-hooks#569) —
             // without it, `TMPDIR=$HOME` would silence the nudge estate-wide.

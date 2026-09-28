@@ -31,7 +31,9 @@
 //! [`PathClass::Source`]. The `memory` and `vault` classes stay deferred. This
 //! module has had no consumer since the recursive-delete guard was removed
 //! (cameronsjo/cadence-ecosystem#582); a new consumer must re-review the
-//! classes here rather than trust them as reviewed.
+//! classes here rather than trust them as reviewed. Where the docs below say a
+//! consumer maps a class to ASK or BLOCK, they describe the retired guard's
+//! policy, not a contract of this module.
 //!
 //! **The `.claude` carve-out is an allowlist of session scratch, not the whole
 //! tree.** It once granted the ALLOW class to *any* path under a `.claude`

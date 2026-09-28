@@ -903,8 +903,8 @@ mod tests {
     #[test]
     fn the_two_security_lists_diverge_only_where_intended() {
         /// Security-critical, deliberately NOT protected from `CADENCE_DISABLE`.
-        /// Both are workflow guards over recoverable state, and both have a
-        /// legitimate reason to be switched off per session.
+        /// A workflow guard over recoverable state, with a legitimate reason
+        /// to be switched off per session.
         const CRITICAL_BUT_UNPROTECTED: &[&str] = &["enforce-worktree"];
         /// Protected from `CADENCE_DISABLE` but not security-critical. Two
         /// different reasons, one per entry:
@@ -1001,7 +1001,7 @@ mod tests {
     /// Protection from `CADENCE_DISABLE` and criticality are separate
     /// properties, and this hook deliberately has only the first.
     #[test]
-    fn the_liveness_detector_is_protected_but_never_security_critical() {
+    fn the_status_detector_is_protected_but_never_security_critical() {
         // Every bypass-exempt hook is a status check by definition, so the
         // exempt list is the detector list.
         for detector in bypass::BYPASS_EXEMPT_HOOKS {

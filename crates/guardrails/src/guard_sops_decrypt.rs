@@ -127,7 +127,7 @@ fn render_found(segment: &str, consumer: Option<&str>) -> String {
 /// to an allowed consumer.
 ///
 /// Mirrors the traversal the deleted delete guard's target collector once used
-/// (cameronsjo/cadence-ecosystem#582) rather than flattening with
+/// (cameronsjo/cadence-ecosystem#582; the code is in tag `v0.105.0`) rather than flattening with
 /// `command_segments`: this guard's whole question is *what the next segment in
 /// the pipeline is*, and a flat view splices a substitution body into the
 /// parent's stream, inventing pipeline neighbours that do not exist. Child

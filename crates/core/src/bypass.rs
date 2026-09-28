@@ -114,7 +114,9 @@
 //! binary, and no check inside the binary can fully report it. Beyond the two
 //! switches and the variables above, the plugin wrapper honours
 //! `CADENCE_HOOKS_BIN` and falls back to `PATH`, so `CADENCE_HOOKS_BIN=/usr/bin/true`
-//! replaces the binary itself and `enforcement-status` never runs. `HOME` and
+//! replaces the binary itself and `enforcement-status` never runs. Any
+//! `CADENCE_HOOKS_BIN` that is not an absolute path to an executable makes the
+//! wrapper inert instead: every hook exits 0 and one notice prints per day. `HOME` and
 //! `CLAUDE_CONFIG_DIR` move where config and identity terms are read from, and
 //! child-process variables (`GIT_CONFIG_*`, `GIT_DIR`, `XDG_CONFIG_HOME`,
 //! `GH_CONFIG_DIR`) change what git and gh report to the guards that call them.
@@ -538,8 +540,8 @@ mod tests {
         }
     }
 
-    /// The four previously-divergent call sites, replayed against the one
-    /// resolver. Before #567 the `list` summary line and the liveness detector
+    /// The previously-divergent call sites, replayed against the one resolver.
+    /// Before #567 the `list` summary line and a since-retired liveness detector
     /// were protection-blind while the `list` per-hook row and the enforcement
     /// path were not, so `CADENCE_DISABLE=git-safety` produced two different
     /// answers to "is git-safety disabled?" in one binary.
@@ -557,8 +559,7 @@ mod tests {
         assert!(state.suppression_requested());
         assert_ne!(state.as_str(), "disabled");
         assert_eq!(state.as_str(), "disable-refused");
-        // The liveness answer: it names a switch, and the switch names the
-        // variable that was set.
+        // The switch answer: it names the variable that was set.
         assert_eq!(
             state.switch(PROTECTED).as_deref(),
             Some("CADENCE_DISABLE=git-safety")

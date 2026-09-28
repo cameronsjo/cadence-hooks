@@ -903,8 +903,8 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 
 /// Words that stand in front of a real command without being the command.
 ///
-/// Shared by `enforce_worktree` and the polish ship anchor, so the
-/// set cannot drift between the code that skips these and the code that asks
+/// Shared by `enforce_worktree`, `core::push` (`guard-push-remote`), and the
+/// polish ship anchor (a nudge), so the set cannot drift between the code that skips these and the code that asks
 /// whether a word is one. **It is not the repo's only prefix set, and is not
 /// meant to become one** — three others answer adjacent questions with
 /// deliberately different membership, and each admits words this set excludes:
@@ -917,7 +917,7 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 ///   shell is about to run
 ///
 /// So `sudo` and `xargs` ARE transparent to some checks and deliberately not to
-/// these. Unifying them would widen two gates that can block, on the strength
+/// these. Unifying them would widen the two consumers that can block, on the strength
 /// of a question neither was asked — see this constant's consumers before
 /// adding a word to it.
 pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];

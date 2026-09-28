@@ -16,6 +16,8 @@ bypasses sat in the diff. Neither of the two Criticals appeared in any of six
 harnesses — grepping all fifty-one hand-built rows for the triggering shape
 (a `)` inside a `${…}` default) returns zero.
 
+**2026-09-28:** the six `shellcluster-*.sh` harnesses counted above probed only the recursive-delete guard and were deleted with it (cameronsjo/cadence-ecosystem#582; they remain in tag `v0.105.0`). The numbers above describe that history. Rebuilding an equivalent real-bash differential against a live guard is tracked separately.
+
 That is the argument #510 makes: a harness whose rows grow by adversarial search
 rather than by authorship.
 

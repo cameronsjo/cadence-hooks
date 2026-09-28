@@ -301,7 +301,7 @@ fn check_destructive_in_vault(
 /// message it was just shown. `mv` is likewise outside the command scanner's
 /// verb set on the Bash route, so the two harnesses agree. Same call, same
 /// reasoning as the deleted delete guard's own path judgment
-/// (cameronsjo/cadence-ecosystem#582); pinned by
+/// (cameronsjo/cadence-ecosystem#582; the code is in tag `v0.105.0`); pinned by
 /// `normalized_patch_rename_inside_vault_is_not_a_delete`.
 fn check_delete_in_vault(path: &str, cwd: &str, vault: &str) -> CheckResult {
     let vault = normalize_path(vault);

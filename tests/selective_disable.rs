@@ -387,13 +387,13 @@ fn list_works_during_bypass() {
         stdout.contains("all hooks bypassed except enforcement-status"),
         "the banner still claims every hook is bypassed: {stdout}"
     );
-    let liveness_line = stdout
+    let status_line = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("enforcement-status "))
         .unwrap_or_else(|| panic!("no enforcement-status row: {stdout}"));
     assert!(
-        !liveness_line.contains("(disabled)"),
-        "the bypass-exempt hook is rendered as disabled while it runs: {liveness_line}"
+        !status_line.contains("(disabled)"),
+        "the bypass-exempt hook is rendered as disabled while it runs: {status_line}"
     );
 }
 
