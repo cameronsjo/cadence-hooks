@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`doctor` no longer warns that `CADENCE_ALLOWED_OWNERS` is unset when the guards would allow.** The push and gh-write guards read the allowlist from their process environment, but doctor looked only in the user settings.json, so an allowlist exported from a shell rc file drew a false "every push and gh write is blocked" warning. Doctor now checks the process environment with the guards' own resolver (`env_allow_entries`), and still treats a string value in the settings.json `env` block as authoritative, since Claude Code applies it over the inherited environment: an explicit empty value there still warns, because the guards would block. (cameronsjo/cadence-hooks#987)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed
