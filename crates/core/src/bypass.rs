@@ -93,9 +93,10 @@
 //! relocates the marker state other checks key on. `CADENCE_ALLOWED_OWNERS`,
 //! `CADENCE_ALLOWED_REPOS` and `CADENCE_EXTRA_HOSTS` widen what
 //! `guard-push-remote` and `guard-gh-write` accept as the operator's own, and
-//! `CADENCE_ALLOW_SOPS_DECRYPT` switches `guard-sops-decrypt` off; all four
-//! guards are protected, and none of these is reported at session start
-//! (`enforcement-status` covers only the two switches above). The identity tier already
+//! `CADENCE_ALLOW_SOPS_DECRYPT` lets `guard-sops-decrypt` allow a decrypt (it
+//! still writes a bypass row). All three guards are protected, and none of
+//! these variables is reported at session start: `enforcement-status` covers
+//! only the two switches above (widening it: cameronsjo/cadence-hooks#1031). The identity tier already
 //! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this
 //! reason; see the "Why no environment override in production" note on
 //! `terms_path` in the `cadence` crate. Protection here is per-switch, not

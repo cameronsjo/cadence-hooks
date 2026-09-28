@@ -56,7 +56,7 @@
 //! [`PROTECTED_GUARDS`]: cadence_hooks_core::bypass::PROTECTED_GUARDS
 //! [`BYPASS_EXEMPT_HOOKS`]: cadence_hooks_core::bypass::BYPASS_EXEMPT_HOOKS
 
-use cadence_hooks_core::bypass::{self, PROTECTED_GUARDS};
+use cadence_hooks_core::bypass::{self, BypassState, PROTECTED_GUARDS};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// The registry name, shared with `bypass::BYPASS_EXEMPT_HOOKS` and
@@ -75,14 +75,19 @@ pub const REPORT_PREFIX: &str = "[cadence-hooks enforcement-status]";
 /// process environment. [`EnforcementStatus::run`] is the thin reader.
 #[must_use]
 pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> Option<String> {
-    if bypass::bypass_engaged_from(bypass_value) {
-        // Derived from the resolver's own lists, so the report cannot claim a
-        // bypass-exempt check is off, or name one that no longer exists.
-        let switched_off: Vec<&str> = PROTECTED_GUARDS
+    // Every name comes from the resolver itself, so the report cannot disagree
+    // with what enforcement, `list` and `doctor` decide (#567).
+    let guards_in = |state: BypassState| -> Vec<&'static str> {
+        PROTECTED_GUARDS
             .iter()
             .copied()
             .filter(|guard| !bypass::is_bypass_exempt_hook(guard))
-            .collect();
+            .filter(|guard| bypass::resolve_from(bypass_value, disable_value, guard) == state)
+            .collect()
+    };
+
+    let switched_off = guards_in(BypassState::Bypassed);
+    if !switched_off.is_empty() {
         return Some(format!(
             "{REPORT_PREFIX} {var}={on} is set: every cadence-hooks guard is switched off for this session, \
              including the protected ones ({guards}). Only the status checks ({exempt}) and \
@@ -95,15 +100,9 @@ pub fn report_from(bypass_value: Option<&str>, disable_value: Option<&str>) -> O
         ));
     }
 
-    let named: Vec<&'static str> = match disable_value {
-        Some(raw) => PROTECTED_GUARDS
-            .iter()
-            .copied()
-            .filter(|guard| !bypass::is_bypass_exempt_hook(guard))
-            .filter(|guard| bypass::disable_list(raw).any(|entry| entry == *guard))
-            .collect(),
-        None => Vec::new(),
-    };
+    // Status checks are left out: a refused disable of one changes nothing, and
+    // it still runs and speaks for itself.
+    let named = guards_in(BypassState::DisableRefused);
     if named.is_empty() {
         return None;
     }
