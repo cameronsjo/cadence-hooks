@@ -2,9 +2,10 @@
 //! peer discovery with mtime-based liveness.
 //!
 //! Liveness is the file's mtime, not its contents — a session that crashes or
-//! is closed without ceremony simply stops heartbeating and goes stale. Stale
-//! files are swept by the PostToolUse heartbeat (every wired tool call in any
-//! live session) and, as a baseline, on `session start`.
+//! is closed without ceremony simply stops heartbeating and goes stale. The
+//! heartbeat rides `session persist-plan-approval` on every `PostToolUse`,
+//! throttled to one write per `heartbeat::beat_interval_secs` (#902). Stale
+//! files are swept on each beat and, as a baseline, on `session start`.
 
 use crate::identity::{self, SessionRecord};
 use cadence_hooks_core::shell::git_command;
@@ -14,9 +15,9 @@ use std::time::SystemTime;
 
 /// Default staleness threshold in minutes.
 ///
-/// Liveness is mtime-only and the heartbeat fires only on Bash/Edit/Write, so a
-/// session in a long read/think phase emits no signal. 30 min keeps such a
-/// session out of the sweep's reach far more reliably than the original 10.
+/// Liveness is mtime-only and the heartbeat fires only on tool calls, so a
+/// session idle at the prompt emits no signal. 30 min keeps such a session out
+/// of the sweep's reach far more reliably than the original 10.
 pub const DEFAULT_STALE_MINUTES: u64 = 30;
 
 /// The DEFAULT staleness window in seconds, ignoring any per-session override.

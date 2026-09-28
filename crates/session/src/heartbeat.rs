@@ -118,10 +118,15 @@ pub fn run_heartbeat(
 /// version dirs under it. This restores the refresh without a spawn by riding
 /// the `persist-plan-approval` process that already runs on every `PostToolUse`.
 ///
-/// Throttled: when this session's record is younger than a third of the stale
-/// window, the call is one `stat` and returns. Otherwise it runs the full
-/// [`run_heartbeat`] (record write, branch probe, stale sweep). Returns whether
-/// it wrote. Never errors.
+/// The throttle reads the machine-wide mirror record, whose path needs no git:
+/// when it is younger than [`beat_interval_secs`], the call is one `stat` and
+/// returns. Only a due beat resolves the repo and runs [`run_heartbeat`]
+/// (local and mirror write, branch probe, stale sweep). Returns whether it
+/// wrote. Never errors.
+///
+/// Not covered: a session idle at the prompt (no tool calls), a cwd outside
+/// any git repo (no registry dir), and a session with `persist-plan-approval`
+/// switched off by `CADENCE_BYPASS=1` or `CADENCE_DISABLE`.
 pub fn beat_if_due(session_id: Option<&str>, cwd: Option<&str>) -> bool {
     let Some(sid) = session_id.filter(|s| identity::is_safe_session_id(s)) else {
         return false;
@@ -129,42 +134,43 @@ pub fn beat_if_due(session_id: Option<&str>, cwd: Option<&str>) -> bool {
     let Some(cwd) = cwd else {
         return false;
     };
+    let global = registry::global_sessions_dir();
+    let mirror = global.join(identity::filename(sid));
+    if !is_due(&mirror, beat_interval_secs(), std::time::SystemTime::now()) {
+        return false;
+    }
     let Some(dir) = registry::sessions_dir(cwd) else {
         return false;
     };
-    let stale_secs = registry::stale_minutes() * 60;
-    if !is_due(&dir, sid, stale_secs, std::time::SystemTime::now()) {
-        return false;
-    }
     let branch = git_command(cwd, &["branch", "--show-current"]);
     run_heartbeat(
         &dir,
-        Some(registry::global_sessions_dir().as_path()),
+        Some(global.as_path()),
         sid,
         branch,
         None,
-        stale_secs,
+        registry::stale_minutes() * 60,
     );
     true
 }
 
-/// Whether this session's record needs a refresh: absent, unreadable, or older
-/// than a third of `stale_secs`. A third leaves two missed windows of slack
-/// before a reader would call the session stale.
-fn is_due(
-    dir: &std::path::Path,
-    session_id: &str,
-    stale_secs: u64,
-    now: std::time::SystemTime,
-) -> bool {
-    let Some(path) = registry::find_own(dir, session_id) else {
-        return true;
-    };
-    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+/// A third of the smaller of this session's stale window and the default one.
+/// Peers sweep the mirror on the default window whatever this session's
+/// override, so a beat interval past a third of it could let a peer reap this
+/// session's mirror record between beats.
+fn beat_interval_secs() -> u64 {
+    (registry::stale_minutes() * 60).min(registry::default_stale_secs()) / 3
+}
+
+/// Whether the record at `path` needs a refresh: absent, unreadable, dated in
+/// the future (readers treat that as maximally stale), or at least
+/// `interval_secs` old.
+fn is_due(path: &std::path::Path, interval_secs: u64, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
         return true;
     };
     now.duration_since(modified)
-        .is_ok_and(|age| age.as_secs() >= stale_secs / 3)
+        .map_or(true, |age| age.as_secs() >= interval_secs)
 }
 
 #[cfg(test)]
@@ -498,27 +504,37 @@ mod tests {
     fn is_due_when_no_record_exists() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(is_due(
-            tmp.path(),
-            "sess-none",
-            1800,
+            &tmp.path().join("none.json"),
+            600,
             std::time::SystemTime::now()
         ));
     }
 
     #[test]
-    fn is_due_only_after_a_third_of_the_stale_window() {
+    fn is_due_only_after_the_interval() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("sessions");
-        registry::touch_own(&dir, None, "sess-fresh", None, false).unwrap();
+        let path = tmp.path().join("r.json");
+        std::fs::write(&path, "{}").unwrap();
         let now = std::time::SystemTime::now();
-        assert!(
-            !is_due(&dir, "sess-fresh", 1800, now),
-            "fresh record is not due"
-        );
+        assert!(!is_due(&path, 600, now), "a fresh record is not due");
         let later = now + std::time::Duration::from_secs(600);
-        assert!(
-            is_due(&dir, "sess-fresh", 1800, later),
-            "10 min into a 30 min window is due"
-        );
+        assert!(is_due(&path, 600, later), "at the interval it is due");
+    }
+
+    /// Readers treat a future mtime as maximally stale, so it must be due, or
+    /// the session stays invisible until a peer reaps its record.
+    #[test]
+    fn a_future_mtime_is_due() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.json");
+        std::fs::write(&path, "{}").unwrap();
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(86_400);
+        assert!(is_due(&path, 600, past), "record dated after `now` is due");
+    }
+
+    #[test]
+    fn the_beat_interval_stays_under_a_third_of_the_default_window() {
+        assert!(beat_interval_secs() <= registry::default_stale_secs() / 3);
     }
 }
