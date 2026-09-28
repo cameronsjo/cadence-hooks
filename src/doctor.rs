@@ -839,7 +839,7 @@ fn rules_drift_finding(config_dir: &Path, installs: &[(String, PathBuf)]) -> Opt
             pinned_path.display()
         ),
         remediation: format!(
-            "compare first with `diff {pinned} {deployed}` and move any deliberate local \
+            "compare first with `diff -- {pinned} {deployed}` and move any deliberate local \
              edit upstream, then copy the pinned file over the deployed one or re-run \
              /cadence-groundwork:initializing-cadence. If a dotfiles manager tracks the \
              deployed file, update its source too, or the next back-sync reverts the copy",
@@ -4928,6 +4928,8 @@ mod tests {
             deployed.to_string_lossy().as_ref(),
             "initializing-cadence",
             "back-sync",
+            // `--` ends diff's options, so a path starting with `-` stays a path.
+            "`diff -- '",
         ] {
             assert!(
                 finding.remediation.contains(needle),
