@@ -306,12 +306,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
-    // Replaces guard-rm-liveness's CADENCE_BYPASS report. The cadence-guardrails
-    // SessionStart wiring lands in the cadence PR that follows this release;
-    // the guard-rm deletion PR refreshes the fixture and removes this entry
-    // (cameronsjo/cadence-ecosystem#582).
+    // Deliberately unwired, not awaiting a wiring PR: guard-rm is being retired
+    // (cameronsjo/cadence-ecosystem#582). cameronsjo/cadence#1479 removed its
+    // wiring; the subcommands stay in the binary until the deletion release,
+    // which removes both entries along with the code.
+    ("guardrails guard-rm", "cameronsjo/cadence-ecosystem#582"),
     (
-        "guardrails enforcement-status",
+        "guardrails guard-rm-liveness",
         "cameronsjo/cadence-ecosystem#582",
     ),
 ];
@@ -338,14 +339,6 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
-    // Same shape, one plugin over: no single `if:` glob expresses "a delete
-    // verb", wherever it appears in a command. The prefilter matcher is
-    // case-sensitive and has no notion of a command head, so a glob written
-    // against the lowercase verb misses the capitalized spelling and a
-    // head-anchored form misses the verb after a shell operator. The guard
-    // therefore inspects every Bash call and lets the binary's tokenizer decide
-    // (cameronsjo/cadence-hooks#597; docs/hooks.md § Wiring prefilters).
-    "guardrails guard-rm",
 ];
 
 /// Entries of [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] whose wiring still carries
