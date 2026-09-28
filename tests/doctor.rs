@@ -243,6 +243,38 @@ fn doctor_quiet_error_prints_envelope_to_stdout_and_exits_two() {
     );
 }
 
+/// A configuration error reaches SessionStart as the envelope on stdout (the
+/// detail stays on stderr, which the wiring discards), and exits 2.
+#[test]
+fn doctor_quiet_config_errors_print_envelope_to_stdout() {
+    let markers = tempfile::tempdir().unwrap();
+    let empty_home = tempfile::tempdir().unwrap();
+    let metrics = tempfile::tempdir().unwrap();
+    let no_home = cadence_hooks()
+        .args(["doctor", "--quiet"])
+        .env_remove("HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env("CADENCE_MARKER_DIR", markers.path())
+        .env("CADENCE_NO_DAILY_GATE", "1")
+        .output()
+        .expect("failed to execute");
+    let no_cache = doctor_in_home(empty_home.path(), metrics.path())
+        .arg("--quiet")
+        .env("CADENCE_MARKER_DIR", markers.path())
+        .env("CADENCE_NO_DAILY_GATE", "1")
+        .output()
+        .expect("failed to execute");
+    for (label, output) in [("HOME unset", no_home), ("no manifest, no cache", no_cache)] {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(2), "{label}: {stdout}");
+        assert!(
+            stdout.contains("1 error(s) and 0 inert hook wiring(s)"),
+            "{label}: envelope must reach stdout: {stdout}"
+        );
+        assert!(!output.stderr.is_empty(), "{label}: detail stays on stderr");
+    }
+}
+
 /// Plugin-controlled bytes — the plugin directory, the command, the namespace,
 /// the subcommand, and a `CADENCE_DISABLE` entry — never reach `--quiet`
 /// stdout. That stdout becomes SessionStart `additionalContext`, so any of them

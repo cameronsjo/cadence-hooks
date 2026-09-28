@@ -348,7 +348,7 @@ warning [cadence@workbench] ~/.claude/plugins/cache/workbench/cadence/174e3eb0de
 cadence-hooks doctor: 0 error(s), 1 warning(s)
 ```
 
-**`--quiet` mode** is the SessionStart preflight shape. It reports only **blockers**: findings that mean a wired hook is not running. Those are shell-expansion errors, a wiring that names a subcommand or namespace this binary does not have, a `group` entry the binary cannot parse or run, and a hook whose CLI dependency is not on `PATH`. Everything else — hook latency, stale telemetry, orphaned cache dirs, unenabled plugins, identity — waits for a full `cadence-hooks doctor` run, which `cadence:outro` makes at session end.
+**`--quiet` mode** is the SessionStart preflight shape. It reports only **blockers**: findings that mean a wired hook is not running. Those are shell-expansion errors, a wiring that names a subcommand or namespace this binary does not have (in a plugin `hooks.json`, in `settings.json`, or in a plugin removed upstream), a `group` entry the binary cannot parse or run, a hook whose CLI dependency is not on `PATH`, a plugin that ships hooks but has no `enabledPlugins` entry, and a pinned plugin cache dir that is missing or empty. A plugin set to `false` in `enabledPlugins` never blocks. Everything else — hook latency, stale telemetry, orphaned cache dirs, identity — waits for a full `cadence-hooks doctor` run, which `cadence:outro` makes at session end.
 
 - **No blockers:** no output, exit 0.
 - **Blockers:** one fixed `<cadence-system-message>` envelope on stdout, with counts only (`N error(s) and M inert hook wiring(s)`) and the upgrade hint when a subcommand is missing. It prints at most once a day per distinct blocker set. Exit 2 when any blocker is an error, else 0 (so a `set -euo pipefail` script won't abort on inert wiring alone).
@@ -359,8 +359,9 @@ Everything the session must see goes to **stdout**, because the documented wirin
 
 ```bash
 # In a SessionStart hook — surface blockers without failing the hook
+# stdout at exit 0 becomes session context; stderr does not reach the model.
 if msg=$(cadence-hooks doctor --quiet 2>/dev/null); [ -n "$msg" ]; then
-  echo "$msg" >&2
+  printf '%s\n' "$msg"
 fi
 ```
 

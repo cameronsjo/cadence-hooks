@@ -34,9 +34,10 @@ const MAX_UNKNOWN_NAMES: usize = 10;
 /// This is the only operator-supplied text either surface prints — the honoured
 /// and refused buckets hold `&'static str` registry names, reached only by an
 /// exact match. The value can arrive from a repository's committed
-/// `.claude/settings.json` `env` block, and `doctor --quiet`'s stdout is
-/// captured as SessionStart `additionalContext`, so an entry nobody recognizes
-/// reaches the model's context as text.
+/// `.claude/settings.json` `env` block, and the full `doctor` report is read
+/// by the model when a session runs it, so an entry nobody recognizes reaches
+/// the model's context as text. (It is not on the `doctor --quiet` route; see
+/// [`quiet_status_lines`].)
 ///
 /// That destination is why the **allowlist** sanitizer applies, not the
 /// denylist one. `filename_safe` keeps `[A-Za-z0-9._-]` and collapses every
@@ -392,8 +393,8 @@ pub(crate) fn bypass_status_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     if bypass::bypass_engaged_from(bypass_raw) {
-        // Reaches the agent's context through `doctor --quiet`, which is the
-        // surface an operator trusts to say what is and is not enforcing.
+        // The banner also reaches SessionStart through `doctor --quiet`
+        // ([`quiet_status_lines`]); both routes share this sentence.
         lines.push(format!(
             "cadence-hooks doctor: {}",
             bypass_banner_sentence()
@@ -569,9 +570,9 @@ mod tests {
     ///
     /// The test above pins that `doctor` never claims a guard runs when none
     /// does; this one pins the complement, because a report that is silent
-    /// about the exception is as wrong as one that overclaims — and this text
+    /// about the exception is as wrong as one that overclaims — and the banner
     /// reaches the agent through `doctor --quiet`'s stdout. Both the banner and
-    /// the refusal line must name it.
+    /// the full report's refusal line must name it.
     #[test]
     fn doctor_names_the_bypass_exempt_hook_as_still_running() {
         let lines = bypass_status_lines(Some("1"), Some("guard-rm-liveness"));
@@ -883,8 +884,8 @@ mod tests {
         }
     }
 
-    /// An unrecognized entry reaches the model's context through
-    /// `doctor --quiet`'s stdout, so the allowlist sanitizer — not the denylist
+    /// An unrecognized entry reaches the model's context through the full
+    /// `doctor` report, so the allowlist sanitizer — not the denylist
     /// one — renders it: SPACE is outside the allowlist, and every run of
     /// disallowed characters collapses to a single `?`. Fluent instructions
     /// therefore arrive visibly mangled rather than in this tool's own voice.

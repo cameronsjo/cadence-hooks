@@ -801,7 +801,8 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .filter(|(label, _)| seen.insert(label.as_str()))
         .map(|(label, hooks)| Finding {
             severity: Severity::Warning,
-            blocker: Blocker::No,
+            // None of its hooks can fire: a wired hook that is not running.
+            blocker: Blocker::Yes,
             // The label is an `installed_plugins.json` key — third-party
             // influenced. Every `Finding` field is sanitized once, at the
             // display boundary (`Finding::render`, cameronsjo/cadence-hooks#440),
@@ -825,6 +826,21 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
             ),
         })
         .collect()
+}
+
+/// Demote to advisory every blocker attributed to a plugin the operator set
+/// to `false` in `enabledPlugins`. Its hooks are not wired, so a defect in its
+/// `hooks.json` is not a wired hook failing to run — full `doctor` still
+/// reports it.
+fn demote_disabled_plugin_blockers(findings: &mut [Finding], config_dir: &Path) {
+    let Some(enabled) = enabled_plugin_map(config_dir) else {
+        return;
+    };
+    for f in findings.iter_mut() {
+        if enabled.get(f.plugin.as_str()) == Some(&false) {
+            f.blocker = Blocker::No;
+        }
+    }
 }
 
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
@@ -936,11 +952,16 @@ fn marketplace_status(label: &str, known_marketplaces: &Path) -> MarketplaceStat
 /// binary" and points the operator at `cargo install --git` to chase
 /// subcommands that were intentionally retired — the exact misdiagnosis
 /// this finding exists to prevent.
-fn removed_upstream_finding(label: &str, install_dir: &Path) -> Finding {
+///
+/// `inert` is whether the plugin's cached wiring still names subcommands this
+/// binary lacks. The skew findings themselves stay suppressed (they would
+/// misdiagnose), but a delisted plugin whose hooks cannot run is still a
+/// SessionStart blocker — delisting must not silence it.
+fn removed_upstream_finding(label: &str, install_dir: &Path, inert: bool) -> Finding {
     let marketplace = label.split_once('@').map(|(_, m)| m).unwrap_or(label);
     Finding {
         severity: Severity::Warning,
-        blocker: Blocker::No,
+        blocker: if inert { Blocker::Yes } else { Blocker::No },
         plugin: label.to_string(),
         file: install_dir.to_path_buf(),
         line: None,
@@ -978,7 +999,11 @@ fn manifest_scan_findings(
             |(label, dir)| match marketplace_status(label, known_marketplaces) {
                 MarketplaceStatus::RemovedUpstream => {
                     let mut findings = scan_plugin_dir(label, dir, channel, false);
-                    findings.push(removed_upstream_finding(label, dir));
+                    let blockers =
+                        |f: &Vec<Finding>| f.iter().filter(|x| is_session_start_blocker(x)).count();
+                    let inert =
+                        blockers(&scan_plugin_dir(label, dir, channel, true)) > blockers(&findings);
+                    findings.push(removed_upstream_finding(label, dir, inert));
                     findings
                 }
                 MarketplaceStatus::DirectorySourced | MarketplaceStatus::Resolved => {
@@ -1487,6 +1512,7 @@ fn version_mismatch_finding(
     current_version: &str,
     days: u64,
     split_off_adhoc: bool,
+    wiring_known: bool,
 ) -> Finding {
     // Name the invocations, not just the count (#183). The count alone
     // leaves the operator auditing every installed plugin by hand; the
@@ -1564,11 +1590,24 @@ fn version_mismatch_finding(
     };
     Finding {
         severity: Severity::Warning,
-        blocker: Blocker::No,
+        // A named pair some hooks.json or settings.json wires is a hook that
+        // cannot run. The snippet carries no count, so the daily gate keys on
+        // the pairs and stays stable as the count rolls.
+        // Without collected wiring every pair counts as wired, hand-typed ones
+        // included, so only a wiring-backed pair may block.
+        blocker: if missing.is_empty() || !wiring_known {
+            Blocker::No
+        } else {
+            Blocker::YesUpgrade
+        },
         plugin: "cadence-metrics".to_string(),
         file: dir.to_path_buf(),
         line: None,
-        snippet: format!("version_mismatch: {}", count),
+        snippet: if missing.is_empty() {
+            format!("version_mismatch: {count}")
+        } else {
+            format!("version_mismatch (wired): {}", missing.join(", "))
+        },
         diagnosis: format!(
             "{} version_mismatch failopen(s) on this binary's own version \
              ({current_version}) in the last {days} days{adhoc_clause} — a \
@@ -1800,6 +1839,7 @@ fn failopen_findings_with_wiring(
                 current_version,
                 days,
                 !adhoc.is_empty(),
+                wiring.is_some(),
             ));
         }
     }
@@ -2227,7 +2267,8 @@ fn orphan_findings(
         if content_missing {
             findings.push(Finding {
                 severity: Severity::Warning,
-                blocker: Blocker::No,
+                // Nothing loads from an empty pin, hooks included.
+                blocker: Blocker::Yes,
                 plugin: label.clone(),
                 file: install_path.clone(),
                 line: None,
@@ -3032,6 +3073,10 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                         &installs,
                         &cadence_hooks_core::paths::claude_config_dir(),
                     ));
+                    demote_disabled_plugin_blockers(
+                        &mut findings,
+                        &cadence_hooks_core::paths::claude_config_dir(),
+                    );
                     // Project settings live at the repo root, not the cwd:
                     // `doctor` run from a subdirectory still reads them.
                     let project_root = std::env::current_dir().ok().map(|cwd| {
@@ -3206,7 +3251,14 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             .filter(|f| f.severity == Severity::Error)
             .count();
         let upgrade_fixes = blockers.iter().any(|f| f.blocker == Blocker::YesUpgrade);
-        let diagnoses: Vec<&str> = blockers.iter().map(|f| f.diagnosis.as_str()).collect();
+        // Keyed on plugin + snippet: both are count-free for every blocker
+        // class, where a diagnosis may carry rolling counts. Length-prefixed
+        // so the join has no in-band delimiter a plugin could forge.
+        let identities: Vec<String> = blockers
+            .iter()
+            .map(|f| format!("{}:{}{}", f.plugin.len(), f.plugin, f.snippet))
+            .collect();
+        let diagnoses: Vec<&str> = identities.iter().map(String::as_str).collect();
         print_quiet_blockers(
             n_errors,
             blockers.len() - n_errors,
@@ -3429,6 +3481,26 @@ mod tests {
     // entry is exactly the fingerprint the audit found: the metrics plugin was
     // absent from the map entirely and its loggers had been inert for months.
     #[test]
+    fn an_explicitly_disabled_plugin_never_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(
+            &config,
+            r#"{"enabledPlugins":{"off@workbench":false,"on@workbench":true}}"#,
+        );
+        let mut findings = vec![
+            hostile_finding("off@workbench"),
+            hostile_finding("on@workbench"),
+        ];
+        for f in &mut findings {
+            f.blocker = Blocker::YesUpgrade;
+        }
+        demote_disabled_plugin_blockers(&mut findings, &config);
+        assert_eq!(findings[0].blocker, Blocker::No, "its hooks are not wired");
+        assert_eq!(findings[1].blocker, Blocker::YesUpgrade);
+    }
+
+    #[test]
     fn absent_enabled_entry_is_a_finding() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config");
@@ -3439,6 +3511,11 @@ mod tests {
         let findings = unenabled_plugin_findings(&installs, &config);
         assert_eq!(findings.len(), 1, "the absent plugin must be reported");
         assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(
+            findings[0].blocker,
+            Blocker::Yes,
+            "none of its hooks can fire, so it blocks at session start"
+        );
         assert!(
             findings[0].diagnosis.contains("cadence-metrics@workbench"),
             "names the plugin: {}",
@@ -4445,6 +4522,16 @@ mod tests {
             .iter()
             .find(|f| f.severity == Severity::Warning)
             .expect("wired pairs keep the skew warning");
+        assert_eq!(
+            warning.blocker,
+            Blocker::YesUpgrade,
+            "a wired pair cannot run"
+        );
+        assert!(
+            !warning.snippet.chars().any(|c| c.is_ascii_digit()),
+            "the gate identity must carry no rolling count: {}",
+            warning.snippet
+        );
         assert!(
             warning.diagnosis.contains("lab gate"),
             "{}",
@@ -4522,6 +4609,11 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].diagnosis.contains("session list"));
+        assert_eq!(
+            findings[0].blocker,
+            Blocker::No,
+            "without wiring a hand-typed pair looks wired, so it must not block"
+        );
     }
 
     // A row with no pair is unclassified: it could be the wired invocation,
@@ -5035,6 +5127,7 @@ mod tests {
             "only the missing-dir warning fires quiet"
         );
         assert!(findings[0].diagnosis.contains("missing or empty"));
+        assert_eq!(findings[0].blocker, Blocker::Yes, "nothing loads from it");
     }
 
     #[test]
@@ -5298,6 +5391,11 @@ mod tests {
             &tmp.path().join("known_marketplaces.json"),
         );
 
+        assert_eq!(
+            findings.iter().map(|f| f.blocker).collect::<Vec<_>>(),
+            vec![Blocker::Yes],
+            "delisting must not silence wiring that cannot run"
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -5790,7 +5888,7 @@ mod tests {
             let f = first_scan_finding(cmd).unwrap_or_else(|| panic!("no finding for {cmd}"));
             (is_session_start_blocker(&f), f.blocker)
         };
-        let cases: [(&str, &str, Blocker); 5] = [
+        let cases: [(&str, &str, Blocker); 7] = [
             (
                 "shell-expansion error",
                 "'${CLAUDE_PLUGIN_ROOT}/hooks/run.sh' arg",
@@ -5812,6 +5910,16 @@ mod tests {
                 Blocker::Yes,
             ),
             (
+                "group member that is not a tool-event check",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group metrics/log-commit",
+                Blocker::Yes,
+            ),
+            (
+                "group member split by quoting",
+                "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group 'cadence/terminology",
+                Blocker::Yes,
+            ),
+            (
                 "group member not in ns/hook form",
                 "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group terminology",
                 Blocker::Yes,
@@ -5827,7 +5935,7 @@ mod tests {
             Path::new("hooks.json"),
             None,
         );
-        // Only meaningful if the extractor picked the name up at all.
+        assert!(!missing.is_empty(), "the extractor must see the CLI");
         for f in &missing {
             assert!(is_session_start_blocker(f), "missing CLI is a blocker");
         }
