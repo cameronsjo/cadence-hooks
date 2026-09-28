@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.108.0] - 2026-09-28
+
 ### Changed
 
 - **`doctor --quiet` reports only blockers at session start.** A blocker is a finding that means a wired hook is not running: a shell-expansion error; a wiring that names a subcommand or namespace the binary lacks, in a plugin `hooks.json`, in `settings.json`, or in a plugin removed upstream; a `group` entry the binary cannot parse or run; a hook whose CLI is not on `PATH`; a plugin that ships hooks with no `enabledPlugins` entry; or a pinned cache dir that is missing or empty. A plugin set to `false` never blocks, and neither does a project-scope install pinned for a different project. The quiet route prints one fixed envelope with counts and exits 2 only on errors. Hook latency, stale telemetry, orphaned cache dirs, and identity findings no longer print there; a full `cadence-hooks doctor` run reports them, and `cadence:outro` makes that run at session end. The old once-a-day nag hashed every warning's text, and the hook-latency warning embeds rolling counts, so it re-fired most sessions and asked for a triage of findings nobody could fix at session start. The daily gate now keys on each blocker's plugin and command, which carry no counts.
