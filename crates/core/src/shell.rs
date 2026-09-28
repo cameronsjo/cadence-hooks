@@ -1200,6 +1200,7 @@ struct GhPrInvocation<'a> {
 /// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
 /// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
 /// | `scan_ship_flags` (here) | value, every operand, pflag clusters, per-subcommand grammar, `--`-aware |
+/// | `pr_selector` (here) | skips the value via `read_flag_token` to find the PR positional, `--`-aware |
 /// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
 /// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
 /// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
@@ -1728,6 +1729,122 @@ pub fn ship_target(segment_tokens: &[String]) -> ShipTarget {
         host,
         head: combine_heads(&scan.heads),
     }
+}
+
+/// The PR a `gh pr <sub>` segment names as its positional argument
+/// (cadence-hooks#1028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrSelector {
+    /// No positional: gh picks the PR for the branch checked out in the cwd.
+    None,
+    /// A PR number, bare (`12`) or with gh's `#` prefix (`#12`).
+    Number(u64),
+    /// A pull-request URL. It names its own host and repo, so gh ignores
+    /// any `-R` for it.
+    Url {
+        host: String,
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    /// Anything else gh accepts, such as a branch name. Only gh can resolve it.
+    Other(String),
+    /// The positional cannot be told apart from a flag value: an unknown flag
+    /// came first, or the argument is a lone `-`.
+    Unreadable,
+}
+
+/// A PR number as gh accepts one: digits, optionally behind a `#`.
+static PR_NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^#?([0-9]+)$").expect("pattern should compile"));
+
+/// A pull-request URL: `https://HOST/OWNER/REPO/pull/NUMBER`, optionally
+/// followed by a sub-page (`/files`). Anchored at both ends. Public so a
+/// caller parsing gh's own `url` field reads it with the same pattern.
+pub static PR_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^https://([^/]+)/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$")
+        .expect("pattern should compile")
+});
+
+/// Read a PR URL into its host, owner, repo, and number, or `None` when
+/// `value` is not one ([`PR_URL_RE`]).
+pub fn pr_url_parts(value: &str) -> Option<(String, String, String, u64)> {
+    let caps = PR_URL_RE.captures(value)?;
+    Some((
+        caps[1].to_string(),
+        caps[2].to_string(),
+        caps[3].to_string(),
+        caps[4].parse().ok()?,
+    ))
+}
+
+/// The PR selector of a single `gh pr <sub>` segment (cadence-hooks#1028).
+/// A segment that is not a `gh pr` invocation yields [`PrSelector::None`].
+///
+/// The walk uses the same flag grammar as [`scan_ship_flags`]
+/// ([`flag_grammar`], [`read_flag_token`]), so a flag's value is never read
+/// as the selector: `-R o/r 5` and `-b 7 5` both select `5`. A `#` comment
+/// ends the walk, redirects are skipped, and after `--` the next token is the
+/// selector whatever it looks like. An unknown flag, or a lone `-`, makes the
+/// selector [`PrSelector::Unreadable`], because which later token is a value
+/// can no longer be told.
+///
+/// This reads one segment. A caller that passes only the first flip segment
+/// of a compound command (`gh pr ready 1 && gh pr merge 2`) examines only
+/// that one.
+pub fn pr_selector(segment_tokens: &[String]) -> PrSelector {
+    let Some(invocation) = gh_pr_invocation(segment_tokens) else {
+        return PrSelector::None;
+    };
+    let grammar = flag_grammar(invocation.subcommand);
+    let operands = invocation.operands;
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        if token == "#" {
+            break;
+        }
+        if token == "--" {
+            return operands
+                .get(i + 1)
+                .map_or(PrSelector::None, |t| classify_pr_selector(t));
+        }
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
+            continue;
+        }
+        if token == "-" {
+            return PrSelector::Unreadable;
+        }
+        if !token.starts_with('-') {
+            return classify_pr_selector(token);
+        }
+        let read = read_flag_token(grammar, token, operands.get(i + 1).map(String::as_str));
+        if read.taints_rest {
+            return PrSelector::Unreadable;
+        }
+        i += read.consumed;
+    }
+    PrSelector::None
+}
+
+/// Classify one positional token as a PR number, a PR URL, or anything else.
+fn classify_pr_selector(token: &str) -> PrSelector {
+    if let Some(caps) = PR_NUMBER_RE.captures(token) {
+        // A number too large for u64 is no PR gh can find; gh resolves it.
+        return caps[1]
+            .parse()
+            .map_or_else(|_| PrSelector::Other(token.to_string()), PrSelector::Number);
+    }
+    if let Some((host, owner, repo, number)) = pr_url_parts(token) {
+        return PrSelector::Url {
+            host,
+            owner,
+            repo,
+            number,
+        };
+    }
+    PrSelector::Other(token.to_string())
 }
 
 /// Collapse every `--head` spelling a segment carried into one [`ShipHead`].
@@ -6382,6 +6499,102 @@ mod tests {
         assert_eq!(target.repos, vec!["own/repo".to_string()]);
         let target = ship_target(&tokenize("gh pr merge -t -Rother/r"));
         assert!(target.repos.is_empty());
+    }
+
+    // --- pr_selector (cadence-hooks#1028) ---
+
+    fn selector_of(command: &str) -> PrSelector {
+        pr_selector(&tokenize(command))
+    }
+
+    #[test]
+    fn pr_selector_reads_a_bare_number() {
+        assert_eq!(selector_of("gh pr merge 5"), PrSelector::Number(5));
+        // Moved from the hook's old `pr_number_from_command` test.
+        assert_eq!(
+            selector_of("gh pr merge 42 --squash"),
+            PrSelector::Number(42)
+        );
+        assert_eq!(selector_of("gh pr ready 7"), PrSelector::Number(7));
+        assert_eq!(selector_of("gh pr merge --auto --squash"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_skips_the_repo_value_before_the_number() {
+        // The old whitespace scan stopped at `o/r` and read no number.
+        assert_eq!(selector_of("gh pr merge -R o/r 5"), PrSelector::Number(5));
+        assert_eq!(selector_of("gh pr merge 5 -R o/r"), PrSelector::Number(5));
+    }
+
+    #[test]
+    fn pr_selector_skips_another_flags_value() {
+        // `-b` is `--body` on merge: `7` is its value, `5` is the PR.
+        assert_eq!(selector_of("gh pr merge -b 7 5"), PrSelector::Number(5));
+    }
+
+    #[test]
+    fn pr_selector_none_without_a_positional() {
+        assert_eq!(selector_of("gh pr merge --squash"), PrSelector::None);
+        assert_eq!(selector_of("gh pr ready"), PrSelector::None);
+        assert_eq!(selector_of("git status"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_reads_the_token_after_double_dash() {
+        assert_eq!(selector_of("gh pr merge -- 5"), PrSelector::Number(5));
+        assert_eq!(
+            selector_of("gh pr merge -- -weird-branch"),
+            PrSelector::Other("-weird-branch".to_string())
+        );
+        assert_eq!(selector_of("gh pr merge --"), PrSelector::None);
+    }
+
+    #[test]
+    fn pr_selector_reads_a_pull_request_url() {
+        assert_eq!(
+            selector_of("gh pr merge https://github.com/o/r/pull/511/files"),
+            PrSelector::Url {
+                host: "github.com".to_string(),
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                number: 511,
+            }
+        );
+        // An issue URL is not a PR URL.
+        assert_eq!(
+            selector_of("gh pr merge https://github.com/o/r/issues/511"),
+            PrSelector::Other("https://github.com/o/r/issues/511".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_selector_reads_a_hash_prefixed_number() {
+        assert_eq!(selector_of("gh pr merge '#12'"), PrSelector::Number(12));
+    }
+
+    #[test]
+    fn pr_selector_reads_a_branch_as_other() {
+        assert_eq!(
+            selector_of("gh pr merge my-branch --squash"),
+            PrSelector::Other("my-branch".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_selector_unreadable_after_an_unknown_flag() {
+        // `--newflag` may take `x` as its value or not, so `x` or `5` could
+        // be the selector.
+        assert_eq!(
+            selector_of("gh pr merge --newflag x 5"),
+            PrSelector::Unreadable
+        );
+        assert_eq!(selector_of("gh pr merge -"), PrSelector::Unreadable);
+    }
+
+    #[test]
+    fn pr_selector_skips_redirects() {
+        assert_eq!(selector_of("gh pr ready 12 > log"), PrSelector::Number(12));
+        assert_eq!(selector_of("gh pr ready > log 12"), PrSelector::Number(12));
     }
 
     #[test]
