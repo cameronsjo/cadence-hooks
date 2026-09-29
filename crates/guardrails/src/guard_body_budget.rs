@@ -1303,7 +1303,9 @@ fn segment_writes_file(segment: &str, path: &str) -> bool {
     let operands = || rest[1..].iter().filter(|t| !t.starts_with('-'));
     match command_word(head).as_ref() {
         "tee" => operands().any(|t| same_file_name(t, path)),
-        "cp" | "mv" => operands().last().is_some_and(|t| same_file_name(t, path)),
+        "cp" | "mv" => operands()
+            .next_back()
+            .is_some_and(|t| same_file_name(t, path)),
         _ => false,
     }
 }
