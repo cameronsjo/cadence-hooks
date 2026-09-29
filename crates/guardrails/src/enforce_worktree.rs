@@ -172,7 +172,7 @@ use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
-    is_assignment_word, is_redirect_token, is_transparent_prefix_word, looks_absolute,
+    is_assignment_word, is_transparent_prefix_word, looks_absolute, redirect_operator_span,
     redirect_targets, resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
     split_segments_with_ops_joining_redirects, strip_compound_heads, strip_heredoc_bodies,
     tokenize, tokenize_marked, unescape_word,
@@ -1619,8 +1619,11 @@ fn cd_word(tokens: &[MarkedToken]) -> Option<CdWord> {
 }
 
 /// A redirection whose operator is unquoted — `'>x'` is a literal argument.
+///
+/// Unquoted through the whole OPERATOR — the descriptor and the `<`/`>` —
+/// not just its first byte: `2'>'x` is a file name (review I-c).
 fn is_unquoted_redirect(t: &MarkedToken) -> bool {
-    t.unquoted_prefix_len >= 1 && is_redirect_token(&t.text)
+    redirect_operator_span(&t.text).is_some_and(|(len, _)| t.unquoted_prefix_len >= len)
 }
 
 /// A redirection operator with no target attached (`>`, `2>`, `&>`, `<&`):
@@ -7567,6 +7570,75 @@ mod tests {
                 assert_eq!(
                     run_enforce(&input, &cfg(false, false)).outcome,
                     Outcome::Allow,
+                    "{cmd}"
+                );
+            }
+        }
+    }
+
+    // --- round-5 Important repros (I-a, I-b, I-c) ---
+
+    #[test]
+    fn a_negated_or_timed_case_and_a_paren_default_take_the_union_path() {
+        // I-a / I-b: each hid a keyword or a paren from the old scoping walk.
+        for cmd in [
+            "(! case a in a) true;; esac; cd /w); git commit -m x",
+            "(time -p case a in a) true;; esac; cd /w); git commit -m x",
+            "(cd /w; echo ${x:-(}); git commit -m x",
+        ] {
+            assert!(!is_plain_shape(cmd, "/p", CdEnv::new(None, false)), "{cmd}");
+            assert_eq!(sorted_targets(cmd, "/p"), vec!["/p", "/w"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_redirect_character_is_part_of_a_word() {
+        // I-c: `2'>'x` is a file name. Read as a redirection it was dropped,
+        // and `commit` became `-C`'s value, so no commit was seen at all.
+        for cmd in [
+            "git -C 2'>'x commit -m x",
+            "mkdir -p 2'>'x; git -C 2'>'x commit -m x",
+            "(git -C 2'>'x commit -m x)",
+            "git -C 2\">\"x commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/p"), vec!["/p/2>x"], "{cmd}");
+        }
+        // The unquoted operator is still a redirection.
+        assert_eq!(
+            sorted_targets("git -C /w 2>x commit -m x", "/p"),
+            vec!["/w"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round_five_important_repros_block_end_to_end() {
+        let scratch = scratch("round-five-important-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let w = wt.to_string_lossy().into_owned();
+        let p = primary.to_string_lossy().into_owned();
+        // The directory and link exist when the hook runs, as they do on any
+        // re-run; a path the command itself creates is not judged (see the
+        // let-through list).
+        std::fs::create_dir(primary.join("2>x")).unwrap();
+        std::os::unix::fs::symlink(&primary, wt.join("2>p")).unwrap();
+        let from_p = [
+            format!("(! case a in a) true;; esac; cd {w}); git commit -m x"),
+            format!("(time -p case a in a) true;; esac; cd {w}); git commit -m x"),
+            format!("(cd {w}; echo ${{x:-(}}); git commit -m x"),
+            "mkdir -p 2'>'x; git -C 2'>'x commit -m x".to_string(),
+        ];
+        let from_w = [
+            format!("ln -sfn {p} 2'>'p; git -C 2'>'p commit -m x"),
+            format!("ln -sfn {p} 2'>'p && (git -C 2'>'p commit -m x)"),
+        ];
+        for (cmds, cwd) in [(&from_p[..], &p), (&from_w[..], &w)] {
+            for cmd in cmds {
+                let mut input = make_bash(cmd);
+                input.cwd = Some(cwd.clone());
+                assert_eq!(
+                    run_enforce(&input, &cfg(false, false)).outcome,
+                    Outcome::Block,
                     "{cmd}"
                 );
             }

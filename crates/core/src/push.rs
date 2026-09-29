@@ -33,9 +33,8 @@
 
 use crate::shell::{
     COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
-    executable_tokens_marked, git_output_detailed, is_assignment_word, is_redirect_token,
-    peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
-    unescape_word,
+    executable_tokens_marked, git_output_detailed, is_assignment_word, peel_command_runners,
+    resolve_cd_target, split_segments_with_ops, strip_group_wrappers, unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -859,7 +858,7 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
 ///
 /// A redirect arrives as one token when its target is glued on (`>/dev/null`,
 /// `2>&1`) and as two when the operator stands alone (`> log`), so the standalone
-/// form consumes the word after it. [`is_redirect_token`] is core's own test for
+/// form consumes the word after it. [`crate::shell::is_redirect_token`] is core's own test for
 /// the operator, shared rather than re-spelled.
 /// [`strip_redirections`], but a token the shell QUOTED is never a redirection.
 ///
@@ -965,16 +964,8 @@ struct RedirectOperator {
 /// leading `&` where this strips every one, and only the gate keeps that from
 /// mattering.
 fn redirect_operator(word: &str) -> Option<RedirectOperator> {
-    if !is_redirect_token(word) {
-        return None;
-    }
-    let after_ampersands = word.trim_start_matches('&');
-    let after_digits = after_ampersands.trim_start_matches(|c: char| c.is_ascii_digit());
-    let after_operators = after_digits.trim_start_matches(['>', '<']);
-    Some(RedirectOperator {
-        len: word.len() - after_operators.len(),
-        is_whole_word: after_operators.is_empty(),
-    })
+    let (len, is_whole_word) = crate::shell::redirect_operator_span(word)?;
+    Some(RedirectOperator { len, is_whole_word })
 }
 
 fn strip_redirections(words: &[String]) -> Vec<&String> {

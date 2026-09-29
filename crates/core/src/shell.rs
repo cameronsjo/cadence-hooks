@@ -1596,6 +1596,26 @@ pub fn is_redirect_token(token: &str) -> bool {
     rest.starts_with('>') || rest.starts_with('<')
 }
 
+/// The byte length of `word`'s redirect OPERATOR — leading `&`s, a
+/// descriptor (digits or `{name}`), and the `>`/`<` run — and whether the
+/// operator is the whole word (its target is then the next word). `None` when
+/// `word` is not redirect-shaped ([`is_redirect_token`]).
+///
+/// A caller holding a [`MarkedToken`] must require the token's
+/// `unquoted_prefix_len` to reach this length: quote removal makes `2'>'x`
+/// (a literal file name) byte-identical to `2>x`, and only the operator's own
+/// quoting tells them apart (cadence-hooks#1058 review I-c).
+pub fn redirect_operator_span(word: &str) -> Option<(usize, bool)> {
+    if !is_redirect_token(word) {
+        return None;
+    }
+    let rest = word.trim_start_matches('&');
+    let rest = strip_named_fd(rest)
+        .unwrap_or_else(|| rest.trim_start_matches(|c: char| c.is_ascii_digit()));
+    let after = rest.trim_start_matches(['>', '<']);
+    Some((word.len() - after.len(), after.is_empty()))
+}
+
 /// `rest` after a leading `{ident}` descriptor name, or `None` when it has
 /// none.
 fn strip_named_fd(rest: &str) -> Option<&str> {
@@ -9794,5 +9814,20 @@ mod tests {
         );
         // The default splitter is unchanged.
         assert_eq!(split_segments_with_ops("a 2>&1").len(), 2);
+    }
+
+    #[test]
+    fn a_redirect_operator_spans_its_descriptor_and_angle_brackets() {
+        assert_eq!(redirect_operator_span("2>x"), Some((2, false)));
+        assert_eq!(redirect_operator_span("2>"), Some((2, true)));
+        assert_eq!(redirect_operator_span("&>>log"), Some((3, false)));
+        assert_eq!(redirect_operator_span("{fd}>/dev/null"), Some((5, false)));
+        assert_eq!(redirect_operator_span("2>&1"), Some((2, false)));
+        assert_eq!(redirect_operator_span("x>y"), None);
+        // `2'>'x` tokenizes to `2>x` with only `2` unquoted: the operator is
+        // quoted, so it is a word, not a redirection.
+        let marked = tokenize_marked("2'>'x");
+        let (len, _) = redirect_operator_span(&marked[0].text).unwrap();
+        assert!(marked[0].unquoted_prefix_len < len);
     }
 }
