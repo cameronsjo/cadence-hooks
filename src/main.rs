@@ -391,6 +391,8 @@ enum GuardrailsCommands {
     GuardGhDangerous,
     /// Block gh write operations to non-owned repos
     GuardGhWrite,
+    /// Block tea/glab write operations to non-owned repos
+    GuardForgeWrite,
     /// Nudge to scaffold and confirm license after git init or gh repo create
     GuardGitInit,
     /// Warn when editing on main/master branch
@@ -635,6 +637,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
             GuardrailsCommands::GuardGhDangerous => "guard-gh-dangerous",
             GuardrailsCommands::GuardGhWrite => "guard-gh-write",
+            GuardrailsCommands::GuardForgeWrite => "guard-forge-write",
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
@@ -857,6 +860,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::GuardGhWrite => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_gh_write::GhWriteGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardForgeWrite => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_forge_write::ForgeWriteGuard),
                 pre,
             ),
             GuardrailsCommands::GuardGitInit => CheckPlan::new(
@@ -1153,6 +1160,9 @@ fn print_hook_manifest(format: ManifestFormat) {
                         // joins its vendored snapshot on (plugin, name), so a new
                         // key is inert there.
                         "bypassExempt": bypass::is_bypass_exempt_hook(hook.name),
+                        // Additive: behavior under CLAUDE_CODE_REMOTE=true
+                        // (`run`, `self-disable`, `block-with-reason`).
+                        "remote": hook.remote.label(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1446,6 +1456,13 @@ fn main() {
             // runs, and there is nothing to say about it.
             BypassState::Enforced => {}
         }
+    }
+
+    // Cloud sessions (CLAUDE_CODE_REMOTE=true): apply the entry's declared
+    // remote policy. Ahead of any stdin read, so a self-disabled hook never
+    // touches its payload or its machine-local state (cadence-hooks#1197).
+    if let Some(name) = hook_name(&cli.command) {
+        registry::enforce_remote_policy(name);
     }
 
     // The canonical registry hook name for the dispatched subcommand, threaded

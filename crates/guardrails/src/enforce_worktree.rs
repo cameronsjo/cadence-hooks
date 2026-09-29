@@ -180,7 +180,7 @@ use cadence_hooks_core::shell::{
     is_transparent_prefix_word, looks_absolute, redirect_operator_span, redirect_targets,
     resolve_cd_target, skip_env_assignment_operands, skip_runner_flags, skip_transparent_prefixes,
     split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
-    strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    strip_heredoc_bodies, strip_verbatim_prefix, tokenize, tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -572,6 +572,11 @@ fn read_git_assignment<'a>(
 /// corrupted path and the guard failed open (`Allow`) on a commit that landed
 /// in the primary checkout.
 fn lexical_normalize(path: &str) -> String {
+    // A verbatim path (`\\?\C:\repo`) names the same place as `C:\repo`;
+    // left as written it reads as ONE relative segment and the fold never
+    // sees the drive (cadence-hooks#513).
+    let unverbatim = unverbatim(path);
+    let path = unverbatim.as_str();
     // A pure STRING fold — deliberately NOT a `Path`/`PathBuf` round-trip,
     // which would re-join with the PLATFORM separator and normalize a target
     // to a spelling the rest of the module (and the dismiss map keyed on
@@ -703,7 +708,20 @@ fn is_linked_worktree_admin_dir(path: &str) -> bool {
 /// `Path::is_absolute` stays as a belt-and-braces fallback for a native
 /// Windows form the string check doesn't cover (e.g. a UNC `\\server\share`).
 fn is_shell_absolute(path: &str) -> bool {
-    looks_absolute(path) || Path::new(path).is_absolute()
+    let path = unverbatim(path);
+    looks_absolute(&path) || Path::new(&path).is_absolute()
+}
+
+/// Rewrite a Windows verbatim path to its plain shell spelling before it is
+/// folded or classified: `\\?\C:\r` becomes `C:\r` (via the shared
+/// [`strip_verbatim_prefix`]) and `\\?\UNC\srv\share\r` becomes
+/// `//srv/share/r`, which the fold treats as absolute. Anything without the
+/// prefix is returned unchanged.
+fn unverbatim(path: &str) -> String {
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!("//{}", rest.replace('\\', "/")),
+        None => strip_verbatim_prefix(path),
+    }
 }
 
 /// Walk `command` once, returning both output channels: the `git commit`
@@ -8484,6 +8502,28 @@ mod tests {
             "repo//wt",
             "",
         ] {
+            // The verbatim spelling joins the table: it must classify like
+            // every other flavour of the same path.
+            for drive in ["C", "c"] {
+                let verbatim = format!(r"\\?\{drive}:\{}", body.replace('/', "\\"));
+                let plain = format!("{drive}:/{body}");
+                assert!(is_shell_absolute(&verbatim), "{verbatim:?}");
+                assert_eq!(
+                    lexical_normalize(&verbatim),
+                    lexical_normalize(&plain),
+                    "{verbatim:?}"
+                );
+                assert_eq!(
+                    normalize_target(&verbatim),
+                    normalize_target(&plain),
+                    "{verbatim:?}"
+                );
+                assert_eq!(
+                    is_linked_worktree_admin_dir(&verbatim),
+                    is_linked_worktree_admin_dir(&plain),
+                    "{verbatim:?}"
+                );
+            }
             let spellings = drive_spellings(body);
             let reference = &spellings[0];
             for spelling in &spellings {
@@ -8533,35 +8573,60 @@ mod tests {
         assert!(!is_shell_absolute("repo\\wt"));
     }
 
-    /// Characterizes, and does not endorse, how the fold treats a Windows
-    /// verbatim path (`\\?\C:\…`) today: it is not recognised as a drive path,
-    /// so it is read as one relative segment and returned as written. The
-    /// separator invariant above therefore does NOT extend to the verbatim
-    /// prefix (cameronsjo/cadence-hooks#513, ask 1). A change to this shows up
-    /// here as a diff, not as a CI surprise on a Windows runner.
+    /// A Windows verbatim path (`\\?\C:\…`) is the same location as the plain
+    /// drive path, so it folds to the same key and is absolute: without this a
+    /// `git -C '\\?\C:\repo' commit` joined onto the cwd and the real target
+    /// was never assessed, a fail-open (cameronsjo/cadence-hooks#513). A
+    /// verbatim UNC path folds like the `//server/share` spelling.
     #[test]
-    fn verbatim_prefix_paths_are_not_folded_today() {
-        for verbatim in [
-            r"\\?\C:\repo\.git",
-            r"\\?\c:\repo\wt",
-            r"\\?\UNC\server\share\repo",
+    fn verbatim_prefix_paths_fold_like_their_plain_spelling() {
+        for (verbatim, plain) in [
+            (r"\\?\C:\repo\.git", r"C:\repo\.git"),
+            (r"\\?\c:\repo\wt", r"c:/repo/wt"),
+            (r"\\?\C:\repo\.git\worktrees\..", r"C:/repo/.git"),
+            (r"\\?\C:\Repo\a\..\b", r"c:\repo\b"),
+            (r"\\?\UNC\server\share\repo", "//server/share/repo"),
+            (
+                r"\\?\UNC\server\share\repo\.git\worktrees\x",
+                "//server/share/repo/.git/worktrees/x",
+            ),
         ] {
+            let context = format!("{verbatim:?} vs {plain:?}");
+            assert!(is_shell_absolute(verbatim), "{context}");
             assert_eq!(
                 lexical_normalize(verbatim),
-                verbatim,
-                "the verbatim spelling is returned unfolded"
+                lexical_normalize(plain),
+                "{context}"
             );
-            assert_ne!(
-                lexical_normalize(verbatim),
-                lexical_normalize(&verbatim.replacen(r"\\?\", "", 1)),
-                "and so differs from the same path without the prefix: {verbatim}"
+            assert_eq!(
+                normalize_target(verbatim),
+                normalize_target(plain),
+                "{context}"
             );
-            assert!(!is_linked_worktree_admin_dir(verbatim));
+            assert_eq!(
+                is_linked_worktree_admin_dir(verbatim),
+                is_linked_worktree_admin_dir(plain),
+                "{context}"
+            );
+            assert!(!lexical_normalize(verbatim).contains('\\'), "{context}");
+            assert!(!lexical_normalize(verbatim).contains('?'), "{context}");
         }
+        assert_eq!(lexical_normalize(r"\\?\C:\repo"), "c:/repo");
+        assert_eq!(lexical_normalize(r"\\?\UNC\srv\share\r"), "/srv/share/r");
+        assert!(is_linked_worktree_admin_dir(
+            r"\\?\C:\repo\.git\worktrees\x"
+        ));
+        assert!(!is_linked_worktree_admin_dir(
+            r"\\?\C:\repo\.git\worktrees\.."
+        ));
         assert_eq!(
             git_commit_targets(r"git -C '\\?\C:\repo' commit -m x", "/cwd"),
-            vec![r"/cwd/\\?\C:\repo".to_string(), "/cwd".to_string()]
+            vec!["c:/repo".to_string(), "/cwd".to_string()]
         );
+        // Controls: `\\?\` is only a prefix; text later in a path, or a bare
+        // `\\?` with no drive after it, is not stripped into something else.
+        assert_eq!(lexical_normalize("/a/b"), "/a/b");
+        assert!(!is_shell_absolute(r"repo\?\C:\x"));
     }
 
     #[test]

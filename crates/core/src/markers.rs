@@ -21,10 +21,10 @@
 use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::{
-    LocatedSegment, ShipHead, ShipSegment, ShipTarget, command_segments, git_command,
-    merge_anchor_repo_targets_in, origin_triple, parse_work_dir, polish_ship_segments_for_origin,
-    polish_ship_segments_in, remote_host_and_slug, repo_value_names_remote, segment_work_dirs,
-    strip_group_wrappers,
+    LocatedSegment, ShipHead, ShipSegment, ShipTarget, UNRESOLVABLE_DIR, command_segments,
+    git_command, merge_anchor_repo_targets_in, origin_triple, parse_work_dir,
+    polish_ship_segments_for_origin, polish_ship_segments_in, remote_host_and_slug,
+    repo_value_names_remote, segment_work_dirs, ships_in_cd_wrappers, strip_group_wrappers,
 };
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
@@ -570,7 +570,28 @@ pub fn located_ship_segments(command: &str, cwd: Option<&str>) -> Vec<LocatedShi
             })
             .collect();
     let per_segment = per_segment_ships(&segments, cwd, &mut origins);
-    dedup_ships(merge_in_command_order(whole, per_segment))
+    let mut ships = merge_in_command_order(whole, per_segment);
+    mark_cd_wrapper_ships(&mut ships, command, cwd);
+    dedup_ships(ships)
+}
+
+/// A ship inside a `sh -c` wrapper whose script `cd`s away from the outer
+/// resolution is judged in a directory nobody resolved, so its work_dir is
+/// [`UNRESOLVABLE_DIR`] and the gate says "cannot check" rather than judging
+/// the wrong checkout (cadence-hooks#448). Nudge path, never a block.
+fn mark_cd_wrapper_ships(ships: &mut [LocatedShip], command: &str, cwd: &str) {
+    let mut wrapped = Vec::new();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        wrapped.extend(ships_in_cd_wrappers(&raw, &dir));
+    }
+    if wrapped.is_empty() {
+        return;
+    }
+    for ship in ships.iter_mut() {
+        if wrapped.contains(&ship.segment) {
+            ship.work_dir = Some(UNRESOLVABLE_DIR.to_string());
+        }
+    }
 }
 
 /// One command and its [`command_segments`], so a text that IS the whole
@@ -3768,6 +3789,48 @@ mod tests {
         ];
         for (command, want) in cases {
             assert_eq!(located(command), some(want), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_ship_inside_a_cd_wrapper_is_unresolvable() {
+        // cameronsjo/cadence-hooks#448: the resolver cannot see the wrapper's
+        // `cd`, so the ship is not judged against the outer directory.
+        for command in [
+            "sh -c 'cd /some/worktree && gh pr create --title x'",
+            "bash -c 'cd /w; gh pr create -t x'",
+            "env FOO=1 sh -c 'cd ../other && gh pr create -t x'",
+            "sh -c \"sh -c 'cd /w && gh pr create -t x'\"",
+            "cd /a && bash -c 'cd /b && gh pr ready'",
+        ] {
+            let ships = located_ship_segments(command, Some("/cwd"));
+            assert!(!ships.is_empty(), "{command}");
+            for ship in &ships {
+                assert_eq!(
+                    ship.work_dir.as_deref(),
+                    Some(UNRESOLVABLE_DIR),
+                    "{command}: {ship:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ship_in_a_wrapper_without_a_cd_keeps_its_directory() {
+        for command in [
+            "sh -c 'gh pr create -t x'",
+            "cd /a && sh -c 'gh pr create -t x'",
+            "cd /a && bash -c 'cd /a && gh pr create -t x'",
+            "cd /w && gh pr create -t x",
+        ] {
+            let ships = located_ship_segments(command, Some("/cwd"));
+            assert!(!ships.is_empty(), "{command}");
+            assert!(
+                ships
+                    .iter()
+                    .all(|s| s.work_dir.as_deref() != Some(UNRESOLVABLE_DIR)),
+                "{command}: {ships:?}"
+            );
         }
     }
 

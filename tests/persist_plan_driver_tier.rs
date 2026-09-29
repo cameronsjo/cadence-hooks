@@ -29,6 +29,7 @@ fn cadence_hooks(metrics_dir: &std::path::Path, config_dir: &std::path::Path) ->
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_REMOTE");
     cmd.env_remove("CADENCE_NO_PERSIST_PLAN");
     // The destination resolver (cadence-hooks#1021) reads the session root
     // from `CLAUDE_PROJECT_DIR` and falls back to `<config_dir>/cadence/plans`.

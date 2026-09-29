@@ -1818,6 +1818,17 @@ pub fn looks_absolute(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// Strip the Windows verbatim prefix `canonicalize` emits, so its output
+/// compares against the plain paths a hook payload carries: `\\?\C:\x`
+/// becomes `C:\x` and `\\?\UNC\srv\share` becomes `\\srv\share`. Pure string
+/// logic, so it is exercised on every platform.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
 /// Strip shell grouping (`(`/`{` … `)`/`}`) from a segment so `(git commit)`,
 /// `{ git commit; }`, and `( gh pr create )` surface their real command word
 /// rather than a bare `(`/`{` token. [`tokenize`] treats the punctuation as
@@ -5020,6 +5031,51 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
         }
     }
     effective
+}
+
+/// Ship anchors that sit inside a `sh -c`/`bash -c` wrapper whose script `cd`s
+/// somewhere [`parse_work_dir`] of the outer command does not see
+/// (cameronsjo/cadence-hooks#448). `parse_work_dir` is a raw-string scan and
+/// does not descend into a wrapper, so the ship is detected but judged
+/// against the outer directory; a caller marks these ships unresolvable
+/// ([`UNRESOLVABLE_DIR`]) and says "cannot check" instead. Nudge path only.
+///
+/// `dir` is the directory the outer command runs the wrapper in. A script is
+/// flagged when its own [`parse_work_dir`] differs from `dir` (any `cd` in it,
+/// in any position: the over-flag side is a "cannot check", never a miss).
+/// Nested wrappers are followed to a fixed depth; past it a wrapper that
+/// still holds a `cd` is flagged. Pure.
+pub fn ships_in_cd_wrappers(command: &str, dir: &str) -> Vec<ShipSegment> {
+    let mut out = Vec::new();
+    collect_cd_wrapper_ships(command, dir, 0, &mut out);
+    out
+}
+
+fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Vec<ShipSegment>) {
+    const MAX_DEPTH: usize = 4;
+    for segment in split_segments(command) {
+        let tokens = executable_tokens(strip_group_wrappers(&segment));
+        let Some(script) = shell_c_argument_tokens(&tokens) else {
+            continue;
+        };
+        if !matches!(
+            command_word(
+                peel_command_runners(strip_compound_heads(&tokens))
+                    .first()
+                    .map_or("", String::as_str)
+            )
+            .as_ref(),
+            "sh" | "bash" | "zsh" | "dash"
+        ) {
+            continue;
+        }
+        if parse_work_dir(&script, dir) != dir || (depth >= MAX_DEPTH && script.contains("cd")) {
+            out.extend(polish_ship_segments_for_origin(&script, None));
+        }
+        if depth < MAX_DEPTH {
+            collect_cd_wrapper_ships(&script, dir, depth + 1, out);
+        }
+    }
 }
 
 /// The root of the checkout `dir` is in (after an optional `git -C <dir>`),
@@ -11663,7 +11719,7 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
-fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
+pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),

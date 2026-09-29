@@ -65,6 +65,7 @@
 //! [`BYPASS_EXEMPT_HOOKS`]: cadence_hooks_core::bypass::BYPASS_EXEMPT_HOOKS
 
 use cadence_hooks_core::bypass::{self, BypassState, PROTECTED_GUARDS};
+use cadence_hooks_core::remote;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// The registry name, shared with `bypass::BYPASS_EXEMPT_HOOKS` and
@@ -129,19 +130,49 @@ pub fn armed_switches_line(lookup: impl Fn(&str) -> Option<String>) -> Option<St
     ))
 }
 
+/// The allowlist that arms the push and `gh` write guards.
+pub const ALLOWED_OWNERS_VAR: &str = "CADENCE_ALLOWED_OWNERS";
+
+/// The one-line cloud-session status (cameronsjo/cadence-hooks#1197), or `None`
+/// outside a cloud session. `ARMED` when the owner allowlist is non-empty,
+/// `INERT` otherwise, because without it the push guards refuse every push.
+/// It reports the state at session start only. Under `CADENCE_BYPASS=1` it is
+/// withheld: the bypass report already says every guard is off, and ARMED
+/// would contradict it.
+#[must_use]
+pub fn remote_status_line(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if !remote::is_remote_from(lookup(remote::REMOTE_VAR).as_deref()) {
+        return None;
+    }
+    if bypass::bypass_engaged_from(lookup(bypass::BYPASS_VAR).as_deref()) {
+        return None;
+    }
+    let configured = lookup(ALLOWED_OWNERS_VAR).is_some_and(|v| !v.trim().is_empty());
+    Some(if configured {
+        format!("cadence-hooks: ARMED v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        "cadence-hooks: INERT (allowed owners not configured)".to_string()
+    })
+}
+
 /// The full SessionStart report for an environment lookup: the bypass/disable
-/// report and the armed-switch line, newline-joined; `None` when both are silent.
+/// report, the armed-switch line and the cloud status line, newline-joined;
+/// `None` when all are silent.
 #[must_use]
 pub fn report_for_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     let base = report_from(
         lookup(bypass::BYPASS_VAR).as_deref(),
         lookup(bypass::DISABLE_VAR).as_deref(),
     );
-    let armed = armed_switches_line(&lookup);
-    match (base, armed) {
-        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-        (a, b) => a.or(b),
-    }
+    let lines: Vec<String> = [
+        base,
+        armed_switches_line(&lookup),
+        remote_status_line(&lookup),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The report for explicit variable values, or `None` when there is nothing
@@ -211,6 +242,91 @@ impl Check for EnforcementStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn remote_status_line_table() {
+        let armed = format!("cadence-hooks: ARMED v{}", env!("CARGO_PKG_VERSION"));
+        let inert = "cadence-hooks: INERT (allowed owners not configured)";
+        type Env<'a> = &'a [(&'a str, &'a str)];
+        let cases: &[(Env, Option<&str>)] = &[
+            // not remote: silent, whatever the owners say
+            (&[], None),
+            (&[("CADENCE_ALLOWED_OWNERS", "me")], None),
+            (
+                &[
+                    ("CLAUDE_CODE_REMOTE", "1"),
+                    ("CADENCE_ALLOWED_OWNERS", "me"),
+                ],
+                None,
+            ),
+            (&[("CLAUDE_CODE_REMOTE", "false")], None),
+            // remote
+            (&[("CLAUDE_CODE_REMOTE", "true")], Some(inert)),
+            (
+                &[
+                    ("CLAUDE_CODE_REMOTE", "true"),
+                    ("CADENCE_ALLOWED_OWNERS", ""),
+                ],
+                Some(inert),
+            ),
+            (
+                &[
+                    ("CLAUDE_CODE_REMOTE", "true"),
+                    ("CADENCE_ALLOWED_OWNERS", "  "),
+                ],
+                Some(inert),
+            ),
+            (
+                &[
+                    ("CLAUDE_CODE_REMOTE", "true"),
+                    ("CADENCE_ALLOWED_OWNERS", "me"),
+                ],
+                Some(&armed),
+            ),
+        ];
+        for (pairs, want) in cases {
+            assert_eq!(
+                remote_status_line(env(pairs)).as_deref(),
+                *want,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_status_line_is_withheld_under_the_blanket_bypass() {
+        let pairs = [
+            ("CLAUDE_CODE_REMOTE", "true"),
+            ("CADENCE_ALLOWED_OWNERS", "me"),
+            ("CADENCE_BYPASS", "1"),
+        ];
+        assert_eq!(remote_status_line(env(&pairs)), None);
+        let report = report_for_env(env(&pairs)).expect("the bypass still reports");
+        assert!(!report.contains("ARMED"), "{report}");
+    }
+
+    #[test]
+    fn remote_status_line_joins_the_other_reports() {
+        let pairs = [
+            ("CLAUDE_CODE_REMOTE", "true"),
+            ("CADENCE_DISABLE", "trash-guard"),
+        ];
+        let report = report_for_env(env(&pairs)).expect("reports");
+        assert!(report.contains("refused"), "{report}");
+        assert!(
+            report.ends_with("cadence-hooks: INERT (allowed owners not configured)"),
+            "{report}"
+        );
+    }
 
     #[test]
     fn every_report_leads_with_the_fixed_prefix() {
