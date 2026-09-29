@@ -289,7 +289,18 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
     // input, which still carries every field that did parse.
     let unreadable = input.unreadable_operation_fields();
     if !unreadable.is_empty() && any_security_critical(hook_names) {
-        // Static field names only (`core::TOOL_INPUT_KEYS`), never values.
+        // Static field names only (`core::TOOL_INPUT_KEYS`), never values, so
+        // the row keeps the ledger's no-payload posture.
+        let fields = unreadable.join(", ");
+        for hook_name in hook_names {
+            cadence_hooks_metrics::log_failopen(
+                "unreadable_input",
+                crate::registry::namespace_of(hook_name),
+                Some(hook_name),
+                env!("CARGO_PKG_VERSION"),
+                Some(&format!("wrong type: {fields}")),
+            );
+        }
         eprintln!("{}", unreadable_operation_message(&unreadable));
         process::exit(2);
     }

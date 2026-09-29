@@ -3816,7 +3816,9 @@ fn kill_process_group(child: &std::process::Child) {
     let Ok(pgid) = i32::try_from(child.id()) else {
         return;
     };
-    if pgid <= 0 {
+    // 0 would signal this process's own group, 1 is init, and a negative
+    // value is not a pid at all.
+    if pgid <= 1 {
         return;
     }
     // SAFETY: kill(2) takes plain integers and touches no memory. A negative

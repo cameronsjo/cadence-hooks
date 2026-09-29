@@ -17,7 +17,7 @@ use cadence_hooks_core::shell::{
 use cadence_hooks_core::time::{now_unix_seconds, rfc3339_unix_seconds};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-use crate::bounded_tool::DeadlineGhRunner;
+use crate::bounded_tool::{DeadlineGhRunner, FLOW_CALL_CAP};
 
 /// How long after `mergedAt` the merge flow still acts. A `gh pr merge` on a
 /// PR merged longer ago than this is a re-run, not the merge itself.
@@ -213,16 +213,28 @@ pub trait Clock {
     fn sleep_secs(&self, secs: u64);
     /// The current time, in seconds since the Unix epoch.
     fn now_unix(&self) -> i64;
+    /// Time left before the flow's deadline ([`FLOW_BUDGET`] after the check
+    /// started). A sleep that would leave less than one bounded `gh` call
+    /// after it is skipped (cadence-hooks#986).
+    fn remaining(&self) -> std::time::Duration;
 }
 
 // ---------------------------------------------------------------------------
 // Real I/O implementations
 // ---------------------------------------------------------------------------
 
-/// Production clock: delegates to `std::thread::sleep`.
-pub struct RealClock;
+/// Production clock: delegates to `std::thread::sleep`, and measures the time
+/// left against the flow deadline `until`.
+pub struct RealClock {
+    pub until: std::time::Instant,
+}
 
 impl Clock for RealClock {
+    fn remaining(&self) -> std::time::Duration {
+        self.until
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
     fn sleep_secs(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
@@ -438,18 +450,27 @@ pub fn handle_merge(
     // Check early, and skip the rest of the wait only when every ref is
     // already CLOSED. `Missing` (which a `gh` failure also returns) never
     // counts as closed, so a failed read falls through to the full wait.
+    //
+    // Every sleep must leave room for at least one bounded `gh` call before
+    // the flow deadline, or the hook would sleep into the external hooks.json
+    // timeout and be killed silently. When it would not, the flow gives up
+    // here instead (cadence-hooks#986 review I1).
     let early = EARLY_CHECK_SECS.min(wait_secs);
     if early > 0 && early < wait_secs {
-        clock.sleep_secs(early);
+        if !sleep_within_flow(clock, early) {
+            return None;
+        }
         let all_closed = refs
             .iter()
             .all(|issue| fetch_issue_state(gh, *issue, slug) == IssueState::Closed);
         if all_closed {
             return None;
         }
-        clock.sleep_secs(wait_secs - early);
-    } else if wait_secs > 0 {
-        clock.sleep_secs(wait_secs);
+        if !sleep_within_flow(clock, wait_secs - early) {
+            return None;
+        }
+    } else if wait_secs > 0 && !sleep_within_flow(clock, wait_secs) {
+        return None;
     }
 
     let short_sha = if merge_sha.len() >= 7 {
@@ -525,6 +546,30 @@ fn current_branch_pr(gh: &dyn GhRunner, origin_host: &str, slug: &str) -> Option
         &slug.to_ascii_lowercase(),
     );
     (names_origin && url_number == number).then_some(number)
+}
+
+/// Sleep `secs` when the flow deadline still leaves one bounded `gh` call
+/// ([`FLOW_CALL_CAP`]) after it; otherwise sleep nothing and return false.
+fn sleep_within_flow(clock: &dyn Clock, secs: u64) -> bool {
+    let needed = std::time::Duration::from_secs(secs) + FLOW_CALL_CAP;
+    if clock.remaining() < needed {
+        cadence_hooks_core::deadline::note_hit_by("gh");
+        return false;
+    }
+    clock.sleep_secs(secs);
+    true
+}
+
+/// The most `GH_AUTOCLOSE_WAIT_SECONDS` may ask for. A longer wait could not
+/// leave room for the checks after it inside [`FLOW_BUDGET`].
+const MAX_WAIT_SECS: u64 = 15;
+
+/// Read `GH_AUTOCLOSE_WAIT_SECONDS`: unset or unparseable is the 10 s
+/// default, and a larger value clamps to [`MAX_WAIT_SECS`].
+fn wait_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(10)
+        .min(MAX_WAIT_SECS)
 }
 
 // ---------------------------------------------------------------------------
@@ -615,11 +660,10 @@ impl Check for VerifyPrAutoclose {
                 .collect(),
             until: started + FLOW_BUDGET,
         };
-        let clock = RealClock;
-        let wait_secs: u64 = std::env::var("GH_AUTOCLOSE_WAIT_SECONDS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+        let clock = RealClock {
+            until: started + FLOW_BUDGET,
+        };
+        let wait_secs = wait_secs_from(std::env::var("GH_AUTOCLOSE_WAIT_SECONDS").ok().as_deref());
 
         let message = match flow {
             Flow::Create => {
@@ -988,6 +1032,8 @@ mod tests {
     struct FakeClock {
         sleep_calls: RefCell<Vec<u64>>,
         now: i64,
+        /// Time left in the flow; each sleep spends from it.
+        remaining: std::cell::Cell<std::time::Duration>,
     }
 
     impl FakeClock {
@@ -996,6 +1042,7 @@ mod tests {
             Self {
                 sleep_calls: RefCell::new(Vec::new()),
                 now: rfc3339_unix_seconds("2026-09-25T00:01:00Z").unwrap(),
+                remaining: std::cell::Cell::new(FLOW_BUDGET),
             }
         }
 
@@ -1010,10 +1057,56 @@ mod tests {
     impl Clock for FakeClock {
         fn sleep_secs(&self, secs: u64) {
             self.sleep_calls.borrow_mut().push(secs);
+            let left = self.remaining.get();
+            self.remaining
+                .set(left.saturating_sub(std::time::Duration::from_secs(secs)));
         }
 
         fn now_unix(&self) -> i64 {
             self.now
+        }
+
+        fn remaining(&self) -> std::time::Duration {
+            self.remaining.get()
+        }
+    }
+
+    /// cadence-hooks#986 review I1: no sleep may run into the flow deadline.
+    /// (time left, sleeps taken, closes #5, why)
+    #[test]
+    fn merge_wait_never_sleeps_past_the_flow_deadline() {
+        let cases: &[(u64, &[u64], bool, &str)] = &[
+            (25, &[2, 8], true, "a full budget pays the whole wait"),
+            (
+                15,
+                &[2],
+                false,
+                "the rest of the wait would leave no room for a call",
+            ),
+            (9, &[], false, "not even the early check fits"),
+        ];
+        for (left, sleeps, closes, why) in cases {
+            let gh = FakeGh::new()
+                .with_pr_body("Closes #5")
+                .with_issue(5, "OPEN");
+            let clock = FakeClock::new();
+            clock.remaining.set(std::time::Duration::from_secs(*left));
+            let msg = handle_merge("owner/repo", None, "gh pr merge 8", &gh, &clock, 10);
+            assert_eq!(*clock.sleep_calls.borrow(), *sleeps, "{why}");
+            assert_eq!(msg.is_some(), *closes, "{why}");
+        }
+    }
+
+    #[test]
+    fn wait_seconds_default_and_clamp() {
+        for (raw, expected) in [
+            (None, 10),
+            (Some("3"), 3),
+            (Some("0"), 0),
+            (Some("junk"), 10),
+            (Some("600"), MAX_WAIT_SECS),
+        ] {
+            assert_eq!(wait_secs_from(raw), expected, "{raw:?}");
         }
     }
 

@@ -13,6 +13,12 @@ use std::process::Stdio;
 
 /// Pipe `payload` to `<namespace> <hook>` and return `(exit code, stderr)`.
 fn run_hook(args: &[&str], payload: &str) -> (Option<i32>, String) {
+    let (code, stderr, _) = run_hook_with_ledger(args, payload);
+    (code, stderr)
+}
+
+/// [`run_hook`], also returning the raw `failopen.jsonl` text ("" when none).
+fn run_hook_with_ledger(args: &[&str], payload: &str) -> (Option<i32>, String, String) {
     let metrics = tempfile::tempdir().expect("temp metrics dir");
     let markers = tempfile::tempdir().expect("temp marker dir");
     let output = support::cadence_hooks()
@@ -36,9 +42,11 @@ fn run_hook(args: &[&str], payload: &str) -> (Option<i32>, String) {
             child.wait_with_output()
         })
         .expect("run hook");
+    let ledger = std::fs::read_to_string(metrics.path().join("failopen.jsonl")).unwrap_or_default();
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
+        ledger,
     )
 }
 
@@ -67,7 +75,28 @@ fn mistyped_tool_input_is_judged_not_waved_through() {
             "Bash",
             serde_json::json!({"command": ["git", "reset", "--hard"]}),
             2,
-            "an array command cannot be read, so it blocks",
+            "an argv-array command is joined and judged",
+        ),
+        (
+            "git-safety",
+            "Bash",
+            serde_json::json!({"command": ["ls", "-la"]}),
+            0,
+            "a harmless argv-array command is joined and allowed",
+        ),
+        (
+            "git-safety",
+            "Bash",
+            serde_json::json!({"command": ["git", "reset", 5]}),
+            2,
+            "an array with a non-string element cannot be read, so it blocks",
+        ),
+        (
+            "prevent-secret-writes",
+            "Edit",
+            serde_json::json!({"file_path": "notes.txt", "old_string": "a", "new_string": "b", "replace_all": "true"}),
+            0,
+            "a string replace_all is read, not a block",
         ),
         (
             "git-safety",
@@ -132,6 +161,38 @@ fn mistyped_tool_input_is_judged_not_waved_through() {
     }
 }
 
+/// A mistyped top-level field no longer fails the whole parse and exits 0
+/// with the command unjudged (review N4). (payload, expected exit, why)
+#[test]
+fn mistyped_top_level_field_does_not_skip_the_guard() {
+    let cases: &[(&str, i32, &str)] = &[
+        (
+            r#"{"tool_name":"Bash","cwd":5,"tool_input":{"command":"git reset --hard"}}"#,
+            2,
+            "a numeric cwd is dropped and the command judged",
+        ),
+        (
+            r#"{"tool_name":"Bash","session_id":{},"tool_input":{"command":"git reset --hard"}}"#,
+            2,
+            "an object session_id is dropped and the command judged",
+        ),
+        (
+            r#"{"tool_name":5,"tool_input":{"command":"git reset --hard"}}"#,
+            2,
+            "without a readable tool_name the operation cannot be judged",
+        ),
+        (
+            r#"{"tool_name":"Bash","cwd":5,"tool_input":{"command":"ls"}}"#,
+            0,
+            "a harmless command with a numeric cwd still allows",
+        ),
+    ];
+    for (payload, expected, why) in cases {
+        let (code, stderr) = run_hook(&["cadence", "git-safety"], payload);
+        assert_eq!(code, Some(*expected), "{why}: {stderr}");
+    }
+}
+
 /// A non-critical hook runs on the salvaged input instead of blocking, so a
 /// mistyped field never turns an advisory hook into an enforcement point.
 #[test]
@@ -148,15 +209,27 @@ fn block_message_names_the_field_not_the_value() {
     let payload = serde_json::json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": [secret]},
+        "tool_input": {"command": [secret, 5]},
         "cwd": "/",
     })
     .to_string();
-    let (code, stderr) = run_hook(&["cadence", "git-safety"], &payload);
+    let (code, stderr, ledger) = run_hook_with_ledger(&["cadence", "git-safety"], &payload);
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
         stderr.contains("command present with the wrong type"),
         "{stderr}"
     );
     assert!(!stderr.contains(secret), "{stderr}");
+    // Review N1: the block leaves an `unreadable_input` row naming the field.
+    let rows: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("jsonl row"))
+        .collect();
+    assert!(
+        rows.iter().any(|row| row["reason"] == "unreadable_input"
+            && row["subcommand"] == "git-safety"
+            && row["error"] == "wrong type: command"),
+        "{ledger}"
+    );
+    assert!(!ledger.contains(secret), "{ledger}");
 }

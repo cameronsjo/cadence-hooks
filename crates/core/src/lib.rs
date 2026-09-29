@@ -333,6 +333,11 @@ pub struct HookInput {
     /// (a string, array, number, or bool). Derived, never deserialized.
     #[serde(skip)]
     pub tool_input_non_object: bool,
+    /// Top-level payload keys that were present but failed their typed shape,
+    /// and so were dropped while the rest of the payload parsed (see
+    /// [`salvage_top_level`]). Derived, never deserialized.
+    #[serde(skip)]
+    pub mistyped_top_level: Vec<&'static str>,
 }
 
 /// `tool_input` keys that carry the operation a guard judges, for a
@@ -359,7 +364,6 @@ const FILE_OPERATION_KEYS: &[&str] = &[
     "content",
     "new_string",
     "old_string",
-    "replace_all",
     "edits",
     "tool_input",
 ];
@@ -395,6 +399,8 @@ pub struct ToolInput {
     pub new_string: Option<String>,
     pub old_string: Option<String>,
     /// Edit tool: replace every occurrence of `old_string` (default: first only).
+    /// Lenient: see [`lenient_bool`].
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub replace_all: Option<bool>,
     /// MultiEdit tool: sequence of edit operations applied in order.
     pub edits: Option<Vec<EditOperation>>,
@@ -446,6 +452,8 @@ pub struct ToolInput {
 pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
+    /// Lenient: see [`lenient_bool`].
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub replace_all: Option<bool>,
 }
 
@@ -455,6 +463,7 @@ pub struct EditOperation {
 pub struct AskQuestion {
     pub question: Option<String>,
     pub header: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub multi_select: Option<bool>,
     pub options: Option<Vec<AskOption>>,
 }
@@ -616,30 +625,136 @@ fn salvage_tool_input(value: &mut serde_json::Value) -> Vec<&'static str> {
     let Some(serde_json::Value::Object(map)) = value.get_mut("tool_input") else {
         return Vec::new();
     };
-    if ToolInput::deserialize(&serde_json::Value::Object(map.clone())).is_ok() {
+    for key in ["command", "cmd"] {
+        if let Some(field) = map.get_mut(key)
+            && let Some(joined) = join_argv(field)
+        {
+            *field = serde_json::Value::String(joined);
+        }
+    }
+    salvage_fields::<ToolInput>(map, TOOL_INPUT_KEYS, "tool_input")
+}
+
+/// Drop every key of `map` whose value fails `T`'s typed shape on its own,
+/// returning the dropped keys as static names from `known` (`whole` for a key
+/// outside it). When the map still fails with nothing left to drop (duplicate
+/// aliases), `whole` is returned too. A map that already parses is untouched.
+fn salvage_fields<T: serde::de::DeserializeOwned>(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    known: &[&'static str],
+    whole: &'static str,
+) -> Vec<&'static str> {
+    if T::deserialize(&serde_json::Value::Object(map.clone())).is_ok() {
         return Vec::new();
     }
     let mut mistyped = Vec::new();
     map.retain(|key, field| {
         let alone = serde_json::json!({ key.as_str(): field });
-        if ToolInput::deserialize(&alone).is_ok() {
+        if T::deserialize(&alone).is_ok() {
             return true;
         }
         mistyped.push(
-            TOOL_INPUT_KEYS
+            known
                 .iter()
                 .copied()
-                .find(|known| *known == key)
-                .unwrap_or("tool_input"),
+                .find(|name| *name == key)
+                .unwrap_or(whole),
         );
         false
     });
-    if ToolInput::deserialize(&serde_json::Value::Object(map.clone())).is_err() {
-        mistyped.push("tool_input");
+    if T::deserialize(&serde_json::Value::Object(map.clone())).is_err() {
+        mistyped.push(whole);
     }
     mistyped.sort_unstable();
     mistyped.dedup();
     mistyped
+}
+
+/// Join an argv array (`["git", "reset", "--hard"]`) into the one shell string
+/// that reproduces it, or `None` when `field` is not a non-empty array of
+/// strings. Codex's historical `shell` tool sent its command this way.
+///
+/// Each element is kept bare only when every character is one a shell never
+/// treats specially (`[A-Za-z0-9_@%+=:,./-]`); anything else, the empty string
+/// included, is single-quoted ([`display::shell_single_quote`]), so a shell
+/// splits the result back into exactly the same words and expands nothing.
+/// The guards then read what the harness would have executed. An array holding
+/// any non-string element is not joined, and stays unreadable.
+fn join_argv(field: &serde_json::Value) -> Option<String> {
+    let items = field.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let words: Option<Vec<&str>> = items.iter().map(serde_json::Value::as_str).collect();
+    let quoted: Vec<String> = words?
+        .into_iter()
+        .map(|word| {
+            let bare = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+            if bare {
+                word.to_string()
+            } else {
+                display::shell_single_quote(word)
+            }
+        })
+        .collect();
+    Some(quoted.join(" "))
+}
+
+/// Every top-level payload key [`HookInput`] models with a typed, non-lenient
+/// shape, as static names for [`HookInput::mistyped_top_level`].
+const HOOK_INPUT_KEYS: &[&str] = &[
+    "tool_name",
+    "tool_input",
+    "tool_response",
+    "cwd",
+    "transcript_path",
+    "session_id",
+    "hook_event_name",
+    "source",
+    "model",
+    "from_model",
+    "to_model",
+    "agent_id",
+    "prompt",
+];
+
+/// Top-level keys whose loss leaves the operation unjudgeable: without a
+/// readable `tool_name`, a guard cannot tell a Bash call from anything else.
+const TOP_LEVEL_OPERATION_KEYS: &[&str] = &["tool_name", "payload"];
+
+/// Salvage a top-level payload object whose modeled field is mistyped
+/// (`"cwd": 5`, `"session_id": {}`), so the parse no longer fails whole and
+/// exits 0 with the command unjudged (cadence-hooks#1087 review N4).
+fn salvage_top_level<T: serde::de::DeserializeOwned>(
+    value: &mut serde_json::Value,
+) -> Vec<&'static str> {
+    let Some(map) = value.as_object_mut() else {
+        return Vec::new();
+    };
+    salvage_fields::<T>(map, HOOK_INPUT_KEYS, "payload")
+}
+
+/// Deserialize an optional bool leniently (cadence-hooks#1087 review I2).
+///
+/// A JSON bool is taken as is and `"true"`/`"false"` (any case, trimmed) as the
+/// bool they spell. Any other value is read as `true`: for `replace_all` that
+/// is the worst case for the content simulation (every occurrence replaced),
+/// so an unreadable flag can widen what a content guard scans but never
+/// narrow it, and never blocks the edit outright. Null or absent is `None`.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(b),
+        Some(serde_json::Value::String(s)) if s.trim().eq_ignore_ascii_case("false") => Some(false),
+        Some(_) => Some(true),
+    })
 }
 
 /// Describe a hook-payload parse failure without echoing any of the payload.
@@ -796,6 +911,7 @@ impl HookInput {
             .get("tool_input")
             .is_some_and(|v| !v.is_null() && !v.is_object());
         let mistyped = salvage_tool_input(&mut value);
+        let mistyped_top_level = salvage_top_level::<HookInput>(&mut value);
         let mut input: HookInput = serde_json::from_value(value).map_err(|e| {
             plain(json_parse_failure(&e, raw, || {
                 serde_json::from_str::<HookInput>(raw)
@@ -805,6 +921,7 @@ impl HookInput {
         })?;
         input.schema_drift = drift;
         input.mistyped_tool_input = mistyped;
+        input.mistyped_top_level = mistyped_top_level;
         input.tool_input_non_object = tool_input_non_object;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
@@ -1193,6 +1310,12 @@ impl HookInput {
         if self.tool_input_non_object && tool.is_some_and(|t| OBJECT_INPUT_TOOLS.contains(&t)) {
             fields.push("tool_input");
         }
+        fields.extend(
+            self.mistyped_top_level
+                .iter()
+                .copied()
+                .filter(|field| TOP_LEVEL_OPERATION_KEYS.contains(field)),
+        );
         fields
     }
 
@@ -3546,7 +3669,9 @@ mod tests {
 
     #[test]
     fn hook_parse_failure_omits_a_mistyped_scalar_and_recovers_its_position() {
-        let error = HookInput::from_json(r#"{"cwd":959424242}"#).unwrap_err();
+        // A mistyped *field* is now salvaged (cadence-hooks#1087 review N4),
+        // so the canary is a payload that is not an object at all.
+        let error = HookInput::from_json("959424242").unwrap_err();
         assert!(
             !error.contains("959424242"),
             "payload value leaked: {error}"
@@ -3675,8 +3800,49 @@ mod tests {
         );
         let hook = HookInput::from_json(json).unwrap();
         assert_eq!(hook.schema_drift, ["tool_input", "tool_response"]);
-        assert!(hook.command().is_none(), "the mistyped command is dropped");
-        assert_eq!(hook.mistyped_tool_input, ["command"]);
+        assert_eq!(
+            hook.command(),
+            Some("ls"),
+            "an argv-array command is joined, not dropped"
+        );
+        assert!(hook.mistyped_tool_input.is_empty());
+    }
+
+    /// Review N3: the joined argv string, run by a real shell, reproduces
+    /// exactly the argv it came from — word boundaries and all, with nothing
+    /// expanded. Checked with harmless `printf` canaries against `sh`.
+    #[cfg(unix)]
+    #[test]
+    fn joined_argv_round_trips_through_a_real_shell() {
+        let argvs: &[&[&str]] = &[
+            &[
+                "printf",
+                "<%s>",
+                "a b",
+                "it's",
+                "$HOME",
+                "",
+                ";echo pwned",
+                "`id`",
+            ],
+            &[
+                "printf", "<%s>", "*", "~", "a\nb", "\\", "'", "\"", "-n", "!x",
+            ],
+            &["printf", "<%s>", "k=v", "@x", "a,b", "ü", "{a,b}", "$(id)"],
+        ];
+        for argv in argvs {
+            let field = serde_json::json!(argv);
+            let joined = join_argv(&field).expect("an all-string argv joins");
+            let via_shell = std::process::Command::new("sh")
+                .args(["-c", &joined])
+                .output()
+                .expect("sh");
+            let direct = std::process::Command::new(argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("direct");
+            assert_eq!(via_shell.stdout, direct.stdout, "{joined}");
+        }
     }
 
     #[test]
@@ -3691,10 +3857,52 @@ mod tests {
                 &[],
             ),
             (
-                r#"{"tool_name":"Bash","tool_input":{"command":["git","reset"]}}"#,
+                r#"{"tool_name":"Bash","tool_input":{"command":["git","reset",5]}}"#,
                 None,
                 &["command"],
                 &["command"],
+            ),
+            (
+                r#"{"tool_name":"Bash","tool_input":{"command":[]}}"#,
+                None,
+                &["command"],
+                &["command"],
+            ),
+            (
+                r#"{"tool_name":"Bash","tool_input":{"command":["git","reset","--hard"]}}"#,
+                Some("git reset --hard"),
+                &[],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"shell","tool_input":{"command":["bash","-lc","rm -rf $HOME; echo 'x'"]}}"#,
+                Some(r#"bash -lc 'rm -rf $HOME; echo '\''x'\'''"#),
+                &[],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"Bash","tool_input":{"command":["printf","","a b"]}}"#,
+                Some("printf '' 'a b'"),
+                &[],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"Bash","cwd":5,"session_id":{},"tool_input":{"command":"git reset --hard"}}"#,
+                Some("git reset --hard"),
+                &[],
+                &[],
+            ),
+            (
+                r#"{"tool_name":5,"tool_input":{"command":"git reset --hard"}}"#,
+                Some("git reset --hard"),
+                &[],
+                &["tool_name"],
+            ),
+            (
+                r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"x","new_string":"y","replace_all":"true"}}"#,
+                None,
+                &[],
+                &[],
             ),
             (
                 r#"{"tool_name":"exec_command","tool_input":{"cmd":7}}"#,
@@ -3751,6 +3959,31 @@ mod tests {
             assert_eq!(input.command(), *command, "{json}");
             assert_eq!(input.mistyped_tool_input, *mistyped, "{json}");
             assert_eq!(input.unreadable_operation_fields(), *unreadable, "{json}");
+        }
+        // A mistyped top-level field is dropped, not fatal.
+        let input =
+            HookInput::from_json(r#"{"tool_name":"Bash","cwd":5,"tool_input":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(input.mistyped_top_level, ["cwd"]);
+        assert!(input.cwd.is_none());
+        // `replace_all` reads leniently; anything unreadable is the worst case.
+        for (raw, expected) in [
+            ("true", Some(true)),
+            ("false", Some(false)),
+            (r#""true""#, Some(true)),
+            (r#"" False ""#, Some(false)),
+            (r#""yes""#, Some(true)),
+            ("5", Some(true)),
+            ("null", None),
+        ] {
+            let json = format!(
+                r#"{{"tool_name":"MultiEdit","tool_input":{{"file_path":"a","replace_all":{raw},"edits":[{{"old_string":"x","new_string":"y","replace_all":{raw}}}]}}}}"#
+            );
+            let input = HookInput::from_json(&json).unwrap();
+            let tool_input = input.tool_input.expect("tool_input");
+            assert_eq!(tool_input.replace_all, expected, "{raw}");
+            let edits = tool_input.edits.expect("edits");
+            assert_eq!(edits[0].replace_all, expected, "{raw}");
         }
         // The salvaged fields keep their values.
         let input = HookInput::from_json(
