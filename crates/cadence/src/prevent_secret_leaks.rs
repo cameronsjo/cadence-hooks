@@ -7508,6 +7508,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_commands_on_a_substituted_directory_allow() {
+        // #970: `$D` expands to the whole `$(mktemp …)`, so the metadata-only
+        // exemption sees `touch` with the operand bash would build.
+        assert_bash(
+            &[
+                "D=$(mktemp -d /home/u/x.XXXXXX); touch \"$D/.env\"",
+                "D=$(mktemp -d /home/u/x.XXXXXX); ls -l \"$D/.env\"",
+                "D=$(mktemp -d /home/u/x.XXXXXX); rm \"$D/.env\"",
+                "D=$(mktemp -d /home/u/x.XXXXXX); wc -l \"$D/.env\"",
+                "D=$(mktemp -d); touch $D/.env",
+                "export D=$(mktemp -d); touch \"$D/.env\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a metadata-only command on a path under a substituted directory",
+        );
+        assert_bash(
+            &[
+                "D=$(mktemp -d /home/u/x.XXXXXX); cat \"$D/.env\"",
+                "D=$(mktemp -d); cat $D/.env",
+                "D=$(mktemp -d); head \"$D\"/.env*",
+                "F=$(echo .env); cat \"$F\"",
+                "D=$(mktemp -d \"$T/x\"); cat \"$D/.env\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a read of the same path still blocks",
+        );
+    }
+
+    #[test]
     fn operands_that_spell_a_secret_only_after_tokenizing_block() {
         // #819: the raw text names no deny-set file, so the old substring
         // pre-filter skipped the resolver that classifies each of these.

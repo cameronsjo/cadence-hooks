@@ -4616,7 +4616,58 @@ fn segment_assignment(segment: &str) -> Option<(String, String)> {
     {
         return None;
     }
+    // An unquoted `D=$(mktemp -d /x.XXXX)` tokenizes on the spaces inside the
+    // substitution, so the token's value is the fragment `$(mktemp`, and every
+    // later `$D` became a broken span (cadence-hooks#970).
+    // Only a plain value is re-read; anything else keeps the fragment, as
+    // before, so no other value's expansion changes.
+    if value.contains("$(")
+        && value.matches('(').count() > value.matches(')').count()
+        && let Some(whole) = unquoted_substitution_value(segment, idx, name)
+    {
+        return Some((name.to_string(), whole));
+    }
     Some((name.to_string(), value.to_string()))
+}
+
+/// The whole value of an unquoted `NAME=$(…)` word in `segment` — the text the
+/// shell substitutes for a later `$NAME` — or `None` when it cannot be read
+/// with confidence, in which case the caller keeps the token's fragment.
+///
+/// Confident means plain: outside the substitution no quote, backslash, or
+/// backtick; inside it none of those and no `(` or `)` but the closing one. A
+/// value outside that shape, `D=$(mktemp -d "$T/x")` say, is unchanged by
+/// cadence-hooks#970. `export_idx` is 1 when the word follows `export`.
+fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> Option<String> {
+    let mut rest = segment.trim_start();
+    if export_idx == 1 {
+        rest = rest.strip_prefix("export")?.trim_start();
+    }
+    let value = rest.strip_prefix(name)?.strip_prefix('=')?;
+    let mut depth = 0usize;
+    let mut end = value.len();
+    let mut chars = value.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' | '\\' | '`' => return None,
+            '$' if chars.peek().map(|&(_, n)| n) == Some('(') => {
+                if depth > 0 {
+                    return None;
+                }
+                chars.next();
+                depth = 1;
+            }
+            '(' => return None,
+            ')' if depth == 1 => depth = 0,
+            ')' => return None,
+            c if c.is_whitespace() && depth == 0 => {
+                end = at;
+                break;
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| value[..end].to_string())
 }
 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
@@ -9362,6 +9413,31 @@ mod tests {
         // Append-ordered lookup must find the replacement, not the original.
         let out = command_segments("F=first; F=second; cat $F");
         assert!(out.contains(&"cat second".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_expands_an_unquoted_substitution_value_whole() {
+        // #970: the value is `$(mktemp -d /x.XXXX)`, not the token `$(mktemp`.
+        for (command, expected) in [
+            (
+                "D=$(mktemp -d /x.XXXX); touch \"$D/.env\"",
+                "touch \"$(mktemp -d /x.XXXX)/.env\"",
+            ),
+            ("export D=$(mktemp -d); ls $D/a", "ls $(mktemp -d)/a"),
+            ("D=$(pwd)x; cat $D", "cat $(pwd)x"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
+        // Not plain enough to read with confidence: the token's fragment, as
+        // before.
+        for (command, expected) in [
+            ("D=$(mktemp -d \"$T/x\"); touch $D/a", "touch $(mktemp/a"),
+            ("D=$(echo $(pwd) x); touch $D/a", "touch $(echo/a"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
     }
 
     #[test]
