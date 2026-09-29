@@ -69,6 +69,7 @@ use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookI
 mod context;
 mod identity;
 
+use crate::credential_scan;
 use regex::Regex;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -1098,6 +1099,16 @@ impl Check for RedactExternalContent {
         if bodies.is_empty() && notes.is_empty() {
             return CheckResult::allow();
         }
+        // Credential tier (#1022): runs on every posted text, before the term
+        // source is consulted, and no identity setting reaches it. The value
+        // the shell actually passes is scanned too, when it differs.
+        let mut cred_hits: Vec<credential_scan::CredHit> = Vec::new();
+        for posted in &bodies {
+            let passed = shell_passed_value(posted);
+            for text in std::iter::once(posted.0.as_str()).chain(passed.as_deref()) {
+                cred_hits.extend(credential_scan::scan(text));
+            }
+        }
         let (identity_list, _status) = identity::load();
         // A text the identity scan could not read is said once on stderr, and
         // only where the tier is armed — a machine with no term source has
@@ -1209,7 +1220,18 @@ impl Check for RedactExternalContent {
         // the transcript). A clean scan with a broken config still nudges —
         // otherwise the drop is exactly as silent as the #536 defect was.
         let warnings = loaded.warnings;
-        combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode)
+        let folded = combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode);
+        if cred_hits.is_empty() {
+            return folded;
+        }
+        // Tokens are never OK to post: a block regardless of identity mode or
+        // bypass (the bypass provenance is dropped — nothing was bypassed).
+        let mut message = credential_scan::render(&cred_hits);
+        if let Some(rest) = folded.message {
+            message.push('\n');
+            message.push_str(&rest);
+        }
+        CheckResult::block(message)
     }
 }
 
@@ -2505,6 +2527,75 @@ mod tests {
     fn run(cmd: &str) -> CheckResult {
         let _guard = lock_terms_env();
         RedactExternalContent.run(&make_bash(cmd))
+    }
+
+    // --- Credential tier (#1022) ---
+
+    fn fake_ghp() -> String {
+        ["gh", "p_"].concat() + &"aB3dE5gH7jK9mN1pQ2sT4vW6yZ8cF0hL".repeat(2)[..36]
+    }
+
+    #[test]
+    fn credential_blocks_across_body_forms() {
+        let t = fake_ghp();
+        let cmds = [
+            format!("gh issue create --title x --body \"token {t}\""),
+            format!("gh pr comment 1 -b '{t}'"),
+            format!("git commit -m \"wip {t}\""),
+            format!("gh issue comment 1 --body-file - <<'EOF'\n{t}\nEOF"),
+            format!("echo {t} | gh issue comment 1 --body-file -"),
+        ];
+        for c in cmds {
+            let r = run(&c);
+            assert_eq!(r.outcome, Outcome::Block, "{c}");
+            let m = r.message.unwrap();
+            assert!(m.contains("GitHub token") && !m.contains(&t), "{c}");
+        }
+    }
+
+    #[test]
+    fn credential_split_fixture_blocks() {
+        let t = fake_ghp();
+        let (a, b) = t.split_at(8);
+        for body in [
+            format!("gh issue create --body \"{a}\"\"{b}\""),
+            format!("gh issue create --body \"{a} {b}\""),
+            format!("gh issue create --body '{a}'\"{b}\""),
+        ] {
+            assert_eq!(run(&body).outcome, Outcome::Block, "{body}");
+        }
+    }
+
+    #[test]
+    fn credential_ignores_identity_bypass() {
+        let t = fake_ghp();
+        // SAFETY-free env use is serialized by `run`'s lock only for terms env;
+        // the bypass var is irrelevant to the outcome either way.
+        let _g = lock_terms_env();
+        let prev = std::env::var("CADENCE_ALLOW_SENSITIVE_TERMS").ok();
+        unsafe { std::env::set_var("CADENCE_ALLOW_SENSITIVE_TERMS", "1") };
+        let r = RedactExternalContent.run(&make_bash(&format!("gh issue create --body \"{t}\"")));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CADENCE_ALLOW_SENSITIVE_TERMS", v) },
+            None => unsafe { std::env::remove_var("CADENCE_ALLOW_SENSITIVE_TERMS") },
+        }
+        assert_eq!(r.outcome, Outcome::Block);
+        assert!(r.bypass.is_none());
+    }
+
+    #[test]
+    fn credential_control_table_allowed_in_posts() {
+        for body in [
+            "3f786850e387550fdab836ed7e6dc881de23001b",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "use sk-learn for this",
+        ] {
+            assert_eq!(
+                run(&format!("gh issue create --body \"{body}\"")).outcome,
+                Outcome::Allow,
+                "{body}"
+            );
+        }
     }
 
     // --- Guard clause: wrong tool / non-posting commands → allow ---
