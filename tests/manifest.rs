@@ -63,3 +63,43 @@ fn manifest_keeps_the_plugin_key_and_fills_it_with_the_clap_namespace() {
         "`session start` reports its clap namespace; the cadence plugin wires it"
     );
 }
+
+#[test]
+fn manifest_lists_every_event_of_a_multi_event_hook() {
+    // cameronsjo/cadence-hooks#957: `event` stays the primary (catalog_lib
+    // joins on it); `events` is the additive full set, empty for a logger.
+    let metrics = tempfile::tempdir().expect("temp metrics dir");
+    let output = support::cadence_hooks()
+        .env("CADENCE_METRICS_DIR", metrics.path())
+        .args(["manifest", "--format", "json"])
+        .output()
+        .expect("run cadence-hooks manifest");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let hooks = value["hooks"].as_array().expect("hooks array");
+    let find = |name: &str| hooks.iter().find(|r| r["name"] == name).expect(name);
+    let posture = find("model-posture");
+    assert_eq!(posture["event"], "SessionStart");
+    assert_eq!(
+        posture["events"],
+        serde_json::json!(["SessionStart", "PostModelSwitch"])
+    );
+    assert_eq!(
+        find("terminology")["events"],
+        serde_json::json!(["PreToolUse"])
+    );
+    assert_eq!(find("log-commit")["events"], serde_json::json!([]));
+}
+
+#[test]
+fn list_shows_every_event_of_a_multi_event_hook() {
+    let output = support::cadence_hooks()
+        .arg("list")
+        .output()
+        .expect("run cadence-hooks list");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let row = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("model-posture"))
+        .expect("model-posture row");
+    assert!(row.contains("SessionStart,PostModelSwitch"), "{row}");
+}

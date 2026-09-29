@@ -3,6 +3,8 @@
 //! Code quality, secret protection, and development hygiene checks
 //! that run on every tool invocation during a Claude Code session.
 
+/// Run the runner-pool workflow audit after a workflow file is edited (PostToolUse).
+pub mod audit_runner_pool;
 /// Require `MARKER(#issue):` format for TODO, FIXME, HACK, and other code markers.
 pub mod block_orphaned_todos;
 /// The `forgectl env` line the secret guards append to an env-file block.
