@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`warn-untracked` warns at commit time when the branch's in-flight plan is modified but not staged.** `nudge-plan-tick` fires after the work commit lands, so the tick always rode a follow-up commit. The pre-arm fires on a plain `git commit` when `git status` shows ` M docs/plans/<plan>.md` for the plan bound to the current branch, and stays silent when the commit could take it anyway (`-a`, `-i`, `-o`, `--`, a `git add` in the same command, or the plan named on the command line). It says explicitly that a dirty plan means "about to miss the commit" here, the reverse of the post-commit guard's "maintained" reading. Guardrails now depends on the session crate for the plan scan. (cameronsjo/cadence-hooks#691)
 - **`record-polish --skip <reason>` records a dispositioned skip, and `nudge-polish-before-pr` accepts it.** The marker is branch-scoped like a run record, carries the reason and no roster, and the gate stays quiet on it while echoing the reason. The reason is required and non-trivial (not empty, `n/a`, `none`, `-`, `.`), at most 120 bytes of a small charset, checked on the record side (exit 2) and again on the read side before it reaches `additionalContext`; `--skip` cannot be combined with `--scope`, `--arm*` or `--fresh`. (cameronsjo/cadence-hooks#787)
 
 ### Security

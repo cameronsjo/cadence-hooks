@@ -239,6 +239,7 @@ dependencies = [
  "cadence-hooks-cadence",
  "cadence-hooks-core",
  "cadence-hooks-metrics",
+ "cadence-hooks-session",
  "libc",
  "regex",
  "serde",

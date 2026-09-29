@@ -11,6 +11,9 @@ description = "Git guardrails hooks: push protection, gh write guards, idle dete
 cadence-hooks-cadence.workspace = true
 cadence-hooks-core.workspace = true
 cadence-hooks-metrics.workspace = true
+# `unstaged_plan_at_commit`: the commit-time plan-tick pre-arm reuses the
+# session crate's plan scan (cadence-hooks#691).
+cadence-hooks-session.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
