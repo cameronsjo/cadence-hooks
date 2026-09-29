@@ -947,7 +947,7 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
     if redirection_of(token) != Some(false) {
         return None;
     }
-    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = strip_fd_prefix(token);
     let rest = rest.strip_prefix('&').unwrap_or(rest);
     let operator_len = rest.chars().take_while(|c| matches!(c, '>' | '<')).count();
     if !matches!(&rest[..operator_len], "<" | "<>") {
@@ -1106,6 +1106,24 @@ const PURE_FILE_READERS: &[&str] = &[
     "rev",
 ];
 
+/// `token` with a redirection's descriptor prefix removed: a decimal fd
+/// (`2>`, `10<`) or bash's named-fd form (`{fd}>`, `{log}<`), which allocates
+/// a descriptor and stores it in the variable (#832 review: `{fd}>/tmp/o cd /x`
+/// hid the `cd`). A `{…}` that is not a valid name is left alone — it is a
+/// brace group or literal, not a redirection prefix.
+fn strip_fd_prefix(token: &str) -> &str {
+    if let Some(inner) = token.strip_prefix('{')
+        && let Some((name, rest)) = inner.split_once('}')
+        && !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && rest.starts_with(['>', '<'])
+    {
+        return rest;
+    }
+    token.trim_start_matches(|c: char| c.is_ascii_digit())
+}
+
 /// Is `token` a redirection, and if so does its target live in the NEXT token?
 ///
 /// `Some(true)` for a bare operator (`>`, `>>`, `2>`, `&>`, `<`, `<<<`, `>&`),
@@ -1115,7 +1133,7 @@ const PURE_FILE_READERS: &[&str] = &[
 fn redirection_of(token: &str) -> Option<bool> {
     // Strip an fd prefix (`2>`, `1>&2`) and an `&` prefix (`&>`) before looking
     // for the redirection character itself.
-    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = strip_fd_prefix(token);
     let rest = rest.strip_prefix('&').unwrap_or(rest);
     if !(rest.starts_with('>') || rest.starts_with('<')) {
         return None;
@@ -1207,7 +1225,7 @@ fn redirection_file_targets(tokens: &[String]) -> Vec<&str> {
             // there it is the fd sigil this arm tests for, not punctuation to
             // discard.
             Some(false) => {
-                let target = token.trim_start_matches(|c: char| c.is_ascii_digit());
+                let target = strip_fd_prefix(token);
                 let target = target.strip_prefix('&').unwrap_or(target);
                 let target = target.trim_start_matches(['>', '<', '|']);
                 // Unreachable by construction — `redirection_of` returns
@@ -1517,6 +1535,9 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 fn command_changes_directory(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let tokens = executable_tokens(&segment);
+        if runner_changes_directory(&tokens) {
+            return true;
+        }
         let mut argv = tokens.as_slice();
         let mut after_wrapper = false;
         // Peel while something follows: a lone trailing wrapper word runs
@@ -1525,8 +1546,22 @@ fn command_changes_directory(command: &str) -> bool {
             let head = &argv[0];
             // A redirection may sit anywhere in a simple command, including in
             // front of the verb: `>/tmp/o cd /x` is a `cd` (#832).
-            if let Some(target_is_next) = redirection_of(head) {
+            // `executable_tokens` strips a leading `{` as a group opener, so a
+            // named-fd head (`{fd}>/tmp/o`) arrives as `fd}>/tmp/o`; restore
+            // the brace before asking whether it is a redirection.
+            if let Some(target_is_next) =
+                redirection_of(head).or_else(|| redirection_of(&format!("{{{head}")))
+            {
                 argv = &argv[if target_is_next { 2 } else { 1 }.min(argv.len())..];
+                continue;
+            }
+            // The other half of an fd duplication or close. `split_segments`
+            // cuts at the `&` in `2>&1 cd /x`, `>&2 cd /x`, `2>&- cd /x`, so
+            // this segment arrives headed by the orphaned `1`, `2`, or `-`
+            // (#832 review). None of those is a command a session runs, so
+            // dropping it can only expose the verb behind it.
+            if head == "-" || head.chars().all(|c| c.is_ascii_digit()) {
+                argv = &argv[1..];
                 continue;
             }
             // A wrapper's own flags (`command -p cd`, `time -p cd`) stop the
@@ -1541,13 +1576,6 @@ fn command_changes_directory(command: &str) -> bool {
             }
             let word = command_word(head);
             if CD_WRAPPERS.contains(&word.as_ref()) {
-                // `sudo -D /x` and `sudo --chdir=/x` run the command in `/x`,
-                // the same shape as `env -C` (#832). Searched across the rest
-                // of the segment rather than parsed, so a later operand that
-                // happens to spell a chdir flag over-blocks — fail-closed.
-                if word == "sudo" && argv[1..].iter().any(|t| sudo_chdir_flag(t)) {
-                    return true;
-                }
                 after_wrapper = true;
                 argv = &argv[1..];
             } else if is_assignment_word(head) {
@@ -1599,14 +1627,53 @@ fn command_changes_directory(command: &str) -> bool {
 /// (`--chd`)? A `D` anywhere in a short-option cluster counts, including one
 /// that is really another option's value (`-uDave`): over-reading is the
 /// fail-closed direction for a detector.
+///
+/// `-i`/`--login` count too: a login shell starts in the target user's home
+/// directory, so the command runs there rather than in `input.cwd`.
 fn sudo_chdir_flag(token: &str) -> bool {
     if let Some(long) = token.strip_prefix("--") {
         let name = long.split_once('=').map_or(long, |(name, _)| name);
-        return name.len() >= 3 && "chdir".starts_with(name);
+        return name.len() >= 3 && ("chdir".starts_with(name) || "login".starts_with(name));
     }
     token
         .strip_prefix('-')
-        .is_some_and(|cluster| cluster.contains('D'))
+        .is_some_and(|cluster| cluster.contains(['D', 'i']))
+}
+
+/// Is `token` a `su`/`runuser` login option — `-`, `-l` (alone or in a
+/// cluster), or `--login` and its abbreviations? A login session starts in the
+/// target user's home directory.
+fn su_login_flag(token: &str) -> bool {
+    if token == "-" {
+        return true;
+    }
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return name.len() >= 3 && "login".starts_with(name);
+    }
+    token
+        .strip_prefix('-')
+        .is_some_and(|cluster| cluster.contains('l'))
+}
+
+/// Does any `sudo`, `su`, or `runuser` in this segment run its command in
+/// another directory (#832 review)?
+///
+/// Searched across the WHOLE segment rather than at the resolved head, because
+/// the runner can sit behind any prefix — `nice -n 5 sudo -D /x cat .envrc`
+/// hides it from a head-only peel — and every flag after the runner word is
+/// checked rather than parsed. Both widen the detector, never an exemption: a
+/// later operand that happens to spell a chdir flag (`sudo grep -i x .envrc`)
+/// over-blocks the `.envrc` carve-out, which is the fail-closed direction.
+fn runner_changes_directory(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        let rest = &tokens[i + 1..];
+        match command_word(token).as_ref() {
+            "sudo" => rest.iter().any(|t| sudo_chdir_flag(t)),
+            "su" | "runuser" => rest.iter().any(|t| su_login_flag(t)),
+            _ => false,
+        }
+    })
 }
 
 /// Content-aware `.envrc` carve-out for the Bash read path (#193): the Read/Grep
@@ -5805,5 +5872,59 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "the audited --file value itself stays exempt",
         );
+    }
+
+    #[test]
+    fn chdir_behind_an_fd_duplication_or_named_fd_is_seen() {
+        // #832 review C1: the `&` split leaves the segment headed by the fd.
+        for command in [
+            "2>&1 cd /evil && cat .envrc",
+            ">&2 cd /evil && cat .envrc",
+            "1>&2 cd /evil && cat .envrc",
+            "2>&- cd /evil && cat .envrc",
+            "<&- cd /evil && cat .envrc",
+            "command 2>&1 cd /evil && cat .envrc",
+            "FOO=1 2>&1 cd /evil && cat .envrc",
+            "{fd}>/tmp/o cd /evil && cat .envrc",
+            "{fd}</dev/null cd /evil && cat .envrc",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn runner_login_or_chdir_anywhere_in_the_segment_is_seen() {
+        // #832 review I4.
+        for command in [
+            "sudo -i cat .envrc",
+            "sudo -iu root cat .envrc",
+            "sudo --login cat .envrc",
+            "sudo --log cat .envrc",
+            "nice -n 5 sudo -D /x cat .envrc",
+            "nohup nice sudo --chdir=/x cat .envrc",
+            "su - root -c 'cat .envrc'",
+            "su -l root",
+            "su --login root",
+            "runuser -l root -c 'cat .envrc'",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+        for command in [
+            "sudo -u root cat .envrc",
+            "su root -c true",
+            "runuser -u x id",
+        ] {
+            assert!(!command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn strip_fd_prefix_handles_numbers_and_names_only() {
+        assert_eq!(strip_fd_prefix("2>&1"), ">&1");
+        assert_eq!(strip_fd_prefix("{fd}>/tmp/o"), ">/tmp/o");
+        assert_eq!(strip_fd_prefix("{log_2}<in"), "<in");
+        assert_eq!(strip_fd_prefix("{1x}>o"), "{1x}>o");
+        assert_eq!(strip_fd_prefix("{a b}>o"), "{a b}>o");
+        assert_eq!(strip_fd_prefix("{fd}"), "{fd}");
     }
 }
