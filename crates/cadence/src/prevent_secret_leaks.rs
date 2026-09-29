@@ -902,6 +902,13 @@ fn segment_direct_reads(
     for (at, file) in pattern_file_values(&cmd_word, argv) {
         pattern_files.entry(at).or_default().push(file);
     }
+    // `kubectl` reads each `--kubeconfig` value as a file; one the exemption
+    // below does not cover is judged as a known filename.
+    let kube_values: HashMap<usize, &str> = if cmd_word == "kubectl" {
+        kubeconfig_values(argv).into_iter().collect()
+    } else {
+        HashMap::new()
+    };
     // Files `curl` uploads through an option's value (#1098).
     let mut uploads: HashMap<usize, Vec<&str>> = HashMap::new();
     if cmd_word == "curl" {
@@ -927,6 +934,12 @@ fn segment_direct_reads(
             let expands = globs.get(argv_at + i).copied().unwrap_or(true);
             if Some(i) == pattern && !expands {
                 return pattern_word_secret(t, position);
+            }
+            if let Some(value) = kube_values
+                .get(&i)
+                .and_then(|value| dangerous_secret_operand(value, Filename::Known))
+            {
+                return Some(value);
             }
             if let Some(value) = pattern_files
                 .get(&i)
@@ -1117,6 +1130,58 @@ fn curl_value_paths<'a>(option: &str, value: &'a str) -> Vec<&'a str> {
     }
 }
 
+/// A `kubectl` word with no quoting, escape, or expansion left in it once a
+/// leading `--kubeconfig=` and `$HOME/`/`${HOME}/` are peeled. The
+/// tokenizer keeps a backslash, so `conf\ig` reads as no `config` word while
+/// bash runs `config view --raw`; a `$X` can word-split into one.
+fn kubectl_word_plain(word: &str) -> bool {
+    let rest = word.strip_prefix("--kubeconfig=").unwrap_or(word);
+    let rest = rest
+        .strip_prefix("$HOME/")
+        .or_else(|| rest.strip_prefix("${HOME}/"))
+        .unwrap_or(rest);
+    !rest.contains(['\\', '\'', '"', '$', '`'])
+}
+
+/// Every `kubectl --kubeconfig` value, as `(argv index, value)`: the next
+/// word after `--kubeconfig`, or the text after `--kubeconfig=`. kubectl
+/// reads the last one, so each is judged — an exempt one never vouches for
+/// another (#771 regression check).
+fn kubeconfig_values(argv: &[String]) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    for (i, t) in argv.iter().enumerate().skip(1) {
+        if t == "--kubeconfig" {
+            if let Some(value) = argv.get(i + 1) {
+                out.push((i + 1, value.as_str()));
+            }
+        } else if let Some(value) = t.strip_prefix("--kubeconfig=") {
+            out.push((i, value));
+        }
+    }
+    out
+}
+
+/// A `--kubeconfig` value exempt under the #771 floor: a plain path to a
+/// non-secret file directly inside a `.kube` directory. The only `$` allowed
+/// is a leading `$HOME`/`${HOME}`, which cannot word-split; any other
+/// expansion, quote, backslash, glob, redirection, or whitespace refuses it.
+fn kube_config_file(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("$HOME/")
+        .or_else(|| value.strip_prefix("${HOME}/"))
+        .unwrap_or(value);
+    let mut parts = rest.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    !rest.is_empty()
+        && !rest.contains([
+            '<', '>', '`', '*', '?', '[', '{', '$', '\\', '\'', '"', '(', ';', '|', '&',
+        ])
+        && !rest.chars().any(char::is_whitespace)
+        && parts.next() == Some(".kube")
+        && !name.is_empty()
+        && !is_dangerous_secret_token_at(name, Filename::Known)
+}
+
 /// Operands a recognized verb consumes as configuration without printing,
 /// by argv index — the operand-position exemption floor ruled on #771/#782:
 /// scoped to one option or operand of one verb, never an assignment's
@@ -1141,32 +1206,17 @@ fn consumed_path_operands(cmd: &str, argv: &[String]) -> Vec<usize> {
     };
     match cmd {
         "kubectl" => {
-            if argv.iter().any(|t| t == "config") {
+            let values = kubeconfig_values(argv);
+            // Every word must be plain (#771 regression check).
+            let words_plain = argv.iter().all(|t| kubectl_word_plain(t));
+            if !words_plain || argv.iter().any(|t| t == "config") {
                 return Vec::new();
             }
-            let kube_file = |v: &str| {
-                let mut parts = v.rsplit('/');
-                let name = parts.next().unwrap_or_default();
-                plain(v)
-                    && parts.next() == Some(".kube")
-                    && !name.is_empty()
-                    && !is_dangerous_secret_token_at(name, Filename::Known)
-            };
-            let mut out = Vec::new();
-            for (i, t) in argv.iter().enumerate().skip(1) {
-                if t == "--kubeconfig"
-                    && let Some(value) = argv.get(i + 1)
-                    && kube_file(value)
-                {
-                    out.push(i + 1);
-                }
-                if let Some(value) = t.strip_prefix("--kubeconfig=")
-                    && kube_file(value)
-                {
-                    out.push(i);
-                }
-            }
-            out
+            values
+                .into_iter()
+                .filter(|(_, value)| kube_config_file(value))
+                .map(|(i, _)| i)
+                .collect()
         }
         "gcloud" => {
             let mut words = argv.iter().skip(1).filter(|t| !t.starts_with('-'));
@@ -8545,6 +8595,8 @@ mod tests {
                 "kubectl --kubeconfig=~/.kube/config get pods",
                 "kubectl get pods --kubeconfig ~/.kube/config",
                 "kubectl --kubeconfig $HOME/.kube/config get pods",
+                "kubectl --kubeconfig ${HOME}/.kube/config get pods",
+                "kubectl --kubeconfig=~/.kube/config --kubeconfig=~/.kube/prod get pods",
                 "gcloud storage ls -r \"gs://bucket/**/runtime/.netrc\"",
                 "gcloud storage du gs://b/.netrc",
             ],
@@ -8566,6 +8618,15 @@ mod tests {
                 "kubectl --kubeconfig ~/.kube/config get pods < ~/.kube/config",
                 "kubectl --kubeconfig ~/.kube/config$(cat .env) get pods",
                 "kubectl --kubeconfig ~/.kube/config cp ~/.kube/config pod:/x",
+                // #771 regression check: a `config` word bash builds from an
+                // escape or expansion, and a later value kubectl reads last.
+                "kubectl --kubeconfig ~/.kube/config conf\\ig view --raw",
+                "kubectl --kubeconfig ~/.kube/config $C view --raw",
+                "kubectl --kubeconfig ~/.kube/config con'fig' view --raw",
+                "kubectl --kubeconfig=~/.kube/config --kubeconfig=.env get pods",
+                "kubectl --kubeconfig=~/.kube/config --kubeconfig prod.env get pods",
+                "kubectl --kubeconfig=~/.kube/config --kubeconfig $X get pods",
+                "kubectl --kubeconfig prod.env get pods",
                 "gcloud storage cat gs://b/.netrc",
                 "gcloud storage ls .netrc",
                 "gcloud storage ls gs://b/.netrc .netrc",
