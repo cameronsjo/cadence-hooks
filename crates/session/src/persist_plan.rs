@@ -1766,19 +1766,55 @@ fn session_already_persisted(
 /// canonical), else a generic label. The ledger is a local file, but its text
 /// reaches the model through the nudge, so only a narrow charset passes
 /// through.
+///
+/// The ledger stores the path forward-slash normalized
+/// ([`cadence_hooks_core::normalize_path`]), so containment is a string
+/// prefix test against the root normalized the same way — a native
+/// `Path::starts_with` never matches on Windows, where the root is
+/// `\\?\C:\…` and the ledger text `//?/C:/…`. On Windows only, the
+/// drive prefix (`C:` or `//?/C:`) of an absolute path is exempt from the
+/// charset; everything after it is held to the same charset as elsewhere.
 fn echoable_plan_path(plan_path: Option<&str>, user_plans_root: Option<&Path>) -> String {
     plan_path
         .filter(|p| {
-            let placed = !p.starts_with('/')
-                || user_plans_root.is_some_and(|root| Path::new(p).starts_with(root));
-            placed
-                && p.ends_with(".md")
+            let drive_tail = if cfg!(windows) {
+                strip_windows_drive(p)
+            } else {
+                None
+            };
+            let checked = if p.starts_with('/') || drive_tail.is_some() {
+                let Some(root) = user_plans_root else {
+                    return false;
+                };
+                let root = cadence_hooks_core::normalize_path(&root.to_string_lossy());
+                if !p
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    return false;
+                }
+                drive_tail.unwrap_or(p)
+            } else {
+                p
+            };
+            p.ends_with(".md")
                 && p.len() <= MAX_ECHOED_PLAN_PATH_LEN
                 && !p.contains("..")
-                && p.bytes()
+                && checked
+                    .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         })
         .map_or_else(|| "an earlier copy".to_string(), |p| format!("`{p}`"))
+}
+
+/// The rest of a forward-slash Windows absolute path after its drive prefix
+/// (`C:/…` or the verbatim `//?/C:/…`), starting at that `/`; `None` for any
+/// other shape. Pure string logic so it is testable off Windows; the caller
+/// applies it only under `cfg!(windows)`.
+fn strip_windows_drive(p: &str) -> Option<&str> {
+    let rest = p.strip_prefix("//?/").unwrap_or(p);
+    let b = rest.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/').then(|| &rest[2..])
 }
 
 /// Append one row to `<metrics_dir>/plan-links.jsonl`. Fully fail-open
@@ -4051,6 +4087,53 @@ mod tests {
             echoable_plan_path(Some("/home/u/.claude/cadence/plans/2026-09-22-x.md"), None),
             "an earlier copy"
         );
+    }
+
+    #[test]
+    fn strip_windows_drive_takes_only_a_drive_prefix() {
+        assert_eq!(
+            strip_windows_drive("C:/u/plans/x.md"),
+            Some("/u/plans/x.md")
+        );
+        assert_eq!(
+            strip_windows_drive("//?/D:/a/plans/x.md"),
+            Some("/a/plans/x.md")
+        );
+        for other in [
+            "/home/u/x.md",
+            "docs/x.md",
+            "C:x.md",
+            "//?/UNC/srv/share/x.md",
+            "1:/x.md",
+            "",
+        ] {
+            assert_eq!(strip_windows_drive(other), None, "{other}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn echoable_plan_path_matches_a_verbatim_windows_root() {
+        let root = Path::new(r"\\?\C:\Users\u\.claude\cadence\plans");
+        assert_eq!(
+            echoable_plan_path(
+                Some("//?/C:/Users/u/.claude/cadence/plans/2026-09-22-x.md"),
+                Some(root)
+            ),
+            "`//?/C:/Users/u/.claude/cadence/plans/2026-09-22-x.md`"
+        );
+        for elsewhere in [
+            "//?/C:/Users/u/.claude/cadence/plansx/y.md",
+            "//?/D:/Users/u/.claude/cadence/plans/y.md",
+            "C:/Windows/x.md",
+            "C:x.md",
+        ] {
+            assert_eq!(
+                echoable_plan_path(Some(elsewhere), Some(root)),
+                "an earlier copy",
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]
