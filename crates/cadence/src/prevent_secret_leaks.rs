@@ -12,6 +12,7 @@ use crate::secret_patterns::{
     Filename, command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token_at, is_safe_template, is_secret_shaped_var_name,
 };
+use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, is_assignment_word, skip_git_global_options,
     split_segments, tokenize,
@@ -1642,7 +1643,10 @@ fn envrc_bash_read_allowed(resolve_token: &str, cwd: Option<&str>, command_has_c
         }
     };
 
-    envrc_carveout_allows(".envrc", std::fs::read_to_string(&resolved).ok().as_deref())
+    // Bounded (#818): a `.envrc` symlinked to a FIFO or `/dev/zero`, or a
+    // multi-GB file, would hang or exhaust the hook through a plain
+    // `read_to_string`. A rejected read is `None`, which keeps the block.
+    envrc_carveout_allows(".envrc", read_untrusted_config(&resolved).as_deref())
 }
 
 /// Does an `echo`/`printf` segment expand a secret-shaped variable?
@@ -1815,7 +1819,8 @@ fn envrc_read_allowed(filename: &str, raw_path: Option<&str>) -> bool {
         && envrc_carveout_allows(
             filename,
             raw_path
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                // Bounded, as on the Bash arm (#818).
+                .and_then(|p| read_untrusted_config(Path::new(p)))
                 .as_deref(),
         )
 }
@@ -5727,5 +5732,44 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn envrc_fifo_or_endless_file_blocks_without_hanging() {
+        // #818: the carve-out read was an unbounded `read_to_string`. A FIFO
+        // would hang this test; `/dev/zero` would grow without bound. Both
+        // are rejected on stat and the read stays blocked.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_dir = dir.path().join("fifo");
+        std::fs::create_dir(&fifo_dir).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(fifo_dir.join(".envrc"))
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let zero_dir = dir.path().join("zero");
+        std::fs::create_dir(&zero_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", zero_dir.join(".envrc")).unwrap();
+        for d in [&fifo_dir, &zero_dir] {
+            let cwd = d.to_str().unwrap();
+            let bash = SecretLeaksGuard::default().run(&make_bash_with_cwd("cat .envrc", cwd));
+            assert_eq!(bash.outcome, cadence_hooks_core::Outcome::Block, "{cwd}");
+            let path = d.join(".envrc");
+            let read = SecretLeaksGuard::default().run(&make_read_input(path.to_str().unwrap()));
+            assert_eq!(read.outcome, cadence_hooks_core::Outcome::Block, "{cwd}");
+        }
+    }
+
+    #[test]
+    fn envrc_over_the_read_cap_blocks() {
+        // A pure loader padded past the 1 MiB cap is not classified at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = "use flake\n".to_string();
+        body.push_str(&"#".repeat(1024 * 1024));
+        std::fs::write(dir.path().join(".envrc"), body).unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let result = SecretLeaksGuard::default().run(&make_bash_with_cwd("cat .envrc", cwd));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }
