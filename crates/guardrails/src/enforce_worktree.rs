@@ -4395,10 +4395,15 @@ fn with_union_worktree_hint(
 /// walks up until it hits an existing directory. A `dir` that already exists is
 /// returned unchanged, so the common path is a single `exists()` stat and no
 /// behavior changes for edits to existing files.
+///
+/// An ancestor longer than the OS path limit cannot exist, so it is skipped
+/// without a stat: each `exists()` copies the whole path into a C string, and
+/// stat-ing every ancestor of a 100k-component path is quadratic in its length
+/// — long enough to blow the hook deadline and fail open (cadence-hooks#1171).
 fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
     let mut cur = dir;
     loop {
-        if cur.exists() {
+        if cur.as_os_str().len() <= MAX_STATABLE_PATH_LEN && cur.exists() {
             return cur.to_path_buf();
         }
         match cur.parent() {
@@ -4407,6 +4412,14 @@ fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
         }
     }
 }
+
+/// Longest path the OS can resolve: Linux `PATH_MAX` (macOS's is shorter), and
+/// Windows' extended-length limit. Anything longer fails `stat` with
+/// `ENAMETOOLONG`, so [`nearest_existing_ancestor`] need not ask.
+#[cfg(windows)]
+const MAX_STATABLE_PATH_LEN: usize = 32_767 * 3;
+#[cfg(not(windows))]
+const MAX_STATABLE_PATH_LEN: usize = 4096;
 
 /// Evaluate one candidate directory: allow, or block with the message.
 /// `origin_repo`, when set, names the repo the command's cwd started in — used
@@ -11310,5 +11323,30 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_skips_over_limit_ancestors_quickly() {
+        // cadence-hooks#1171: stat-ing every ancestor of a 100k-component
+        // Write path took ~1 s in release — past the hook deadline, so the
+        // guard failed open. Over-limit ancestors now skip the stat.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let deep = base.join("a/".repeat(100_000)).join("x");
+        let start = std::time::Instant::now();
+        assert_eq!(nearest_existing_ancestor(&deep), base);
+        // Unix only: Windows' extended-length cap still stats ~100 KB paths.
+        #[cfg(not(windows))]
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_still_stats_short_ancestors() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(nearest_existing_ancestor(&base.join("no/such/dir")), base);
+        assert_eq!(nearest_existing_ancestor(base), base);
     }
 }

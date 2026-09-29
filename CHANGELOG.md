@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`enforce-worktree` judges a Write or Edit to a very deep path inside the hook deadline.** Resolving a not-yet-created file's directory stat-ed every ancestor, and each stat copies the whole path, so a `file_path` of 100,000 components took about a second in release: past the deadline, where the hook fails open. An ancestor longer than the OS path limit cannot exist, so it is now skipped without a stat, and the same path resolves in milliseconds with the same verdict. (cameronsjo/cadence-hooks#1171)
+
 ### Fixed
 
 - **`warn-going-public` reads the command behind an assignment word or a transparent prefix.** It took the first word of each segment as the command, so `X=1 gh repo create <name> --public`, `env X=1 gh repo create …`, `command gh repo create …` and a create inside `if …; then …; fi` or `{ …; }` were never scanned, while bash runs `gh` for every one. The guard now reads each segment through the shared pre-processing model (`executable_tokens`, then `skip_transparent_prefixes`). An inline `CADENCE_GOING_PUBLIC_IGNORE=…` prefix no longer silences the nudge: it reaches the `gh` process rather than the hook, and it had only worked by hiding the whole segment, including the `redaction.toml` terms that the ignore list is never allowed to relieve. The relief list is read from the session environment, as documented. (cameronsjo/cadence-hooks#1171)
