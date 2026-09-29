@@ -1204,9 +1204,681 @@ pub fn is_secret_scan_exempt(path: &str) -> bool {
         .any(|c| c == "cadence-hooks")
 }
 
+// --- file operands of network and script commands (#1098, #1125, #1130) ---
+//
+// Shared by both secret guards: `prevent_secret_leaks` judges the files these
+// commands read, `prevent_secret_writes` the ones they write. One grammar per
+// command, so the two guards can never read the same argv differently.
+
+/// What a command does with the file an option's value names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileUse {
+    /// Read and sent or printed: `curl -K`, `wget --post-file`.
+    Read,
+    /// A `curl` upload value in its own `@FILE`/`name=@FILE` grammar.
+    Upload,
+    /// Created or overwritten: `curl -o`, `wget -O`.
+    Write,
+    /// A directory a downloaded file lands in: `curl --output-dir`,
+    /// `wget -P`.
+    Dir,
+}
+
+/// `curl` options whose value names a file, as the long name, the short
+/// letter, and what curl does with it.
+///
+/// - Uploads (#1098): `-F name=@FILE` / `-F name=<FILE` (a form part),
+///   `-d @FILE` and its `--data-*`/`--json` kin, `--data-urlencode name@FILE`
+///   and the same grammar in `--url-query` and `--variable`, `-H @FILE` (one
+///   header per line), and `-T FILE`. `--data-raw` and `--form-string` take
+///   `@` literally and are not listed.
+/// - Reads (#1125): `-K`/`--config` parses the file as options, so its lines
+///   reach the request or an error message; `-b`/`--cookie` sends a cookie
+///   file's contents (a value holding `=` is a cookie string instead).
+/// - Writes (#1125): `-o`/`--output`, `-D`/`--dump-header`,
+///   `-c`/`--cookie-jar`, `--trace`, `--trace-ascii`, `--stderr`,
+///   `--etag-save`, `--libcurl`; `--output-dir` is where `-o` and `-O` land.
+const CURL_FILE_OPTIONS: &[(&str, Option<char>, FileUse)] = &[
+    ("form", Some('F'), FileUse::Upload),
+    ("data", Some('d'), FileUse::Upload),
+    ("data-ascii", None, FileUse::Upload),
+    ("data-binary", None, FileUse::Upload),
+    ("json", None, FileUse::Upload),
+    ("data-urlencode", None, FileUse::Upload),
+    ("url-query", None, FileUse::Upload),
+    ("variable", None, FileUse::Upload),
+    ("header", Some('H'), FileUse::Upload),
+    ("proxy-header", None, FileUse::Upload),
+    ("upload-file", Some('T'), FileUse::Upload),
+    ("config", Some('K'), FileUse::Read),
+    ("cookie", Some('b'), FileUse::Read),
+    ("output", Some('o'), FileUse::Write),
+    ("output-dir", None, FileUse::Dir),
+    ("dump-header", Some('D'), FileUse::Write),
+    ("cookie-jar", Some('c'), FileUse::Write),
+    ("trace", None, FileUse::Write),
+    ("trace-ascii", None, FileUse::Write),
+    ("stderr", None, FileUse::Write),
+    ("etag-save", None, FileUse::Write),
+    ("libcurl", None, FileUse::Write),
+];
+
+/// Exact `curl` long options that a prefix match would misread as one of
+/// [`CURL_FILE_OPTIONS`]: `--head` is not `--header`, `--proxy` is not
+/// `--proxy-header`, `--url` is not `--url-query`.
+const CURL_EXACT_OTHERS: &[&str] = &["head", "proxy", "url"];
+
+/// `curl`'s short options that take a value, so a cluster ends at one:
+/// `-sd@x` is `-s -d @x`, while `-Hd@x` is a header named `d@x`.
+const CURL_VALUED_SHORT: &str = "AbcCdDeEFHKmoPQrtTuUwxXyYz";
+
+/// The [`CURL_FILE_OPTIONS`] entry a `--NAME` spelling selects. A long name
+/// matches any prefix of 3+ characters (curl accepts unambiguous
+/// abbreviations and refuses ambiguous ones, so a generous read only adds
+/// judgments), with curl 8.3's `--expand-` prefix peeled. curl has no
+/// `--name=value` spelling: it refuses one as an unknown option.
+fn curl_long_option(name: &str) -> Option<(&'static str, FileUse)> {
+    let name = name.strip_prefix("expand-").unwrap_or(name);
+    if name.len() < 3 || CURL_EXACT_OTHERS.contains(&name) {
+        return None;
+    }
+    CURL_FILE_OPTIONS
+        .iter()
+        .find(|(long, _, _)| *long == name)
+        .or_else(|| {
+            CURL_FILE_OPTIONS
+                .iter()
+                .find(|(long, _, _)| long.starts_with(name))
+        })
+        .map(|(long, _, used)| (*long, *used))
+}
+
+/// Each [`CURL_FILE_OPTIONS`] value in a `curl` argv, as `(argv index, long
+/// name, use, value)` — the index of the token that carries the value,
+/// whether attached (`-d@.env`, `-o.env`, `-sK.env`) or the next word
+/// (`-F f=@.env`, `--output .env`). Every token is read as a possible option
+/// on its own, so a value that looks like an option is judged both ways.
+pub(crate) fn curl_file_values(argv: &[String]) -> Vec<(usize, &'static str, FileUse, &str)> {
+    let mut out = Vec::new();
+    for (i, t) in argv.iter().enumerate().skip(1) {
+        let next = argv.get(i + 1).map(|n| (i + 1, n.as_str()));
+        let (option, used, value) = if let Some(name) = t.strip_prefix("--") {
+            match curl_long_option(name) {
+                Some((long, used)) => (long, used, next),
+                None => continue,
+            }
+        } else if let Some(cluster) = t.strip_prefix('-') {
+            let Some((at, c)) = cluster
+                .char_indices()
+                .find(|(_, c)| CURL_VALUED_SHORT.contains(*c))
+            else {
+                continue;
+            };
+            let Some((long, _, used)) = CURL_FILE_OPTIONS
+                .iter()
+                .find(|(_, short, _)| *short == Some(c))
+            else {
+                continue;
+            };
+            let rest = &cluster[at + c.len_utf8()..];
+            (
+                *long,
+                *used,
+                if rest.is_empty() {
+                    next
+                } else {
+                    Some((i, rest))
+                },
+            )
+        } else {
+            continue;
+        };
+        if let Some((at, value)) = value {
+            out.push((at, option, used, value));
+        }
+    }
+    out
+}
+
+/// The last path component of a URL — the name `curl -O` and a plain `wget`
+/// save it under — or `None` when the URL has no path to name one.
+fn url_file_name(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = &rest[rest.find('/')?..];
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    path.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+/// `dir/name`, or `name` alone when there is no directory.
+fn in_dir(dir: Option<&str>, name: &str) -> String {
+    match dir {
+        Some(dir) => format!("{}/{name}", dir.trim_end_matches('/')),
+        None => name.to_string(),
+    }
+}
+
+/// Every file a `curl` argv writes (#1125): each write option's value, an
+/// `-o` value under `--output-dir`, and — under `-O`/`--remote-name`/
+/// `--remote-name-all` — the last path component of every word that is not
+/// an option (a URL, or an unknown option's value, which can only add a
+/// judgment), under `--output-dir`.
+pub(crate) fn curl_write_targets(argv: &[String]) -> Vec<String> {
+    let values = curl_file_values(argv);
+    let dir = values
+        .iter()
+        .rev()
+        .find(|(_, _, used, _)| *used == FileUse::Dir)
+        .map(|(_, _, _, value)| *value);
+    let mut out: Vec<String> = values
+        .iter()
+        .filter(|(_, _, used, _)| *used == FileUse::Write)
+        .flat_map(|(_, long, _, value)| {
+            let mut paths = vec![(*value).to_string()];
+            if *long == "output" && dir.is_some() {
+                paths.push(in_dir(dir, value));
+            }
+            paths
+        })
+        .collect();
+    let remote_name = argv.iter().skip(1).any(|t| match t.strip_prefix("--") {
+        Some(name) => name.starts_with("remote-n") && "remote-name-all".starts_with(name),
+        None => t.strip_prefix('-').is_some_and(|cluster| {
+            cluster
+                .chars()
+                .take_while(|c| !CURL_VALUED_SHORT.contains(*c))
+                .any(|c| c == 'O')
+        }),
+    });
+    if remote_name {
+        let consumed: std::collections::HashSet<usize> =
+            values.iter().map(|(at, _, _, _)| *at).collect();
+        let mut i = 1;
+        while let Some(t) = argv.get(i) {
+            let valued_short = t.len() > 1
+                && !t.starts_with("--")
+                && t.strip_prefix('-').is_some_and(|cluster| {
+                    cluster
+                        .char_indices()
+                        .find(|(_, c)| CURL_VALUED_SHORT.contains(*c))
+                        .is_some_and(|(at, c)| at + c.len_utf8() == cluster.len())
+                });
+            if valued_short {
+                i += 2;
+                continue;
+            }
+            if !t.starts_with('-')
+                && !consumed.contains(&i)
+                && let Some(name) = url_file_name(t)
+            {
+                out.push(in_dir(dir, name));
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `wget` long options whose value names a file (#1125): `--post-file`,
+/// `--body-file` and `-i`/`--input-file` send or echo the file's contents,
+/// `--config` parses it and quotes its lines in errors; `-O`/
+/// `--output-document`, `-o`/`--output-file` and `-a`/`--append-output`
+/// write one; `-P`/`--directory-prefix` is where a download lands.
+const WGET_FILE_OPTIONS: &[(&str, Option<char>, FileUse)] = &[
+    ("post-file", None, FileUse::Read),
+    ("body-file", None, FileUse::Read),
+    ("input-file", Some('i'), FileUse::Read),
+    ("config", None, FileUse::Read),
+    ("output-document", Some('O'), FileUse::Write),
+    ("output-file", Some('o'), FileUse::Write),
+    ("append-output", Some('a'), FileUse::Write),
+    ("directory-prefix", Some('P'), FileUse::Dir),
+];
+
+/// `wget -e`/`--execute` wgetrc commands with the same effect as a
+/// [`WGET_FILE_OPTIONS`] entry, by their normalized name (case, `_` and `-`
+/// are insignificant to wgetrc).
+const WGET_RC_FILES: &[(&str, &str)] = &[
+    ("postfile", "post-file"),
+    ("bodyfile", "body-file"),
+    ("input", "input-file"),
+    ("outputdocument", "output-document"),
+    ("logfile", "output-file"),
+    ("dirprefix", "directory-prefix"),
+];
+
+/// The [`WGET_FILE_OPTIONS`] entry for a long name.
+fn wget_option(long: &str) -> Option<(&'static str, FileUse)> {
+    WGET_FILE_OPTIONS
+        .iter()
+        .find(|(name, _, _)| *name == long)
+        .map(|(name, _, used)| (*name, *used))
+}
+
+/// `wget`'s short options that take a value (`-n` takes the one letter after
+/// it, and is walked separately).
+const WGET_VALUED_SHORT: &str = "aABDeiIloOPQRtTUwX";
+
+/// Each file a `wget` argv names, as `(argv index, long name, use, value)`. GNU getopt
+/// grammar: `--name=value` or `--name value`, any prefix of 3+ characters of a
+/// long name (getopt accepts unambiguous abbreviations and refuses ambiguous
+/// ones, so a generous read only adds judgments), and short clusters
+/// (`-qi.env` is `-q -i .env`). A `-e`/`--execute` wgetrc command is read for
+/// the same files. The walk also returns the words no option consumed — the
+/// URLs a plain `wget` saves under their own names.
+#[allow(clippy::type_complexity)]
+pub(crate) fn wget_file_values(
+    argv: &[String],
+) -> (Vec<(usize, &'static str, FileUse, &str)>, Vec<&str>) {
+    let mut out = Vec::new();
+    let mut operands = Vec::new();
+    fn push_rc<'a>(
+        at: usize,
+        command: &'a str,
+        out: &mut Vec<(usize, &'static str, FileUse, &'a str)>,
+    ) {
+        let (key, value) = command.split_once('=').unwrap_or((command, ""));
+        let key: String = key
+            .chars()
+            .filter(|c| !matches!(c, '_' | '-') && !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if let Some((long, used)) = WGET_RC_FILES
+            .iter()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, long)| wget_option(long))
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                out.push((at, long, used, value));
+            }
+        }
+    }
+    let mut i = 1;
+    let mut options_done = false;
+    while let Some(t) = argv.get(i) {
+        let next = argv.get(i + 1).map(String::as_str);
+        if options_done || !t.starts_with('-') || t.len() == 1 {
+            operands.push(t.as_str());
+            i += 1;
+            continue;
+        }
+        if t == "--" {
+            options_done = true;
+            i += 1;
+            continue;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let execute = name.len() >= 3 && "execute".starts_with(name);
+            let option = (name.len() >= 3)
+                .then(|| {
+                    WGET_FILE_OPTIONS
+                        .iter()
+                        .find(|(long, _, _)| *long == name)
+                        .or_else(|| {
+                            WGET_FILE_OPTIONS
+                                .iter()
+                                .find(|(long, _, _)| long.starts_with(name))
+                        })
+                })
+                .flatten();
+            match (attached, next) {
+                (Some(value), _) => {
+                    if let Some((long, _, used)) = option {
+                        out.push((i, *long, *used, value));
+                    } else if execute {
+                        push_rc(i, value, &mut out);
+                    }
+                }
+                (None, Some(value)) if option.is_some() || execute => {
+                    if let Some((long, _, used)) = option {
+                        out.push((i + 1, *long, *used, value));
+                    } else {
+                        push_rc(i + 1, value, &mut out);
+                    }
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        let cluster = &t[1..];
+        let mut consumed = 1;
+        let mut letters = cluster.char_indices();
+        while let Some((at, c)) = letters.next() {
+            if c == 'n' {
+                letters.next();
+                continue;
+            }
+            if !WGET_VALUED_SHORT.contains(c) {
+                continue;
+            }
+            let rest = &cluster[at + c.len_utf8()..];
+            let value = if rest.is_empty() {
+                consumed = 2;
+                next.map(|value| (i + 1, value))
+            } else {
+                Some((i, rest))
+            };
+            if let Some((at, value)) = value {
+                if c == 'e' {
+                    push_rc(at, value, &mut out);
+                } else if let Some((long, _, used)) = WGET_FILE_OPTIONS
+                    .iter()
+                    .find(|(_, short, _)| *short == Some(c))
+                {
+                    out.push((at, *long, *used, value));
+                }
+            }
+            break;
+        }
+        i += consumed;
+    }
+    (out, operands)
+}
+
+/// Every file a `wget` argv writes (#1125): each write option's value, and —
+/// unless `-O` names the output or `--spider` saves nothing — each URL's last
+/// path component, under `-P`.
+pub(crate) fn wget_write_targets(argv: &[String]) -> Vec<String> {
+    let (values, operands) = wget_file_values(argv);
+    let dir = values
+        .iter()
+        .rev()
+        .find(|(_, _, used, _)| *used == FileUse::Dir)
+        .map(|(_, _, _, value)| *value);
+    let mut out: Vec<String> = values
+        .iter()
+        .filter(|(_, _, used, _)| *used == FileUse::Write)
+        .map(|(_, _, _, value)| (*value).to_string())
+        .collect();
+    let named_output = values
+        .iter()
+        .any(|(_, long, _, _)| *long == "output-document");
+    let spider = argv.iter().any(|t| t == "--spider");
+    if !spider && !named_output {
+        out.extend(
+            operands
+                .into_iter()
+                .filter_map(url_file_name)
+                .map(|name| in_dir(dir, name)),
+        );
+    }
+    out
+}
+
+/// A file or command a `sed` or `awk` program opens by itself (#1130).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramOpen {
+    Read(String),
+    Write(String),
+    /// A shell command the program runs (`sed`'s `e`, awk's `system()` and
+    /// pipes).
+    Command(String),
+}
+
+/// Characters that may sit right before a `sed` command letter: a command
+/// separator, a block brace, an address negation or end, a closing
+/// delimiter, or an `s` command flag. Read generously — a letter taken for a
+/// command whose "file" names no secret adds nothing.
+fn sed_command_boundary(prev: Option<char>) -> bool {
+    prev.is_none_or(|p| {
+        p.is_ascii_digit()
+            || matches!(
+                p,
+                ';' | '{' | '}' | '!' | '$' | '/' | '|' | 'g' | 'p' | 'i' | 'I' | 'm' | 'M' | 'e'
+            )
+    })
+}
+
+/// What a `sed` program opens: `r`/`R FILE` read a file into the output,
+/// `w`/`W FILE` and an `s///w FILE` flag write one, and `e COMMAND` runs a
+/// command. A file name runs to the end of its line (GNU and BSD alike:
+/// `r .env; p` reads a file named `.env; p`), and needs no space before it
+/// (`1r.env`).
+///
+/// Every letter that may be a command is a candidate, but only the last
+/// [`SED_LINE_CANDIDATES`] on a line are kept, and no file operand longer
+/// than [`SED_OPERAND_LIMIT`]: the real command's operand runs to the
+/// end of its line, so a decoy letter can only sit BEFORE it, and a decoy
+/// inside the file name yields a suffix of that name — which keeps its base
+/// name. The bound keeps a 200 KB program linear.
+pub(crate) fn sed_program_opens(program: &str) -> Vec<ProgramOpen> {
+    let mut out = Vec::new();
+    for line in program.lines() {
+        let mut prev = None;
+        let mut candidates = std::collections::VecDeque::new();
+        for (at, c) in line.char_indices() {
+            if matches!(c, 'r' | 'R' | 'w' | 'W' | 'e') && sed_command_boundary(prev) {
+                if candidates.len() == SED_LINE_CANDIDATES {
+                    candidates.pop_front();
+                }
+                candidates.push_back((at, c));
+            }
+            if !c.is_whitespace() {
+                prev = Some(c);
+            }
+        }
+        for (at, c) in candidates {
+            let operand = line[at + 1..].trim();
+            // A command (`e`) has no length bound to fall under.
+            if operand.is_empty() || (c != 'e' && operand.len() > SED_OPERAND_LIMIT) {
+                continue;
+            }
+            out.push(match c {
+                'r' | 'R' => ProgramOpen::Read(operand.to_string()),
+                'w' | 'W' => ProgramOpen::Write(operand.to_string()),
+                _ => ProgramOpen::Command(operand.to_string()),
+            });
+        }
+    }
+    out
+}
+
+/// Candidate commands [`sed_program_opens`] keeps per line.
+const SED_LINE_CANDIDATES: usize = 16;
+
+/// Longest `sed` operand judged: `PATH_MAX` on Linux, past which no file
+/// opens.
+const SED_OPERAND_LIMIT: usize = 4096;
+
+/// The string literals of an `awk` program, as `(open quote, close quote,
+/// contents)` byte offsets, and the program with every literal blanked to
+/// `""`. `#` comments are skipped; a literal that never closes runs to the
+/// end.
+fn awk_literals(program: &str) -> (Vec<(usize, usize, String)>, String) {
+    let bytes = program.as_bytes();
+    let mut literals = Vec::new();
+    let mut blanked = String::with_capacity(program.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                let end = program[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                i = end;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                let mut contents = Vec::new();
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        j += 1;
+                    }
+                    contents.push(bytes[j]);
+                    j += 1;
+                }
+                literals.push((
+                    i,
+                    j.min(bytes.len()),
+                    String::from_utf8_lossy(&contents).into_owned(),
+                ));
+                blanked.push_str("\"\"");
+                i = j + 1;
+            }
+            _ => {
+                let len = program[i..].chars().next().map_or(1, char::len_utf8);
+                blanked.push_str(&program[i..i + len]);
+                i += len;
+            }
+        }
+    }
+    (literals, blanked)
+}
+
+/// A pipe in blanked `awk` text: a `|` that is not half of `||`.
+fn awk_has_pipe(blanked: &str) -> bool {
+    let bytes = blanked.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'|' && bytes.get(i + 1) != Some(&b'|') && (i == 0 || bytes[i - 1] != b'|')
+    })
+}
+
+/// Matches an `awk` output redirection: a `print`/`printf` statement with a
+/// `>` before the statement ends.
+static AWK_PRINT_REDIRECT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bprintf?\b[^;{}\n]*>").expect("valid regex"));
+
+/// What an `awk` program opens: a literal after `getline <` is read, one
+/// after `>`/`>>` is written, one after `|` or inside `system(…)`, or before
+/// `| getline`, is a command. When the program opens something named by an
+/// expression rather than one literal (`f = ".env"; getline < f`,
+/// `system("cat " f)`), every literal — and every run of adjacent literals,
+/// joined as awk concatenates them — is a candidate for that use.
+pub(crate) fn awk_program_opens(program: &str) -> Vec<ProgramOpen> {
+    let (literals, blanked) = awk_literals(program);
+    // Literals with only whitespace between them are one string to awk:
+    // `".e" "nv"` is `.env`.
+    let mut runs: Vec<(usize, usize, String)> = Vec::new();
+    for (open, close, contents) in &literals {
+        match runs.last_mut() {
+            Some(run)
+                if program
+                    .get(run.1 + 1..*open)
+                    .is_some_and(|gap| gap.chars().all(char::is_whitespace)) =>
+            {
+                run.1 = *close;
+                run.2.push_str(contents);
+            }
+            _ => runs.push((*open, *close, contents.clone())),
+        }
+    }
+    let mut out = Vec::new();
+    for (open, close, contents) in &runs {
+        let before = program[..*open].trim_end();
+        let after = program.get(close + 1..).unwrap_or_default().trim_start();
+        let piped_to_getline = after
+            .strip_prefix('|')
+            .map(|rest| rest.trim_start_matches('&').trim_start())
+            .is_some_and(|rest| rest.starts_with("getline"));
+        let open_use = if before.ends_with('<') && !before.ends_with("<<") {
+            Some(ProgramOpen::Read(contents.clone()))
+        } else if before.ends_with('>') {
+            Some(ProgramOpen::Write(contents.clone()))
+        } else if before.ends_with('|')
+            || before.ends_with("|&")
+            || before
+                .strip_suffix('(')
+                .is_some_and(|b| b.trim_end().ends_with("system"))
+            || piped_to_getline
+        {
+            Some(ProgramOpen::Command(contents.clone()))
+        } else {
+            None
+        };
+        out.extend(open_use);
+    }
+    let commands = blanked.contains("system") || awk_has_pipe(&blanked);
+    let reads = commands || (blanked.contains("getline") && blanked.contains('<'));
+    let writes = commands || AWK_PRINT_REDIRECT.is_match(&blanked);
+    let pieces = literals
+        .iter()
+        .map(|(_, _, contents)| contents)
+        .chain(runs.iter().map(|(_, _, contents)| contents));
+    for contents in pieces {
+        if reads {
+            out.push(ProgramOpen::Read(contents.clone()));
+        }
+        if writes {
+            out.push(ProgramOpen::Write(contents.clone()));
+        }
+    }
+    out
+}
+
+/// What a `sed` or `awk` program opens, by the command that runs it.
+pub(crate) fn program_opens(cmd: &str, program: &str) -> Vec<ProgramOpen> {
+    match cmd {
+        "sed" | "gsed" => sed_program_opens(program),
+        "awk" | "gawk" | "mawk" | "nawk" => awk_program_opens(program),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sed_program_opens_read_to_the_end_of_the_line() {
+        // #1130: GNU and BSD sed take the file name to the end of its line.
+        for (program, want) in [
+            ("r .env", vec![ProgramOpen::Read(".env".into())]),
+            ("1r.env", vec![ProgramOpen::Read(".env".into())]),
+            ("r .env; p", vec![ProgramOpen::Read(".env; p".into())]),
+            ("s/a/b/w out", vec![ProgramOpen::Write("out".into())]),
+            ("1e cat x", vec![ProgramOpen::Command("cat x".into())]),
+            ("p\nW .env", vec![ProgramOpen::Write(".env".into())]),
+            ("s/foo/bar/", vec![]),
+            ("1a w .env", vec![]),
+        ] {
+            assert_eq!(sed_program_opens(program), want, "{program}");
+        }
+    }
+
+    #[test]
+    fn awk_program_opens_classify_literals_by_context() {
+        let opens = awk_program_opens(r#"BEGIN{getline l < "a"; print > "b"; system("c")}"#);
+        for want in [
+            ProgramOpen::Read("a".into()),
+            ProgramOpen::Write("b".into()),
+            ProgramOpen::Command("c".into()),
+        ] {
+            assert!(opens.contains(&want), "{want:?} in {opens:?}");
+        }
+        // No opening construct: a printed literal is text.
+        assert!(awk_program_opens(r#"{print ".env"} $1 == "x" || 1"#).is_empty());
+    }
+
+    #[test]
+    fn url_file_names_and_wget_values() {
+        for (url, want) in [
+            ("https://x/.env", Some(".env")),
+            ("https://x/a/id_rsa?v=1#f", Some("id_rsa")),
+            ("https://x/", None),
+            ("https://x", None),
+            ("x.org/.netrc", Some(".netrc")),
+        ] {
+            assert_eq!(url_file_name(url), want, "{url}");
+        }
+        let argv: Vec<String> = ["wget", "-nv", "-qO", "out", "--post-f=.env", "-P", "d", "u"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (values, operands) = wget_file_values(&argv);
+        assert_eq!(
+            values,
+            vec![
+                (3, "output-document", FileUse::Write, "out"),
+                (4, "post-file", FileUse::Read, ".env"),
+                (6, "directory-prefix", FileUse::Dir, "d"),
+            ]
+        );
+        assert_eq!(operands, vec!["u"]);
+    }
 
     #[test]
     fn safe_templates_detected() {
