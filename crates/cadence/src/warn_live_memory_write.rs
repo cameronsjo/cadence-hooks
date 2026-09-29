@@ -16,6 +16,10 @@
 //! [`LOCK_MAX_AGE`] — the same 6-hour window dream uses to tell a live run from
 //! a crashed run's leftover. The check reads one `stat`; it never opens the
 //! lock or any memory file. Every I/O failure allows (ADR-0001).
+//!
+//! **Accepted miss:** the target path is matched lexically, so a write through
+//! a symlink that resolves into a memory directory is not recognized. The check
+//! is advisory, and resolving links would cost a filesystem walk per write.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
@@ -45,6 +49,7 @@ pub fn judge(input: &HookInput, config_dir: &str, now: SystemTime) -> CheckResul
     let Some(path) = input.file_path() else {
         return CheckResult::allow();
     };
+    let path = anchor_to_cwd(&path, input.cwd.as_deref());
     let Some(target) = live_memory_target(&path, config_dir) else {
         return CheckResult::allow();
     };
@@ -119,6 +124,28 @@ pub fn live_memory_target(path: &str, config_dir: &str) -> Option<MemoryTarget> 
     })
 }
 
+/// Resolve a relative `path` against the payload's `cwd` — the directory the
+/// harness will write relative to — rather than this process's cwd. An absolute
+/// path, or a relative one with no `cwd`, passes through unchanged.
+pub fn anchor_to_cwd(path: &str, cwd: Option<&str>) -> String {
+    let absolute = path.starts_with('/') || path.starts_with('\\') || path.get(1..2) == Some(":");
+    match cwd {
+        Some(dir) if !absolute && !dir.is_empty() => {
+            format!("{}/{path}", dir.trim_end_matches(['/', '\\']))
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// The slug as it may be echoed: only a plain `[A-Za-z0-9._-]+` name.
+fn display_slug(slug: &str) -> &str {
+    let plain = !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain { slug } else { "(non-standard slug)" }
+}
+
 fn normalized_components(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for component in raw.replace('\\', "/").split('/') {
@@ -164,7 +191,7 @@ pub fn lock_state(path: &Path, now: SystemTime) -> LockState {
 }
 
 fn render(target: &MemoryTarget, state: LockState) -> String {
-    let slug = cadence_hooks_core::display::sanitize_field(&target.slug, 80);
+    let slug = display_slug(&target.slug);
     let lock_note = match state {
         LockState::Stale => {
             " A run lock exists but is older than 6 hours — a crashed run's leftover, not an open window."
@@ -303,5 +330,31 @@ mod tests {
             judge(&make_bash("ls"), cfg_str, now).outcome,
             Outcome::Allow
         );
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_payload_cwd() {
+        assert_eq!(
+            anchor_to_cwd("memory/x.md", Some("/home/u/.claude/projects/s/")),
+            "/home/u/.claude/projects/s/memory/x.md"
+        );
+        assert_eq!(anchor_to_cwd("/abs/x.md", Some("/cwd")), "/abs/x.md");
+        assert_eq!(anchor_to_cwd("rel.md", None), "rel.md");
+
+        let cfg = tempfile::tempdir().unwrap();
+        let cfg_str = cfg.path().to_str().unwrap();
+        let mut input = cadence_hooks_core::test_builders::make_write("memory/MEMORY.md", "x");
+        input.cwd = Some(format!("{cfg_str}/projects/slug"));
+        let result = judge(&input, cfg_str, SystemTime::now());
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn only_a_plain_slug_is_echoed() {
+        assert_eq!(display_slug("-home-u-repo"), "-home-u-repo");
+        assert_eq!(display_slug("a.b_c-1"), "a.b_c-1");
+        for odd in ["", "x`y", "x y", "x\u{202e}y", "x\ny"] {
+            assert_eq!(display_slug(odd), "(non-standard slug)", "{odd:?}");
+        }
     }
 }

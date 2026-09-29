@@ -27,7 +27,7 @@
 //! additional context. Every read or parse failure allows (ADR-0001).
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Plugin-root directories that never ship runtime content.
 const CRUFT_DIRS: &[&str] = &["docs", "scripts"];
@@ -44,6 +44,7 @@ impl Check for WarnPluginRootCruft {
         let Some(path) = input.file_path() else {
             return CheckResult::allow();
         };
+        let path = crate::warn_live_memory_write::anchor_to_cwd(&path, input.cwd.as_deref());
         for candidate in candidates(&path) {
             let manifest = candidate
                 .repo_root
@@ -145,16 +146,14 @@ pub fn manifest_declares(raw: &str, plugin: &str) -> bool {
 fn render(c: &Candidate) -> String {
     let plugin = cadence_hooks_core::display::sanitize_field(&c.plugin, 80);
     let dir = &c.dir;
-    let root = Path::new(&c.repo_root).display().to_string();
-    let root = cadence_hooks_core::display::sanitize_field(&root, 200);
     format!(
         "📦  This write creates `plugins/{plugin}/{dir}/` content. The marketplace copies the whole \
          plugin directory into the plugin cache on every marketplace commit, so a plugin-root \
          `{dir}/` ships as cruft — and the repo's `plugin-runtime-only` CI check and \
          `.gitignore` will reject it later.\n\n\
          Put it where it does not ship:\n  \
-         - session plans, research, maintenance scripts → the monorepo-root `docs/` or `scripts/` \
-         (under {root})\n  \
+         - session plans, research, maintenance scripts → the repo-root `docs/` or `scripts/`, \
+         outside the plugin root\n  \
          - field reports → the vault, never a repo\n  \
          - a runtime asset a SKILL.md or README cites → the plugin's `references/`, or a \
          skill-nested `skills/<skill>/scripts/`\n\n\
@@ -167,6 +166,7 @@ mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_edit, make_multi_edit, make_write};
+    use std::path::Path;
 
     const MANIFEST: &str = r#"{
       "name": "cadence",
@@ -297,5 +297,17 @@ mod tests {
             outcome_for(repo.path(), "plugins/cadence/docs/x.md"),
             Outcome::Allow
         );
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_payload_cwd() {
+        let repo = repo_with_manifest(MANIFEST);
+        let mut input = make_write("plugins/cadence/docs/x.md", "x");
+        input.cwd = Some(repo.path().to_str().unwrap().to_string());
+        let result = WarnPluginRootCruft.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        // The message names the plugin root, never the repo's filesystem path.
+        let msg = result.message.unwrap();
+        assert!(!msg.contains(repo.path().to_str().unwrap()), "{msg}");
     }
 }
