@@ -418,6 +418,9 @@ mod tests {
             "rm *.key",
             "rm ~/.ssh/*",
             "tee ~/.aws/cred* < /dev/null",
+            "truncate -s0 .[!A-Z]nv",
+            "rm *credentials*",
+            "rm id_*",
         ] {
             assert!(bash_targets_env_file(command), "{command}");
         }
@@ -427,6 +430,9 @@ mod tests {
             "echo x > out/*.log",
             "rm .env*.example",
             "rm -rf node_modules/.cache/*",
+            "rm *.json",
+            "rm -f certs/*.pem",
+            "cp a.json config/*.json",
         ] {
             assert!(!bash_targets_env_file(command), "{command}");
         }

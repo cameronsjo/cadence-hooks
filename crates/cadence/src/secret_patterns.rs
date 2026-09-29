@@ -417,25 +417,39 @@ pub fn is_dangerous_secret_token(token: &str) -> bool {
 /// token names a file — a redirection target, a writer verb's operand, or an
 /// operand of a command that does nothing but read files.
 pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
-    let lower = token.to_lowercase();
+    secret_token_verdict(token, position, true)
+}
+
+/// [`is_dangerous_secret_token_at`] without the glob judgment, for a word
+/// that a command reads as a PATTERN (`grep`'s regex, `jq`'s filter), where
+/// `*`, `?` and `[` are regex syntax rather than filename expansion. A
+/// literal secret name still counts, and so does a brace group, which the
+/// shell expands into separate words before the command runs.
+pub fn is_dangerous_secret_name_at(token: &str, position: Filename) -> bool {
+    secret_token_verdict(token, position, false)
+}
+
+fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
+    // Checked before any brace or glob analysis, both of which grow with the
+    // token: a 100 KB `{{{…` took seconds (#1097 review). Nothing legitimate
+    // needs a 4 KiB word with glob syntax in it.
+    if token.len() > GLOB_TOKEN_LIMIT && has_glob_syntax(token) {
+        return true;
+    }
     // Brace expansion runs before globbing and makes names, dotfiles
     // included, so `{a,.env}` is judged as `a` and `.env` (#1052). A token that
     // expands past the cap is refused outright.
-    match brace_expansions(&lower) {
+    match brace_expansions(token) {
         None => return true,
         Some(words) if words.len() > 1 => {
             return words
                 .iter()
-                .any(|word| is_dangerous_secret_token_at(word, position));
+                .any(|word| secret_token_verdict(word, position, globs));
         }
         Some(_) => {}
     }
-    // `@(…)` is an extglob group, not the curl upload idiom.
-    let trimmed = match lower.strip_prefix('@') {
-        Some(rest) if !rest.starts_with('(') => rest,
-        _ => &lower,
-    };
-    let trimmed = trimmed.trim_end_matches(')');
+    let lower = token.to_lowercase();
+    let trimmed = trim_operand(&lower);
     let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
     if is_safe_template(component) {
         return false;
@@ -447,22 +461,39 @@ pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
         || BLOCKED_PATH_FRAGMENTS
             .iter()
             .any(|frag| trimmed.contains(frag))
-        || (has_glob_syntax(trimmed) && glob_may_name_secret(trimmed, position))
+        || (globs
+            && has_glob_syntax(trimmed)
+            && glob_may_name_secret(trim_operand(token), position))
+}
+
+/// A shell operand with the curl/httpie upload `@` and a subshell's closing
+/// `)` removed. `@(…)` is an extglob group, not the upload idiom.
+fn trim_operand(token: &str) -> &str {
+    let trimmed = match token.strip_prefix('@') {
+        Some(rest) if !rest.starts_with('(') => rest,
+        _ => token,
+    };
+    trimmed.trim_end_matches(')')
 }
 
 /// Most words one token's brace groups may expand to before the token is
 /// refused unexpanded.
 const BRACE_EXPANSION_LIMIT: usize = 64;
 
-/// Every word the comma brace groups in `token` expand to, left to right as
-/// bash does, or `None` past [`BRACE_EXPANSION_LIMIT`]. A token with no comma
-/// group yields itself. `${…}` is a parameter, not a group; a `{a..z}`
-/// sequence is left for [`parse_glob`], which reads it as `*`.
+/// Longest token, in bytes, whose glob or brace syntax is analysed. A longer
+/// one carrying that syntax is judged dangerous unread.
+const GLOB_TOKEN_LIMIT: usize = 4096;
+
+/// Every word the comma brace groups in `token` expand to, or `None` past
+/// [`BRACE_EXPANSION_LIMIT`]. A token with no comma group yields itself.
+/// `${…}` is a parameter, not a group; a `{a..z}` sequence is left for
+/// [`parse_glob`], which reads it as `*`. The groups are expanded in whatever
+/// order they are found, which yields the same set of words as bash's order.
 fn brace_expansions(token: &str) -> Option<Vec<String>> {
     let mut done = Vec::new();
     let mut pending = vec![token.to_string()];
     while let Some(word) = pending.pop() {
-        let Some((open, close, alternatives)) = first_comma_group(&word) else {
+        let Some((open, close, alternatives)) = comma_group(&word) else {
             done.push(word);
             if done.len() > BRACE_EXPANSION_LIMIT {
                 return None;
@@ -483,56 +514,60 @@ fn brace_expansions(token: &str) -> Option<Vec<String>> {
     Some(done)
 }
 
-/// The first `{…}` in `word` holding a top-level comma: its byte span and its
-/// alternatives.
-fn first_comma_group(word: &str) -> Option<(usize, usize, Vec<String>)> {
-    let bytes = word.as_bytes();
-    for (open, _) in word.match_indices('{') {
-        if open > 0 && bytes[open - 1] == b'$' {
-            continue;
-        }
-        let (mut depth, mut start) = (0usize, open + 1);
-        let mut alternatives = Vec::new();
-        for (k, c) in word[open..].char_indices().map(|(k, c)| (k + open, c)) {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        if alternatives.is_empty() {
-                            break;
-                        }
-                        alternatives.push(word[start..k].to_string());
-                        return Some((open, k, alternatives));
-                    }
+/// The first `{…}` in `word` to close while holding a comma at its own
+/// level: its byte span and its alternatives. One pass with a stack, so a run
+/// of unclosed `{` costs linear time. A `${` opens a parameter, never a group.
+fn comma_group(word: &str) -> Option<(usize, usize, Vec<String>)> {
+    struct Frame {
+        open: usize,
+        parameter: bool,
+        commas: Vec<usize>,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut previous = None;
+    for (at, c) in word.char_indices() {
+        match c {
+            '{' => stack.push(Frame {
+                open: at,
+                parameter: previous == Some('$'),
+                commas: Vec::new(),
+            }),
+            ',' => {
+                if let Some(frame) = stack.last_mut() {
+                    frame.commas.push(at);
                 }
-                ',' if depth == 1 => {
-                    alternatives.push(word[start..k].to_string());
-                    start = k + 1;
-                }
-                _ => {}
             }
+            '}' => {
+                if let Some(frame) = stack.pop()
+                    && !frame.parameter
+                    && !frame.commas.is_empty()
+                {
+                    let mut alternatives = Vec::with_capacity(frame.commas.len() + 1);
+                    let mut start = frame.open + 1;
+                    for comma in frame.commas {
+                        alternatives.push(word[start..comma].to_string());
+                        start = comma + 1;
+                    }
+                    alternatives.push(word[start..at].to_string());
+                    return Some((frame.open, at, alternatives));
+                }
+            }
+            _ => {}
         }
+        previous = Some(c);
     }
     None
 }
 
-/// Directories whose every file is a credential, so a bare `*` inside one is
-/// a sweep of secrets rather than of a project directory: where the `id_*`
-/// keys live, plus the directory half of each [`BLOCKED_PATH_FRAGMENTS`]
-/// entry.
+/// Directories whose every file is a credential, so any glob inside one —
+/// a bare `*` included — is a sweep of secrets rather than of a project
+/// directory: where the `id_*` keys live, plus the directory half of each
+/// [`BLOCKED_PATH_FRAGMENTS`] entry.
 const SECRET_STORE_DIRS: &[&str] = &[".ssh", ".aws", ".kube", ".docker"];
 
-/// Longest path component the glob matcher will walk. The matcher is linear
-/// in the component, but it runs once per deny pattern per operand, and an
-/// operand can be most of a 16 KiB command. Past the cap a globbed component
-/// is judged dangerous: nothing legitimate needs a 4 KiB wildcard filename.
-const GLOB_COMPONENT_LIMIT: usize = 4096;
-
-/// Does this (lowercased) token carry filename-expansion syntax — `*`, `?`,
-/// `[`, a brace group, or an extglob group? Quote removal has already run, so
-/// a quoted `'*'` reads the same as a bare one; judging both as globs only
-/// adds blocks.
+/// Does this token carry filename-expansion syntax — `*`, `?`, `[`, a brace
+/// group, or an extglob group? Quote removal has already run, so a quoted
+/// `'*'` reads the same as a bare one; judging both as globs only adds blocks.
 fn has_glob_syntax(token: &str) -> bool {
     token.contains(['*', '?', '['])
         || token.contains("+(")
@@ -550,56 +585,92 @@ fn has_glob_syntax(token: &str) -> bool {
 /// spelling, and the exact-component rules above see none of them. Expanding
 /// against the working directory would add I/O and a race between the check
 /// and the run, so instead each component is compared, as a pattern, with a
-/// pattern for each deny-set family ([`deny_component_patterns`]): the token is
-/// dangerous when the two languages can share one name. That is fail-closed by
-/// construction — a pattern that COULD match a secret blocks whether or not the
-/// secret exists.
+/// pattern for each deny-set family ([`deny_families`]).
 ///
-/// The only glob this lets through without that comparison is a component made
-/// of nothing but `*` (`rm -rf dist/*`, `for f in *`), outside the
-/// [`SECRET_STORE_DIRS`]. It names every non-hidden file in a directory, which
-/// is what `grep -r x .` does and what neither guard polices; a bare `*` does
-/// not match a dotfile, and `.ssh/*` still blocks. Bash's own rule that a
-/// leading `.` must be matched explicitly is honoured, which is what keeps
-/// `cat *.md` and `cat *.rs` clear of the `.env.<x>` family.
+/// **Two conditions, both required.** The glob and the family must be able
+/// to share a name, and some literal run of the glob must carry that family's
+/// distinctive stem ([`stem_covered`]): `.env` for the dotenv files, `id_rsa`,
+/// `credentials`, `key`, and so on. Without the second, every sweep by
+/// extension blocked — `cat *.json` can match `credentials.json`, and
+/// `prettier --write "**/*.json"` is daily work, not a secret read (#1097
+/// review ruling). With it, `.env*`, `*credentials*`, `id_*`, `*.key`, `*env`
+/// and `.[e]nv` block, and `*.json`, `package*.json`, `*.pem`, `.*rc` and
+/// `.git*` do not.
+///
+/// Three shapes carry no literal stem and still block: any glob directly inside
+/// one of the [`SECRET_STORE_DIRS`] (`~/.ssh/*`), an extglob group, whose
+/// literals this does not read (`@(.env)`), and a dotfile sweep — a
+/// component that opens with an explicit `.` and has no other literal run
+/// (`.*`, `.??*`, `.[e][n][v]`), which is how the dotenv files are reached
+/// without spelling them. Bash's rule that a wildcard never matches a leading
+/// `.` is honoured.
 fn glob_may_name_secret(token: &str, position: Filename) -> bool {
-    let components: Vec<&str> = token.split('/').collect();
-    if components.iter().any(|c| c.len() > GLOB_COMPONENT_LIMIT) {
-        return true;
-    }
-    let patterns: Vec<Vec<GlobElement>> = components.iter().map(|c| parse_glob(c)).collect();
+    let patterns: Vec<Vec<GlobElement>> = token.split('/').map(parse_glob).collect();
     let last = patterns.len() - 1;
-    let bare_star =
-        !patterns[last].is_empty() && patterns[last].iter().all(|e| *e == GlobElement::Star);
+    let target = &patterns[last];
     let in_store = last > 0
         && SECRET_STORE_DIRS
             .iter()
             .any(|dir| glob_intersects(&patterns[last - 1], &parse_glob(dir)));
-    if (!bare_star || in_store)
-        && deny_component_patterns(position)
-            .iter()
-            .any(|deny| glob_intersects(&patterns[last], &parse_glob(deny)))
-    {
+    let chunks = literal_chunks(target);
+    let dot_sweep = target.first().is_some_and(GlobElement::matches_leading_dot)
+        && chunks.iter().skip(1).all(|chunk| chunk.chars().count() < 2)
+        && chunks.first().is_some_and(|first| first == ".");
+    // An extglob group's literals are not read, so it carries every stem.
+    let opaque = target.contains(&GlobElement::Group);
+    if families_at(position).iter().any(|family| {
+        let gated = in_store
+            || opaque
+            || (dot_sweep && family.pattern.starts_with('.'))
+            || stem_covered(&chunks, &family.stem);
+        gated && glob_intersects(target, &family.parsed)
+    }) {
         return true;
     }
     // Directory-qualified fragments: `~/.a?s/cred*`, `~/.kube/*`. The
-    // single-component fragments are families in `deny_component_patterns`.
+    // single-component fragments are families in `deny_families`.
     BLOCKED_PATH_FRAGMENTS
         .iter()
         .filter_map(|fragment| fragment.split_once('/'))
         .any(|(dir, name)| {
-            let dir = parse_glob(dir);
+            let dir_pattern = parse_glob(dir);
             let name = parse_glob(&format!("{name}*"));
-            patterns
-                .windows(2)
-                .any(|w| glob_intersects(&w[0], &dir) && glob_intersects(&w[1], &name))
+            patterns.windows(2).any(|w| {
+                stem_covered(&literal_chunks(&w[0]), dir)
+                    && glob_intersects(&w[0], &dir_pattern)
+                    && glob_intersects(&w[1], &name)
+            })
         })
 }
 
-/// Each deny-set family as a glob over one lowercased path component — the
-/// same families [`is_dangerous_secret_token_at`] matches literally, with
-/// `<name>.env` and the key extensions gated on `position` as there.
-fn deny_component_patterns(position: Filename) -> Vec<String> {
+/// One deny-set family as a glob over a lowercased path component, and the
+/// part of its name that is specific to secrets.
+struct DenyFamily {
+    pattern: String,
+    parsed: Vec<GlobElement>,
+    stem: String,
+}
+
+/// [`deny_families`] for each position, built once: the fallback past the
+/// size cap judges every piece of a 16 KiB command, and rebuilding the
+/// families per piece made that take a second (#1097 review).
+static DENY_FAMILIES: LazyLock<[Vec<DenyFamily>; 2]> = LazyLock::new(|| {
+    [
+        deny_families(Filename::Known),
+        deny_families(Filename::Unqualified),
+    ]
+});
+
+fn families_at(position: Filename) -> &'static [DenyFamily] {
+    &DENY_FAMILIES[usize::from(position == Filename::Unqualified)]
+}
+
+/// Each deny-set family as a glob — the same families
+/// [`is_dangerous_secret_token_at`] matches literally, with `<name>.env` and
+/// the key extensions gated on `position` as there. Every stem comes from
+/// [`distinctive_stem`], so a new deny-set entry gets one without an edit
+/// here.
+fn deny_families(position: Filename) -> Vec<DenyFamily> {
     let mut patterns: Vec<String> = BLOCKED_FILENAMES.iter().map(|f| f.to_string()).collect();
     patterns.push(".env.?*".to_string());
     patterns.extend(BLOCKED_SUFFIXES.iter().map(|s| format!("*{s}")));
@@ -619,11 +690,108 @@ fn deny_component_patterns(position: Filename) -> Vec<String> {
         patterns.extend(BLOCKED_EXTENSIONS.iter().map(|e| e.to_string()));
     }
     patterns
+        .into_iter()
+        .map(|pattern| DenyFamily {
+            stem: distinctive_stem(&pattern),
+            parsed: parse_glob(&pattern),
+            pattern,
+        })
+        .collect()
+}
+
+/// The part of a deny-set name that says "secret" rather than "file": every
+/// dotenv spelling is `.env`; otherwise the name loses its wildcards, a
+/// leading `.`, a trailing `.json`/`.pem`, and everything up to its last
+/// `-`, `_`, or `.` separator unless that would leave it empty. So
+/// `.git-credentials` → `credentials`, `*-key.pem` → `key`, `.npmrc` → `npmrc`,
+/// `service-account*.json` → `service-account`, `id_rsa` → `id_rsa`.
+fn distinctive_stem(pattern: &str) -> String {
+    let bare: String = pattern
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?'))
+        .collect();
+    if bare.contains(".env") || bare == ".envrc" {
+        return ".env".to_string();
+    }
+    if bare.starts_with("id_") || bare.starts_with("service-account") {
+        return bare.trim_end_matches(".json").to_string();
+    }
+    let mut stem = bare.trim_start_matches('.');
+    for suffix in [".json", ".pem"] {
+        if let Some(rest) = stem.strip_suffix(suffix)
+            && !rest.is_empty()
+        {
+            stem = rest;
+            break;
+        }
+    }
+    let stem = stem
+        .rsplit(['-', '_', '.'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(stem);
+    stem.to_string()
+}
+
+/// Do a glob's literal runs carry `stem`? Each run contributes the length of
+/// the longest substring it shares with the stem, and the runs together must
+/// reach three characters, or two for a three-character stem (`key`, `p12`).
+/// So `.e*v` (`.e` + `v`), `.[e]nv` (`.` + `nv`), `.n?trc` and `*.k?y` carry
+/// their stems, while `open*` (`en`), `.*rc` (`rc`) and `*.pem` do not.
+fn stem_covered(chunks: &[String], stem: &str) -> bool {
+    let need = if stem.chars().count() <= 3 { 2 } else { 3 };
+    let mut covered = 0;
+    for chunk in chunks {
+        covered += longest_common_substring(chunk, stem, need);
+        if covered >= need {
+            return true;
+        }
+    }
+    false
+}
+
+/// Length of the longest substring `a` and `b` share, capped at `cap` (the
+/// caller needs no more), by the rolling-row method over a fixed buffer;
+/// stems are short, and a longer one is compared on its first 32 characters.
+fn longest_common_substring(a: &str, b: &str, cap: usize) -> usize {
+    let mut row = [0usize; 33];
+    let b: Vec<char> = b.chars().take(32).collect();
+    let mut best = 0;
+    for x in a.chars() {
+        let mut diagonal = 0;
+        for (j, &y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == y { diagonal + 1 } else { 0 };
+            best = best.max(row[j + 1]);
+            if best >= cap {
+                return best;
+            }
+            diagonal = above;
+        }
+    }
+    best
+}
+
+/// The maximal runs of literal characters in a pattern, in order.
+fn literal_chunks(pattern: &[GlobElement]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for element in pattern {
+        if let GlobElement::Literal(c) = element {
+            current.push(*c);
+        } else if !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// One element of a filename pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobElement {
+    /// A literal character, lowercased.
     Literal(char),
     /// `?`: any one character.
     Any,
@@ -632,8 +800,11 @@ enum GlobElement {
     /// An extglob group (`@(env)`, `!(x)`): any run of characters, like
     /// `*`, but one that may spell a leading `.` — `@(.env)` names `.env`.
     Group,
-    /// `[…]`: explicit characters and ranges, possibly negated. `open`
-    /// marks a POSIX class (`[:alpha:]`), which is read as any character.
+    /// `[…]`: explicit characters and ranges in their ORIGINAL case, possibly
+    /// negated. `open` marks a POSIX class (`[:alpha:]`), read as any
+    /// character. Kept unfolded because folding a negated set inverts it:
+    /// `[!E]` lowercased to `[!e]` would refuse the `e` of `.env` (#1097
+    /// review M2).
     Set {
         chars: Vec<char>,
         ranges: Vec<(char, char)>,
@@ -643,9 +814,9 @@ enum GlobElement {
 }
 
 /// Parse one path component as a bash glob. Every approximation widens what
-/// the pattern can match, never narrows it: brace and extglob groups become
-/// `*`. An unclosed `[` is a literal, as in bash, so a jq filter such as
-/// `.[]` stays three literal characters.
+/// the pattern can match, never narrows it: `{a..z}` sequences become `*` and
+/// extglob groups a [`GlobElement::Group`]. An unclosed `[` is a literal, as
+/// in bash, so a jq filter such as `.[]` stays three literal characters.
 fn parse_glob(component: &str) -> Vec<GlobElement> {
     let chars: Vec<char> = component.chars().collect();
     let mut out = Vec::new();
@@ -653,6 +824,9 @@ fn parse_glob(component: &str) -> Vec<GlobElement> {
         if out.last() != Some(&GlobElement::Star) {
             out.push(GlobElement::Star);
         }
+    };
+    let literal = |out: &mut Vec<GlobElement>, c: char| {
+        out.extend(c.to_lowercase().map(GlobElement::Literal));
     };
     let mut i = 0;
     while i < chars.len() {
@@ -666,7 +840,7 @@ fn parse_glob(component: &str) -> Vec<GlobElement> {
         }
         match c {
             '\\' => {
-                out.push(GlobElement::Literal(next.unwrap_or('\\')));
+                literal(&mut out, next.unwrap_or('\\'));
                 i += 2;
             }
             '*' => {
@@ -683,7 +857,7 @@ fn parse_glob(component: &str) -> Vec<GlobElement> {
                     i = end + 1;
                 }
                 None => {
-                    out.push(GlobElement::Literal('['));
+                    literal(&mut out, '[');
                     i += 1;
                 }
             },
@@ -694,12 +868,12 @@ fn parse_glob(component: &str) -> Vec<GlobElement> {
                     i = end + 1;
                 }
                 _ => {
-                    out.push(GlobElement::Literal('{'));
+                    literal(&mut out, '{');
                     i += 1;
                 }
             },
             _ => {
-                out.push(GlobElement::Literal(c));
+                literal(&mut out, c);
                 i += 1;
             }
         }
@@ -772,8 +946,11 @@ fn parse_bracket(chars: &[char], start: usize) -> Option<(GlobElement, usize)> {
 }
 
 impl GlobElement {
-    /// Does this element accept `c`? `None` stands for any character that no
-    /// element of either pattern names explicitly.
+    /// Does this element accept `c`, a lowercased character? `None` stands
+    /// for any character that no element of either pattern names explicitly.
+    /// Case is not known — the filesystem may fold it, and the file's own
+    /// spelling may differ — so a set accepts `c` when it accepts either case
+    /// of it.
     fn accepts(&self, c: Option<char>) -> bool {
         match self {
             GlobElement::Literal(l) => c == Some(*l),
@@ -784,14 +961,22 @@ impl GlobElement {
                 open,
                 negated,
             } => {
-                let hit = match c {
+                // A negated POSIX class (`[![:alpha:]]`) cannot be evaluated
+                // here; read it as any character (#1097 review M1).
+                if *negated && *open {
+                    return true;
+                }
+                let hit = |v: char| {
+                    *open || chars.contains(&v) || ranges.iter().any(|&(a, b)| a <= v && v <= b)
+                };
+                match c {
                     Some(c) => {
-                        *open || chars.contains(&c) || ranges.iter().any(|&(a, b)| a <= c && c <= b)
+                        let upper = c.to_uppercase().next().unwrap_or(c);
+                        [c, upper].iter().any(|&v| hit(v) != *negated)
                     }
                     // An unnamed character: inside a range or class, perhaps.
-                    None => *open || !ranges.is_empty(),
-                };
-                if *negated { c.is_none() || !hit } else { hit }
+                    None => *negated || *open || !ranges.is_empty(),
+                }
             }
         }
     }
@@ -817,8 +1002,11 @@ impl GlobElement {
         match self {
             GlobElement::Literal(c) => into.push(*c),
             GlobElement::Set { chars, ranges, .. } => {
-                into.extend(chars);
-                into.extend(ranges.iter().flat_map(|&(a, b)| [a, b]));
+                let named = chars
+                    .iter()
+                    .copied()
+                    .chain(ranges.iter().flat_map(|&(a, b)| [a, b]));
+                into.extend(named.flat_map(char::to_lowercase));
             }
             GlobElement::Any | GlobElement::Star | GlobElement::Group => {}
         }
@@ -1361,20 +1549,15 @@ mod tests {
             (".[a-z]nv", Unqualified),
             ("[.]env", Unqualified),
             (".*", Unqualified),
-            (".*rc", Unqualified),
             (".env.*", Unqualified),
             (".env[.]local", Unqualified),
             (".n?trc", Unqualified),
             ("id_*", Unqualified),
             ("id_rsa*", Unqualified),
-            ("*.json", Unqualified),
-            ("gcloud-*.json", Unqualified),
             ("*-key.pem", Unqualified),
-            ("*.pem", Unqualified),
             ("service-account*", Unqualified),
             ("*env", Known),
             ("*.key", Known),
-            ("*.p1?", Known),
             ("~/.ssh/*", Unqualified),
             ("~/.s*/id_rsa", Unqualified),
             ("~/.aws/*", Unqualified),
@@ -1394,6 +1577,18 @@ mod tests {
             (".env*)", Unqualified),
             ("*.ENV", Known),
             (".ENV*", Unqualified),
+            ("*credentials*", Unqualified),
+            (".??*", Unqualified),
+            (".[e][n][v]", Unqualified),
+            // #1097 review M1: a negated POSIX class is any character.
+            ("id[![:alpha:]]rsa", Unqualified),
+            (".[![:upper:]]nv", Unqualified),
+            // #1097 review M2: a negated set is judged in its own case.
+            (".[!E]nv", Unqualified),
+            (".[!A-Z]nv", Unqualified),
+            ("id_[!A-Z]sa", Unqualified),
+            (".e[!N]v", Unqualified),
+            (".[!e]nv", Unqualified),
         ] {
             assert!(
                 is_dangerous_secret_token_at(token, position),
@@ -1422,7 +1617,21 @@ mod tests {
             (".env.{example,sample}", Known),
             ("id_rsa*.pub", Known),
             // Nothing a secret could be.
-            (".[!e]nv", Unqualified),
+            (".[!eE]nv", Unqualified),
+            // #1097 review ruling: a sweep by extension or by an unrelated
+            // name carries no secret stem.
+            ("*.json", Known),
+            ("*.pem", Known),
+            ("package*.json", Known),
+            ("tsconfig*.json", Known),
+            ("config/*.json", Known),
+            ("**/*.{json,md}", Known),
+            ("Cargo.*", Known),
+            (".*rc", Known),
+            (".git*", Known),
+            (".eslintrc*", Known),
+            ("gcloud-*.json", Known),
+            ("open*", Known),
             ("{readme,changelog}.md", Known),
             ("x{1..3}.txt", Known),
             ("/etc/*/config", Known),
@@ -1447,7 +1656,9 @@ mod tests {
     fn glob_matcher_honours_bash_syntax() {
         let p = |s: &str| parse_glob(s);
         assert!(glob_intersects(&p(".e[mn]v"), &p(".env")));
-        assert!(!glob_intersects(&p(".e[!n]v"), &p(".env")));
+        assert!(!glob_intersects(&p(".e[!nN]v"), &p(".env")));
+        // Either case of a named character counts (#1097 review M2).
+        assert!(glob_intersects(&p(".e[!N]v"), &p(".env")));
         assert!(glob_intersects(&p(".e[[:alpha:]]v"), &p(".env")));
         assert!(glob_intersects(&p("\\.env"), &p(".env")));
         assert!(!glob_intersects(&p("*env"), &p(".env")));
@@ -1463,6 +1674,82 @@ mod tests {
         assert_eq!(brace_expansions("a{b,c}d").unwrap(), vec!["abd", "acd"]);
         assert_eq!(brace_expansions("${x}").unwrap(), vec!["${x}"]);
         assert!(brace_expansions(&"{a,b}".repeat(7)).is_none());
+    }
+
+    #[test]
+    fn every_deny_family_has_a_distinctive_stem() {
+        for (pattern, stem) in [
+            (".env", ".env"),
+            (".envrc", ".env"),
+            (".env.?*", ".env"),
+            ("?*.env", ".env"),
+            ("credentials.json", "credentials"),
+            (".git-credentials", "credentials"),
+            ("*gcloud-credentials.json", "credentials"),
+            ("secrets.json", "secrets"),
+            ("id_rsa", "id_rsa"),
+            (".npmrc", "npmrc"),
+            (".netrc", "netrc"),
+            (".pgpass", "pgpass"),
+            ("*-key.pem", "key"),
+            ("*.private.pem", "private"),
+            ("service-account*.json", "service-account"),
+            ("*.key", "key"),
+            ("jks", "jks"),
+        ] {
+            assert_eq!(distinctive_stem(pattern), stem, "{pattern}");
+        }
+        for position in [Filename::Known, Filename::Unqualified] {
+            for family in deny_families(position) {
+                assert!(
+                    family.stem.len() >= 3,
+                    "{}: {}",
+                    family.pattern,
+                    family.stem
+                );
+            }
+        }
+        let covered = |chunks: &[&str], stem: &str| {
+            stem_covered(
+                &chunks.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                stem,
+            )
+        };
+        assert!(covered(&[".", "nv"], ".env"));
+        assert!(covered(&[".e", "v"], ".env"));
+        assert!(covered(&[".n", "trc"], "netrc"));
+        assert!(covered(&[".k", "y"], "key"));
+        assert!(!covered(&["open"], ".env"));
+        assert!(!covered(&[".", "rc"], "npmrc"));
+        assert!(!covered(&[".git"], "credentials"));
+        assert!(!covered(&[".pem"], "key"));
+    }
+
+    #[test]
+    fn pattern_operands_skip_only_the_glob_judgment() {
+        use Filename::Unqualified;
+        assert!(!is_dangerous_secret_name_at(".env*", Unqualified));
+        assert!(!is_dangerous_secret_name_at(".*", Unqualified));
+        assert!(is_dangerous_secret_name_at(".env", Unqualified));
+        assert!(is_dangerous_secret_name_at("{x,.env}", Unqualified));
+        assert!(is_dangerous_secret_token_at(".env*", Unqualified));
+    }
+
+    #[test]
+    fn adversarial_brace_and_glob_tokens_stay_fast() {
+        // #1097 review PERF: each took seconds before the cap.
+        let started = std::time::Instant::now();
+        for token in [
+            "{".repeat(100_000),
+            format!("{{{}}}", "a,".repeat(50_000)),
+            format!("{}a", "{a,".repeat(30_000)),
+            "@(a)*".repeat(20_000),
+            format!("{}.env", "?".repeat(4000)),
+            "[a]".repeat(1300),
+        ] {
+            is_dangerous_secret_token_at(&token, Filename::Known);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

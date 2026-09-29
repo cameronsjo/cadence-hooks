@@ -9,8 +9,9 @@
 
 use crate::forgectl_hint::{HintKind, is_forgectl_env_file, with_forgectl_hint};
 use crate::secret_patterns::{
-    Filename, envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token_at,
-    is_safe_template, is_secret_shaped_var_name,
+    Filename, envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_name_at,
+    is_dangerous_secret_token_at, is_key_material_name, is_safe_template,
+    is_secret_shaped_var_name,
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
@@ -515,7 +516,15 @@ fn normalized_secret_name(text: &str) -> Option<String> {
                 )
         })
         .find(|piece| {
-            !piece.is_empty() && is_dangerous_secret_token_at(piece, Filename::Unqualified)
+            !piece.is_empty()
+                && (is_dangerous_secret_token_at(piece, Filename::Unqualified)
+                    // Past the cap no command grammar vouches for a file, so
+                    // a key-material name blocks wherever it sits (#1097
+                    // review: a padded `cat prod.key` allowed).
+                    || is_key_material_name(
+                        piece.rsplit('/').next().unwrap_or(piece).to_lowercase().as_str(),
+                        Filename::Known,
+                    ))
         })
         .map(str::to_string)
 }
@@ -858,10 +867,30 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
             && argv
                 .get(1)
                 .is_some_and(|applet| command_word(applet) == "dd"));
+    // The PATTERN operand of a regex or filter language (#1097 review): its
+    // `*`, `?` and `[` are that language's syntax, so it is exempt from the
+    // glob judgment alone — a literal secret name there still counts. Same
+    // byte-exact head rule as the jq filter above.
+    let pattern = tokens
+        .first()
+        .is_some_and(|head| *head == cmd_word)
+        .then(|| pattern_operand_index(&cmd_word, argv))
+        .flatten();
     argv.iter()
         .enumerate()
         .filter(|(i, _)| Some(*i) != jq_filter)
-        .filter_map(|(_, t)| {
+        .filter_map(|(i, t)| {
+            if Some(i) == pattern {
+                return dangerous_secret_operand(t, position).filter(|value| {
+                    // A piece peeled off the word (`pat<.env*`) is a file, and
+                    // a substitution is judged by what it prints; only the
+                    // word judged whole as a glob is let through.
+                    !std::ptr::eq(*value, t.as_str())
+                        || value.chars().any(char::is_whitespace)
+                        || value.contains('`')
+                        || is_dangerous_secret_name_at(value, position)
+                });
+            }
             // `dd` names its input as `if=FILE` — one token whose basename
             // split sees `if=.env`, which matches no secret pattern (#850).
             // Peeled for `dd` alone: a generic `KEY=value` split would block
@@ -897,6 +926,140 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
         })
         .map(|value| (cmd_word.to_string(), value.to_string()))
         .collect()
+}
+
+/// Where a regex or filter command's PATTERN operand sits in `argv`, or
+/// `None` when it cannot be placed or the pattern comes from an option
+/// (`grep -e`, `grep -f FILE`, `sed -e`, `awk -f`, `jq --from-file`), in which
+/// case every positional is a file.
+///
+/// Options are read from per-command tables of the ones that take a value.
+/// An option missing from its table is read as taking none, which can only
+/// place the pattern EARLIER than the real one — so the real pattern is then
+/// judged as a file (a false block), never a real file exempted. A short
+/// cluster holding an `e` or `f` (for `yq`, only `f`) is read as supplying the
+/// pattern, whatever the command, for the same reason.
+fn pattern_operand_index(cmd: &str, argv: &[String]) -> Option<usize> {
+    let (short_valued, long_valued): (&str, &[&str]) = match cmd {
+        "grep" | "egrep" | "fgrep" => (
+            "ABCmdD",
+            &[
+                "--after-context",
+                "--before-context",
+                "--context",
+                "--max-count",
+                "--directories",
+                "--devices",
+                "--include",
+                "--exclude",
+                "--exclude-dir",
+                "--exclude-from",
+                "--label",
+                "--binary-files",
+            ],
+        ),
+        "rg" => (
+            "ABCmgtTjMrdE",
+            &[
+                "--after-context",
+                "--before-context",
+                "--context",
+                "--max-count",
+                "--glob",
+                "--iglob",
+                "--type",
+                "--type-not",
+                "--type-add",
+                "--threads",
+                "--max-columns",
+                "--replace",
+                "--max-depth",
+                "--encoding",
+                "--pre",
+                "--pre-glob",
+                "--sort",
+                "--sortr",
+                "--colors",
+                "--max-filesize",
+                "--path-separator",
+                "--ignore-file",
+            ],
+        ),
+        "ag" => (
+            "ABCmGgp",
+            &[
+                "--after",
+                "--before",
+                "--context",
+                "--max-count",
+                "--file-search-regex",
+                "--ignore",
+                "--depth",
+                "--path-to-ignore",
+            ],
+        ),
+        "sed" => ("l", &["--line-length"]),
+        "awk" | "gawk" | "mawk" | "nawk" => ("Fv", &["--field-separator", "--assign"]),
+        "jq" => ("L", &["--indent", "--library-path"]),
+        "yq" => ("opI", &["--output-format", "--input-format", "--indent"]),
+        _ => return None,
+    };
+    let supplier = |t: &str| {
+        let long = [
+            "--regexp",
+            "--file",
+            "--expression",
+            "--source",
+            "--from-file",
+        ];
+        let long = if cmd == "yq" { &long[4..] } else { &long[..] };
+        if long
+            .iter()
+            .any(|l| t == *l || t.starts_with(&format!("{l}=")))
+        {
+            return true;
+        }
+        let letters: &[char] = if cmd == "yq" { &['f'] } else { &['e', 'f'] };
+        t.starts_with('-') && !t.starts_with("--") && t[1..].contains(letters)
+    };
+    if argv.iter().skip(1).any(|t| supplier(t)) {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(t) = argv.get(i) {
+        if t == "--" {
+            return (i + 1 < argv.len()).then_some(i + 1);
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let takes = !long.contains('=') && long_valued.contains(&t.as_str());
+            // jq's two-value options.
+            let pairs = cmd == "jq" && matches!(long, "arg" | "argjson" | "slurpfile" | "rawfile");
+            i += if pairs {
+                3
+            } else if takes {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if t.len() > 1 && t.starts_with('-') {
+            let cluster: Vec<char> = t[1..].chars().collect();
+            let mut consumed = 1;
+            for (k, c) in cluster.iter().enumerate() {
+                if short_valued.contains(*c) {
+                    if k + 1 == cluster.len() {
+                        consumed = 2;
+                    }
+                    break;
+                }
+            }
+            i += consumed;
+            continue;
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// Heads that take dd's `if=FILE` operand grammar: GNU `dd`, the Homebrew
@@ -7413,10 +7576,30 @@ mod tests {
                 "cat ~/.ssh/id_*",
                 "cat ~/.aws/*",
                 "cat ~/.a?s/cred*",
-                "cat *.json",
                 "cat *.key",
                 "cat *env",
+                "cat *credentials*",
+                "cat .??*",
+                "cat .[!E]nv",
+                "cat .[!A-Z]nv",
+                "cat id_[!A-Z]sa",
+                "cat .e[!N]v",
+                "cat id[![:alpha:]]rsa",
+                "cat .[![:upper:]]nv",
                 "bash -c 'cat .env*'",
+                // A pattern command's FILE operands are still judged.
+                "grep -n TODO .env*",
+                "rg '.*TODO' .env*",
+                "grep -e x .env*",
+                "grep -f pats.txt .env*",
+                "awk -f prog.awk .env*",
+                "sed -e p .env*",
+                "grep -A 3 x .env*",
+                "rg -g '*.json' x .env*",
+                // A literal secret name in the pattern slot still counts, and
+                // a brace group there is split by the shell into files.
+                "grep .env x",
+                "grep {x,.env} y",
                 "echo ok && tail -n5 config/.env.*",
             ],
             cadence_hooks_core::Outcome::Block,
@@ -7438,6 +7621,28 @@ mod tests {
                 "jq -r '.items[]?.name' x.json | xargs echo",
                 "curl 'https://h/p?x=1'",
                 "cat .envrc.example",
+                // #1097 review ruling: daily commands whose globs carry no
+                // secret stem.
+                "prettier --write \"**/*.json\"",
+                "prettier --check '**/*.{json,md}'",
+                "jq . package*.json",
+                "cat tsconfig*.json",
+                "git diff -- '*.json'",
+                "rg -g '*.json' version",
+                "grep -n '.*password' README.md",
+                "cat *.json",
+                "cp src/*.json dist/",
+                "cat *.pem",
+                "cat Cargo.*",
+                "ls .*rc && cat .eslintrc*",
+                "cat .git*",
+                // The pattern operand is a regex, not a glob.
+                "grep -r '.*TODO' .",
+                "rg '.*TODO'",
+                "yq '.*' x.yaml",
+                "grep -E '.*' x.txt",
+                "sed -n '/.*/p' x.txt",
+                "awk '/.*/' x.txt",
             ],
             cadence_hooks_core::Outcome::Allow,
             "a glob that cannot match a secret, or a metadata-only command",
@@ -7533,6 +7738,46 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Block,
             "a read of the same path still blocks",
+        );
+    }
+
+    #[test]
+    fn pattern_operand_index_places_the_regex() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (command, expected) in [
+            ("grep x f", Some(1)),
+            ("grep -n -A 3 x f", Some(4)),
+            ("grep -A3 x f", Some(2)),
+            ("grep -e x f", None),
+            ("grep -rf p f", None),
+            ("grep -- -x f", Some(2)),
+            ("rg -g *.json x", Some(3)),
+            ("rg --glob=*.json x", Some(2)),
+            ("awk -F : /x/ f", Some(3)),
+            ("awk -f p.awk f", None),
+            ("sed -n p f", Some(2)),
+            ("jq --arg a b .x f", Some(4)),
+            ("jq --from-file p f", None),
+            ("yq -e .x f", Some(2)),
+            ("cat x", None),
+        ] {
+            let args = argv(command);
+            assert_eq!(
+                pattern_operand_index(&args[0], &args),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_command_naming_key_material_blocks() {
+        // #1097 review nit: the size-cap fallback judged only `Unqualified`.
+        let padding = "x ".repeat(STRUCTURED_SCAN_LIMIT / 2 + 10);
+        assert_bash(
+            &[&format!("cat prod.key # {padding}")],
+            cadence_hooks_core::Outcome::Block,
+            "key material named past the size cap",
         );
     }
 
