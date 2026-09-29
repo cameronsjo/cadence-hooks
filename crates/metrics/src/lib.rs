@@ -64,7 +64,9 @@ pub mod warn_stale;
 pub use common::{metrics_dir, open_ledger};
 
 pub use log_askuserquestion::LogAskUserQuestion;
-pub use log_bypass::{BypassEvent, log_bypass};
+pub use log_bypass::{
+    BypassEvent, log_bypass, summarize as summarize_bypasses, summary_line as bypass_summary_line,
+};
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
 pub use log_failopen::log_failopen;

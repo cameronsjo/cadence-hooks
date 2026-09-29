@@ -1273,8 +1273,8 @@ fn argv_hook_label(argv: &[String]) -> Option<String> {
         .iter()
         .map(String::as_str)
         .take_while(|t| {
-            !t.is_empty()
-                && t.len() <= 40
+            t.len() <= 40
+                && t.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
                 && t.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })

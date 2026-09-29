@@ -231,10 +231,20 @@ impl Check for EnforcementStatus {
         HOOK_NAME
     }
 
-    fn run(&self, _input: &HookInput) -> CheckResult {
-        match report_for_env(|name| std::env::var(name).ok()) {
-            Some(message) => CheckResult::nudge(message),
-            None => CheckResult::allow(),
+    fn run(&self, input: &HookInput) -> CheckResult {
+        // Read-side of bypass provenance (cadence-hooks#223): counts only, from
+        // the local ledger, appended to whatever the environment report says.
+        let lines: Vec<String> = [
+            report_for_env(|name| std::env::var(name).ok()),
+            cadence_hooks_metrics::bypass_summary_line(input.cwd.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if lines.is_empty() {
+            CheckResult::allow()
+        } else {
+            CheckResult::nudge(lines.join("\n"))
         }
     }
 }
