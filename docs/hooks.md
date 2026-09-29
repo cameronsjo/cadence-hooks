@@ -101,6 +101,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 |------|-------|--------------|
 | `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own |
 | `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos |
+| `guard-forge-write` | PreToolUse (Bash) | Block `tea`/`glab` write operations to non-owned repos (unwired until the plugin entry lands) |
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |

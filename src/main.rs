@@ -391,6 +391,8 @@ enum GuardrailsCommands {
     GuardGhDangerous,
     /// Block gh write operations to non-owned repos
     GuardGhWrite,
+    /// Block tea/glab write operations to non-owned repos
+    GuardForgeWrite,
     /// Nudge to scaffold and confirm license after git init or gh repo create
     GuardGitInit,
     /// Warn when editing on main/master branch
@@ -635,6 +637,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
             GuardrailsCommands::GuardGhDangerous => "guard-gh-dangerous",
             GuardrailsCommands::GuardGhWrite => "guard-gh-write",
+            GuardrailsCommands::GuardForgeWrite => "guard-forge-write",
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
@@ -857,6 +860,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::GuardGhWrite => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_gh_write::GhWriteGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardForgeWrite => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_forge_write::ForgeWriteGuard),
                 pre,
             ),
             GuardrailsCommands::GuardGitInit => CheckPlan::new(

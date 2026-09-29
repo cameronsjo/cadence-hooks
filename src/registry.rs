@@ -205,6 +205,12 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
     },
     HookEntry {
+        name: "guard-forge-write",
+        description: "Block tea/glab write operations to non-owned repos",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+    },
+    HookEntry {
         name: "guard-git-init",
         description: "Nudge to scaffold and confirm license after git init or gh repo create",
         namespace: "guardrails",
