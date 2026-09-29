@@ -10,9 +10,9 @@ use cadence_hooks_core::config::{
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
-    command_segments, command_word, contains_ignoring_ascii_case, gh_command_path, gh_repo_flags,
-    host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
-    strip_quotes, tokenize,
+    carries_substitution, command_segments, command_word, contains_ignoring_ascii_case,
+    gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word, parse_gh_repo_value,
+    parse_work_dir, requote_words, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -370,7 +370,8 @@ fn scan_unanimous_flag(
     let mut seen: Vec<String> = Vec::new();
     let mut ambiguous = false;
     let push = |seen: &mut Vec<String>, v: String| {
-        if !v.is_empty() && !v.contains(char::is_whitespace) {
+        // A substitution's blanks are in the source, not the value gh gets.
+        if !v.is_empty() && (!v.contains(char::is_whitespace) || carries_substitution(&v)) {
             seen.push(v);
         }
     };
@@ -1265,42 +1266,45 @@ fn is_literal_identifier(name: &str) -> bool {
 /// function definition head (`name()`, `name(){`, `name ( ) {`,
 /// `function name {`), and a case arm's pattern (`case x in x)`, `y)`).
 fn strip_compound_openers(tokens: &[String]) -> Vec<String> {
+    // A cursor rather than removing from the front: a segment of thousands of
+    // `case x in x)` openers shifted the whole vector once per opener, and a
+    // 200 KB flood spent half a second here.
     let mut words: Vec<String> = tokens.to_vec();
+    let mut at = 0;
     loop {
-        let Some(first) = words.first().cloned() else {
-            return words;
+        let Some(first) = words.get(at).cloned() else {
+            return words.split_off(at.min(words.len()));
         };
+        let rest = &words[at..];
         if first == "(" || first == "{" || first == "()" {
-            words.remove(0);
-        } else if let Some(rest) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
-            words[0] = rest.to_string();
-        } else if first == "function" && words.len() > 1 {
-            words.drain(..2);
+            at += 1;
+        } else if let Some(tail) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
+            words[at] = tail.to_string();
+        } else if first == "function" && rest.len() > 1 {
+            at += 2;
         } else if let Some((name, _)) = first.split_once("()")
             && is_literal_identifier(&name.replace('-', "_"))
         {
             let tail = first[name.len() + 2..].trim_start_matches('{').to_string();
             if tail.is_empty() {
-                words.remove(0);
+                at += 1;
             } else {
-                words[0] = tail;
+                words[at] = tail;
             }
-        } else if words.get(1).is_some_and(|w| w == "()" || w == "(){")
+        } else if rest.get(1).is_some_and(|w| w == "()" || w == "(){")
             && is_literal_identifier(&first.replace('-', "_"))
         {
-            words.drain(..2);
+            at += 2;
         } else if first == "case" {
-            match words.iter().position(|w| w.ends_with(')')) {
-                Some(end) => {
-                    words.drain(..=end);
-                }
-                None => return words,
+            match rest.iter().position(|w| w.ends_with(')')) {
+                Some(end) => at += end + 1,
+                None => return words.split_off(at),
             }
         } else if first.len() > 1 && first.ends_with(')') && !first.contains("$(") {
             // A later case arm: `y) export …`.
-            words.remove(0);
+            at += 1;
         } else {
-            return words;
+            return words.split_off(at);
         }
     }
 }
@@ -5434,6 +5438,30 @@ mod tests {
             let input = input_with("gh pr create --title hi", &repo.path().to_string_lossy());
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn substituted_repo_flag_in_an_owned_checkout_does_not_fall_back_to_the_cwd() {
+        // cadence-hooks#1106: the tokenizer keeps `$(cat target)` whole, so the
+        // value carries a blank. Dropping blank-bearing values as prose fell
+        // back to the owned cwd repo and allowed a write whose target only the
+        // shell knows. The quoted spelling had the same hole already.
+        with_env(&owners_env(), || {
+            let repo = crate::github_origin_repo();
+            for command in [
+                "gh issue close 1 -R $(cat target)",
+                "gh issue close 1 -R `cat target`",
+                "gh issue close 1 -R \"$(cat target)\"",
+                "gh issue close 1 --repo=$(cat t x)",
+            ] {
+                let input = input_with(command, &repo.path().to_string_lossy());
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+            }
         });
     }
 

@@ -13,6 +13,11 @@ serde_json.workspace = true
 gethostname.workspace = true
 sha2.workspace = true
 
+# `O_NOFOLLOW`/`O_NONBLOCK` for the plan-store reader (cadence-hooks#763).
+# Already a workspace dependency.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 # Dev-only: the run_start ↔ enforce-worktree parity test drives the actual
