@@ -10,10 +10,16 @@
 //! otherwise it sleeps the rest of the wait and checks again.
 
 use cadence_hooks_core::shell::{
-    GH_DEFAULT_HOST, PrSelector, forge_host, gh_pr_subcommand, git_command, host_and_repo_from_url,
-    pr_flip_segments, pr_selector, pr_url_parts, repo_value_names_remote, ship_target,
+    GH_DEFAULT_HOST, PrSelector, command_segments, command_word, forge_host, gh_pr_subcommand,
+    git_command, host_and_repo_from_url, pr_flip_segments, pr_selector, pr_url_parts,
+    repo_value_names_remote, ship_target, tokenize,
 };
+use cadence_hooks_core::time::{now_unix_seconds, rfc3339_unix_seconds};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+/// How long after `mergedAt` the merge flow still acts. A `gh pr merge` on a
+/// PR merged longer ago than this is a re-run, not the merge itself.
+const MERGE_RECENCY_SECS: i64 = 10 * 60;
 
 /// Seconds into the merge wait at which referenced issues are first checked.
 ///
@@ -49,8 +55,11 @@ pub fn parse_remote(url: &str) -> Option<(Option<String>, String)> {
 }
 
 /// The PR `gh pr create` reports creating: `(host, "owner/repo", number)`,
-/// read from the first whitespace-separated word of its stdout that is a
-/// whole PR URL ([`pr_url_parts`]). `None` when there is none.
+/// read from the whitespace-separated words of its stdout that are whole PR
+/// URLs ([`pr_url_parts`]). `None` when there is none, or when stdout holds
+/// more than one distinct PR URL (a compound command, or output that quotes
+/// another PR), since which one was created cannot be told. Repeats of one URL
+/// count once; the last is taken.
 ///
 /// The repo comes from the URL, never from `origin` (cadence-hooks#759). A PR
 /// opened from a fork with an explicit target lands in the upstream repo, and
@@ -58,10 +67,22 @@ pub fn parse_remote(url: &str) -> Option<(Option<String>, String)> {
 /// at. Reading it there reported refs from another PR's body and that repo's
 /// issue states as this PR's.
 pub fn pr_from_create_stdout(stdout: &str) -> Option<(String, String, u64)> {
-    stdout.split_whitespace().find_map(|word| {
-        let (host, owner, repo, number) = pr_url_parts(word)?;
-        Some((host.to_ascii_lowercase(), format!("{owner}/{repo}"), number))
-    })
+    let mut found: Option<(String, String, u64)> = None;
+    for word in stdout.split_whitespace() {
+        let Some((host, owner, repo, number)) = pr_url_parts(word) else {
+            continue;
+        };
+        let pr = (
+            host.to_ascii_lowercase(),
+            format!("{owner}/{repo}").to_ascii_lowercase(),
+            number,
+        );
+        if found.as_ref().is_some_and(|seen| *seen != pr) {
+            return None;
+        }
+        found = Some(pr);
+    }
+    found
 }
 
 /// The PR a `gh pr merge` command acts on, resolved against `origin`
@@ -96,7 +117,38 @@ pub enum MergeTarget {
 /// unreadable selector, or more than one merge in the command. The merge
 /// flow closes issues, so it must never act on a guessed repo. An exported
 /// `GH_REPO`/`GH_HOST` leaves no token and is not seen.
+///
+/// **Allowlist on the whole command** (cadence-hooks#1070 review I2): every
+/// segment must be a plain `gh pr <sub>` invocation, `gh` as its first word
+/// with nothing in front of it. Anything else anywhere in the command (a
+/// `cd`/`pushd`, an `export`/`declare`/bare `GH_REPO=` assignment, an inline
+/// assignment or prefix on `gh` itself, a subshell or group, a wrapper, any
+/// other command) is [`MergeTarget::Unsure`], because each can move the merge
+/// to another directory or repo without a token in the merge segment. So is a
+/// `--help`/`-h` in the merge segment, which merges nothing.
 pub fn merge_target(cmd: &str, origin_host: &str, origin_slug: &str) -> MergeTarget {
+    let segments = command_segments(cmd);
+    let plain_gh_pr = |segment: &String| {
+        let mut raw = tokenize(segment);
+        match raw.first() {
+            Some(first) if command_word(first).as_ref() == "gh" => raw[0] = "gh".to_string(),
+            _ => return false,
+        }
+        gh_pr_subcommand(&raw).is_some()
+    };
+    if segments.is_empty() {
+        return MergeTarget::NotAMerge;
+    }
+    if !segments.iter().all(plain_gh_pr) {
+        return if pr_flip_segments(cmd)
+            .iter()
+            .any(|tokens| gh_pr_subcommand(tokens) == Some("merge"))
+        {
+            MergeTarget::Unsure
+        } else {
+            MergeTarget::NotAMerge
+        };
+    }
     let merges: Vec<Vec<String>> = pr_flip_segments(cmd)
         .into_iter()
         .filter(|tokens| gh_pr_subcommand(tokens) == Some("merge"))
@@ -106,6 +158,9 @@ pub fn merge_target(cmd: &str, origin_host: &str, origin_slug: &str) -> MergeTar
         [tokens] => tokens,
         _ => return MergeTarget::Unsure,
     };
+    if tokens.iter().any(|t| t == "--help" || t == "-h") {
+        return MergeTarget::Unsure;
+    }
     let names_origin = |value: &str, implied: Option<&str>| {
         repo_value_names_remote(value, implied, origin_host, origin_slug)
     };
@@ -148,6 +203,8 @@ pub trait GhRunner {
 /// Sleeps for a given number of seconds (injectable so tests don't actually sleep).
 pub trait Clock {
     fn sleep_secs(&self, secs: u64);
+    /// The current time, in seconds since the Unix epoch.
+    fn now_unix(&self) -> i64;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +242,10 @@ pub struct RealClock;
 impl Clock for RealClock {
     fn sleep_secs(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+
+    fn now_unix(&self) -> i64 {
+        now_unix_seconds()
     }
 }
 
@@ -359,11 +420,16 @@ pub fn handle_merge(
     // queue. Closing the PR's
     // issues then marks unfinished work done, with nothing to announce it.
     // A missing or unreadable field counts as not merged.
+    //
+    // The merge must also be recent (cadence-hooks#1070 review N1): re-running
+    // `gh pr merge` on a PR merged long ago reads MERGED too, and closing its
+    // issues then would close ones reopened since.
     let merged = value.get("state").and_then(serde_json::Value::as_str) == Some("MERGED")
         && value
             .get("mergedAt")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|at| !at.is_empty());
+            .and_then(rfc3339_unix_seconds)
+            .is_some_and(|at| clock.now_unix() - at <= MERGE_RECENCY_SECS);
     if !merged {
         return None;
     }
@@ -614,7 +680,9 @@ mod tests {
             "gh pr merge 17 -R owner/repo",
             "gh -R github.com/Owner/Repo pr merge 17",
             "gh pr merge https://github.com/owner/repo/pull/17",
-            "GH_TOKEN=x gh pr merge 17",
+            "gh pr -R owner/repo merge 17",
+            "gh pr checks 17 && gh pr merge 17",
+            "/opt/homebrew/bin/gh pr merge 17",
         ] {
             assert_eq!(
                 merge_target(cmd, "github.com", "owner/repo"),
@@ -651,6 +719,25 @@ mod tests {
             "gh pr merge -R owner/repo",
             "gh pr merge feat/branch",
             "gh pr merge 5 && gh pr merge 6",
+            "gh pr -R other/repo merge 16",
+            // cadence-hooks#1070 review I2: anything around the merge that
+            // can move it.
+            "cd ../other && gh pr merge 5",
+            "(cd /x; gh pr merge 5)",
+            "pushd /x && gh pr merge 5",
+            "export GH_REPO=other/repo; gh pr merge 5",
+            "declare -x GH_REPO=other/repo; gh pr merge 5",
+            "GH_REPO=other/repo; gh pr merge 5",
+            "GH_TOKEN=x gh pr merge 5",
+            "env gh pr merge 5",
+            "{ gh pr merge 5; }",
+            "sh -c 'gh pr merge 5'",
+            "git push && gh pr merge 5",
+            "gh pr merge 5 | tee log",
+            "gh pr merge 5 $(cd /x)",
+            // review N1: help merges nothing.
+            "gh pr merge 5 --help",
+            "gh pr merge -h",
         ] {
             assert_eq!(
                 merge_target(cmd, "github.com", "owner/repo"),
@@ -826,12 +913,22 @@ mod tests {
     /// No-op clock for tests — records sleep calls.
     struct FakeClock {
         sleep_calls: RefCell<Vec<u64>>,
+        now: i64,
     }
 
     impl FakeClock {
+        /// One minute after FakeGh's default `mergedAt`.
         fn new() -> Self {
             Self {
                 sleep_calls: RefCell::new(Vec::new()),
+                now: rfc3339_unix_seconds("2026-09-25T00:01:00Z").unwrap(),
+            }
+        }
+
+        fn at(now: &str) -> Self {
+            Self {
+                now: rfc3339_unix_seconds(now).unwrap(),
+                ..Self::new()
             }
         }
     }
@@ -839,6 +936,10 @@ mod tests {
     impl Clock for FakeClock {
         fn sleep_secs(&self, secs: u64) {
             self.sleep_calls.borrow_mut().push(secs);
+        }
+
+        fn now_unix(&self) -> i64 {
+            self.now
         }
     }
 
@@ -1083,6 +1184,52 @@ mod tests {
             assert!(gh.close_calls.borrow().is_empty(), "{cmd}: no close");
             assert!(clock.sleep_calls.borrow().is_empty(), "{cmd}: no wait");
         }
+    }
+
+    #[test]
+    fn merge_after_a_cd_makes_no_calls() {
+        let gh = FakeGh::new()
+            .with_issue(5, "OPEN")
+            .with_pr_body("Closes #5");
+        let clock = FakeClock::new();
+        let cmd = "cd ../other && gh pr merge 8";
+        assert_eq!(handle_merge("owner/repo", None, cmd, &gh, &clock, 10), None);
+        assert!(gh.repo_args.borrow().is_empty(), "no gh call");
+    }
+
+    #[test]
+    fn a_merge_long_ago_closes_nothing() {
+        // cadence-hooks#1070 review N1: re-running a merge on an old merged PR
+        // must not close issues reopened since.
+        let gh = FakeGh::new()
+            .with_issue(5, "OPEN")
+            .with_pr_body("Closes #5");
+        let clock = FakeClock::at("2026-09-25T01:00:00Z");
+        assert_eq!(
+            handle_merge("owner/repo", None, "gh pr merge 8", &gh, &clock, 10),
+            None
+        );
+        assert!(gh.close_calls.borrow().is_empty());
+        assert!(clock.sleep_calls.borrow().is_empty());
+        // Ten minutes is still recent.
+        let gh = FakeGh::new()
+            .with_issue(5, "OPEN")
+            .with_pr_body("Closes #5");
+        let clock = FakeClock::at("2026-09-25T00:10:00Z");
+        assert!(handle_merge("owner/repo", None, "gh pr merge 8", &gh, &clock, 0).is_some());
+    }
+
+    #[test]
+    fn two_distinct_pr_urls_in_create_stdout_are_ambiguous() {
+        // cadence-hooks#1070 review N2.
+        assert_eq!(
+            pr_from_create_stdout("https://github.com/o/r/pull/1\nhttps://github.com/o/r/pull/2"),
+            None
+        );
+        assert_eq!(
+            pr_from_create_stdout("https://github.com/o/r/pull/3 https://github.com/o/r/pull/3"),
+            Some(("github.com".to_string(), "o/r".to_string(), 3))
+        );
     }
 
     #[test]

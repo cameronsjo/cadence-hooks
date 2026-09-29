@@ -1144,6 +1144,26 @@ pub fn gh_pr_subcommand(segment_tokens: &[String]) -> Option<&str> {
 /// the transparent set (`sudo`, `timeout`, `xargs`) are still missed, for the
 /// reason [`gh_pr_invocation`] documents.
 pub fn pr_flip_segments(command: &str) -> Vec<Vec<String>> {
+    gh_pr_segments(command)
+        .into_iter()
+        .filter(|tokens| {
+            gh_pr_invocation(tokens).is_some_and(|invocation| match invocation.subcommand {
+                "ready" => !carries_undo_flag(invocation.operands),
+                "merge" => true,
+                _ => false,
+            })
+        })
+        .collect()
+}
+
+/// The tokens of every `gh pr <sub>` segment in `command`, whatever the
+/// subcommand, read the way [`pr_flip_segments`] reads them (reserved words
+/// and group punctuation stripped, transparent prefixes and gh's global and
+/// `pr`-level repo flags skipped, a path-qualified `gh` rewritten to the
+/// literal). [`gh_pr_subcommand`] names each one's subcommand. Shared by the
+/// nudges that watch one `gh pr` subcommand, so they see the same spellings
+/// the ship anchor does (cadence-hooks#545, #778).
+pub fn gh_pr_segments(command: &str) -> Vec<Vec<String>> {
     command_segments(command)
         .iter()
         .filter_map(|segment| {
@@ -1153,15 +1173,8 @@ pub fn pr_flip_segments(command: &str) -> Vec<Vec<String>> {
                 return None;
             }
             tokens[head] = "gh".to_string();
-            let is_flip = {
-                let invocation = gh_pr_invocation(&tokens)?;
-                match invocation.subcommand {
-                    "ready" => !carries_undo_flag(invocation.operands),
-                    "merge" => true,
-                    _ => false,
-                }
-            };
-            is_flip.then_some(tokens)
+            gh_pr_invocation(&tokens)?;
+            Some(tokens)
         })
         .collect()
 }
@@ -1632,22 +1645,10 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         if !flag.starts_with('-') {
             break;
         }
-        // The separate form consumes an extra token; every attached spelling
-        // (`--repo=owner/r`, `-Rowner/r`) consumes only itself.
-        if flag == "--repo" || flag == "-R" {
+        if let Some((value, next)) = read_repo_flag(argv, i) {
             retargeted = true;
-            if let Some(value) = argv.get(i + 1) {
-                repo_targets.push(value.clone());
-            }
-            i += 2;
-        } else if let Some(value) = flag.strip_prefix("--repo=") {
-            retargeted = true;
-            repo_targets.push(value.to_string());
-            i += 1;
-        } else if let Some(value) = flag.strip_prefix("-R").filter(|v| !v.is_empty()) {
-            retargeted = true;
-            repo_targets.push(value.to_string());
-            i += 1;
+            repo_targets.extend(value);
+            i = next;
         } else {
             retargeted |= is_repo_flag(flag);
             i += 1;
@@ -1656,8 +1657,17 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
     if argv.get(i).map(String::as_str) != Some("pr") {
         return None;
     }
-    let subcommand = argv.get(i + 1)?;
-    let operands = argv.get(i + 2..).unwrap_or(&[]);
+    // gh also takes the repo override between `pr` and the subcommand
+    // (`gh pr -R o/r merge 5`, `gh pr --repo=o/r ready 12`), because `-R` is
+    // a persistent flag of the `pr` command group. Skip it the same way.
+    let mut j = i + 1;
+    while let Some((value, next)) = read_repo_flag(argv, j) {
+        retargeted = true;
+        repo_targets.extend(value);
+        j = next;
+    }
+    let subcommand = argv.get(j)?;
+    let operands = argv.get(j + 1..).unwrap_or(&[]);
     let scan = scan_operands(operands);
     if !scan.repo_targets.is_empty() {
         retargeted = true;
@@ -1673,6 +1683,21 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
         pre_subcommand_repo_targets,
         host_overridden,
     })
+}
+
+/// Read one gh repo override at `argv[i]`: the value it carries (`None` when
+/// a separate-form flag has nothing after it) and the index after it. `None`
+/// when `argv[i]` is not a repo override. The separate form (`-R o/r`,
+/// `--repo o/r`) consumes an extra token; every attached spelling
+/// (`--repo=o/r`, `-Ro/r`) consumes only itself.
+fn read_repo_flag(argv: &[String], i: usize) -> Option<(Option<String>, usize)> {
+    let flag = argv.get(i)?;
+    if flag == "--repo" || flag == "-R" {
+        return Some((argv.get(i + 1).cloned(), i + 2));
+    }
+    flag.strip_prefix("--repo=")
+        .or_else(|| flag.strip_prefix("-R").filter(|v| !v.is_empty()))
+        .map(|value| (Some(value.to_string()), i + 1))
 }
 
 /// The branch a ship command names as its PR head (cadence-hooks#995).
@@ -6899,6 +6924,33 @@ mod tests {
         assert_eq!(gh_pr_subcommand(&segments[0]), Some("merge"));
         assert_eq!(gh_pr_subcommand(&segments[1]), Some("ready"));
         assert_eq!(gh_pr_subcommand(&tokenize("git status")), None);
+    }
+
+    #[test]
+    fn repo_flag_between_pr_and_the_subcommand_is_read() {
+        // cadence-hooks#1070 review I3: `-R` is a persistent flag of `gh pr`.
+        for (command, repo) in [
+            ("gh pr -R o/r merge 5", "o/r"),
+            ("gh pr --repo o/r ready 12", "o/r"),
+            ("gh pr --repo=o/r merge 5", "o/r"),
+            ("gh pr -Ro/r ready 12", "o/r"),
+        ] {
+            let segments = pr_flip_segments(command);
+            assert_eq!(segments.len(), 1, "{command}");
+            assert_eq!(
+                ship_target(&segments[0]).repos,
+                vec![repo.to_string()],
+                "{command}"
+            );
+            assert!(
+                matches!(pr_selector(&segments[0]), PrSelector::Number(_)),
+                "{command}"
+            );
+        }
+        assert!(pr_flip_segments("gh pr -R o/r view 5").is_empty());
+        assert!(pr_flip_segments("gh pr -R").is_empty());
+        let segments = gh_pr_segments("gh pr -R o/r create --title t");
+        assert_eq!(gh_pr_subcommand(&segments[0]), Some("create"));
     }
 
     #[test]

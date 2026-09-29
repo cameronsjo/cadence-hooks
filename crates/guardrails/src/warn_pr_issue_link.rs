@@ -9,26 +9,18 @@
 //! is not false-flagged.
 
 use crate::issue_refs::has_closing_keyword;
-use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, skip_transparent_prefixes, tokenize,
-};
+use cadence_hooks_core::shell::{gh_pr_segments, gh_pr_subcommand, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// True when an executable segment invokes the literal `pr create` subcommand
 /// on a `gh` command word. Only the command word folds.
 fn is_gh_pr_create(command: &str) -> bool {
-    command_segments(command).into_iter().any(|segment| {
-        // Reserved words and group punctuation go first, then transparent
-        // prefixes and `NAME=value` assignments, so `GH_TOKEN=x gh pr create`,
-        // `env … gh`, `time gh`, and `then gh pr create` are seen
-        // (cadence-hooks#545).
-        let tokens = executable_tokens(&segment);
-        let argv = skip_transparent_prefixes(&tokens);
-        argv.first()
-            .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && argv.get(1).map(String::as_str) == Some("pr")
-            && argv.get(2).map(String::as_str) == Some("create")
-    })
+    // The shared `gh pr` matcher: reserved words, transparent prefixes and
+    // assignments, gh's global `-R`, and a `pr`-level `-R` are all skipped
+    // (cadence-hooks#545, #778).
+    gh_pr_segments(command)
+        .iter()
+        .any(|tokens| gh_pr_subcommand(tokens) == Some("create"))
 }
 
 /// Extract the path argument from `--body-file <path>`, `--body-file=<path>`,
@@ -514,5 +506,14 @@ mod tests {
             "gh pr comment 5 --body 'then gh pr create'"
         ));
         assert!(!is_gh_pr_create("GH_TOKEN=x gh pr view 5"));
+    }
+
+    #[test]
+    fn retargeted_create_is_checked() {
+        // cadence-hooks#1070 review I4: gh's global and `pr`-level `-R`.
+        assert!(is_gh_pr_create("gh -R o/r pr create --title t"));
+        assert!(is_gh_pr_create("gh --repo=o/r pr create --title t"));
+        assert!(is_gh_pr_create("gh pr -R o/r create --title t"));
+        assert!(!is_gh_pr_create("gh -R o/r pr list"));
     }
 }

@@ -49,7 +49,10 @@
 
 use crate::plan_scan::{self, InFlightPlan};
 use cadence_hooks_core::markers::{self, MarkerTarget, resolve_ship_target};
-use cadence_hooks_core::shell::{PrSelector, pr_flip_segments, pr_selector, ship_target};
+use cadence_hooks_core::shell::{
+    PrSelector, basename, carries_undo_flag, command_segments, gh_pr_segments, pr_flip_segments,
+    pr_selector, ship_target, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 
@@ -278,7 +281,8 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    let flips = pr_flip_segments(command);
+    let mut flips = pr_flip_segments(command);
+    flips.extend(windowed_flips(command));
     if flips.is_empty() {
         return CheckResult::allow();
     }
@@ -318,6 +322,48 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
          reconcile point (ADR-0038): tick what shipped, set status:/next:, commit the plan, \
          then flip. Advisory only."
     ))
+}
+
+/// Flips the shared matcher does not see because a prefix outside the
+/// transparent set sits in front of `gh` (`sudo`, `timeout 60`, `nice -n 5`,
+/// `xargs`, `env -u X`, `command -p`, `watch`). This is the guard's original
+/// token-window scan, kept beside [`pr_flip_segments`] so moving onto the
+/// shared matcher did not lose those spellings (cadence-hooks#1070 review
+/// I1). Each hit is returned from its `gh` token on, so
+/// [`flips_the_cwd_branch`] still reads its `-R` and selector.
+///
+/// **Detector direction only**, and advisory: a `gh pr merge` in argument
+/// position (`echo gh pr merge`) also matches, which costs at most a
+/// spurious nudge. The window is `gh pr <sub>` adjacent, so a global `-R`
+/// behind a non-transparent prefix (`sudo gh -R o/r pr ready 1`) is not seen
+/// here, and an inline `GH_REPO=` in front of such a prefix
+/// (`GH_REPO=o/r sudo gh pr ready 1`) is dropped with it.
+fn windowed_flips(command: &str) -> Vec<Vec<String>> {
+    command_segments(command)
+        .into_iter()
+        // A segment the shared matcher reads is left to it: slicing from `gh`
+        // here would drop an inline `GH_REPO=` in front of it.
+        .filter(|segment| gh_pr_segments(segment).is_empty())
+        .flat_map(|segment| {
+            let tokens = tokenize(&segment);
+            (0..tokens.len().saturating_sub(2))
+                .filter(|&i| {
+                    basename(&tokens[i]) == "gh"
+                        && tokens[i + 1] == "pr"
+                        && match tokens[i + 2].as_str() {
+                            "ready" => !carries_undo_flag(&tokens[i + 3..]),
+                            "merge" => true,
+                            _ => false,
+                        }
+                })
+                .map(|i| {
+                    let mut flip = tokens[i..].to_vec();
+                    flip[0] = "gh".to_string();
+                    flip
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Does this flip segment act on the PR of the branch checked out in `cwd`
@@ -1018,6 +1064,38 @@ mod tests {
                 run_warn_plan_ready_flip(&input).outcome,
                 cadence_hooks_core::Outcome::Nudge,
                 "{cmd} is a ready flip of this checkout's PR"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_sees_non_transparent_prefixes() {
+        // cadence-hooks#1070 review I1: the old window scan saw these, and the
+        // shared matcher alone does not.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "sudo gh pr ready 12",
+            "timeout 60 gh pr merge 12",
+            "nice -n 5 gh pr ready 12",
+            "env -u GH_TOKEN gh pr merge 12",
+        ] {
+            let input = bash_input("flip-1070-i1", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} is a ready flip of this checkout's PR"
+            );
+        }
+        // The window hit still reads its own target.
+        for cmd in [
+            "sudo gh pr ready 12 -R other/repo",
+            "timeout 60 gh pr ready --undo",
+        ] {
+            let input = bash_input("flip-1070-i1-quiet", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cmd}"
             );
         }
     }

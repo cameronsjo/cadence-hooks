@@ -13,9 +13,7 @@
 //!    `gh pr view <n> --json mergedAt,mergeCommit` before retrying or assuming
 //!    failure.
 
-use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, skip_transparent_prefixes,
-};
+use cadence_hooks_core::shell::{gh_pr_subcommand, pr_flip_segments};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Nudges a pre-flight checklist on `gh pr merge`.
@@ -27,18 +25,12 @@ pub struct WarnGhMergePreflight;
 /// script names, prose) while recognizing shell-wrapper bodies. Only the
 /// command word folds; the `pr merge` subcommands remain case-sensitive.
 fn is_gh_pr_merge(command: &str) -> bool {
-    command_segments(command).into_iter().any(|segment| {
-        // Reserved words and group punctuation go first, then transparent
-        // prefixes and `NAME=value` assignments, so `GH_TOKEN=x gh pr merge`,
-        // `env … gh`, `time gh`, and `then gh pr merge` are seen
-        // (cadence-hooks#545).
-        let tokens = executable_tokens(&segment);
-        let argv = skip_transparent_prefixes(&tokens);
-        argv.first()
-            .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && argv.get(1).map(String::as_str) == Some("pr")
-            && argv.get(2).map(String::as_str) == Some("merge")
-    })
+    // The shared `gh pr` matcher: reserved words, transparent prefixes and
+    // assignments, gh's global `-R`, and a `pr`-level `-R` are all skipped
+    // (cadence-hooks#545, #778).
+    pr_flip_segments(command)
+        .iter()
+        .any(|tokens| gh_pr_subcommand(tokens) == Some("merge"))
 }
 
 impl Check for WarnGhMergePreflight {
@@ -240,5 +232,20 @@ mod tests {
             let result = WarnGhMergePreflight.run(&make_bash(command));
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
         }
+    }
+
+    #[test]
+    fn retargeted_merge_nudges() {
+        // cadence-hooks#1070 review I4: gh's global and `pr`-level `-R`.
+        for command in [
+            "gh -R o/r pr merge 5",
+            "gh --repo=o/r pr merge 5",
+            "gh pr -R o/r merge 5",
+        ] {
+            let result = WarnGhMergePreflight.run(&make_bash(command));
+            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+        }
+        let result = WarnGhMergePreflight.run(&make_bash("gh -R o/r pr view 5"));
+        assert_eq!(result.outcome, Outcome::Allow);
     }
 }

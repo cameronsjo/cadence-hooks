@@ -66,6 +66,17 @@ pub fn cron_datetime() -> CronDatetime {
     }
 }
 
+/// Seconds since the Unix epoch for an RFC 3339 timestamp such as GitHub's
+/// `2026-09-25T00:00:00Z`, or `None` when it does not parse.
+pub fn rfc3339_unix_seconds(value: &str) -> Option<i64> {
+    value.parse::<Timestamp>().ok().map(|t| t.as_second())
+}
+
+/// The current time in seconds since the Unix epoch.
+pub fn now_unix_seconds() -> i64 {
+    Timestamp::now().as_second()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +119,13 @@ mod tests {
             "weekday should be an alphabetic name: {}",
             dt.weekday
         );
+    }
+
+    #[test]
+    fn rfc3339_unix_seconds_parses_github_timestamps() {
+        assert_eq!(rfc3339_unix_seconds("1970-01-01T00:01:00Z"), Some(60));
+        assert_eq!(rfc3339_unix_seconds("not a time"), None);
+        assert_eq!(rfc3339_unix_seconds(""), None);
+        assert!(now_unix_seconds() > 1_700_000_000);
     }
 }
