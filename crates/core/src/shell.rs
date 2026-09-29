@@ -3967,14 +3967,43 @@ pub fn forge_host(host: String) -> String {
 /// - `ssh://git@github.com/owner/repo.git`
 /// - `git@github.com:owner/repo.git` (SCP-style)
 /// - URLs with ports, credentials, trailing slashes, and subpaths
+///
+/// **`None` wherever this parser cannot promise to agree with the transport**,
+/// which every caller reads as "not owned" (cadence-hooks#1066):
+///
+/// - a scheme URL carrying `#`, `?`, `[`, a backslash, whitespace or a
+///   control character, or a `%` outside its userinfo —
+///   `https://evil.com#@github.com/o/r` used to read as host `github.com`
+///   through the last `@`, while git and curl end the authority at the `#`
+///   and contact `evil.com`. [`parse_gh_repo_value`]'s URL arm refuses the
+///   same set;
+/// - a scheme URL whose authority holds more than one `@`, where "which `@`
+///   ends the userinfo" is a question transports have answered differently;
+/// - any `.` or `..` path segment, in either form: curl resolves
+///   `https://github.com/own/x/../../other/y` to `other/y`, so the first two
+///   segments are not the repository contacted.
 pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
     let trimmed = url.trim();
 
     let (host, path) = if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        if after_scheme.contains(['#', '?', '[', '\\'])
+            || after_scheme.contains(|c: char| c.is_whitespace() || c.is_control())
+        {
+            return None;
+        }
         // Has scheme (https://, ssh://) — extract host, then path after first /
         let (host_part, path) = after_scheme.split_once('/')?;
+        if host_part.matches('@').count() > 1 {
+            return None;
+        }
         // Strip credentials: user@host or token:x-oauth@host
         let host_part = host_part.rsplit('@').next().unwrap_or(host_part);
+        // A percent-escape is refused past the userinfo only: an escaped
+        // credential is ordinary, while an escaped host or path (`%2e%2e`)
+        // is decoded by the transport and not by this parser.
+        if host_part.contains('%') || path.contains('%') {
+            return None;
+        }
         // Strip port: host:22
         let host_part = host_part.split(':').next().unwrap_or(host_part);
         (host_part, path)
@@ -3992,6 +4021,14 @@ pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
     };
 
     if host.is_empty() {
+        return None;
+    }
+
+    // A dot segment moves the path the transport resolves (cadence-hooks#1066).
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
         return None;
     }
 
@@ -7376,7 +7413,7 @@ pub const COMMAND_RUNNERS: &[&str] = &[
 /// expanding a script the shell would NOT run can manufacture a false block, so
 /// the cost of over-eagerness is bounded, not zero.
 pub fn peel_command_runners(tokens: &[String]) -> &[String] {
-    let mut argv = skip_transparent_prefixes(tokens);
+    let mut argv = skip_prefixes_and_env_operands(tokens, tokens);
     while let Some(first) = argv.first() {
         let runner = command_word(first).into_owned();
         if !COMMAND_RUNNERS.contains(&runner.as_str()) {
@@ -7385,10 +7422,67 @@ pub fn peel_command_runners(tokens: &[String]) -> &[String] {
         let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
             break;
         };
+        let rest = if runner == "env" {
+            skip_env_assignment_operands(rest)
+        } else {
+            rest
+        };
         // Each pass consumes at least the runner itself, so this ends.
-        argv = skip_transparent_prefixes(rest);
+        argv = skip_prefixes_and_env_operands(tokens, rest);
     }
     argv
+}
+
+/// Skip the assignment operands at the front of an `env` command, by `env`'s
+/// rule rather than the shell's: **every** leading operand containing `=` is an
+/// assignment to `env` (GNU and BSD both test `strchr(arg, '=')`), whatever
+/// precedes the `=`. [`is_assignment_word`] asks the shell's question — a valid
+/// name — so `env A${Y}B=1 bash -c '…'` stopped the peel at `A${Y}B=1`, the
+/// `bash -c` script was never surfaced, and every guard missed the command it
+/// runs (cadence-hooks#1129). A quoted `'A B=1'` and an escaped `A\=1` are
+/// assignments to `env` as well, which is why the word is unescaped first.
+///
+/// At least one word is always left, as [`skip_transparent_prefixes`] does.
+fn skip_env_assignment_operands(argv: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < argv.len() && unescape_word(&argv[start]).contains('=') {
+        start += 1;
+    }
+    &argv[start..]
+}
+
+/// [`skip_transparent_prefixes`] from `from` (a tail of `tokens`), then, while
+/// the words just skipped end in an `env` verb, its `=` operands too
+/// ([`skip_env_assignment_operands`]). `env` with no options of its own is
+/// peeled as a [`TRANSPARENT`] prefix, whose walk stops at the first word that
+/// is not a valid shell assignment — so the `env` rule has to be applied where
+/// that walk stopped, by looking back at what it skipped.
+fn skip_prefixes_and_env_operands<'a>(tokens: &'a [String], from: &'a [String]) -> &'a [String] {
+    let mut argv = skip_transparent_prefixes(from);
+    loop {
+        let start = tokens.len() - argv.len();
+        if !follows_an_env_verb(tokens, start) {
+            return argv;
+        }
+        let rest = skip_env_assignment_operands(argv);
+        if rest.len() == argv.len() {
+            return argv;
+        }
+        argv = skip_transparent_prefixes(rest);
+    }
+}
+
+/// Is `tokens[start]` in `env`'s operand position — preceded by `env`, an
+/// optional `--`, and any number of `=` operands?
+fn follows_an_env_verb(tokens: &[String], start: usize) -> bool {
+    let mut at = start;
+    while at > 0 && unescape_word(&tokens[at - 1]).contains('=') {
+        at -= 1;
+    }
+    if at > 0 && unescape_word(&tokens[at - 1]).as_ref() == "--" {
+        at -= 1;
+    }
+    at > 0 && command_word(&tokens[at - 1]).as_ref() == "env"
 }
 
 /// `sudo`'s short options that take NO argument of their own AND still run the
@@ -10416,6 +10510,60 @@ mod tests {
     }
 
     #[test]
+    fn host_and_repo_from_url_refuses_what_the_transport_reads_differently() {
+        // cadence-hooks#1066: each of these names a different host or path to
+        // git/curl than a naive split does, so it must read as not owned.
+        for url in [
+            "https://evil.com#@github.com/cameronsjo/x",
+            "https://evil.com?@github.com/cameronsjo/x",
+            "https://evil.com\\@github.com/cameronsjo/x",
+            "https://a@evil.com@github.com/cameronsjo/x",
+            "https://github.com/cameronsjo/x#frag",
+            "https://github.com/cameronsjo/x?x=1",
+            "https://github.com/cameronsjo/x/../../other/y",
+            "https://github.com/cameronsjo/./x",
+            "https://github.com/cameronsjo/x/..",
+            "https://github.com/cameronsjo/%2e%2e/other/y",
+            "https://github%2ecom/cameronsjo/x",
+            "https://[::1]/cameronsjo/x",
+            "https://github.com /cameronsjo/x",
+            "git@github.com:cameronsjo/x/../../other/y",
+            "git@github.com:./cameronsjo/x",
+        ] {
+            assert_eq!(host_and_repo_from_url(url), None, "{url}");
+        }
+        // Controls: an escaped credential and a subpath still parse.
+        for (url, host, slug) in [
+            (
+                "https://u:p%40ss@github.com/cameronsjo/x.git",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "https://github.com/cameronsjo/x/tree/main",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "git@github.com:cameronsjo/x.git",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "https://github.com/cameronsjo/x..y",
+                "github.com",
+                "cameronsjo/x..y",
+            ),
+        ] {
+            assert_eq!(
+                host_and_repo_from_url(url),
+                Some((host.to_string(), slug.to_string())),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn host_and_repo_from_url_strips_git_before_a_trailing_slash() {
         assert_eq!(
             host_and_repo_from_url("https://github.com/own/repo.git/"),
@@ -12890,6 +13038,62 @@ mod tests {
         }
     }
 
+    /// cadence-hooks#1129: `env` takes EVERY leading operand containing `=` as
+    /// an assignment, not only a valid shell name, so the peel does too.
+    #[test]
+    fn peel_command_runners_skips_every_env_assignment_operand() {
+        for (command, want_head) in [
+            ("env A${Y}B=1 bash", Some("bash")),
+            ("env A-B=1 bash", Some("bash")),
+            ("env 'A B=1' bash", Some("bash")),
+            ("env A\\=1 bash", Some("bash")),
+            ("env A${Y}=1 B${Z}=2 sh", Some("sh")),
+            ("env -- A${Y}B=1 bash", Some("bash")),
+            ("env -i A${Y}B=1 bash", Some("bash")),
+            ("env -u X A${Y}B=1 bash", Some("bash")),
+            ("/usr/bin/env A${Y}B=1 bash", Some("bash")),
+            ("FOO=1 env A${Y}B=1 bash", Some("bash")),
+            ("nice env A${Y}B=1 bash", Some("bash")),
+            ("env A${Y}B=1 env C${Z}=2 bash", Some("bash")),
+            // Controls. Outside `env`, the shell's rule: a word that is not a
+            // valid assignment is the command.
+            ("A${Y}B=1 bash", Some("A${Y}B=1")),
+            ("FOO=1 A${Y}B=1 bash", Some("A${Y}B=1")),
+            ("nohup A${Y}B=1 bash", Some("A${Y}B=1")),
+            // Assignments only: the last word is left, as the shell leaves it.
+            ("env A${Y}B=1", Some("A${Y}B=1")),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                peel_command_runners(&tokens).first().map(String::as_str),
+                want_head,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_script_behind_an_env_non_name_assignment() {
+        // cadence-hooks#1129, measured: bash runs the inner gh with a canary.
+        for (command, inner) in [
+            (
+                "env A${Y}B=1 bash -c 'gh pr create -R evil/x'",
+                "gh pr create -R evil/x",
+            ),
+            (
+                "env -i A-B=1 sh -c 'git push --force origin main'",
+                "git push --force origin main",
+            ),
+            ("env 'A B=1' bash -c 'cat .env'", "cat .env"),
+        ] {
+            assert!(
+                command_segments(command).contains(&inner.to_string()),
+                "{command}: {:?}",
+                command_segments(command)
+            );
+        }
+    }
+
     #[test]
     fn command_segments_keeps_substitutions_on_a_wrapper_segment() {
         // A `$(…)` runs in the PARENT before the wrapper is spawned, so the two
@@ -13642,16 +13846,19 @@ mod tests {
 
     #[test]
     fn url_with_query_string() {
-        // Query string is part of the path after splitn — repo extracts cleanly
-        // because splitn(3, '/') captures at most 3 segments
-        let result = repo_from_url("https://github.com/owner/repo?tab=readme");
-        assert_eq!(result, Some("owner/repo?tab=readme".to_string()));
+        // A query or fragment is refused rather than folded into the slug: the
+        // transport stops the path at it, and a `#`/`?` before the `@` moves
+        // the host (cadence-hooks#1066). The old answer here was the garbage
+        // slug `owner/repo?tab=readme`.
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo?tab=readme"),
+            None
+        );
     }
 
     #[test]
     fn url_with_fragment() {
-        let result = repo_from_url("https://github.com/owner/repo#section");
-        assert_eq!(result, Some("owner/repo#section".to_string()));
+        assert_eq!(repo_from_url("https://github.com/owner/repo#section"), None);
     }
 
     #[test]
