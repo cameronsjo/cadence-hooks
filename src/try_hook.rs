@@ -106,6 +106,15 @@ pub fn run(
     if let Some(scratch) = &metrics_scratch {
         command.env("CADENCE_METRICS_DIR", scratch.path());
     }
+    // A write-side-effect hook gets a genuine no-write path, not just a
+    // non-repo `cwd`: since cadence-hooks#1021, `persist-plan-approval` takes
+    // its destination from `CLAUDE_PROJECT_DIR` and sends a non-repo root to
+    // the user-scoped plans dir, so a sandbox `cwd` alone no longer keeps it
+    // from writing. The opt-out stops it before any directory is resolved.
+    if CWD_OVERRIDE_REFUSED.contains(&(namespace, subcommand)) {
+        command.env("CADENCE_NO_PERSIST_PLAN", "1");
+        command.env_remove("CLAUDE_PROJECT_DIR");
+    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,

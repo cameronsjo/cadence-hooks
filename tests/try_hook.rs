@@ -15,7 +15,22 @@ fn cadence_hooks() -> Command {
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
+    // A Claude session's own session root and config dir must never reach a
+    // hook this suite drives: `persist-plan-approval` resolves its destination
+    // from both (cadence-hooks#1021), so inheriting them would let `make ci`
+    // inside a session write into the real checkout or `~/.claude`.
+    cmd.env_remove("CLAUDE_PROJECT_DIR");
+    cmd.env("CLAUDE_CONFIG_DIR", scratch_config_dir());
     cmd
+}
+
+/// One scratch config dir shared by every spawn in this test binary. A
+/// `static` is never dropped, so the dir is left under the OS temp dir after
+/// the run; that is the cost of keeping the no-argument helper.
+fn scratch_config_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("scratch config dir"))
+        .path()
 }
 
 /// Spawns the binary with JSON on stdin and returns the completed output.
@@ -354,9 +369,17 @@ fn try_persist_plan_never_writes_a_real_plan_doc() {
         .expect("git init");
     assert!(init.success());
 
+    // cadence-hooks#1021 made `CLAUDE_PROJECT_DIR` the session root, and a
+    // non-repo root falls back to the user-scoped `<config_dir>/cadence/plans`.
+    // Point both at places this test can inspect: the root at the real repo
+    // (the worst case, since the resolver would otherwise target it) and the
+    // config dir at a scratch dir.
+    let config = tempfile::tempdir().unwrap();
     let mut cmd = cadence_hooks();
     cmd.args(["try", "session", "persist-plan-approval"]);
     cmd.current_dir(repo.path());
+    cmd.env("CLAUDE_PROJECT_DIR", repo.path());
+    cmd.env("CLAUDE_CONFIG_DIR", config.path());
 
     let output = cmd.output().expect("failed to execute binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -365,6 +388,15 @@ fn try_persist_plan_never_writes_a_real_plan_doc() {
     assert!(
         !repo.path().join("docs").exists(),
         "try must never write a real plan doc, even standing inside a real git repo"
+    );
+    assert!(
+        !config.path().join("cadence").join("plans").exists(),
+        "try must never write into the user-scoped plans dir either"
+    );
+    assert_eq!(
+        std::fs::read_dir(repo.path()).unwrap().count(),
+        1,
+        "the CLAUDE_PROJECT_DIR repo holds only its .git"
     );
 }
 
