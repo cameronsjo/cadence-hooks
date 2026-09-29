@@ -844,9 +844,9 @@ enum DirectoryVerb<'a> {
 ///    quoting away, so `'c\d' /x` and `c\d /x` arrive as the SAME token — and
 ///    the shells split on exactly that: measured, `\cd /usr` moves under bash,
 ///    zsh and sh while `'\cd' /usr` moves under none of them, because the quotes
-///    make it a literal command name. `cd\ /other` is a third reading: the
-///    escaped space makes it one word the shell never runs, where the tokenizer
-///    sees two.
+///    make it a literal command name. (`cd\ /other` is one word the shell
+///    never runs; the tokenizer keeps an escaped blank in its word, so it is
+///    read that way here too and is not a directory verb.)
 ///
 /// **Point 2 is the opposite call from the push verb, deliberately.** There,
 /// unescaping only widens what is seen, and seeing more is the safe direction
@@ -1170,7 +1170,10 @@ fn resolve_directory_verb(
         {
             Some((
                 resolve_cd_target(target, effective_dir),
-                target.starts_with('/'),
+                // A Windows drive path is as absolute as `/x`, the same test
+                // `resolve_cd_target` uses; `starts_with('/')` alone kept the
+                // doubt of an earlier `cd "$HOME"` alive past `cd C:\repo`.
+                crate::shell::looks_absolute(target),
             ))
         }
         _ => None,
@@ -2268,6 +2271,17 @@ mod tests {
                 "/abs/own",
                 false,
             ),
+            // So does a Windows drive path, in either separator.
+            (
+                "cd \"$HOME\" && cd C:\\abs\\own && git push origin main",
+                "C:\\abs\\own",
+                false,
+            ),
+            (
+                "cd \"$HOME\" && cd D:/abs/own && git push origin main",
+                "D:/abs/own",
+                false,
+            ),
             (
                 "cd \"$HOME\" && cd rel && git push origin main",
                 "/repo/rel",
@@ -2369,9 +2383,7 @@ mod tests {
         // `tokenize` throws quoting away, so `'c\d' /x` and `c\d /x` arrive as
         // the SAME token — and the shells disagree about them: measured, `\cd
         // /usr` moves under bash, zsh and sh while `'\cd' /usr` moves under
-        // none of them (the quotes make it a literal command name). `cd\ /other`
-        // is a third case: the escaped space makes it ONE word the shell never
-        // runs, where the tokenizer sees two.
+        // none of them (the quotes make it a literal command name).
         //
         // For push detection, unescaping is safe — it only widens what is seen.
         // For a directory verb it is not: a wrong move is a wrong repository. So
@@ -2380,11 +2392,17 @@ mod tests {
             "'c\\d' /other && git push origin main",
             "c\\d /other && git push origin main",
             "\\cd /other && git push origin main",
-            "cd\\ /other && git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert!(invocation.unresolved, "should refuse: {command}");
         }
+        // `cd\ /other` is ONE word, a command named `cd /other` that the shell
+        // cannot find, so it never moves: the push is judged where it stands.
+        // The tokenizer used to split it into two words, which is the only
+        // reason this row once had to refuse (PR #1140 review).
+        let invocation = only("cd\\ /other && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/repo");
+        assert!(!invocation.unresolved);
     }
 
     #[test]
