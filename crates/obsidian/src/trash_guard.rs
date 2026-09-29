@@ -9,7 +9,8 @@
 use cadence_hooks_core::shell::{
     carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
     executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
-    redirect_operator_span, redirect_targets, skip_git_global_options, tokenize,
+    redirect_operator_span, redirect_targets, skip_git_global_options, strip_verbatim_prefix,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -232,17 +233,6 @@ pub trait FileMeta {
     fn canonical_dir(&self, _path: &str) -> Option<String> {
         None
     }
-}
-
-/// Strip the Windows verbatim prefix `canonicalize` emits, so its output
-/// compares against the plain paths a hook payload carries: `\\?\C:\x`
-/// becomes `C:\x` and `\\?\UNC\srv\share` becomes `\\srv\share`. Pure string
-/// logic, so it is exercised on every platform.
-fn strip_verbatim_prefix(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
 /// Production impl over `std::fs`. Uses `symlink_metadata(...).is_ok()` — a
