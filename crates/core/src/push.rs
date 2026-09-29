@@ -164,6 +164,11 @@ pub struct PushInvocation {
     /// a bare `git push`, where git uses the tracking remote. A remote name or
     /// a URL; resolving it is the caller's job.
     pub repository: Option<String>,
+    /// The push runs under a `-c alias.X=push` alias (`git -c alias.p=push p
+    /// origin feat`). A text-based reading of the command sees no `git push`
+    /// there, so a caller judges this invocation's destination from the
+    /// fields above, wherever it runs (cadence-hooks#1172).
+    pub via_alias: bool,
 }
 
 /// Every `git push` the command runs, in command order.
@@ -323,6 +328,28 @@ impl<'a> Walk<'a> {
 struct GhHosts {
     hosts: Vec<String>,
     unreadable: bool,
+    /// Something in the command or the environment may make gh act as another
+    /// account than the one its config file names: a token variable, or a
+    /// `gh auth` command. A bare `gh repo clone REPO` is then unreadable.
+    account_unreadable: bool,
+    /// [`signed_in_user`] per host, read once: a flood of clones costs one
+    /// file read.
+    users: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl GhHosts {
+    /// The account gh is signed in to on `host`, or `None` when it cannot be
+    /// told ([`Self::account_unreadable`], or no readable config).
+    fn signed_in_user(&self, host: &str) -> Option<String> {
+        if self.account_unreadable {
+            return None;
+        }
+        self.users
+            .borrow_mut()
+            .entry(host.to_string())
+            .or_insert_with(|| signed_in_user(host))
+            .clone()
+    }
 }
 
 impl GhHosts {
@@ -330,6 +357,8 @@ impl GhHosts {
         let mut hosts = Self {
             hosts: vec![crate::config::default_host()],
             unreadable: false,
+            account_unreadable: false,
+            users: Default::default(),
         };
         // Only a `gh repo clone` reads this; skip the scan for anything else.
         if !command.contains("clone") {
@@ -341,6 +370,19 @@ impl GhHosts {
             .collect();
         hosts.observe(&flat);
         hosts.observe_statements(command);
+        const ACCOUNT_VARIABLES: [&str; 5] = [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_CONFIG_DIR",
+        ];
+        hosts.account_unreadable = ACCOUNT_VARIABLES.iter().any(|name| {
+            flat.contains(name) || std::env::var_os(name).is_some_and(|_| *name != "GH_CONFIG_DIR")
+        }) || flat.contains("XDG_CONFIG_HOME")
+            || flat
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == "auth");
         hosts
     }
 
@@ -362,7 +404,7 @@ impl GhHosts {
     fn observe_statements(&mut self, command: &str) {
         static KNOWN_EVAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r#"^\$\((?:ssh-agent|brew[ \t]+shellenv|pyenv[ \t]+init)\b[^$`()'";&|<>\\\n]*\)$"#,
+                r#"^\$\((?:ssh-agent|brew[ \t]+shellenv|pyenv[ \t]+init|rbenv[ \t]+init|direnv[ \t]+hook|starship[ \t]+init|zoxide[ \t]+init|fnm[ \t]+env|mise[ \t]+activate)\b[^$`()'";&|<>\\\n]*\)$"#,
             )
             .expect("pattern should compile")
         });
@@ -542,6 +584,68 @@ impl GhHosts {
     }
 }
 
+/// The account gh is signed in to on `host`: the `user:` gh's own config file
+/// (`hosts.yml` under `$GH_CONFIG_DIR`, else `$XDG_CONFIG_HOME/gh`, else
+/// `~/.config/gh`) records under the host's key. Read from disk with no
+/// network; `None` when the file is unreadable, or names no plain login
+/// (cadence-hooks#1172).
+fn signed_in_user(host: &str) -> Option<String> {
+    let dir = match std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+            Some(dir) => std::path::Path::new(&dir).join("gh"),
+            None => std::path::Path::new(&crate::paths::user_home_lossy_or_default())
+                .join(".config")
+                .join("gh"),
+        },
+    };
+    signed_in_user_in(&dir, host)
+}
+
+/// [`signed_in_user`] for one config directory.
+fn signed_in_user_in(dir: &std::path::Path, host: &str) -> Option<String> {
+    let path = dir.join("hosts.yml");
+    if std::fs::metadata(&path).ok()?.len() > 1 << 20 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut in_host = false;
+    let mut child_indent = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if indent == 0 {
+            in_host = body
+                .strip_suffix(':')
+                .is_some_and(|key| key.trim_matches(['"', '\'']).eq_ignore_ascii_case(host));
+            child_indent = None;
+            continue;
+        }
+        if !in_host {
+            continue;
+        }
+        // The host's own keys sit at the indent its first child has; a
+        // `users:` map nests further and is not read.
+        let child = *child_indent.get_or_insert(indent);
+        if indent != child {
+            continue;
+        }
+        if let Some(value) = body.strip_prefix("user:") {
+            let value = value.split(" #").next().unwrap_or("").trim();
+            let value = value.trim_matches(['"', '\'']);
+            return (!value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .then(|| value.to_string());
+        }
+    }
+    None
+}
+
 /// `value` lowercased when it is a plain host name (letters, digits, `.`,
 /// `-`, and a `:port`), else `None`.
 fn plain_host(value: &str) -> Option<String> {
@@ -564,11 +668,11 @@ fn plain_host(value: &str) -> Option<String> {
 /// costs a nudge or a block, and never an allow the command did not earn. Any
 /// `alias` at all counts, since `shopt -s expand_aliases` can arrive by the
 /// same routes.
-fn may_redefine_known_commands(command: &str) -> bool {
+pub fn may_redefine_known_commands(command: &str) -> bool {
     static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(concat!(
-            r"(?:git|ssh-agent)[ \t]*\([ \t]*\)",
-            r"|\bfunction[ \t]+\\?(?:git|ssh-agent)\b",
+            r"(?:git|ssh-agent|direnv|brew|pyenv|rbenv|starship|zoxide|fnm|mise)[ \t]*\([ \t]*\)",
+            r"|\bfunction[ \t]+\\?(?:git|ssh-agent|direnv|brew|pyenv|rbenv|starship|zoxide|fnm|mise)\b",
             r"|\balias\b|\bhash\b|\benable\b|\bsource\b",
             r"|(?:^|[;&|(\n])[ \t]*\.[ \t]",
             r"|\bPATH\+?=",
@@ -589,6 +693,9 @@ fn may_redefine_known_commands(command: &str) -> bool {
 fn substitutions_are_live(segment: &str) -> bool {
     !segment.contains(['\'', '\\'])
 }
+
+/// Most open subshells [`collect_push_invocations`] keeps a directory for.
+const MAX_SUBSHELL_SCOPES: usize = 32;
 
 /// Recursive worker for [`push_invocations`], mirroring
 /// `enforce_worktree::collect_targets`: one `effective_dir` per script scope,
@@ -622,7 +729,35 @@ fn collect_push_invocations(
     // `eval` or a `GIT_DIR=` redirect.
     let mut scope_directory = inherited.directory;
 
+    // A `( … )` subshell's `cd` ends with it (cameronsjo/cadence-hooks#1172):
+    // the directory state each open one started from, and the closes the
+    // previous segment left to apply. Off for a script with a `case`, whose
+    // `pattern)` arms read as closers this walk cannot tell from real ones.
+    let mut scopes_subshells = !script.contains("case");
+    let mut subshells: Vec<(String, bool)> = Vec::new();
+    let mut pending_closes = 0;
     for (segment, _next_op) in split_segments_with_ops(script) {
+        for _ in 0..std::mem::take(&mut pending_closes) {
+            if let Some((dir, directory)) = subshells.pop() {
+                effective_dir = dir;
+                scope_directory = directory;
+            }
+        }
+        if scopes_subshells {
+            let (opens, closes) = crate::shell::subshell_shape(&segment);
+            if subshells.len() + opens > MAX_SUBSHELL_SCOPES {
+                // Nested past what a real command does (and what a flood of
+                // `(cd a;` could make this copy quadratically): stop
+                // scoping, so the `cd` leaks as it always did.
+                scopes_subshells = false;
+                scope_directory = true;
+            } else {
+                for _ in 0..opens {
+                    subshells.push((effective_dir.clone(), scope_directory));
+                }
+                pending_closes = closes;
+            }
+        }
         let trimmed = segment.trim();
         // A function definition glued to its body (`f(){ git push …`) left
         // `f(){` in command position, so the push inside it was never seen
@@ -858,6 +993,7 @@ fn collect_push_invocations(
                 destination_unreadable: false,
                 config_remotes: Vec::new(),
                 repository: None,
+                via_alias: false,
             });
         }
     }
@@ -1364,7 +1500,7 @@ fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>
     // keeps the later segments honest (cadence-hooks#237 security review, F20).
     if unescape_word(candidate).as_ref() == "eval" {
         // Redirections are not operands: `eval "$(ssh-agent -s)" >/dev/null`.
-        if known_ok && evals_only_an_agent_environment(&strip_redirections(&rest[1..])) {
+        if known_ok && crate::shell::eval_is_tool_init(&strip_redirections(&rest[1..])) {
             return None;
         }
         return Some(DirectoryVerb::Unknowable);
@@ -1401,7 +1537,7 @@ fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>
 /// directory. Matched exactly: a single operand that is a substitution of
 /// `ssh-agent` with option words only, so `eval "$(ssh-agent -s)"; cd …` is
 /// still a separate segment and `eval "$(cat x)"` still refuses.
-fn evals_only_an_agent_environment(operands: &[&String]) -> bool {
+pub fn evals_only_an_agent_environment(operands: &[&String]) -> bool {
     let Some(body) = substitution_body(operands) else {
         return false;
     };
@@ -1473,7 +1609,7 @@ fn names_the_current_toplevel(operands: &[&String]) -> bool {
 /// trailing `)`. Rejoining quoted pieces (`cd '$(git' …`) yields the same text,
 /// which is harmless here: the shell then refuses the extra operands and
 /// stays where it is, which is where this walk reports it.
-fn substitution_body(operands: &[&String]) -> Option<String> {
+pub fn substitution_body(operands: &[&String]) -> Option<String> {
     let joined = operands
         .iter()
         .map(|word| word.as_str())
@@ -1941,6 +2077,21 @@ fn alias_hides_a_push(aliases: &[(String, Option<String>)], subcommand: &str) ->
         })
 }
 
+/// Whether a git subcommand is an alias the same command line defines as
+/// exactly `push` (`-c alias.p=push p origin feat`): git runs its builtin with
+/// the alias's own words in front of the ones written, and there are none, so
+/// the rest of the command line is the push's, judged like any other
+/// (cadence-hooks#1172). A `!` shell alias, a value with anything else in it,
+/// and a `--config-env` one are not this: they keep [`alias_hides_a_push`].
+fn alias_is_plain_push(aliases: &[(String, Option<String>)], subcommand: &str) -> bool {
+    let name = unescape_word(subcommand).to_ascii_lowercase();
+    aliases
+        .iter()
+        .rev()
+        .find(|(alias, _)| *alias == name)
+        .is_some_and(|(_, value)| value.as_deref().is_some_and(|value| value.trim() == "push"))
+}
+
 /// What one `-c`/`--config-env` setting, or one earlier config write, does to
 /// where a push goes.
 #[derive(Debug, Clone)]
@@ -2198,12 +2349,13 @@ fn inline_gh_host(prefix: &[String]) -> Option<Result<Vec<String>, ()>> {
 /// the unescaped words after `clone`. `OWNER/REPO` is on the `GH_HOST` gh
 /// runs with — each of `gh_hosts`, or unreadable when that is `None` —
 /// `HOST/OWNER/REPO` on that host, and a URL (gh reads any `:` as one) is
-/// itself. A bare `REPO` is the signed-in user's, whom the text cannot name,
-/// so it is unreadable.
+/// itself. A bare `REPO` is the signed-in user's, whom gh's config file names
+/// (`user_of`), and is unreadable when it does not.
 fn gh_clone_write(
     words: &[String],
     dir: &str,
     gh_hosts: Option<&[String]>,
+    user_of: &dyn Fn(&str) -> Option<String>,
 ) -> Option<ConfigRedirect> {
     let split = words.iter().position(|word| word == "--");
     let (own, git_flags) = match split {
@@ -2232,6 +2384,18 @@ fn gh_clone_write(
                 Some(hosts) => hosts
                     .iter()
                     .map(|host| ConfigRedirect::Url(format!("https://{host}/{owner}/{name}")))
+                    .collect(),
+                None => vec![ConfigRedirect::Unreadable],
+            },
+            // A bare `REPO` is the signed-in account's, which gh's own config
+            // names (cadence-hooks#1172); no account there, or no host: unreadable.
+            [name] if !name.is_empty() => match gh_hosts {
+                Some(hosts) => hosts
+                    .iter()
+                    .map(|host| match user_of(host) {
+                        Some(user) => ConfigRedirect::Url(format!("https://{host}/{user}/{name}")),
+                        None => ConfigRedirect::Unreadable,
+                    })
                     .collect(),
                 None => vec![ConfigRedirect::Unreadable],
             },
@@ -2394,7 +2558,13 @@ fn config_writes_of(
                     Ok(gh_hosts.hosts.clone())
                 }
             });
-            writes.extend(gh_clone_write(&words[2..], dir, hosts.as_deref().ok()));
+            let user_of = |host: &str| gh_hosts.signed_in_user(host);
+            writes.extend(gh_clone_write(
+                &words[2..],
+                dir,
+                hosts.as_deref().ok(),
+                &user_of,
+            ));
         }
         return writes;
     }
@@ -2655,7 +2825,7 @@ fn push_invocation_of(
     // backslash removal the verb does: `git pu\sh origin main` really pushes
     // (measured), and a literal compare read it as some other subcommand and
     // dropped the segment.
-    if unescape_word(subcommand) != "push" {
+    if unescape_word(subcommand) != "push" && !alias_is_plain_push(&globals.aliases, subcommand) {
         if !alias_hides_a_push(&globals.aliases, subcommand) {
             return None;
         }
@@ -2678,6 +2848,7 @@ fn push_invocation_of(
             destination_unreadable: true,
             config_remotes: globals.config_remotes,
             repository: None,
+            via_alias: false,
         });
     }
 
@@ -2726,6 +2897,7 @@ fn push_invocation_of(
             let named = crate::shell::push_repository_argument(words);
             named.positional.or(named.repo_flag)
         },
+        via_alias: unescape_word(subcommand) != "push",
     })
 }
 
@@ -3272,6 +3444,86 @@ mod tests {
     fn cd_moves_the_work_dir_for_a_later_push() {
         let invocation = only("cd /other && git push", "/repo");
         assert_eq!(invocation.work_dir, "/other");
+    }
+
+    /// A `cd` inside a `( … )` subshell ends with it (cameronsjo/cadence-hooks#1172),
+    /// and a push that runs inside it still runs where the `cd` went. Rows are
+    /// `(command, the directory of every push, in order)`.
+    #[test]
+    fn a_subshells_cd_does_not_move_the_parents_push() {
+        for (command, want) in [
+            (
+                "(cd /other && git status); git push origin HEAD",
+                &["/repo"][..],
+            ),
+            ("(cd /other; git status); git push origin HEAD", &["/repo"]),
+            (
+                "( cd /other ; git status ) ; git push origin HEAD",
+                &["/repo"],
+            ),
+            ("(cd /other); git push origin HEAD", &["/repo"]),
+            ("cd /x; (cd /other); git push origin HEAD", &["/x"]),
+            (
+                "((cd /other && git status)); git push origin HEAD",
+                &["/repo"],
+            ),
+            (
+                "(cd /a && (cd /b && git status); git status); git push origin HEAD",
+                &["/repo"],
+            ),
+            ("echo $(true; cd /other); git push origin HEAD", &["/repo"]),
+            // The dangerous twins: the push runs in the subshell's directory.
+            ("(cd /other && git push origin HEAD)", &["/other"]),
+            ("(cd /other; git push origin HEAD)", &["/other"]),
+            (
+                "(cd /a && (cd /b && git status); git push origin HEAD)",
+                &["/a"],
+            ),
+            (
+                "(cd /a; git push origin HEAD); git push origin HEAD",
+                &["/a", "/repo"],
+            ),
+            (
+                "(cd /other && git status); cd /other && git push origin HEAD",
+                &["/other"],
+            ),
+            // Braces share the parent's directory.
+            ("{ cd /other; }; git push origin HEAD", &["/other"]),
+            (
+                "{ cd /other && git status; } && git push origin HEAD",
+                &["/other"],
+            ),
+            // A `case` arm's `)` cannot be told from a closer: the `cd` leaks.
+            (
+                "(cd /other; case x in a) true;; esac; git push origin HEAD)",
+                &["/other"],
+            ),
+            (
+                "(cd /other; case x in a) true;; esac); git push origin HEAD",
+                &["/other"],
+            ),
+        ] {
+            let dirs: Vec<String> = push_invocations(command, "/repo")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, want, "{command}");
+        }
+    }
+
+    /// A flood of nested `(cd a;` is bounded, and stops scoping rather than
+    /// restoring a directory it did not keep.
+    #[test]
+    fn a_nested_subshell_flood_is_bounded_and_keeps_the_leak() {
+        let command = format!("{}git push origin main", "(cd a;".repeat(20_000));
+        let started = std::time::Instant::now();
+        let pushes = push_invocations(&command, "/repo");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(pushes.len(), 1);
+        assert!(pushes[0].work_dir.starts_with("/repo/a/a"));
+        let closed = format!("{}git push origin main", "(cd a;".repeat(40));
+        let pushes = push_invocations(&format!("{closed}{}", ")".repeat(40)), "/repo");
+        assert!(pushes[0].work_dir.starts_with("/repo/a/a"), "{pushes:?}");
     }
 
     #[test]

@@ -505,6 +505,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
             return false;
         }
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
+        let truncate = command_word(&argv[0]) == "truncate";
         let mut options_done = false;
         let mut i = 1;
         while let Some(arg) = argv.get(i) {
@@ -521,7 +522,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
                     continue;
                 }
                 if arg.len() > 1 && arg.starts_with('-') {
-                    i += 1;
+                    i += 1 + usize::from(truncate && option_takes_next_word(arg));
                     continue;
                 }
             }
@@ -556,12 +557,12 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
                 let rest = skip_git_global_options(&argv[1..]);
                 start = argv.len() - rest.len() + 1;
             }
-            collect_operands(argv, lens, start, false, out);
+            collect_operands(argv, lens, start, false, verb == "truncate", out);
         } else if verb == "find" {
             let is_delete = argv.iter().any(|t| t == "-delete");
             let has_exec = argv.iter().any(|t| EXEC_ACTIONS.contains(&t.as_str()));
             if is_delete || has_exec {
-                collect_operands(argv, lens, 1, true, out);
+                collect_operands(argv, lens, 1, true, false, out);
             }
             for (i, token) in argv.iter().enumerate() {
                 if !EXEC_ACTIONS.contains(&token.as_str()) {
@@ -586,12 +587,15 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
 }
 
 /// Push the operands of `argv[start..]`. `roots_only` (a `find`) stops at the
-/// first expression token instead of skipping options.
+/// first expression token instead of skipping options. `truncate` also skips
+/// the values of `-s`/`--size` (a size) and `-r`/`--reference` (a file it only
+/// reads), which are not files it truncates (cadence-hooks#1172).
 fn collect_operands(
     argv: &[String],
     lens: &[usize],
     start: usize,
     roots_only: bool,
+    truncate: bool,
     out: &mut Vec<String>,
 ) {
     let mut options_done = false;
@@ -613,7 +617,7 @@ fn collect_operands(
                 continue;
             }
             if arg.len() > 1 && arg.starts_with('-') {
-                i += 1;
+                i += 1 + usize::from(truncate && option_takes_next_word(arg));
                 continue;
             }
         }
@@ -621,6 +625,26 @@ fn collect_operands(
         out.push(arg.clone());
         i += 1;
     }
+}
+
+/// Does this `truncate` option leave its value in the next word? `-s SIZE` and
+/// `-r RFILE`, alone or last in a cluster (`-cs 0`), and their long names, whole
+/// or abbreviated as getopt allows (`--size 0`, `--ref f`). A value glued to
+/// the option (`-s0`, `-cs0`, `--size=0`) is in the same word.
+fn option_takes_next_word(arg: &str) -> bool {
+    if let Some(long) = arg.strip_prefix("--") {
+        return !long.is_empty()
+            && !long.contains('=')
+            && ("size".starts_with(long) || "reference".starts_with(long));
+    }
+    for (at, c) in arg.char_indices().skip(1) {
+        match c {
+            's' | 'r' => return at + c.len_utf8() == arg.len(),
+            'c' | 'o' => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Resolve a deletion operand lexically against `cwd` (`~` against `home`,
@@ -698,7 +722,7 @@ fn sibling_reshapes_vault(command: &str, cwd: &str, vault: &str, home: Option<&s
         }
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
         let mut operands = Vec::new();
-        collect_operands(argv, lens, 1, false, &mut operands);
+        collect_operands(argv, lens, 1, false, false, &mut operands);
         if operands
             .iter()
             .any(|operand| operand_lexically_touches_vault(operand, cwd, vault, home))
@@ -1150,8 +1174,35 @@ mod tests {
             ("rm -- -f", Block),
             // A quoted redirect-shaped word is a file `rm` deletes.
             ("rm /tmp/a '>note.md'", Block),
-            // `-s 0`'s size reads as a relative operand: a known over-block.
-            ("truncate -s 0 /tmp/log", Block),
+            // `-s`'s size and `-r`'s reference are not files truncated
+            // (cadence-hooks#1172); every operand still is.
+            ("truncate -s 0 /tmp/log", Allow),
+            ("truncate --size 0 /tmp/log", Allow),
+            ("truncate --size=0 /tmp/log", Allow),
+            ("truncate -s0 /tmp/log", Allow),
+            ("truncate -cs 0 /tmp/log", Allow),
+            ("truncate -s +10K /tmp/log", Allow),
+            ("truncate -r note.md /tmp/log", Allow),
+            ("truncate --reference note.md /tmp/log", Allow),
+            ("truncate --ref note.md /tmp/log", Allow),
+            ("truncate -s 0 -r note.md /tmp/a /tmp/b", Allow),
+            ("sudo truncate -s 0 /tmp/log", Allow),
+            ("truncate -s 0 note.md", Block),
+            ("truncate -s 0 /tmp/log note.md", Block),
+            ("truncate -s 0 /vault/note.md", Block),
+            ("truncate -s 0 -- note.md", Block),
+            ("truncate -r /tmp/ref note.md", Block),
+            ("truncate -r /tmp/ref -s 0 note.md", Block),
+            ("truncate -s 0 -r /tmp/ref", Allow),
+            ("truncate -s 0", Allow),
+            ("truncate -s", Allow),
+            ("truncate -rs 0 note.md", Block),
+            ("truncate -cr note.md /tmp/log", Allow),
+            ("truncate -s 0 $X", Block),
+            ("truncate -s 0 /tmp/log; rm note.md", Block),
+            // The size or reference of another verb is still an operand.
+            ("rm -s 0 /tmp/a", Block),
+            ("shred -n 3 /tmp/a", Block),
             ("rm /tmp/a; rm note.md", Block),
             // Shapes never judged operand by operand keep the cwd verdict.
             ("git rm /tmp/a", Block),
