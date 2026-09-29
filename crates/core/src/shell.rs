@@ -6908,7 +6908,7 @@ struct HeredocLex {
     backticks: bool,
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
     /// be bounded, stop trying, so an opener flood stays linear.
-    exhausted: bool,
+    exhausted: SpanLatch,
 }
 
 /// A heredoc operator [`scan_command_line`] found, by char index.
@@ -6949,7 +6949,7 @@ struct CommandLine {
 /// whole input is read as one line.
 ///
 /// Quoting is [`scan_quote_syntax`]; a substitution inside `"…"` is skipped
-/// through [`quoted_substitution_end`] as [`split_segments_with_ops`] and
+/// through [`quoted_substitution_bound`] as [`split_segments_with_ops`] and
 /// [`comment_spans`] skip it; a `#` opens a comment by exactly the
 /// [`comment_spans`] rule, so this never recognises a comment that function
 /// does not. Every one of those is a shared model on purpose: this scanner
@@ -6981,13 +6981,15 @@ fn scan_command_line(
                 j += 2;
                 continue;
             }
-            if !lex.exhausted && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'('))) {
-                if let Some(end) = quoted_substitution_end(chars, j) {
+            if !lex.exhausted.tripped && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'(')))
+            {
+                let bound = quoted_substitution_bound(chars, j);
+                if let SubstBound::Bounded(end) = bound {
                     skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
                     j = end;
                     continue;
                 }
-                lex.exhausted = true;
+                lex.exhausted.note(bound);
             }
         }
         // `\` before a CRLF continues the line the way [`take_logical_line`]
@@ -7184,7 +7186,7 @@ fn split_segments_impl(
     // of the pass keeps the old character-by-character reading instead of
     // paying O(n) per opener — a flood of them was quadratic, seconds long,
     // and a hook timeout fails open.
-    let mut scan_exhausted = false;
+    let mut scan_exhausted = SpanLatch::default();
 
     while let Some(c) = chars.next() {
         // A substitution inside `"…"` is copied whole: its own quoting belongs
@@ -7203,19 +7205,19 @@ fn split_segments_impl(
             continue;
         }
         if quote == Some(Quote::Double)
-            && !scan_exhausted
+            && !scan_exhausted.tripped
             && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
         {
             let i = all.len() - chars.len() - 1;
-            match quoted_substitution_end(&all, i) {
-                Some(end) => {
+            match quoted_substitution_bound(&all, i) {
+                SubstBound::Bounded(end) => {
                     current.extend(&all[i..end]);
                     for _ in i + 1..end {
                         chars.next();
                     }
                     continue;
                 }
-                None => scan_exhausted = true,
+                other => scan_exhausted.note(other),
             }
         }
         if let Some(q) = quote {
@@ -7437,7 +7439,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     let mut table: Option<(Vec<char>, Vec<usize>)> = None;
     // Same latch as [`split_segments_with_ops`]: after one unboundable scan,
     // stop scanning so an opener flood stays linear.
-    let mut scan_exhausted = false;
+    let mut scan_exhausted = SpanLatch::default();
 
     while let Some((i, c)) = chars.next() {
         // A substitution inside `"…"` is skipped whole, the same way
@@ -7452,7 +7454,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 chars.next();
                 continue;
             }
-            if !scan_exhausted
+            if !scan_exhausted.tripped
                 && (c == '`' || (c == '$' && chars.peek().map(|&(_, n)| n) == Some('(')))
             {
                 let (all, byte_of) = table.get_or_insert_with(|| {
@@ -7465,7 +7467,8 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     (all, byte_of)
                 });
                 let at = byte_of.binary_search(&i).expect("char boundary");
-                if let Some(end) = quoted_substitution_end(all, at) {
+                let bound = quoted_substitution_bound(all, at);
+                if let SubstBound::Bounded(end) = bound {
                     let end_byte = byte_of[end];
                     while chars.peek().is_some_and(|&(j, _)| j < end_byte) {
                         chars.next();
@@ -7473,7 +7476,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     boundary = false;
                     continue;
                 }
-                scan_exhausted = true;
+                scan_exhausted.note(bound);
             }
         }
         if let Some(q) = quote {
@@ -7798,6 +7801,66 @@ pub fn command_segments(command: &str) -> Vec<String> {
     out
 }
 
+thread_local! {
+    static EXPANSION_WORK_LEFT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static EXPANSION_WORK_SPENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// An optional allowance of bytes [`command_segments`] may hand to the
+/// splitter and the wrapper/substitution readers, shared by every call made
+/// while it is armed (cadence-hooks#1141).
+///
+/// Each call is linear, but the constant is large — a 200 KB flood of
+/// `"$(cat <<E` spans costs seconds — and a hook that runs past its deadline
+/// fails OPEN. A guard that arms it asks [`ExpansionWork::spent`] afterwards
+/// and REFUSES the command when it is set: once spent, the walk stops
+/// expanding (the segments already read are kept, nothing is dropped from
+/// them), so what remains unread is exactly what the guard must not allow.
+/// Unarmed, which is every other caller, nothing is charged.
+pub struct ExpansionWork;
+
+impl ExpansionWork {
+    /// Arm an allowance of `budget` bytes until the returned guard drops.
+    pub fn arm(budget: usize) -> ExpansionWorkGuard {
+        EXPANSION_WORK_LEFT.with(|left| left.set(Some(budget)));
+        EXPANSION_WORK_SPENT.with(|spent| spent.set(false));
+        ExpansionWorkGuard
+    }
+
+    fn charge(n: usize) -> bool {
+        EXPANSION_WORK_LEFT.with(|left| match left.get() {
+            None => true,
+            Some(have) => match have.checked_sub(n) {
+                Some(rest) => {
+                    left.set(Some(rest));
+                    true
+                }
+                None => {
+                    left.set(Some(0));
+                    EXPANSION_WORK_SPENT.with(|spent| spent.set(true));
+                    false
+                }
+            },
+        })
+    }
+
+    /// Whether an armed allowance ran out, leaving part of a command unread.
+    pub fn spent() -> bool {
+        EXPANSION_WORK_SPENT.with(std::cell::Cell::get)
+    }
+}
+
+/// Disarms [`ExpansionWork`] on drop.
+pub struct ExpansionWorkGuard;
+
+impl Drop for ExpansionWorkGuard {
+    fn drop(&mut self) {
+        EXPANSION_WORK_LEFT.with(|left| left.set(None));
+    }
+}
+
 /// Longest value [`AssignmentScope`] stores whole. `D=ab; D=$D$D; D=$D$D; …`
 /// doubles the value per segment, so forty segments asked for a terabyte and
 /// the guard hung past its deadline (cadence-hooks#1114). A longer value is
@@ -7969,6 +8032,9 @@ fn expand_segments(
     out: &mut Vec<String>,
     dedupe: bool,
 ) {
+    if !ExpansionWork::charge(command.len()) {
+        return;
+    }
     for segment in split_segments(command) {
         let mut defaults = Vec::new();
         let mut ambiguous = false;
@@ -8013,6 +8079,12 @@ fn emit_segment(
     out: &mut Vec<String>,
     dedupe: bool,
 ) {
+    if !ExpansionWork::charge(segment.len()) {
+        // Out of allowance: the segment itself is still surfaced, only its
+        // children go unread, and the caller sees [`ExpansionWork::spent`].
+        out.push(unmark(segment));
+        return;
+    }
     // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
     // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
     // substitution in the PARENT before it spawns bash at all, so a segment
@@ -8335,6 +8407,11 @@ enum ScanStop {
     /// A nested `$( )` scan failed, for any reason. Says nothing about whether
     /// the shell runs the outer construct — usually it does.
     NestedUnresolved,
+    /// A nested scan hit [`MAX_SUBSTITUTION_DEPTH`]. [`ScanStop::NestedUnresolved`]
+    /// for a caller that widens, but it says the scan stopped at the cap's
+    /// openers rather than at the end of the input, which is what lets a
+    /// caller's latch stay local to the span (cameronsjo/cadence-hooks#1137).
+    NestedTooDeep,
     /// Nesting exceeded [`MAX_SUBSTITUTION_DEPTH`].
     ///
     /// Internal to the recursion: the nested arm relabels every nested failure
@@ -8358,6 +8435,7 @@ impl ScanStop {
         match self {
             ScanStop::QuoteUnresolved
             | ScanStop::NestedUnresolved
+            | ScanStop::NestedTooDeep
             | ScanStop::DepthExceeded
             | ScanStop::LexUnresolved => true,
             ScanStop::Unterminated => false,
@@ -8648,11 +8726,17 @@ fn scan_substitution_body_bounded(
                 // on that reading. Measured cost: a `#` comment inside the
                 // nested body flipped a heredoc secret read from blocked to
                 // allowed (see [`ScanStop`]).
-                let Ok((_, nested_end)) =
-                    scan_substitution_body_bounded(chars, j + 2, true, budget)
-                else {
-                    return Err(ScanStop::NestedUnresolved);
-                };
+                let (_, nested_end) =
+                    match scan_substitution_body_bounded(chars, j + 2, true, budget) {
+                        Ok(found) => found,
+                        // Depth is remembered through the relabelling: a
+                        // depth failure read only as far as the cap's
+                        // openers, unlike one that ran to the end of input.
+                        Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => {
+                            return Err(ScanStop::NestedTooDeep);
+                        }
+                        Err(_) => return Err(ScanStop::NestedUnresolved),
+                    };
                 body.extend(&chars[j..nested_end]);
                 j = nested_end;
                 boundary = false;
@@ -9169,6 +9253,56 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
     None
 }
 
+/// How far a `"$( … )"` / `` "`…`" `` span reaches, and WHY when it does not.
+///
+/// The latch each splitter keeps ("stop scanning after one span that cannot
+/// be bounded") is only sound for [`SubstBound::Unbounded`]: that scan ran to
+/// the end of the input, so every later one would too. [`SubstBound::TooDeep`]
+/// gave up at a nesting cap after reading only as far as the cap's openers —
+/// local to that span, so it must not switch off span handling for the rest
+/// of the pass (cameronsjo/cadence-hooks#1137, #1143): 17 levels of `"$(`
+/// early in a command read every later span character by character, and a
+/// commit body with an odd `"` then hid a later `cat .env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubstBound {
+    Bounded(usize),
+    /// Nesting past [`MAX_SUBSTITUTION_DEPTH`]: cheap, and local.
+    TooDeep,
+    /// No closer found: the scan read to the end of the input.
+    Unbounded,
+}
+
+/// The most too-deep failures one pass retries before it latches anyway. A
+/// too-deep scan reads only the cap's worth of nested openers, but an
+/// unclosed flood (`"$("` × 60 000) fails at every opener, ~17 levels each —
+/// 0.3-0.6 s at 200 KB, in a hook whose deadline fails open. Past the cap the
+/// pass reads the rest character by character, as it always did.
+const MAX_TOO_DEEP_RETRIES: usize = 1024;
+
+/// Whether a pass has stopped asking [`quoted_substitution_bound`].
+#[derive(Default)]
+struct SpanLatch {
+    tripped: bool,
+    too_deep: usize,
+}
+
+impl SpanLatch {
+    /// Record a span that could not be bounded. An [`SubstBound::Unbounded`]
+    /// scan ran to the end of the input, so every later one would too: trip.
+    /// A [`SubstBound::TooDeep`] one is local to its span: retry the next
+    /// span, up to [`MAX_TOO_DEEP_RETRIES`].
+    fn note(&mut self, bound: SubstBound) {
+        match bound {
+            SubstBound::Bounded(_) => {}
+            SubstBound::Unbounded => self.tripped = true,
+            SubstBound::TooDeep => {
+                self.too_deep += 1;
+                self.tripped |= self.too_deep > MAX_TOO_DEEP_RETRIES;
+            }
+        }
+    }
+}
+
 /// Index just past the command substitution — `$(…)` or `` `…` `` — opening at
 /// `chars[i]`, when one opens there AND its terminator can be located.
 ///
@@ -9177,16 +9311,18 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
 /// outer run nor opens a new one. A walker that reads the body as plain
 /// quoted data lets that inner `"` close its `Quote::Double`, and the rest of
 /// the command — separators included — is then misread as quoted text
-/// (cameronsjo/cadence-hooks#830). `None` means "no substitution here, or
+/// (cameronsjo/cadence-hooks#830). `Unbounded`/`TooDeep` mean "no substitution here, or
 /// none this scanner can bound": the caller keeps its old character-by-
 /// character reading, which is the status quo rather than a new deletion.
-fn quoted_substitution_end(chars: &[char], i: usize) -> Option<usize> {
+fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
     match chars[i] {
-        '$' if chars.get(i + 1) == Some(&'(') => scan_substitution_body(chars, i + 2, true)
-            .ok()
-            .map(|(_, end)| end),
-        '`' => backtick_span_end(chars, i),
-        _ => None,
+        '$' if chars.get(i + 1) == Some(&'(') => match scan_substitution_body(chars, i + 2, true) {
+            Ok((_, end)) => SubstBound::Bounded(end),
+            Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => SubstBound::TooDeep,
+            Err(_) => SubstBound::Unbounded,
+        },
+        '`' => backtick_span_end(chars, i).map_or(SubstBound::Unbounded, SubstBound::Bounded),
+        _ => SubstBound::Unbounded,
     }
 }
 
@@ -16342,6 +16478,47 @@ mod tests {
             !substitution_bodies(&"$(".repeat(levels)).is_empty(),
             "deep nesting must still emit the ambiguous readings"
         );
+    }
+
+    #[test]
+    fn deep_quoted_substitution_nesting_does_not_latch_later_spans() {
+        // cadence-hooks#1137/#1143: 17+ levels of `"$(` early in a command
+        // latched the splitter into character-by-character reading for the
+        // rest of the pass, so a later commit heredoc holding an odd `"`
+        // opened a phantom quote over `cat .env`. The depth failure is local
+        // to its span: the later span is still bounded, and `cat .env` is a
+        // segment of its own at every depth.
+        for n in [1usize, 15, 16, 17, 18, 20, 40] {
+            let cmd = format!(
+                "{}; git commit -m \"$(cat <<'EOF'\nit\"s\nEOF\n)\"; cat .env",
+                "echo \"$(".repeat(n) + "echo x" + &")\"".repeat(n),
+            );
+            for (name, segs) in [
+                ("split_segments", split_segments(&cmd)),
+                ("command_segments", command_segments(&cmd)),
+            ] {
+                assert!(
+                    segs.iter().any(|s| s.trim() == "cat .env"),
+                    "{name} n={n}: {segs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn too_deep_retries_are_capped_so_an_unclosed_opener_flood_stays_fast() {
+        // The no-latch rule for too-deep spans retries every opener of an
+        // unclosed `"$(` flood, ~17 levels each; the retry cap bounds that.
+        let flood = "\"$(".repeat(200 * 1024 / 3);
+        let cmd = format!("{flood} ; cat .env");
+        let started = std::time::Instant::now();
+        let segs = split_segments(&cmd);
+        let took = started.elapsed();
+        assert!(!segs.is_empty());
+        // Debug builds get headroom; release is the hook's real budget.
+        let limit =
+            std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
+        assert!(took < limit, "{took:?}");
     }
 
     #[test]

@@ -1003,7 +1003,15 @@ fn hides_a_push_behind_a_prefix(
         // `eval` joins the prefix set for the same reason: it is in neither
         // `TRANSPARENT` nor `COMMAND_RUNNERS`, so nothing else in this walk
         // will ever get past it.
-        TRANSPARENT.contains(&word.as_ref()) || word == "eval"
+        //
+        // So do the command runners (`sudo`, `xargs`, `stdbuf`, `timeout`,
+        // `setsid`): the peel only leaves one as the head when it met an
+        // option it does not model, and `sudo -D DIR` / `--chdir DIR` runs the
+        // push in another repository with none of that visible here
+        // (cadence-hooks#1141). Refuse rather than guess the option's grammar.
+        TRANSPARENT.contains(&word.as_ref())
+            || word == "eval"
+            || COMMAND_RUNNERS.contains(&word.as_ref())
     });
     leads_with_a_prefix && names_a_push(tokens, unquoted_prefix_lens, effective_dir)
 }
