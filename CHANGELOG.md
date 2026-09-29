@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`prevent-secret-writes` judges the file operands of an in-place `sed` or `perl` as write targets.** `sed -i d .env`, `sed -ni`, `sed --in-place=.bak`, `gsed -i "" d .env` and `perl -pi -e … .env` rewrote a secret file and were allowed; the script operand (first positional unless `-e`/`-f` supplies it) is skipped and each remaining operand is judged like a redirect target. (cameronsjo/cadence-hooks#1165)
+
+### Changed
+
+- **The Bash block message for a `.envrc` write says a pure-loader `.envrc` can be written with the Write tool.** The Bash write keeps blocking, per the #248 ruling; the Write and Edit path already allows a pure-loader `.envrc` (#149), which is also what #533 asked for. (cameronsjo/cadence-hooks#248)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security
