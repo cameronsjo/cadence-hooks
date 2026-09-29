@@ -198,6 +198,13 @@ pub fn run_start(
             if existing.declared_branch.is_none() {
                 existing.declared_branch = branch.clone();
             }
+            // Re-registration vouches only from a fresh process. `/resume b`
+            // inside a running process A arrives here as `resume` with b's
+            // id, and A loaded its plugins before b's recorded start; keeping
+            // b's vouch would let the prune bounds delete a dir A is reading.
+            // A `startup` over an existing record keeps its older, more
+            // cautious `started_epoch` (cameronsjo/cadence-hooks#904).
+            existing.start_verified &= input.source.as_deref() == Some("startup");
             existing
         }
         None => SessionRecord {
@@ -207,6 +214,10 @@ pub fn run_start(
             declared_branch: branch,
             started: identity::utc_timestamp(),
             started_epoch: identity::now_epoch(),
+            // Only a fresh process loaded its plugins at about this moment;
+            // `clear`, `compact`, `resume` and `fork` run in a process that may
+            // have loaded them long before (cameronsjo/cadence-hooks#904).
+            start_verified: input.source.as_deref() == Some("startup"),
             ..Default::default()
         },
     };
@@ -590,6 +601,91 @@ mod tests {
         let own = registry::read_own(tmp.path(), "solo-session").unwrap();
         assert_eq!(own.branch.as_deref(), Some("main"));
         assert!(!own.name.is_empty());
+    }
+
+    /// Only a `startup` registration vouches for its start time: the prune
+    /// flags delete dirs orphaned before every live session started, and
+    /// `/clear`, `/compact`, `resume` and `fork` register inside a process that
+    /// loaded its plugins earlier (cameronsjo/cadence-hooks#904).
+    #[test]
+    fn only_a_startup_registration_vouches_for_its_start() {
+        for (source, verified) in [
+            ("startup", true),
+            ("clear", false),
+            ("compact", false),
+            ("resume", false),
+            ("fork", false),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let input = make_session_with_cwd("vouch-session", source, "/tmp");
+            run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
+            let own = registry::read_own(tmp.path(), "vouch-session").unwrap();
+            assert_eq!(own.start_verified, verified, "source {source}");
+        }
+    }
+
+    /// Only a `startup` re-registration keeps a vouch: a `resume`, `clear`,
+    /// `compact` or `fork` over a verified record drops it, and an unverified
+    /// record (a heartbeat recreated it, say) is never promoted by a later
+    /// event other than a fresh registration.
+    /// `/resume b` inside running process A: b's record was written by b's own
+    /// fresh startup, later than A loaded its plugins. Re-registering it from A
+    /// must not carry b's vouch, or the prune bounds would take b's later start
+    /// as the earliest live one and delete a dir A still reads.
+    #[test]
+    fn resume_inside_another_process_drops_the_resumed_records_vouch() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_session_with_cwd("session-b", "startup", "/tmp");
+        run_start(&b, tmp.path(), None, None, 600, None);
+        let before = registry::read_own(tmp.path(), "session-b").unwrap();
+        assert!(before.start_verified);
+
+        let resumed_in_a = make_session_with_cwd("session-b", "resume", "/tmp");
+        run_start(&resumed_in_a, tmp.path(), None, None, 600, None);
+        let after = registry::read_own(tmp.path(), "session-b").unwrap();
+        assert!(
+            !after.start_verified,
+            "a resume cannot vouch for A's load time"
+        );
+        assert_eq!(after.started_epoch, before.started_epoch);
+    }
+
+    #[test]
+    fn reregistration_keeps_the_start_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let input = make_session_with_cwd("keep-session", "startup", "/tmp");
+        run_start(&input, tmp.path(), None, None, 600, None);
+        let input = make_session_with_cwd("keep-session", "startup", "/tmp");
+        run_start(&input, tmp.path(), None, None, 600, None);
+        assert!(
+            registry::read_own(tmp.path(), "keep-session")
+                .unwrap()
+                .start_verified,
+            "a startup over a verified record keeps the vouch"
+        );
+        for source in ["resume", "clear", "compact", "fork"] {
+            let tmp = TempDir::new().unwrap();
+            let input = make_session_with_cwd("keep-session", "startup", "/tmp");
+            run_start(&input, tmp.path(), None, None, 600, None);
+            let input = make_session_with_cwd("keep-session", source, "/tmp");
+            run_start(&input, tmp.path(), None, None, 600, None);
+            assert!(
+                !registry::read_own(tmp.path(), "keep-session")
+                    .unwrap()
+                    .start_verified,
+                "{source} over a verified record drops the vouch"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        registry::touch_own(tmp.path(), None, "recreated-session", None, false).unwrap();
+        let input = make_session_with_cwd("recreated-session", "compact", "/tmp");
+        run_start(&input, tmp.path(), None, None, 600, None);
+        assert!(
+            !registry::read_own(tmp.path(), "recreated-session")
+                .unwrap()
+                .start_verified
+        );
     }
 
     #[test]

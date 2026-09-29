@@ -4,6 +4,8 @@
 //! Verifies that individual hooks can be skipped via the env var, while
 //! non-listed hooks still run normally.
 
+mod support;
+
 use std::io::Write;
 use std::process::Command;
 
@@ -20,7 +22,7 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 }
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // Ensure tests don't inherit env vars from the test runner's session
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");

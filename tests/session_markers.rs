@@ -6,6 +6,8 @@
 //! two pids under the pre-CP0 code, so the pid-keyed marker never matches and
 //! the once-per-session nudge fires twice — exactly the bug CP0 closes (#133).
 
+mod support;
+
 use std::io::Write;
 use std::process::Command;
 
@@ -14,7 +16,7 @@ use std::process::Command;
 /// directory (#302) — `.env()` only affects the *child's* environment, so this
 /// needs no serialization against other tests in this file.
 fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // Don't inherit enforcement toggles from the test runner's session.
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");

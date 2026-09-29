@@ -13,6 +13,10 @@ serde_json.workspace = true
 regex.workspace = true
 jiff.workspace = true
 
+# `O_NOFOLLOW` for `open_ledger`. Already a workspace dependency.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 tempfile = "3"

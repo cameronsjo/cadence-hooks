@@ -11,7 +11,10 @@
 //!   per session to tick the plan. cadence-rules § Plan Execution asks for
 //!   ticks "as work lands" — not on every commit — so the guard tolerates a
 //!   three-commit gap and fires at most once per session (friction canon:
-//!   spend friction only where it is load-bearing).
+//!   spend friction only where it is load-bearing). Because it lands after
+//!   the work commit, the copy names `git commit --amend` for an unpushed
+//!   commit, so the tick can join it rather than ride a follow-up
+//!   (cameronsjo/cadence-hooks#691).
 //! - **`warn-plan-ready-flip` (PreToolUse:Bash).** `gh pr ready` / `gh pr
 //!   merge` while the branch's plan still reads `status: in-flight` or
 //!   carries unticked checkboxes ⇒ warn. The PR-ready flip is one of the
@@ -48,7 +51,11 @@
 //!   telemetry-driven).
 
 use crate::plan_scan::{self, InFlightPlan};
-use cadence_hooks_core::markers;
+use cadence_hooks_core::markers::{self, MarkerTarget, resolve_ship_target};
+use cadence_hooks_core::shell::{
+    PrSelector, basename, carries_undo_flag, command_segments, gh_pr_segments, pr_flip_segments,
+    pr_selector, ship_target, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 
@@ -268,8 +275,9 @@ pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
     CheckResult::nudge(format!(
         "living plan untouched: the last commits didn't tick {rel} — tick completed boxes and \
          bump its updated:/next: (the commit that lands work is the commit that touches the \
-         plan; cadence-rules § Plan Execution). Once per session; already-reconciled plans \
-         never see this."
+         plan; cadence-rules § Plan Execution). If the commit that just landed is unpushed, \
+         `git commit --amend` folds the tick into it instead of a follow-up commit. Once per \
+         session; already-reconciled plans never see this."
     ))
 }
 
@@ -277,7 +285,9 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    if !is_pr_flip_command(command) {
+    let mut flips = pr_flip_segments(command);
+    flips.extend(windowed_flips(command));
+    if flips.is_empty() {
         return CheckResult::allow();
     }
     let Some(cwd) = input.cwd.as_deref() else {
@@ -289,6 +299,15 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(plan) = plan_for_current_branch(&repo_root) else {
         return CheckResult::allow();
     };
+    // The plan speaks for the cwd's branch only, so a flip aimed anywhere
+    // else says nothing about it (cadence-hooks#972).
+    let branch = plan.branch.as_deref().unwrap_or_default();
+    if !flips
+        .iter()
+        .any(|tokens| flips_the_cwd_branch(tokens, cwd, branch))
+    {
+        return CheckResult::allow();
+    }
 
     let unticked = unticked_boxes(&plan.path);
     let in_flight = plan.status == "in-flight";
@@ -309,50 +328,89 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     ))
 }
 
-/// The in-flight plan doc bound to the repo's current branch, if any. Binding
-/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
-/// is a silent no-fire (the guard must not guess), and shared-main repos
-/// match naturally because both sides read `main`. First match wins in
-/// `plan_scan`'s deterministic path order.
-/// Is `command` a `gh pr ready` / `gh pr merge` invocation? Token-window
-/// scan over the shell tokenizer's output rather than a substring (security
-/// review of this change): `echo "gh pr merge"` tokenizes the quoted text
-/// into ONE token, so prose about the command never matches, while flags
-/// after the verb (`gh pr merge 42 --squash`) don't disturb the window.
+/// Flips the shared matcher does not see because a prefix outside the
+/// transparent set sits in front of `gh` (`sudo`, `timeout 60`, `nice -n 5`,
+/// `xargs`, `env -u X`, `command -p`, `watch`). This is the guard's original
+/// token-window scan, kept beside [`pr_flip_segments`] so moving onto the
+/// shared matcher did not lose those spellings (cadence-hooks#1070 review
+/// I1). Each hit is returned from its `gh` token on, so
+/// [`flips_the_cwd_branch`] still reads its `-R` and selector.
 ///
-/// The scan runs PER SEGMENT. `tokenize` does no operator splitting, so a
-/// whole-command token stream runs straight through `&&`/`;`/`|` into later
-/// commands — and the `--undo` slice below would then read a *following*
-/// command's flag as this invocation's, suppressing the nudge on a real ship
-/// (`gh pr ready 42 && gh pr ready --undo`). [`command_segments`] cuts the
-/// line at those separators first, so each invocation only ever sees its own
-/// operands.
-///
-/// [`command_segments`]: cadence_hooks_core::shell::command_segments
-fn is_pr_flip_command(command: &str) -> bool {
-    cadence_hooks_core::shell::command_segments(command)
+/// **Detector direction only**, and advisory: a `gh pr merge` in argument
+/// position (`echo gh pr merge`) also matches, which costs at most a
+/// spurious nudge. The window is `gh pr <sub>` adjacent, so a global `-R`
+/// behind a non-transparent prefix (`sudo gh -R o/r pr ready 1`) is not seen
+/// here. A window with an inline `GH_REPO=`/`GH_HOST=` anywhere before its
+/// `gh` (`env -u X GH_REPO=o/r gh pr ready 12`) is skipped: the slice would
+/// drop the retarget and read the flip as this checkout's.
+fn windowed_flips(command: &str) -> Vec<Vec<String>> {
+    command_segments(command)
         .into_iter()
-        .any(|segment| {
-            let tokens = cadence_hooks_core::shell::tokenize(&segment);
-            tokens.windows(3).enumerate().any(|(i, w)| {
-                if cadence_hooks_core::shell::basename(&w[0]) != "gh" || w[1] != "pr" {
-                    return false;
-                }
-                match w[2].as_str() {
-                    // `--undo` flips the PR back to DRAFT — it un-ships, the
-                    // retreat FROM the reconcile point this guard names, so
-                    // the unticked-box nudge is noise. Shared predicate with
-                    // the ship anchor (cadence-hooks#773/#774): it skips
-                    // redirect targets and here-string words, which the shell
-                    // eats before gh ever sees them.
-                    "ready" => !cadence_hooks_core::shell::carries_undo_flag(
-                        tokens.get(i + 3..).unwrap_or(&[]),
-                    ),
-                    "merge" => true,
-                    _ => false,
-                }
-            })
+        // A segment the shared matcher reads is left to it: slicing from `gh`
+        // here would drop an inline `GH_REPO=` in front of it.
+        .filter(|segment| gh_pr_segments(segment).is_empty())
+        .flat_map(|segment| {
+            let tokens = tokenize(&segment);
+            (0..tokens.len().saturating_sub(2))
+                .filter(|&i| {
+                    // An inline retarget ahead of `gh` would be dropped by the
+                    // slice below, so such a window is not read at all.
+                    !tokens[..i]
+                        .iter()
+                        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="))
+                        && basename(&tokens[i]) == "gh"
+                        && tokens[i + 1] == "pr"
+                        && match tokens[i + 2].as_str() {
+                            "ready" => !carries_undo_flag(&tokens[i + 3..]),
+                            "merge" => true,
+                            _ => false,
+                        }
+                })
+                .map(|i| {
+                    let mut flip = tokens[i..].to_vec();
+                    flip[0] = "gh".to_string();
+                    flip
+                })
+                .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+/// Does this flip segment act on the PR of the branch checked out in `cwd`
+/// (named `branch`)? The plan guard binds to that branch, so it speaks only
+/// for a flip of that branch's PR (cadence-hooks#972). The tokens come from
+/// [`pr_flip_segments`], the matcher the ready-flip guards share
+/// (cadence-hooks#778).
+///
+/// The target is read from the command text, the way the polish gate reads a
+/// ship's ([`resolve_ship_target`]): every `-R`/`--repo`/`GH_REPO=` value
+/// must name one of the cwd repo's remotes. A PR URL names its own repo, so
+/// it joins that comparison. A branch selector must be `branch` itself.
+///
+/// Anything this cannot read stays quiet: an unreadable selector, a repo
+/// value that is no remote here, or a branch selector naming another branch.
+/// A PR **number** in the cwd's own repo still counts as a flip of this
+/// branch, as it always has: telling which branch a number belongs to needs
+/// a network call this local guard does not make. An exported `GH_REPO`
+/// leaves no token behind and is not seen.
+fn flips_the_cwd_branch(tokens: &[String], cwd: &str, branch: &str) -> bool {
+    let mut target = ship_target(tokens);
+    match pr_selector(tokens) {
+        PrSelector::None | PrSelector::Number(_) => {}
+        PrSelector::Url {
+            host, owner, repo, ..
+        } => target.repos.push(format!("{host}/{owner}/{repo}")),
+        PrSelector::Other(selector) => {
+            if selector != branch {
+                return false;
+            }
+        }
+        PrSelector::Unreadable => return false,
+    }
+    matches!(
+        resolve_ship_target(&target, Some(cwd)),
+        MarkerTarget::Local { .. }
+    )
 }
 
 /// Atomically claim `path` with `create_new`: `true` means this invocation
@@ -374,6 +432,11 @@ fn claim_marker(path: &Path) -> bool {
     }
 }
 
+/// The in-flight plan doc bound to the repo's current branch, if any. Binding
+/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
+/// is a silent no-fire (the guard must not guess), and shared-main repos
+/// match naturally because both sides read `main`. First match wins in
+/// `plan_scan`'s deterministic path order.
 fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
     let branch =
         cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)?;
@@ -653,6 +716,9 @@ mod tests {
         assert_eq!(r.outcome, cadence_hooks_core::Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("2026-08-11-guards.md"));
+        // cadence-hooks#691: the nudge lands after the work commit, so it
+        // names the escape that lets the tick join that commit.
+        assert!(msg.contains("`git commit --amend` folds the tick into it"));
 
         // Second qualifying commit in the same session: marker holds, silent.
         let r2 = run_nudge_plan_tick(&input);
@@ -925,6 +991,146 @@ mod tests {
         let prose = bash_input("flip-session-3", tmp.path(), "echo \"gh pr merge\"", "");
         assert_eq!(
             run_warn_plan_ready_flip(&prose).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    /// A repo on `main` with an in-flight plan and an `origin` of
+    /// `github.com/me/plans`.
+    fn repo_with_plan_and_origin() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-20-work.md",
+            "in-flight",
+            "main",
+            "# W\n\n- [ ] build\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        let ok = std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/me/plans.git"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        tmp
+    }
+
+    #[test]
+    fn ready_flip_stays_quiet_for_a_pr_in_another_repo() {
+        // cadence-hooks#972: every one of these flips a PR the cwd's plan has
+        // nothing to do with.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh pr ready 16 -R other/repo",
+            "gh pr merge 16 --repo=other/repo --squash",
+            "gh -R other/repo pr merge 16",
+            "GH_REPO=other/repo gh pr merge 16",
+            "gh pr merge https://github.com/other/repo/pull/16",
+            "gh pr ready feat/elsewhere",
+        ] {
+            let input = bash_input("flip-972", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cmd} targets another repo or branch"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_still_warns_for_the_cwd_repos_own_pr() {
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh pr ready 16",
+            "gh pr ready",
+            "gh pr merge 16 -R me/plans",
+            "gh pr merge 16 -R github.com/me/plans",
+            "gh pr merge https://github.com/me/plans/pull/16",
+            "gh pr ready main",
+            "gh pr ready 16 -R other/repo && gh pr ready 17",
+        ] {
+            let input = bash_input("flip-972-own", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} flips this checkout's PR"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_sees_retargeted_and_prefixed_spellings() {
+        // cadence-hooks#778: the old matcher demanded `gh pr` adjacent, so a
+        // global `-R` or a keyword-led segment never nudged.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh -R me/plans pr ready 42",
+            "gh --repo=me/plans pr merge 42",
+            "env GH_TOKEN=x gh pr ready 42",
+            "if true; then gh pr ready 42; fi",
+        ] {
+            let input = bash_input("flip-778", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} is a ready flip of this checkout's PR"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_sees_non_transparent_prefixes() {
+        // cadence-hooks#1070 review I1: the old window scan saw these, and the
+        // shared matcher alone does not.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "sudo gh pr ready 12",
+            "timeout 60 gh pr merge 12",
+            "nice -n 5 gh pr ready 12",
+            "env -u GH_TOKEN gh pr merge 12",
+        ] {
+            let input = bash_input("flip-1070-i1", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} is a ready flip of this checkout's PR"
+            );
+        }
+        // The window hit still reads its own target.
+        for cmd in [
+            "sudo gh pr ready 12 -R other/repo",
+            "timeout 60 gh pr ready --undo",
+            "env -u X GH_REPO=o/r gh pr ready 12",
+            "GH_HOST=x.example sudo gh pr ready 12",
+        ] {
+            let input = bash_input("flip-1070-i1-quiet", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_with_no_matching_remote_stays_quiet() {
+        // No remotes at all: a repo value can name nothing here.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-20-work.md",
+            "in-flight",
+            "main",
+            "# W\n\n- [ ] build\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        let input = bash_input("flip-972-none", tmp.path(), "gh pr ready 1 -R o/r", "");
+        assert_eq!(
+            run_warn_plan_ready_flip(&input).outcome,
             cadence_hooks_core::Outcome::Allow
         );
     }

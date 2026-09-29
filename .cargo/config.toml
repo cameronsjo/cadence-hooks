@@ -1,0 +1,19 @@
+# Test hermeticity against the developer's git config (cameronsjo/cadence-hooks#1075).
+#
+# Test fixtures run `git commit` (and a few `git tag`) through many hand-rolled
+# helpers, and every one inherits the user's global `commit.gpgsign`. When the
+# signer fails (a missing key, an agent that ran out of file descriptors), each
+# of those commits fails and dozens of unrelated tests go red.
+#
+# `GIT_CONFIG_PARAMETERS` is the environment form of `git -c`: it outranks the
+# global, system and repo config files, and git reads it after
+# `GIT_CONFIG_COUNT`, so an ambient `GIT_CONFIG_COUNT` (sandboxes use it for URL
+# rewrites) still applies alongside it. Cargo sets `[env]` on every process it
+# spawns, test binaries included, so every fixture's `git` child inherits it.
+# `force` replaces any inherited value: a test run started from inside a
+# `git -c ...` hook would otherwise carry the parent's parameters instead.
+#
+# This only reaches processes cargo starts. An installed `cadence-hooks`
+# binary never sees it.
+[env]
+GIT_CONFIG_PARAMETERS = { value = "'commit.gpgsign=false' 'tag.gpgsign=false'", force = true }

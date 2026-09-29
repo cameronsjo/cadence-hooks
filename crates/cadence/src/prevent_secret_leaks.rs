@@ -12,8 +12,10 @@ use crate::secret_patterns::{
     Filename, command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token_at, is_safe_template, is_secret_shaped_var_name,
 };
+use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, is_assignment_word, split_segments, tokenize,
+    command_segments, command_word, executable_tokens, is_assignment_word, skip_git_global_options,
+    split_segments, strip_heredoc_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -282,7 +284,300 @@ fn resolve_command<'a>(tokens: &'a [String]) -> Option<(Cow<'a, str>, &'a [Strin
 /// costs nothing: a genuine command word (`cat`, `ls`) never classifies as a
 /// dangerous secret token, so the only tokens this adds to the scan are the
 /// ones that should have been there.
-fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, String)> {
+fn segment_env_reads(
+    segment: &str,
+    context: ScanContext,
+    budget: &mut RescanBudget,
+) -> Vec<(String, String)> {
+    segment_env_reads_at(segment, context, budget, 0)
+}
+
+/// Whole-command facts a single segment's scan needs.
+#[derive(Clone, Copy, Default)]
+struct ScanContext {
+    /// [`command_is_plain_jq_pipeline`] over the full command (#947).
+    plain_jq_pipeline: bool,
+    /// Some segment assigns a `GIT_*` variable (`GIT_PAGER=…`,
+    /// `export GIT_EDITOR=…`, `GIT_CONFIG_PARAMETERS=…`), which can make any
+    /// later `git` run an arbitrary command — so no `git` keeps its exemption.
+    git_env_rebound: bool,
+}
+
+/// Most levels of command-string-in-an-option re-scanning.
+const NESTED_SCAN_DEPTH: usize = 4;
+/// Most bytes of nested command text re-scanned for one command.
+const RESCAN_BYTES: usize = 64 * 1024;
+/// Most nested command strings re-scanned for one command.
+const RESCAN_NODES: usize = 256;
+
+/// The GLOBAL allowance for nested re-scans across one whole command (#832
+/// delta review K1). Without it, `su su … -c '<the same again>'` nested four
+/// deep grew as k⁴ — an 804-byte command took 18 s, past the hook timeout,
+/// and a timed-out hook does not block, so the stall WAS the bypass. When the
+/// allowance runs out, the scan stops and the caller fails closed on the raw
+/// command ([`rough_secret`]).
+///
+/// It also carries the scan's wall-clock DEADLINE (#832 delta review I-2):
+/// the Bash arm runs inside a hook group that fails a member OPEN after
+/// 4000 ms, so the structured scan gives up well before that and the caller
+/// falls back to [`normalized_secret_name`].
+struct RescanBudget {
+    bytes: usize,
+    nodes: usize,
+    deadline: std::time::Instant,
+    exhausted: bool,
+}
+
+impl RescanBudget {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            bytes: RESCAN_BYTES,
+            nodes: RESCAN_NODES,
+            deadline,
+            exhausted: false,
+        }
+    }
+
+    /// Past the deadline? Marks the budget exhausted when it is.
+    fn out_of_time(&mut self) -> bool {
+        if std::time::Instant::now() >= self.deadline {
+            self.exhausted = true;
+        }
+        self.exhausted
+    }
+
+    /// Spend on `script`, or mark the budget exhausted and refuse.
+    fn spend(&mut self, script: &str) -> bool {
+        if self.out_of_time() || self.nodes == 0 || script.len() > self.bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.nodes -= 1;
+        self.bytes -= script.len();
+        true
+    }
+}
+
+thread_local! {
+    /// Whether the segment being scanned has a LIVE substitution — a `$(` or
+    /// backtick outside single quotes and outside a quoted heredoc body. Read
+    /// by [`dangerous_secret_operand`]; set per segment by
+    /// [`segment_env_reads_at`]. Defaults to live, the fail-closed reading.
+    static SUBSTITUTIONS_LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Restores [`SUBSTITUTIONS_LIVE`] when a segment's scan ends, so a nested
+/// re-scan cannot leak its setting into the caller's remaining tokens.
+struct LiveScope(bool);
+
+impl LiveScope {
+    fn set(live: bool) -> Self {
+        Self(SUBSTITUTIONS_LIVE.with(|cell| cell.replace(live)))
+    }
+}
+
+impl Drop for LiveScope {
+    fn drop(&mut self) {
+        SUBSTITUTIONS_LIVE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Does `segment` carry a substitution the shell will EXPAND (#815 delta
+/// review I-a)? A backtick or `$(` inside single quotes, or inside a quoted
+/// heredoc body (`<<'EOF'`), is literal text — `--body 'Ignore `.env files'`
+/// is prose, and routing it through the substitution resolver false-blocked.
+/// The tokenizer drops quote state, so this reads the raw segment, after its
+/// quoted heredoc bodies are gone ([`strip_quoted_heredoc_bodies`]).
+fn substitutions_live(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    let mut in_double = false;
+    // Was the previous byte a `$` that the shell reads as a sigil — not
+    // escaped (`\$`) and not half of `$$`? Only such a `$` makes the next
+    // `'` open an ANSI-C `$'…'` (#815 delta review I3: treating `\$'` or
+    // `$$'` as ANSI-C honoured `\'` inside a plain single-quoted string,
+    // overran it, and read a later live substitution as quoted).
+    let mut sigil = false;
+    while i < bytes.len() {
+        let was_sigil = std::mem::replace(&mut sigil, false);
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'$' => match bytes.get(i + 1) {
+                Some(b'(') => return true,
+                Some(b'$') => i += 1,
+                _ => sigil = true,
+            },
+            b'\'' if !in_double => {
+                let ansi = was_sigil;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if ansi && bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    // An unterminated single quote: the reading is unsure,
+                    // so it counts as live (fail closed).
+                    return true;
+                }
+            }
+            b'"' => in_double = !in_double,
+            b'`' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    // Non-live only when the scan ends with every quote closed.
+    in_double
+}
+
+/// `text` with every QUOTED-delimiter heredoc body removed (`<<'EOF'`,
+/// `<<"EOF"`, `<<\EOF`, and their `<<-` forms), wherever the introducer sits —
+/// including inside a `"$(cat <<'EOF' … )"` argument, which the shared
+/// stripper leaves alone because it suppresses detection inside double
+/// quotes. A body is removed only when its terminator line is found.
+fn strip_quoted_heredoc_bodies(text: &str) -> Cow<'_, str> {
+    static INTRO: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\([A-Za-z0-9_]+))"#)
+            .expect("heredoc introducer compiles")
+    });
+    if !text.contains("<<") {
+        return Cow::Borrowed(text);
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    // Indexed ONCE: line text → the sorted line numbers holding it, exactly
+    // (`<<'X'`) and with leading tabs trimmed (`<<-'X'`). Finding a
+    // terminator is then a lookup plus a binary search, not a rescan of every
+    // remaining line per introducer — that rescan was quadratic (#815 delta
+    // review I1: 8000 unterminated introducers took 4.2 s). A delimiter with
+    // no entry at all is a missing terminator, answered by the same lookup.
+    let mut exact: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    let mut trimmed: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (n, line) in lines.iter().enumerate() {
+        exact.entry(line).or_default().push(n);
+        trimmed
+            .entry(line.trim_start_matches('\t'))
+            .or_default()
+            .push(n);
+    }
+    let next_at_or_after =
+        |index: &std::collections::HashMap<&str, Vec<usize>>, key: &str, from: usize| {
+            let at = index.get(key)?;
+            at.get(at.partition_point(|&n| n < from)).copied()
+        };
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        out.push(line);
+        i += 1;
+        let delimiters: Vec<(bool, &str)> = INTRO
+            .captures_iter(line)
+            .filter_map(|c| {
+                let dash = c.get(1).is_some_and(|m| !m.as_str().is_empty());
+                c.get(2)
+                    .or(c.get(3))
+                    .or(c.get(4))
+                    .map(|m| (dash, m.as_str()))
+            })
+            .collect();
+        // Bodies are consumed in order, each starting where the last ended —
+        // bash's rule for several heredocs on one line.
+        for (dash, delimiter) in delimiters {
+            // `<<-` strips leading TABS from the terminator; plain `<<` needs
+            // the line to match exactly.
+            let index = if dash { &trimmed } else { &exact };
+            if let Some(end) = next_at_or_after(index, delimiter, i) {
+                i = end + 1;
+                out.push(delimiter);
+            }
+        }
+    }
+    Cow::Owned(out.join("\n"))
+}
+
+/// A secret-file name in `text` once quoting is REMOVED, not split on — the
+/// fail-closed judgment for input the structured scan does not finish
+/// (#832/#815 delta review I2/I4). `".e"'nv'` and `.e\nv` normalize to
+/// `.env` here, where splitting at the quote left two harmless halves.
+fn normalized_secret_name(text: &str) -> Option<String> {
+    let normalized: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    normalized
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '{' | '}' | '='
+                )
+        })
+        .find(|piece| {
+            !piece.is_empty() && is_dangerous_secret_token_at(piece, Filename::Unqualified)
+        })
+        .map(str::to_string)
+}
+
+/// Commands longer than this skip the structured scan: the shared segmenter
+/// and runner peel are super-linear on adversarial input, and a hook that runs
+/// past its group's 4000 ms limit fails OPEN. At 64 KiB a nested `su` repro
+/// still took 3.9 s on a release build, so the cap is 16 KiB (#832 delta
+/// review I-2). Over the cap, [`normalized_secret_name`] decides alone.
+const STRUCTURED_SCAN_LIMIT: usize = 16 * 1024;
+
+/// Wall-clock allowance for the structured scan of one command. Past it, the
+/// scan is abandoned and [`normalized_secret_name`] decides, as over the size
+/// cap. Well under the hook group's 4000 ms fail-open limit.
+///
+/// The deadline is checked only between iterations of the segment loop and
+/// the nested re-scan loop. A single call it cannot interrupt — the
+/// `command_segments` split, [`command_changes_directory`], and the
+/// untracked-content pass ahead of the loop — is bounded by
+/// [`STRUCTURED_SCAN_LIMIT`], not by this deadline.
+const STRUCTURED_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The untracked-content check for a command too long for the structured
+/// scan: its tokens, read without segmenting. Fails closed — any mention of
+/// the untracked-stash or ignored-file-grep shape anywhere blocks.
+fn untracked_content_by_tokens(command: &str, lower: &str) -> bool {
+    if !(lower.contains("stash") || lower.contains("untracked")) {
+        return false;
+    }
+    let tokens = tokenize(command);
+    let has = |f: &dyn Fn(&str) -> bool| tokens.iter().any(|t| f(t));
+    let short_has = |t: &str, c: char| t.starts_with('-') && !t.starts_with("--") && t.contains(c);
+    let stash_patch = has(&|t| t == "stash")
+        && has(&|t| t == "show")
+        && has(&|t| t.starts_with("--patch") || short_has(t, 'p'));
+    let untracked = lower.contains("showincludeuntracked")
+        || has(&|t| {
+            t.starts_with("--include-untracked")
+                || t.starts_with("--only-untracked")
+                || short_has(t, 'u')
+        });
+    (stash_patch && untracked)
+        || has(&|t| t.contains("stash") && t.contains("^3"))
+        || (has(&|t| t == "--untracked") && has(&|t| t == "--no-exclude-standard"))
+}
+
+/// [`segment_env_reads`] at a nesting depth: the segment's own operands, plus
+/// every command string it hands to something that runs it
+/// ([`nested_command_strings`]), scanned as commands in their own right.
+fn segment_env_reads_at(
+    segment: &str,
+    context: ScanContext,
+    budget: &mut RescanBudget,
+    depth: usize,
+) -> Vec<(String, String)> {
+    // A quoted heredoc body is data, not shell text: removed BEFORE
+    // tokenizing, because the tokenizer's quote tracking does not know about
+    // heredocs, and a `"` inside a `"$(cat <<'EOF' … EOF)"` body re-split the
+    // argument into fragments (#815 delta review I-a). Command-level
+    // stripping already drops these bodies outside double quotes.
+    let segment = strip_quoted_heredoc_bodies(segment);
+    let segment = segment.as_ref();
     let tokens = tokenize(segment);
     let Some(first) = tokens.first() else {
         return Vec::new();
@@ -290,7 +585,196 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
     if first.starts_with('#') {
         return Vec::new();
     }
-    let Some((cmd_word, argv)) = resolve_command(&tokens) else {
+    let mut found = {
+        let _live = LiveScope::set(substitutions_live(segment));
+        segment_direct_reads(&tokens, context)
+    };
+    if depth < NESTED_SCAN_DEPTH {
+        for script in nested_command_strings(&tokens) {
+            if !budget.spend(&script) {
+                break;
+            }
+            for inner in command_segments(&script) {
+                let inner_context = ScanContext {
+                    plain_jq_pipeline: false,
+                    ..context
+                };
+                found.extend(segment_env_reads_at(
+                    &inner,
+                    inner_context,
+                    budget,
+                    depth + 1,
+                ));
+                if budget.exhausted {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Shell options whose VALUE is the next token, so it is not the script.
+const SHELL_VALUED_OPTIONS: &[&str] = &["-o", "-O", "+o", "+O", "--rcfile", "--init-file"];
+
+/// Command strings this segment hands to something that will RUN them, which
+/// the segmenter does not expand on its own, deduplicated:
+///
+/// - a shell's `-c` script (`sh -c`, `bash -lc`, `bash -o posix -c`, `+x`)
+///   wherever the shell sits — the segmenter's own expansion stops at a runner
+///   flag it cannot parse, so `sudo -D /x sh -c 'cat .env'` reached no scan
+///   (#832 delta review C1, I-d);
+/// - `su`/`runuser` `-c` (alone, in a cluster like `-lc`, or attached like
+///   `-c'…'`), `--command`, `--session-command` — the FIRST one only, and the
+///   walk stops at the next `su`/`runuser`, which starts its own (K1);
+/// - `git` options that run a command: `-c key=VALUE`, `rebase -x`/`--exec`,
+///   `--upload-pack`, `--receive-pack` (any unique prefix of 3+ characters,
+///   attached or not), and `clone -u` (#850 delta review I6, I-c);
+/// - the value of any `GIT_*` assignment (`GIT_EDITOR='cat .env' git commit`).
+///
+/// A leading `!` (git's shell-alias marker) is dropped. Over-collecting is
+/// safe: a string that is not really a command yields no secret operand.
+fn nested_command_strings(tokens: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut scripts = Vec::new();
+    let mut push = |value: &str| {
+        let value = value.strip_prefix('!').unwrap_or(value);
+        if !value.is_empty() && seen.insert(value.to_string()) {
+            scripts.push(value.to_string());
+        }
+    };
+    let mut git_sub: Option<&str> = None;
+    let mut git_seen = false;
+    for (i, token) in tokens.iter().enumerate() {
+        let next = tokens.get(i + 1).map(String::as_str);
+        if is_assignment_word(token)
+            && let Some((name, value)) = token.split_once('=')
+            && name.starts_with("GIT_")
+        {
+            push(value);
+        }
+        match command_word(token).as_ref() {
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" => {
+                let mut j = i + 1;
+                let mut dash_c = false;
+                while let Some(flag) = tokens
+                    .get(j)
+                    .filter(|t| t.len() > 1 && (t.starts_with('-') || t.starts_with('+')))
+                {
+                    if SHELL_VALUED_OPTIONS.contains(&flag.as_str()) {
+                        j += 2;
+                        continue;
+                    }
+                    dash_c |=
+                        flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c');
+                    j += 1;
+                }
+                if dash_c && let Some(script) = tokens.get(j) {
+                    push(script);
+                }
+            }
+            "su" | "runuser" => {
+                for (k, t) in tokens.iter().enumerate().skip(i + 1) {
+                    if matches!(command_word(t).as_ref(), "su" | "runuser") {
+                        break;
+                    }
+                    let value = su_command_value(t, tokens.get(k + 1).map(String::as_str));
+                    if let Some(value) = value {
+                        push(value);
+                        break;
+                    }
+                }
+            }
+            "git" if !git_seen => {
+                git_seen = true;
+                git_sub = skip_git_global_options(&tokens[i + 1..])
+                    .first()
+                    .map(String::as_str);
+            }
+            _ => {}
+        }
+        if git_seen && let Some(value) = git_command_option_value(git_sub, token, next) {
+            push(value);
+        }
+    }
+    scripts
+}
+
+/// The command string a `su`/`runuser` option carries: `-c VALUE`,
+/// `-lc VALUE`, `-c'VALUE'` (attached), `--command[=]VALUE`,
+/// `--session-command[=]VALUE`. Walks a short cluster up to `c`, stopping at
+/// another value-taking letter (`-g`, `-G`, `-s`, `-w`).
+fn su_command_value<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, value) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        let is_command =
+            name.len() >= 3 && ("command".starts_with(name) || "session-command".starts_with(name));
+        return is_command.then(|| value.or(next)).flatten();
+    }
+    let cluster = token.strip_prefix('-')?;
+    for (at, c) in cluster.char_indices() {
+        match c {
+            'c' => {
+                let rest = &cluster[at + 1..];
+                return if rest.is_empty() { next } else { Some(rest) };
+            }
+            'g' | 'G' | 's' | 'w' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The command string a `git` option carries, for the options that RUN one.
+/// Long options match any unique prefix of 3+ characters (git's own parser
+/// accepts `--exe`, `--upload-pac`), attached (`=`) or separate. Short: the
+/// global `-c key=VALUE`, `rebase -x`, `clone -u` — alone, or at the end of a
+/// cluster with the value attached (`-x'cat .env'`, `-mx…`).
+fn git_command_option_value<'a>(
+    sub: Option<&str>,
+    token: &'a str,
+    next: Option<&'a str>,
+) -> Option<&'a str> {
+    if token == "-c" {
+        return next.and_then(|v| v.split_once('=')).map(|(_, v)| v);
+    }
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, value) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        let runs = name.len() >= 3
+            && ["exec", "upload-pack", "receive-pack"]
+                .iter()
+                .any(|f| f.starts_with(name));
+        return runs.then(|| value.or(next)).flatten();
+    }
+    let cluster = token.strip_prefix('-')?;
+    let target = match sub? {
+        "rebase" => 'x',
+        "clone" => 'u',
+        _ => return None,
+    };
+    for (at, c) in cluster.char_indices() {
+        if c == target {
+            let rest = &cluster[at + 1..];
+            return if rest.is_empty() { next } else { Some(rest) };
+        }
+        if git_valued_short(sub?).contains(&c) {
+            return None;
+        }
+    }
+    None
+}
+
+/// One segment's own operands — [`segment_env_reads`] without the nested
+/// re-scan.
+fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String, String)> {
+    let plain_jq_pipeline = context.plain_jq_pipeline;
+    let Some((cmd_word, argv)) = resolve_command(tokens) else {
         return Vec::new();
     };
     // `find` is metadata-safe on its own (`find . -name .env`), but an
@@ -327,7 +811,26 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
     if cmd_word == "forgectl" && tokens.first().is_some_and(|head| head == "forgectl") {
         return forgectl_env_leak(argv);
     }
-    if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
+    // `git` keeps its metadata-only exemption only for the subcommands that
+    // earn it ([`git_keeps_exemption`], #850); every other shape falls through
+    // to the full operand scan. Even an exempt `git` segment is refused an
+    // input redirection from a secret file — `git column <.env` and
+    // `git stripspace <.env` print their stdin, and the shell opens that file
+    // whatever the subcommand.
+    if cmd_word == "git" {
+        // A `GIT_*` assignment in front of this `git` (or anywhere in the
+        // command) can make it run anything (#850 delta review I6).
+        let git_env = context.git_env_rebound
+            || tokens
+                .iter()
+                .any(|t| is_assignment_word(t) && t.starts_with("GIT_"));
+        if !git_env && git_keeps_exemption(&argv[1..]) {
+            return secret_input_redirections(argv)
+                .into_iter()
+                .map(|value| (cmd_word.to_string(), value.to_string()))
+                .collect();
+        }
+    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -349,12 +852,424 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
         (cmd_word == "jq" && plain_jq_pipeline && tokens.first().is_some_and(|head| head == "jq"))
             .then(|| jq_filter_index(argv))
             .flatten();
+    // `busybox dd`/`toybox dd` run the applet named by their first operand.
+    let dd_like = DD_COMMANDS.contains(&cmd_word.as_ref())
+        || (matches!(cmd_word.as_ref(), "busybox" | "toybox")
+            && argv
+                .get(1)
+                .is_some_and(|applet| command_word(applet) == "dd"));
     argv.iter()
         .enumerate()
         .filter(|(i, _)| Some(*i) != jq_filter)
-        .filter_map(|(_, t)| dangerous_secret_operand(t, position))
+        .filter_map(|(_, t)| {
+            // `dd` names its input as `if=FILE` — one token whose basename
+            // split sees `if=.env`, which matches no secret pattern (#850).
+            // Peeled for `dd` alone: a generic `KEY=value` split would block
+            // every path-valued assignment (`make ENV=.env`, `export F=.env`),
+            // the #771 false-block class. dd reads that operand, so it is a
+            // known filename.
+            if dd_like && let Some(input) = t.strip_prefix("if=") {
+                return dangerous_secret_operand(input, Filename::Known);
+            }
+            // A non-exempt `git` names files through attached option values
+            // too: `git commit --file=.env` echoes the file's first line as
+            // the commit subject, `git config --file=.env --list` prints it.
+            if cmd_word == "git" {
+                let attached = t
+                    .strip_prefix("--")
+                    .and_then(|long| long.split_once('='))
+                    .map(|(_, value)| value)
+                    .or_else(|| t.strip_prefix("-F").filter(|v| !v.is_empty()));
+                if let Some(value) =
+                    attached.and_then(|v| dangerous_secret_operand(v, Filename::Known))
+                {
+                    return Some(value);
+                }
+            }
+            dangerous_secret_operand(t, position)
+        })
         .map(|value| (cmd_word.to_string(), value.to_string()))
         .collect()
+}
+
+/// Heads that take dd's `if=FILE` operand grammar: GNU `dd`, the Homebrew
+/// `gdd` spelling, and the forensic forks `dcfldd` and `dc3dd`.
+const DD_COMMANDS: &[&str] = &["dd", "gdd", "dcfldd", "dc3dd"];
+
+/// `git` subcommands that keep the metadata-only exemption (#850). An
+/// ALLOWLIST, because the denylist it replaced was the wrong structure: the
+/// first cut named `diff` and `stripspace`, and review found `column`,
+/// `interpret-trailers`, `merge-file -p`, `config -f .env --list`,
+/// `grep --untracked`, and alias expansion printing the same file. Git has
+/// too many content-emitting subcommands, plus user aliases, to enumerate.
+///
+/// Every listed subcommand stages, moves, deletes, or names files, or reports
+/// repository state, without printing a working-tree file's bytes. Losing the
+/// exemption costs nothing unless the segment also carries a secret-file
+/// operand, which is the only thing the fall-through scan can block on.
+const GIT_METADATA_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "rm",
+    "mv",
+    "status",
+    "check-ignore",
+    "check-attr",
+    "ls-files",
+    "ls-tree",
+    "restore",
+    "checkout",
+    "switch",
+    "commit",
+    "stash",
+    "branch",
+    "fetch",
+    "push",
+    "pull",
+    "clone",
+    "init",
+    "merge",
+    "rebase",
+    "reset",
+    "revert",
+    "cherry-pick",
+    "clean",
+    "rev-parse",
+    "rev-list",
+    "remote",
+    "worktree",
+    "tag",
+    "describe",
+    "reflog",
+    "update-index",
+    "filter-repo",
+];
+
+/// `log`/`show`/`diff`/`whatchanged` keep the exemption only in a names-only
+/// form: one of these flags present, and no patch flag.
+const GIT_NAMES_ONLY_FLAGS: &[&str] = &[
+    "--stat",
+    "--name-only",
+    "--name-status",
+    "--numstat",
+    "--shortstat",
+];
+
+/// Long flags (names after `--`, matched as prefixes) that print or imply a
+/// patch, or read a file into the command.
+const GIT_PATCH_LONG_FLAGS: &[&str] = &[
+    "patch",
+    "unified",
+    "word-diff",
+    "color-words",
+    "function-context",
+    "cc",
+    "combined",
+    "binary",
+];
+
+/// Long flags that read a file into the command or run one (#850 delta
+/// review I5/I6), matched as prefixes of the option name.
+const GIT_FILE_OR_EXEC_LONG_FLAGS: &[&str] = &[
+    "file",
+    "template",
+    "exec",
+    "upload-pack",
+    "receive-pack",
+    "no-index",
+];
+
+/// Short options whose VALUE is attached in the same token (`-mmsg`,
+/// `-S<string>`, `-n5`). A cluster is read up to the first of these and no
+/// further, so letters inside a value (`-m"prod fix"`) are not flags.
+///
+/// Per subcommand (#850 delta review I-c): `rebase`'s `-m` and `-i` take NO
+/// value, so `-mx'cat .env'` is `-m -x 'cat .env'` there, and reading `m` as
+/// valued hid the `-x`.
+fn git_valued_short(sub: &str) -> &'static [char] {
+    match sub {
+        "rebase" => &['s', 'X', 'C'],
+        _ => &[
+            'm', 'S', 'G', 'C', 'n', 'O', 'o', 'j', 'b', 'B', 'M', 'R', 'i', 'I',
+        ],
+    }
+}
+
+/// `log`/`whatchanged` long options known to print only commit metadata or
+/// names (#850 delta review I-b). An ALLOWLIST: `--dd`, `--remerge-diff`, and
+/// whatever git adds next print content, so any long option not here drops
+/// the exemption. Matched exactly (before any `=`), never by prefix.
+const GIT_LOG_SAFE_LONG: &[&str] = &[
+    "oneline",
+    "format",
+    "pretty",
+    "all",
+    "full-history",
+    "follow",
+    "since",
+    "until",
+    "after",
+    "before",
+    "author",
+    "committer",
+    "grep",
+    "stat",
+    "name-only",
+    "name-status",
+    "numstat",
+    "shortstat",
+    "graph",
+    "decorate",
+    "no-decorate",
+    "reverse",
+    "date",
+    "relative-date",
+    "abbrev-commit",
+    "no-merges",
+    "merges",
+    "first-parent",
+    "max-count",
+    "skip",
+    "branches",
+    "tags",
+    "remotes",
+    "topo-order",
+    "date-order",
+    "color",
+    "no-color",
+    "no-walk",
+    "diff-filter",
+    "summary",
+    "left-right",
+    "cherry-pick",
+    "regexp-ignore-case",
+    "all-match",
+    "invert-grep",
+    "parents",
+    "boundary",
+    "abbrev",
+    "show-signature",
+    "use-mailmap",
+];
+
+/// Is every option of this `log`/`whatchanged` argv on the metadata
+/// allowlist? Short options allowed: `-n<N>`/`-<N>`, `-S<s>`, `-G<re>`;
+/// non-option words (revs, paths, option values) and `--` pass.
+fn git_log_flags_safe(operands: &[String]) -> bool {
+    operands.iter().all(|t| {
+        if !t.starts_with('-') || t == "--" {
+            return true;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            return GIT_LOG_SAFE_LONG.contains(&name);
+        }
+        let short = &t[1..];
+        short == "i"
+            || short.chars().all(|c| c.is_ascii_digit())
+            || short.starts_with(['n', 'S', 'G'])
+    })
+}
+
+/// Does long option `name` select `flag`? Exactly, as an extension of it
+/// (`--patch-with-stat`), or as a unique prefix of 3+ characters, which git's
+/// option parser accepts (`--fil`, `--patc`, `--exe`) (#850 delta review
+/// I-c). `--color` is a complete option in its own right, never an
+/// abbreviation of `--color-words`.
+fn git_long_selects(name: &str, flag: &str) -> bool {
+    name.starts_with(flag) || (name.len() >= 3 && flag.starts_with(name) && name != "color")
+}
+
+/// Does this `git` argv (the tokens AFTER the verb) keep the metadata-only
+/// exemption? An allowlist at every level, failing CLOSED on doubt:
+///
+/// - a global option [`skip_git_global_options`] cannot classify, no
+///   subcommand, or ANY global `-c`/`--config-env` (a pager, editor, alias,
+///   or hook can run a command) (#850 delta review I6);
+/// - `show`/`diff` only in a names-only form ([`GIT_NAMES_ONLY_FLAGS`]);
+///   `log`/`whatchanged` without a patch flag; otherwise only a
+///   [`GIT_METADATA_SUBCOMMANDS`] entry;
+/// - no disqualifying option ([`git_option_disqualifies`]).
+fn git_keeps_exemption(args: &[String]) -> bool {
+    let rest = skip_git_global_options(args);
+    let globals = &args[..args.len() - rest.len()];
+    if globals
+        .iter()
+        .any(|t| t.starts_with("-c") || t.starts_with("--config-env"))
+    {
+        return false;
+    }
+    let Some((sub, operands)) = rest.split_first() else {
+        return false;
+    };
+    let sub = sub.as_str();
+    let known = match sub {
+        "show" | "diff" => git_names_only(operands),
+        "log" | "whatchanged" => git_log_flags_safe(operands),
+        s => GIT_METADATA_SUBCOMMANDS.contains(&s),
+    };
+    known && !operands.iter().any(|t| git_option_disqualifies(sub, t))
+}
+
+fn git_names_only(operands: &[String]) -> bool {
+    operands
+        .iter()
+        .any(|t| GIT_NAMES_ONLY_FLAGS.contains(&t.split('=').next().unwrap_or(t)))
+}
+
+/// Does option `t` of `git <sub>` print file content or run a command?
+///
+/// Short flags are subcommand-scoped (#850 delta review I5/I8): `p` (patch)
+/// and `F` (message file) everywhere; `u`/`U`/`W`/`c`/`L` only for the
+/// diff family, so `git commit -c HEAD` keeps its exemption; `v` for
+/// `status`/`commit` (the verbose diff); `t` (template) for `commit`; `x`
+/// for `rebase`; `u` (upload-pack) for `clone`.
+fn git_option_disqualifies(sub: &str, t: &str) -> bool {
+    if !t.starts_with('-') || t == "-" || t == "--" {
+        return false;
+    }
+    let diff_family = matches!(sub, "log" | "show" | "diff" | "whatchanged");
+    if let Some(long) = t.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return GIT_PATCH_LONG_FLAGS
+            .iter()
+            .any(|f| git_long_selects(name, f))
+            || GIT_FILE_OR_EXEC_LONG_FLAGS
+                .iter()
+                .any(|f| git_long_selects(name, f))
+            || (matches!(sub, "status" | "commit") && git_long_selects(name, "verbose"))
+            || (sub == "filter-repo" && name.contains("callback"));
+    }
+    let mut bad = vec!['p', 'F'];
+    if diff_family {
+        bad.extend(['u', 'U', 'W', 'c', 'L']);
+    }
+    match sub {
+        "status" => bad.push('v'),
+        "commit" => bad.extend(['v', 't']),
+        "rebase" => bad.push('x'),
+        "clone" => bad.push('u'),
+        _ => {}
+    }
+    for c in t[1..].chars() {
+        if bad.contains(&c) {
+            return true;
+        }
+        if git_valued_short(sub).contains(&c) {
+            break;
+        }
+    }
+    false
+}
+
+/// Does `git stash show` in this argv carry a patch flag?
+fn git_stash_show_patched(operands: &[String]) -> bool {
+    operands.first().is_some_and(|op| op == "show")
+        && operands[1..].iter().any(|t| {
+            t.strip_prefix("--").is_some_and(|name| {
+                git_long_selects(name.split('=').next().unwrap_or(name), "patch")
+            }) || (t.starts_with('-') && !t.starts_with("--") && t.contains('p'))
+        })
+}
+
+/// Does this `git` argv print UNTRACKED file content — where a `.env` lives —
+/// without naming any file (#850 delta review I-e/I-f)? Blocked outright,
+/// since no operand ever names the secret:
+///
+/// - `stash show` with a patch flag and untracked content switched on, by
+///   `-u`/`--include-untracked`/`--only-untracked`, a `-c
+///   stash.showIncludeUntracked`, or that config set anywhere in the command
+///   (`untracked_config`);
+/// - `show`/`diff` of a stash's untracked-files commit (`stash@{0}^3`);
+/// - `grep --untracked --no-exclude-standard`, which searches ignored files.
+///
+/// Residual: `stash.showIncludeUntracked` set in an EARLIER tool call makes a
+/// plain `git stash show -p` print them, and is not seen.
+fn git_prints_untracked_content(args: &[String], untracked_config: bool) -> bool {
+    let rest = skip_git_global_options(args);
+    let Some((sub, operands)) = rest.split_first() else {
+        return false;
+    };
+    match sub.as_str() {
+        "stash" => {
+            git_stash_show_patched(operands)
+                && (untracked_config
+                    || operands[1..].iter().any(|t| {
+                        t.starts_with("--include-untracked")
+                            || t.starts_with("--only-untracked")
+                            || (t.starts_with('-') && !t.starts_with("--") && t.contains('u'))
+                    }))
+        }
+        "show" | "diff" => operands
+            .iter()
+            .any(|t| t.contains("stash") && t.contains("^3")),
+        "grep" => {
+            operands.iter().any(|t| t == "--untracked")
+                && operands.iter().any(|t| t == "--no-exclude-standard")
+        }
+        _ => false,
+    }
+}
+
+/// Does this `git` argv (tokens AFTER the verb) print file CONTENT from the
+/// index, a stash, the history, or the work tree — whatever its operands
+/// name? (#850 delta review I7, I-b, I-e, I-f.)
+fn git_prints_content(args: &[String]) -> bool {
+    let rest = skip_git_global_options(args);
+    let Some((sub, operands)) = rest.split_first() else {
+        return false;
+    };
+    let sub = sub.as_str();
+    let patched = |family: &str| operands.iter().any(|t| git_option_disqualifies(family, t));
+    match sub {
+        "diff" | "show" => {
+            !git_names_only(operands)
+                || patched(sub)
+                || operands
+                    .iter()
+                    .any(|t| t.contains("stash") && t.contains("^3"))
+        }
+        "log" | "whatchanged" => !git_log_flags_safe(operands) || patched(sub),
+        "stash" => git_stash_show_patched(operands),
+        "status" => patched("status"),
+        "grep" | "cat-file" | "format-patch" | "archive" | "blame" | "annotate" => true,
+        "checkout-index" => operands.iter().any(|t| t == "--stdout"),
+        "merge-file" => operands.iter().any(|t| {
+            t == "-p"
+                || t == "--stdout"
+                || (t.starts_with('-') && !t.starts_with("--") && t.contains('p'))
+        }),
+        _ => false,
+    }
+}
+
+/// Every secret file an INPUT redirection in `tokens` opens — `< .env`,
+/// `<.env`, `0<.env`, `<> .env`, `{fd}<.env`. The shell opens these whatever
+/// the command is, so they are judged even where the command is exempt.
+fn secret_input_redirections(tokens: &[String]) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = tokens.iter();
+    while let Some(token) = rest.next() {
+        match redirection_of(token) {
+            Some(true) => {
+                let op = strip_fd_prefix(token);
+                if matches!(op, "<" | "<>")
+                    && let Some(target) = rest.next()
+                    && let Some(value) = dangerous_secret_operand(target, Filename::Known)
+                {
+                    found.push(value);
+                }
+            }
+            Some(false) => {
+                if let Some(target) = attached_input_redirection_target(token)
+                    && let Some(value) = dangerous_secret_operand(target, Filename::Known)
+                {
+                    found.push(value);
+                }
+            }
+            None => {}
+        }
+    }
+    found
 }
 
 /// Heads a command may use anywhere and still let the jq filter exemption
@@ -673,13 +1588,19 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// The upgrade trigger is a legitimate new value-free reader being blocked.
 fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
     let exempt = exempt_file_operands(tokens);
-    tokens[1..]
+    tokens
         .iter()
-        // The exemption is matched on the RAW token, before any redirection
-        // peel: `--file .env` exempts the operand `.env`, never a `<.env` that
-        // happens to peel to the same name. A peel-then-compare would let a
-        // shell-opened read inherit the exemption written for a forgectl one.
-        .filter(|t| !exempt.contains(&t.as_str()))
+        .enumerate()
+        .skip(1)
+        // The exemption is matched by ARGV INDEX (#1053), never by value. A
+        // value test exempted every copy of the string: in
+        // `forgectl env keys --file .env .env` the second `.env` sits where
+        // forgectl never audited it, and a `<.env` redirection could inherit
+        // an exemption written for a forgectl-opened file. Only the exact
+        // `--file` value position is skipped, the way `jq_filter_index` does
+        // it for #947.
+        .filter(|(i, _)| !exempt.contains(i))
+        .map(|(_, t)| t)
         // NOT vouched: these operands are a mix of flags and values, and an
         // attached `--file=.env` is a flag, not a file named `.env` — vouching
         // here turned the ordinary `forgectl env keys --file=.env` into a
@@ -698,7 +1619,7 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
 /// group, an unaudited `env` subcommand, no subcommand at all, or a redirection
 /// whose target is itself a secret file) exempts nothing and lets the standard
 /// scan judge every operand.
-fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
+fn exempt_file_operands(tokens: &[String]) -> Vec<usize> {
     // A redirection whose TARGET IS A SECRET FILE means the shell, not
     // `forgectl`, decides what is read or written — nothing about the audited
     // subcommand covers that. `set` reads stdin, so
@@ -757,23 +1678,24 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
     }
 
     let mut exempt = Vec::new();
-    let mut rest = &tokens[1..];
-    while let Some(token) = rest.first() {
+    for (i, token) in tokens.iter().enumerate().skip(1) {
+        // The index of the token that CARRIES the value: the flag token itself
+        // when attached (`--file=.env`), the next token when separate.
         let value = token
             .strip_prefix("--file=")
             .or_else(|| token.strip_prefix("-f="))
+            .map(|v| (i, v))
             .or_else(|| {
                 if token == "--file" || token == "-f" {
-                    rest.get(1).map(String::as_str)
+                    tokens.get(i + 1).map(|v| (i + 1, v.as_str()))
                 } else {
                     None
                 }
             });
         // The shape gate: only a dotenv-shaped file is one the audit covers.
-        if let Some(value) = value.filter(|v| is_forgectl_env_file(v)) {
-            exempt.push(value);
+        if let Some((index, _)) = value.filter(|(_, v)| is_forgectl_env_file(v)) {
+            exempt.push(index);
         }
-        rest = &rest[1..];
     }
     exempt
 }
@@ -895,7 +1817,7 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
     if redirection_of(token) != Some(false) {
         return None;
     }
-    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = strip_fd_prefix(token);
     let rest = rest.strip_prefix('&').unwrap_or(rest);
     let operator_len = rest.chars().take_while(|c| matches!(c, '>' | '<')).count();
     if !matches!(&rest[..operator_len], "<" | "<>") {
@@ -914,10 +1836,413 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 /// firewall described on [`segment_env_reads`]: quoted prose stays glued into
 /// one token by [`tokenize`] and is skipped, while a quoted filename stays a
 /// clean single token and is caught.
+///
+/// **A command substitution is the one whitespace-bearing token that is
+/// resolved rather than skipped** (#815). `cat "$(echo .env)"` keeps the
+/// substitution one token, so the firewall skipped it, and the inner
+/// `echo .env` segment is metadata-safe — two safe rules composed into an
+/// allow of a real read. [`substitution_operand_is_secret`] classifies what
+/// the substitution can be shown to produce; anything else keeps the firewall.
 fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
     let value = attached_input_redirection_target(token).unwrap_or(token);
-    (!value.chars().any(char::is_whitespace) && is_dangerous_secret_token_at(value, position))
-        .then_some(value)
+    // A backtick routes through the substitution check even without
+    // whitespace: an unquoted `` cat `echo .env` `` tokenizes into
+    // `` `echo `` and `` .env` ``, and the second is a broken span whose raw
+    // text names the secret (#815 delta review I4).
+    let has_backtick = value.contains('`');
+    if value.chars().any(char::is_whitespace) || has_backtick {
+        // A substitution the shell will not expand (single quotes, a quoted
+        // heredoc body) is literal text: the whitespace firewall applies, and
+        // a backtick is just a character (#815 delta review I-a).
+        if !SUBSTITUTIONS_LIVE.with(std::cell::Cell::get) {
+            return (!value.chars().any(char::is_whitespace)
+                && is_dangerous_secret_token_at(value, position))
+            .then_some(value);
+        }
+        return substitution_operand_is_secret(value, position).then_some(value);
+    }
+    is_dangerous_secret_token_at(value, position).then_some(value)
+}
+
+/// Byte ranges of each top-level `$(…)` / backtick substitution in `word`, as
+/// `(open, body_start, body_end, close_end)`, or `None` when one never closes.
+/// Scanned as bytes, and every boundary it reports sits on an ASCII delimiter,
+/// so slicing `word` at one can never split a multi-byte character.
+fn substitution_spans(word: &str) -> Option<Vec<(usize, usize, usize, usize)>> {
+    // Quote-aware first: a `)` inside `'…'` or `"…"` in a body does not close
+    // it (`"$(echo ')' >/dev/null; echo .env)"`, #815 delta review I3). Prose
+    // bodies with a stray apostrophe can defeat that reading, so the plain
+    // paren count is the second opinion; only when both fail is the word
+    // unbalanced.
+    scan_substitutions(word, true).or_else(|| scan_substitutions(word, false))
+}
+
+/// One pass of [`substitution_spans`]. Backslash escapes are skipped in both
+/// modes, and a backtick span closes only at an UNESCAPED backtick.
+fn scan_substitutions(word: &str, quote_aware: bool) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let bytes = word.as_bytes();
+    let skip_backtick = |from: usize| -> Option<usize> {
+        let mut j = from;
+        loop {
+            match bytes.get(j)? {
+                b'\\' => j += 2,
+                b'`' => return Some(j),
+                _ => j += 1,
+            }
+        }
+    };
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == b'`' {
+            let close = skip_backtick(i + 1)?;
+            spans.push((i, i + 1, close, close + 1));
+            i = close + 1;
+        } else if bytes[i..].starts_with(b"$(") {
+            // One `in_dq` flag per open paren: a `$(` inside double quotes
+            // starts a fresh, unquoted context, as in bash.
+            let mut levels = vec![false];
+            let mut j = i + 2;
+            while let Some(&in_dq) = levels.last() {
+                match *bytes.get(j)? {
+                    b'\\' => {
+                        j += 2;
+                        continue;
+                    }
+                    b'`' => j = skip_backtick(j + 1)?,
+                    b'\'' if quote_aware && !in_dq => {
+                        j += 1 + bytes[j + 1..].iter().position(|&b| b == b'\'')?;
+                    }
+                    b'"' if quote_aware => {
+                        if let Some(level) = levels.last_mut() {
+                            *level = !*level;
+                        }
+                    }
+                    b'$' if bytes.get(j + 1) == Some(&b'(') => {
+                        levels.push(false);
+                        j += 2;
+                        continue;
+                    }
+                    b'(' if !in_dq => levels.push(false),
+                    b')' if !in_dq => {
+                        levels.pop();
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            spans.push((i, i + 2, j - 1, j));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Some(spans)
+}
+
+/// A span's body as the shell runs it. A backtick body un-escapes `` \` ``
+/// and `\\` first — that is how `` `echo \`echo .env\`` `` nests.
+fn span_body(
+    word: &str,
+    (open, body_start, body_end, _): (usize, usize, usize, usize),
+) -> Cow<'_, str> {
+    let body = &word[body_start..body_end];
+    if word.as_bytes()[open] == b'`' && body.contains('\\') {
+        Cow::Owned(body.replace("\\`", "`").replace("\\\\", "\\"))
+    } else {
+        Cow::Borrowed(body)
+    }
+}
+
+/// Fail-CLOSED judgment for text the resolver cannot pin down (an unbalanced
+/// word, a nesting past the depth cap): split on every shell delimiter and
+/// block if any piece names a secret (#815 delta review). Linear.
+fn rough_secret(text: &str, position: Filename) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '('
+                    | ')'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '\''
+                    | '"'
+                    | '$'
+                    | '\\'
+                    | '{'
+                    | '}'
+                    | '='
+            )
+    })
+    .filter(|piece| !piece.is_empty() && !piece.starts_with('-'))
+    .any(|piece| is_dangerous_secret_token_at(piece, position))
+}
+
+/// Longest word [`substitution_operand_is_secret`] resolves. Past it, only the
+/// literal tail is judged — resolution builds candidate strings, and an
+/// unbounded word made that quadratic (a 100k-argument `echo` took minutes).
+const SUBSTITUTION_WORD_LIMIT: usize = 8 * 1024;
+/// Most substitutions in one word that are resolved together.
+const SUBSTITUTION_SPAN_LIMIT: usize = 16;
+/// Most outputs one substitution contributes before its outputs are judged
+/// one by one instead of combined with the rest of the word.
+const SUBSTITUTION_OUTPUT_LIMIT: usize = 32;
+/// Most combined candidates built for one word.
+const SUBSTITUTION_CANDIDATE_LIMIT: usize = 256;
+/// Stand-in for a substitution whose output cannot be read from the text.
+const UNKNOWN_OUTPUT: &str = "sub";
+
+/// Metadata-safe heads whose stdout is (a form of) their own operands —
+/// `$(realpath .env)` prints a path ending in `.env`. Judged as echoing each
+/// non-flag operand (#815 review).
+const OPERAND_ECHOING_HEADS: &[&str] =
+    &["ls", "find", "realpath", "readlink", "basename", "dirname"];
+
+/// Does a whitespace-bearing operand holding a command substitution resolve to
+/// a secret file (#815)?
+///
+/// The word is split into its literal pieces and its top-level substitutions.
+/// **If any literal piece carries whitespace, the word is prose** — the
+/// firewall's original reason — and nothing is resolved: a quoted title like
+/// `"fix $(date) .env handling"` stays allowed. Otherwise the word is
+/// path-shaped, and each substitution is replaced by what it can be shown to
+/// print ([`substitution_outputs`]), or by a placeholder when it cannot. Every
+/// combination is classified, so `"$(pwd)/$(echo .env)"`,
+/// `"$(echo .env)$(true)"`, and `"$(echo .e)nv"` all resolve.
+///
+/// Fails CLOSED on what it cannot resolve: an unterminated substitution, or a
+/// word past [`SUBSTITUTION_WORD_LIMIT`], is judged on its literal tail alone
+/// ([`secret_shaped_tail`]), so `"$(echo "(")/.env"` still blocks.
+///
+/// A PR body written as `"$(cat <<'EOF' … EOF)"` is untouched: `cat` has no
+/// readable output, so the word resolves to the placeholder and nothing else.
+fn substitution_operand_is_secret(word: &str, position: Filename) -> bool {
+    if !(word.contains("$(") || word.contains('`')) {
+        return false;
+    }
+    if word.len() > SUBSTITUTION_WORD_LIMIT {
+        return secret_shaped_tail(word, position);
+    }
+    // A heredoc body is data, and its prose (`doesn't`, a lone `(`) is what
+    // unbalances the span scan into the fail-closed path. Stripped first; the
+    // stripper keeps any body line that carries its own substitution, and
+    // keeps everything when the terminator is not found.
+    let stripped;
+    let word = if word.contains("<<") {
+        stripped = strip_heredoc_bodies(word);
+        stripped.as_str()
+    } else {
+        word
+    };
+    let Some(spans) = substitution_spans(word) else {
+        return rough_secret(word, position);
+    };
+    if spans.len() > SUBSTITUTION_SPAN_LIMIT {
+        // Too many to combine: judge each substitution's outputs alone, and
+        // the literal tail (#815 delta review I2).
+        return secret_shaped_tail(word, position)
+            || spans.iter().any(|&span| {
+                substitution_outputs(&span_body(word, span), 0)
+                    .iter()
+                    .any(|output| rough_secret(output, position))
+            });
+    }
+    let mut literals = Vec::with_capacity(spans.len() + 1);
+    let mut at = 0;
+    for &(open, _, _, close_end) in &spans {
+        literals.push(&word[at..open]);
+        at = close_end;
+    }
+    literals.push(&word[at..]);
+    if literals.iter().any(|l| l.chars().any(char::is_whitespace)) {
+        return false;
+    }
+    let outputs: Vec<Vec<String>> = spans
+        .iter()
+        .map(|&span| substitution_outputs(&span_body(word, span), 0))
+        .collect();
+    word_candidates(&literals, &outputs)
+        .iter()
+        .any(|candidate| is_dangerous_secret_token_at(candidate, position))
+}
+
+/// Every word `literals` interleaved with one output per substitution can
+/// spell, bounded. Over [`SUBSTITUTION_CANDIDATE_LIMIT`] combinations, each
+/// substitution varies alone with the others at their placeholder; a
+/// substitution with too many outputs to combine contributes each output on
+/// its own, joined to nothing, so a secret-shaped output is still seen.
+fn word_candidates(literals: &[&str], outputs: &[Vec<String>]) -> Vec<String> {
+    let build = |choice: &dyn Fn(usize) -> String| {
+        let mut word = String::from(literals[0]);
+        for (k, literal) in literals[1..].iter().enumerate() {
+            word.push_str(&choice(k));
+            word.push_str(literal);
+        }
+        word
+    };
+    let mut candidates = Vec::new();
+    let combinable: Vec<bool> = outputs
+        .iter()
+        .map(|o| {
+            if o.len() > SUBSTITUTION_OUTPUT_LIMIT {
+                candidates.extend(o.iter().cloned());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let pick = |k: usize, i: usize| -> String {
+        if combinable[k] {
+            outputs[k][i].clone()
+        } else {
+            UNKNOWN_OUTPUT.to_string()
+        }
+    };
+    let product = outputs
+        .iter()
+        .zip(&combinable)
+        .try_fold(1usize, |acc, (o, &c)| {
+            acc.checked_mul(if c { o.len() } else { 1 })
+                .filter(|n| *n <= SUBSTITUTION_CANDIDATE_LIMIT)
+        });
+    if product.is_some() {
+        let mut index = vec![0usize; outputs.len()];
+        loop {
+            candidates.push(build(&|k| pick(k, index[k])));
+            let Some(k) =
+                (0..outputs.len()).find(|&k| combinable[k] && index[k] + 1 < outputs[k].len())
+            else {
+                break;
+            };
+            index[k] += 1;
+            index[..k].iter_mut().for_each(|i| *i = 0);
+        }
+    } else {
+        for k in (0..outputs.len()).filter(|&k| combinable[k]) {
+            for i in 0..outputs[k].len() {
+                candidates.push(build(&|j| {
+                    if j == k {
+                        pick(k, i)
+                    } else {
+                        UNKNOWN_OUTPUT.to_string()
+                    }
+                }));
+            }
+        }
+    }
+    candidates
+}
+
+/// What a substitution body can be shown to print — one entry per possible
+/// output, never empty. A body the resolver cannot read yields the
+/// [`UNKNOWN_OUTPUT`] placeholder, so the word around it is still judged.
+///
+/// Resolved: `echo` (its operands joined by a space — a quoted multi-argument
+/// `echo` is ONE word, so `"$(echo see .env docs)"` is prose, not a path);
+/// `printf` (its format, each argument, and their concatenation, which covers
+/// `printf %s .env`); `true`/`false`/`:` (nothing); and the
+/// [`OPERAND_ECHOING_HEADS`] (each non-flag operand). Wrapper prefixes are
+/// peeled (`command echo .env`), every `;`/`&&` segment contributes
+/// (`echo .env; true`), and a nested substitution is expanded into its body
+/// first (`` $(echo `echo .env`) ``).
+fn substitution_outputs(body: &str, depth: usize) -> Vec<String> {
+    let unknown = || vec![UNKNOWN_OUTPUT.to_string()];
+    // Past the caps, over-approximate instead of giving up: every word of the
+    // body is a possible output (#815 delta review I1 — five nested
+    // `$(echo …)` resolved to the placeholder and allowed).
+    let rough = || {
+        let mut out: Vec<String> = body
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '`' | '(' | ')' | ';' | '\'' | '"' | '$')
+            })
+            .filter(|piece| !piece.is_empty() && !piece.starts_with('-'))
+            .map(str::to_string)
+            .collect();
+        out.push(UNKNOWN_OUTPUT.to_string());
+        out
+    };
+    if depth > 3 || body.len() > SUBSTITUTION_WORD_LIMIT {
+        return rough();
+    }
+    let Some(spans) = substitution_spans(body) else {
+        return rough();
+    };
+    if !spans.is_empty() {
+        if spans.len() > SUBSTITUTION_SPAN_LIMIT {
+            return rough();
+        }
+        let mut literals = Vec::with_capacity(spans.len() + 1);
+        let mut at = 0;
+        for &(open, _, _, close_end) in &spans {
+            literals.push(&body[at..open]);
+            at = close_end;
+        }
+        literals.push(&body[at..]);
+        let inner: Vec<Vec<String>> = spans
+            .iter()
+            .map(|&span| substitution_outputs(&span_body(body, span), depth + 1))
+            .collect();
+        let mut out: Vec<String> = word_candidates(&literals, &inner)
+            .iter()
+            .flat_map(|expanded| substitution_outputs(expanded, depth + 1))
+            .collect();
+        out.dedup();
+        return out;
+    }
+    let mut out = Vec::new();
+    for segment in split_segments(body) {
+        let tokens = tokenize(&segment);
+        let Some((word, argv)) = resolve_command(&tokens) else {
+            continue;
+        };
+        let operands: Vec<&str> = argv
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .filter(|t| !t.starts_with('-'))
+            .collect();
+        match word.as_ref() {
+            "echo" => out.push(operands.join(" ")),
+            "printf" => {
+                out.extend(operands.iter().map(|t| t.to_string()));
+                out.push(operands.iter().skip(1).copied().collect());
+            }
+            "true" | "false" | ":" => out.push(String::new()),
+            // `dirname a/.env/x` prints `a/.env`: the parent, not the operand.
+            "dirname" if !operands.is_empty() => out.extend(operands.iter().map(|t| {
+                t.trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map_or(".", |(parent, _)| parent)
+                    .to_string()
+            })),
+            w if OPERAND_ECHOING_HEADS.contains(&w) && !operands.is_empty() => {
+                out.extend(operands.iter().map(|t| t.to_string()));
+            }
+            _ => out.push(UNKNOWN_OUTPUT.to_string()),
+        }
+    }
+    if out.is_empty() {
+        return unknown();
+    }
+    out
+}
+
+/// Fail-closed judgment of a word the resolver will not expand: the text after
+/// its last substitution delimiter or whitespace, placed behind a placeholder,
+/// so a `…)/.env` tail still classifies as the `.env` it names.
+fn secret_shaped_tail(word: &str, position: Filename) -> bool {
+    let tail = word
+        .rsplit(|c: char| c == ')' || c == '`' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    !tail.is_empty() && is_dangerous_secret_token_at(&format!("{UNKNOWN_OUTPUT}{tail}"), position)
 }
 
 /// Commands whose every non-flag operand is a FILE THEY READ — nothing else.
@@ -962,6 +2287,24 @@ const PURE_FILE_READERS: &[&str] = &[
     "rev",
 ];
 
+/// `token` with a redirection's descriptor prefix removed: a decimal fd
+/// (`2>`, `10<`) or bash's named-fd form (`{fd}>`, `{log}<`), which allocates
+/// a descriptor and stores it in the variable (#832 review: `{fd}>/tmp/o cd /x`
+/// hid the `cd`). A `{…}` that is not a valid name is left alone — it is a
+/// brace group or literal, not a redirection prefix.
+fn strip_fd_prefix(token: &str) -> &str {
+    if let Some(inner) = token.strip_prefix('{')
+        && let Some((name, rest)) = inner.split_once('}')
+        && !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && rest.starts_with(['>', '<'])
+    {
+        return rest;
+    }
+    token.trim_start_matches(|c: char| c.is_ascii_digit())
+}
+
 /// Is `token` a redirection, and if so does its target live in the NEXT token?
 ///
 /// `Some(true)` for a bare operator (`>`, `>>`, `2>`, `&>`, `<`, `<<<`, `>&`),
@@ -971,7 +2314,7 @@ const PURE_FILE_READERS: &[&str] = &[
 fn redirection_of(token: &str) -> Option<bool> {
     // Strip an fd prefix (`2>`, `1>&2`) and an `&` prefix (`&>`) before looking
     // for the redirection character itself.
-    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = strip_fd_prefix(token);
     let rest = rest.strip_prefix('&').unwrap_or(rest);
     if !(rest.starts_with('>') || rest.starts_with('<')) {
         return None;
@@ -1063,7 +2406,7 @@ fn redirection_file_targets(tokens: &[String]) -> Vec<&str> {
             // there it is the fd sigil this arm tests for, not punctuation to
             // discard.
             Some(false) => {
-                let target = token.trim_start_matches(|c: char| c.is_ascii_digit());
+                let target = strip_fd_prefix(token);
                 let target = target.strip_prefix('&').unwrap_or(target);
                 let target = target.trim_start_matches(['>', '<', '|']);
                 // Unreachable by construction — `redirection_of` returns
@@ -1349,12 +2692,12 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 /// too, so none is opened by #538; they are named because a reader who sees
 /// `command cd` fixed will otherwise assume `command -p cd` is:
 ///
-/// - A leading REDIRECTION parks itself in `argv[0]`, so `>/tmp/o cd /x` and
-///   `2>/dev/null cd /x` hide the verb. [`command_words`] already strips
-///   redirections for the dump arm ([`redirection_of`]); this scan does not
-///   compose that strip with [`executable_tokens`].
-/// - A WRAPPER'S OWN FLAG stops the peel one token short: `command -p cd /x`,
-///   `time -p cd /x`. The loop skips a `CD_WRAPPERS` word, not a flag behind it.
+/// - **RESOLVED (#832).** A leading REDIRECTION (`>/tmp/o cd /x`,
+///   `2>/dev/null cd /x`) is peeled like a wrapper word, and so is a
+///   wrapper's own flag (`command -p cd /x`, `time -p cd /x`). `sudo -D /x`
+///   and `sudo --chdir=/x` are a chdir by flag and are detected as one.
+///   `command if cd /x; then …; fi` was named alongside these and is not a
+///   miss: bash rejects it as a syntax error and runs nothing.
 /// - **RESOLVED (cadence-hooks#237 security review, F6).** A mid-word backslash
 ///   used to go unfolded: `command_word` stripped one LEADING backslash while
 ///   bash removes every unquoted one, so `c\d /x` was a `cd` the resolver read
@@ -1370,18 +2713,63 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 /// - `env -S 'cd /x; …'`, which the `-S` posture stops the walk on — measured,
 ///   it does not chdir on macOS anyway.
 ///
-/// The first three are closeable in this function alone and in the
-/// blocks-only direction; they are held back from #538 so each widening keeps
-/// its own differential, which is this file's standing rule.
 fn command_changes_directory(command: &str) -> bool {
+    // The runner search reads the RAW segments first, before wrapper
+    // expansion: `su - root -c 'cat .envrc'` and `sudo -D /x sh -c '…'` hand
+    // the read to a `-c` string that expansion splits into a segment of its
+    // own, away from the runner flag that moved it (#832 delta review C1).
+    if split_segments(command)
+        .iter()
+        .any(|segment| runner_changes_directory(&tokenize(segment)))
+    {
+        return true;
+    }
     command_segments(command).into_iter().any(|segment| {
         let tokens = executable_tokens(&segment);
+        if runner_changes_directory(&tokens) {
+            return true;
+        }
         let mut argv = tokens.as_slice();
+        let mut after_wrapper = false;
         // Peel while something follows: a lone trailing wrapper word runs
         // nothing, and stopping at one token keeps `argv[0]` addressable.
         while argv.len() > 1 {
             let head = &argv[0];
-            if is_assignment_word(head) || CD_WRAPPERS.contains(&command_word(head).as_ref()) {
+            // A redirection may sit anywhere in a simple command, including in
+            // front of the verb: `>/tmp/o cd /x` is a `cd` (#832).
+            // `executable_tokens` strips a leading `{` as a group opener, so a
+            // named-fd head (`{fd}>/tmp/o`) arrives as `fd}>/tmp/o`; restore
+            // the brace before asking whether it is a redirection.
+            if let Some(target_is_next) =
+                redirection_of(head).or_else(|| redirection_of(&format!("{{{head}")))
+            {
+                argv = &argv[if target_is_next { 2 } else { 1 }.min(argv.len())..];
+                continue;
+            }
+            // The other half of an fd duplication or close. `split_segments`
+            // cuts at the `&` in `2>&1 cd /x`, `>&2 cd /x`, `2>&- cd /x`, so
+            // this segment arrives headed by the orphaned `1`, `2`, or `-`
+            // (#832 review). None of those is a command a session runs, so
+            // dropping it can only expose the verb behind it.
+            if head == "-" || head.chars().all(|c| c.is_ascii_digit()) {
+                argv = &argv[1..];
+                continue;
+            }
+            // A wrapper's own flags (`command -p cd`, `time -p cd`) stop the
+            // peel one token short otherwise (#832). Flags are dropped without
+            // parsing their values: a valued flag leaves its value as the head,
+            // which is not `cd`, so the cost is a miss the pre-#832 walk had
+            // too, never a new one. A `v`/`V` flag ends the peel instead:
+            // `command -v cd` looks `cd` up and runs nothing.
+            if after_wrapper && head.starts_with('-') && !head.contains(['v', 'V']) {
+                argv = &argv[1..];
+                continue;
+            }
+            let word = command_word(head);
+            if CD_WRAPPERS.contains(&word.as_ref()) {
+                after_wrapper = true;
+                argv = &argv[1..];
+            } else if is_assignment_word(head) {
                 argv = &argv[1..];
             } else {
                 break;
@@ -1422,6 +2810,60 @@ fn command_changes_directory(command: &str) -> bool {
             start += 1 + consumed;
         }
         false
+    })
+}
+
+/// Is `token` a `sudo` option that changes the working directory — `-D DIR`,
+/// `--chdir=DIR`, or any unambiguous abbreviation `getopt_long` accepts
+/// (`--chd`)? A `D` anywhere in a short-option cluster counts, including one
+/// that is really another option's value (`-uDave`): over-reading is the
+/// fail-closed direction for a detector.
+///
+/// `-i`/`--login` count too: a login shell starts in the target user's home
+/// directory, so the command runs there rather than in `input.cwd`.
+fn sudo_chdir_flag(token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return name.len() >= 3 && ("chdir".starts_with(name) || "login".starts_with(name));
+    }
+    token
+        .strip_prefix('-')
+        .is_some_and(|cluster| cluster.contains(['D', 'i']))
+}
+
+/// Is `token` a `su`/`runuser` login option — `-`, `-l` (alone or in a
+/// cluster), or `--login` and its abbreviations? A login session starts in the
+/// target user's home directory.
+fn su_login_flag(token: &str) -> bool {
+    if token == "-" {
+        return true;
+    }
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return name.len() >= 3 && "login".starts_with(name);
+    }
+    token
+        .strip_prefix('-')
+        .is_some_and(|cluster| cluster.contains('l'))
+}
+
+/// Does any `sudo`, `su`, or `runuser` in this segment run its command in
+/// another directory (#832 review)?
+///
+/// Searched across the WHOLE segment rather than at the resolved head, because
+/// the runner can sit behind any prefix — `nice -n 5 sudo -D /x cat .envrc`
+/// hides it from a head-only peel — and every flag after the runner word is
+/// checked rather than parsed. Both widen the detector, never an exemption: a
+/// later operand that happens to spell a chdir flag (`sudo grep -i x .envrc`)
+/// over-blocks the `.envrc` carve-out, which is the fail-closed direction.
+fn runner_changes_directory(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        let rest = &tokens[i + 1..];
+        match command_word(token).as_ref() {
+            "sudo" => rest.iter().any(|t| sudo_chdir_flag(t)),
+            "su" | "runuser" => rest.iter().any(|t| su_login_flag(t)),
+            _ => false,
+        }
     })
 }
 
@@ -1466,7 +2908,10 @@ fn envrc_bash_read_allowed(resolve_token: &str, cwd: Option<&str>, command_has_c
         }
     };
 
-    envrc_carveout_allows(".envrc", std::fs::read_to_string(&resolved).ok().as_deref())
+    // Bounded (#818): a `.envrc` symlinked to a FIFO or `/dev/zero`, or a
+    // multi-GB file, would hang or exhaust the hook through a plain
+    // `read_to_string`. A rejected read is `None`, which keeps the block.
+    envrc_carveout_allows(".envrc", read_untrusted_config(&resolved).as_deref())
 }
 
 /// Does an `echo`/`printf` segment expand a secret-shaped variable?
@@ -1510,13 +2955,67 @@ fn bash_leaks_secrets(
     cwd: Option<&str>,
     detect: fn() -> bool,
 ) -> Option<CheckResult> {
+    bash_leaks_secrets_within(command, cwd, detect, STRUCTURED_SCAN_DEADLINE)
+}
+
+/// [`bash_leaks_secrets`] with the structured scan's time allowance passed in,
+/// so a test can exercise the deadline fallback without a slow input.
+fn bash_leaks_secrets_within(
+    command: &str,
+    cwd: Option<&str>,
+    detect: fn() -> bool,
+    time_limit: std::time::Duration,
+) -> Option<CheckResult> {
+    let deadline = std::time::Instant::now() + time_limit;
     let lower = command.to_lowercase();
+    let oversized = command.len() > STRUCTURED_SCAN_LIMIT;
+
+    // #850 delta review I7: `git stash show -p` with untracked files prints
+    // every untracked file a `git stash -u` swept up — a `.env` is the
+    // typical one, and the command need not name it. Judged before the
+    // raw-text pre-filter AND before the size cap (#1071 review I-1: the cap
+    // returning first turned a padded `git stash show -p -u` into an allow).
+    // Over the cap it reads tokens only, never the segmenter.
+    let untracked_config = lower.contains("showincludeuntracked");
+    let prints_untracked = if oversized {
+        untracked_content_by_tokens(command, &lower)
+    } else {
+        (lower.contains("stash") || lower.contains("untracked"))
+            && command_segments(command).iter().any(|segment| {
+                let tokens = tokenize(segment);
+                resolve_command(&tokens).is_some_and(|(word, argv)| {
+                    word == "git" && git_prints_untracked_content(&argv[1..], untracked_config)
+                })
+            })
+    };
+    if prints_untracked {
+        return Some(CheckResult::block(
+            "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
+             Found: a `git` command printing UNTRACKED or ignored file content (a stash's \
+             untracked files, or `grep --untracked --no-exclude-standard`), which is where a \
+             `.env` lives\n\
+             Fix: list names instead — `git stash show --stat --include-untracked`, \
+             `git grep -l`.",
+        ));
+    }
+
+    // Over the size cap the structured scan is skipped: block when the
+    // normalized raw text names a secret anywhere — prose included — and
+    // otherwise fall through to the nudges below.
+    if oversized && let Some(name) = normalized_secret_name(command) {
+        return Some(CheckResult::block(format!(
+            "🚫 BLOCKED: prevent-secret-leaks: command is too long to scan and names a \
+             secret file\n\
+             Found: `{name}`\n\
+             Fix: run the command directly, or split it into shorter commands."
+        )));
+    }
 
     // Block: a dangerous deny-set operand (the `.env` family plus the non-`.env`
     // credential stores) handed to any command that is not metadata-safe
     // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
     // is still seen.
-    if command_may_reference_secret(&lower) {
+    if !oversized && command_may_reference_secret(&lower) {
         // #308: computed once per command — an in-command cd/pushd/popd
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
@@ -1549,14 +3048,24 @@ fn bash_leaks_secrets(
         // own comparison site rather than depending on pre-lowered input.
         // #947: computed once over the FULL command — a rebinding in one
         // segment shadows `jq` in every later one.
-        let plain_jq_pipeline = command_is_plain_jq_pipeline(command);
-        for segment in command_segments(command) {
+        let context = ScanContext {
+            plain_jq_pipeline: command_is_plain_jq_pipeline(command),
+            git_env_rebound: tokenize(command)
+                .iter()
+                .any(|t| is_assignment_word(t) && t.starts_with("GIT_")),
+        };
+        let segments = command_segments(command);
+        let mut budget = RescanBudget::new(deadline);
+        for segment in &segments {
+            if budget.out_of_time() {
+                break;
+            }
             // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
             // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
             // proven pure-loader `.envrc`; any other dangerous operand in the
             // same segment still falls through to the block below, exactly as
             // it did before the #193 carve-out existed.
-            for (cmd_word, token) in segment_env_reads(&segment, plain_jq_pipeline) {
+            for (cmd_word, token) in segment_env_reads(segment, context, &mut budget) {
                 // `token` is already the real, original-case substring of
                 // `command` — it was tokenized from an un-lowered segment —
                 // so it resolves the `.envrc` carve-out directly. No
@@ -1582,6 +3091,51 @@ fn bash_leaks_secrets(
                     detect,
                 )));
             }
+        }
+        // #832 delta review K1: the nested re-scan ran out of budget, so some
+        // command strings went unscanned. Fail closed if the raw command names
+        // a secret anywhere.
+        if budget.exhausted && normalized_secret_name(command).is_some() {
+            return Some(CheckResult::block(
+                "🚫 BLOCKED: prevent-secret-leaks: command nests too many command strings to \
+                 scan (or took too long to scan), and names a secret file\n\
+                 Fix: run the command directly, without nested `su`/`sh -c` wrappers.",
+            ));
+        }
+        // #850 delta review I7: a `git` that prints content from the index, a
+        // stash, or the work tree can print a secret it was never handed as an
+        // operand — `git add -N .env && git diff`, `git add -f .env && git
+        // diff --cached`, `git stash -u && git stash show -p -u`. When such a
+        // segment shares a command with any secret-file name, fail closed.
+        // Residual: the same pair split across two tool calls is not seen.
+        let prints_content = segments.iter().any(|segment| {
+            let tokens = tokenize(segment);
+            resolve_command(&tokens)
+                .is_some_and(|(word, argv)| word == "git" && git_prints_content(&argv[1..]))
+        });
+        if prints_content
+            && let Some(token) = segments.iter().find_map(|segment| {
+                tokenize(segment).into_iter().find(|t| {
+                    dangerous_secret_operand(t, Filename::Unqualified).is_some()
+                        && !envrc_bash_read_allowed(t, cwd, command_has_cd)
+                })
+            })
+        {
+            return Some(CheckResult::block(with_forgectl_hint(
+                format!(
+                    "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
+                     Found: `{token}` named alongside a `git` command that prints file content\n\
+                     Fix: secrets are available to programs via direnv (`direnv allow`) — \
+                     run the program directly instead of reading its secret file.\n\
+                     Allowed: metadata-only commands (ls, stat, wc, rm, touch, …), \
+                     `git diff --stat`/`--name-only`, and \
+                     safe templates (.env.example, id_rsa.pub, .aws/credentials.example, …)."
+                ),
+                HintKind::Read,
+                None,
+                &token,
+                detect,
+            )));
         }
     }
 
@@ -1639,7 +3193,8 @@ fn envrc_read_allowed(filename: &str, raw_path: Option<&str>) -> bool {
         && envrc_carveout_allows(
             filename,
             raw_path
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                // Bounded, as on the Bash arm (#818).
+                .and_then(|p| read_untrusted_config(Path::new(p)))
                 .as_deref(),
         )
 }
@@ -5371,5 +6926,930 @@ mod tests {
         assert_eq!(jq_filter_index(&argv("jq -- -r")), None);
         assert_eq!(jq_filter_index(&argv("jq --arg a")), None);
         assert_eq!(jq_filter_index(&argv("jq -f p.jq x.json")), None);
+    }
+
+    #[test]
+    fn dd_input_operand_naming_a_secret_blocks() {
+        // #850: `if=.env` is one token whose basename is `if=.env`, so the
+        // classifier saw no secret while dd printed the file.
+        assert_bash(
+            &[
+                "dd if=.env",
+                "dd if=.env of=/dev/stdout",
+                "dd bs=1 if=config/.env.production",
+                "dd if=/home/u/.ssh/id_rsa",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "dd's if= names the file it reads",
+        );
+    }
+
+    #[test]
+    fn dd_peel_does_not_reach_other_assignments() {
+        // Controls: the `KEY=value` peel is dd-only and input-only. `of=` is a
+        // write (the writes guard's shape), and a path-valued assignment on
+        // another command is the #771 false-block class.
+        assert_bash(
+            &[
+                "dd if=/dev/zero of=out.bin bs=1 count=1",
+                "dd if=.env.example",
+                "make ENV=.env",
+                "node --env-file=.env app.js",
+                "export F=.env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only dd's if= operand is peeled",
+        );
+    }
+
+    #[test]
+    fn git_subcommands_that_print_a_worktree_file_block() {
+        // #850: `git` is metadata-safe, but these two print the file on disk,
+        // tracked or not.
+        assert_bash(
+            &[
+                "git diff --no-index /dev/null .env",
+                "git diff /dev/null .env",
+                "git diff -- .env",
+                "git -C . diff --no-index /dev/null .env",
+                "git --no-pager diff --no-index /dev/null .env",
+                "git stripspace <.env",
+                "git stripspace < .env",
+                "git log --no-index .env",
+                // An unclassifiable global option fails closed.
+                "git --bogus diff .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "git reading a working-tree secret is a read",
+        );
+    }
+
+    #[test]
+    fn git_metadata_subcommands_stay_exempt() {
+        assert_bash(
+            &[
+                "git diff",
+                "git diff --stat",
+                "git diff HEAD~1 -- src/main.rs",
+                "git diff -- .env.example",
+                "git add .env",
+                "git status .env",
+                "git log --stat -- .env",
+                "git log --name-only -- .env",
+                "git diff --stat -- .env",
+                "git commit -m wip .env",
+                "git mv .env .env.bak",
+                "git -C . add .env",
+                "git check-ignore .env",
+                "git rm --cached .env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only content-emitting git subcommands lose the exemption",
+        );
+    }
+
+    #[test]
+    fn substitution_operand_resolving_to_a_secret_blocks() {
+        // #815: a double-quoted substitution stays one whitespace-bearing
+        // token, which the prose firewall skipped, while bash ran `cat .env`.
+        assert_bash(
+            &[
+                "cat \"$(echo .env)\"",
+                "cat \"$(printf %s .env)\"",
+                "cat \"`echo .env`\"",
+                "cat \"$(echo -n .env)\"",
+                "cat \"./$(echo .env)\"",
+                "cat \"$(git rev-parse --show-toplevel)/.env\"",
+                "cat \"$(dirname \"$0\")/config/.env.production\"",
+                "cat \"$(echo $(echo .env))\"",
+                "base64 \"$(echo ~/.ssh/id_rsa)\"",
+                "cat <\"$(echo .env)\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a substitution provably producing a secret path is a read",
+        );
+    }
+
+    #[test]
+    fn substitution_operands_not_provably_secret_stay_allowed() {
+        // Controls: the firewall still skips prose and unresolvable output.
+        assert_bash(
+            &[
+                "cat \"$(git rev-parse --show-toplevel)/README.md\"",
+                "cat \"$(echo README.md)\"",
+                "gh pr create --body \"$(cat <<'EOF'\nfixes the .env loader\nEOF\n)\"",
+                "gh pr create --title \"fix $(date) .env handling\"",
+                "cat \"$(echo .env.example)\"",
+                "wc -l \"$(echo .env)\"",
+                "cat \"$(echo é .env.example)\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only a provable secret path blocks",
+        );
+    }
+
+    #[test]
+    fn chdir_behind_a_redirection_or_wrapper_flag_is_seen() {
+        // #832: each of these moves the shell (or sudo's child) away from
+        // `input.cwd` before the read, so the pure loader proven there is not
+        // the file `cat` opens.
+        for command in [
+            ">/tmp/o cd /x && cat .envrc",
+            "> /tmp/o cd /x && cat .envrc",
+            "2>/dev/null cd /x && cat .envrc",
+            "command -p cd /x && cat .envrc",
+            "time -p cd /x && cat .envrc",
+            "command -- cd /x && cat .envrc",
+            "sudo -D /x cat .envrc",
+            "sudo -u root -D /x cat .envrc",
+            "sudo --chdir=/x cat .envrc",
+            "sudo --chdir /x cat .envrc",
+            "sudo --chd=/x cat .envrc",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn chdir_scan_still_ignores_non_chdir_shapes() {
+        for command in [
+            "cat .envrc",
+            ">/tmp/o cat .envrc",
+            "command -v cd",
+            "sudo -u root cat .envrc",
+            "sudo --chroot=/x cat .envrc",
+            "time -p make",
+        ] {
+            assert!(!command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn relative_envrc_read_after_a_hidden_chdir_blocks() {
+        // End to end: the carve-out allows the loader at `input.cwd`, and each
+        // hidden chdir must now revoke it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let run = |c: &str| {
+            SecretLeaksGuard::default()
+                .run(&make_bash_with_cwd(c, cwd))
+                .outcome
+        };
+        assert_eq!(run("cat .envrc"), cadence_hooks_core::Outcome::Allow);
+        for command in [
+            ">/tmp/o cd /x && cat .envrc",
+            "command -p cd /x && cat .envrc",
+            "time -p cd /x && cat .envrc",
+            "sudo -D /x cat .envrc",
+            "sudo --chdir=/x cat .envrc",
+        ] {
+            assert_eq!(
+                run(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn envrc_fifo_or_endless_file_blocks_without_hanging() {
+        // #818: the carve-out read was an unbounded `read_to_string`. A FIFO
+        // would hang this test; `/dev/zero` would grow without bound. Both
+        // are rejected on stat and the read stays blocked.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_dir = dir.path().join("fifo");
+        std::fs::create_dir(&fifo_dir).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(fifo_dir.join(".envrc"))
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let zero_dir = dir.path().join("zero");
+        std::fs::create_dir(&zero_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", zero_dir.join(".envrc")).unwrap();
+        for d in [&fifo_dir, &zero_dir] {
+            let cwd = d.to_str().unwrap();
+            let bash = SecretLeaksGuard::default().run(&make_bash_with_cwd("cat .envrc", cwd));
+            assert_eq!(bash.outcome, cadence_hooks_core::Outcome::Block, "{cwd}");
+            let path = d.join(".envrc");
+            let read = SecretLeaksGuard::default().run(&make_read_input(path.to_str().unwrap()));
+            assert_eq!(read.outcome, cadence_hooks_core::Outcome::Block, "{cwd}");
+        }
+    }
+
+    #[test]
+    fn envrc_over_the_read_cap_blocks() {
+        // A pure loader padded past the 1 MiB cap is not classified at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = "use flake\n".to_string();
+        body.push_str(&"#".repeat(1024 * 1024));
+        std::fs::write(dir.path().join(".envrc"), body).unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let result = SecretLeaksGuard::default().run(&make_bash_with_cwd("cat .envrc", cwd));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn forgectl_exemption_covers_only_the_file_value_position() {
+        // #1053: the exemption matched by value, so a second copy of the
+        // audited `--file` string anywhere in the call was exempt too.
+        assert_bash(
+            &[
+                "forgectl env keys --file .env .env",
+                "forgectl env keys .env --file .env",
+                "forgectl env keys --file=.env .env",
+                "forgectl env redact -f .env .env",
+                "forgectl env keys --file .env <.env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a copy of the --file value outside its position is not audited",
+        );
+        assert_bash(
+            &[
+                "forgectl env keys --file .env",
+                "forgectl env keys --file=.env",
+                "forgectl env redact -f .env.local",
+                "forgectl env keys --file .env --file .env.prod",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "the audited --file value itself stays exempt",
+        );
+    }
+
+    #[test]
+    fn chdir_behind_an_fd_duplication_or_named_fd_is_seen() {
+        // #832 review C1: the `&` split leaves the segment headed by the fd.
+        for command in [
+            "2>&1 cd /evil && cat .envrc",
+            ">&2 cd /evil && cat .envrc",
+            "1>&2 cd /evil && cat .envrc",
+            "2>&- cd /evil && cat .envrc",
+            "<&- cd /evil && cat .envrc",
+            "command 2>&1 cd /evil && cat .envrc",
+            "FOO=1 2>&1 cd /evil && cat .envrc",
+            "{fd}>/tmp/o cd /evil && cat .envrc",
+            "{fd}</dev/null cd /evil && cat .envrc",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn runner_login_or_chdir_anywhere_in_the_segment_is_seen() {
+        // #832 review I4.
+        for command in [
+            "sudo -i cat .envrc",
+            "sudo -iu root cat .envrc",
+            "sudo --login cat .envrc",
+            "sudo --log cat .envrc",
+            "nice -n 5 sudo -D /x cat .envrc",
+            "nohup nice sudo --chdir=/x cat .envrc",
+            "su - root -c 'cat .envrc'",
+            "su -l root",
+            "su --login root",
+            "runuser -l root -c 'cat .envrc'",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+        for command in [
+            "sudo -u root cat .envrc",
+            "su root -c true",
+            "runuser -u x id",
+        ] {
+            assert!(!command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn strip_fd_prefix_handles_numbers_and_names_only() {
+        assert_eq!(strip_fd_prefix("2>&1"), ">&1");
+        assert_eq!(strip_fd_prefix("{fd}>/tmp/o"), ">/tmp/o");
+        assert_eq!(strip_fd_prefix("{log_2}<in"), "<in");
+        assert_eq!(strip_fd_prefix("{1x}>o"), "{1x}>o");
+        assert_eq!(strip_fd_prefix("{a b}>o"), "{a b}>o");
+        assert_eq!(strip_fd_prefix("{fd}"), "{fd}");
+    }
+
+    #[test]
+    fn substitution_review_repros_block() {
+        // #815 review I1: every shape the first cut still let through.
+        assert_bash(
+            &[
+                "cat \"$(pwd)/$(echo .env)\"",
+                "cat \"$(echo .env)$(true)\"",
+                "cat \"$(echo `echo .env`)\"",
+                // A tail completing the output. (`"$(echo .e)nv"` spells the
+                // same file but never reaches the resolver: the raw-text
+                // pre-filter sees no `.env` — cadence-hooks#819.)
+                "cat \"$(echo .env).local\"",
+                "cat \"$(echo config/.env).production\"",
+                "cat \"$(echo .env; true)\"",
+                "cat \"$(command echo .env)\"",
+                "cat \"$(echo \"(\")/.env\"",
+                "cat \"$(realpath .env)\"",
+                "cat \"$(ls .env)\"",
+                "cat \"$(basename x/.env)\"",
+                "cat \"$(find . -name .env)\"",
+                "cat \"$(dirname .env/x)\"",
+                "cat \"$(printf '%s' .env)\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a substitution provably producing a secret path is a read",
+        );
+    }
+
+    #[test]
+    fn quoted_multi_argument_echo_is_one_word() {
+        // #815 review N2: `"$(echo a b)"` is the single word `a b`, so prose
+        // that mentions `.env` is not a path to it.
+        assert_bash(
+            &[
+                "gh pr create --body \"$(echo see .env docs)\"",
+                "gh pr create --body \"$(cat <<'EOF'\nsee (the) .env docs\nEOF\n)\"",
+                "cat \"$(git rev-parse --show-toplevel)/README.md\"",
+                "cat \"$(true)$(echo README.md)\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "prose and non-secret paths stay allowed",
+        );
+    }
+
+    #[test]
+    fn oversized_substitution_word_is_bounded_and_judged_by_its_tail() {
+        // #815 review I3: resolution built one candidate per echo argument,
+        // quadratic in the word. A 100k-argument word must stay fast, and a
+        // secret-shaped tail past the limit still blocks.
+        let args = "a ".repeat(100_000);
+        let started = std::time::Instant::now();
+        let allow = format!("cat \"$(echo {args})\"");
+        let block = format!("cat \"$(echo {args})/.env\"");
+        let small = format!("cat \"$(echo {})\"", "a ".repeat(3_000));
+        assert_bash(
+            &[&allow, &small],
+            cadence_hooks_core::Outcome::Allow,
+            "no secret",
+        );
+        assert_bash(&[&block], cadence_hooks_core::Outcome::Block, "secret tail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3000),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn git_outside_the_metadata_allowlist_blocks_on_a_secret() {
+        // #850 review I2: the diff/stripspace denylist left every other
+        // content-emitting subcommand, and aliases, exempt.
+        assert_bash(
+            &[
+                "git column <.env",
+                "git column < .env",
+                "git interpret-trailers .env",
+                "git merge-file -p .env /dev/null /dev/null",
+                "git config -f .env --list",
+                "git grep --untracked KEY -- .env",
+                "git show $(git hash-object -w .env)",
+                "git -c alias.x='!cat' x .env",
+                "git -c alias.x=!cat x .env",
+                "git -c core.pager='!cat' status .env",
+                "git blame .env",
+                "git log -p --stat -- .env",
+                "git diff --stat --patch -- .env",
+                "git show --stat -U3 -- .env",
+                "git add -p .env",
+                "git commit -F .env",
+                "git commit --file=.env",
+                "git commit -F.env",
+                "git config --file=.env --list",
+                "git status <.env",
+                "git x .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "only the metadata allowlist keeps git's exemption",
+        );
+    }
+
+    #[test]
+    fn dd_family_heads_peel_if() {
+        // #850 review N1.
+        assert_bash(
+            &[
+                "gdd if=.env",
+                "dcfldd if=.env",
+                "dc3dd if=.env",
+                "busybox dd if=.env",
+                "toybox dd if=.env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "dd-family heads read their if= operand",
+        );
+        assert_bash(
+            &["busybox ls if=.env", "gdd if=/dev/zero of=x count=1"],
+            cadence_hooks_core::Outcome::Allow,
+            "only a dd applet peels if=",
+        );
+    }
+
+    #[test]
+    fn runner_chdir_before_a_dash_c_string_is_seen() {
+        // #832 delta review C1: the `-c` body became its own segment and the
+        // runner flag was judged apart from it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        for command in [
+            "su - root -c 'cat .envrc'",
+            "su -l root -c 'cat .envrc'",
+            "su - -c 'cat .envrc'",
+            "runuser -l root -c 'cat .envrc'",
+            "sudo -D /evil sh -c 'cat .envrc'",
+        ] {
+            let outcome = SecretLeaksGuard::default()
+                .run(&make_bash_with_cwd(command, cwd))
+                .outcome;
+            assert_eq!(outcome, cadence_hooks_core::Outcome::Block, "{command}");
+        }
+    }
+
+    #[test]
+    fn substitution_delta_review_repros_block() {
+        // #815 delta review I1-I4.
+        let seventeen = "$(true)".repeat(17);
+        let many_first = format!("cat \"{seventeen}$(echo .env)\"");
+        let many_last = format!("cat \"$(echo .env){seventeen}\"");
+        assert_bash(
+            &[
+                // I1: nesting past the depth cap.
+                "cat \"$(echo $(echo $(echo $(echo $(echo .env)))))\"",
+                "cat \"$(echo $(echo $(echo $(echo $(echo $(echo .env))))))\"",
+                // I2: more substitutions than the combination cap.
+                &many_first,
+                &many_last,
+                // I3: a quoted paren and escaped nested backticks.
+                "cat \"$(echo ')' >/dev/null; echo .env)\"",
+                "cat \"`echo \\`echo .env\\``\"",
+                // I4: an unquoted backtick run split by whitespace.
+                "cat `echo .env`",
+                "cat `printf %s .env`",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "an unresolvable substitution naming a secret fails closed",
+        );
+        assert_bash(
+            &[
+                "cat `echo README.md`",
+                "cat \"$(echo $(echo $(echo $(echo $(echo README.md)))))\"",
+                "gh pr create --body \"$(cat <<'EOF'\nthis doesn't touch (the .env docs\nEOF\n)\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "no secret named",
+        );
+    }
+
+    #[test]
+    fn git_delta_review_patch_and_exec_options_block() {
+        // #850 delta review I5/I6.
+        assert_bash(
+            &[
+                "git log -u -- .env",
+                "git show --stat -u -- .env",
+                "git diff --stat --binary -- .env",
+                "git status -v .env",
+                "git status --verbose .env",
+                "git commit -v .env",
+                "git commit -t .env",
+                "git commit --template=.env",
+                "git -c core.pager=less log -- .env",
+                "git --config-env=core.pager=P log -- .env",
+                "GIT_PAGER=cat git log -- .env",
+                "env GIT_EDITOR=vi git commit .env",
+                "export GIT_CONFIG_PARAMETERS=x; git add .env",
+                "GIT_CONFIG_KEY_0=core.pager git log -- .env",
+                "git rebase -x 'cat .env' main",
+                "git rebase --exec 'cat .env' main",
+                "git clone -u 'cat .env' repo",
+                "git fetch --upload-pack='cat .env' origin",
+                "git push --receive-pack 'cat .env' origin",
+                "git -c core.pager='cat .env' log",
+                "git -c alias.x='!cat .env' x",
+                "GIT_EDITOR='cat .env' git commit",
+                "GIT_SSH_COMMAND='cat .env' git fetch",
+                "git filter-repo --filename-callback 'return 1' --path .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a git option that prints content or runs a command drops the exemption",
+        );
+    }
+
+    #[test]
+    fn git_content_printer_beside_a_named_secret_blocks() {
+        // #850 delta review I7.
+        assert_bash(
+            &[
+                "git add -N .env && git diff",
+                "git add -f .env && git diff --cached",
+                "git stash -u && git stash show -p --include-untracked",
+                "git add .env; git log -p",
+                "git add .env && git show",
+                "git add .env && git status -v",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "content-printing git beside a named secret fails closed",
+        );
+        assert_bash(
+            &[
+                "git add .env && git diff --stat",
+                "git add .env && git diff --name-only --cached",
+                "git add .env && git log --oneline",
+                "git add .env.example && git diff",
+                "git diff && git status",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "names-only output, or no secret named",
+        );
+    }
+
+    #[test]
+    fn git_delta_review_false_blocks_allow() {
+        // #850 delta review I8.
+        assert_bash(
+            &[
+                "git log --oneline -- .env",
+                "git log --all --full-history -- .env",
+                "git log -1 --format=%H -- .env",
+                "git log -S SECRET -- .env",
+                "git whatchanged --oneline -- .env",
+                "git update-index --assume-unchanged .env",
+                "git update-index --skip-worktree .env",
+                "git filter-repo --path .env --invert-paths",
+                "git commit -c HEAD .env",
+                "git commit -m \"update prod\" .env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "metadata-only git forms keep the exemption",
+        );
+    }
+
+    /// `shlex.quote`: unchanged when every character is shell-safe, otherwise
+    /// single-quoted with each `'` spelled `'"'"'`.
+    fn shlex_quote(s: &str) -> String {
+        let safe = !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c));
+        if safe {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', "'\"'\"'"))
+        }
+    }
+
+    #[test]
+    fn nested_su_amplification_is_bounded_and_blocks() {
+        // #832 delta review K1: each `su` re-scanned every later token and
+        // every level re-scanned the same script once per `su`, k^4 — 804
+        // bytes took 18.6 s against a 5 s hook timeout, and a timed-out hook
+        // does not block.
+        let mut x = "true".to_string();
+        for _ in 0..4 {
+            x = format!("{}-c {}", "su ".repeat(60), shlex_quote(&x));
+        }
+        let command = format!("{x} 2>/dev/null; cat .env");
+        let started = std::time::Instant::now();
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+        let elapsed = started.elapsed();
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            elapsed < std::time::Duration::from_millis(3000),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn rescan_budget_exhaustion_fails_closed_on_a_named_secret() {
+        // 300 distinct nested scripts exceed the node budget; the secret read
+        // sits in the last one, past where the scan stops.
+        // `su -c` strings are reached only by the nested re-scan (the
+        // segmenter does not expand them), and one segment's `su` walk stops
+        // at the next `su`, so each is its own node. The verdict must come
+        // from the budget's fail-closed arm, which the message names.
+        let mut command: String = (0..300).map(|i| format!("su -c 'true {i}' ")).collect();
+        command.push_str("su -c 'cat .env'");
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("nests too many"),
+            "{:?}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn literal_backticks_in_quoted_prose_allow() {
+        // #815 delta review I-a.
+        assert_bash(
+            &[
+                "gh pr create --title t --body 'Ignore `.env files'",
+                "gh pr create --title t --body 'Blocks `cat .env` and ``` fences'",
+                "gh pr create --title t --body \"$(cat <<'EOF'\nBlocks `sh -c \"cat .env\"` now\nEOF\n)\"",
+                "gh issue comment 5 --body \"$(cat <<'EOF'\nsee `cat .env` (and `.env`\nEOF\n)\"",
+                "gh issue comment 5 --body 'the `$(cat .env)` shape'",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a backtick the shell never expands is text",
+        );
+        assert_bash(
+            &[
+                "gh pr create --title t --body \"see `cat .env`\"",
+                "cat `echo .env`",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "an unquoted or double-quoted backtick still runs",
+        );
+    }
+
+    #[test]
+    fn git_second_delta_review_repros_block() {
+        // #850 delta review I-b, I-c, I-e, I-f; #832 I-d.
+        assert_bash(
+            &[
+                // I-b: log flags outside the metadata allowlist.
+                "git log --dd -1 -- .env",
+                "git log --remerge-diff -- .env",
+                "git whatchanged -m -- .env",
+                // I-c: unique-prefix long options and attached short values.
+                "git commit --fil=.env",
+                "git commit --templ=.env",
+                "git add --patc .env",
+                "git reset --patc .env",
+                "git rebase --exe='cat .env' main",
+                "git rebase -x'cat .env' main",
+                "git rebase -mx'cat .env' main",
+                "git clone -u'cat .env' repo",
+                "git fetch --upload-pac='cat .env' origin",
+                // I-d: shell and su -c detection.
+                "bash -o posix -c 'cat .env'",
+                "bash -O extglob -c 'cat .env'",
+                "bash --rcfile /dev/null -c 'cat .env'",
+                "bash +x -c 'cat .env'",
+                "sudo -D /x bash -o posix -c 'cat .env'",
+                "su -lc 'cat .env' root",
+                "su -c'cat .env' root",
+                // I-e: untracked content in the stash.
+                "git -c stash.showIncludeUntracked=true stash show -p",
+                "git config stash.showIncludeUntracked true; git stash show -p",
+                "git show stash@{0}^3",
+                "git diff stash^3",
+                // I-f: content printers beside a named secret, and ignored-file grep.
+                "git add .env && git grep KEY",
+                "git add .env && git cat-file -p :0:x",
+                "git add .env && git format-patch -1",
+                "git add .env && git archive HEAD",
+                "git add .env && git checkout-index --stdout x",
+                "git add .env && git blame x",
+                "git add .env && git merge-file -p a b c",
+                "git grep --untracked --no-exclude-standard KEY",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "second delta review repro",
+        );
+        assert_bash(
+            &[
+                "git log --oneline --graph --decorate -- .env",
+                "git log -n 3 --format=%H --author=me -- .env",
+                "git log -5 -SKEY -- .env",
+                "git rebase -i main",
+                "git clone repo",
+                "git grep --untracked KEY",
+                "git stash show",
+                "git stash show --stat -u",
+                "git diff --stat --color -- .env",
+                "bash -o posix -c 'ls'",
+                "su -lc 'id' root",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "metadata-only forms",
+        );
+    }
+
+    /// Blocks within `limit_ms` of wall-clock time. Bounds in this file are
+    /// 3000 ms: loose enough for a loaded CI runner on a debug build, and
+    /// still under the hook group's 4000 ms fail-open limit.
+    fn assert_fast_block(command: &str, limit_ms: u64) {
+        let started = std::time::Instant::now();
+        let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+        let elapsed = started.elapsed();
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            elapsed < std::time::Duration::from_millis(limit_ms),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn many_unterminated_quoted_heredocs_stay_linear() {
+        // #815 delta review I1: each introducer rescanned every later line.
+        // Sized to stay under the structured-scan cap, so the stripper runs.
+        let n = 2000;
+        let command = format!(
+            "echo \"$(cat {}\n{})\"; cat .env",
+            "<<'X' ".repeat(n),
+            "y\n".repeat(n)
+        );
+        assert!(
+            command.len() < STRUCTURED_SCAN_LIMIT,
+            "must exercise the structured scan"
+        );
+        assert_fast_block(&command, 3000);
+    }
+
+    #[test]
+    fn oversized_command_skips_the_structured_scan_and_fails_closed() {
+        // #832 delta review I2: `su ` × N is super-linear in the shared
+        // segmenter; past the cap only the normalized raw text is judged.
+        let command = format!("{}-c true; cat .env", "su ".repeat(30_000));
+        assert_fast_block(&command, 3000);
+        let quoted = format!("{}-c true; cat .e\"\"n'v'", "su ".repeat(30_000));
+        assert_fast_block(&quoted, 3000);
+        let benign = format!("{}-c true; cat README.md", "su ".repeat(30_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn normalized_secret_name_removes_quotes_rather_than_splitting() {
+        // #815 delta review I4.
+        assert_eq!(
+            normalized_secret_name("cat .e\"\"n'v'").as_deref(),
+            Some(".env")
+        );
+        assert_eq!(
+            normalized_secret_name("cat .e\\nv").as_deref(),
+            Some(".env")
+        );
+        assert_eq!(
+            normalized_secret_name("x=$(cat 'id_rsa')").as_deref(),
+            Some("id_rsa")
+        );
+        assert_eq!(normalized_secret_name("cat README.md .env.example"), None);
+    }
+
+    #[test]
+    fn escaped_or_doubled_dollar_does_not_open_ansi_c_quoting() {
+        // #815 delta review I3: `\$'` and `$$'` open a PLAIN single-quoted
+        // string, where `\` is literal — reading it as `$'…'` skipped the
+        // closing quote and hid the live substitution after it.
+        assert!(substitutions_live(r"echo \$'a\' $(cat .env)"));
+        assert!(substitutions_live(r"echo $$'a\' $(cat .env)"));
+        assert!(substitutions_live(r"echo 'a\' `cat .env`"));
+        // A real `$'…'` does honour `\'`.
+        assert!(!substitutions_live(r"echo $'a\' $(x)'"));
+        // Unbalanced endings count as live.
+        assert!(substitutions_live("echo \"abc"));
+        assert!(substitutions_live("echo 'abc"));
+        assert!(!substitutions_live("echo 'a `b` $(c)'"));
+        assert_bash(
+            &["gh pr create --body \\$'x\\' \"$(cat .env)\""],
+            cadence_hooks_core::Outcome::Block,
+            "a live substitution after `\\$'`",
+        );
+    }
+
+    #[test]
+    fn git_log_metadata_flags_from_the_review_allow() {
+        // #850 delta review N1.
+        assert_bash(
+            &[
+                "git log --diff-filter=A -- .env",
+                "git log --no-walk --summary -- .env",
+                "git log --left-right --cherry-pick main...HEAD -- .env",
+                "git log --regexp-ignore-case -i --all-match --invert-grep --grep=x -- .env",
+                "git log --parents --boundary --abbrev=8 --show-signature --use-mailmap -- .env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "metadata-only log flags",
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_stripping_matches_bash() {
+        // #815 delta review N2. Each case states what bash does.
+        // Unterminated `<<'X'`: bash reads to end of input as the body, but
+        // the stripper cannot know the body ends there, so it KEEPS the
+        // lines — the fail-closed reading.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'X'\ncat .env"),
+            "cat <<'X'\ncat .env"
+        );
+        // `<<-'X'`: bash strips leading tabs, so `\tX` terminates it.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<-'X'\nbody\n\tX\nls"),
+            "cat <<-'X'\nX\nls"
+        );
+        // Plain `<<'X'`: `\tX` is NOT a terminator; the real one is `X`.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'X'\nbody\n\tX\nmore\nX\nls"),
+            "cat <<'X'\nX\nls"
+        );
+        // Two heredocs on one line: bodies are consumed in order.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'A' <<'B'\na\nA\nb\nB\nls"),
+            "cat <<'A' <<'B'\nA\nB\nls"
+        );
+        assert_bash(
+            &[
+                // An introducer inside double quotes is text; the read after
+                // it runs (bash prints `<<'X'`, then the file).
+                "echo \"<<'X'\"; cat .env",
+                "echo \"<<'X'\"\ncat .env\nX",
+                // `cat <<'X' .env` reads the FILE operand; the heredoc is
+                // stdin that `cat` ignores once given a file.
+                "cat <<'X' .env\nbody\nX",
+                // Unterminated: bash treats the rest as body and runs no
+                // `cat .env`, but the guard cannot prove that — block.
+                "cat <<'X'\ncat .env",
+                // Two heredocs, then a real read.
+                "cat <<'A' <<'B'\na\nA\nb\nB\ncat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "heredoc checklist",
+        );
+        assert_bash(
+            &[
+                "cat <<'A' <<'B'\ncat .env\nA\ncat .env\nB",
+                "cat <<-'X'\n\tcat .env\n\tX",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "heredoc bodies are data",
+        );
+    }
+
+    #[test]
+    fn untracked_stash_check_runs_before_the_size_cap() {
+        // #1071 review I-1: padding past the cap skipped this check.
+        let padded = format!("git stash show -p -u; {}", "true; ".repeat(11_000));
+        assert!(padded.len() > STRUCTURED_SCAN_LIMIT);
+        assert_fast_block(&padded, 3000);
+        let grep = format!(
+            "git grep --untracked --no-exclude-standard KEY; {}",
+            "true; ".repeat(11_000)
+        );
+        assert_fast_block(&grep, 3000);
+        let stash3 = format!("git show stash@{{0}}^3; {}", "true; ".repeat(11_000));
+        assert_fast_block(&stash3, 3000);
+        let benign = format!("git stash show --stat; {}", "true; ".repeat(11_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn nudges_still_fire_over_the_size_cap() {
+        let dump = format!("{}printenv", "true; ".repeat(4_000));
+        assert!(dump.len() > STRUCTURED_SCAN_LIMIT);
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&dump));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+        let echo = format!("{}echo $API_SECRET", "true; ".repeat(4_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&echo));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn nested_substitution_su_flood_blocks_fast() {
+        // #1071 review I-2: under the old 64 KiB cap this took 3.9 s on a
+        // release build, inside a hook group that fails open at 4000 ms.
+        let command = format!(
+            "echo {}{}-c true{}; cat .env",
+            "$(".repeat(20),
+            "su ".repeat(21_800),
+            ")".repeat(20)
+        );
+        assert_fast_block(&command, 3000);
+    }
+
+    #[test]
+    fn structured_scan_deadline_fails_closed() {
+        // #1071 review I-2: past the deadline the structured scan is
+        // abandoned and the normalized raw text decides.
+        let run = |command: &str| {
+            bash_leaks_secrets_within(command, None, || false, std::time::Duration::ZERO)
+        };
+        let blocked = run("true; su -c 'cat .env'").expect("secret named");
+        assert_eq!(blocked.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            blocked
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("took too long"),
+            "{:?}",
+            blocked.message
+        );
+        assert!(run("true; su -c 'ls'").is_none());
     }
 }

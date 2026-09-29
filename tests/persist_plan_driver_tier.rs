@@ -24,11 +24,19 @@
 use std::io::Write;
 use std::process::Command;
 
-fn cadence_hooks(metrics_dir: &std::path::Path) -> Command {
+fn cadence_hooks(metrics_dir: &std::path::Path, config_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CADENCE_NO_PERSIST_PLAN");
+    // The destination resolver (cadence-hooks#1021) reads the session root
+    // from `CLAUDE_PROJECT_DIR` and falls back to `<config_dir>/cadence/plans`.
+    // Inheriting either from a Claude session running `make ci` would let this
+    // suite write into the real checkout or `~/.claude`: clear the root so the
+    // payload `cwd` decides, and pin the config dir to a scratch dir.
+    cmd.env_remove("CLAUDE_PROJECT_DIR");
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir);
     // Sandbox the plan-links.jsonl append so this suite never writes into a
     // real per-user metrics dir (same discipline as tests/session_markers.rs
     // and tests/try_hook.rs's log-skill regression).
@@ -81,6 +89,21 @@ fn additional_context(stdout: &str) -> String {
         .to_string()
 }
 
+/// The plan doc landed in the payload-`cwd` repo's `docs/plans`, exactly
+/// one of it, and nothing reached the user-scoped fallback dir.
+fn assert_landed_in_repo(repo: &std::path::Path, config_dir: &std::path::Path, slug: &str) {
+    let plans: Vec<_> = std::fs::read_dir(repo.join("docs/plans"))
+        .expect("the plan must land in the repo's docs/plans")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(plans[0].ends_with(&format!("-{slug}.md")), "{plans:?}");
+    assert!(
+        !config_dir.join("cadence/plans").exists(),
+        "nothing may reach the user-scoped plans dir"
+    );
+}
+
 #[test]
 fn approval_nudge_carries_the_model_check_directive_for_a_recorded_driver() {
     let repo = tempfile::tempdir().unwrap();
@@ -98,7 +121,8 @@ fn approval_nudge_carries_the_model_check_directive_for_a_recorded_driver() {
     })
     .to_string();
 
-    let mut cmd = cadence_hooks(metrics_dir.path());
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut cmd = cadence_hooks(metrics_dir.path(), config_dir.path());
     cmd.args(["session", "persist-plan-approval"]);
     let output = run_with_stdin(cmd, &payload);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -117,6 +141,8 @@ fn approval_nudge_carries_the_model_check_directive_for_a_recorded_driver() {
         ctx.find("Approved plan persisted to").unwrap() < ctx.find("recommended driver").unwrap(),
         "directive lands after the persist sentence: {ctx}"
     );
+
+    assert_landed_in_repo(repo.path(), config_dir.path(), "fix-the-widget");
 
     let links = std::fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
     assert!(
@@ -142,7 +168,8 @@ fn approval_nudge_omits_the_directive_when_no_driver_is_recorded() {
     })
     .to_string();
 
-    let mut cmd = cadence_hooks(metrics_dir.path());
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut cmd = cadence_hooks(metrics_dir.path(), config_dir.path());
     cmd.args(["session", "persist-plan-approval"]);
     let output = run_with_stdin(cmd, &payload);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -157,6 +184,8 @@ fn approval_nudge_omits_the_directive_when_no_driver_is_recorded() {
         !ctx.contains("recommended driver"),
         "no directive text end to end when the plan carries no recognized Driver: anchor: {ctx}"
     );
+
+    assert_landed_in_repo(repo.path(), config_dir.path(), "fix-the-widget");
 
     let links = std::fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
     assert!(
@@ -189,7 +218,8 @@ fn approval_from_a_subagent_never_persists_regardless_of_driver_tier() {
     })
     .to_string();
 
-    let mut cmd = cadence_hooks(metrics_dir.path());
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut cmd = cadence_hooks(metrics_dir.path(), config_dir.path());
     cmd.args(["session", "persist-plan-approval"]);
     let output = run_with_stdin(cmd, &payload);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -201,5 +231,9 @@ fn approval_from_a_subagent_never_persists_regardless_of_driver_tier() {
     assert!(
         !repo.path().join("docs/plans").exists(),
         "a subagent approval must never write a plan doc"
+    );
+    assert!(
+        !config_dir.path().join("cadence/plans").exists(),
+        "nor a user-scoped one"
     );
 }

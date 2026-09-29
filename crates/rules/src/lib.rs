@@ -6,5 +6,5 @@
 pub mod askuserquestion;
 /// Scan written code for language-specific security anti-patterns.
 pub mod check_security_patterns;
-/// Validate SKILL.md and command file frontmatter (required fields, name format, known fields).
+/// Validate SKILL.md and command file frontmatter (required fields, name format, known fields, description rules, `@skills/` force-loads), living-plan frontmatter, and plugin-agent fields.
 pub mod validate_skill_frontmatter;

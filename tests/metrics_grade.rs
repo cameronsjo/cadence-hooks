@@ -7,6 +7,8 @@
 //! because a cost figure nobody can trace back to a file is worse than no
 //! figure. Every test here therefore asserts the exit code as well as output.
 
+mod support;
+
 use std::process::Command;
 
 const ID: &str = "0e0e5f58-9ca8-4d51-bb3e-1d79a02636ae";
@@ -21,7 +23,7 @@ const TRANSCRIPT: &str = concat!(
 );
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");

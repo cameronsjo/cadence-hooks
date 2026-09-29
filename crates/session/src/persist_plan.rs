@@ -55,6 +55,17 @@
 //! the four plan guards and the SessionStart plan scanner are not covered by
 //! this flag.
 //!
+//! **Destination** ([`resolve_destination`], cadence-hooks#1021). The session
+//! root (`CLAUDE_PROJECT_DIR`, else the payload `cwd`) picks the repo, never
+//! the repo an incidental tool call happened to run in. A `cwd` in a linked
+//! worktree of that same repo narrows the target to the worktree. The plans
+//! dir is the repo's `CADENCE_PLANS_DIR` (settings `env` block, relative,
+//! nesting-checked; empty opts out), default `docs/plans`. A plan with no
+//! provable repo home goes to the user-scoped `<config_dir>/cadence/plans`.
+//! That covers a non-repo root without a configured dir, a repo with a remote
+//! outside `CADENCE_ALLOWED_OWNERS`, and a dir that escapes the checkout. The
+//! nudge's follow-up sentence defers the commit to the repo's own policy.
+//!
 //! Never blocks (ADR-0001): every failure path — no plan text, no `cwd`, not
 //! a git repo, unsafe session id, exhausted suffix ladder, a subagent-context
 //! approval — exits silently via `CheckResult::allow()`. A hook bug must not
@@ -62,6 +73,7 @@
 
 use crate::identity;
 use crate::plan_scan::{Tier, recommended_tier};
+use cadence_hooks_core::config::{AllowEntry, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use serde_json::Value;
 use std::fs;
@@ -112,9 +124,18 @@ const DEFAULT_SLUG: &str = "approved-plan";
 /// suffixes taken" in the plan doc), after which [`fallback_path`] is tried.
 const NUMERIC_SUFFIXES: std::ops::RangeInclusive<u32> = 2..=9;
 
-/// The frontmatter key carrying the plan body's hash — the tier-1 idempotency
-/// anchor for every document this hook persists from birth (Design 18,
-/// cadence-hooks#396's plan). Parsed only from the LEADING frontmatter block
+/// The frontmatter key that carried the plan body's hash in documents this
+/// hook persisted before the field was retired (cameronsjo/cadence-hooks#870:
+/// every write the hook never saw — a PR merge, a `gh api` contents write, an
+/// unwired checkout — left it certifying a body that no longer existed, and
+/// no reader could reproduce it). Nothing writes it any more; it survives as a
+/// READ-ONLY legacy idempotency tier (see [`file_matches`]) so documents
+/// already on disk stay recognized as re-fires. It stays on
+/// [`HOOK_OWNED_KEYS`], which covers only a plan-authored copy rendered by
+/// this hook: a file written by hand can carry any key, so the tier is
+/// believed only where the `plan-links.jsonl` ledger cannot contradict it
+/// (#1085 review).
+/// Parsed only from the LEADING frontmatter block
 /// ([`leading_frontmatter_block`]), never a whole-document scan: the body now
 /// grows by design (checkbox ticks, appended `## Deviations`/`## Learnings`
 /// sections) and may itself quote this exact key, so anchoring anywhere but
@@ -180,10 +201,11 @@ impl Check for PersistPlanApproval {
         // (cameronsjo/cadence-hooks#349): this fires on every PostToolUse
         // call, and a bug here must not eat the approval (or the tool call).
         let result = std::panic::catch_unwind(|| {
+            let env = DestinationEnv::from_process();
             if input.tool_name() == Some("ExitPlanMode") {
-                run_persist_plan_approval(input, &utc_now, &local_date, &host)
+                run_persist_plan_approval(input, &utc_now, &local_date, &host, &env)
             } else {
-                run_injected_plan_persist(input, &utc_now, &local_date, &host)
+                run_injected_plan_persist(input, &utc_now, &local_date, &host, &env)
             }
         })
         .unwrap_or_else(|_| CheckResult::allow());
@@ -198,13 +220,15 @@ impl Check for PersistPlanApproval {
     }
 }
 
-/// Testable core for the PostToolUse trigger — clock and host are injected so
-/// tests pin the rendered frontmatter and the plan-links row byte-for-byte.
+/// Testable core for the PostToolUse trigger — clock, host, and the
+/// destination inputs ([`DestinationEnv`]) are injected so tests pin the
+/// rendered frontmatter and the plan-links row byte-for-byte.
 pub fn run_persist_plan_approval(
     input: &HookInput,
     utc_now: &str,
     local_date: &str,
     host: &str,
+    env: &DestinationEnv,
 ) -> CheckResult {
     if input.tool_name() != Some("ExitPlanMode") {
         return CheckResult::allow();
@@ -249,7 +273,15 @@ pub fn run_persist_plan_approval(
     }
     // Same-session approval: the approving identity IS the executing session
     // — no sibling-transcript scan needed (Design record item 2).
-    persist_plan_body(input, utc_now, local_date, host, &body, input.session_id())
+    persist_plan_body(
+        input,
+        utc_now,
+        local_date,
+        host,
+        &body,
+        input.session_id(),
+        env,
+    )
 }
 
 /// The injected-prompt arm — approve-and-clear coverage (module doc path 2).
@@ -264,9 +296,11 @@ pub fn run_persist_plan_approval(
 /// already saturated (the transcript exceeds the read cap with no user row
 /// inside it), which can never resolve and burns the marker so the per-call
 /// 1 MiB read does not recur for the life of the session (security review of
-/// this change). A resolvable no-repo `cwd` also leaves the marker unwritten:
-/// which repo receives the plan depends on where the first tool call happens
-/// to run, and a first call outside any git repo must not spend the one shot.
+/// this change). Where the plan lands does not depend on this call's `cwd`
+/// beyond the linked-worktree refinement: [`resolve_destination`] keys on the
+/// session root. The arm used to leave the marker unwritten on a no-repo `cwd`
+/// and retry, which made whichever repo a later incidental call ran in the
+/// target (cadence-hooks#1021).
 ///
 /// **Authenticity floor** (security review of this change): a bare prefix
 /// match is NOT an approval. The persist requires the harness's trailing
@@ -285,6 +319,7 @@ pub fn run_injected_plan_persist(
     utc_now: &str,
     local_date: &str,
     host: &str,
+    env: &DestinationEnv,
 ) -> CheckResult {
     // A subagent's PostToolUse stream never persists — its transcript head is
     // its task prompt, which an orchestrator can legitimately open with plan
@@ -345,22 +380,20 @@ pub fn run_injected_plan_persist(
         let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         return CheckResult::allow();
     }
-    // Resolve the repo BEFORE burning the marker: the first tool call can run
-    // outside any git repo (or in the wrong one), and that is a property of
-    // the call, not of the session — the next call may sit in the real repo.
-    if input
-        .cwd
-        .as_deref()
-        .and_then(crate::registry::repo_root)
-        .is_none()
-    {
-        return CheckResult::allow();
-    }
-    // Definitive verdict with a resolvable target: bound the scan to this one
-    // fire even if the persist below declines (opt-out, hash already on disk)
-    // — those are stable conditions a retry would only re-litigate.
+    // Definitive verdict: bound the scan to this one fire even if the persist
+    // below declines (opt-out, hash already on disk). Those are stable
+    // conditions a retry would only re-litigate, and the destination keys on
+    // the session root, which a later call cannot change (#1021).
     let _ = cadence_hooks_core::markers::write_marker(&marker, "");
-    persist_plan_body(input, utc_now, local_date, host, &body, Some(&approving))
+    persist_plan_body(
+        input,
+        utc_now,
+        local_date,
+        host,
+        &body,
+        Some(&approving),
+        env,
+    )
 }
 
 /// Verdict of one bounded scan of a transcript head for the injected
@@ -445,8 +478,9 @@ fn parent_session_id_from_pointer_lines(suffix_lines: &[&str]) -> Option<String>
     identity::is_safe_session_id(stem).then(|| stem.to_string())
 }
 
-/// Shared persist tail for both recognition paths: resolve the repo, render
-/// the frontmatter, write once, append the plan-links row, nudge.
+/// Shared persist tail for both recognition paths: resolve the destination
+/// ([`resolve_destination`]), render the frontmatter, write once, append the
+/// plan-links row, nudge.
 /// `approving_session_id` names the session whose operator approved the plan
 /// — the executing session itself on a same-session approval, the parent on
 /// an approve-and-clear pickup, `None` when unknown (then `approved_in:` is
@@ -458,32 +492,31 @@ fn persist_plan_body(
     host: &str,
     body: &str,
     approving_session_id: Option<&str>,
+    env: &DestinationEnv,
 ) -> CheckResult {
-    let Some(cwd) = input.cwd.as_deref() else {
-        return CheckResult::allow();
-    };
-    let Some(repo_root) = crate::registry::repo_root(cwd) else {
-        return CheckResult::allow();
-    };
-    // Opt-out (cadence-hooks#692): checked right after `repo_root` resolves
-    // so the repo-level `.claude/settings*.json` flag can be read, and before
-    // any plans-dir resolution or write.
-    if persist_plan_opted_out(&repo_root) {
-        return CheckResult::allow();
-    }
     let Some(session_id) = input
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
         return CheckResult::allow();
     };
-
-    let body_hash = sha256_hex(body.as_bytes());
-    let slug = slugify(body);
-    let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
-        return CheckResult::allow();
+    // Opt-out (cadence-hooks#692) is decided inside the resolver, before any
+    // plans-dir resolution or write, against every settings dir it consults.
+    let dest = match resolve_destination(input.cwd.as_deref(), env) {
+        Resolved::To(dest) => dest,
+        Resolved::OptedOut | Resolved::Nowhere => return CheckResult::allow(),
     };
+    let plans_dir = dest.plans_dir;
+
+    let recognizer = Recognizer::new(body, &dest.base, &dest.disposition);
+    let body_hash = recognizer.body_hash.clone();
+    let slug = slugify(body);
     let stem = format!("{local_date}-{slug}");
+    let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
+    // The file this very tool call wrote, when it is a `Write` of this plan
+    // (#861, #1085 review). Decided before the ledger pre-check: a hand copy
+    // the session just saved is the answer, whatever the ledger says.
+    let own_write = adoptable_own_write(input, &plans_dir, body);
     // `claim_target`'s hash check only sees today's stem in this repo. A
     // resumed session after a reboot (marker wiped, same id, same injected
     // prompt, date rolled) or a plan moved since its first persist slips past
@@ -491,17 +524,26 @@ fn persist_plan_body(
     // A same-stem copy still on disk keeps the existing re-fire nudge; any
     // other earlier copy gets a nudge naming it, so a deleted or moved plan
     // re-approved in the same session is never skipped silently.
-    if let Some(earlier) = session_already_persisted(&body_hash, session_id)
+    let user_plans_root = env.user_plans_dir.canonicalize().ok();
+    if own_write.is_none()
+        && let Some(earlier) = session_already_persisted(
+            &recognizer.ledger,
+            &body_hash,
+            session_id,
+            user_plans_root.as_deref(),
+        )
         && !numbered_candidates(&plans_dir, &stem)
             .into_iter()
             .chain(std::iter::once(fallback_path(
                 &plans_dir, &stem, session_id,
             )))
-            .any(|path| file_matches_body(&path, &body_hash))
+            .any(|path| recognizer.holds_this_plan(&path))
     {
-        return CheckResult::nudge(format!(
-            "This session already persisted this plan to {earlier}; no second copy written. \
-             If that copy was deleted on purpose, save the plan by hand."
+        return CheckResult::nudge(refire_nudge(
+            &earlier,
+            &dest.base,
+            approving == Some(session_id),
+            recommended_tier(body),
         ));
     }
 
@@ -516,13 +558,11 @@ fn persist_plan_body(
         .and_then(|tp| cadence_hooks_core::transcript::read_tail(Path::new(tp)));
     let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
-    let branch = current_branch(cwd);
+    let branch = dest.branch;
 
-    let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
     let fields = FrontmatterFields {
         updated: local_date,
         branch: branch.as_deref(),
-        body_hash: &body_hash,
         own_session_id: session_id,
         model: model.as_deref(),
         harness: harness.as_deref(),
@@ -535,13 +575,13 @@ fn persist_plan_body(
         &plans_dir,
         &stem,
         session_id,
-        &body_hash,
+        &recognizer,
         &document,
+        own_write.as_deref(),
         utc_now,
         approving,
         session_id,
         &machine_digest,
-        &repo_root,
         // NOT "an earlier session (<id>)" — `approving` is this session's own
         // id on the same-session path, and naming that "earlier" tells a plan
         // approved in the turn you are reading that it came from a previous
@@ -552,23 +592,23 @@ fn persist_plan_body(
             .unwrap_or_else(|| "an earlier session".to_string()),
         body,
         recommended_tier(body),
+        &dest.disposition,
     )
 }
 
-/// Has this repo or session opted out of the persist (cadence-hooks#692)?
+/// Has this settings dir opted out of the persist (cadence-hooks#692)?
 /// `CADENCE_NO_PERSIST_PLAN` with any non-empty value — the `CADENCE_NO_*`
 /// family's convention (`CADENCE_NO_OUTRO_BACKSTOP`, `CADENCE_NO_FEEDBACK_FOOTER`),
-/// so `"0"`/`"false"` DO opt out; unset or empty to re-enable — read from the
-/// process environment first and then from the repo's
-/// `.claude/settings.local.json` / `.claude/settings.json` `env` block, the
-/// same two sources and the same untrusted-config reader `CADENCE_ALLOW_MAIN`
-/// uses. Advisory tier: no `PROTECTED_GUARDS` treatment, no audit row on the
+/// so `"0"`/`"false"` DO opt out; unset or empty to re-enable — in the dir's
+/// `.claude/settings.local.json` / `.claude/settings.json` `env` block, read
+/// with the same untrusted-config reader `CADENCE_ALLOW_MAIN` uses. The
+/// process-environment half is [`DestinationEnv::opted_out`], checked first.
+/// Advisory tier: no `PROTECTED_GUARDS` treatment, no audit row on the
 /// skip — the flag is the operator's own choice about an advisory write, not
 /// a bypass of a block.
-fn persist_plan_opted_out(repo_root: &Path) -> bool {
-    std::env::var("CADENCE_NO_PERSIST_PLAN").is_ok_and(|v| !v.is_empty())
-        || cadence_hooks_core::config::repo_env_flag(repo_root, "CADENCE_NO_PERSIST_PLAN")
-            .is_some_and(|v| !v.is_empty())
+fn persist_plan_opted_out(dir: &Path) -> bool {
+    cadence_hooks_core::config::repo_env_flag(dir, "CADENCE_NO_PERSIST_PLAN")
+        .is_some_and(|v| !v.is_empty())
 }
 
 /// The current checked-out branch of the repo containing `cwd`, or `None`
@@ -579,24 +619,352 @@ fn current_branch(cwd: &str) -> Option<String> {
     cadence_hooks_core::gitstate::GitState::resolve(Path::new(cwd)).and_then(|gs| gs.branch)
 }
 
-/// Resolve `<repo_root>/docs/plans`, creating it if needed, and return its
-/// canonical path alongside the canonical `repo_root` — but only when the
-/// canonical plans dir actually nests under the canonical repo root. `None`
-/// on any I/O failure, or when it DOESN'T nest: a `docs/plans` (or an
+/// The plans directory used when a repo declares no `CADENCE_PLANS_DIR`.
+const DEFAULT_PLANS_DIR: &str = "docs/plans";
+
+/// The per-repo destination key (cadence-hooks#1021, #560): a path RELATIVE to
+/// the checkout root, read from the repo's `.claude/settings*.json` `env`
+/// block through [`cadence_hooks_core::config::repo_env_flag`]. An empty value
+/// opts the repo out, the same as `CADENCE_NO_PERSIST_PLAN`.
+const PLANS_DIR_KEY: &str = "CADENCE_PLANS_DIR";
+
+/// Process-sourced inputs to [`resolve_destination`] (cadence-hooks#1021),
+/// gathered once by [`DestinationEnv::from_process`] so the resolver itself
+/// never reads the process environment. Tests build this directly, which keeps
+/// an ambient `CLAUDE_PROJECT_DIR`, opt-out, `GH_HOST` or allowlist in the
+/// runner's shell from deciding their verdicts.
+#[derive(Clone)]
+pub struct DestinationEnv {
+    /// `CADENCE_NO_PERSIST_PLAN` is set to a non-empty value in the process
+    /// environment (cadence-hooks#692).
+    pub opted_out: bool,
+    /// The session root: `CLAUDE_PROJECT_DIR`, which Claude Code sets for every
+    /// hook process. `None` (unset, empty, or relative) falls back to the
+    /// payload `cwd`.
+    pub session_root: Option<PathBuf>,
+    /// `CADENCE_ALLOWED_OWNERS`, the same allowlist `guard-push-remote` reads.
+    pub allowed_owners: Vec<AllowEntry>,
+    /// `CADENCE_ALLOWED_REPOS`.
+    pub allowed_repos: Vec<AllowEntry>,
+    /// `CADENCE_EXTRA_HOSTS`.
+    pub extra_hosts: Vec<String>,
+    /// `GH_HOST`, else `github.com`: the host a bare allowlist entry means.
+    pub default_host: String,
+    /// The user-scoped fallback directory, `<config_dir>/cadence/plans`.
+    pub user_plans_dir: PathBuf,
+    /// Would `enforce-worktree` block a commit in this checkout?
+    pub worktree_first: fn(&Path) -> bool,
+}
+
+impl DestinationEnv {
+    /// Read every input from the live process environment.
+    pub fn from_process() -> Self {
+        Self {
+            opted_out: std::env::var("CADENCE_NO_PERSIST_PLAN").is_ok_and(|v| !v.is_empty()),
+            session_root: std::env::var_os("CLAUDE_PROJECT_DIR")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute()),
+            allowed_owners: env_allow_entries("CADENCE_ALLOWED_OWNERS"),
+            allowed_repos: env_allow_entries("CADENCE_ALLOWED_REPOS"),
+            extra_hosts: env_extra_hosts(),
+            default_host: cadence_hooks_core::config::default_host(),
+            user_plans_dir: cadence_hooks_core::paths::claude_config_dir()
+                .join("cadence")
+                .join("plans"),
+            worktree_first: cadence_hooks_core::worktree::would_block_here,
+        }
+    }
+}
+
+/// What the nudge tells the session to do with the file it just got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Disposition {
+    /// A repo destination the resolver could prove. The commit line defers to
+    /// the repo's own policy instead of ordering a commit (#560).
+    Repo,
+    /// The primary checkout of a worktree-first repo, where `enforce-worktree`
+    /// refuses the commit. The plan has to move into the feature worktree
+    /// (#739, #1045).
+    WorktreeFirstPrimary,
+    /// No repo could be proven the right one, so the plan went to the
+    /// user-scoped directory. The payload is a static reason, never text taken
+    /// from a payload or a repo.
+    UserScoped(&'static str),
+}
+
+/// A resolved write target. Both paths are canonical: `plans_dir` is where the
+/// file lands, and `base` is what `plan_path` in `plan-links.jsonl` is made
+/// relative to.
+#[derive(Debug)]
+struct Destination {
+    base: PathBuf,
+    plans_dir: PathBuf,
+    /// The target checkout's branch, for `branch:`. `None` when writing into a
+    /// worktree-first primary, because that branch is the one the plan must NOT
+    /// carry, and always `None` outside a repo.
+    branch: Option<String>,
+    disposition: Disposition,
+}
+
+#[derive(Debug)]
+enum Resolved {
+    /// The repo or the session opted out (#692): write nothing, say nothing.
+    OptedOut,
+    To(Destination),
+    /// Even the user-scoped fallback could not be created. Fail open.
+    Nowhere,
+}
+
+const REASON_NO_ROOT: &str = "no session root or cwd was available";
+const REASON_NO_REPO_ROOT: &str = "the session root is not inside a git repo and its \
+     `.claude/settings.json` sets no CADENCE_PLANS_DIR";
+const REASON_NOT_OWNED: &str = "the target repo has a remote whose owner is not in \
+     CADENCE_ALLOWED_OWNERS (or that allowlist is unset)";
+const REASON_BAD_PLANS_DIR: &str = "the repo's plans directory (CADENCE_PLANS_DIR, default \
+     docs/plans) does not resolve to a directory inside the checkout";
+
+/// Decide where an approved plan lands (cadence-hooks#1021).
+///
+/// The session root (`CLAUDE_PROJECT_DIR`, else the payload `cwd`) decides,
+/// never whichever repo an incidental tool call happened to run in:
+///
+/// - **Root inside a repo.** That repo is the target, unless `cwd` sits in a
+///   linked worktree of the SAME repository, in which case the worktree is
+///   (#739). A `cwd` in any other repo is ignored. The target must be owned
+///   (#1014): every remote's owner must pass `CADENCE_ALLOWED_OWNERS`, or it has
+///   no remotes at all. Only then is its `CADENCE_PLANS_DIR` read, since a
+///   non-owned repo's settings are someone else's config. The plans dir must
+///   nest inside the checkout. A primary that `enforce-worktree` guards gets
+///   the file without a `branch:` value and a move-it note (#1045).
+/// - **Root outside any repo** (a multi-repo wing, #798). Only a
+///   `CADENCE_PLANS_DIR` in the root's own settings names a destination.
+///   Without one the plan is kept out of every repo.
+///
+/// Every case that cannot prove a repo destination writes to the user-scoped
+/// directory and says why. That keeps the plan (the hook's whole job) without
+/// dropping an untracked file into a repo nobody chose.
+fn resolve_destination(cwd: Option<&str>, env: &DestinationEnv) -> Resolved {
+    if env.opted_out {
+        return Resolved::OptedOut;
+    }
+    let Some(root) = env.session_root.clone().or_else(|| cwd.map(PathBuf::from)) else {
+        return user_scoped(env, REASON_NO_ROOT);
+    };
+    let Some(root_repo) = crate::registry::repo_root(&root.to_string_lossy()) else {
+        return resolve_outside_repo(&root, env);
+    };
+    let target = cwd
+        .and_then(|c| linked_worktree_of(Path::new(c), &root_repo))
+        .unwrap_or_else(|| root_repo.clone());
+    // `settings.local.json` is untracked, so it lives only in the checkout it
+    // was written in: read the target first, then the root's checkout.
+    let settings_dirs = [target.as_path(), root_repo.as_path()];
+    if settings_dirs.iter().any(|d| persist_plan_opted_out(d)) {
+        return Resolved::OptedOut;
+    }
+    if !repo_is_owned(&target, env) {
+        return user_scoped(env, REASON_NOT_OWNED);
+    }
+    let configured = settings_dirs
+        .iter()
+        .find_map(|d| cadence_hooks_core::config::repo_env_flag(d, PLANS_DIR_KEY));
+    let relative = match configured.as_deref() {
+        Some("") => return Resolved::OptedOut,
+        Some(rel) => rel,
+        None => DEFAULT_PLANS_DIR,
+    };
+    let Some((base, plans_dir)) = canonical_plans_dir(&target, relative) else {
+        return user_scoped(env, REASON_BAD_PLANS_DIR);
+    };
+    let worktree_first = cadence_hooks_core::gitstate::GitState::resolve(&target)
+        .is_some_and(|g| g.is_primary())
+        && (env.worktree_first)(&target);
+    Resolved::To(Destination {
+        base,
+        plans_dir,
+        branch: if worktree_first {
+            None
+        } else {
+            current_branch(&target.to_string_lossy())
+        },
+        disposition: if worktree_first {
+            Disposition::WorktreeFirstPrimary
+        } else {
+            Disposition::Repo
+        },
+    })
+}
+
+/// The non-repo session root (a wing): only the root's own configured
+/// `CADENCE_PLANS_DIR` names a destination (#798, #1021).
+fn resolve_outside_repo(root: &Path, env: &DestinationEnv) -> Resolved {
+    if persist_plan_opted_out(root) {
+        return Resolved::OptedOut;
+    }
+    match cadence_hooks_core::config::repo_env_flag(root, PLANS_DIR_KEY).as_deref() {
+        Some("") => Resolved::OptedOut,
+        Some(rel) => match canonical_plans_dir(root, rel) {
+            Some((base, plans_dir)) => Resolved::To(Destination {
+                base,
+                plans_dir,
+                branch: None,
+                disposition: Disposition::Repo,
+            }),
+            None => user_scoped(env, REASON_BAD_PLANS_DIR),
+        },
+        None => user_scoped(env, REASON_NO_REPO_ROOT),
+    }
+}
+
+/// The user-scoped fallback destination, or [`Resolved::Nowhere`] when it
+/// cannot be created.
+fn user_scoped(env: &DestinationEnv, reason: &'static str) -> Resolved {
+    if fs::create_dir_all(&env.user_plans_dir).is_err() {
+        return Resolved::Nowhere;
+    }
+    match env.user_plans_dir.canonicalize() {
+        Ok(dir) => Resolved::To(Destination {
+            base: dir.clone(),
+            plans_dir: dir,
+            branch: None,
+            disposition: Disposition::UserScoped(reason),
+        }),
+        Err(_) => Resolved::Nowhere,
+    }
+}
+
+/// The checkout root of `cwd` when it is a LINKED worktree of the same
+/// repository as `root_repo` (same git common dir). `None` otherwise. A `cwd`
+/// in a different repository is not evidence of anything.
+fn linked_worktree_of(cwd: &Path, root_repo: &Path) -> Option<PathBuf> {
+    use cadence_hooks_core::gitstate::GitState;
+    let here = GitState::resolve(cwd)?;
+    if !here.is_linked() {
+        return None;
+    }
+    let root = GitState::resolve(root_repo)?;
+    (here.git_common_dir == root.git_common_dir).then_some(here.repo_root)
+}
+
+/// Is every remote of `repo` owned (cadence-hooks#1014)? A repo with no
+/// remotes is local-only and owned by definition. Otherwise every fetch and
+/// push URL must pass the `guard-push-remote` allowlist check. An unparseable
+/// URL, an empty allowlist, or a failed or timed-out `git remote -v` all read
+/// as not owned. Unprovable counts as not owned, so the plan goes to the
+/// user-scoped directory rather than into someone else's repo.
+///
+/// Every remote, not just `origin`: in a fork checkout the PR branch lands in
+/// the upstream repo, so a plan committed there reaches the upstream PR even
+/// when `origin` is the operator's own fork.
+fn repo_is_owned(repo: &Path, env: &DestinationEnv) -> bool {
+    use cadence_hooks_core::shell::{GitOutput, git_output_detailed};
+    let GitOutput::Ok(listing) = git_output_detailed(&repo.to_string_lossy(), &["remote", "-v"])
+    else {
+        return false;
+    };
+    listing.lines().all(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|url| url_is_owned(url, env))
+    })
+}
+
+/// Does `url` name a repo the allowlists cover?
+///
+/// Bare entries are expanded here against [`DestinationEnv::default_host`]
+/// and the extra hosts, so the shared matcher only ever sees host-qualified
+/// entries and its own `GH_HOST` read cannot change the verdict.
+fn url_is_owned(url: &str, env: &DestinationEnv) -> bool {
+    let Some((host, repo_path)) = cadence_hooks_core::shell::host_and_repo_from_url(url) else {
+        return false;
+    };
+    let (owner, repo) = repo_path
+        .split_once('/')
+        .unwrap_or((repo_path.as_str(), ""));
+    cadence_hooks_core::config::is_allowed_with_extra_hosts(
+        &host,
+        owner,
+        repo,
+        &qualify_entries(&env.allowed_owners, env),
+        &qualify_entries(&env.allowed_repos, env),
+        &[],
+    )
+}
+
+/// Every bare entry becomes one host-qualified entry per host it matches: the
+/// default host and each extra host. Qualified entries pass through.
+fn qualify_entries(entries: &[AllowEntry], env: &DestinationEnv) -> Vec<AllowEntry> {
+    entries
+        .iter()
+        .flat_map(|entry| match entry.host {
+            Some(_) => vec![entry.clone()],
+            None => std::iter::once(&env.default_host)
+                .chain(&env.extra_hosts)
+                .map(|h| AllowEntry {
+                    host: Some(h.to_lowercase()),
+                    ..entry.clone()
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Is `relative` a plain relative path, made only of ordinary components with
+/// at least one of them? Absolute paths, `..`, and an empty or `.`-only value
+/// are refused before anything touches the filesystem. So is any `\\`, on
+/// every platform: it is a separator on Windows and a literal elsewhere, so a
+/// value that means one path on one machine means another on the next. A
+/// `.git` component (any case) is refused too: plans never go in git's own
+/// directory.
+fn is_plain_relative(relative: &str) -> bool {
+    use std::path::Component;
+    if relative.contains('\\') {
+        return false;
+    }
+    let path = Path::new(relative);
+    let mut normal = 0;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) if name.eq_ignore_ascii_case(".git") => return false,
+            Component::Normal(_) => normal += 1,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    normal > 0
+}
+
+/// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
+/// needed, and return its canonical path alongside the canonical `root`. The
+/// result is used only when the canonical plans dir actually nests under the
+/// canonical root. `None` on any I/O failure, on a `relative` that is not
+/// [`is_plain_relative`], or when it does not nest. A `docs/plans` (or an
 /// ancestor, e.g. a symlinked `docs/`) pointing outside the checkout would
 /// otherwise let a plan write escape the repo entirely (cameronsjo/cadence-hooks#396
-/// review) — the same "never trust a path without checking where it actually
-/// resolves" discipline `GitState::resolve` applies to `.git`. Both returned
-/// paths are canonical, so a caller using them for the write target and the
-/// `plan_path` prefix-strip stays internally consistent.
-fn canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
-    let plans_dir = repo_root.join("docs").join("plans");
+/// review). This is the same "never trust a path without checking where it
+/// actually resolves" discipline `GitState::resolve` applies to `.git`.
+///
+/// The nearest EXISTING ancestor is checked before `create_dir_all` runs, so a
+/// symlinked component cannot make the hook create directories outside the
+/// root even though the write itself would be refused. The final path is
+/// checked again after creation. Both returned paths are canonical, so a
+/// caller using them for the write target and the `plan_path` prefix-strip
+/// stays internally consistent.
+fn canonical_plans_dir(root: &Path, relative: &str) -> Option<(PathBuf, PathBuf)> {
+    if !is_plain_relative(relative) {
+        return None;
+    }
+    let canonical_root = root.canonicalize().ok()?;
+    let plans_dir = root.join(relative);
+    let existing = plans_dir.ancestors().find(|a| a.exists())?;
+    if !existing.canonicalize().ok()?.starts_with(&canonical_root) {
+        return None;
+    }
     fs::create_dir_all(&plans_dir).ok()?;
-    let canonical_repo_root = repo_root.canonicalize().ok()?;
     let canonical_plans_dir = plans_dir.canonicalize().ok()?;
     canonical_plans_dir
-        .starts_with(&canonical_repo_root)
-        .then_some((canonical_repo_root, canonical_plans_dir))
+        .starts_with(&canonical_root)
+        .then_some((canonical_root, canonical_plans_dir))
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +1146,8 @@ fn slugify(body: &str) -> String {
 enum Claim {
     /// A fresh file was created and the document written.
     Wrote(PathBuf),
-    /// An existing file already carries this exact body hash — a re-fire.
+    /// An existing file already carries this exact body hash — a re-fire —
+    /// or is the file the triggering `Write` just saved (#861).
     AlreadyPersisted(PathBuf),
     /// Every candidate was occupied by a different plan, or a non-recoverable
     /// I/O error occurred. Never overwrite — give up silently (fail-open).
@@ -851,36 +1220,10 @@ pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
     frontmatter_extent(doc).map(|(start, end, _)| &doc[start..end])
 }
 
-/// Does the document at `path` carry the plan body `body_hash` identifies?
-///
-/// Three sources answer that, tried in order, from a single capped read:
-///
-/// 1. The parsed LEADING frontmatter block's [`FRONTMATTER_HASH_KEY`]
-///    (`body_sha256:`) — the format every document persisted since
-///    cadence-hooks#396 carries from birth. Bounded to the frontmatter
-///    prefix, never a whole-document scan: a living plan's body grows by
-///    design (ticked checkboxes, appended `## Deviations`/`## Learnings`),
-///    and may itself quote this exact key — anchoring anywhere else would let
-///    a body-authored decoy spoof the match, OR let a legitimately mutated
-///    body wrongly defeat it (Design 18).
-/// 2. No frontmatter key (a document predating cadence-hooks#396, or a
-///    backfilled plan carrying only ad-hoc frontmatter) — the LAST
-///    `Plan-body-SHA256:` legacy trailer line, if present. Anchored on the
-///    last occurrence, not the first, so a plan body that itself embeds a
-///    decoy line of that exact shape can never spoof the check.
-/// 3. Neither marker — a document neither trigger wrote, such as a backfilled
-///    plan carrying only frontmatter with no hash key (cadence-hooks#399). The
-///    body is recomputed the way both triggers compute it: strip leading
-///    frontmatter, strip the trailing harness suffix lines and trim, hash.
-///
-/// Only an equality returns `true`; every ambiguity (unreadable, over
-/// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
-/// suffix ladder run.
-/// Bounded read of `path`, capped at [`IDEMPOTENCY_MAX_FILE_BYTES`] — shared
-/// by [`file_matches_body`] and [`file_has_approved_session_id`], which
-/// otherwise duplicated the identical open-take-read-and-size-check
-/// sequence. Caps the read itself rather than stat-then-read: a file over the
-/// cap is not a plan this hook wrote, and must not become an unbounded read.
+/// Bounded read of `path`, capped at [`IDEMPOTENCY_MAX_FILE_BYTES`], for
+/// [`file_matches_body`]. Caps the read itself rather than stat-then-read: a
+/// file over the cap is not a plan this hook wrote, and must not become an
+/// unbounded read.
 /// `None` on any open/read failure or an oversized file.
 fn read_capped_at_idempotency_limit(path: &Path) -> Option<String> {
     use std::io::Read as _;
@@ -898,7 +1241,49 @@ fn read_capped_at_idempotency_limit(path: &Path) -> Option<String> {
     Some(content)
 }
 
-fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+/// Does the document at `path` carry the plan body `body_hash` identifies?
+///
+/// Three sources answer that, tried in order, from a single capped read:
+///
+/// 1. The parsed LEADING frontmatter block's [`FRONTMATTER_HASH_KEY`]
+///    (`body_sha256:`) — carried by documents persisted between
+///    cadence-hooks#396 and the field's retirement (#870); new documents
+///    no longer carry it and fall through to tier 3. Bounded to the frontmatter
+///    prefix, never a whole-document scan: a living plan's body grows by
+///    design (ticked checkboxes, appended `## Deviations`/`## Learnings`),
+///    and may itself quote this exact key — anchoring anywhere else would let
+///    a body-authored decoy spoof the match, OR let a legitimately mutated
+///    body wrongly defeat it (Design 18).
+/// 2. No frontmatter key (a document predating cadence-hooks#396, or a
+///    backfilled plan carrying only ad-hoc frontmatter) — the LAST
+///    `Plan-body-SHA256:` legacy trailer line, if present. Anchored on the
+///    last occurrence, not the first, so a plan body that itself embeds a
+///    decoy line of that exact shape can never spoof the check.
+/// 3. Neither marker — every document persisted since the #870 retirement,
+///    and a backfilled plan carrying only frontmatter with no hash key
+///    (cadence-hooks#399). The body is recomputed the way both triggers
+///    compute it: strip leading frontmatter, strip the trailing harness
+///    suffix lines and trim, hash.
+///
+///    The recompute is compared against BOTH the approval hash and
+///    `past_frontmatter_hash`, the hash of the approval with its own leading
+///    frontmatter block removed: [`render_document`] folds that block into
+///    the hook's, so the hook's own output for a frontmatter-bearing plan
+///    recomputes to the second one (#1085 review).
+///
+/// `tier1_allowed` gates tier 1 (#1085 review): the caller passes `false`
+/// when the ledger knows this path but has no row for this hash, so a
+/// recorded key is only believed where the ledger cannot contradict it.
+///
+/// Only an equality returns `true`; every ambiguity (unreadable, over
+/// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
+/// suffix ladder run.
+fn file_matches(
+    path: &Path,
+    body_hash: &str,
+    past_frontmatter_hash: &str,
+    tier1_allowed: bool,
+) -> bool {
     let Some(content) = read_capped_at_idempotency_limit(path) else {
         return false;
     };
@@ -907,7 +1292,7 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
         fm.lines()
             .find_map(|l| l.strip_prefix(FRONTMATTER_HASH_KEY))
     }) {
-        return yaml_unquote(recorded.trim()) == body_hash;
+        return tier1_allowed && yaml_unquote(recorded.trim()) == body_hash;
     }
 
     if let Some(recorded) = content
@@ -919,19 +1304,287 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
     }
 
     let body = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(&content));
-    sha256_hex(body.as_bytes()) == body_hash
+    let recomputed = sha256_hex(body.as_bytes());
+    recomputed == body_hash || recomputed == past_frontmatter_hash
+}
+
+/// [`file_matches`] for a plan with no frontmatter of its own and no ledger:
+/// the shape the tier tests pin.
+#[cfg(test)]
+fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+    file_matches(path, body_hash, body_hash, true)
+}
+
+/// One `plan-links.jsonl` row, reduced to the fields recognition reads.
+struct LedgerRow {
+    body_hash: String,
+    plan_path: Option<String>,
+    child_session_id: Option<String>,
+}
+
+/// The `plan-links.jsonl` rows, read once per persist from a bounded tail
+/// ([`PLAN_LINKS_SCAN_MAX_BYTES`]), in file order. Both
+/// [`session_already_persisted`] and [`Recognizer::holds_this_plan`] read
+/// these rows. An unreadable ledger is empty, which falls back to the file
+/// checks.
+#[derive(Default)]
+struct PlanLedger {
+    rows: Vec<LedgerRow>,
+}
+
+impl PlanLedger {
+    fn load() -> Self {
+        let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
+        let Some(tail) =
+            cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
+        else {
+            return Self::default();
+        };
+        let rows = tail
+            .lines()
+            .filter_map(|line| {
+                let row = serde_json::from_str::<Value>(line).ok()?;
+                let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+                Some(LedgerRow {
+                    body_hash: text("body_sha256")?,
+                    plan_path: text("plan_path"),
+                    child_session_id: text("child_session_id"),
+                })
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// The rows recording that this hook wrote `plan_path` for this body.
+    fn rows_for<'s>(
+        &'s self,
+        body_hash: &'s str,
+        plan_path: &'s str,
+    ) -> impl Iterator<Item = &'s LedgerRow> + 's {
+        self.rows
+            .iter()
+            .filter(move |r| r.body_hash == body_hash && r.plan_path.as_deref() == Some(plan_path))
+    }
+
+    /// Does any row record `plan_path` for this body?
+    fn wrote(&self, body_hash: &str, plan_path: &str) -> bool {
+        self.rows_for(body_hash, plan_path).next().is_some()
+    }
+
+    /// Does any row name `plan_path`?
+    fn knows_path(&self, plan_path: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.plan_path.as_deref() == Some(plan_path))
+    }
+}
+
+/// Everything that decides whether a file already holds this approval: the
+/// approval's two hashes, the ledger, and how the ledger spells a path.
+struct Recognizer<'a> {
+    /// SHA-256 of the stripped approval text, the ledger key.
+    body_hash: String,
+    /// SHA-256 of the approval past its own leading frontmatter block (equal
+    /// to `body_hash` when it has none) — see [`file_matches`].
+    past_frontmatter_hash: String,
+    ledger: PlanLedger,
+    base: &'a Path,
+    disposition: &'a Disposition,
+}
+
+impl<'a> Recognizer<'a> {
+    fn new(body: &str, base: &'a Path, disposition: &'a Disposition) -> Self {
+        Self::with_ledger(body, base, disposition, PlanLedger::load())
+    }
+
+    fn with_ledger(
+        body: &str,
+        base: &'a Path,
+        disposition: &'a Disposition,
+        ledger: PlanLedger,
+    ) -> Self {
+        let body_hash = sha256_hex(body.as_bytes());
+        let past_frontmatter_hash = match frontmatter_extent(body) {
+            Some(_) => sha256_hex(
+                strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(body)).as_bytes(),
+            ),
+            None => body_hash.clone(),
+        };
+        Self {
+            body_hash,
+            past_frontmatter_hash,
+            ledger,
+            base,
+            disposition,
+        }
+    }
+
+    /// The `plan_path` a ledger row records for `path`. A user-scoped copy
+    /// has no repo to be relative to, so it records where it really is.
+    fn ledger_path(&self, path: &Path) -> String {
+        match self.disposition {
+            Disposition::UserScoped(_) => {
+                cadence_hooks_core::normalize_path(&path.to_string_lossy())
+            }
+            _ => repo_relative(path, self.base),
+        }
+    }
+
+    /// Does the file at `path` hold this approval? It must exist. Then a
+    /// ledger row saying this hook wrote this path for this body answers yes
+    /// (a ticked plan re-approved by another session, #1085 review), but only
+    /// when the file's own leading `session_id:` names that row's writer.
+    /// `plan_path` is repo-relative and the row names no repo, so without
+    /// that check a row from another checkout sharing the metrics dir, or a
+    /// path deleted and reused by a different plan, would pass a foreign file
+    /// off as this one and the approval would be lost. Otherwise
+    /// [`file_matches`] decides, with the legacy tier allowed where the
+    /// ledger does not know the path or records it for this body.
+    fn holds_this_plan(&self, path: &Path) -> bool {
+        if fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        let plan_path = self.ledger_path(path);
+        let writers: Vec<&str> = self
+            .ledger
+            .rows_for(&self.body_hash, &plan_path)
+            .filter_map(|r| r.child_session_id.as_deref())
+            .collect();
+        if !writers.is_empty()
+            && frontmatter_session_id(path).is_some_and(|sid| writers.contains(&sid.as_str()))
+        {
+            return true;
+        }
+        file_matches(
+            path,
+            &self.body_hash,
+            &self.past_frontmatter_hash,
+            !self.ledger.knows_path(&plan_path) || self.ledger.wrote(&self.body_hash, &plan_path),
+        )
+    }
+}
+
+/// The first `session_id:` in the file's leading frontmatter block. The hook
+/// emits its own lines first and drops a plan-authored `session_id:`, so on a
+/// document this hook rendered this is the writer's id.
+fn frontmatter_session_id(path: &Path) -> Option<String> {
+    let content = read_capped_at_idempotency_limit(path)?;
+    let recorded = leading_frontmatter_block(&content)?
+        .lines()
+        .find_map(|l| l.strip_prefix("session_id:"))?;
+    Some(yaml_unquote(recorded.trim()))
+}
+
+/// Normalize a plan text for the own-write affinity check: drop leading
+/// frontmatter and the harness suffix lines, untick checkboxes, and collapse
+/// blank runs, so a hand copy that only ticked a step or reflowed blank lines
+/// still compares equal to the approval.
+fn affinity_normal_form(text: &str) -> String {
+    let stripped = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(text));
+    let mut out: Vec<String> = Vec::new();
+    let mut previous_blank = false;
+    for line in stripped.lines() {
+        let line = line.trim_end();
+        let blank = line.is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        previous_blank = blank;
+        let indent = line.len() - line.trim_start().len();
+        let rest = &line[indent..];
+        let unticked = ["- [x]", "- [X]", "* [x]", "* [X]"]
+            .iter()
+            .find_map(|ticked| rest.strip_prefix(ticked))
+            .map(|tail| format!("{}- [ ]{tail}", &line[..indent]));
+        out.push(unticked.unwrap_or_else(|| line.to_string()));
+    }
+    out.join("\n")
+}
+
+/// Does `content` look like this approval (#1085 review)? Either it is the
+/// approval up to [`affinity_normal_form`], or its first ATX heading past
+/// frontmatter is the approval's first heading line verbatim. An approval
+/// with nothing past its frontmatter has no affinity with anything, so an
+/// empty file is never adopted.
+fn has_affinity(content: &str, body: &str) -> bool {
+    let approval = affinity_normal_form(body);
+    if approval.is_empty() {
+        return false;
+    }
+    if affinity_normal_form(content) == approval {
+        return true;
+    }
+    let first_heading = |text: &str| {
+        strip_leading_frontmatter(text)
+            .lines()
+            .find(|line| heading_text(line).is_some())
+            .map(|line| line.trim().to_string())
+    };
+    first_heading(body).is_some_and(|heading| first_heading(content) == Some(heading))
+}
+
+/// The plan file the triggering `Write` just saved, when the hook should adopt
+/// it as the persisted plan instead of writing its own copy
+/// (cameronsjo/cadence-hooks#861).
+///
+/// An approve-and-clear session that saves the plan by hand as its first tool
+/// call fires the injected arm on that Write, and the hand copy (its own
+/// frontmatter, a ticked step, often another filename) no longer hashes to the
+/// approval. Adoption needs every one of (#1085 review):
+///
+/// - the tool is `Write` and names a path; a relative path resolves against
+///   the payload `cwd`, and without an absolute `cwd` there is nothing to adopt;
+/// - the path is a regular `.md` file, not a symlink (`symlink_metadata`);
+/// - its parent is exactly the canonical `plans_dir`, so a Write anywhere else
+///   never counts;
+/// - the content has [`has_affinity`] with the approval, so a Write of some
+///   other document into the plans dir never certifies it.
+///
+/// The model supplies `file_path`, so the most it can do here is stop the hook
+/// writing its own copy of a plan it demonstrably just saved; it can never
+/// cause a write or a read outside `plans_dir`.
+fn adoptable_own_write(input: &HookInput, plans_dir: &Path, body: &str) -> Option<PathBuf> {
+    if input.tool_name() != Some("Write") {
+        return None;
+    }
+    let raw = PathBuf::from(input.file_path()?);
+    let path = if raw.is_absolute() {
+        raw
+    } else {
+        let cwd = PathBuf::from(input.cwd.as_deref()?);
+        if !cwd.is_absolute() {
+            return None;
+        }
+        cwd.join(raw)
+    };
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return None;
+    }
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    if path.parent()?.canonicalize().ok()? != plans_dir {
+        return None;
+    }
+    let adopted = plans_dir.join(path.file_name()?);
+    if !fs::symlink_metadata(&adopted).ok()?.file_type().is_file() {
+        return None;
+    }
+    let content = read_capped_at_idempotency_limit(&adopted)?;
+    has_affinity(&content, body).then_some(adopted)
 }
 
 /// Try each candidate in order with `create_new` (O_EXCL): a fresh path wins
-/// outright; an occupied path is re-checked by
-/// [`file_matches_body`] — a match is a re-fire (idempotent skip), a mismatch
-/// tries the next candidate. Never overwrites anything.
+/// outright; an occupied path is re-checked by `holds_this_plan` (in
+/// production [`Recognizer::holds_this_plan`]) — a match is a re-fire
+/// (idempotent skip), a mismatch tries the next candidate. Never overwrites
+/// anything.
 fn claim_target(
     dir: &Path,
     stem: &str,
     session_id: &str,
-    body_hash: &str,
     document: &str,
+    holds_this_plan: &dyn Fn(&Path) -> bool,
 ) -> Claim {
     let mut candidates = numbered_candidates(dir, stem);
     candidates.push(fallback_path(dir, stem, session_id));
@@ -950,7 +1603,7 @@ fn claim_target(
                 return Claim::GiveUp;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if file_matches_body(&path, body_hash) {
+                if holds_this_plan(&path) {
                     return Claim::AlreadyPersisted(path);
                 }
                 // Different plan at this path — try the next suffix.
@@ -979,8 +1632,6 @@ struct FrontmatterFields<'a> {
     updated: &'a str,
     /// The cwd's current checked-out branch, if resolvable.
     branch: Option<&'a str>,
-    /// The plan body's SHA-256 hex digest — the tier-1 idempotency anchor.
-    body_hash: &'a str,
     /// The executing session's id.
     own_session_id: &'a str,
     /// The executing session's model, resolved from its own transcript tail.
@@ -1068,12 +1719,13 @@ fn render_frontmatter(f: &FrontmatterFields) -> String {
 /// the plan's OWN leading block already carries — [`render_document`] passes
 /// them so a living plan's recorded `status`/`updated`/`branch` wins over the
 /// hook's birth defaults (cadence-hooks#738). The identity keys
-/// (`body_sha256`, `session_id`, `model`, `harness`, `machine`,
-/// `approved_session_id`) are always emitted: they are this persist's
-/// provenance, not plan state. `session` and `approved_in` are no longer
-/// emitted — the session id carries every join a name used to — but both stay
-/// in [`HOOK_OWNED_KEYS`], so a plan-authored line claiming either is still
-/// dropped rather than passed through as forged attribution.
+/// (`session_id`, `model`, `harness`, `machine`, `approved_session_id`) are
+/// always emitted: they are this persist's provenance, not plan state.
+/// `session` and `approved_in` are no longer emitted — the session id carries
+/// every join a name used to — and `body_sha256` was retired
+/// (cameronsjo/cadence-hooks#870), but all three stay in [`HOOK_OWNED_KEYS`],
+/// so a plan-authored line claiming one is still dropped rather than passed
+/// through as forged attribution or a spoofed legacy idempotency anchor.
 fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<String> {
     let owned = |key: &str| plan_keys.contains(&key);
     let mut lines = Vec::new();
@@ -1091,10 +1743,6 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
             yaml_quote(&identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
         ));
     }
-    lines.push(format!(
-        "{FRONTMATTER_HASH_KEY} {}",
-        yaml_quote(f.body_hash)
-    ));
     lines.push(format!("session_id: {}", yaml_quote(f.own_session_id)));
     if let Some(m) = f.model {
         lines.push(format!(
@@ -1126,7 +1774,9 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
 /// `session` and `approved_in` are SUPPRESSED-ONLY as of 0.98.0: this hook no
 /// longer emits them, but a plan that authors either would otherwise smuggle a
 /// forged session attribution into the persisted document, so they stay on the
-/// drop list. The set is deliberately larger than the emitted set.
+/// drop list. `body_sha256` joined them when the field was retired (#870): a
+/// plan-authored copy rendered by this hook would otherwise satisfy
+/// [`file_matches`]'s legacy tier. The set is deliberately larger than the emitted set.
 const HOOK_OWNED_KEYS: [&str; 8] = [
     "body_sha256",
     "session",
@@ -1200,17 +1850,34 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{rest}\n", lines.join("\n"))
 }
 
-/// The model-check directive, verbatim from the plan doc — the ONLY text
-/// [`Tier`] contributes to it is [`Tier::as_str`]'s canonical name. Shared by
-/// [`persist_and_nudge`] and the dir-scan-skip repair so the two nudge sites
-/// can never drift onto different wording for the same instruction.
+/// The driver-announcement reminder (cameronsjo/cadence-hooks#608). attune
+/// requires a bold driver line right after approval; this hook already fires
+/// at that moment, so it carries the reminder. Static text only: the hook
+/// does not render the plan's own trigger or tier into it, it points the
+/// session at the `## Orchestrator` block to derive them.
+const DRIVER_ANNOUNCE_REMINDER: &str = "Announce the driver in your next message, derived \
+     from the plan's `## Orchestrator` block: \"**Plan approved — Sonnet-drivable**\" or \
+     \"**Plan approved — needs an Opus driver: <trigger>**\" (cadence:attune).";
+
+/// The model-check directive — the ONLY text [`Tier`] contributes to it is
+/// [`Tier::as_str`]'s canonical name.
+///
+/// The compare-and-ask comes first and is unconditional
+/// (cameronsjo/cadence-hooks#823, matching cameronsjo/cadence#1212's skill
+/// wording): equal is the only pass, a stronger running model is a mismatch
+/// exactly as a weaker one is, and dispatching workers at the target tier or
+/// handing the session down is something to offer IN the ask, never a way
+/// around it. The earlier copy led with "dispatch workers at {t} or hand the
+/// session down" and gated the compare on "about to execute inline", which a
+/// session read as permission to skip the ask.
 fn model_check_directive(tier: Tier) -> String {
     let t = tier.as_str();
     format!(
-        "This plan's recommended driver is {t}: dispatch workers at {t} or hand the session \
-         down; if you are about to execute inline, compare {t} against your running model \
-         (the \"You are powered by\" line) and on a tier mismatch pause and ask before the \
-         first implementation step."
+        "This plan's recommended driver is {t}. Before the first implementation step, compare \
+         {t} against your running model (the \"You are powered by\" line): equal is the only \
+         pass. On any difference, a stronger running model included, pause and ask the \
+         operator how to proceed. Dispatching workers at {t} or handing the session down is an \
+         option to offer in that ask, not a way to skip it."
     )
 }
 
@@ -1238,30 +1905,37 @@ fn persist_and_nudge(
     plans_dir: &Path,
     stem: &str,
     session_id: &str,
-    body_hash: &str,
+    recognizer: &Recognizer,
     document: &str,
+    own_write: Option<&Path>,
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
     machine_digest: &str,
-    repo_root: &Path,
     approved_label: &str,
     plan_body: &str,
     recommended_tier: Option<Tier>,
+    disposition: &Disposition,
 ) -> CheckResult {
-    let path = match claim_target(plans_dir, stem, session_id, body_hash, document) {
-        Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
-        Claim::GiveUp => return CheckResult::allow(),
+    // A hand copy the triggering Write just saved is the plan (#861); it is
+    // adopted without touching the ladder, whatever its name.
+    let path = match own_write {
+        Some(adopted) => adopted.to_path_buf(),
+        None => match claim_target(plans_dir, stem, session_id, document, &|candidate| {
+            recognizer.holds_this_plan(candidate)
+        }) {
+            Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
+            Claim::GiveUp => return CheckResult::allow(),
+        },
     };
 
-    let plan_path_rel = repo_relative(&path, repo_root);
     append_plan_links_row(&plan_links_row(
         utc_now,
         parent_session_id,
         child_session_id,
         machine_digest,
-        &plan_path_rel,
-        body_hash,
+        &recognizer.ledger_path(&path),
+        &recognizer.body_hash,
         recommended_tier.map(Tier::as_str),
     ));
 
@@ -1269,6 +1943,14 @@ fn persist_and_nudge(
         "Approved plan persisted to {} (approved in {approved_label}).",
         path.display()
     );
+    // The announcement is owed by the session that approved the plan, so
+    // only a same-session approval carries it. On an approve-and-clear pickup
+    // the approving session is the parent; the child only runs the model
+    // check below.
+    if parent_session_id == Some(child_session_id) {
+        nudge.push(' ');
+        nudge.push_str(DRIVER_ANNOUNCE_REMINDER);
+    }
     // The model-check directive lands between the persist confirmation and
     // the format-gate sentences — only when a tier was actually parsed
     // (see [`recommended_tier`]); the hook has no way to know the LIVE
@@ -1278,9 +1960,7 @@ fn persist_and_nudge(
         nudge.push_str(&model_check_directive(tier));
     }
     nudge.push(' ');
-    nudge.push_str(
-        "Verify placement, then commit it (explicit-path git add) before implementation.",
-    );
+    nudge.push_str(&disposition_sentence(disposition));
     // Evaluated only after the claim succeeded: the persistence write must
     // never depend on the detectors — a future panic here eats the format-gate
     // line, never the persist (security review of this change). One composed
@@ -1296,6 +1976,27 @@ fn persist_and_nudge(
         ));
     }
     CheckResult::nudge(nudge)
+}
+
+/// The follow-up instruction for each [`Disposition`]. None of them orders a
+/// commit outright (#560): the repo's own instructions decide whether plans are
+/// committed at all, and the hook cannot see them.
+fn disposition_sentence(disposition: &Disposition) -> String {
+    match disposition {
+        Disposition::Repo => "Verify placement against this repo's own plan and commit \
+             conventions (its CLAUDE.md overrides this line); where those commit plans, commit \
+             it with an explicit-path git add before implementation."
+            .to_string(),
+        Disposition::WorktreeFirstPrimary => "Verify placement, but do not commit it here: \
+             this is the primary checkout of a worktree-first repo, where enforce-worktree \
+             refuses the commit. Move it into the feature worktree with the first feature \
+             commit, and add a `branch:` frontmatter line naming the feature branch."
+            .to_string(),
+        Disposition::UserScoped(reason) => format!(
+            "Verify placement: {reason}, so the plan was kept out of every repo. Nothing to \
+             commit here; if it belongs in a repo, move it into that repo's plans directory."
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,7 +2049,7 @@ fn plan_links_row(
     row
 }
 
-/// How much of `plan-links.jsonl`'s tail [`session_already_persisted`] reads.
+/// How much of `plan-links.jsonl`'s tail [`PlanLedger::load`] reads.
 /// Rows run ~350 bytes, so this covers thousands of recent persists.
 // debt: a row older than this window no longer suppresses; raise it or index by session if a resume that late ever duplicates.
 const PLAN_LINKS_SCAN_MAX_BYTES: u64 = 1024 * 1024;
@@ -1356,8 +2057,60 @@ const PLAN_LINKS_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// Longest ledger `plan_path` echoed back into the re-fire nudge.
 const MAX_ECHOED_PLAN_PATH_LEN: usize = 200;
 
+/// The re-fire nudge for a plan this session already persisted (#1085
+/// review): the wording says whether the earlier copy is still on disk, and a
+/// same-session re-approval still gets the #608 announcement reminder and the
+/// #823 model check, since it is an approval like any other.
+fn refire_nudge(
+    earlier: &EarlierCopy,
+    base: &Path,
+    same_session: bool,
+    tier: Option<Tier>,
+) -> String {
+    let label = &earlier.label;
+    let still_there = earlier.path.as_deref().map(|p| {
+        let p = Path::new(p);
+        if p.is_absolute() {
+            p.exists()
+        } else {
+            base.join(p).exists()
+        }
+    });
+    let mut nudge = match still_there {
+        Some(true) => format!(
+            "This session already persisted this plan to {label}, which is still there; no \
+             second copy written."
+        ),
+        Some(false) => format!(
+            "This session already persisted this plan to {label}, which is no longer there; \
+             no second copy written. If it was deleted on purpose, save the plan by hand."
+        ),
+        None => format!(
+            "This session already persisted this plan to {label}; no second copy written. If \
+             that copy was deleted on purpose, save the plan by hand."
+        ),
+    };
+    if same_session {
+        nudge.push(' ');
+        nudge.push_str(DRIVER_ANNOUNCE_REMINDER);
+        if let Some(tier) = tier {
+            nudge.push(' ');
+            nudge.push_str(&model_check_directive(tier));
+        }
+    }
+    nudge
+}
+
+/// An earlier persist found in the ledger: the label for the nudge, and the
+/// recorded path when it passed [`echoable_plan_path`]'s filter (only then is
+/// it stat-ed).
+struct EarlierCopy {
+    label: String,
+    path: Option<String>,
+}
+
 /// Has this session already persisted this exact plan body? Returns the
-/// earlier copy's label for the nudge when it has.
+/// earlier copy for the nudge when it has.
 ///
 /// Keyed on (`body_sha256`, `child_session_id`) in the durable ledger, which
 /// survives the reboot that wipes the injected arm's temp-dir marker. The
@@ -1366,33 +2119,80 @@ const MAX_ECHOED_PLAN_PATH_LEN: usize = 200;
 /// different session approving the same text is a new approval. The ledger
 /// is per metrics dir, and an unreadable one reads as "not persisted" (fail
 /// open toward writing).
-fn session_already_persisted(body_hash: &str, session_id: &str) -> Option<String> {
-    let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
-    let tail = cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)?;
-    tail.lines()
-        .filter(|line| line.contains(body_hash) && line.contains(session_id))
-        .find_map(|line| {
-            let row = serde_json::from_str::<Value>(line).ok()?;
-            let matches = row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
-                && row.get("child_session_id").and_then(Value::as_str) == Some(session_id);
-            matches.then(|| echoable_plan_path(row.get("plan_path").and_then(Value::as_str)))
+fn session_already_persisted(
+    ledger: &PlanLedger,
+    body_hash: &str,
+    session_id: &str,
+    user_plans_root: Option<&Path>,
+) -> Option<EarlierCopy> {
+    ledger
+        .rows
+        .iter()
+        .find(|r| r.body_hash == body_hash && r.child_session_id.as_deref() == Some(session_id))
+        .map(|r| {
+            let recorded = r.plan_path.as_deref();
+            let label = echoable_plan_path(recorded, user_plans_root);
+            let path = recorded
+                .filter(|_| label.starts_with('`'))
+                .map(str::to_string);
+            EarlierCopy { label, path }
         })
 }
 
-/// The ledger's `plan_path` when it is a plain repo-relative path, else a
-/// generic label. The ledger is a local file, but its text reaches the model
-/// through the nudge, so only a narrow charset passes through.
-fn echoable_plan_path(plan_path: Option<&str>) -> String {
+/// The ledger's `plan_path` when it is a plain repo-relative path, or an
+/// absolute path under the user-scoped plans dir (`user_plans_root`,
+/// canonical), else a generic label. The ledger is a local file, but its text
+/// reaches the model through the nudge, so only a narrow charset passes
+/// through.
+///
+/// The ledger stores the path forward-slash normalized
+/// ([`cadence_hooks_core::normalize_path`]), so containment is a string
+/// prefix test against the root normalized the same way — a native
+/// `Path::starts_with` never matches on Windows, where the root is
+/// `\\?\C:\…` and the ledger text `//?/C:/…`. On Windows only, the
+/// drive prefix (`C:` or `//?/C:`) of an absolute path is exempt from the
+/// charset; everything after it is held to the same charset as elsewhere.
+fn echoable_plan_path(plan_path: Option<&str>, user_plans_root: Option<&Path>) -> String {
     plan_path
         .filter(|p| {
+            let drive_tail = if cfg!(windows) {
+                strip_windows_drive(p)
+            } else {
+                None
+            };
+            let checked = if p.starts_with('/') || drive_tail.is_some() {
+                let Some(root) = user_plans_root else {
+                    return false;
+                };
+                let root = cadence_hooks_core::normalize_path(&root.to_string_lossy());
+                if !p
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    return false;
+                }
+                drive_tail.unwrap_or(p)
+            } else {
+                p
+            };
             p.ends_with(".md")
                 && p.len() <= MAX_ECHOED_PLAN_PATH_LEN
-                && !p.starts_with('/')
                 && !p.contains("..")
-                && p.bytes()
+                && checked
+                    .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         })
         .map_or_else(|| "an earlier copy".to_string(), |p| format!("`{p}`"))
+}
+
+/// The rest of a forward-slash Windows absolute path after its drive prefix
+/// (`C:/…` or the verbatim `//?/C:/…`), starting at that `/`; `None` for any
+/// other shape. Pure string logic so it is testable off Windows; the caller
+/// applies it only under `cfg!(windows)`.
+fn strip_windows_drive(p: &str) -> Option<&str> {
+    let rest = p.strip_prefix("//?/").unwrap_or(p);
+    let b = rest.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/').then(|| &rest[2..])
 }
 
 /// Append one row to `<metrics_dir>/plan-links.jsonl`. Fully fail-open
@@ -1404,7 +2204,7 @@ fn append_plan_links_row(row: &Value) {
         return;
     }
     let path = dir.join("plan-links.jsonl");
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = cadence_hooks_metrics::open_ledger(&path) {
         // One `write_all` of the record + newline (POSIX O_APPEND makes this
         // single small write atomic), so a concurrent append from another
         // session can't interleave a record with its trailing newline — same
@@ -1585,13 +2385,9 @@ mod tests {
     #[test]
     fn claim_target_writes_fresh_file() {
         let tmp = TempDir::new().unwrap();
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "content-a",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-a", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         match claim {
             Claim::Wrote(path) => {
                 assert_eq!(path, tmp.path().join("2026-07-20-x.md"));
@@ -1607,13 +2403,9 @@ mod tests {
         let path = tmp.path().join("2026-07-20-x.md");
         fs::write(&path, doc_with_hash("hash-a")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "content-a",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-a", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         match claim {
             Claim::AlreadyPersisted(p) => assert_eq!(p, path),
             _ => panic!("expected an idempotent skip"),
@@ -1627,13 +2419,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("2026-07-20-x.md"), doc_with_hash("hash-a")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-b",
-            "content-b",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-b", &|p| {
+            file_matches_body(p, "hash-b")
+        });
         match claim {
             Claim::Wrote(path) => assert_eq!(path, tmp.path().join("2026-07-20-x-2.md")),
             _ => panic!("expected the -2 suffix to be claimed"),
@@ -1646,7 +2434,9 @@ mod tests {
         // time we get to it, but carries our OWN hash — same as a re-fire.
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("2026-07-20-x.md"), doc_with_hash("hash-a")).unwrap();
-        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "hash-a", "ignored");
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         assert!(matches!(claim, Claim::AlreadyPersisted(_)));
     }
 
@@ -1660,8 +2450,8 @@ mod tests {
             tmp.path(),
             "2026-07-20-x",
             "sid12345",
-            "hash-new",
             "content-new",
+            &|p| file_matches_body(p, "hash-new"),
         );
         match claim {
             Claim::Wrote(path) => {
@@ -1680,13 +2470,9 @@ mod tests {
         let fallback = fallback_path(tmp.path(), "2026-07-20-x", "sid12345");
         fs::write(&fallback, doc_with_hash("hash-new")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-new",
-            "ignored",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-new")
+        });
         match claim {
             Claim::AlreadyPersisted(path) => assert_eq!(path, fallback),
             _ => panic!("expected the fallback re-fire to be idempotent"),
@@ -1702,13 +2488,9 @@ mod tests {
         let fallback = fallback_path(tmp.path(), "2026-07-20-x", "sid12345");
         fs::write(&fallback, doc_with_hash("someone-elses-hash")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-new",
-            "ignored",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-new")
+        });
         assert!(
             matches!(claim, Claim::GiveUp),
             "no further ladder beyond the fallback — must give up, never overwrite"
@@ -1857,13 +2639,9 @@ mod tests {
         )
         .unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            &body_hash,
-            "ignored",
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, &body_hash)
+        });
         match claim {
             Claim::AlreadyPersisted(path) => assert_eq!(path, base),
             _ => panic!("a backfilled doc holding this exact body is a re-fire, not a new plan"),
@@ -1889,7 +2667,9 @@ mod tests {
         )
         .unwrap();
 
-        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "hash-a", "ignored");
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         assert!(
             matches!(claim, Claim::AlreadyPersisted(_)),
             "must anchor on the LAST hash line, not the decoy"
@@ -2017,8 +2797,8 @@ mod tests {
     #[test]
     fn canonical_plans_dir_resolves_normally_when_nested() {
         let repo = TempDir::new().unwrap();
-        let (canonical_repo, canonical_plans) =
-            canonical_plans_dir(repo.path()).expect("plans dir resolves under a plain repo root");
+        let (canonical_repo, canonical_plans) = canonical_plans_dir(repo.path(), DEFAULT_PLANS_DIR)
+            .expect("plans dir resolves under a plain repo root");
         assert!(canonical_plans.starts_with(&canonical_repo));
         assert!(
             canonical_plans.ends_with("docs/plans") || canonical_plans.ends_with("docs\\plans")
@@ -2037,7 +2817,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).unwrap();
 
         assert!(
-            canonical_plans_dir(repo.path()).is_none(),
+            canonical_plans_dir(repo.path(), DEFAULT_PLANS_DIR).is_none(),
             "a docs/ symlink escaping the repo root must be refused"
         );
     }
@@ -2060,8 +2840,14 @@ mod tests {
             &tmp.path().join("sid12345.jsonl").to_string_lossy(),
             Some(false),
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
-        assert_eq!(r.outcome, Outcome::Allow);
+        let user_dir = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            ..base_env(&user_dir.path().join("plans"))
+        };
+        let metrics_dir = TempDir::new().unwrap();
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &env)
+        });
         assert!(
             !outside
                 .path()
@@ -2070,15 +2856,23 @@ mod tests {
                 .exists(),
             "nothing must be written outside the repo via the symlinked docs/"
         );
+        assert!(
+            !outside.path().join("plans").exists(),
+            "the escape is refused before create_dir_all runs, so no dir appears outside either"
+        );
+        // Fail-safe (cadence-hooks#1021): an unresolvable repo plans dir keeps
+        // the plan in the user-scoped dir rather than dropping it.
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(user_dir.path().join("plans/2026-07-20-x.md").exists());
+        assert!(r.message.unwrap().contains(REASON_BAD_PLANS_DIR));
     }
 
     // --- cross-trigger hash normalization (Design 18) ---
 
-    fn base_fields<'a>(body_hash: &'a str, machine_digest: &'a str) -> FrontmatterFields<'a> {
+    fn base_fields(machine_digest: &str) -> FrontmatterFields<'_> {
         FrontmatterFields {
             updated: "2026-07-25",
             branch: None,
-            body_hash,
             own_session_id: "own-sid",
             model: None,
             harness: None,
@@ -2089,10 +2883,13 @@ mod tests {
 
     #[test]
     fn render_frontmatter_omits_unresolved_optional_fields() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let fm = render_frontmatter(&fields);
         assert!(fm.starts_with("---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\n"));
-        assert!(fm.contains("body_sha256: \"hash\""));
+        assert!(
+            !fm.contains("body_sha256"),
+            "the retired body hash is never emitted (#870): {fm}"
+        );
         assert!(
             !fm.lines().any(|l| l.starts_with("session: ")),
             "the name-bearing `session:` key is no longer emitted: {fm}"
@@ -2124,7 +2921,7 @@ mod tests {
 
     #[test]
     fn render_frontmatter_includes_every_resolved_field() {
-        let mut fields = base_fields("hash", "digest");
+        let mut fields = base_fields("digest");
         fields.branch = Some("feat/x");
         fields.model = Some("claude-fable-5");
         fields.harness = Some("2.1.220");
@@ -2146,7 +2943,7 @@ mod tests {
         // validated by this hook — a value embedding a literal `"` or `\`
         // must not break the block's YAML shape (cameronsjo/cadence-hooks#396
         // review).
-        let mut fields = base_fields("hash", "digest");
+        let mut fields = base_fields("digest");
         fields.model = Some(r#"weird"model\name"#);
         let fm = render_frontmatter(&fields);
         assert!(
@@ -2157,7 +2954,7 @@ mod tests {
 
     #[test]
     fn render_document_places_body_after_the_closing_fence() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "# Title\n\nbody text");
         let (frontmatter, body) = doc
             .split_once("---\n\n")
@@ -2170,7 +2967,7 @@ mod tests {
     fn render_document_merges_into_a_plan_s_own_frontmatter_block() {
         // cadence-hooks#738: a template-authored plan already opens with its
         // own block; the hook must MERGE, never stack a second block on top.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body =
             "---\nstatus: done\nnext: \"ship it\"\nbranch: feat/x\n---\n\n# Title\n\nbody text";
         let doc = render_document(&fields, body);
@@ -2182,7 +2979,7 @@ mod tests {
         // Hook-owned lines first (`updated` was absent from the plan's block,
         // so the hook supplies it; `status`/`branch` are the plan's), then the
         // plan's own lines verbatim, then the one closing fence.
-        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nbody_sha256: \"hash\"\n"));
+        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nsession_id: \"own-sid\"\n"));
         assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         assert_eq!(doc.matches("\nstatus:").count(), 1, "{doc}");
         assert!(!doc.contains("status: \"in-flight\""));
@@ -2202,7 +2999,7 @@ mod tests {
     fn render_document_merge_copies_plan_keys_verbatim_without_interpreting_them() {
         // Untrusted content: odd but well-formed lines pass through unchanged,
         // and only a column-0 `ident:` suppresses a hook default.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body = "---\n  status: nested-is-not-top-level\n# status: a comment\nweird key: \"x\"\n---\nbody";
         let doc = render_document(&fields, body);
         assert!(doc.contains("\n  status: nested-is-not-top-level\n"));
@@ -2220,7 +3017,7 @@ mod tests {
         // A plan block declaring the hook's provenance keys must not be able
         // to forge them: its lines are dropped, the hook's come first, and
         // each hook-owned key appears exactly once with the hook's value.
-        let fields = base_fields("real-hash", "real-digest");
+        let fields = base_fields("real-digest");
         let body = "---\nbody_sha256: \"forged\"\nsession_id: \"forged-sid\"\n\
                     approved_session_id: \"forged-approver\"\nmachine: \"forged-machine\"\n\
                     status: done\n---\n\nbody";
@@ -2230,7 +3027,10 @@ mod tests {
             let count = doc.matches(&format!("\n{key}:")).count();
             assert!(count <= 1, "{key} appears {count} times:\n{doc}");
         }
-        assert!(doc.contains("\nbody_sha256: \"real-hash\"\n"));
+        assert!(
+            !doc.contains("body_sha256"),
+            "a plan-authored body_sha256 is dropped and the hook emits none (#870): {doc}"
+        );
         assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         assert!(doc.contains("\nmachine: \"real-digest\"\n"));
         // The plan's non-owned key survives, after the hook's lines.
@@ -2247,7 +3047,7 @@ mod tests {
     /// persisted verbatim.
     #[test]
     fn render_document_drops_plan_authored_session_and_approved_in_lines() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body = "---\nstatus: \"planned\"\nsession: \"forged-name\"\napproved_in: \"forged-parent\"\n---\n\n# Plan\n";
         let doc = render_document(&fields, body);
         assert!(
@@ -2273,10 +3073,10 @@ mod tests {
     fn render_document_merge_keeps_hook_keys_ahead_of_a_malformed_plan_line() {
         // An unterminated quote on the plan's last line can only swallow what
         // follows it — and nothing hook-owned follows it any more.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "---\ntitle: \"unterminated\n---\nbody");
         let (frontmatter, _) = doc.split_once("---\n\n").unwrap();
-        let hook_at = frontmatter.find("\nbody_sha256:").unwrap();
+        let hook_at = frontmatter.find("\nsession_id:").unwrap();
         let plan_at = frontmatter.find("\ntitle:").unwrap();
         assert!(hook_at < plan_at, "{doc}");
         assert!(frontmatter.ends_with("\ntitle: \"unterminated\n"));
@@ -2286,7 +3086,7 @@ mod tests {
     fn render_document_without_a_closing_fence_is_not_a_frontmatter_block() {
         // A body that merely starts with `---` and never closes it is prose;
         // the hook's block is prepended as usual.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "---\nnot a block\n\n# Title");
         assert!(doc.starts_with("---\nstatus: \"in-flight\"\n"));
         assert!(doc.contains("---\n\n---\nnot a block\n\n# Title\n"));
@@ -2443,30 +3243,110 @@ mod tests {
         let plans_dir = tmp.path().join("docs/plans");
         fs::create_dir_all(&plans_dir).unwrap();
         let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
-        let r = persist_and_nudge(
-            &plans_dir,
-            "2026-08-16-x",
-            "session-id",
-            "hash",
-            "document text",
-            "2026-08-16T00:00:00Z",
-            None,
-            "session-id",
-            "digest",
-            tmp.path(),
-            "unknown",
-            body,
-            recommended_tier(body),
-        );
+        // Pinned to a throwaway metrics dir under the shared lock: an unlocked
+        // call appends a placeholder row to whatever `CADENCE_METRICS_DIR` a
+        // sibling has set (#1062) or to the live ledger (#768).
+        let r = with_scratch_metrics_dir(|| {
+            persist_and_nudge(
+                &plans_dir,
+                "2026-08-16-x",
+                "session-id",
+                &Recognizer::with_ledger(
+                    body,
+                    tmp.path(),
+                    &Disposition::Repo,
+                    PlanLedger::default(),
+                ),
+                "document text",
+                None,
+                "2026-08-16T00:00:00Z",
+                None,
+                "session-id",
+                "digest",
+                "unknown",
+                body,
+                recommended_tier(body),
+                &Disposition::Repo,
+            )
+        });
         let msg = r.message.unwrap();
         let persisted_idx = msg.find("Approved plan persisted to").unwrap();
         let directive_idx = msg
             .find("This plan's recommended driver is sonnet")
             .expect("directive must be present when tier is Some");
-        let verify_idx = msg.find("Verify placement,").unwrap();
+        let verify_idx = msg.find("Verify placement").unwrap();
         assert!(
             persisted_idx < directive_idx && directive_idx < verify_idx,
             "directive must land between the persist sentence and the format gates: {msg}"
+        );
+    }
+
+    #[test]
+    fn nudge_reminds_a_same_session_approval_to_announce_the_driver() {
+        // cadence-hooks#608: the announcement is owed at approval, by the
+        // approving session; an approve-and-clear child or an unknown
+        // approver does not get it.
+        let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
+        for (parent, expected) in [
+            (Some("session-id"), true),
+            (Some("parent-id"), false),
+            (None, false),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let plans_dir = tmp.path().join("docs/plans");
+            fs::create_dir_all(&plans_dir).unwrap();
+            let r = with_scratch_metrics_dir(|| {
+                persist_and_nudge(
+                    &plans_dir,
+                    "2026-08-16-x",
+                    "session-id",
+                    &Recognizer::with_ledger(
+                        body,
+                        tmp.path(),
+                        &Disposition::Repo,
+                        PlanLedger::default(),
+                    ),
+                    "document text",
+                    None,
+                    "2026-08-16T00:00:00Z",
+                    parent,
+                    "session-id",
+                    "digest",
+                    "unknown",
+                    body,
+                    recommended_tier(body),
+                    &Disposition::Repo,
+                )
+            });
+            let msg = r.message.unwrap();
+            assert_eq!(
+                msg.contains(DRIVER_ANNOUNCE_REMINDER),
+                expected,
+                "parent {parent:?}: {msg}"
+            );
+            if expected {
+                let announce = msg.find("Announce the driver").unwrap();
+                let persisted = msg.find("Approved plan persisted to").unwrap();
+                let directive = msg.find("This plan's recommended driver").unwrap();
+                assert!(persisted < announce && announce < directive, "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_check_directive_puts_the_unconditional_ask_before_any_alternative() {
+        // cadence-hooks#823: the ask must lead, fire on ANY tier difference,
+        // and never be offered an out ahead of it.
+        let d = model_check_directive(Tier::Opus);
+        let ask = d.find("pause and ask").expect("the ask is present");
+        let dispatch = d.find("Dispatching workers at opus").expect("alternative");
+        assert!(ask < dispatch, "the ask precedes the alternatives: {d}");
+        assert!(d.contains("equal is the only pass"), "{d}");
+        assert!(d.contains("a stronger running model included"), "{d}");
+        assert!(d.contains("not a way to skip it"), "{d}");
+        assert!(
+            !d.contains("about to execute inline"),
+            "the compare is not gated on inline execution: {d}"
         );
     }
 
@@ -2476,21 +3356,32 @@ mod tests {
         let plans_dir = tmp.path().join("docs/plans");
         fs::create_dir_all(&plans_dir).unwrap();
         let body = "## Goal\n\nDo the thing.";
-        let r = persist_and_nudge(
-            &plans_dir,
-            "2026-08-16-x",
-            "session-id",
-            "hash",
-            "document text",
-            "2026-08-16T00:00:00Z",
-            None,
-            "session-id",
-            "digest",
-            tmp.path(),
-            "unknown",
-            body,
-            recommended_tier(body),
-        );
+        // Pinned to a throwaway metrics dir under the shared lock: an unlocked
+        // call appends a placeholder row to whatever `CADENCE_METRICS_DIR` a
+        // sibling has set (#1062) or to the live ledger (#768).
+        let r = with_scratch_metrics_dir(|| {
+            persist_and_nudge(
+                &plans_dir,
+                "2026-08-16-x",
+                "session-id",
+                &Recognizer::with_ledger(
+                    body,
+                    tmp.path(),
+                    &Disposition::Repo,
+                    PlanLedger::default(),
+                ),
+                "document text",
+                None,
+                "2026-08-16T00:00:00Z",
+                None,
+                "session-id",
+                "digest",
+                "unknown",
+                body,
+                recommended_tier(body),
+                &Disposition::Repo,
+            )
+        });
         let msg = r.message.unwrap();
         assert!(
             !msg.contains("recommended driver"),
@@ -2594,7 +3485,45 @@ mod tests {
     /// crate's test count grew (cadence-hooks#437). One shared lock closes it
     /// by construction; both modules' tests now serialize against the same
     /// mutex.
-    use crate::registry::test_metrics_env::with_metrics_dir;
+    use crate::registry::test_metrics_env::{with_metrics_dir, with_scratch_metrics_dir};
+
+    /// A hermetic [`DestinationEnv`]: not opted out, no session root (the
+    /// payload `cwd` decides), empty allowlists, `github.com` as the default
+    /// host, no worktree-first repos, and `user_plans_dir` as the fallback.
+    fn base_env(user_plans_dir: &Path) -> DestinationEnv {
+        DestinationEnv {
+            opted_out: false,
+            session_root: None,
+            allowed_owners: Vec::new(),
+            allowed_repos: Vec::new(),
+            extra_hosts: Vec::new(),
+            default_host: "github.com".into(),
+            user_plans_dir: user_plans_dir.to_path_buf(),
+            worktree_first: |_| false,
+        }
+    }
+
+    /// [`base_env`] over a user-scoped dir that lives exactly as long as the
+    /// returned value, so no test shares a fallback dir with another.
+    struct TestEnv {
+        env: DestinationEnv,
+        _user: TempDir,
+    }
+
+    impl std::ops::Deref for TestEnv {
+        type Target = DestinationEnv;
+        fn deref(&self) -> &DestinationEnv {
+            &self.env
+        }
+    }
+
+    fn test_env() -> TestEnv {
+        let user = TempDir::new().unwrap();
+        TestEnv {
+            env: base_env(&user.path().join("plans")),
+            _user: user,
+        }
+    }
 
     #[test]
     fn approval_falls_back_to_tool_input_plan() {
@@ -2618,7 +3547,13 @@ mod tests {
             ..Default::default()
         };
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "tool_input.plan must persist");
         assert!(
@@ -2695,7 +3630,13 @@ mod tests {
             ..Default::default()
         };
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
@@ -2728,7 +3669,13 @@ mod tests {
             ..Default::default()
         };
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         assert!(
@@ -2759,7 +3706,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&bare, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+            run_persist_plan_approval(
+                &bare,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
         });
         let msg = r.message.unwrap();
         // One composed format-gate line naming every missing stanza
@@ -2790,7 +3743,13 @@ mod tests {
             Some(false),
         );
         let r2 = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&full, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+            run_persist_plan_approval(
+                &full,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
         });
         let msg2 = r2.message.unwrap();
         assert!(!msg2.contains("format gate:"));
@@ -2815,7 +3774,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -2847,7 +3812,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -2865,7 +3836,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         assert!(!r.message.unwrap().contains("a settled Panel: line"));
@@ -2903,7 +3880,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -2913,7 +3890,7 @@ mod tests {
             tool_name: Some("ExitPlanMode".into()),
             ..Default::default()
         };
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -2929,7 +3906,7 @@ mod tests {
             &tmp.path().join("t.jsonl").to_string_lossy(),
             Some(true),
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             !tmp.path().join("docs").exists(),
@@ -2953,7 +3930,7 @@ mod tests {
             &tmp.path().join("t.jsonl").to_string_lossy(),
             None,
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             !tmp.path().join("docs").exists(),
@@ -2978,7 +3955,7 @@ mod tests {
             Some(false),
         );
         input.agent_id = Some("agent-1".into());
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(!tmp.path().join("docs").exists());
     }
@@ -3016,7 +3993,7 @@ mod tests {
             session_id: Some("sid".into()),
             ..Default::default()
         };
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -3030,7 +4007,7 @@ mod tests {
             &tmp.path().join("t.jsonl").to_string_lossy(),
             None,
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -3046,7 +4023,7 @@ mod tests {
             &tmp.path().join("t.jsonl").to_string_lossy(),
             None,
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(!tmp.path().join("docs").exists(), "nothing written");
     }
@@ -3063,7 +4040,7 @@ mod tests {
             &tmp.path().join("t.jsonl").to_string_lossy(),
             None,
         );
-        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host", &test_env());
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -3085,7 +4062,13 @@ mod tests {
         );
 
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -3139,7 +4122,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let written =
@@ -3150,7 +4139,11 @@ mod tests {
             "one block:\n{written}"
         );
         let block = leading_frontmatter_block(&written).expect("leading block");
-        assert!(block.starts_with("updated: \"2026-07-20\"\nbody_sha256: \""));
+        assert!(block.starts_with("updated: \"2026-07-20\"\nsession_id: \""));
+        assert!(
+            !block.contains("body_sha256"),
+            "the retired body hash is never written (#870): {block}"
+        );
         assert!(block.ends_with("\nstatus: in-flight\nnext: \"Phase 2\"\nbranch: main\n"));
         assert!(block.contains("approved_session_id: \"merge-sid\""));
         assert_eq!(block.matches("status:").count(), 1);
@@ -3158,19 +4151,231 @@ mod tests {
         assert!(written.ends_with("---\n\n# Merge Me\n\n- [x] done\n"));
     }
 
+    /// One same-session `ExitPlanMode` approval of `plan` by `sid` in `repo`,
+    /// recording to `metrics`, on 2026-07-20.
+    fn approve_on(repo: &Path, metrics: &Path, sid: &str, plan: &str) -> CheckResult {
+        let transcript_path = repo.join(format!("{sid}.jsonl"));
+        fs::write(&transcript_path, "{}").unwrap();
+        let input = exit_plan_mode_post_tool_use(
+            sid,
+            plan,
+            &repo.to_string_lossy(),
+            &transcript_path.to_string_lossy(),
+            Some(false),
+        );
+        with_metrics_dir(metrics, || {
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
+        })
+    }
+
+    #[test]
+    fn same_session_refire_of_a_frontmatter_plan_writes_no_sibling_without_a_body_hash() {
+        // cadence-hooks#870 retired the frontmatter `body_sha256:` that used to
+        // be the tier-1 re-fire anchor; the hook must still recognize its own
+        // output for a plan that carries frontmatter.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let metrics_dir = TempDir::new().unwrap();
+        let plan = "---\nstatus: in-flight\nbranch: main\n---\n\n# Refire Me\n\n- [ ] step";
+        for _ in 0..2 {
+            let r = approve_on(tmp.path(), metrics_dir.path(), "refire-sid", plan);
+            assert_eq!(r.outcome, Outcome::Nudge);
+        }
+        assert_eq!(plan_names(tmp.path()), ["2026-07-20-refire-me.md"]);
+    }
+
+    /// #1085 review P7: another session approving a byte-identical plan that
+    /// carries frontmatter recognizes the hook's own output by the tier-3
+    /// recompute past the plan's frontmatter, with no ledger to lean on.
+    #[test]
+    fn cross_session_identical_frontmatter_plan_writes_no_sibling() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = "---\nstatus: in-flight\nbranch: main\n---\n\n# Seven\n\n- [ ] step";
+        let first_metrics = TempDir::new().unwrap();
+        approve_on(tmp.path(), first_metrics.path(), "sid-a", plan);
+        let second_metrics = TempDir::new().unwrap();
+        let r = approve_on(tmp.path(), second_metrics.path(), "sid-b", plan);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(plan_names(tmp.path()), ["2026-07-20-seven.md"]);
+    }
+
+    /// #1085 review P8: a plain plan persisted, then ticked, then re-approved
+    /// by another session. The file no longer recomputes to the approval, but
+    /// the ledger proves the hook wrote that path for that body. With no
+    /// ledger row (a different metrics dir) the ladder still mints `-2`.
+    #[test]
+    fn ticked_plan_reapproved_by_another_session_is_recognized_through_the_ledger() {
+        let plan = "# Eight\n\n- [ ] one\n- [ ] two";
+        for shared_ledger in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            let first_metrics = TempDir::new().unwrap();
+            approve_on(tmp.path(), first_metrics.path(), "sid-a", plan);
+            let path = tmp.path().join("docs/plans/2026-07-20-eight.md");
+            let ticked = fs::read_to_string(&path)
+                .unwrap()
+                .replace("- [ ] one", "- [x] one");
+            fs::write(&path, &ticked).unwrap();
+            let other_metrics = TempDir::new().unwrap();
+            let metrics = if shared_ledger {
+                first_metrics.path()
+            } else {
+                other_metrics.path()
+            };
+            let r = approve_on(tmp.path(), metrics, "sid-b", plan);
+            assert_eq!(r.outcome, Outcome::Nudge);
+            let expected: &[&str] = if shared_ledger {
+                &["2026-07-20-eight.md"]
+            } else {
+                &["2026-07-20-eight-2.md", "2026-07-20-eight.md"]
+            };
+            assert_eq!(plan_names(tmp.path()), expected, "{:?}", r.message);
+            assert_eq!(fs::read_to_string(&path).unwrap(), ticked);
+        }
+    }
+
+    /// #1085 delta review: the ledger records a repo-relative `plan_path` and
+    /// no repo, so a row from another checkout sharing the metrics dir must
+    /// not vouch for a different plan that happens to sit at the same path in
+    /// this one. The shortcut needs the file's own `session_id:` to name the
+    /// row's writer, so here the approval lands in `-2` instead of being lost.
+    #[test]
+    fn a_ledger_row_from_another_repo_does_not_vouch_for_a_foreign_file() {
+        let plan = "# Eight\n\n- [ ] one\n- [ ] two";
+        let metrics = TempDir::new().unwrap();
+        let repo_one = TempDir::new().unwrap();
+        init_repo(repo_one.path());
+        approve_on(repo_one.path(), metrics.path(), "sid-a", plan);
+        let repo_two = TempDir::new().unwrap();
+        init_repo(repo_two.path());
+        let plans = repo_two.path().join("docs/plans");
+        fs::create_dir_all(&plans).unwrap();
+        let foreign = "---\nstatus: in-flight\nsession_id: \"someone-else\"\n---\n\n\
+                       # Something Else\n\nunrelated\n";
+        fs::write(plans.join("2026-07-20-eight.md"), foreign).unwrap();
+        let r = approve_on(repo_two.path(), metrics.path(), "sid-b", plan);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(
+            plan_names(repo_two.path()),
+            ["2026-07-20-eight-2.md", "2026-07-20-eight.md"],
+            "{:?}",
+            r.message
+        );
+        assert!(r.message.unwrap().contains("2026-07-20-eight-2.md"));
+        assert_eq!(
+            fs::read_to_string(plans.join("2026-07-20-eight.md")).unwrap(),
+            foreign
+        );
+    }
+
+    /// #1085 review N2: a legacy `body_sha256:` key is believed only where the
+    /// ledger cannot contradict it. A ledger that knows the path under a
+    /// different hash wins; a ledger that has never seen the path leaves the
+    /// read-only legacy tier in charge.
+    #[test]
+    fn legacy_frontmatter_hash_is_gated_by_the_ledger_when_it_knows_the_path() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let body = "# Legacy\n\nbody";
+        let hash = sha256_hex(body.as_bytes());
+        let path = base.join("docs/plans/2026-07-20-legacy.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The body drifted, so only tier 1 could match.
+        fs::write(
+            &path,
+            format!("---\nbody_sha256: \"{hash}\"\n---\n\n# Legacy\n\nedited body\n"),
+        )
+        .unwrap();
+        let disposition = Disposition::Repo;
+        let rel = "docs/plans/2026-07-20-legacy.md".to_string();
+        let silent = Recognizer::with_ledger(body, &base, &disposition, PlanLedger::default());
+        assert!(
+            silent.holds_this_plan(&path),
+            "no ledger entry: legacy tier"
+        );
+        let contradicting = Recognizer::with_ledger(
+            body,
+            &base,
+            &disposition,
+            PlanLedger {
+                rows: vec![LedgerRow {
+                    body_hash: "another-hash".into(),
+                    plan_path: Some(rel.clone()),
+                    child_session_id: None,
+                }],
+            },
+        );
+        assert!(!contradicting.holds_this_plan(&path));
+        let confirming = Recognizer::with_ledger(
+            body,
+            &base,
+            &disposition,
+            PlanLedger {
+                rows: vec![LedgerRow {
+                    body_hash: hash,
+                    plan_path: Some(rel),
+                    child_session_id: None,
+                }],
+            },
+        );
+        assert!(confirming.holds_this_plan(&path));
+        // The ledger fallback never answers for a file that is not there.
+        fs::remove_file(&path).unwrap();
+        assert!(!confirming.holds_this_plan(&path));
+    }
+
+    /// #1085 review N3: the re-fire wording says whether the earlier copy is
+    /// still on disk, and a same-session re-approval still carries the #608
+    /// reminder and the #823 directive.
+    #[test]
+    fn refire_nudge_names_whether_the_copy_survives_and_keeps_the_approval_lines() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("docs/plans")).unwrap();
+        fs::write(tmp.path().join("docs/plans/kept.md"), "x").unwrap();
+        let copy = |p: &str| EarlierCopy {
+            label: format!("`{p}`"),
+            path: Some(p.to_string()),
+        };
+        let kept = refire_nudge(&copy("docs/plans/kept.md"), tmp.path(), false, None);
+        assert!(kept.contains("which is still there"), "{kept}");
+        assert!(!kept.contains("save the plan by hand"), "{kept}");
+        let gone = refire_nudge(&copy("docs/plans/gone.md"), tmp.path(), false, None);
+        assert!(gone.contains("which is no longer there"), "{gone}");
+        assert!(gone.contains("save the plan by hand"), "{gone}");
+        let unknown = EarlierCopy {
+            label: "an earlier copy".into(),
+            path: None,
+        };
+        let unknown = refire_nudge(&unknown, tmp.path(), false, None);
+        assert!(!unknown.contains("still there") && !unknown.contains("no longer"));
+        assert!(!kept.contains(DRIVER_ANNOUNCE_REMINDER));
+        let same = refire_nudge(
+            &copy("docs/plans/kept.md"),
+            tmp.path(),
+            true,
+            Some(Tier::Opus),
+        );
+        assert!(same.contains(DRIVER_ANNOUNCE_REMINDER), "{same}");
+        assert!(
+            same.contains("This plan's recommended driver is opus"),
+            "{same}"
+        );
+    }
+
     #[test]
     fn approval_opt_out_via_process_env_writes_nothing() {
         // cadence-hooks#692: any non-empty CADENCE_NO_PERSIST_PLAN skips the
-        // persist (no file, no row), exit-clean allow.
-        // Every approval test in this module reads the process env for the
-        // flag, and the ones asserting a persist run inside `with_metrics_dir`,
-        // which takes `METRICS_ENV_LOCK` — so holding that same lock across
-        // the set/unset here is what keeps a concurrently running sibling
-        // from observing the flag. `CADENCE_METRICS_DIR` is set by hand for
-        // the same reason (calling `with_metrics_dir` would self-deadlock).
-        let _guard = crate::registry::test_metrics_env::METRICS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // persist (no file, no row), exit-clean allow. The process-env read
+        // lives in `DestinationEnv::from_process` (pinned by
+        // `destination_env_reads_the_process_environment`), so this test
+        // drives the resolved flag directly and mutates no env at all.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -3184,31 +4389,38 @@ mod tests {
             &transcript_path.to_string_lossy(),
             Some(false),
         );
-        let prev_metrics = std::env::var_os("CADENCE_METRICS_DIR");
-        // SAFETY: serialized on METRICS_ENV_LOCK above, like `with_metrics_dir`.
-        unsafe {
-            std::env::set_var("CADENCE_METRICS_DIR", metrics_dir.path());
-            std::env::set_var("CADENCE_NO_PERSIST_PLAN", "1");
-        }
-        let r =
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
-        unsafe { std::env::remove_var("CADENCE_NO_PERSIST_PLAN") };
+        let t = test_env();
+        let opted_out = DestinationEnv {
+            opted_out: true,
+            ..t.env.clone()
+        };
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &opted_out,
+            )
+        });
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             !tmp.path().join("docs/plans").exists(),
             "no plans dir, no file"
         );
+        assert!(!t.user_plans_dir.exists(), "no user-scoped fallback either");
         assert!(!metrics_dir.path().join("plan-links.jsonl").exists());
 
         // Control: the same payload without the flag persists.
-        let r2 =
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
-        unsafe {
-            match prev_metrics {
-                Some(v) => std::env::set_var("CADENCE_METRICS_DIR", v),
-                None => std::env::remove_var("CADENCE_METRICS_DIR"),
-            }
-        }
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &t,
+            )
+        });
         assert_eq!(r2.outcome, Outcome::Nudge);
         assert!(tmp.path().join("docs/plans/2026-07-20-opt-out.md").exists());
     }
@@ -3236,7 +4448,13 @@ mod tests {
             Some(false),
         );
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(!tmp.path().join("docs/plans").exists());
@@ -3247,7 +4465,13 @@ mod tests {
         )
         .unwrap();
         let r2 = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r2.outcome, Outcome::Nudge);
     }
@@ -3270,13 +4494,25 @@ mod tests {
         );
 
         with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            );
         });
         let first_write =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
 
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan_approval(&input, "2026-07-20T01:00:00Z", "2026-07-20", "test-host")
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T01:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "re-fire still nudges");
         assert!(
@@ -3366,7 +4602,13 @@ mod tests {
         let input = injected_input(&cwd, &transcript, &sid);
 
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "injected plan must persist");
         let doc =
@@ -3397,6 +4639,288 @@ mod tests {
         assert_eq!(own[0]["parent_session_id"], parent_id, "file: {rows}");
     }
 
+    /// The hand copy an approve-and-clear session saves by hand: its own
+    /// frontmatter, the approval's heading, and a ticked step.
+    const HAND_COPY: &str = "---\nstatus: in-flight\napproved_session_id: \"x\"\n---\n\n\
+                             # Injected Plan\n\n- [x] Do the injected thing.\n";
+
+    /// Fire the injected arm once in a fresh repo on 2026-08-25. `setup` lays
+    /// out files under the repo root and returns the triggering `Write`'s
+    /// `file_path` (`None` for a Bash trigger).
+    fn injected_fire(setup: impl FnOnce(&Path) -> Option<String>) -> (TempDir, CheckResult) {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let parent_id = "11111111-2222-3333-4444-555555555561";
+        let transcript =
+            write_child_transcript(tmp.path(), &injected_prompt(tmp.path(), parent_id));
+        fs::create_dir_all(tmp.path().join("docs/plans")).unwrap();
+        let write_path = setup(tmp.path());
+        let mut input = injected_input(&cwd, &transcript, &unique_session_id("child-861"));
+        if let Some(file_path) = write_path {
+            input.tool_name = Some("Write".into());
+            input.tool_input = Some(ToolInput {
+                file_path: Some(file_path),
+                content: Some(HAND_COPY.into()),
+                ..Default::default()
+            });
+        }
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
+        });
+        (tmp, r)
+    }
+
+    /// Every `.md` name in the repo's plans dir, sorted.
+    fn plan_names(repo: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(repo.join("docs/plans"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// cadence-hooks#861: an approve-and-clear session whose FIRST tool call
+    /// is a `Write` saving the plan by hand fires the injected arm on that
+    /// Write. The hand copy carries its own frontmatter and a ticked step, so
+    /// it no longer hashes to the approval; it is still the plan, and the
+    /// hook must adopt it rather than mint `-2.md`. The control half keeps
+    /// the ladder for the same on-disk file when the trigger is not that
+    /// Write: adoption is keyed on the tool call, not on the stem.
+    #[test]
+    fn injected_arm_adopts_the_plan_file_its_own_write_just_saved() {
+        for trigger_is_write in [true, false] {
+            let (tmp, r) = injected_fire(|root| {
+                let own = root.join("docs/plans/2026-08-25-injected-plan.md");
+                fs::write(&own, HAND_COPY).unwrap();
+                trigger_is_write.then(|| own.to_string_lossy().into_owned())
+            });
+            assert_eq!(r.outcome, Outcome::Nudge);
+            let expected: &[&str] = if trigger_is_write {
+                &["2026-08-25-injected-plan.md"]
+            } else {
+                &[
+                    "2026-08-25-injected-plan-2.md",
+                    "2026-08-25-injected-plan.md",
+                ]
+            };
+            assert_eq!(plan_names(tmp.path()), expected, "{:?}", r.message);
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md"))
+                    .unwrap(),
+                HAND_COPY,
+                "the hand copy is never rewritten"
+            );
+            if trigger_is_write {
+                let msg = r.message.unwrap();
+                assert!(
+                    msg.contains("2026-08-25-injected-plan.md (approved in"),
+                    "the nudge names the hand copy: {msg}"
+                );
+            }
+        }
+    }
+
+    /// #1085 review P1: a Write of unrelated content to the plan's own stem
+    /// must not certify it as the approved plan. The ladder runs and the
+    /// approval lands in `-2`.
+    #[test]
+    fn injected_arm_does_not_adopt_an_own_write_without_affinity() {
+        let garbage = "# Shopping list\n\n- milk\n";
+        let (tmp, r) = injected_fire(|root| {
+            let own = root.join("docs/plans/2026-08-25-injected-plan.md");
+            fs::write(&own, garbage).unwrap();
+            Some(own.to_string_lossy().into_owned())
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(
+            plan_names(tmp.path()),
+            [
+                "2026-08-25-injected-plan-2.md",
+                "2026-08-25-injected-plan.md"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md")).unwrap(),
+            garbage
+        );
+    }
+
+    /// #1085 review P3/P3b: a hand copy under another name in the plans dir
+    /// (another date, or the `-2` name with the base free) is adopted before
+    /// the ladder runs, so no second copy appears under the stem.
+    #[test]
+    fn injected_arm_adopts_a_hand_copy_under_another_name() {
+        for name in [
+            "2026-08-24-injected-plan.md",
+            "2026-08-25-injected-plan-2.md",
+        ] {
+            let (tmp, r) = injected_fire(|root| {
+                let own = root.join("docs/plans").join(name);
+                fs::write(&own, HAND_COPY).unwrap();
+                Some(own.to_string_lossy().into_owned())
+            });
+            assert_eq!(r.outcome, Outcome::Nudge);
+            assert_eq!(plan_names(tmp.path()), [name], "{:?}", r.message);
+            assert!(r.message.unwrap().contains(name));
+        }
+    }
+
+    /// #1085 review N4: a relative `file_path` resolves against the payload
+    /// `cwd`.
+    #[test]
+    fn injected_arm_resolves_a_relative_own_write_against_cwd() {
+        let (tmp, r) = injected_fire(|root| {
+            fs::write(
+                root.join("docs/plans/2026-08-24-injected-plan.md"),
+                HAND_COPY,
+            )
+            .unwrap();
+            Some("docs/plans/2026-08-24-injected-plan.md".into())
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(plan_names(tmp.path()), ["2026-08-24-injected-plan.md"]);
+    }
+
+    /// #1085 review N6: a Write outside the plans dir, or to a symlink inside
+    /// it, is never adopted; the hook writes its own copy as usual.
+    #[test]
+    fn injected_arm_does_not_adopt_a_write_elsewhere_or_through_a_symlink() {
+        // Outside the plans dir, same content.
+        let (tmp, _) = injected_fire(|root| {
+            let notes = root.join("notes");
+            fs::create_dir_all(&notes).unwrap();
+            let own = notes.join("2026-08-24-injected-plan.md");
+            fs::write(&own, HAND_COPY).unwrap();
+            Some(own.to_string_lossy().into_owned())
+        });
+        assert_eq!(plan_names(tmp.path()), ["2026-08-25-injected-plan.md"]);
+
+        // A plans-dir symlink to a matching file elsewhere.
+        #[cfg(unix)]
+        {
+            let (tmp, r) = injected_fire(|root| {
+                let real = root.join("elsewhere.md");
+                fs::write(&real, HAND_COPY).unwrap();
+                let link = root.join("docs/plans/2026-08-24-injected-plan.md");
+                std::os::unix::fs::symlink(&real, &link).unwrap();
+                Some(link.to_string_lossy().into_owned())
+            });
+            assert_eq!(
+                plan_names(tmp.path()),
+                ["2026-08-24-injected-plan.md", "2026-08-25-injected-plan.md"],
+                "{:?}",
+                r.message
+            );
+        }
+    }
+
+    /// #1085 delta review nit 4: a path that reaches outside through a
+    /// symlinked component is judged by where its parent really is.
+    #[cfg(unix)]
+    #[test]
+    fn injected_arm_does_not_adopt_through_a_symlinked_parent_or_dotdot() {
+        // `docs/plans/link/../x.md` with `link` pointing outside: the parent
+        // resolves to the outside dir's parent, not the plans dir.
+        let (tmp, r) = injected_fire(|root| {
+            let outside = root.join("elsewhere/sub");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(
+                root.join("elsewhere/2026-08-24-injected-plan.md"),
+                HAND_COPY,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("docs/plans/link")).unwrap();
+            Some(
+                root.join("docs/plans/link/../2026-08-24-injected-plan.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
+        assert_eq!(
+            plan_names(tmp.path()),
+            ["2026-08-25-injected-plan.md", "link"],
+            "{:?}",
+            r.message
+        );
+
+        // A symlinked directory inside the plans dir pointing outside.
+        let (tmp, r) = injected_fire(|root| {
+            let outside = root.join("elsewhere");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("2026-08-24-injected-plan.md"), HAND_COPY).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("docs/plans/linkdir")).unwrap();
+            Some(
+                root.join("docs/plans/linkdir/2026-08-24-injected-plan.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
+        assert_eq!(
+            plan_names(tmp.path()),
+            ["2026-08-25-injected-plan.md", "linkdir"],
+            "{:?}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn own_write_without_an_absolute_cwd_is_not_adopted() {
+        let tmp = TempDir::new().unwrap();
+        let plans = tmp.path().canonicalize().unwrap();
+        fs::write(plans.join("p.md"), HAND_COPY).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some("p.md".into()),
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        let body = "# Injected Plan\n\nDo the injected thing.";
+        assert_eq!(adoptable_own_write(&input, &plans, body), None);
+        let absolute = HookInput {
+            tool_input: Some(ToolInput {
+                file_path: Some(plans.join("p.md").to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            ..input
+        };
+        assert_eq!(
+            adoptable_own_write(&absolute, &plans, body),
+            Some(plans.join("p.md"))
+        );
+    }
+
+    #[test]
+    fn affinity_accepts_ticks_and_blank_runs_or_the_heading_and_nothing_else() {
+        let body = "# Plan Title\n\n- [ ] one\n- [ ] two";
+        assert!(has_affinity(
+            "---\nstatus: x\n---\n\n# Plan Title\n\n\n\n- [x] one\n- [X] two\n",
+            body
+        ));
+        assert!(has_affinity("prose\n# Plan Title\nmore", body));
+        // Nit 2: only the content's FIRST heading counts.
+        assert!(!has_affinity("# Other\n\n# Plan Title\n", body));
+        // Nit 3: an approval with nothing past its frontmatter adopts nothing.
+        assert!(!has_affinity("", "---\nstatus: x\n---\n"));
+        assert!(!has_affinity("---\na: b\n---\n", "---\nstatus: x\n---\n"));
+        assert!(!has_affinity("# Other Title\n\n- [ ] one\n", body));
+        assert!(!has_affinity("mentions Plan Title inline", body));
+        // No heading: only the normalized-equality path.
+        assert!(has_affinity("- [x] a", "- [ ] a"));
+        assert!(!has_affinity("- [x] b", "- [ ] a"));
+    }
+
     /// A reboot clears the marker temp dir, and a resumed session keeps its
     /// id and transcript, so the injected arm scans again and finds the same
     /// implement-prompt. The local date may have rolled over too, which moves
@@ -3416,7 +4940,13 @@ mod tests {
         let input = injected_input(&cwd, &transcript, &sid);
 
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-09-22T23:00:00Z", "2026-09-22", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-09-22T23:00:00Z",
+                "2026-09-22",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "first fire persists");
         assert!(
@@ -3431,7 +4961,13 @@ mod tests {
         fs::remove_file(&marker).unwrap();
 
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-09-23T14:00:00Z", "2026-09-23", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-09-23T14:00:00Z",
+                "2026-09-23",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "the skip is announced");
         let message = r.message.unwrap_or_default();
@@ -3453,7 +4989,13 @@ mod tests {
         let other = unique_session_id("child-other");
         let input = injected_input(&cwd, &transcript, &other);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-09-23T15:00:00Z", "2026-09-23", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-09-23T15:00:00Z",
+                "2026-09-23",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "another session still persists");
     }
@@ -3461,7 +5003,7 @@ mod tests {
     #[test]
     fn echoable_plan_path_passes_only_plain_relative_paths() {
         assert_eq!(
-            echoable_plan_path(Some("docs/plans/2026-09-22-x.md")),
+            echoable_plan_path(Some("docs/plans/2026-09-22-x.md"), None),
             "`docs/plans/2026-09-22-x.md`"
         );
         for hostile in [
@@ -3473,13 +5015,81 @@ mod tests {
             Some("docs/plans/x\n.md"),
         ] {
             assert_eq!(
-                echoable_plan_path(hostile),
+                echoable_plan_path(hostile, None),
                 "an earlier copy",
                 "{hostile:?}"
             );
         }
         let long = format!("docs/{}.md", "a".repeat(MAX_ECHOED_PLAN_PATH_LEN));
-        assert_eq!(echoable_plan_path(Some(&long)), "an earlier copy");
+        assert_eq!(echoable_plan_path(Some(&long), None), "an earlier copy");
+        // An absolute path echoes only when it sits under the user-scoped
+        // plans root it was written to.
+        let root = Path::new("/home/u/.claude/cadence/plans");
+        assert_eq!(
+            echoable_plan_path(
+                Some("/home/u/.claude/cadence/plans/2026-09-22-x.md"),
+                Some(root)
+            ),
+            "`/home/u/.claude/cadence/plans/2026-09-22-x.md`"
+        );
+        for elsewhere in ["/etc/x.md", "/home/u/.claude/cadence/plansx/y.md"] {
+            assert_eq!(
+                echoable_plan_path(Some(elsewhere), Some(root)),
+                "an earlier copy",
+                "{elsewhere}"
+            );
+        }
+        assert_eq!(
+            echoable_plan_path(Some("/home/u/.claude/cadence/plans/2026-09-22-x.md"), None),
+            "an earlier copy"
+        );
+    }
+
+    #[test]
+    fn strip_windows_drive_takes_only_a_drive_prefix() {
+        assert_eq!(
+            strip_windows_drive("C:/u/plans/x.md"),
+            Some("/u/plans/x.md")
+        );
+        assert_eq!(
+            strip_windows_drive("//?/D:/a/plans/x.md"),
+            Some("/a/plans/x.md")
+        );
+        for other in [
+            "/home/u/x.md",
+            "docs/x.md",
+            "C:x.md",
+            "//?/UNC/srv/share/x.md",
+            "1:/x.md",
+            "",
+        ] {
+            assert_eq!(strip_windows_drive(other), None, "{other}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn echoable_plan_path_matches_a_verbatim_windows_root() {
+        let root = Path::new(r"\\?\C:\Users\u\.claude\cadence\plans");
+        assert_eq!(
+            echoable_plan_path(
+                Some("//?/C:/Users/u/.claude/cadence/plans/2026-09-22-x.md"),
+                Some(root)
+            ),
+            "`//?/C:/Users/u/.claude/cadence/plans/2026-09-22-x.md`"
+        );
+        for elsewhere in [
+            "//?/C:/Users/u/.claude/cadence/plansx/y.md",
+            "//?/D:/Users/u/.claude/cadence/plans/y.md",
+            "C:/Windows/x.md",
+            "C:x.md",
+        ] {
+            assert_eq!(
+                echoable_plan_path(Some(elsewhere), Some(root)),
+                "an earlier copy",
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]
@@ -3493,7 +5103,13 @@ mod tests {
         let sid = unique_session_id("child-marker");
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
 
@@ -3506,7 +5122,13 @@ mod tests {
         );
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow, "marker must short-circuit");
         assert!(
@@ -3529,7 +5151,13 @@ mod tests {
         let sid = unique_session_id("child-race");
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
 
@@ -3540,7 +5168,13 @@ mod tests {
         );
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(
             r.outcome,
@@ -3568,7 +5202,13 @@ mod tests {
         let mut input = injected_input(&cwd, &transcript, &sid);
         input.agent_id = Some("a1".into());
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
@@ -3595,7 +5235,13 @@ mod tests {
         let sid = unique_session_id("child-noptr");
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
@@ -3608,9 +5254,10 @@ mod tests {
     }
 
     #[test]
-    fn injected_arm_no_repo_cwd_leaves_the_marker_for_a_later_call() {
-        // First tool call outside any git repo: the one-shot marker must not
-        // be spent — the next call, in the real repo, persists.
+    fn injected_arm_targets_the_session_root_repo_from_a_no_repo_first_call() {
+        // cadence-hooks#1021: the first tool call running outside any repo no
+        // longer defers the persist to whichever repo a LATER call lands in.
+        // The session root names the repo, so the first fire persists there.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let no_repo = TempDir::new().unwrap();
@@ -3621,20 +5268,21 @@ mod tests {
         );
         let sid = unique_session_id("child-norepo");
         let outside = injected_input(&no_repo.path().to_string_lossy(), &transcript, &sid);
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(tmp.path().to_path_buf()),
+            ..base_env(&scratch.path().join("plans"))
+        };
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&outside, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &outside,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &env,
+            )
         });
-        assert_eq!(r.outcome, Outcome::Allow);
-
-        let inside = injected_input(&tmp.path().to_string_lossy(), &transcript, &sid);
-        let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&inside, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
-        });
-        assert_eq!(
-            r.outcome,
-            Outcome::Nudge,
-            "no-repo must not burn the marker"
-        );
+        assert_eq!(r.outcome, Outcome::Nudge);
         assert!(
             tmp.path()
                 .join("docs/plans/2026-08-25-injected-plan.md")
@@ -3664,7 +5312,13 @@ mod tests {
         let sid = unique_session_id("child-saturated");
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
-            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
         let marker =
@@ -3788,6 +5442,563 @@ mod tests {
             parent_session_id_from_pointer_lines(&suffix).as_deref(),
             Some("11111111-2222-3333-4444-555555555508"),
             "an appended second path must not override the first"
+        );
+    }
+
+    // --- destination resolution (cadence-hooks#1021) ---
+
+    /// Run git in `dir`, asserting success.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?} in {} failed", dir.display());
+    }
+
+    /// A repo with one commit, so `git worktree add` has something to check out.
+    fn init_repo_with_commit(dir: &Path) {
+        init_repo(dir);
+        git_in(
+            dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+    }
+
+    fn write_settings_env(dir: &Path, key: &str, value: &str) {
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        fs::write(
+            dir.join(".claude/settings.json"),
+            serde_json::json!({ "env": { key: value } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn approve(cwd: &Path, sid: &str, plan: &str, env: &DestinationEnv) -> CheckResult {
+        let metrics_dir = TempDir::new().unwrap();
+        let input = exit_plan_mode_post_tool_use(
+            sid,
+            plan,
+            &cwd.to_string_lossy(),
+            &cwd.join(format!("{sid}.jsonl")).to_string_lossy(),
+            Some(false),
+        );
+        with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-09-28T00:00:00Z",
+                "2026-09-28",
+                "test-host",
+                env,
+            )
+        })
+    }
+
+    /// Owners allowlist naming `github.com/cameronsjo`, host-qualified so an
+    /// ambient `GH_HOST` cannot change which host a bare entry matches.
+    fn owned_env(user_plans_dir: &Path) -> DestinationEnv {
+        DestinationEnv {
+            allowed_owners: vec![cadence_hooks_core::config::parse_allow_entry(
+                "github.com/cameronsjo",
+            )],
+            ..base_env(user_plans_dir)
+        }
+    }
+
+    #[test]
+    fn configured_plans_dir_replaces_docs_plans() {
+        // #560: a vault that keeps plans in `Meta/docs/plans` says so once, in
+        // its own settings, and the hook stops creating `docs/plans`.
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/docs/plans");
+        let r = approve(repo.path(), "cfg-dir", "# Vault Plan\n\nbody", &test_env());
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(
+            repo.path()
+                .join("Meta/docs/plans/2026-09-28-vault-plan.md")
+                .exists()
+        );
+        assert!(!repo.path().join("docs").exists(), "no docs/plans tree");
+    }
+
+    #[test]
+    fn repo_nudge_defers_the_commit_to_the_repo_policy() {
+        // #560: the line no longer orders a commit the repo may forbid.
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let msg = approve(repo.path(), "defer", "# Defer\n\nbody", &test_env())
+            .message
+            .unwrap();
+        assert!(!msg.contains("then commit it"), "{msg}");
+        assert!(msg.contains("its CLAUDE.md overrides this line"), "{msg}");
+    }
+
+    #[test]
+    fn empty_configured_plans_dir_opts_out() {
+        // #1021 point 3: an empty CADENCE_PLANS_DIR is the repo-level off switch.
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "");
+        let user = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            ..base_env(&user.path().join("plans"))
+        };
+        let r = approve(repo.path(), "cfg-empty", "# Off\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(!repo.path().join("docs").exists());
+        assert!(
+            !user.path().join("plans").exists(),
+            "an opt-out is not a fallback"
+        );
+    }
+
+    #[test]
+    fn plain_relative_rejects_escapes() {
+        for good in ["docs/plans", "Meta/docs/plans", "./plans", "plans/"] {
+            assert!(is_plain_relative(good), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "/etc",
+            "../sibling",
+            "docs/../../x",
+            "a/../b",
+            "docs\\plans",
+            "..\\sibling",
+            ".git/plans",
+            "docs/.GIT/x",
+        ] {
+            assert!(!is_plain_relative(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn escaping_configured_plans_dir_falls_back_to_user_scope() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "../elsewhere");
+        let user = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            ..base_env(&user.path().join("plans"))
+        };
+        let r = approve(repo.path(), "cfg-escape", "# Escape\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(user.path().join("plans/2026-09-28-escape.md").exists());
+        assert!(!repo.path().parent().unwrap().join("elsewhere").exists());
+    }
+
+    /// A wing: a plain directory holding two member repos.
+    fn wing() -> (TempDir, PathBuf, PathBuf) {
+        let wing = TempDir::new().unwrap();
+        let homelab = wing.path().join("homelab");
+        let homelan = wing.path().join("homelan");
+        for member in [&homelab, &homelan] {
+            fs::create_dir_all(member).unwrap();
+            init_repo(member);
+        }
+        (wing, homelab, homelan)
+    }
+
+    #[test]
+    fn wing_root_never_adopts_the_member_repo_the_cwd_sits_in() {
+        // #798 / #1021 repro: the session is rooted at a wing, and the approval
+        // happens with the cwd inside a member repo the plan is not about.
+        let (wing, homelab, homelan) = wing();
+        let user = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(wing.path().to_path_buf()),
+            ..base_env(&user.path().join("plans"))
+        };
+        let r = approve(&homelan, "wing-sid", "# Absorb Into Homelab\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        for member in [&homelab, &homelan] {
+            assert!(!member.join("docs").exists(), "{}", member.display());
+        }
+        assert!(
+            user.path()
+                .join("plans/2026-09-28-absorb-into-homelab.md")
+                .exists()
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(REASON_NO_REPO_ROOT),
+            "the nudge says why: {msg}"
+        );
+        assert!(msg.contains("kept out of every repo"), "{msg}");
+    }
+
+    #[test]
+    fn wing_root_injected_arm_never_adopts_an_incidental_member_repo() {
+        // The #1021 mechanism itself: approve-and-clear in a wing, whose first
+        // repo-bound call is a read-only `cd homelab && grep`.
+        let (wing, homelab, _) = wing();
+        let user = TempDir::new().unwrap();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            wing.path(),
+            &injected_prompt(wing.path(), "11111111-2222-3333-4444-555555555520"),
+        );
+        let sid = unique_session_id("child-wing");
+        let input = injected_input(&homelab.to_string_lossy(), &transcript, &sid);
+        let env = DestinationEnv {
+            session_root: Some(wing.path().to_path_buf()),
+            ..base_env(&user.path().join("plans"))
+        };
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(
+                &input,
+                "2026-09-28T00:00:00Z",
+                "2026-09-28",
+                "test-host",
+                &env,
+            )
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(!homelab.join("docs").exists());
+        assert!(
+            user.path()
+                .join("plans/2026-09-28-injected-plan.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn wing_root_with_configured_plans_dir_writes_there() {
+        // #1021 point 2: a configured target is the one way a non-repo root
+        // gets a destination.
+        let (wing, homelab, _) = wing();
+        write_settings_env(wing.path(), PLANS_DIR_KEY, "Meta/plans");
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(wing.path().to_path_buf()),
+            ..base_env(&scratch.path().join("plans"))
+        };
+        let r = approve(&homelab, "wing-cfg", "# Wing Plan\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(
+            wing.path()
+                .join("Meta/plans/2026-09-28-wing-plan.md")
+                .exists()
+        );
+        assert!(!homelab.join("docs").exists());
+    }
+
+    #[test]
+    fn session_root_repo_wins_over_a_cwd_in_another_repo() {
+        let root = TempDir::new().unwrap();
+        init_repo(root.path());
+        let other = TempDir::new().unwrap();
+        init_repo(other.path());
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(root.path().to_path_buf()),
+            ..base_env(&scratch.path().join("plans"))
+        };
+        let r = approve(other.path(), "root-wins", "# Root Wins\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(
+            root.path()
+                .join("docs/plans/2026-09-28-root-wins.md")
+                .exists()
+        );
+        assert!(!other.path().join("docs").exists());
+    }
+
+    #[test]
+    fn non_owned_repo_gets_no_plan_even_when_its_settings_name_a_dir() {
+        // #1014: a PR worktree of someone else's repo. Its own settings are
+        // someone else's config, so a CADENCE_PLANS_DIR there is not read.
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/stranger/project.git",
+            ],
+        );
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "plans");
+        let user = TempDir::new().unwrap();
+        let env = owned_env(&user.path().join("plans"));
+        let r = approve(repo.path(), "stranger", "# Upstream Fix\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(!repo.path().join("plans").exists());
+        assert!(!repo.path().join("docs").exists());
+        assert!(
+            user.path()
+                .join("plans/2026-09-28-upstream-fix.md")
+                .exists()
+        );
+        assert!(r.message.unwrap().contains(REASON_NOT_OWNED));
+    }
+
+    #[test]
+    fn owned_remote_keeps_the_repo_destination() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:CameronSjo/project.git",
+            ],
+        );
+        let user = TempDir::new().unwrap();
+        let env = owned_env(&user.path().join("plans"));
+        let r = approve(repo.path(), "owned", "# Mine\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(repo.path().join("docs/plans/2026-09-28-mine.md").exists());
+    }
+
+    #[test]
+    fn fork_with_a_non_owned_upstream_is_not_owned() {
+        // Every remote counts: a PR from an owned fork still lands upstream.
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/cameronsjo/project.git",
+            ],
+        );
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/stranger/project.git",
+            ],
+        );
+        let user = TempDir::new().unwrap();
+        let env = owned_env(&user.path().join("plans"));
+        let r = approve(repo.path(), "fork", "# Fork Plan\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(!repo.path().join("docs").exists());
+    }
+
+    #[test]
+    fn unset_allowlist_cannot_prove_a_remote_repo_owned() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/cameronsjo/project.git",
+            ],
+        );
+        let user = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            ..base_env(&user.path().join("plans"))
+        };
+        approve(repo.path(), "unset", "# Unset\n\nbody", &env);
+        assert!(!repo.path().join("docs").exists());
+        assert!(user.path().join("plans/2026-09-28-unset.md").exists());
+    }
+
+    #[test]
+    fn linked_worktree_cwd_of_the_root_repo_gets_the_plan() {
+        // #739: the session sits in the primary, the work in a linked worktree
+        // of the same repo. The plan lands where it can be committed, stamped
+        // with the worktree's branch rather than the primary's.
+        let primary = TempDir::new().unwrap();
+        init_repo_with_commit(primary.path());
+        let wt_parent = TempDir::new().unwrap();
+        let wt = wt_parent.path().join("feat");
+        git_in(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/theme",
+                &wt.to_string_lossy(),
+            ],
+        );
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(primary.path().to_path_buf()),
+            worktree_first: |_| true,
+            ..base_env(&scratch.path().join("plans"))
+        };
+        let r = approve(&wt, "wt-sid", "# Theme\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let doc = fs::read_to_string(wt.join("docs/plans/2026-09-28-theme.md")).unwrap();
+        assert!(doc.contains("branch: \"feat/theme\""), "{doc}");
+        assert!(!primary.path().join("docs").exists());
+        assert!(
+            !r.message.unwrap().contains("do not commit it here"),
+            "a linked worktree is where the commit belongs"
+        );
+    }
+
+    #[test]
+    fn worktree_first_primary_omits_branch_and_says_to_move_the_plan() {
+        // #1045: no worktree to prove, so the plan stays in the primary, but
+        // without `branch: "main"` and with no instruction to commit it there.
+        let primary = TempDir::new().unwrap();
+        init_repo_with_commit(primary.path());
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(primary.path().to_path_buf()),
+            worktree_first: |_| true,
+            ..base_env(&scratch.path().join("plans"))
+        };
+        let r = approve(primary.path(), "wtf-sid", "# Outro Fix\n\nbody", &env);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let doc =
+            fs::read_to_string(primary.path().join("docs/plans/2026-09-28-outro-fix.md")).unwrap();
+        let block = leading_frontmatter_block(&doc).unwrap();
+        assert!(!block.contains("branch:"), "{block}");
+        let msg = r.message.unwrap();
+        assert!(msg.contains("do not commit it here"), "{msg}");
+        assert!(msg.contains("feature worktree"), "{msg}");
+
+        // Control: the same primary with no worktree-first guard keeps
+        // `branch:` and the plain repo sentence.
+        let r = approve(
+            primary.path(),
+            "wtf-ctl",
+            "# Control Plan\n\nbody",
+            &test_env(),
+        );
+        let doc = fs::read_to_string(primary.path().join("docs/plans/2026-09-28-control-plan.md"))
+            .unwrap();
+        assert!(doc.contains("branch: \"main\""), "{doc}");
+        assert!(!r.message.unwrap().contains("do not commit it here"));
+    }
+
+    #[test]
+    fn destination_env_reads_the_process_environment() {
+        let root = TempDir::new().unwrap();
+        let root_str = root.path().to_string_lossy().into_owned();
+        crate::registry::test_metrics_env::with_env_vars(
+            &[
+                ("CLAUDE_PROJECT_DIR", Some(root_str.as_str())),
+                ("CADENCE_ALLOWED_OWNERS", Some("github.com/cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", Some("github.com/stranger/one")),
+                ("CADENCE_NO_PERSIST_PLAN", Some("1")),
+                ("GH_HOST", Some("ghe.example")),
+            ],
+            || {
+                let env = DestinationEnv::from_process();
+                assert!(env.opted_out);
+                assert_eq!(env.default_host, "ghe.example");
+                assert_eq!(env.session_root.as_deref(), Some(root.path()));
+                assert!(url_is_owned("https://github.com/cameronsjo/x.git", &env));
+                assert!(url_is_owned("https://github.com/stranger/one.git", &env));
+                assert!(!url_is_owned("https://github.com/stranger/two.git", &env));
+            },
+        );
+        crate::registry::test_metrics_env::with_env_vars(
+            &[
+                ("CLAUDE_PROJECT_DIR", Some("relative/dir")),
+                ("CADENCE_ALLOWED_OWNERS", None),
+                ("CADENCE_NO_PERSIST_PLAN", Some("")),
+            ],
+            || {
+                let env = DestinationEnv::from_process();
+                assert!(!env.opted_out, "an empty value re-enables");
+                assert_eq!(env.session_root, None, "a relative root is not a root");
+                assert!(!url_is_owned("https://github.com/cameronsjo/x.git", &env));
+            },
+        );
+    }
+
+    #[test]
+    fn bare_allowlist_entries_match_the_resolved_default_host_only() {
+        // The resolver's GH_HOST comes from `DestinationEnv`, not a second
+        // live read inside the shared matcher.
+        let scratch = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            allowed_owners: vec![cadence_hooks_core::config::parse_allow_entry("cameronsjo")],
+            default_host: "ghe.example".into(),
+            extra_hosts: vec!["git.sjo.lol".into()],
+            ..base_env(&scratch.path().join("plans"))
+        };
+        assert!(url_is_owned("https://ghe.example/cameronsjo/x.git", &env));
+        assert!(url_is_owned("git@git.sjo.lol:cameronsjo/x.git", &env));
+        assert!(!url_is_owned("https://github.com/cameronsjo/x.git", &env));
+    }
+
+    #[test]
+    fn user_scoped_copy_records_an_absolute_plan_path_and_echoes_it_on_refire() {
+        let (wing, homelab, _) = wing();
+        let user = TempDir::new().unwrap();
+        let metrics_dir = TempDir::new().unwrap();
+        let env = DestinationEnv {
+            session_root: Some(wing.path().to_path_buf()),
+            ..base_env(&user.path().join("plans"))
+        };
+        let input = exit_plan_mode_post_tool_use(
+            "abs-sid",
+            "# Absolute Plan\n\nbody",
+            &homelab.to_string_lossy(),
+            &homelab.join("abs-sid.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-09-28T00:00:00Z",
+                "2026-09-28",
+                "test-host",
+                &env,
+            )
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let written = user
+            .path()
+            .join("plans/2026-09-28-absolute-plan.md")
+            .canonicalize()
+            .unwrap();
+        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        let recorded = row["plan_path"].as_str().unwrap();
+        assert_eq!(
+            recorded,
+            cadence_hooks_core::normalize_path(&written.to_string_lossy()),
+            "a user-scoped row records where the copy really is"
+        );
+
+        // The copy is moved away, the date rolls: the re-fire names it.
+        fs::remove_file(&written).unwrap();
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-09-29T00:00:00Z",
+                "2026-09-29",
+                "test-host",
+                &env,
+            )
+        });
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(&format!("already persisted this plan to `{recorded}`")),
+            "{msg}"
         );
     }
 }

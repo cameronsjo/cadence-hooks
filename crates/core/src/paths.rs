@@ -185,6 +185,24 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
     read_capped_detailed(path, max_bytes).ok()
 }
 
+/// Open `path` for reading without blocking on a FIFO with no writer, and
+/// without letting a terminal device become the process's controlling
+/// terminal (`O_NOCTTY`). `O_NONBLOCK` has no effect on a regular file's reads.
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// [`read_capped`], reporting *why* instead of collapsing to `None`. The single
 /// implementation — `read_capped` is a projection of it, so the two can never
 /// drift on where the cap sits or what counts as a readable file.
@@ -199,7 +217,27 @@ pub fn read_capped_detailed(path: &Path, max_bytes: u64) -> Result<String, Cappe
         // follows the link, fails, and returns `Unreadable` above.
         return Err(CappedReadError::NotRegular);
     }
-    let file = std::fs::File::open(path).map_err(|_| CappedReadError::Unreadable)?;
+    // The `stat` above follows the path; the path can be swapped for a FIFO
+    // between it and the open. Opening non-blocking keeps that FIFO from
+    // blocking the open itself, and re-checking the OPENED handle (`fstat`)
+    // decides on the object actually read — the pre-check stays only as the
+    // cheap early answer.
+    let file = open_nonblocking(path).map_err(|_| CappedReadError::Unreadable)?;
+    read_opened_capped(file, max_bytes)
+}
+
+/// The post-open half of [`read_capped_detailed`]: judge the OPENED handle by
+/// `fstat`, then read at most `max_bytes + 1`. Split out so the fstat check —
+/// the one that closes the stat/open race — is testable on its own, since the
+/// path-level `stat` answers first whenever no race occurs.
+fn read_opened_capped(file: std::fs::File, max_bytes: u64) -> Result<String, CappedReadError> {
+    if !file
+        .metadata()
+        .map_err(|_| CappedReadError::Unreadable)?
+        .is_file()
+    {
+        return Err(CappedReadError::NotRegular);
+    }
     let mut buf = String::new();
     file.take(max_bytes + 1)
         .read_to_string(&mut buf)
@@ -337,6 +375,30 @@ pub fn expand_tilde_with(s: &str, home: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn opened_fifo_is_rejected_by_fstat_without_blocking() {
+        // #818 review N3: a path swapped for a FIFO after the `stat` must be
+        // refused on the handle. Opening non-blocking must not hang with no
+        // writer, and the fstat must answer NotRegular before any read.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success());
+        let file = open_nonblocking(&fifo).expect("non-blocking open of a FIFO");
+        assert_eq!(
+            read_opened_capped(file, 1024),
+            Err(CappedReadError::NotRegular)
+        );
+        let regular = dir.path().join("f");
+        std::fs::write(&regular, "use flake\n").unwrap();
+        let file = open_nonblocking(&regular).unwrap();
+        assert_eq!(read_opened_capped(file, 1024).as_deref(), Ok("use flake\n"));
+    }
+
     use super::*;
 
     #[test]

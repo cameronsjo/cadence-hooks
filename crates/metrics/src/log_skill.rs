@@ -46,11 +46,7 @@ impl Logger for LogSkill {
         let debug = std::env::var("CADENCE_METRICS_DEBUG").as_deref() == Ok("1");
         let record = build_skill_record(input, &common::utc_timestamp(), debug);
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("skills.jsonl"))
-        {
+        if let Ok(mut file) = common::open_ledger(dir.join("skills.jsonl")) {
             // Build the whole line (record + newline) and write it in one
             // write_all, matching log_subagent.rs — a single O_APPEND write is
             // atomic, so concurrent appends can't interleave a record with its

@@ -88,11 +88,7 @@ impl Logger for LogAskUserQuestion {
             return;
         }
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("askuserquestion.jsonl"))
-        {
+        if let Ok(mut file) = common::open_ledger(dir.join("askuserquestion.jsonl")) {
             // Single `write_all` of record + newline so concurrent appends from
             // other sessions can't interleave (mirrors log_commit / log_polish_nudge).
             let mut line = record.to_string();

@@ -15,6 +15,8 @@
 //! No test here sets `CADENCE_HARNESS`. The variable no longer changes any
 //! verdict, and leaving it would have implied a posture that no longer exists.
 
+mod support;
+
 use cadence_hooks_core::{HookInput, MetricsInput};
 use serde_json::Value;
 use std::fs;
@@ -39,7 +41,7 @@ use std::process::Command;
 /// not, because nothing here reads it and a scrub nothing needs is a claim the
 /// next reader has to re-derive.
 fn isolated_cadence_hooks(metrics_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", metrics_dir);
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CADENCE_BYPASS");

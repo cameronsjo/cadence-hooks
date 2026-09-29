@@ -1,10 +1,11 @@
+mod support;
+
 use serde_json::Value;
-use std::process::Command;
 
 #[test]
 fn manifest_json_exports_complete_registry_and_criticality() {
     let metrics = tempfile::tempdir().expect("temp metrics dir");
-    let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let output = support::cadence_hooks()
         .env("CADENCE_METRICS_DIR", metrics.path())
         .args(["manifest", "--format", "json"])
         .output()
@@ -44,7 +45,7 @@ fn manifest_keeps_the_plugin_key_and_fills_it_with_the_clap_namespace() {
     // The value assertion is the other half: `session` hooks must report the
     // clap namespace `session`, not the `cadence` plugin that wires them.
     let metrics = tempfile::tempdir().expect("temp metrics dir");
-    let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let output = support::cadence_hooks()
         .env("CADENCE_METRICS_DIR", metrics.path())
         .args(["manifest", "--format", "json"])
         .output()

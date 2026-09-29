@@ -701,6 +701,39 @@ pub(crate) mod test_metrics_env {
         result
     }
 
+    /// Run `f` with each `(name, value)` pinned (`None` = unset), restoring the
+    /// caller's values afterward. Takes [`METRICS_ENV_LOCK`], the crate's one
+    /// env lock, so these writes serialize against every `with_metrics_dir`
+    /// caller instead of racing them through a second mutex (#446).
+    pub(crate) fn with_env_vars<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _guard = METRICS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
+            .collect();
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK, held until the restore below.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: as above; still under METRICS_ENV_LOCK.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        result.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
     /// Convenience for a test that doesn't inspect `sweeps.jsonl` itself but
     /// still reaps a real file (and so fires `log_sweep`) — a throwaway
     /// tempdir keeps the write off the real metrics dir and off the lock
@@ -1187,6 +1220,41 @@ mod tests {
             find_own(global.path(), "mirrored-session").is_some(),
             "and the mirror carries it across checkouts"
         );
+    }
+
+    /// A heartbeat that recreates a swept record stamps `started_epoch` as now,
+    /// which is not when that session loaded its plugins, so the record must
+    /// not vouch for its start; one that refreshes a vouching record keeps the
+    /// vouch, in both registries (cameronsjo/cadence-hooks#904).
+    #[test]
+    fn touch_own_never_vouches_for_a_start_it_did_not_see() {
+        let local = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        touch_own(
+            local.path(),
+            Some(global.path()),
+            "resurrected",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !read_own(local.path(), "resurrected")
+                .unwrap()
+                .start_verified
+        );
+        assert!(
+            !read_own(global.path(), "resurrected")
+                .unwrap()
+                .start_verified
+        );
+
+        let mut rec = record("", "vouched");
+        rec.start_verified = true;
+        write_record(local.path(), &rec).unwrap();
+        touch_own(local.path(), Some(global.path()), "vouched", None, false).unwrap();
+        assert!(read_own(local.path(), "vouched").unwrap().start_verified);
+        assert!(read_own(global.path(), "vouched").unwrap().start_verified);
     }
 
     /// `None` means do not mirror — the state every test runs in, and the

@@ -89,6 +89,44 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
     new_root
 }
 
+/// Open a metrics ledger for appending, creating it owner-only (`0600`).
+///
+/// Every `<metrics_dir>/*.jsonl` writer goes through here (cadence-hooks#425).
+/// Rows are privacy-safe by construction, but repo basenames and session ids
+/// are still metadata worth keeping from other local users, and the default
+/// `OpenOptions` mode is world-readable under a permissive umask. A ledger an
+/// older binary already created with group/other bits has exactly those bits
+/// cleared through the open handle (owner bits are kept), so existing installs
+/// converge on their next write; a mode that is already tighter is left alone.
+///
+/// On Unix the final path component is opened with `O_NOFOLLOW`: a ledger
+/// that is a symlink fails to open, so nothing is appended through it and no
+/// chmod lands on whatever it points at. The caller treats that like any other
+/// open failure and skips the row (ADR-0001). Permissions are a Unix concept;
+/// elsewhere this is a plain create-and-append open. A failed tighten is
+/// ignored, so the append still happens.
+pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        if let Ok(meta) = file.metadata() {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+            }
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
 /// Harness stamped on schema-v2 rows.
 ///
 /// Constant since the Codex adapters were retired (#1040). The field stays
@@ -130,11 +168,7 @@ fn append_transcript_diagnostic_to(
         "stream": stream,
         "priced": false,
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut file) = open_ledger(path) {
         let mut line = record.to_string();
         line.push('\n');
         let _ = file.write_all(line.as_bytes());
@@ -448,6 +482,99 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// #425: a new ledger is owner-only, whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_creates_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        let mut file = open_ledger(&path).unwrap();
+        file.write_all(b"{}\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// #425: a ledger an older binary left world-readable is tightened on the
+    /// next append, and its contents are appended to, not replaced.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_tightens_an_existing_readable_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("subagents.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_ledger(&path).unwrap().write_all(b"b\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+    }
+
+    /// A mode already tighter than 0600 is never loosened.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_leaves_a_tighter_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        open_ledger(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o200);
+    }
+
+    /// Tightening clears only group/other bits; owner bits are not reset to
+    /// a flat 0600.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_clears_only_group_and_other_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("sessions.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o754)).unwrap();
+        open_ledger(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    /// A symlinked ledger fails to open: nothing is appended through it and
+    /// its target's mode is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_refuses_a_symlinked_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, "keep\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("commits.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            open_ledger(&link).is_err(),
+            "a symlinked ledger must not open"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+        assert_eq!(mode_of(&target), 0o644);
+    }
+
+    /// End to end through a writer: the diagnostic append skips a symlinked
+    /// ledger silently instead of writing through it.
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_append_skips_a_symlinked_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("diagnostics.jsonl")).unwrap();
+        append_transcript_diagnostic_to(tmp.path(), "claude", "jsonl", "code", "main");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    }
 
     #[test]
     fn display_safe_is_unchanged_by_the_move_to_core() {

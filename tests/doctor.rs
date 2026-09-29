@@ -3,6 +3,8 @@
 //! Build a fixture plugin cache in a tempdir, point doctor at it via
 //! `--root`, and assert exit code + stderr/stdout content.
 
+mod support;
+
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -16,7 +18,7 @@ use std::time::{Duration, SystemTime};
 /// false failure about the plugin scan. Cleared here rather than per test, so a
 /// future `doctor` test cannot be steered by whoever runs it.
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env_remove("CADENCE_BYPASS")
         .env_remove("CADENCE_DISABLE");
     cmd
@@ -1211,4 +1213,347 @@ fn doctor_still_flags_missing_cache_dir_for_non_directory_source() {
          report as broken.\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ── doctor --prune --keep-newest / --older-than (#904), gate window (#902) ──
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+const DAY: u64 = 86_400;
+
+fn set_mtime(path: &std::path::Path, epoch: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch))
+        .unwrap();
+}
+
+/// Create `<parent>/<sha>` as an orphan, stamped `.orphaned_at` at `at`
+/// (contents and mtime) unless `at` is `None`.
+fn orphan(parent: &std::path::Path, sha: &str, at: Option<u64>) -> std::path::PathBuf {
+    let dir = parent.join(sha);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload"), "x").unwrap();
+    if let Some(at) = at {
+        let marker = dir.join(".orphaned_at");
+        std::fs::write(&marker, at.to_string()).unwrap();
+        set_mtime(&marker, at);
+    }
+    dir
+}
+
+fn prune_with_root(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    cadence_hooks()
+        .args(["doctor", "--prune"])
+        .args(extra)
+        .arg("--root")
+        .arg(root)
+        .output()
+        .expect("failed to execute")
+}
+
+#[test]
+fn doctor_prune_keep_newest_keeps_unstamped_and_newest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let oldest = orphan(&parent, "oldest-sha", Some(now - 3 * DAY));
+    let older = orphan(&parent, "older-sha", Some(now - 2 * DAY));
+    let newest = orphan(&parent, "newest-sha", Some(now - DAY));
+    let unstamped = orphan(&parent, "unstamped-sha", None);
+
+    let dry = prune_with_root(tmp.path(), &["--keep-newest", "2"]);
+    assert_eq!(dry.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(stdout.contains("keep: unstamped"), "{stdout}");
+    assert!(stdout.contains("keep: among the newest"), "{stdout}");
+    assert!(stdout.contains("2 orphaned version dir(s)"), "{stdout}");
+    assert!(
+        oldest.exists() && older.exists(),
+        "a dry run deletes nothing"
+    );
+
+    let out = prune_with_root(tmp.path(), &["--keep-newest", "2", "--apply"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !oldest.exists() && !older.exists(),
+        "past N, stamped: removed"
+    );
+    assert!(
+        newest.exists(),
+        "the unstamped dir takes one slot, this the other"
+    );
+    assert!(unstamped.exists(), "unstamped counts as newest");
+    assert!(pinned.exists());
+}
+
+#[test]
+fn doctor_prune_older_than_removes_only_dirs_orphaned_that_long_ago() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let old = orphan(&parent, "old-sha", Some(now - 3 * DAY));
+    let recent = orphan(&parent, "recent-sha", Some(now - 3_600));
+    let unstamped = orphan(&parent, "unstamped-sha", None);
+
+    let out = prune_with_root(tmp.path(), &["--older-than", "2d", "--apply"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed 1 orphaned version dir(s)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2 kept"), "{stdout}");
+    assert!(!old.exists());
+    assert!(recent.exists() && unstamped.exists() && pinned.exists());
+}
+
+#[test]
+fn doctor_prune_limits_are_usage_errors_without_prune_or_with_a_bad_age() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["doctor", "--keep-newest", "3"],
+        vec!["doctor", "--older-than", "7d"],
+        vec!["doctor", "--prune", "--older-than", "7"],
+        vec!["doctor", "--prune", "--older-than", "0d"],
+        vec!["doctor", "--prune", "--keep-newest", "many"],
+    ] {
+        let out = cadence_hooks()
+            .args(&args)
+            .arg("--root")
+            .arg(tmp.path())
+            .output()
+            .expect("failed to execute");
+        assert_eq!(out.status.code(), Some(2), "{args:?} is a usage error");
+    }
+}
+
+/// A pin whose `installPath` is a symlink to a sibling makes that sibling look
+/// orphaned by name. Removing it would leave the pin dangling, so it is kept.
+#[cfg(unix)]
+#[test]
+fn doctor_prune_apply_keeps_the_dir_a_symlinked_pin_resolves_onto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let real = orphan(&parent, "real-sha", Some(1));
+    let other = orphan(&parent, "other-sha", Some(1));
+    let pinned = parent.join("pinned-sha");
+    std::os::unix::fs::symlink(&real, &pinned).unwrap();
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+
+    for extra in [vec!["--apply"], vec!["--keep-newest", "0", "--apply"]] {
+        let out = prune_with_root(tmp.path(), &extra);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{extra:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("resolves onto a pinned install"),
+            "{extra:?}"
+        );
+        assert!(
+            real.exists() && pinned.exists(),
+            "{extra:?}: the pin must survive"
+        );
+    }
+    assert!(!other.exists(), "a real orphan beside it is still removed");
+}
+
+/// A Claude config dir with a pinned install and two stamped orphans: one
+/// orphaned three days ago, one a day ago. Returns (home, config, metrics,
+/// pinned, three_days, one_day).
+fn live_prune_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let metrics = home.path().join("metrics");
+    std::fs::create_dir_all(&metrics).unwrap();
+    let plugins = config.join("plugins");
+    let parent = plugins.join("cache/workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(&plugins, "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let three_days = orphan(&parent, "three-days-sha", Some(now - 3 * DAY));
+    let one_day = orphan(&parent, "one-day-sha", Some(now - DAY));
+    (home, config, metrics, pinned, three_days, one_day)
+}
+
+/// Write a live-session record into the cross-checkout mirror.
+fn seed_live_session(config: &std::path::Path, id: &str, started: u64, verified: bool, mtime: u64) {
+    let dir = config.join("cadence/live-sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{id}.json"));
+    let rec = serde_json::json!({
+        "name": &id[..8],
+        "session_id": id,
+        "started_epoch": started,
+        "start_verified": verified,
+    });
+    std::fs::write(&path, rec.to_string()).unwrap();
+    set_mtime(&path, mtime);
+}
+
+fn live_prune(
+    home: &std::path::Path,
+    config: &std::path::Path,
+    metrics: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Command {
+    let mut cmd = doctor_in_config_dir(home, config, metrics);
+    cmd.args(["--prune", "--apply"])
+        .args(extra)
+        .current_dir(home)
+        .env_remove("CADENCE_DOCTOR_PRUNE_FORCE")
+        .env_remove("CADENCE_SESSION_STALE_MINUTES");
+    cmd
+}
+
+/// cameronsjo/cadence-hooks#902: peers refresh their records on the default
+/// cadence, so a doctor run with a shorter `CADENCE_SESSION_STALE_MINUTES`
+/// read a working peer 12 minutes into its beat interval as stale and pruned.
+#[test]
+fn doctor_prune_apply_refuses_a_peer_between_beats_under_a_short_stale_override() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "busypeer-0000", now - 2 * DAY, true, now - 12 * 60);
+
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .env("CADENCE_SESSION_STALE_MINUTES", "5")
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}
+
+/// A session that started two days ago cannot be reading a dir orphaned three
+/// days ago, but may be reading one orphaned a day ago.
+#[test]
+fn doctor_prune_older_than_removes_only_dirs_orphaned_before_every_live_start() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+
+    let out = live_prune(home.path(), &config, &metrics, &["--older-than", "12h"])
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !three_days.exists(),
+        "orphaned before the session started: removed"
+    );
+    assert!(one_day.exists(), "orphaned after it started: kept");
+    assert!(
+        stdout.contains("keep: a live session may be reading it"),
+        "{stdout}"
+    );
+    assert!(pinned.exists());
+}
+
+/// A session registered by `/clear` (or recreated by a heartbeat, or written by
+/// an older binary) cannot say when it loaded its plugins, so nothing goes.
+#[test]
+fn doctor_prune_limits_keep_every_dir_when_a_live_session_cannot_vouch() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+    seed_live_session(&config, "cleared0-0000", now - 60, false, now);
+
+    let out = live_prune(home.path(), &config, &metrics, &["--keep-newest", "0"])
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot say when they loaded their plugins"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cleared0"), "names the session: {stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}
+
+/// `is_contained` is lexical: a pin under a symlinked intermediate dir inside
+/// the cache makes that dir's real siblings, outside the cache, look like
+/// orphans. They are kept.
+#[cfg(unix)]
+#[test]
+fn doctor_prune_apply_keeps_siblings_a_symlinked_intermediate_dir_reaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let pinned_real = orphan(outside.path(), "pinned-sha", None);
+    let victim = orphan(outside.path(), "victim-sha", Some(1));
+    std::fs::create_dir_all(tmp.path().join("workbench")).unwrap();
+    let linked = tmp.path().join("workbench/my-plugin");
+    std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+    write_installed_plugins_manifest(
+        tmp.path(),
+        "my-plugin@workbench",
+        &linked.join("pinned-sha"),
+    );
+
+    for extra in [vec!["--apply"], vec!["--keep-newest", "0", "--apply"]] {
+        let out = prune_with_root(tmp.path(), &extra);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{extra:?} stderr: {stderr}");
+        assert!(
+            stderr.contains("resolves outside the plugin cache root"),
+            "{extra:?}: {stderr}"
+        );
+        assert!(
+            victim.exists(),
+            "{extra:?}: an out-of-cache dir must survive"
+        );
+        assert!(pinned_real.exists());
+    }
+}
+
+/// The default gate (no bounds) refuses when the machine-wide registry exists
+/// but cannot be listed, here because a file sits where the directory goes.
+#[test]
+fn doctor_prune_apply_refuses_when_the_registry_cannot_be_listed() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    std::fs::create_dir_all(config.join("cadence")).unwrap();
+    std::fs::write(config.join("cadence/live-sessions"), "").unwrap();
+
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(stderr.contains("unreadable registry"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
 }

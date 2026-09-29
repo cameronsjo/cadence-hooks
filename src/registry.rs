@@ -305,7 +305,7 @@ pub const HOOKS: &[HookEntry] = &[
     // rules
     HookEntry {
         name: "validate-frontmatter",
-        description: "Validate SKILL.md and command frontmatter",
+        description: "Validate SKILL.md, command, living-plan, and plugin-agent frontmatter",
         namespace: "rules",
         event: Some(HookEvent::PreToolUse),
     },
@@ -630,17 +630,17 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // neither, so `try` would fail open before ever reaching the write
         // path.
         //
-        // `cwd` is a deliberately NONEXISTENT path, and `try_hook`'s
-        // `CWD_OVERRIDE_REFUSED` list keeps it that way — this hook has a
-        // genuine filesystem WRITE side effect, and `try`'s normal behavior
-        // (inject the REAL current_dir(), so most checks exercise real repo
-        // detection) would otherwise let a bare `cadence-hooks try session
-        // persist-plan-approval` actually create a plan doc in whatever repo
-        // the user ran it from (cameronsjo/cadence-hooks#396 review: verified
-        // end to end — a real plan doc landed in a real repo during review). A
-        // nonexistent directory makes `repo_root`'s `git -C <cwd> …` spawn
-        // fail deterministically, so the check reaches (and exercises) its
-        // "not a git repo" fail-open arm instead of ever writing.
+        // This hook has a genuine filesystem WRITE side effect, so `try` must
+        // never let it write (cameronsjo/cadence-hooks#396 review: a real plan
+        // doc once landed in a real repo). A sandbox `cwd` alone no longer
+        // guarantees that: the destination resolver follows
+        // `CLAUDE_PROJECT_DIR` and falls back to a user-scoped plans dir
+        // (cameronsjo/cadence-hooks#1021). What stops the write is `try_hook`
+        // running this hook with `CADENCE_NO_PERSIST_PLAN=1` and without
+        // `CLAUDE_PROJECT_DIR`: the opt-out is the resolver's first check, so
+        // `try` always reports ALLOW here and demonstrates none of the hook's
+        // branches. The nonexistent `cwd` (kept by `CWD_OVERRIDE_REFUSED`) is
+        // a second layer, not the guarantee.
         ("session", "persist-plan-approval") => Some(
             // Extra `#` in the raw-string delimiter: the payload's own plan
             // text embeds a literal `"#` (a quote immediately followed by an
@@ -824,6 +824,103 @@ mod tests {
                     hook.name
                 );
             }
+        }
+    }
+
+    /// The hook rows in one `## <namespace>` section of `docs/hooks.md`: each
+    /// table row whose first cell is a single backticked name, up to the next
+    /// `## ` heading. The `### CLI actions` subsection lists commands, not
+    /// hooks, so the scan stops there.
+    fn documented_hooks(doc: &str, namespace: &str) -> Vec<String> {
+        let mut in_section = false;
+        let mut rows = Vec::new();
+        for line in doc.lines() {
+            if let Some(heading) = line.strip_prefix("## ") {
+                in_section = heading.split_whitespace().next() == Some(namespace);
+                continue;
+            }
+            if line.starts_with("### CLI actions") {
+                in_section = false;
+            }
+            if !in_section {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("| `")
+                && let Some((name, _)) = rest.split_once("` |")
+            {
+                rows.push(name.to_string());
+            }
+        }
+        rows
+    }
+
+    fn registered_in(namespace: &str) -> Vec<&'static str> {
+        HOOKS
+            .iter()
+            .filter(|h| h.namespace == namespace)
+            .map(|h| h.name)
+            .collect()
+    }
+
+    fn namespaces() -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = HOOKS.iter().map(|h| h.namespace).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// `docs/hooks.md` claims to catalog every hook. Every registered hook has
+    /// exactly one row in its namespace's section, and every row names a
+    /// registered hook (cameronsjo/cadence-hooks#789).
+    #[test]
+    fn docs_hooks_catalog_matches_registry() {
+        let doc = include_str!("../docs/hooks.md");
+        for ns in namespaces() {
+            let documented = documented_hooks(doc, ns);
+            let registered = registered_in(ns);
+            let missing: Vec<_> = registered
+                .iter()
+                .filter(|n| !documented.iter().any(|d| d == *n))
+                .collect();
+            let unknown: Vec<_> = documented
+                .iter()
+                .filter(|d| !registered.contains(&d.as_str()))
+                .collect();
+            assert!(
+                missing.is_empty() && unknown.is_empty(),
+                "docs/hooks.md `## {ns}` is out of step with src/registry.rs: \
+                 missing rows {missing:?}, rows for unregistered hooks {unknown:?}"
+            );
+            assert_eq!(
+                documented.len(),
+                registered.len(),
+                "docs/hooks.md `## {ns}` lists a hook more than once: {documented:?}"
+            );
+        }
+    }
+
+    /// The README's per-namespace `Hooks` count matches the registry.
+    #[test]
+    fn readme_namespace_counts_match_registry() {
+        let readme = include_str!("../README.md");
+        for ns in namespaces() {
+            let prefix = format!("| `{ns}` |");
+            let row = readme
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("README.md has no namespace row for `{ns}`"));
+            let count: usize = row
+                .split('|')
+                .map(str::trim)
+                .nth(3)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or_else(|| panic!("README.md row for `{ns}` has no numeric count: {row}"));
+            assert_eq!(
+                count,
+                registered_in(ns).len(),
+                "README.md says `{ns}` has {count} hooks; src/registry.rs registers {}",
+                registered_in(ns).len()
+            );
         }
     }
 }
