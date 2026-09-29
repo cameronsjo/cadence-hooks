@@ -13,7 +13,9 @@
 //!    `gh pr view <n> --json mergedAt,mergeCommit` before retrying or assuming
 //!    failure.
 
-use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, executable_tokens, skip_transparent_prefixes,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Nudges a pre-flight checklist on `gh pr merge`.
@@ -26,12 +28,16 @@ pub struct WarnGhMergePreflight;
 /// command word folds; the `pr merge` subcommands remain case-sensitive.
 fn is_gh_pr_merge(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
-        let tokens = tokenize(strip_group_wrappers(&segment));
-        tokens
-            .first()
+        // Reserved words and group punctuation go first, then transparent
+        // prefixes and `NAME=value` assignments, so `GH_TOKEN=x gh pr merge`,
+        // `env … gh`, `time gh`, and `then gh pr merge` are seen
+        // (cadence-hooks#545).
+        let tokens = executable_tokens(&segment);
+        let argv = skip_transparent_prefixes(&tokens);
+        argv.first()
             .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && tokens.get(1).map(String::as_str) == Some("pr")
-            && tokens.get(2).map(String::as_str) == Some("merge")
+            && argv.get(1).map(String::as_str) == Some("pr")
+            && argv.get(2).map(String::as_str) == Some("merge")
     })
 }
 
@@ -199,5 +205,40 @@ mod tests {
     fn hyphenated_lookalike_allowed() {
         let result = WarnGhMergePreflight.run(&make_bash("./gh-pr-merge-helper.sh"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn prefixed_and_keyword_wrapped_merge_nudges() {
+        // cadence-hooks#545: each was silent because the segment head was
+        // compared without skipping prefixes or reserved words.
+        for command in [
+            "GH_TOKEN=x gh pr merge 5",
+            "env GH_TOKEN=x gh pr merge 5",
+            "time gh pr merge 5 --squash",
+            "command gh pr merge 5",
+            "nohup gh pr merge 5",
+            "exec gh pr merge 5",
+            "for p in 1 2; do gh pr merge $p; done",
+            "if true; then gh pr merge 5; fi",
+        ] {
+            let result = WarnGhMergePreflight.run(&make_bash(command));
+            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+        }
+    }
+
+    #[test]
+    fn the_rewrites_wins_and_controls_hold() {
+        for command in ["bash -c 'gh pr merge 5'", "/opt/homebrew/bin/gh pr merge 5"] {
+            let result = WarnGhMergePreflight.run(&make_bash(command));
+            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+        }
+        for command in [
+            "echo 'gh pr merge 5'",
+            "gh pr comment 5 --body 'run gh pr merge 5 next'",
+            "GH_TOKEN=x gh pr view 5",
+        ] {
+            let result = WarnGhMergePreflight.run(&make_bash(command));
+            assert_eq!(result.outcome, Outcome::Allow, "{command}");
+        }
     }
 }

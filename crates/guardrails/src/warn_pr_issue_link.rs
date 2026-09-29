@@ -9,19 +9,25 @@
 //! is not false-flagged.
 
 use crate::issue_refs::has_closing_keyword;
-use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, executable_tokens, skip_transparent_prefixes, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// True when an executable segment invokes the literal `pr create` subcommand
 /// on a `gh` command word. Only the command word folds.
 fn is_gh_pr_create(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
-        let tokens = tokenize(strip_group_wrappers(&segment));
-        tokens
-            .first()
+        // Reserved words and group punctuation go first, then transparent
+        // prefixes and `NAME=value` assignments, so `GH_TOKEN=x gh pr create`,
+        // `env … gh`, `time gh`, and `then gh pr create` are seen
+        // (cadence-hooks#545).
+        let tokens = executable_tokens(&segment);
+        let argv = skip_transparent_prefixes(&tokens);
+        argv.first()
             .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && tokens.get(1).map(String::as_str) == Some("pr")
-            && tokens.get(2).map(String::as_str) == Some("create")
+            && argv.get(1).map(String::as_str) == Some("pr")
+            && argv.get(2).map(String::as_str) == Some("create")
     })
 }
 
@@ -477,5 +483,36 @@ mod tests {
             msg.contains("warn-pr-issue-link:"),
             "nudge message should name the check, got: {msg}"
         );
+    }
+
+    #[test]
+    fn prefixed_and_keyword_wrapped_create_is_checked() {
+        // cadence-hooks#545: each was silent because the segment head was
+        // compared without skipping prefixes or reserved words.
+        for command in [
+            "GH_TOKEN=x gh pr create --title t --body 'no link'",
+            "env GH_TOKEN=x gh pr create --title t --body 'no link'",
+            "time gh pr create --title t --body 'no link'",
+            "if true; then gh pr create --title t --body 'no link'; fi",
+        ] {
+            assert!(is_gh_pr_create(command), "{command}");
+            let result = WarnPrIssueLink.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rewrites_wins_and_controls_hold() {
+        assert!(is_gh_pr_create("bash -c 'gh pr create --title t'"));
+        assert!(is_gh_pr_create("/opt/homebrew/bin/gh pr create --title t"));
+        assert!(!is_gh_pr_create("echo 'gh pr create'"));
+        assert!(!is_gh_pr_create(
+            "gh pr comment 5 --body 'then gh pr create'"
+        ));
+        assert!(!is_gh_pr_create("GH_TOKEN=x gh pr view 5"));
     }
 }

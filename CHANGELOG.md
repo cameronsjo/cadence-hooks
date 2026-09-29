@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`warn-gh-merge-preflight` and `warn-pr-issue-link` see prefixed and keyword-wrapped `gh`.** `GH_TOKEN=x gh pr merge 5`, `env`, `time`, `command`, `nohup`, `exec`, and `for … do` / `if … then` segments now nudge. Quoted prose stays silent, and `bash -c '…'` and a path-qualified `gh` still nudge. `sudo`, `timeout`, `xargs`, `stdbuf`, and `eval` remain unseen (cameronsjo/cadence-hooks#545)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed
