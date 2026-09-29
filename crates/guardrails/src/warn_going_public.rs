@@ -1,4 +1,4 @@
-//! Nudge when `gh repo create`/`gh repo edit` telegraphs sensitive content via
+//! Nudge when `gh repo create`/`edit`/`rename` telegraphs sensitive content via
 //! the repo NAME or `--description`.
 //!
 //! Fires as a PreToolUse hook on Bash. Content-scans the repo name and its
@@ -31,12 +31,11 @@ use cadence_hooks_cadence::redact_external_content::identity_matches;
 use cadence_hooks_core::config::env_list;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
-    command_segments, contains_ignoring_ascii_case, executable_tokens, fold_verb,
-    skip_transparent_prefixes,
+    command_segments, command_word, contains_ignoring_ascii_case, executable_tokens,
+    peel_command_runners,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
-use std::borrow::Cow;
 use std::sync::LazyLock;
 
 /// Publicly-known OSS app names that read as a home-media / piracy stack.
@@ -121,25 +120,20 @@ fn find_match(haystack: &str, terms: &[String], ignore: &[String]) -> Option<Str
     None
 }
 
-/// Basename-aware command word, ASCII case folded: `/opt/homebrew/bin/GH` →
-/// `gh`. The fold is cadence-hooks#488 — a case-insensitive volume resolves
-/// `GH` to the `gh` binary and runs it, so the caller's `== "gh"` test silenced
-/// the whole check on a spelling that works. Feeds a nudge, the most forgiving
-/// direction there is.
-fn command_word(tokens: &[String]) -> Option<Cow<'_, str>> {
-    tokens
-        .first()
-        .map(|first| fold_verb(first.rsplit('/').next().unwrap_or(first)))
-}
-
 /// The first positional token immediately after the subcommand (index 3), if it
 /// isn't a flag. Mirrors guard_gh_write's positional extraction — a dash-flag in
-/// that slot means the command carries no bare name.
+/// that slot means the command carries no bare name. A lone `--` ends options,
+/// so the token after it is the name (`gh repo create -- <name>`).
 fn positional_name(tokens: &[String]) -> Option<&str> {
+    let at = if tokens.get(3).map(String::as_str) == Some("--") {
+        4
+    } else {
+        3
+    };
     tokens
-        .get(3)
+        .get(at)
         .map(String::as_str)
-        .filter(|t| !t.starts_with('-'))
+        .filter(|t| at == 4 || !t.starts_with('-'))
 }
 
 /// Extract the `--description`/`-d` value across the separate-token
@@ -207,7 +201,7 @@ impl Check for GoingPublicGuard {
         // The head is read through the shared pre-processing model: group
         // punctuation and reserved words go (`executable_tokens`), then
         // leading `NAME=value` assignment words and transparent prefixes
-        // (`skip_transparent_prefixes`). Bash runs `X=1 gh repo create …` as
+        // (`peel_command_runners`, which also walks `sudo`/`env -i`). Bash runs `X=1 gh repo create …` as
         // `gh`, and reading the assignment as the command word silenced the
         // check (cameronsjo/cadence-hooks#1171). Skipping more prefixes only
         // exposes more `gh` invocations, the forgiving direction for a nudge.
@@ -219,8 +213,11 @@ impl Check for GoingPublicGuard {
         // relieve (#793) included. The relief list is the session environment.
         for segment in command_segments(command) {
             let all_tokens = executable_tokens(&segment);
-            let tokens = skip_transparent_prefixes(&all_tokens);
-            if command_word(tokens).as_deref() != Some("gh") {
+            let tokens = peel_command_runners(&all_tokens);
+            let Some(head) = tokens.first() else {
+                continue;
+            };
+            if command_word(head) != "gh" {
                 continue;
             }
             if tokens.get(1).map(String::as_str) != Some("repo") {
@@ -233,6 +230,11 @@ impl Check for GoingPublicGuard {
                 Some("create") => {}
                 // `edit` fires only when the command publicizes the repo.
                 Some("edit") if has_public_visibility(tokens) => {}
+                // `rename` fires on any visibility, like `create`: it never
+                // changes visibility, and whether the repo is already public
+                // takes an API call this guard does not make. The NEW name is
+                // scanned for the same terms (cadence-hooks#1171).
+                Some("rename") => {}
                 _ => continue,
             }
 
@@ -390,6 +392,41 @@ mod tests {
             outcome("gh repo create my-widget --public"),
             cadence_hooks_core::Outcome::Allow
         );
+    }
+
+    // --- cadence-hooks#1171: rename, escaped/wrapped heads, `--` ---
+
+    #[test]
+    fn rename_create_wrapped_and_dashdash_table() {
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // rename: the NEW name is scanned, on any visibility
+            ("gh repo rename sonarr-cfg", Nudge),
+            ("gh repo rename sonarr-cfg -y", Nudge),
+            ("gh repo rename -- sonarr-cfg", Nudge),
+            ("gh repo rename my-widget", Allow),
+            ("gh repo rename", Allow),
+            // escaped and wrapped heads
+            (r"\gh repo create sonarr-cfg", Nudge),
+            ("sudo gh repo create sonarr-cfg", Nudge),
+            ("sudo -u me gh repo create sonarr-cfg", Nudge),
+            ("env -i gh repo create sonarr-cfg", Nudge),
+            ("env -u FOO gh repo create sonarr-cfg", Nudge),
+            ("env -i X=1 gh repo rename sonarr-cfg", Nudge),
+            // `--` ends options: the next token is the name
+            ("gh repo create -- sonarr-cfg", Nudge),
+            ("gh repo create -- my-widget", Allow),
+            ("gh repo create --", Allow),
+            // controls
+            ("gh repo view sonarr-cfg", Allow),
+            ("gh repo create my-widget --public", Allow),
+            ("echo gh repo rename sonarr-cfg", Allow),
+            ("echo \"gh repo create sonarr-cfg\"", Allow),
+            ("sudo echo gh repo rename sonarr-cfg", Allow),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(outcome(cmd), *want, "{cmd}");
+        }
     }
 
     // --- edit: fires only when publicizing ---
