@@ -230,7 +230,7 @@ row to `failopen.jsonl` rather than blocking:
 - An **unreadable** or **non-UTF-8** body file (a write/hook race, a permission, a binary file).
 - A body assembled by a command substitution the guard cannot resolve to a literal.
 - A **`gh` alias** (`gh alias set prc 'pr create'`) — the expansion lives in `gh`'s own config, which the hook does not read.
-- **`gh api … -f body=@file`** — the raw API path carries no `--body` flag to find.
+- A **`gh api`** body on **standard input** (`-F body=@-`, `--input -`), or an `--input` file that is not JSON or carries no `body` field. Every other `gh api` write to a PR, issue, comment or review endpoint (`repos/O/R/pulls[/N]`, `issues[/N]`, `…/comments`, `…/reviews`) is measured on the surface its path names: `-f`/`-F body=…`, `-F body=@file`, and `--input file.json`'s `body` field. `graphql` mutations are not read.
 - A body reached through **`xargs`** (`echo x | xargs -I{} gh pr create --body …`) — the `gh` argv is assembled by another process at run time. Write the body to a regular file and call `gh` directly if you want it measured.
 
 Two shapes are **not** silent. Each produces the block text rather than an
@@ -296,7 +296,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_MARKER_DIR` | marker-keyed checks, `guard-browser-device` | Where one-time markers live. Pointing it at a directory that already holds a marker makes `guard-browser-device` allow without its first-use block. **Weakens a protected guard** |
 | `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` | `warn-subagent-worktree` | Set to `1`/`true`/`yes` to silence the nudge for a repo |
 | `CADENCE_ALLOW_BRANCH_INTENT` | `warn-branch-intent` | Set to `1`/`true`/`yes` to silence the stale-branch nudge |
-| `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public |
+| `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public. The work-identifiable terms in `~/.config/cadence/redaction.toml` are flagged here too, without being listed again; the ignore list cannot relieve those, only the term source's own `allow` entries can |
 | `CADENCE_NO_OUTRO_BACKSTOP` | `backstop-record`, `backstop-warn` | Set to turn off the loose-ends backstop |
 | `CADENCE_NO_PERSIST_PLAN` | `persist-plan-approval` | Set to stop writing approved plans to disk |
 | `CADENCE_PLANS_DIR` | `persist-plan-approval` | Read from a repo's (or a non-repo session root's) `.claude/settings*.json` `env` block, never the process env. A relative path for approved plans, default `docs/plans`; it must stay inside the checkout, and `\`, `..` or a `.git` component is refused. Empty stops the persist. A session root outside any repo, a repo with a remote outside `CADENCE_ALLOWED_OWNERS`, or a dir that escapes the checkout sends the plan to `<config_dir>/cadence/plans` instead |

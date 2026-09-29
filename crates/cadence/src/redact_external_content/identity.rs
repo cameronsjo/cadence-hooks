@@ -234,12 +234,18 @@ pub(crate) fn load() -> (IdentityList, Status) {
     let Some(path) = terms_path() else {
         return (IdentityList::default(), Status::Absent);
     };
+    load_from(&path)
+}
+
+/// [`load`] against an explicit path — the one reader both the resolved term
+/// source and a test fixture go through.
+pub(crate) fn load_from(path: &std::path::Path) -> (IdentityList, Status) {
     if !path.exists() {
         return (IdentityList::default(), Status::Absent);
     }
     // Same bounded, regular-file-only reader the body-file path uses: a symlink
     // to /dev/zero or a multi-GB file must not hang the hook (#157/#194).
-    let Some(raw) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
+    let Some(raw) = cadence_hooks_core::paths::read_untrusted_config(path) else {
         return (IdentityList::default(), Status::Unreadable);
     };
     match toml::from_str::<IdentityList>(&raw) {
@@ -288,7 +294,28 @@ fn term_regex(term: &str) -> Option<Regex> {
         body,
         if ends_word { r"\b" } else { "" }
     );
-    Regex::new(&pattern).ok()
+    cached_regex(&pattern)
+}
+
+/// Compile `pattern` once per process. A scan runs once per posted text, and
+/// one command can post tens of thousands of texts (every `gh api` field,
+/// every repeated flag); recompiling each term and allow pattern per text
+/// took a 200 KB command past the hook deadline, where the guard fails open.
+/// The cache is bounded by the term source and repo config, which a command
+/// cannot grow. An invalid pattern caches as `None`.
+pub(super) fn cached_regex(pattern: &str) -> Option<Regex> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<Regex>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| Regex::new(pattern).ok())
+            .clone()
+    })
 }
 
 /// Does an allow entry excuse this match?
@@ -304,7 +331,7 @@ fn is_allowed(entry: &AllowEntry, text: &str, file_path: Option<&str>) -> bool {
         return true;
     }
     if let Some(pat) = entry.pattern.as_deref().filter(|p| !p.is_empty())
-        && Regex::new(pat).is_ok_and(|re| re.is_match(text))
+        && cached_regex(pat).is_some_and(|re| re.is_match(text))
     {
         return true;
     }

@@ -10,7 +10,7 @@
 //! so handing this a non-posting segment performs I/O the guard has no business
 //! doing (cadence-hooks#424).
 
-use crate::shell::tokenize;
+use crate::shell::{tokenize, unescape_word};
 use std::path::Path;
 
 /// Why a `--body-file` read yielded no text.
@@ -20,6 +20,51 @@ use std::path::Path;
 /// Re-exported from [`crate::paths`] so the cap discipline and the error
 /// vocabulary stay one thing.
 pub use crate::paths::CappedReadError as BodyFileError;
+
+/// Does the word `tok` name the flag `name` as the program receives it? The
+/// shell drops an unquoted word's backslashes before `gh` or `git` parses its
+/// flags, so `--bo\dy` and `-\m` ARE `--body` and `-m`; comparing the
+/// tokenizer's raw text let a single backslash hide a flag's value from every
+/// reader.
+///
+/// The tokenizer no longer says which backslashes were quoted, so a quoted
+/// `'--bo\dy'` (which bash passes as written, not a flag) also reads as the
+/// flag — the see-more direction for a reader of posted text.
+pub fn is_flag(tok: &str, name: &str) -> bool {
+    unescape_word(tok) == name
+}
+
+/// `tok` with the flag spelling `prefix` removed, matched the way the shell
+/// passes the word (see [`is_flag`]), or `None` when it does not start with
+/// it. The remainder is the RAW text after the prefix, so a joined or glued
+/// value keeps its own backslashes for the caller to read, as a separate-token
+/// value does: `--bo\dy=a\b` yields `a\b`.
+pub fn strip_flag_prefix<'a>(tok: &'a str, prefix: &str) -> Option<&'a str> {
+    if !tok.contains('\\') {
+        return tok.strip_prefix(prefix);
+    }
+    let mut rest = tok;
+    for want in prefix.chars() {
+        let mut chars = rest.chars();
+        let got = match chars.next()? {
+            '\\' => chars.next()?,
+            c => c,
+        };
+        if got != want {
+            return None;
+        }
+        rest = chars.as_str();
+    }
+    Some(rest)
+}
+
+/// A glued short flag's value (`-mMSG` → `MSG`): the word starts with `short`
+/// (read as [`strip_flag_prefix`] does) and something follows it. A word that
+/// is the bare flag, or the flag plus a lone trailing backslash the shell
+/// drops, yields `None`.
+pub fn glued_short_value<'a>(tok: &'a str, short: &str) -> Option<&'a str> {
+    strip_flag_prefix(tok, short).filter(|rest| !unescape_word(rest).is_empty())
+}
 
 /// Flags whose value is a separate token that must never be read as another
 /// flag. Skipping their value keeps a body like `--body --title` from
@@ -48,61 +93,82 @@ const VALUE_FLAGS: &[&str] = &[
 /// value intact. `--title`/`-t` is deliberately out of scope here (bodies only);
 /// [`extract_title`] handles it separately.
 pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
+    extract_bodies_sourced(segment, base_dir)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// Where one extracted body came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodySource {
+    /// A command-line word, as [`tokenize`] returns it: quotes removed, but an
+    /// unquoted backslash still in place (`zorbl\axcorp`), where the shell
+    /// removes it before the program ever sees the value.
+    Word,
+    /// A file's contents, read from disk: the bytes are posted as they are, so
+    /// no shell quote removal applies to them.
+    File,
+}
+
+/// [`extract_bodies`], with each body tagged by where it came from. A caller
+/// that must read a literal value the way the shell passes it (a backslash
+/// removed) needs to know which bodies are words, since doing the same to a
+/// file's contents would scan text nobody posts.
+pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, BodySource)> {
     let tokens = tokenize(segment);
     let mut bodies = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         // Separate-token literal body flags.
-        if matches!(tok, "--body" | "-b" | "-m" | "--message")
+        let name = unescape_word(tok);
+        if matches!(name.as_ref(), "--body" | "-b" | "-m" | "--message")
             && let Some(v) = tokens.get(i + 1)
         {
-            bodies.push(v.clone());
+            bodies.push((v.clone(), BodySource::Word));
             i += 2;
             continue;
         }
         // Separate-token file-body flags (value is a path → read it). The flag
         // consumes two tokens whether or not the file reads, so the i-advance
         // stays outside the read-success branch.
-        if matches!(tok, "--body-file" | "-F")
+        if matches!(name.as_ref(), "--body-file" | "-F")
             && let Some(p) = tokens.get(i + 1)
         {
             if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
+                bodies.push((content, BodySource::File));
             }
             i += 2;
             continue;
         }
         // `=`-joined long forms.
-        if let Some(v) = tok
-            .strip_prefix("--body=")
-            .or_else(|| tok.strip_prefix("--message="))
+        if let Some(v) =
+            strip_flag_prefix(tok, "--body=").or_else(|| strip_flag_prefix(tok, "--message="))
         {
-            bodies.push(v.to_string());
+            bodies.push((v.to_string(), BodySource::Word));
             i += 1;
             continue;
         }
-        if let Some(p) = tok.strip_prefix("--body-file=") {
+        if let Some(p) = strip_flag_prefix(tok, "--body-file=") {
             if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
+                bodies.push((content, BodySource::File));
             }
             i += 1;
             continue;
         }
         // Glued short forms: `-mMSG`, `-bBODY` (literal), `-FPATH` (file).
-        if !tok.starts_with("--") && tok.len() > 2 {
-            if let Some(v) = tok.strip_prefix("-m").or_else(|| tok.strip_prefix("-b")) {
-                bodies.push(v.to_string());
-                i += 1;
-                continue;
+        if let Some(v) = glued_short_value(tok, "-m").or_else(|| glued_short_value(tok, "-b")) {
+            bodies.push((v.to_string(), BodySource::Word));
+            i += 1;
+            continue;
+        }
+        if let Some(p) = glued_short_value(tok, "-F") {
+            if let Ok(content) = read_body_file(p, base_dir) {
+                bodies.push((content, BodySource::File));
             }
-            if let Some(p) = tok.strip_prefix("-F") {
-                if let Ok(content) = read_body_file(p, base_dir) {
-                    bodies.push(content);
-                }
-                i += 1;
-                continue;
-            }
+            i += 1;
+            continue;
         }
         i += 1;
     }
@@ -129,7 +195,8 @@ pub fn extract_title(segment: &str) -> Option<String> {
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
-        if matches!(tok, "--title" | "-t") {
+        let name = unescape_word(tok);
+        if matches!(name.as_ref(), "--title" | "-t") {
             if let Some(v) = tokens.get(i + 1) {
                 found = Some(v.clone());
                 i += 2;
@@ -138,23 +205,19 @@ pub fn extract_title(segment: &str) -> Option<String> {
             // A bare trailing flag has no value; leave the previous one.
             break;
         }
-        if let Some(v) = tok.strip_prefix("--title=") {
+        if let Some(v) = strip_flag_prefix(tok, "--title=") {
             found = Some(v.to_string());
             i += 1;
             continue;
         }
-        // Glued short form `-tTITLE`. `--title` is excluded by the `--` guard;
-        // a bare `-t` is excluded by the length guard.
-        if !tok.starts_with("--")
-            && tok.len() > 2
-            && let Some(v) = tok.strip_prefix("-t")
-        {
+        // Glued short form `-tTITLE`; a bare `-t` has no glued value.
+        if let Some(v) = glued_short_value(tok, "-t") {
             found = Some(v.to_string());
             i += 1;
             continue;
         }
         // Another flag's value is data, not a flag.
-        if VALUE_FLAGS.contains(&tok) {
+        if VALUE_FLAGS.contains(&name.as_ref()) {
             i += 2;
             continue;
         }
@@ -179,6 +242,247 @@ pub fn read_body_file(path: &str, base_dir: &str) -> Result<String, BodyFileErro
         Path::new(base_dir).join(p)
     };
     crate::paths::read_untrusted_config_detailed(&full)
+}
+
+/// Every value of one flag in ONE segment's tokens, in argument order: the
+/// separate (`--desc x`, `-d x`), `=`-joined long (`--desc=x`) and glued short
+/// (`-dx`) spellings. ALL occurrences, not the last — a scanner reading more
+/// than `gh` posts errs toward seeing, which is the direction a leak guard
+/// wants. Pure.
+pub fn flag_values(tokens: &[String], long: &str, short: Option<char>) -> Vec<String> {
+    let short = short.map(|c| format!("-{c}"));
+    let joined = format!("{long}=");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        let name = unescape_word(tok);
+        if name == "--" {
+            break;
+        }
+        if name == long || short.as_deref() == Some(name.as_ref()) {
+            if let Some(v) = tokens.get(i + 1) {
+                out.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = strip_flag_prefix(tok, joined.as_str()) {
+            out.push(v.to_string());
+        } else if let Some(s) = short.as_deref()
+            && let Some(v) = glued_short_value(tok, s)
+        {
+            out.push(v.to_string());
+        }
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// `gh api` request bodies (cadence-hooks#930)
+// ---------------------------------------------------------------------------
+
+/// Where a `gh api` request's `body` (or `title`) field comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiField {
+    /// `-f body=TEXT`, or `-F body=TEXT` without an `@`: the text itself.
+    Literal(String),
+    /// `-F body=@PATH`: gh reads the field's value from the file.
+    File(String),
+    /// `-F body=@-`, or `--input -`: gh reads standard input, which the hook
+    /// cannot see.
+    Stdin,
+}
+
+/// The parts of ONE `gh api` invocation a body reader needs. Pure: no file is
+/// opened building it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiRequest {
+    /// The endpoint positional, as written (`repos/o/r/issues`, `/repos/…`).
+    pub endpoint: String,
+    /// The LAST `-X`/`--method` value, uppercased; `None` when absent.
+    pub method: Option<String>,
+    /// Whether any `-f`/`-F` field was passed.
+    pub has_fields: bool,
+    /// The LAST `body` field — gh keeps the last value for a repeated key.
+    pub body: Option<ApiField>,
+    /// The LAST `title` field.
+    pub title: Option<ApiField>,
+    /// EVERY `-f`/`-F` field in argument order, keys included — `name`,
+    /// `description`, `message`, nested `labels[]`, graphql `query` and its
+    /// variables. A scanner reads all of them; [`Self::body`] and
+    /// [`Self::title`] are the last-wins views a size budget needs.
+    pub fields: Vec<(String, ApiField)>,
+    /// The `--input` source, when given. gh sends that file as the request
+    /// body and turns every field into a query parameter instead.
+    pub input: Option<ApiField>,
+}
+
+impl ApiRequest {
+    /// The method gh will send: the explicit one, else POST once any field or
+    /// `--input` is present, else GET (gh's own implicit rule).
+    pub fn effective_method(&self) -> String {
+        match &self.method {
+            Some(m) => m.clone(),
+            None if self.has_fields || self.input.is_some() => "POST".to_string(),
+            None => "GET".to_string(),
+        }
+    }
+
+    /// Does this request carry a payload? A literal `GET` or `HEAD` sends its
+    /// fields as a query string, so it posts nothing. Any other method —
+    /// including one the hook cannot read literally (`-X "$M"`) — is taken to
+    /// post, which is the see-more direction for a reader.
+    pub fn sends_payload(&self) -> bool {
+        !matches!(self.effective_method().as_str(), "GET" | "HEAD")
+    }
+
+    /// The endpoint with any scheme/host, `api/v3/` prefix, leading slash and
+    /// query string removed: `https://ghe.x/api/v3/repos/o/r/issues?a=b` →
+    /// `repos/o/r/issues`.
+    pub fn endpoint_path(&self) -> &str {
+        let mut e = self.endpoint.as_str();
+        if let Some(rest) = e
+            .strip_prefix("https://")
+            .or_else(|| e.strip_prefix("http://"))
+        {
+            e = rest.split_once('/').map_or("", |(_, path)| path);
+        }
+        e = e.trim_start_matches('/');
+        e = e.strip_prefix("api/v3/").unwrap_or(e);
+        e.split(['?', '#']).next().unwrap_or(e)
+    }
+}
+
+/// `gh api` flags whose value is the following token (or `=`-joined, or glued
+/// to the short form).
+const API_VALUE_FLAGS: &[(&str, Option<char>)] = &[
+    ("--method", Some('X')),
+    ("--field", Some('F')),
+    ("--raw-field", Some('f')),
+    ("--header", Some('H')),
+    ("--jq", Some('q')),
+    ("--template", Some('t')),
+    ("--preview", Some('p')),
+    ("--input", None),
+    ("--hostname", None),
+    ("--cache", None),
+];
+
+/// Parse a `key=value` field into (key, source). `typed` is `-F`/`--field`,
+/// where a value starting with `@` names a file (`@-` is stdin); `-f` values
+/// are always literal.
+fn api_field(raw: &str, typed: bool) -> Option<(&str, ApiField)> {
+    let (key, value) = raw.split_once('=')?;
+    let field = match value.strip_prefix('@') {
+        Some("-") if typed => ApiField::Stdin,
+        Some(path) if typed => ApiField::File(path.to_string()),
+        _ => ApiField::Literal(value.to_string()),
+    };
+    Some((key, field))
+}
+
+/// Read a `gh api` invocation. `argv` is the command's argv with `gh` at index
+/// 0 (transparent prefixes already peeled); `None` when the command word is not
+/// `gh` or the first non-flag word after it is not `api`.
+///
+/// Every flag spelling pflag accepts is read — separate (`-f body=x`),
+/// `=`-joined long (`--raw-field=body=x`) and glued short (`-fbody=x`,
+/// `-XPATCH`). Repeated keys keep the last value, as gh does.
+pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
+    if crate::shell::command_word(argv.first()?).as_ref() != "gh" {
+        return None;
+    }
+    let mut i = 1;
+    while i < argv.len() && unescape_word(&argv[i]).starts_with('-') {
+        i += 1;
+    }
+    // The shell drops an unquoted word's backslashes, so `a\pi` runs `api`.
+    if argv
+        .get(i)
+        .map(|w| crate::shell::unescape_word(w))
+        .as_deref()
+        != Some("api")
+    {
+        return None;
+    }
+    i += 1;
+    let mut req = ApiRequest::default();
+    let mut endpoint: Option<String> = None;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        // Flag names are read as the shell passes them: `-\f` is `-f`.
+        let name = unescape_word(tok);
+        // Resolve (long name, value, tokens consumed) for a value flag.
+        let mut hit: Option<(&str, &str, usize)> = None;
+        if name == "--" {
+            if endpoint.is_none() {
+                endpoint = argv.get(i + 1).cloned();
+            }
+            break;
+        }
+        for (long, short) in API_VALUE_FLAGS {
+            let short_s = short.map(|c| format!("-{c}"));
+            if name == *long || short_s.as_deref() == Some(name.as_ref()) {
+                if let Some(v) = argv.get(i + 1) {
+                    hit = Some((long, v.as_str(), 2));
+                } else {
+                    hit = Some((long, "", 1));
+                }
+                break;
+            }
+            if let Some(v) =
+                strip_flag_prefix(tok, long).and_then(|rest| strip_flag_prefix(rest, "="))
+            {
+                hit = Some((long, v, 1));
+                break;
+            }
+            if let Some(s) = short_s.as_deref()
+                && let Some(v) = glued_short_value(tok, s)
+            {
+                hit = Some((long, v, 1));
+                break;
+            }
+        }
+        match hit {
+            Some((long, value, used)) => {
+                match long {
+                    "--method" => req.method = Some(value.to_ascii_uppercase()),
+                    "--field" | "--raw-field" => {
+                        req.has_fields = true;
+                        if let Some((key, field)) = api_field(value, long == "--field") {
+                            // gh reads the key the shell passes: `bo\dy=x`
+                            // sets `body`.
+                            match unescape_word(key).as_ref() {
+                                "body" => req.body = Some(field.clone()),
+                                "title" => req.title = Some(field.clone()),
+                                _ => {}
+                            }
+                            req.fields.push((key.to_string(), field));
+                        }
+                    }
+                    "--input" => {
+                        req.input = Some(if value == "-" {
+                            ApiField::Stdin
+                        } else {
+                            ApiField::File(value.to_string())
+                        });
+                    }
+                    _ => {}
+                }
+                i += used;
+            }
+            None => {
+                if !name.starts_with('-') && endpoint.is_none() {
+                    endpoint = Some(tok.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    req.endpoint = endpoint.unwrap_or_default();
+    Some(req)
 }
 
 #[cfg(test)]
@@ -387,5 +691,307 @@ mod tests {
             extract_bodies("git commit -m one -m two", "."),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    #[test]
+    fn extract_bodies_sourced_tags_words_and_files() {
+        // A word keeps its unquoted backslash (the caller decides how to read
+        // it); a file's contents are tagged so no caller unescapes them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "file \\text").unwrap();
+        let base = dir.path().to_str().unwrap();
+        let cases: &[(&str, Vec<(&str, BodySource)>)] = &[
+            (
+                r"gh pr comment 3 --body a\b",
+                vec![(r"a\b", BodySource::Word)],
+            ),
+            (
+                r"gh pr comment 3 --body=a\b",
+                vec![(r"a\b", BodySource::Word)],
+            ),
+            (r"git commit -ma\b", vec![(r"a\b", BodySource::Word)]),
+            (
+                "gh pr comment 3 --body-file b.md",
+                vec![(r"file \text", BodySource::File)],
+            ),
+            (
+                "git commit -Fb.md -m x",
+                vec![(r"file \text", BodySource::File), ("x", BodySource::Word)],
+            ),
+        ];
+        for (cmd, want) in cases {
+            let got = extract_bodies_sourced(cmd, base);
+            let want: Vec<(String, BodySource)> =
+                want.iter().map(|(t, s)| (t.to_string(), *s)).collect();
+            assert_eq!(got, want, "{cmd}");
+        }
+    }
+
+    // ---- parse_gh_api (cadence-hooks#930) ----
+
+    fn argv(s: &str) -> Vec<String> {
+        tokenize(s)
+    }
+
+    #[test]
+    fn parse_gh_api_reads_every_field_spelling() {
+        use ApiField::*;
+        let cases: &[(&str, Option<ApiField>)] = &[
+            (
+                "gh api repos/o/r/issues -f body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -fbody=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --raw-field body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --raw-field=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -F body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --field=body=@b.md",
+                Some(File("b.md".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -Fbody=@b.md",
+                Some(File("b.md".into())),
+            ),
+            ("gh api repos/o/r/issues -F body=@-", Some(Stdin)),
+            // A raw field never reads a file: `@` is literal text.
+            (
+                "gh api repos/o/r/issues -f body=@b.md",
+                Some(Literal("@b.md".into())),
+            ),
+            // gh keeps the last value for a repeated key.
+            (
+                "gh api repos/o/r/issues -f body=a -f body=b",
+                Some(Literal("b".into())),
+            ),
+            // Another key is not the body; a flag's VALUE is not a field.
+            ("gh api repos/o/r/issues -f labels=x", None),
+            ("gh api repos/o/r/issues -H body=x", None),
+        ];
+        for (cmd, want) in cases {
+            let req = parse_gh_api(&argv(cmd)).expect(cmd);
+            assert_eq!(&req.body, want, "{cmd}");
+            assert_eq!(req.endpoint, "repos/o/r/issues", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_method_input_and_non_api() {
+        let req = parse_gh_api(&argv("gh api -XPATCH /repos/o/r/pulls/1 --input p.json")).unwrap();
+        assert_eq!(req.method.as_deref(), Some("PATCH"));
+        assert_eq!(req.input, Some(ApiField::File("p.json".into())));
+        assert_eq!(req.endpoint_path(), "repos/o/r/pulls/1");
+        assert!(req.sends_payload());
+
+        let implicit = parse_gh_api(&argv("gh api repos/o/r/issues -f body=x")).unwrap();
+        assert_eq!(implicit.effective_method(), "POST");
+        let get = parse_gh_api(&argv("gh api -X get repos/o/r/issues -f body=x")).unwrap();
+        assert!(!get.sends_payload(), "a GET sends fields as a query string");
+        let bare = parse_gh_api(&argv("gh api repos/o/r/issues")).unwrap();
+        assert!(!bare.sends_payload());
+
+        let url = parse_gh_api(&argv(
+            "gh api https://ghe.example/api/v3/repos/o/r/issues?x=1 -f body=x",
+        ))
+        .unwrap();
+        assert_eq!(url.endpoint_path(), "repos/o/r/issues");
+
+        for not_api in ["gh pr create --body x", "gh repo view api", "echo api"] {
+            assert_eq!(parse_gh_api(&argv(not_api)), None, "{not_api}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_keeps_every_field_in_order() {
+        use ApiField::*;
+        let req = parse_gh_api(&argv(
+            "gh a\\pi repos/o/r/labels -f name=n --field=description=@d.md -Fcolor=@- -H x=y",
+        ))
+        .expect("an escaped `api` is `api`");
+        assert_eq!(
+            req.fields,
+            vec![
+                ("name".to_string(), Literal("n".into())),
+                ("description".to_string(), File("d.md".into())),
+                ("color".to_string(), Stdin),
+            ]
+        );
+    }
+
+    #[test]
+    fn flag_values_reads_every_spelling_and_occurrence() {
+        let cases: &[(&str, &[&str])] = &[
+            ("gh gist create -d a f", &["a"]),
+            ("gh gist create -da f", &["a"]),
+            ("gh gist create --desc a f", &["a"]),
+            ("gh gist create --desc=a f", &["a"]),
+            ("gh gist create -d a --desc b", &["a", "b"]),
+            ("gh gist create --descx a", &[]),
+            ("gh gist create -- --desc a", &[]),
+            ("gh gist create -d", &[]),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(flag_values(&argv(cmd), "--desc", Some('d')), *want, "{cmd}");
+        }
+    }
+
+    // ---- flag names read the way the shell passes them ----
+    //
+    // bash drops an unquoted word's backslashes before the program parses its
+    // flags (`printf '%s\n' --bo\dy -\m --ti\tle` prints `--body -m --title`),
+    // so a backslash in a flag NAME must not hide the flag's value. Values stay
+    // raw: `--bo\dy=a\b` yields `a\b`, as the separate-token value `a\b` does.
+
+    #[test]
+    fn strip_flag_prefix_reads_the_name_as_the_shell_passes_it() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("--body=x", "--body=", Some("x")),
+            (r"--bo\dy=x", "--body=", Some("x")),
+            (r"--body\=x", "--body=", Some("x")),
+            (r"--bo\dy=a\b", "--body=", Some(r"a\b")),
+            (r"\-\-body=", "--body=", Some("")),
+            // `\\` is a literal backslash, not an escape of `d`.
+            (r"--bo\\dy=x", "--body=", None),
+            (r"--bo\", "--body=", None),
+            ("--bodyx", "--body=", None),
+        ];
+        for (tok, prefix, want) in cases {
+            assert_eq!(
+                strip_flag_prefix(tok, prefix),
+                *want,
+                "{tok:?} / {prefix:?}"
+            );
+        }
+        let glued: &[(&str, Option<&str>)] = &[
+            ("-mx", Some("x")),
+            (r"-\mx", Some("x")),
+            (r"-m\x", Some(r"\x")),
+            ("-m", None),
+            // A trailing lone backslash is dropped by the shell: bare `-m`.
+            (r"-m\", None),
+            (r"-\m", None),
+        ];
+        for (tok, want) in glued {
+            assert_eq!(glued_short_value(tok, "-m"), *want, "{tok:?}");
+        }
+        assert!(is_flag(r"--bo\dy", "--body"));
+        assert!(is_flag(r"-\m", "-m"));
+        assert!(!is_flag(r"--bo\\dy", "--body"));
+    }
+
+    #[test]
+    fn extract_bodies_matches_backslashed_flag_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "from file").unwrap();
+        let base = dir.path().to_str().unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            (r"gh pr comment 3 --bo\dy secret", &["secret"]),
+            (r"gh pr comment 3 --bo\dy=secret", &["secret"]),
+            (r"gh pr comment 3 --body\=secret", &["secret"]),
+            (r"gh pr comment 3 -\b secret", &["secret"]),
+            (r"gh pr comment 3 -\bsecret", &["secret"]),
+            (r"git commit -\m secret", &["secret"]),
+            (r"git commit -\msecret", &["secret"]),
+            (r"git commit --mess\age secret", &["secret"]),
+            (r"git commit --mess\age=secret", &["secret"]),
+            (r"gh pr comment 3 --body-fi\le b.md", &["from file"]),
+            (r"gh pr comment 3 --body-fi\le=b.md", &["from file"]),
+            (r"gh pr comment 3 -\F b.md", &["from file"]),
+            (r"gh pr comment 3 -\Fb.md", &["from file"]),
+            // The value keeps its own backslash for the caller to read.
+            (r"gh pr comment 3 --bo\dy=a\b", &[r"a\b"]),
+            // A literal backslash (`\\`) spells a different flag.
+            (r"gh pr comment 3 --bo\\dy secret", &[]),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(extract_bodies(cmd, base), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn extract_title_and_flag_values_match_backslashed_flag_names() {
+        let titles: &[(&str, Option<&str>)] = &[
+            (r"gh issue create --ti\tle secret -b x", Some("secret")),
+            (r"gh issue create --ti\tle=secret", Some("secret")),
+            (r"gh issue create -\t secret", Some("secret")),
+            (r"gh issue create -\tsecret", Some("secret")),
+            // An escaped value flag still swallows its value.
+            (r"gh issue create --bo\dy --title", None),
+        ];
+        for (cmd, want) in titles {
+            assert_eq!(extract_title(cmd).as_deref(), *want, "{cmd}");
+        }
+        let values: &[(&str, &[&str])] = &[
+            (r"gh gist create --de\sc a f", &["a"]),
+            (r"gh gist create --de\sc=a f", &["a"]),
+            (r"gh gist create -\d a f", &["a"]),
+            (r"gh gist create -\da f", &["a"]),
+            (r"gh gist create \-\- --desc a", &[]),
+        ];
+        for (cmd, want) in values {
+            assert_eq!(flag_values(&argv(cmd), "--desc", Some('d')), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_matches_backslashed_flag_names() {
+        use ApiField::*;
+        let cases: &[(&str, Option<ApiField>)] = &[
+            (
+                r"gh api repos/o/r/issues -\f body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues -\fbody=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-fi\eld body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-fi\eld=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-field\=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues -\F body=@b.md",
+                Some(File("b.md".into())),
+            ),
+            // gh reads the key the shell passes.
+            (
+                r"gh api repos/o/r/issues -f bo\dy=hi",
+                Some(Literal("hi".into())),
+            ),
+            // An escaped value flag still takes its value, not the endpoint.
+            (
+                r"gh api -\H x:y repos/o/r/issues -f body=hi",
+                Some(Literal("hi".into())),
+            ),
+        ];
+        for (cmd, want) in cases {
+            let req = parse_gh_api(&argv(cmd)).expect(cmd);
+            assert_eq!(&req.body, want, "{cmd}");
+            assert_eq!(req.endpoint, "repos/o/r/issues", "{cmd}");
+        }
+        let req =
+            parse_gh_api(&argv(r"gh api -\XPATCH repos/o/r/pulls/1 --in\put p.json")).unwrap();
+        assert_eq!(req.method.as_deref(), Some("PATCH"));
+        assert_eq!(req.input, Some(File("p.json".into())));
     }
 }

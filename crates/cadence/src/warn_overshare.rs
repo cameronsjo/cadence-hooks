@@ -274,6 +274,29 @@ mod tests {
     }
 
     #[test]
+    fn gh_api_writes_repo_edits_and_merges_nudge_reads_do_not() {
+        // The identity-tier widening took the shared gate to `gh api` writes that
+        // carry text, `gh repo create/edit` and `gh pr merge`; the nudge
+        // follows it, and a read stays silent.
+        let cases: &[(&str, Outcome)] = &[
+            ("gh api repos/o/r/issues -f body=x", Outcome::Nudge),
+            (
+                "gh api -X PATCH repos/o/r/pulls/2 -f title=x",
+                Outcome::Nudge,
+            ),
+            ("gh api graphql -f query='mutation { x }'", Outcome::Nudge),
+            ("gh repo create o/r -d text --public", Outcome::Nudge),
+            ("gh pr merge 3 --subject s", Outcome::Nudge),
+            ("gh api repos/o/r", Outcome::Allow),
+            ("gh api -X GET repos/o/r/issues -f q=x", Outcome::Allow),
+            ("gh api graphql -f query='query { x }'", Outcome::Allow),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(run(&make_bash(cmd)).outcome, *want, "{cmd}");
+        }
+    }
+
+    #[test]
     fn quoted_mention_of_posting_verb_does_not_nudge() {
         // The EXTERNAL_POST arm quote-strips each segment, mirroring the
         // redact gate — a QUOTED mention of a posting command is prose.

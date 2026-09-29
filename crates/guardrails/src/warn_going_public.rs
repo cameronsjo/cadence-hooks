@@ -17,8 +17,19 @@
 //! hardcoded here, so the open-source binary carries no private vocabulary.
 //! Relieve false positives (e.g. the surnames `starr`/`pfarr` caught by the
 //! `*arr` regex) with `CADENCE_GOING_PUBLIC_IGNORE`.
+//!
+//! The work-identifiable terms in `~/.config/cadence/redaction.toml` are read
+//! here too (cadence-hooks#793), through `redact-external-content`'s identity
+//! matcher rather than a second copy of the list, so a term added there reaches
+//! the repo-visibility path without being duplicated into the environment.
+//! `CADENCE_GOING_PUBLIC_IGNORE` cannot relieve those — only the term source's
+//! own `allow` entries can.
 
+use cadence_hooks_cadence::redact_external_content::TermMatch;
+#[cfg(not(test))]
+use cadence_hooks_cadence::redact_external_content::identity_matches;
 use cadence_hooks_core::config::env_list;
+use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
     command_segments, contains_ignoring_ascii_case, fold_verb, tokenize,
 };
@@ -217,10 +228,53 @@ impl Check for GoingPublicGuard {
             if let Some(term) = find_match(&haystack, &terms, &ignore) {
                 return CheckResult::nudge(nudge_message(&term));
             }
+            // The redaction term source, read through the tier that owns it
+            // (cadence-hooks#793). Deliberately NOT relieved by
+            // `CADENCE_GOING_PUBLIC_IGNORE`: softening authority follows
+            // term-source authority, so only `redaction.toml`'s own `allow`
+            // entries can excuse one of its terms.
+            if let Some(hit) = identity_matches_for(&haystack).into_iter().next() {
+                return CheckResult::nudge(identity_nudge_message(&hit));
+            }
         }
 
         CheckResult::allow()
     }
+}
+
+/// Identity-tier matches for `haystack`. Production reads the real term
+/// source; a test build reads only the fixture a test installed, so no test
+/// ever depends on the operator's own `redaction.toml`.
+#[cfg(not(test))]
+fn identity_matches_for(haystack: &str) -> Vec<TermMatch> {
+    identity_matches(haystack)
+}
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_SOURCE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn identity_matches_for(haystack: &str) -> Vec<TermMatch> {
+    IDENTITY_SOURCE.with(|s| match s.borrow().as_deref() {
+        Some(path) => {
+            cadence_hooks_cadence::redact_external_content::identity_matches_from(haystack, path)
+        }
+        None => Vec::new(),
+    })
+}
+
+fn identity_nudge_message(hit: &TermMatch) -> String {
+    format!(
+        "warn-going-public: this repo's name or description contains `{}` (redaction term \
+         [{}]), which identifies work context on a public or soon-public repo.\n\
+         Use a neutral name/description. If this context is genuinely benign, add an `allow` \
+         entry beside the term in ~/.config/cadence/redaction.toml.",
+        sanitize_field(&hit.snippet, 120),
+        sanitize_field(&hit.id, 120),
+    )
 }
 
 fn nudge_message(term: &str) -> String {
@@ -498,5 +552,87 @@ mod tests {
             "message should name the off-switch"
         );
         assert!(!msg.contains("🚫"), "nudge must not read as a block");
+    }
+
+    // ---- redaction.toml terms (cadence-hooks#793) ----
+
+    /// Run `cmd` with `toml` installed as this thread's identity term source.
+    fn with_identity_source(toml: &str, cmd: &str) -> CheckResult {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redaction.toml");
+        std::fs::write(&path, toml).unwrap();
+        IDENTITY_SOURCE.with(|s| *s.borrow_mut() = Some(path));
+        let mut out = None;
+        crate::with_env(&[], || out = Some(GoingPublicGuard.run(&make_bash(cmd))));
+        IDENTITY_SOURCE.with(|s| *s.borrow_mut() = None);
+        out.unwrap()
+    }
+
+    const TERMS: &str = r#"
+[[terms]]
+id = "W1"
+term = "zorblax corp"
+allow = [{ pattern = "zorblax corp fan club" }]
+"#;
+
+    #[test]
+    fn a_redaction_term_in_the_name_or_description_nudges() {
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // Multi-word terms match across `-`/`_`, as the identity tier does.
+            ("gh repo create zorblax-corp-tools --private", Nudge),
+            ("gh repo create tools --public -d 'for Zorblax Corp'", Nudge),
+            ("gh repo edit o/zorblax_corp --visibility public", Nudge),
+            // Controls: an edit that does not publicize, an unrelated name,
+            // the term source's own allow entry, and a mention in prose.
+            ("gh repo edit o/zorblax-corp --description x", Allow),
+            ("gh repo create tools --public", Allow),
+            ("gh repo create x -d 'zorblax corp fan club'", Allow),
+            ("echo gh repo create zorblax-corp", Allow),
+        ];
+        for (cmd, want) in cases {
+            let result = with_identity_source(TERMS, cmd);
+            assert_eq!(result.outcome, *want, "{cmd}");
+            if *want == Nudge {
+                let msg = result.message.unwrap();
+                assert!(msg.contains("[W1]"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_env_ignore_list_cannot_relieve_a_redaction_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redaction.toml");
+        std::fs::write(&path, TERMS).unwrap();
+        IDENTITY_SOURCE.with(|s| *s.borrow_mut() = Some(path));
+        let mut out = None;
+        crate::with_env(
+            &[(
+                "CADENCE_GOING_PUBLIC_IGNORE",
+                Some("zorblax corp,zorblax-corp-tools"),
+            )],
+            || {
+                out = Some(
+                    GoingPublicGuard
+                        .run(&make_bash("gh repo create zorblax-corp-tools"))
+                        .outcome,
+                )
+            },
+        );
+        IDENTITY_SOURCE.with(|s| *s.borrow_mut() = None);
+        assert_eq!(out, Some(cadence_hooks_core::Outcome::Nudge));
+    }
+
+    #[test]
+    fn an_absent_or_malformed_term_source_is_inert() {
+        for toml in ["", "not = [valid", "version = 1\n"] {
+            let result = with_identity_source(toml, "gh repo create zorblax-corp-tools");
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{toml:?}"
+            );
+        }
     }
 }

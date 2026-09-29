@@ -85,6 +85,44 @@ impl Quote {
     }
 }
 
+/// Is an unquoted `$`, preceded by `before` (the characters before it, nearest
+/// first), bash's quoting sigil — so a `'` after it opens `$'…'` and a `"`
+/// after it opens `$"…"`? Only when the `$` is itself unescaped and is not the
+/// second half of a `$$` (the PID parameter): the run of `$` ending here, less
+/// a first one a backslash escapes, must be of odd length. `\$'a\'b'` and
+/// `$$'a\'b'` open a PLAIN single-quoted string in bash, where `\` is literal
+/// and the second `'` closes it; reading either as `$'…'` honoured the `\'`,
+/// reopened a phantom quote at the real closer, and handed guards the wrong
+/// words and segments for everything after it (the class of
+/// cameronsjo/cadence-hooks#463).
+///
+/// Walks back over one `$` run and one backslash run, both of which end at
+/// this `$`, so a caller asking once per `$'` stays linear overall. A quote
+/// character always separates this `$` from any earlier quoting context, so
+/// the characters walked are in the same (unquoted) context as the `$`.
+fn dollar_is_quote_sigil(before: impl Iterator<Item = char>) -> bool {
+    let mut before = before.peekable();
+    let mut dollars = 1usize;
+    while before.next_if_eq(&'$').is_some() {
+        dollars += 1;
+    }
+    let mut backslashes = 0usize;
+    while before.next_if_eq(&'\\').is_some() {
+        backslashes += 1;
+    }
+    if backslashes % 2 == 1 {
+        dollars -= 1;
+    }
+    dollars % 2 == 1
+}
+
+/// [`dollar_is_quote_sigil`] for a `$` that follows `before` in unquoted text:
+/// does a `'` after that `$` open `$'…'`? For byte scanners outside this module
+/// that track quotes themselves.
+pub fn dollar_opens_quote_after(before: &str) -> bool {
+    dollar_is_quote_sigil(before.chars().rev())
+}
+
 /// Advance `quote` across whatever quoting syntax sits at `chars[i]`, returning
 /// the index just past what was consumed — or `None` when the character is
 /// ordinary text the caller must interpret itself (an operator, a filename
@@ -112,7 +150,9 @@ fn scan_quote_syntax(chars: &[char], i: usize, quote: &mut Option<Quote>) -> Opt
         // `\"` open nothing. A backslash-newline is a line continuation and is
         // left to the caller.
         '\\' if chars.get(i + 1).is_some_and(|&n| n != '\n') => Some(i + 2),
-        '$' if chars.get(i + 1) == Some(&'\'') => {
+        '$' if chars.get(i + 1) == Some(&'\'')
+            && dollar_is_quote_sigil(chars[..i].iter().rev().copied()) =>
+        {
             *quote = Some(Quote::AnsiC);
             Some(i + 2)
         }
@@ -139,7 +179,11 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
     let (mode, mut j) = match chars[i] {
         '\'' => (Quote::Single, i + 1),
         '"' => (Quote::Double, i + 1),
-        '$' if chars.get(i + 1) == Some(&'\'') => (Quote::AnsiC, i + 2),
+        '$' if chars.get(i + 1) == Some(&'\'')
+            && dollar_is_quote_sigil(chars[..i].iter().rev().copied()) =>
+        {
+            (Quote::AnsiC, i + 2)
+        }
         _ => return None,
     };
     if matches!(mode, Quote::AnsiC) {
@@ -467,6 +511,10 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     // The previous unquoted character was a backslash that itself was not
     // escaped, so this one is literal to bash (`\{a,b\}` does not expand).
     let mut escape_pending = false;
+    // The previous character was an unquoted, unescaped `$` that did not
+    // itself complete a `$$`, so a `$` here is the second half of the `$$`
+    // parameter, not the start of `$"…"` (`$$"x"` is the PID then `x`).
+    let mut dollar_pending = false;
     let mut chars = command.chars().peekable();
     // Iterations left before [`unquoted_substitution_len`] may scan again.
     // A failed scan read `n` characters; no opener among them is scanned
@@ -477,6 +525,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
 
     while let Some(c) = chars.next() {
         let escaped = std::mem::take(&mut escape_pending);
+        let after_dollar = std::mem::take(&mut dollar_pending);
         no_scan_for = no_scan_for.saturating_sub(1);
         // Backfill whatever the previous iteration pushed from a quoted arm —
         // at the TOP, because those arms `continue` past the bottom.
@@ -560,13 +609,29 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
                 // the word, so it is consumed like the quote itself. A `$`
-                // before anything else (`$VAR`, `$(…)`) is ordinary text.
-                '$' if chars.peek() == Some(&'\'') => {
+                // before anything else (`$VAR`, `$(…)`) is ordinary text, and so
+                // is an escaped `\$` or the second `$` of `$$`: the `'` after
+                // either opens a plain single-quoted string.
+                '$' if chars.peek() == Some(&'\'') && !escaped && !after_dollar => {
                     chars.next();
                     quote = Some(Quote::AnsiC);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
                     lead.boundary(current.len(), false);
+                }
+                // `$"` is bash's locale quoting: a double-quoted string whose
+                // text is looked up in the message catalog. With no catalog
+                // (the C/POSIX locale every hook runs in) it is the string
+                // itself, and the `$` is syntax, not text: `zorbl$"a"xcorp`
+                // passes `zorblaxcorp`. Keeping the `$` handed guards a word
+                // bash never builds. An escaped `\$` or the second `$` of
+                // `$$` is text, and the `"` after it opens a plain string.
+                '$' if chars.peek() == Some(&'"') && !escaped && !after_dollar => {
+                    chars.next();
+                    quote = Some(Quote::Double);
+                    in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), true);
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
@@ -615,6 +680,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     current.push(c);
                     structural.resize(current.len(), !escaped);
                     escape_pending = c == '\\' && !escaped;
+                    dollar_pending = c == '$' && !escaped && !after_dollar;
                     in_token = true;
                 }
             },
@@ -7066,8 +7132,13 @@ fn split_segments_impl(
             // `$'` opens ANSI-C quoting. The `$` is part of the syntax, but
             // unlike [`tokenize`] — which is building a token VALUE — segments
             // keep their text verbatim, so both characters are pushed. A `$`
-            // before anything else (`$VAR`, `$(…)`) is ordinary text.
-            '$' if chars.peek() == Some(&'\'') => {
+            // before anything else (`$VAR`, `$(…)`) is ordinary text, and so
+            // is the second `$` of `$$` (an escaped `\$` never reaches here).
+            '$' if chars.peek() == Some(&'\'') && {
+                let i = all.len() - chars.len() - 1;
+                dollar_is_quote_sigil(all[..i].iter().rev().copied())
+            } =>
+            {
                 current.push(c);
                 current.push(chars.next().expect("peeked"));
                 quote = Some(Quote::AnsiC);
@@ -7301,7 +7372,9 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 chars.next();
                 boundary = false;
             }
-            '$' if chars.peek().map(|&(_, n)| n) == Some('\'') => {
+            '$' if chars.peek().map(|&(_, n)| n) == Some('\'')
+                && dollar_is_quote_sigil(text[..i].chars().rev()) =>
+            {
                 chars.next();
                 quote = Some(Quote::AnsiC);
                 boundary = false;
@@ -8630,6 +8703,13 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
         match c {
             '\\' if chars.get(k + 1) == Some(&'\n') => k += 2,
             c if c.is_whitespace() || ";&|()<>".contains(c) => break,
+            // `$$` is the PID parameter, kept as text: the `'` or `"` after it
+            // opens a plain string (`<<$$'E'` ends at `$$E`, as in bash). An
+            // escaped `\$` is taken by the backslash arm below.
+            '$' if chars.get(k + 1) == Some(&'$') => {
+                word.push_str("$$");
+                k += 2;
+            }
             '$' if chars.get(k + 1) == Some(&'\'') => {
                 quoted = true;
                 let start = k + 2;
@@ -14066,6 +14146,185 @@ mod tests {
             tokenize(r#"echo $HOME $(date) "$x""#),
             vec!["echo", "$HOME", "$(date)", "$x"]
         );
+    }
+
+    #[test]
+    fn tokenize_locale_quoting_drops_the_dollar_like_bash() {
+        // bash's `$"…"` is a double-quoted string translated through the
+        // message catalog; with none (the C/POSIX locale) it is the string
+        // itself and the `$` is syntax. Every row's expected text is what
+        // `printf '%s\n'` prints under bash 5.2, except that the tokenizer
+        // keeps an unquoted backslash (`\$`) for its callers, as it does
+        // everywhere else.
+        let cases: &[(&str, &[&str])] = &[
+            (r#"--body zorbl$""axcorp"#, &["--body", "zorblaxcorp"]),
+            (r#"--body zorbl$"a"xcorp"#, &["--body", "zorblaxcorp"]),
+            (r#"$"zorblaxcorp""#, &["zorblaxcorp"]),
+            (r#"$"x y" z"#, &["x y", "z"]),
+            (r#"echo $"""#, &["echo", ""]),
+            (r#"$"a\"b""#, &[r#"a"b"#]),
+            (r#"x$"'"y"#, &["x'y"]),
+            // `"$"` is a literal dollar inside a plain string.
+            (r#""$"x"#, &["$x"]),
+            // A substitution inside the string rides along whole.
+            (r#"a$"$(echo hi)"b"#, &["a$(echo hi)b"]),
+            // An escaped `$` is text, so the `"` opens a plain string.
+            (r#"\$"x""#, &[r"\$x"]),
+            // `$$` is the PID parameter; the quote after it is plain.
+            (r#"$$"x""#, &["$$x"]),
+            // `$$` then `$"x"`: the third `$` opens locale quoting.
+            (r#"$$$"x""#, &["$$x"]),
+            // A `$` before anything else stays ordinary text.
+            ("a$ b", &["a$", "b"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(tokenize(command), *want, "tokenize({command:?})");
+        }
+    }
+
+    #[test]
+    fn tokenize_marked_reads_locale_quoting_as_a_quote() {
+        // `>$"log"` is a redirect to `log` with an unquoted operator; `$"$HOME"`
+        // expands like `"$HOME"`.
+        let marked = tokenize_marked(r#">$"log""#);
+        assert_eq!(marked[0].text, ">log");
+        assert_eq!(marked[0].unquoted_prefix_len, 1);
+        let marked = tokenize_marked(r#"$"$HOME"/x"#);
+        assert_eq!(marked[0].text, "$HOME/x");
+        assert_eq!(marked[0].unquoted_prefix_len, 0);
+        assert_eq!(marked[0].expanding_prefix_len, 5);
+    }
+
+    #[test]
+    fn tokenize_escaped_or_paired_dollar_opens_a_plain_single_quote() {
+        // bash's `$'…'` needs a `$` that is itself syntax: an escaped `\$` or
+        // the second `$` of `$$` is text, and the `'` after it opens a PLAIN
+        // single-quoted string where `\` is literal. Every row's expected text
+        // is what `printf '%s\n'` prints under bash 5.2 (with `$$` kept as
+        // written), except that the tokenizer keeps an unquoted backslash.
+        let cases: &[(&str, &[&str])] = &[
+            // The canary: bash prints the one word `$a\b c`.
+            (r"\$'a\'b' c'", &[r"\$a\b c"]),
+            (r"$$'a\'b' c'", &[r"$$a\b c"]),
+            (r"a$$'b'", &["a$$b"]),
+            (r"x\$'y'z", &[r"x\$yz"]),
+            (r"\$'\n'", &[r"\$\n"]),
+            (r"$\$'x'", &[r"$\$x"]),
+            (r"\\\$'a\'b' c'", &[r"\\\$a\b c"]),
+            // An odd `$` run ends in a sigil; a backslash pair escapes itself.
+            (r"$$$'a\'b'", &["$$a'b"]),
+            (r"$$$$'x'", &["$$$$x"]),
+            (r"\\$'a\'b'", &[r"\\a'b"]),
+            (r"$'a\'b'", &["a'b"]),
+            // The phantom quote no longer swallows the next command's words.
+            (r"echo $$'a\' ; cat x", &["echo", r"$$a\", ";", "cat", "x"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(tokenize(command), *want, "tokenize({command:?})");
+        }
+    }
+
+    #[test]
+    fn segmenters_read_escaped_or_paired_dollar_quote_as_plain() {
+        // `\$'a\'` and `$$'a\'` end at the second `'` in bash, so the `;`
+        // after them separates a command bash runs (`bash -c` with
+        // `echo RAN` in place of `cat x` prints RAN for every row). Reading
+        // the `'` as `$'…'` honoured `\'` and swallowed the rest.
+        let cases: &[(&str, &[&str])] = &[
+            (r"echo $$'a\' ; cat x", &[r"echo $$'a\'", "cat x"]),
+            (r"echo \$'a\' ; cat x", &[r"echo \$'a\'", "cat x"]),
+            (r"echo $$'a\' && cat x", &[r"echo $$'a\'", "cat x"]),
+            // A `#` bash reads inside `' # '` is not a comment.
+            (r"echo $$'a\'' # '; cat x", &[r"echo $$'a\'' # '", "cat x"]),
+            // Control: a real `$'…'` still honours `\'`.
+            (r"echo $$$'a\' ; cat x'", &[r"echo $$$'a\' ; cat x'"]),
+            (r"echo $'a\'' # '; cat x", &[r"echo $'a\''"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(
+                split_segments(command),
+                *want,
+                "split_segments({command:?})"
+            );
+        }
+        // The comment scanner reads the same boundary: bash's `' # '` is quoted.
+        assert_eq!(
+            strip_comments(r"echo $$'a\'' # '; cat x"),
+            r"echo $$'a\'' # '; cat x"
+        );
+        assert_eq!(strip_comments(r"echo $'a\'' # '; cat x"), r"echo $'a\'' ");
+        assert_eq!(strip_quotes(r"echo $$'a\' ; x"), "echo $$ ; x");
+        assert_eq!(strip_quotes(r"echo \$'a\' ; x"), r"echo \$ ; x");
+        assert_eq!(strip_quotes(r"echo $'a\' ; x'"), "echo $");
+    }
+
+    #[test]
+    fn redirect_target_after_escaped_or_paired_dollar_is_a_plain_string() {
+        // `> $$'a\x'` writes `<pid>a\x` and `> \$'.en\x76'` writes `$.en\x76`:
+        // no ANSI-C decoding of a string whose `$` is text.
+        assert_eq!(redirect_targets(r"echo hi > $$'a\x'"), vec![r"$$a\x"]);
+        assert_eq!(redirect_targets(r"echo hi > $'.en\x76'"), vec![".env"]);
+    }
+
+    #[test]
+    fn heredoc_delimiter_keeps_a_paired_dollar() {
+        // `<<$$'E'` and `<<$$"E"` end at the line `$$E` in bash; `<<\$'E'` at
+        // `$E`; `<<$$$'E'` at `$$E`.
+        let cases: &[(&str, &str)] = &[
+            (r"<<$$'E'", "$$E"),
+            (r#"<<$$"E""#, "$$E"),
+            (r"<<\$'E'", "$E"),
+            (r#"<<\$"E""#, "$E"),
+            (r"<<$$$'E'", "$$E"),
+            (r"<<$'E'", "E"),
+        ];
+        for (text, want) in cases {
+            let chars: Vec<char> = text.chars().collect();
+            let got = heredoc_delimiter(&chars, 2).map(|d| d.word);
+            assert_eq!(got.as_deref(), Some(*want), "{text:?}");
+        }
+        // The body line `$E` is data under `<<$$'E'`; `cat x` stays in the body.
+        let stripped = strip_heredoc_bodies("cat <<$$'E'\n$E\ncat x\n$$E\necho after");
+        assert!(!stripped.contains("cat x"), "{stripped:?}");
+        assert!(stripped.contains("echo after"), "{stripped:?}");
+    }
+
+    #[test]
+    fn escaped_or_paired_dollar_quote_flood_stays_linear() {
+        // Each `$'` walks back over one `$` run and one backslash run, so a
+        // flood of either spelling stays linear.
+        for unit in [r"\$'a\'", r"$$'a\'", "$$$$$$$$'", r"\\\\$'"] {
+            let command = format!("echo {}", unit.repeat(200_000 / unit.len()));
+            let started = std::time::Instant::now();
+            let _ = tokenize(&command);
+            let _ = split_segments(&command);
+            let _ = strip_quotes(&command);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit:?} flood took {:?}",
+                started.elapsed()
+            );
+        }
+        let long = format!("echo {}'x'", "$".repeat(200_000));
+        let started = std::time::Instant::now();
+        let _ = split_segments(&long);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tokenize_locale_quote_flood_stays_linear() {
+        // 200 KB of `$""` (empty locale strings) and of unterminated `$"`
+        // openers must tokenize well inside the hook deadline.
+        for unit in [r#"$"""#, r#"a$"$"#, r#"$$""#] {
+            let command = format!("echo {}", unit.repeat(200_000 / unit.len()));
+            let started = std::time::Instant::now();
+            let _ = tokenize(&command);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit:?} flood took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

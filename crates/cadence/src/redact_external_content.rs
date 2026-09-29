@@ -1,9 +1,10 @@
 //! Catch internal vocabulary and work-identifiable terms before they leak into
 //! an external post.
 //!
-//! A PreToolUse check over the *body text* of external-posting Bash commands —
-//! `gh pr/issue/release/gist/discussion` create/comment/edit, `git commit`,
-//! `tea pr/issue` — running **two type-separated tiers with opposite
+//! A PreToolUse check over the *text* external-posting Bash commands publish —
+//! bodies, titles, descriptions and notes of `gh pr/issue/release/gist/discussion`
+//! create/comment/edit, `gh pr merge`, `gh repo create/edit`, `git commit`,
+//! `tea pr/issue`, and every field of a `gh api` write — running **two type-separated tiers with opposite
 //! outcomes** (ADR-0041):
 //!
 //! - The **shaped** tier **nudges, never blocks**. It matches vocabulary that
@@ -55,7 +56,10 @@
 //! `--body-file`, a parse miss, or no hits all proceed without a message. In
 //! nudge mode, silent failure beats false positives.
 
-use cadence_hooks_core::gh_bodies::extract_bodies;
+use cadence_hooks_core::gh_bodies::{
+    ApiField, ApiRequest, BodySource, extract_bodies_sourced, flag_values, parse_gh_api,
+    read_body_file, strip_flag_prefix,
+};
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
     skip_git_global_options, strip_quotes, unescape_word,
@@ -65,6 +69,7 @@ mod identity;
 
 use regex::Regex;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -173,6 +178,9 @@ pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
 /// [`EXTERNAL_POST`] spells as text, read here from the parsed argv.
 const GH_POST_GROUPS: &[&str] = &["pr", "issue", "release", "gist", "discussion"];
 const GH_POST_VERBS: &[&str] = &["create", "comment", "edit", "review", "reopen"];
+/// Posting `gh` commands outside the group × verb grid above: a merge commit's
+/// subject and body, and a repository's description.
+const GH_EXTRA_POSTS: &[(&str, &[&str])] = &[("pr", &["merge"]), ("repo", &["create", "edit"])];
 const TEA_POST_GROUPS: &[&str] = &["pr", "issue"];
 const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
 
@@ -209,8 +217,14 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
     };
     match command_word(head).as_ref() {
         "gh" => {
+            if let Some(req) = parse_gh_api(argv) {
+                return api_posts(&req);
+            }
             let path = gh_command_path(argv, 2);
-            in_set(path.first(), GH_POST_GROUPS) && in_set(path.get(1), GH_POST_VERBS)
+            (in_set(path.first(), GH_POST_GROUPS) && in_set(path.get(1), GH_POST_VERBS))
+                || GH_EXTRA_POSTS.iter().any(|(group, verbs)| {
+                    in_set(path.first(), &[group]) && in_set(path.get(1), verbs)
+                })
         }
         "git" => skip_git_global_options(&argv[1..])
             .first()
@@ -220,6 +234,230 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
             in_set(words.first(), TEA_POST_GROUPS) && in_set(words.get(1), TEA_POST_VERBS)
         }
         _ => false,
+    }
+}
+
+/// Does this `gh api` request publish text? It must send
+/// a payload (a literal `GET`/`HEAD` sends its fields as a query string) and
+/// carry one — a field or an `--input` file. Every endpoint counts, not only
+/// `repos/…`: `gists`, `user`, `orgs/…/repos` publish text too, and a write
+/// the guard cannot classify is read rather than waved through.
+///
+/// `graphql` always POSTs, reads included, so there the operation decides: a
+/// query visible as literal text with no `mutation` keyword reads and is
+/// allowed; a mutation — or a query the hook cannot see (`-F query=@file`,
+/// stdin) — publishes.
+fn api_posts(req: &ApiRequest) -> bool {
+    if !req.sends_payload() || (!req.has_fields && req.input.is_none()) {
+        return false;
+    }
+    if req.endpoint_path() != "graphql" || req.input.is_some() {
+        return true;
+    }
+    match req.fields.iter().rev().find(|(key, _)| key == "query") {
+        Some((_, ApiField::Literal(q))) => GRAPHQL_MUTATION.is_match(q),
+        _ => true,
+    }
+}
+
+/// The GraphQL `mutation` keyword. Case-sensitive, as GraphQL keywords are;
+/// a query that merely contains the word elsewhere is read as a mutation,
+/// which is the see-more direction.
+static GRAPHQL_MUTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bmutation\b").expect("mutation pattern should compile"));
+
+/// One text a segment publishes, tagged with where it came from.
+type Posted = (String, BodySource);
+
+/// Every text ONE gate-passing segment publishes: body flags, titles and
+/// descriptions, or a `gh api` request's fields. Callers gate first (#424) —
+/// file-valued flags are read here.
+fn posted_texts(segment: &str, base_dir: &str) -> Vec<Posted> {
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    if let Some(req) = parse_gh_api(argv) {
+        return api_texts(&req, base_dir);
+    }
+    let mut texts = extract_bodies_sourced(segment, base_dir);
+    texts.extend(headline_texts(argv, base_dir));
+    texts
+}
+
+/// The value the shell passes for one posted text, when it differs from the
+/// text as extracted — the second spelling the identity tier scans.
+///
+/// A file's bytes are posted as they are. A command-line word arrives from the
+/// tokenizer with its quotes removed and any `$'…'` escapes decoded, but with
+/// an unquoted backslash still in place — and the shell removes that
+/// backslash before `gh` or `git` sees the value: `--body zorbl\axcorp` posts
+/// `zorblaxcorp`. So a word is scanned both as written and with the shell's
+/// backslash removal applied ([`unescape_word`]). The tokenizer text no longer
+/// says which backslashes were quoted, so the union also reads a backslash
+/// bash keeps (`'zorbl\axcorp'` posts that, backslash and all) as removed —
+/// the see-more direction, and the text it then flags still spells the term.
+fn shell_passed_value((text, source): &Posted) -> Option<String> {
+    if *source == BodySource::File {
+        return None;
+    }
+    match unescape_word(text) {
+        Cow::Owned(v) if v != *text => Some(v),
+        _ => None,
+    }
+}
+
+/// Literal- and file-valued flags a posting command publishes beyond the body
+/// flags [`extract_bodies`] reads. Keyed by command,
+/// because a letter means different things per command: `gh repo create -t`
+/// is a team and `git commit -t` a template file, neither of them text.
+fn headline_texts(argv: &[String], base_dir: &str) -> Vec<Posted> {
+    let Some(head) = argv.first() else {
+        return Vec::new();
+    };
+    let rest = &argv[1..];
+    let mut literal: Vec<(&str, Option<char>)> = Vec::new();
+    let mut file: Vec<(&str, Option<char>)> = Vec::new();
+    match command_word(head).as_ref() {
+        "gh" => match gh_command_path(argv, 1).first().map(|g| unescape_word(g)) {
+            Some(g) if matches!(g.as_ref(), "pr" | "issue" | "release" | "discussion") => {
+                literal.push(("--title", Some('t')));
+                literal.push(("--subject", None));
+                if g == "release" {
+                    literal.push(("--notes", Some('n')));
+                    file.push(("--notes-file", None));
+                }
+            }
+            Some(g) if g == "gist" => literal.push(("--desc", Some('d'))),
+            Some(g) if g == "repo" => literal.push(("--description", Some('d'))),
+            _ => {}
+        },
+        "tea" => {
+            literal.push(("--title", Some('t')));
+            literal.push(("--description", Some('d')));
+        }
+        "git" => {
+            file.push(("--file", None));
+            return git_commit_texts(rest, base_dir, &file);
+        }
+        _ => {}
+    }
+    let mut texts: Vec<Posted> = Vec::new();
+    for (long, short) in literal {
+        texts.extend(words(flag_values(rest, long, short)));
+    }
+    for (long, short) in file {
+        for path in flag_values(rest, long, short) {
+            texts.extend(read_file_text(&path, base_dir));
+        }
+    }
+    texts
+}
+
+/// Command-line values, tagged as words.
+fn words(values: Vec<String>) -> impl Iterator<Item = Posted> {
+    values.into_iter().map(|v| (v, BodySource::Word))
+}
+
+/// A file-valued flag's contents, tagged as a file; nothing when unreadable.
+fn read_file_text(path: &str, base_dir: &str) -> Option<Posted> {
+    read_body_file(path, base_dir)
+        .ok()
+        .map(|t| (t, BodySource::File))
+}
+
+/// `git commit`'s messages beyond `-m`/`-F`: `--file`, and `-m`/`-F` bundled
+/// behind git's boolean short flags (`-am msg`, `-vmmsg`, `-aF path`), which
+/// git parses as the flags one by one and [`extract_bodies`] reads as a word
+/// that is neither.
+fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>)]) -> Vec<Posted> {
+    /// git commit's short flags that take no value, so a bundle can continue
+    /// past them.
+    const BOOLEAN_SHORTS: &str = "aeinopqsvz";
+    let mut texts: Vec<Posted> = Vec::new();
+    for (long, short) in file {
+        for path in flag_values(rest, long, *short) {
+            texts.extend(read_file_text(&path, base_dir));
+        }
+    }
+    for (i, tok) in rest.iter().enumerate() {
+        // The bundle is read as the shell passes it (`-a\m` is `-am`); the
+        // glued value stays raw, as every other word value does.
+        let name = unescape_word(tok);
+        if name == "--" {
+            break;
+        }
+        let Some(bundle) = name.strip_prefix('-').filter(|b| !b.starts_with('-')) else {
+            continue;
+        };
+        let Some(at) = bundle.find(['m', 'F']) else {
+            continue;
+        };
+        // A bare `-m`/`-F` or a glued `-mMSG` is extract_bodies' to read.
+        if at == 0 || !bundle[..at].chars().all(|c| BOOLEAN_SHORTS.contains(c)) {
+            continue;
+        }
+        let glued = strip_flag_prefix(tok, &name[..at + 2]).unwrap_or_default();
+        let glued = if unescape_word(glued).is_empty() {
+            ""
+        } else {
+            glued
+        };
+        let value = if glued.is_empty() {
+            rest.get(i + 1).map(String::as_str)
+        } else {
+            Some(glued)
+        };
+        match (value, &bundle[at..=at]) {
+            (Some(v), "m") => texts.push((v.to_string(), BodySource::Word)),
+            (Some(p), _) => texts.extend(read_file_text(p, base_dir)),
+            (None, _) => {}
+        }
+    }
+    texts
+}
+
+/// Every text a publishing `gh api` request carries: each field's key and
+/// value (a `-F key=@path` value read from its file), and the `--input` file —
+/// its JSON strings, keys included, or its raw text when it is not JSON, since
+/// gh sends the bytes as they are. `@-` and `--input -` are standard input,
+/// which the hook cannot see.
+fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<Posted> {
+    let mut texts: Vec<Posted> = Vec::new();
+    for (key, field) in &req.fields {
+        texts.push((key.clone(), BodySource::Word));
+        match field {
+            ApiField::Literal(v) => texts.push((v.clone(), BodySource::Word)),
+            ApiField::File(p) => texts.extend(read_file_text(p, base_dir)),
+            ApiField::Stdin => {}
+        }
+    }
+    if let Some(ApiField::File(p)) = &req.input
+        && let Ok(raw) = read_body_file(p, base_dir)
+    {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let mut strings = Vec::new();
+                json_strings(&value, &mut strings);
+                texts.extend(strings.into_iter().map(|t| (t, BodySource::File)));
+            }
+            Err(_) => texts.push((raw, BodySource::File)),
+        }
+    }
+    texts
+}
+
+/// Collect every string in a JSON document, object keys included. Decoding
+/// first is what makes `"zorbl\u0061x"` read as the text gh posts.
+fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| json_strings(v, out)),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                json_strings(v, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -430,10 +668,10 @@ impl Check for RedactExternalContent {
         // Quote-strip each segment first so a body merely mentioning `gh pr
         // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
-        let mut bodies: Vec<String> = Vec::new();
+        let mut bodies: Vec<Posted> = Vec::new();
         for segment in command_segments(command) {
             if is_external_post(&segment) {
-                bodies.extend(extract_bodies(&segment, &base_dir));
+                bodies.extend(posted_texts(&segment, &base_dir));
             }
         }
         if bodies.is_empty() {
@@ -459,9 +697,23 @@ impl Check for RedactExternalContent {
         // retry.
         let mut hits: Vec<Hit> = Vec::new();
         let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
-        for body in &bodies {
+        // Identity reports dedup by (id, snippet), so a text it has already
+        // scanned adds nothing — skipping repeats keeps a command that posts
+        // one value thousands of times inside the hook deadline.
+        let mut identity_seen: HashSet<String> = HashSet::new();
+        for posted in &bodies {
+            let body = posted.0.as_str();
             // Config-blind by signature — no config, no tier, no allowlist.
-            identity_hits.extend(identity::scan_identity(body, &identity_list, None));
+            // The value the shell actually passes is scanned too, when it
+            // differs; the shaped tiers read the text as written only, since
+            // they list every occurrence and a second spelling would repeat
+            // them.
+            for text in std::iter::once(body.to_string()).chain(shell_passed_value(posted)) {
+                if !identity_seen.contains(&text) {
+                    identity_hits.extend(identity::scan_identity(&text, &identity_list, None));
+                    identity_seen.insert(text);
+                }
+            }
             hits.extend(scan_body(body, &config, d));
         }
 
@@ -539,6 +791,47 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         }
     }
     combine(&identity_hits, &[], &[], identity_list.mode)
+}
+
+/// One work-identifiable term found by [`identity_matches`]: the term's
+/// authored id and the matched text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermMatch {
+    pub id: String,
+    pub snippet: String,
+}
+
+/// Scan `text` against the identity term source (`redaction.toml`) with the
+/// identity tier's own matching and `allow` entries — for another guard that
+/// judges a surface this one does not own (cadence-hooks#793: the repo name
+/// and description `warn-going-public` reads). One term source, one matcher,
+/// so a term added to `redaction.toml` reaches every reader.
+///
+/// Config-blind like the tier itself: no repo file and no other guard's ignore
+/// list can soften a match. Empty when the source is absent, unreadable, or
+/// unarmed (fail-open, ADR-0001).
+pub fn identity_matches(text: &str) -> Vec<TermMatch> {
+    let (list, _) = identity::load();
+    to_term_matches(text, &list)
+}
+
+/// [`identity_matches`] against an explicit term-source file. For tests in
+/// other crates, which cannot reach this crate's `cfg(test)` path override;
+/// production callers use [`identity_matches`].
+#[doc(hidden)]
+pub fn identity_matches_from(text: &str, source: &std::path::Path) -> Vec<TermMatch> {
+    let (list, _) = identity::load_from(source);
+    to_term_matches(text, &list)
+}
+
+fn to_term_matches(text: &str, list: &identity::IdentityList) -> Vec<TermMatch> {
+    identity::scan_identity(text, list, None)
+        .into_iter()
+        .map(|h| TermMatch {
+            id: h.id,
+            snippet: h.snippet,
+        })
+        .collect()
 }
 
 /// Read the identity-tier bypass switch.
@@ -818,7 +1111,7 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
     // per entry (default owned-internal); a whole pattern is skipped when the
     // gate closes (d <= c).
     for ap in &config.additional_patterns {
-        let Ok(re) = Regex::new(&ap.pattern) else {
+        let Some(re) = identity::cached_regex(&ap.pattern) else {
             continue;
         };
         let c = ceiling_ord(ap.ceiling.as_deref().unwrap_or("owned-internal"));
@@ -2624,6 +2917,297 @@ term = "acmecorp"
                 assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd}");
             }
         });
+    }
+
+    /// Run `cmd` from `dir`, so relative `@file`/`--input`/`--file` paths
+    /// resolve against a fixture directory.
+    fn run_in(cmd: &str, dir: &std::path::Path) -> CheckResult {
+        RedactExternalContent.run(&make_bash_with_cwd(cmd, dir.to_str().unwrap()))
+    }
+
+    /// A fixture directory holding a term-bearing body file, a JSON `--input`
+    /// payload that hides the term behind a `\u` escape, and a non-JSON one.
+    fn post_fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "about acmecorp\n").unwrap();
+        std::fs::write(dir.path().join("clean.md"), "about the parser\n").unwrap();
+        std::fs::write(
+            dir.path().join("p.json"),
+            r#"{"title":"fine","labels":["x"],"body":"acmecorp"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("raw.txt"), "not json: acmecorp").unwrap();
+        std::fs::write(dir.path().join("q.graphql"), "query { viewer { login } }").unwrap();
+        dir
+    }
+
+    #[test]
+    fn titles_descriptions_and_notes_reach_the_identity_block() {
+        // The identity tier read body flags only, so a term
+        // in a title, a description, release notes or a merge subject posted
+        // unseen. Every row publishes the term; each must block.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh issue create --title 'acmecorp thing' --body hi",
+                "gh issue create -t acmecorp --body hi",
+                "gh issue edit 3 --title=acmecorp",
+                "gh pr create -tacmecorp --body hi",
+                "gh pr edit 3 --title acmecorp",
+                "gh pr new --title acmecorp --body hi",
+                "gh release create v1 --title acmecorp",
+                "gh release create v1 --notes acmecorp",
+                "gh release edit v1 -n acmecorp",
+                "gh release create v1 --notes-file b.md",
+                "gh gist create -d acmecorp f.txt",
+                "gh gist create --desc=acmecorp f.txt",
+                "gh gist edit abc --desc acmecorp",
+                "gh repo create o/r -d acmecorp --private",
+                "gh repo edit o/r --description acmecorp",
+                "gh pr merge 3 --subject acmecorp",
+                "gh pr merge 3 -t acmecorp",
+                "gh pr merge 3 --body acmecorp",
+                "tea pr create --title acmecorp",
+                "tea issue create --description acmecorp",
+                "git commit -am acmecorp",
+                "git commit -vmacmecorp",
+                "git commit -aF b.md",
+                "git commit --file=b.md",
+                "git commit --file b.md",
+                "git commit -m 'acmecorp subject' -m body",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(
+                    msg.contains("BLOCKED") && msg.contains("[T1]"),
+                    "{cmd}: {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn gh_api_fields_and_input_reach_the_identity_block() {
+        // `gh api` was outside the posting gate, so any
+        // field of a write request — not only body/title — posted unseen.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api repos/o/r/issues -f body=acmecorp",
+                "gh api repos/o/r/issues -f title=acmecorp -f body=hi",
+                "gh api repos/o/r/issues -F body=@b.md",
+                "gh api repos/o/r/issues --input p.json",
+                "gh api repos/o/r/issues --input=raw.txt",
+                "gh api -X PATCH repos/o/r/issues/3 --raw-field=title=acmecorp",
+                "gh api -XPOST /repos/o/r/issues -fbody=acmecorp",
+                "gh api --method=PATCH repos/o/r/pulls/2 --field body=acmecorp",
+                "gh api repos/o/r/labels -f name=acmecorp",
+                "gh api repos/o/r/labels -f name=x -f description=acmecorp",
+                "gh api repos/o/r/git/commits -f message=acmecorp -f tree=t",
+                "gh api repos/o/r/issues/3/labels -f 'labels[]=acmecorp'",
+                "gh api -X PUT repos/o/r/contents/f -f message=acmecorp -f content=eA==",
+                "gh api gists -f description=acmecorp",
+                "gh api -X PATCH user -f bio=acmecorp",
+                "gh api repos/o/r/issues -f acmecorp=1",
+                "gh api graphql -f query='mutation { addComment(input:{body:\"acmecorp\"}) { x } }'",
+                "gh api graphql -f query='mutation($b:String!){ x(body:$b) }' -f b=acmecorp",
+                "gh api graphql -F query=@q.graphql -f b=acmecorp",
+                "gh \"api\" repos/o/r/issues -f body=acmecorp",
+                "gh a\\pi repos/o/r/issues -f body=acmecorp",
+                "env A=1 gh api repos/o/r/issues -f body=acmecorp",
+                "cd x && gh api repos/o/r/issues -f body=acmecorp",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(
+                    msg.contains("BLOCKED") && msg.contains("[T1]"),
+                    "{cmd}: {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn title_and_api_controls_stay_allowed() {
+        // Reads, clean posts and quoted mentions publish no term.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api repos/o/r",
+                "gh api repos/acmecorp/r",
+                "gh api -X GET repos/o/r/issues -f q=acmecorp",
+                "gh api --method HEAD repos/o/r -f q=acmecorp",
+                "gh api graphql -f query='query { search(query:\"acmecorp\") { x } }'",
+                "gh api graphql -f query='{ viewer { login } }' -f acmecorp=1",
+                "gh api repos/o/r/issues -f body=clean -f title='fix bug'",
+                "gh api repos/o/r/issues -F body=@clean.md",
+                "gh issue create --title 'fix bug' --body hi",
+                "gh gist create -d notes f.txt",
+                "gh repo create o/r -t acmecorp",
+                "git commit -t acmecorp.txt -m clean",
+                "git commit -C acmecorp",
+                "echo \"gh issue create --title acmecorp\"",
+                "echo \"gh api repos/o/r/issues -f body=acmecorp\"",
+                "gh issue list --search acmecorp",
+                "gh pr view --title acmecorp",
+            ] {
+                assert_eq!(
+                    run_in(cmd, dir.path()).outcome,
+                    Outcome::Allow,
+                    "must allow: {cmd}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn shell_removed_backslashes_reach_the_identity_block() {
+        // The identity tier scanned values as the tokenizer returns them, with
+        // an unquoted backslash still in place, while bash removes it:
+        // `--body acme\corp` posts `acmecorp`. Every row's posted value spells
+        // the term (checked with `bash -c "printf '%s' <word>"`); each must
+        // block. The `$'…'` and adjacent-quote rows were already caught (the
+        // tokenizer decodes and joins them) and stay here as regressions.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --body acme\corp",
+                r"gh pr comment 3 --body \a\c\m\e\c\o\r\p",
+                r"gh pr comment 3 --body 'the '\acme\corp' thing'",
+                r"gh pr comment 3 --body=acme\corp",
+                r"gh pr comment 3 -b acme\corp",
+                r"gh pr comment 3 -bacme\corp",
+                r"gh pr comment 3 --body --body=acme\corp",
+                r"gh pr create --title acme\corp --body hi",
+                r"gh pr create -t acme\corp --body hi",
+                r"gh issue edit 3 --title=acme\corp",
+                r"gh release create v1 --notes acme\corp",
+                r"gh gist create -d acme\corp f.txt",
+                r"gh repo edit o/r --description acme\corp",
+                r"gh pr merge 3 --subject acme\corp",
+                r"tea pr create --title acme\corp",
+                r"git commit -m acme\corp",
+                r"git commit -macme\corp",
+                r"git commit -am acme\corp",
+                r"git commit -vmacme\corp",
+                r"gh api repos/o/r/issues -f body=acme\corp",
+                r"gh api repos/o/r/issues -f acme\corp=1",
+                r"gh api repos/o/r/issues -F title=acme\corp",
+                r"gh pr comment 3 --body $'acme\x63orp'",
+                r"gh pr comment 3 --body $'acme\143orp'",
+                r"gh pr comment 3 --body acme''corp",
+                r#"gh pr comment 3 --body acme""corp"#,
+                r"gh pr comment 3 --body 'acme''corp'",
+                r"gh pr comment 3 --body acme$'c'orp",
+                r"gh api repos/o/r/issues -f body=$'acme\x63orp'",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("[T1]"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn backslashed_flag_names_and_locale_quotes_reach_the_identity_block() {
+        // bash drops an unquoted backslash in a flag NAME too (`--bo\dy` is
+        // `--body`), and `$"…"` is a plain string in the C locale
+        // (`acme$""corp` is `acmecorp`). Every row's argv was checked with
+        // `bash -c "printf '%s\n' <words>"`; each posts the term and must block.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --bo\dy acmecorp",
+                r"gh pr comment 3 --bo\dy=acmecorp",
+                r"gh pr comment 3 --body\=acmecorp",
+                r"gh pr comment 3 -\b acmecorp",
+                r"gh pr comment 3 -\bacmecorp",
+                r"git commit -\m acmecorp",
+                r"git commit -\macmecorp",
+                r"git commit --mess\age acmecorp",
+                r"git commit -a\m acmecorp",
+                r"git commit -\a\macmecorp",
+                r"gh issue create --ti\tle acmecorp -b x",
+                r"gh issue create -\t acmecorp -b x",
+                r"gh release create v1 --no\tes acmecorp",
+                r"gh gist create --de\sc acmecorp f.txt",
+                r"gh api repos/o/r/issues -\f body=acmecorp",
+                r"gh api repos/o/r/issues --raw-fi\eld body=acmecorp",
+                r"gh api repos/o/r/issues --raw-fi\eld=body=acmecorp",
+                r#"gh pr comment 3 --body acme$""corp"#,
+                r#"gh pr comment 3 --body acme$"c"orp"#,
+                r#"gh pr comment 3 --body $"acme"corp"#,
+                r#"gh pr create --title acme$"corp" --body hi"#,
+                r#"git commit -m acme$""corp"#,
+                r#"gh api repos/o/r/issues -f body=acme$""corp"#,
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("[T1]"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn literal_backslashes_that_spell_no_term_stay_allowed() {
+        // Prose carrying a real backslash, an escaped backslash bash keeps
+        // (`acme\\corp` posts `acme\corp`), and a file or JSON payload whose
+        // bytes hold a backslash: none posts the term, so none may block. Files
+        // are posted as they are, so no shell unescaping applies to them.
+        let dir = post_fixture_dir();
+        std::fs::write(dir.path().join("bs.md"), "acme\\corp\n").unwrap();
+        std::fs::write(dir.path().join("bs.json"), r#"{"body":"acme\\corp"}"#).unwrap();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --body 'see C:\new\path'",
+                r"gh pr comment 3 --body path\ with\ spaces",
+                r"gh pr comment 3 --body acme\\corp",
+                r"gh pr comment 3 --body acme\ corp",
+                r"git commit -m 'fix \n handling'",
+                r"gh pr comment 3 --body-file bs.md",
+                r"gh release create v1 --notes-file bs.md",
+                r"git commit -F bs.md",
+                r"gh api repos/o/r/issues -F body=@bs.md",
+                r"gh api repos/o/r/issues --input bs.json",
+                // `$$"x"` is the PID then `x`, not a locale string: nothing
+                // here spells the term.
+                r#"gh pr comment 3 --body acme$$"corp""#,
+                r#"gh pr comment 3 --body acme\$"corp""#,
+            ] {
+                assert_eq!(
+                    run_in(cmd, dir.path()).outcome,
+                    Outcome::Allow,
+                    "must allow: {cmd}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn posting_gate_reads_gh_api_writes() {
+        // The shared gate (warn-overshare reads it too) sees a `gh api` write
+        // carrying text, and nothing else of `gh api`.
+        let cases: &[(&str, bool)] = &[
+            ("gh api repos/o/r/issues -f body=x", true),
+            ("gh api -X PATCH repos/o/r/issues/1 --input p.json", true),
+            ("gh api graphql -f query='mutation { x }'", true),
+            ("gh api graphql -F query=@q.graphql", true),
+            ("gh api graphql -f query='query { x }'", false),
+            ("gh api repos/o/r", false),
+            ("gh api -X DELETE repos/o/r/labels/x", false),
+            ("gh api -X GET repos/o/r/issues -f q=x", false),
+            ("gh repo create o/r -d x", true),
+            ("gh pr merge 3 --squash", true),
+            ("gh repo view o/r", false),
+            ("echo gh api repos/o/r/issues -f body=x", false),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(is_external_post(cmd), *want, "{cmd}");
+        }
     }
 
     #[test]
