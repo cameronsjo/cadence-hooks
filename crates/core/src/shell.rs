@@ -6602,13 +6602,34 @@ fn emit_segment(
             expand_segments(&body, &mut scope, depth + 1, out, dedupe);
         }
     }
+    //
+    // A script that is nothing but such a tagged substitution (`watch
+    // "$(cmd)"`) is pushed as the one segment it is, and not split or
+    // expanded: the child runs cmd's OUTPUT, cmd was expanded above, and
+    // every further segment would re-read that one span — splitting a 200 KB
+    // `$(x; x; …)` at its `;`s is what kept depth-3 inputs near the deadline.
+    // [`child_scripts`] applies the same rule for walkers.
+    let mut whole = Vec::new();
     let scripts = if depth < MAX_WRAPPER_DEPTH {
-        let marked = dedupe.then(|| mark_expanded_substitutions(&segment));
-        wrapped_scripts(&executable_tokens(marked.as_deref().unwrap_or(&segment)))
+        if dedupe {
+            let mut scripts =
+                wrapped_scripts(&executable_tokens(&mark_expanded_substitutions(&segment)));
+            scripts.retain(|script| {
+                let only = is_only_an_expanded_substitution(script);
+                if only {
+                    whole.push(unmark(script.trim().to_string()));
+                }
+                !only
+            });
+            scripts
+        } else {
+            wrapped_scripts(&executable_tokens(&segment))
+        }
     } else {
         Vec::new()
     };
     out.push(unmark(segment));
+    out.extend(whole);
     for inner in scripts {
         // A child shell inherits what is set so far, but its own
         // assignments die with the subshell — recurse on a snapshot so
