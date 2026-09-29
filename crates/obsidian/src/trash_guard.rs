@@ -245,6 +245,11 @@ fn resolve_in_vault(target: &str, cwd: &str, vault: &str, vault_prefix: &str) ->
 /// instead of racing the clock.
 const MAX_JUDGED_OPERANDS: usize = 64;
 
+/// Most segments a command may carry and still be judged operand by operand,
+/// for the same reason: every `eval`/`find` segment is re-scanned, and a
+/// 200 KB chain of them came within 0.05 s of the hook deadline.
+const MAX_JUDGED_SEGMENTS: usize = 256;
+
 /// Characters that make an operand's target unknowable from its text: a
 /// parameter, substitution, glob, brace, extglob, or escape the shell
 /// expands before `rm` sees the word. The tokenizer has already removed
@@ -306,18 +311,29 @@ fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> boo
 /// Only a plain deletion verb (`rm`, `unlink`, `shred`, `truncate`) at a
 /// segment head is judged operand by operand. Every other destructive shape
 /// keeps the cwd verdict: `git rm` (pathspecs, `--pathspec-from-file`),
-/// `xargs` (operands arrive on stdin), `find … -delete`/`-exec`, `eval`, and a
-/// shell wrapper whose script deletes. Options are skipped only before the
+/// `xargs` (operands arrive on stdin), `find … -delete`/`-exec`, and `eval`. A
+/// shell wrapper's script (`sh -c 'rm …'`) is not an exception: its segments
+/// are part of `command_segments`' view, so its `rm` is judged like any other.
+/// Options are skipped only before the
 /// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
 /// is judged as one. A redirection is skipped only when its operator is
 /// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
 fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) -> bool {
+    let segments = command_segments(command);
+    if segments.len() > MAX_JUDGED_SEGMENTS {
+        return false;
+    }
     let mut judged = 0;
-    for segment in command_segments(command) {
+    for segment in segments {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
         let argv = peel_command_runners(&tokens);
         if !head_deletes(argv) {
-            if is_destructive_at(&segment, 0) {
+            // A shell wrapper's script is already in `command_segments`' view
+            // and judged there, so only the two verbs whose deletion
+            // `is_destructive_at` finds INSIDE their own segment need it here —
+            // re-scanning every segment made a 200 KB wrapper chain cost 0.37 s.
+            let verb = argv.first().map(|first| command_word(first));
+            if matches!(verb.as_deref(), Some("eval" | "find")) && is_destructive_at(&segment, 0) {
                 return false;
             }
             continue;
@@ -621,7 +637,13 @@ mod tests {
             ("find /tmp/x -delete", Block),
             (r"find /tmp/x -exec rm {} \;", Block),
             ("eval rm /tmp/a", Block),
-            ("sh -c 'rm /tmp/a'", Block),
+            ("sh -c 'eval rm /tmp/a'", Block),
+            (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
+            // A wrapper's script is judged like the top level.
+            ("sh -c 'rm /tmp/a'", Allow),
+            ("sh -c 'rm note.md'", Block),
+            ("bash -c 'rm \"$1\"' _ note.md", Block),
+            ("bash -c 'cd /tmp && rm a'", Block),
         ];
         for &(command, expected) in cases {
             let result =
@@ -659,9 +681,15 @@ mod tests {
     }
 
     #[test]
-    fn deletion_from_vault_cwd_past_the_operand_cap_keeps_blocking() {
+    fn deletion_from_vault_cwd_past_the_operand_or_segment_cap_keeps_blocking() {
         let at_cap = format!("rm {}", vec!["/tmp/a"; MAX_JUDGED_OPERANDS].join(" "));
         let past_cap = format!("{at_cap} /tmp/a");
+        let many_segments = "echo x; ".repeat(MAX_JUDGED_SEGMENTS) + "rm /tmp/a";
+        assert_eq!(
+            check_destructive_in_vault(&many_segments, "/vault", "/vault", &FakeFs::default())
+                .outcome,
+            cadence_hooks_core::Outcome::Block
+        );
         let fs = FakeFs::default();
         assert_eq!(
             check_destructive_in_vault(&at_cap, "/vault", "/vault", &fs).outcome,
