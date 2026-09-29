@@ -541,6 +541,47 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
     combine(&identity_hits, &[], &[], identity_list.mode)
 }
 
+/// One work-identifiable term found by [`identity_matches`]: the term's
+/// authored id and the matched text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermMatch {
+    pub id: String,
+    pub snippet: String,
+}
+
+/// Scan `text` against the identity term source (`redaction.toml`) with the
+/// identity tier's own matching and `allow` entries — for another guard that
+/// judges a surface this one does not own (cadence-hooks#793: the repo name
+/// and description `warn-going-public` reads). One term source, one matcher,
+/// so a term added to `redaction.toml` reaches every reader.
+///
+/// Config-blind like the tier itself: no repo file and no other guard's ignore
+/// list can soften a match. Empty when the source is absent, unreadable, or
+/// unarmed (fail-open, ADR-0001).
+pub fn identity_matches(text: &str) -> Vec<TermMatch> {
+    let (list, _) = identity::load();
+    to_term_matches(text, &list)
+}
+
+/// [`identity_matches`] against an explicit term-source file. For tests in
+/// other crates, which cannot reach this crate's `cfg(test)` path override;
+/// production callers use [`identity_matches`].
+#[doc(hidden)]
+pub fn identity_matches_from(text: &str, source: &std::path::Path) -> Vec<TermMatch> {
+    let (list, _) = identity::load_from(source);
+    to_term_matches(text, &list)
+}
+
+fn to_term_matches(text: &str, list: &identity::IdentityList) -> Vec<TermMatch> {
+    identity::scan_identity(text, list, None)
+        .into_iter()
+        .map(|h| TermMatch {
+            id: h.id,
+            snippet: h.snippet,
+        })
+        .collect()
+}
+
 /// Read the identity-tier bypass switch.
 ///
 /// One home for the predicate, because two call sites read it — the hook's

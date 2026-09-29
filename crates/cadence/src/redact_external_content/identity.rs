@@ -234,12 +234,18 @@ pub(crate) fn load() -> (IdentityList, Status) {
     let Some(path) = terms_path() else {
         return (IdentityList::default(), Status::Absent);
     };
+    load_from(&path)
+}
+
+/// [`load`] against an explicit path — the one reader both the resolved term
+/// source and a test fixture go through.
+pub(crate) fn load_from(path: &std::path::Path) -> (IdentityList, Status) {
     if !path.exists() {
         return (IdentityList::default(), Status::Absent);
     }
     // Same bounded, regular-file-only reader the body-file path uses: a symlink
     // to /dev/zero or a multi-GB file must not hang the hook (#157/#194).
-    let Some(raw) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
+    let Some(raw) = cadence_hooks_core::paths::read_untrusted_config(path) else {
         return (IdentityList::default(), Status::Unreadable);
     };
     match toml::from_str::<IdentityList>(&raw) {

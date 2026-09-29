@@ -6,6 +6,9 @@ license-file.workspace = true
 description = "Git guardrails hooks: push protection, gh write guards, idle detection"
 
 [dependencies]
+# `identity_matches`: warn-going-public reads the redaction term source
+# through the tier that owns it (cadence-hooks#793).
+cadence-hooks-cadence.workspace = true
 cadence-hooks-core.workspace = true
 cadence-hooks-metrics.workspace = true
 regex.workspace = true
