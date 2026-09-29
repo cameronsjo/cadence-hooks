@@ -4264,9 +4264,15 @@ fn span_quoting_unterminated(chars: &[char]) -> bool {
 /// `substitution_spans` skipped the unlocatable `$(` and the payload after it
 /// was deleted before any guard ran, while bash executed it.
 ///
-/// Whether the quote-blind fallback and the `expand_segments` recursion are
-/// bounded on the same axis is tracked separately as cadence-hooks#821; this
-/// cap covers nesting inside a single `scan_substitution_body` call only.
+/// This cap bounds nesting inside a single `scan_substitution_body` call. The
+/// other two recursions on the same input are bounded elsewhere, which is why
+/// no second cap exists (cadence-hooks#821): the quote-blind fallback
+/// (`quote_aware == false`) never recurses — it is a flat depth counter — and
+/// every re-scan of a surfaced body goes through `expand_segments`, which
+/// stops at [`MAX_WRAPPER_DEPTH`]. The callers that consult this scanner from
+/// inside a double-quoted run ([`split_segments_with_ops`], [`comment_spans`])
+/// inherit this cap directly. `command_segments_pathological_opener_floods_*`
+/// pins all of it on a deliberately small stack.
 const MAX_SUBSTITUTION_DEPTH: usize = 16;
 
 /// Why a substitution scan stopped without locating a terminator.
@@ -8763,6 +8769,50 @@ mod tests {
             !substitution_bodies(&"$(".repeat(levels)).is_empty(),
             "deep nesting must still emit the ambiguous readings"
         );
+    }
+
+    #[test]
+    fn command_segments_pathological_opener_floods_return_and_keep_the_payload() {
+        // cadence-hooks#821: the whole pipeline — splitter, comment pass,
+        // heredoc spans, the quote-blind fallback and the `expand_segments`
+        // recursion — must return on a flood of openers rather than overflow
+        // the stack. A guard that crashes fails open (ADR-0001), so an overflow
+        // here would be a bypass with a strange spelling.
+        //
+        // Run on a deliberately SMALL stack so the assertion means "bounded",
+        // not "the default stack happened to be big enough". And returning is
+        // not enough on its own: the trailing payload must still reach a
+        // segment, because the depth caps widen (keep everything) rather than
+        // drop the construct.
+        let flood = |opener: &str| opener.repeat(4096);
+        let inputs = [
+            flood("\"$("),
+            format!("{} ; cat .env", flood("\"$(")),
+            format!("{} ; cat .env", flood("$(")),
+            format!("{} ; cat .env", flood("$(\"")),
+            format!("{} ; cat .env", flood("\"`$(")),
+            format!("cat <<EOF\n{} ; cat .env\nEOF", flood("\"$(")),
+            format!("cat <<EOF\n{} ; cat .env\nEOF", flood("$(")),
+            format!("echo \"{} ; cat .env", flood("$(# (\n")),
+        ];
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                inputs
+                    .iter()
+                    .map(|input| (input.len(), command_segments(input)))
+                    .collect::<Vec<_>>()
+            })
+            .expect("spawn");
+        let results = handle
+            .join()
+            .expect("command_segments overflowed the stack");
+        for (idx, (len, segs)) in results.iter().enumerate().skip(1) {
+            assert!(
+                segs.iter().any(|s| s.contains("cat .env")),
+                "flood #{idx} ({len} chars) dropped the trailing payload"
+            );
+        }
     }
 
     #[test]
