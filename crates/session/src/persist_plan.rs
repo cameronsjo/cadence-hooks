@@ -1571,6 +1571,15 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{rest}\n", lines.join("\n"))
 }
 
+/// The driver-announcement reminder (cameronsjo/cadence-hooks#608). attune
+/// requires a bold driver line right after approval; this hook already fires
+/// at that moment, so it carries the reminder. Static text only: the hook
+/// does not render the plan's own trigger or tier into it, it points the
+/// session at the `## Orchestrator` block to derive them.
+const DRIVER_ANNOUNCE_REMINDER: &str = "Announce the driver in your next message, derived \
+     from the plan's `## Orchestrator` block: \"**Plan approved — Sonnet-drivable**\" or \
+     \"**Plan approved — needs an Opus driver: <trigger>**\" (cadence:attune).";
+
 /// The model-check directive — the ONLY text [`Tier`] contributes to it is
 /// [`Tier::as_str`]'s canonical name.
 ///
@@ -1655,6 +1664,14 @@ fn persist_and_nudge(
         "Approved plan persisted to {} (approved in {approved_label}).",
         path.display()
     );
+    // The announcement is owed by the session that approved the plan, so
+    // only a same-session approval carries it. On an approve-and-clear pickup
+    // the approving session is the parent; the child only runs the model
+    // check below.
+    if parent_session_id == Some(child_session_id) {
+        nudge.push(' ');
+        nudge.push_str(DRIVER_ANNOUNCE_REMINDER);
+    }
     // The model-check directive lands between the persist confirmation and
     // the format-gate sentences — only when a tier was actually parsed
     // (see [`recommended_tier`]); the hook has no way to know the LIVE
@@ -2970,6 +2987,54 @@ mod tests {
             persisted_idx < directive_idx && directive_idx < verify_idx,
             "directive must land between the persist sentence and the format gates: {msg}"
         );
+    }
+
+    #[test]
+    fn nudge_reminds_a_same_session_approval_to_announce_the_driver() {
+        // cadence-hooks#608: the announcement is owed at approval, by the
+        // approving session; an approve-and-clear child or an unknown
+        // approver does not get it.
+        let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
+        for (parent, expected) in [
+            (Some("session-id"), true),
+            (Some("parent-id"), false),
+            (None, false),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let plans_dir = tmp.path().join("docs/plans");
+            fs::create_dir_all(&plans_dir).unwrap();
+            let r = with_scratch_metrics_dir(|| {
+                persist_and_nudge(
+                    &plans_dir,
+                    "2026-08-16-x",
+                    "session-id",
+                    "hash",
+                    "document text",
+                    None,
+                    "2026-08-16T00:00:00Z",
+                    parent,
+                    "session-id",
+                    "digest",
+                    tmp.path(),
+                    "unknown",
+                    body,
+                    recommended_tier(body),
+                    &Disposition::Repo,
+                )
+            });
+            let msg = r.message.unwrap();
+            assert_eq!(
+                msg.contains(DRIVER_ANNOUNCE_REMINDER),
+                expected,
+                "parent {parent:?}: {msg}"
+            );
+            if expected {
+                let announce = msg.find("Announce the driver").unwrap();
+                let persisted = msg.find("Approved plan persisted to").unwrap();
+                let directive = msg.find("This plan's recommended driver").unwrap();
+                assert!(persisted < announce && announce < directive, "{msg}");
+            }
+        }
     }
 
     #[test]
