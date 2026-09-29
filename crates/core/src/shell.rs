@@ -5175,6 +5175,8 @@ struct DirWalk {
     /// in command position.
     mentions: Option<std::collections::HashMap<String, Vec<usize>>>,
     located: Vec<LocatedSegment>,
+    /// Is `CDPATH` non-empty in the hook's own environment?
+    env_cdpath: bool,
     /// Each defined function's body, or `None` when its body is a form this
     /// walk does not record (`f() if …; fi`).
     functions: std::collections::HashMap<String, Option<Script>>,
@@ -5351,6 +5353,78 @@ fn names_a_path(word: &str) -> bool {
         }
     }
     false
+}
+
+/// Resolves a command word that is a variable read — `$G`, `"$G"`, `${G}` —
+/// to the literal the same command assigned it, so a guard that judges a
+/// segment by its command word can judge `G=gh; $G pr create` as `gh pr
+/// create`. Built once per command; each lookup is memoized by name.
+///
+/// Only a `gh` value is substituted, and only when every mention of the
+/// variable is a plain `name=literal` assignment ([`literal_values_of`]).
+/// An unreadable or absent assignment leaves the segment as written: the
+/// variable may hold anything, and the operator accepted that gap
+/// (cameronsjo/cadence-hooks#1171). Where a variable is assigned several
+/// literals and one is `gh`, the segment is read as `gh` — the sharper reading.
+pub struct CommandWordVariables<'a> {
+    command: &'a str,
+    mentions: Option<std::collections::HashMap<String, Vec<usize>>>,
+    resolved: std::collections::HashMap<String, Option<String>>,
+}
+
+impl<'a> CommandWordVariables<'a> {
+    pub fn for_command(command: &'a str) -> Self {
+        Self {
+            command,
+            mentions: None,
+            resolved: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `segment` with a variable command word replaced by the `gh` it was
+    /// assigned, or `None` when the segment is not that shape. Leading
+    /// `NAME=value` words are skipped over.
+    pub fn resolve_gh(&mut self, segment: &str) -> Option<String> {
+        static WORD: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"^"?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"?$"#)
+                .expect("pattern should compile")
+        });
+        // `body` and each `word` are subslices of `segment`, so their
+        // offsets are pointer differences.
+        let body = strip_group_wrappers(segment);
+        let range = segment.as_ptr() as usize..segment.as_ptr() as usize + segment.len();
+        if !range.contains(&(body.as_ptr() as usize)) && !body.is_empty() {
+            return None;
+        }
+        for word in body.split_whitespace() {
+            let at = word.as_ptr() as usize - segment.as_ptr() as usize;
+            if is_assignment_word(word) {
+                continue;
+            }
+            let caps = WORD.captures(word)?;
+            let name = caps.get(1).or(caps.get(2))?.as_str();
+            if !self.resolved.contains_key(name) {
+                let command = self.command;
+                let mentions = self
+                    .mentions
+                    .get_or_insert_with(|| variable_mentions(command));
+                let value = mentions
+                    .get(name)
+                    .and_then(|ends| literal_values_of(command, mentions, ends))
+                    .and_then(|values| {
+                        values.into_iter().find(|value| command_word(value) == "gh")
+                    });
+                self.resolved.insert(name.to_string(), value);
+            }
+            let value = self.resolved.get(name)?.as_ref()?;
+            let mut out = String::with_capacity(segment.len() + value.len());
+            out.push_str(&segment[..at]);
+            out.push_str(value);
+            out.push_str(&segment[at + word.len()..]);
+            return Some(out);
+        }
+        None
+    }
 }
 
 /// Where each name in `command` is mentioned other than as a plain
@@ -5786,6 +5860,30 @@ impl DirWalk {
         }
     }
 
+    /// Does a `cd`/`pushd` to `target` search `CDPATH`? A relative target
+    /// that is not `.`, `..`, `./…` or `../…` does when `CDPATH` is set —
+    /// in the hook's environment, or named anywhere in the command as other than a `$CDPATH` read (an
+    /// assignment after the `cd` counts too, and so does a bare word:
+    /// over-blocking, never a miss).
+    /// The shell then lands in the first match, which this walk cannot name.
+    fn cdpath_may_redirect(&mut self, target: &str) -> bool {
+        if looks_absolute(target)
+            || target.starts_with('~')
+            || matches!(target, "." | "..")
+            || target.starts_with("./")
+            || target.starts_with("../")
+        {
+            return false;
+        }
+        if self.env_cdpath {
+            return true;
+        }
+        let command = &self.command;
+        self.mentions
+            .get_or_insert_with(|| variable_mentions(command))
+            .contains_key("CDPATH")
+    }
+
     fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
         for dir in dirs.snapshot() {
             self.located.push(LocatedSegment {
@@ -5937,6 +6035,9 @@ impl DirWalk {
                 }
             }
             "cd" | "pushd" | "popd" if !own_process => match verb_target(words) {
+                VerbTarget::To(target) if self.cdpath_may_redirect(&target) => {
+                    dirs.add_unresolvable();
+                }
                 VerbTarget::To(target) => {
                     let absolute = looks_absolute(&target) || target.starts_with('~');
                     // `command cd` does not move zsh; `\cd` moves where `'\cd'`
@@ -6014,6 +6115,14 @@ fn group_depth_change(raw: &str) -> isize {
 ///   `pushd`, two operands — adds [`UNRESOLVABLE_DIR`], and so does a
 ///   command word only an expansion names (`$c /u`), and a `trap` whose
 ///   action changes directory;
+/// - a relative `cd`/`pushd` target that is not `.`, `..`, `./…` or `../…`
+///   searches `CDPATH`, so when `CDPATH` is non-empty in the hook's
+///   environment or assigned anywhere in the command it adds
+///   [`UNRESOLVABLE_DIR`]; with `CDPATH` unset, nothing changes;
+/// - deliberately NOT followed: `source FILE` / `. FILE` (the sourced file
+///   could `cd`) and aliases (zsh expands them in non-interactive shells).
+///   Activation scripts are common and benign, so the operator accepted this
+///   gap (cameronsjo/cadence-hooks#1171);
 /// - an `eval`'d script runs in this shell, so its segments are walked in
 ///   line, in the directory in effect; one that needs expansion to read is
 ///   [`UNRESOLVABLE_DIR`];
@@ -6043,9 +6152,21 @@ fn group_depth_change(raw: &str) -> isize {
 /// unpaired `)`, skipping quoted text and escaped characters
 /// ([`segment_shape`]).
 pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
+    let env_cdpath = std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty());
+    segment_work_dirs_with_cdpath(command, cwd, env_cdpath)
+}
+
+/// [`segment_work_dirs`] with the process's `CDPATH` given rather than read,
+/// so a test pins it without touching the environment.
+fn segment_work_dirs_with_cdpath(
+    command: &str,
+    cwd: &str,
+    env_cdpath: bool,
+) -> Vec<LocatedSegment> {
     let segments = split_segments_with_ops_joining_redirects(command);
     let mut walk = DirWalk {
         command: command.to_string(),
+        env_cdpath,
         ..DirWalk::default()
     };
     let mut dirs = DirSet::new(cwd);
@@ -17830,7 +17951,7 @@ mod tests {
             // Relative targets accumulate.
             ("cd a\ncd b\ngh pr create", "/cwd/a/b"),
         ] {
-            let located = segment_work_dirs(command, "/cwd");
+            let located = segment_work_dirs_with_cdpath(command, "/cwd", false);
             assert_eq!(
                 located.last().map(|segment| &*segment.dir),
                 Some(want),
@@ -17841,7 +17962,7 @@ mod tests {
 
     /// Every directory the LAST segment may run in, per [`segment_work_dirs`].
     fn last_dirs(command: &str) -> Vec<String> {
-        let located = segment_work_dirs(command, "/cwd");
+        let located = segment_work_dirs_with_cdpath(command, "/cwd", false);
         let last = located.last().map(|segment| segment.raw.clone());
         located
             .iter()
@@ -18094,6 +18215,161 @@ mod tests {
         }
     }
 
+    /// A relative `cd`/`pushd` target searches `CDPATH` (bash: `cd sub` with
+    /// `CDPATH=/x` lands in `/x/sub`, while `.`, `..`, `./sub`, `../sub`,
+    /// absolute and `~` targets never search it; an EMPTY `CDPATH` searches
+    /// nothing extra — all checked with a `pwd` canary). `CDPATH` is passed
+    /// in, so no test touches the process environment.
+    #[test]
+    fn segment_work_dirs_treats_a_cdpath_searched_target_as_unresolvable() {
+        const X: &str = UNRESOLVABLE_DIR;
+        for (env_cdpath, command, want) in [
+            // Set in the hook's environment.
+            (true, "cd sub; gh pr create", vec!["/cwd", X]),
+            (true, "cd sub/deeper; gh pr create", vec!["/cwd", X]),
+            (true, "cd 'sub'; gh pr create", vec!["/cwd", X]),
+            (true, "pushd sub; gh pr create", vec!["/cwd", X]),
+            (true, "cd -P sub; gh pr create", vec!["/cwd", X]),
+            (true, "true && cd sub; gh pr create", vec!["/cwd", X]),
+            (true, "(cd sub); gh pr create", vec!["/cwd"]),
+            // Assigned in the command, in each spelling.
+            (false, "CDPATH=/x; cd sub; gh pr create", vec!["/cwd", X]),
+            (
+                false,
+                "export CDPATH=/x; cd sub; gh pr create",
+                vec!["/cwd", X],
+            ),
+            (false, "CDPATH=/x cd sub; gh pr create", vec!["/cwd", X]),
+            (
+                false,
+                "CDPATH=\"/x\"; cd sub; gh pr create",
+                vec!["/cwd", X],
+            ),
+            (false, "CDPATH=$HOME; cd sub; gh pr create", vec!["/cwd", X]),
+            // Never searched, even with CDPATH set.
+            (true, "cd .; gh pr create", vec!["/cwd/."]),
+            (true, "cd ..; gh pr create", vec!["/cwd/.."]),
+            (true, "cd ./sub; gh pr create", vec!["/cwd/./sub"]),
+            (true, "cd ../sub; gh pr create", vec!["/cwd/../sub"]),
+            (true, "cd /abs; gh pr create", vec!["/abs"]),
+            (true, "cd C:/abs; gh pr create", vec!["C:/abs"]),
+            // CDPATH unset: unchanged.
+            (false, "cd sub; gh pr create", vec!["/cwd/sub"]),
+            (
+                false,
+                "cd sub; cd deeper; gh pr create",
+                vec!["/cwd/sub/deeper"],
+            ),
+            (
+                false,
+                "cd sub; cd deeper; gh pr create",
+                vec!["/cwd/sub/deeper"],
+            ),
+            // Any mention of the name counts (`read CDPATH`, `${CDPATH:=x}`,
+            // `declare -x CDPATH`), so a bare word over-blocks: never a miss.
+            (false, "echo CDPATH; cd sub; gh pr create", vec!["/cwd", X]),
+            // A later absolute cd leaves the unresolvable directory behind.
+            (true, "cd sub; cd /u; gh pr create", vec!["/u"]),
+        ] {
+            let located = segment_work_dirs_with_cdpath(command, "/cwd", env_cdpath);
+            let last = located.last().map(|segment| segment.raw.clone());
+            let got: std::collections::BTreeSet<String> = located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect();
+            let want: std::collections::BTreeSet<String> =
+                want.into_iter().map(String::from).collect();
+            assert_eq!(got, want, "CDPATH env {env_cdpath}: {command:?}");
+        }
+    }
+
+    #[test]
+    fn a_cdpath_search_stays_fast_on_adversarial_input() {
+        let relative = "cd a;".repeat(40_000);
+        let writes = "cd a; gh pr create -t x; ".repeat(8_000);
+        let assigned = format!("CDPATH=/x; {}", "cd a\n".repeat(40_000));
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
+        for (env_cdpath, command) in [(true, relative), (true, writes), (false, assigned)] {
+            let start = std::time::Instant::now();
+            let _ = segment_work_dirs_with_cdpath(&command, "/cwd", env_cdpath);
+            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+        }
+    }
+
+    /// A variable command word resolves to the `gh` the same command
+    /// assigned it. Rows are `(command, segment, resolved)`; `None` is the
+    /// accepted gap (never assigned, unreadable, not `gh`).
+    #[test]
+    fn command_word_variables_resolve_an_assigned_gh() {
+        for (command, segment, want) in [
+            ("G=gh; $G pr create", "$G pr create", Some("gh pr create")),
+            (
+                "G=gh; \"$G\" pr create",
+                "\"$G\" pr create",
+                Some("gh pr create"),
+            ),
+            (
+                "G=gh; ${G} pr create",
+                "${G} pr create",
+                Some("gh pr create"),
+            ),
+            ("G=gh; \"${G}\" pr", "\"${G}\" pr", Some("gh pr")),
+            (
+                "export G=gh; $G pr create",
+                "$G pr create",
+                Some("gh pr create"),
+            ),
+            ("G='gh'; $G pr", "$G pr", Some("gh pr")),
+            ("G=/usr/bin/gh; $G pr", "$G pr", Some("/usr/bin/gh pr")),
+            ("G=gh; { $G pr; }", "{ $G pr; }", Some("{ gh pr; }")),
+            ("G=gh; (  $G pr )", "(  $G pr )", Some("(  gh pr )")),
+            ("G=gh; X=1 $G pr", "X=1 $G pr", Some("X=1 gh pr")),
+            ("G=ls; G=gh; $G pr", "$G pr", Some("gh pr")),
+            // The accepted gap.
+            ("$G pr create", "$G pr create", None),
+            ("G=$(which gh); $G pr", "$G pr", None),
+            ("G=\"g$H\"; $G pr", "$G pr", None),
+            ("G=\"a b\"; $G pr", "$G pr", None),
+            ("read G; $G pr", "$G pr", None),
+            ("G=ls; $G pr", "$G pr", None),
+            ("G=gh; IFS=x; $G pr", "$G pr", None),
+            // Not a variable command word.
+            ("G=gh; echo $G", "echo $G", None),
+            ("G=gh; gh pr", "gh pr", None),
+            ("G=gh; $G$G pr", "$G$G pr", None),
+            ("G=gh; $G", "$G", Some("gh")),
+            ("", "", None),
+        ] {
+            let mut variables = CommandWordVariables::for_command(command);
+            assert_eq!(
+                variables.resolve_gh(segment).as_deref(),
+                want,
+                "{command:?} / {segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_word_variables_stay_fast_on_adversarial_input() {
+        let same = "G=gh; $G pr create; ".repeat(10_000);
+        let distinct = (0..10_000)
+            .map(|i| format!("v{i}=gh; $v{i} pr; "))
+            .collect::<String>();
+        let words = format!("G=gh; {}$G pr", "X=1 ".repeat(50_000));
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
+        for command in [same, distinct, words] {
+            let start = std::time::Instant::now();
+            let mut variables = CommandWordVariables::for_command(&command);
+            for segment in command_segments(&command) {
+                let _ = variables.resolve_gh(&segment);
+            }
+            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+        }
+    }
+
     #[test]
     fn segment_work_dirs_marks_an_over_long_directory_unresolvable() {
         let deep = "cd aaaaaaaa\n".repeat(MAX_DIR_LEN / 8);
@@ -18103,7 +18379,7 @@ mod tests {
             (format!("{deep}cd b\ngh pr create"), UNRESOLVABLE_DIR),
             (format!("{deep}cd /u\ngh pr create"), "/u"),
         ] {
-            let located = segment_work_dirs(&command, "/cwd");
+            let located = segment_work_dirs_with_cdpath(&command, "/cwd", false);
             assert_eq!(located.last().map(|segment| &*segment.dir), Some(want));
         }
     }
