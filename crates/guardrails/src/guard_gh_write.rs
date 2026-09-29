@@ -600,6 +600,239 @@ fn gh_api_subcommand_index(argv: &[String]) -> Option<usize> {
     (argv.get(index).map(String::as_str) == Some("api")).then_some(index)
 }
 
+/// Stand-in host for a `GH_HOST` this guard could not resolve (#548). It matches
+/// no allowlist entry — bare entries match only the default host and
+/// `CADENCE_EXTRA_HOSTS`, and no hostname contains a space — so a write judged
+/// against it always blocks.
+const UNRESOLVED_GH_HOST: &str = "<unresolved $GH_HOST>";
+
+/// Shell keywords [`command_segments`] can leave in front of a segment's
+/// command word (`then export GH_HOST=…`).
+const SEGMENT_KEYWORDS: &[&str] = &[
+    "then", "do", "else", "elif", "if", "while", "until", "!", "{", "time",
+];
+
+/// Commands that can set or export a shell variable in the CURRENT shell other
+/// than through a plain `export NAME=value`. A `GH_HOST` mention under any of
+/// them is not modeled, so it resolves to [`UNRESOLVED_GH_HOST`].
+const VAR_SETTING_BUILTINS: &[&str] = &[
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
+    "eval",
+    "read",
+    "printf",
+    "source",
+    ".",
+    "set",
+    "mapfile",
+    "readarray",
+    "let",
+    "getopts",
+    ":",
+    "builtin",
+    "command",
+    "exec",
+];
+
+/// The `GH_HOST` values a gh process may inherit at a point in one command,
+/// tracked across its segments (#548).
+///
+/// An inline `GH_HOST=h gh …` was already read by [`gh_command_host`], but an
+/// `export GH_HOST=h` in an EARLIER segment reaches the child just the same,
+/// and the guard used to judge that write against the hook's own host.
+///
+/// Transitions ADD a candidate rather than replace one. The walk runs over the
+/// flattened [`command_segments`] list, which drops the operators between
+/// segments, so it cannot tell whether an `export` or `unset` actually ran:
+/// `export GH_HOST=evil; false && unset GH_HOST; gh …` still reaches `evil`.
+/// A write is judged against every candidate and must be owned on each — the
+/// set only ever grows, so every imprecision here costs a false block, never a
+/// wrong-host allow.
+///
+/// What is modeled precisely: `export GH_HOST=<literal>`, `unset [-v]
+/// GH_HOST` (when the hook process had no `GH_HOST` to fall back to), and a
+/// bare `GH_HOST=<literal>` — which reaches gh only once the variable is
+/// exported (an earlier `export`, `set -a`, or a `GH_HOST` the shell already
+/// inherited), so `GH_HOST=x; gh …` alone stays exactly as before. Any other
+/// write-shaped mention (`declare -x`, `eval`, `${GH_HOST:=…}`, an expansion
+/// in the value, `export -n`, …) adds [`UNRESOLVED_GH_HOST`].
+///
+/// Not modeled, and so unchanged: a file that is `source`d, whose contents
+/// this guard never sees.
+#[derive(Debug)]
+struct GhHostEnv {
+    candidates: Vec<String>,
+    /// `GH_HOST` carries the export attribute, so a bare assignment reaches gh.
+    exported: bool,
+    /// `set -a` was seen: every bare assignment is exported.
+    allexport: bool,
+    /// The hook process (and so the shell) inherited a `GH_HOST`.
+    inherited: bool,
+}
+
+impl GhHostEnv {
+    fn from_process() -> Self {
+        let inherited = std::env::var_os("GH_HOST").is_some();
+        Self {
+            candidates: vec![default_host()],
+            exported: inherited,
+            allexport: false,
+            inherited,
+        }
+    }
+
+    fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    fn add(&mut self, host: String) {
+        if !self.candidates.contains(&host) {
+            self.candidates.push(host);
+        }
+    }
+
+    fn add_unresolved(&mut self) {
+        self.add(UNRESOLVED_GH_HOST.to_string());
+    }
+
+    /// Add the host a `GH_HOST=<value>` assignment names — or the unresolved
+    /// stand-in for an empty value or one still carrying an expansion.
+    fn add_assigned(&mut self, value: &str) {
+        if value.is_empty() || value.contains('$') || value.contains('`') {
+            self.add_unresolved();
+        } else {
+            self.add(value.to_ascii_lowercase());
+        }
+    }
+
+    fn observe(&mut self, segment: &str) {
+        let tokens = tokenize(segment);
+        let mut words: &[String] = &tokens;
+        while words
+            .first()
+            .is_some_and(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
+        {
+            words = &words[1..];
+        }
+        let assignments = words.iter().take_while(|w| is_shell_assignment(w)).count();
+        let (prefix, rest) = words.split_at(assignments);
+        let command = rest.first().map(|w| w.rsplit('/').next().unwrap_or(w));
+
+        if command == Some("set")
+            && rest[1..].iter().any(|w| {
+                w == "allexport" || (w.starts_with('-') && !w.starts_with("--") && w.contains('a'))
+            })
+        {
+            self.allexport = true;
+        }
+        if !tokens.iter().any(|t| mentions_gh_host(t)) {
+            return;
+        }
+
+        match command {
+            // Assignments only: shell variables, which reach gh only once
+            // exported.
+            None => {
+                for word in prefix {
+                    if let Some(value) = word.strip_prefix("GH_HOST=") {
+                        if self.exported || self.allexport {
+                            self.add_assigned(value);
+                        }
+                    } else if mentions_gh_host(word) && (self.exported || self.allexport) {
+                        self.add_unresolved();
+                    }
+                }
+            }
+            Some("export") => {
+                if prefix.iter().any(|w| mentions_gh_host(w)) {
+                    self.add_unresolved();
+                }
+                for word in &rest[1..] {
+                    if word.starts_with('-') {
+                        // `-n` un-exports, `-f` names functions, `-p` prints —
+                        // none is modeled.
+                        self.add_unresolved();
+                    } else if let Some(value) = word.strip_prefix("GH_HOST=") {
+                        self.exported = true;
+                        self.add_assigned(value);
+                    } else if mentions_gh_host(word) {
+                        // `export GH_HOST` exports whatever the shell variable
+                        // holds; `GH_HOST+=…` appends to it.
+                        self.exported = true;
+                        self.add_unresolved();
+                    }
+                }
+            }
+            Some("unset") => {
+                let args = &rest[1..];
+                let unsets = args.iter().any(|w| w == "GH_HOST");
+                if prefix.iter().any(|w| mentions_gh_host(w))
+                    || args.iter().any(|w| w.starts_with('-') && w != "-v")
+                    || args.iter().any(|w| w != "GH_HOST" && mentions_gh_host(w))
+                {
+                    self.add_unresolved();
+                } else if unsets {
+                    // gh then falls back to its own configured default, which
+                    // is the process default only when there was no inherited
+                    // `GH_HOST` for the hook to have read instead.
+                    if self.inherited {
+                        self.add_unresolved();
+                    } else {
+                        self.add(default_host());
+                    }
+                }
+            }
+            Some(name) if VAR_SETTING_BUILTINS.contains(&name) => self.add_unresolved(),
+            // Any other command: a prefix assignment lives only for that
+            // command, so only a mention in its words (`${GH_HOST:=…}`) can
+            // leave something behind.
+            Some(_) => {
+                if rest.iter().any(|w| mentions_gh_host(w)) {
+                    self.add_unresolved();
+                }
+            }
+        }
+    }
+}
+
+/// `NAME=value` / `NAME+=value` in command-word position.
+fn is_shell_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True when `word` names the `GH_HOST` variable in any way other than a plain
+/// read (`$GH_HOST`, `${GH_HOST}`). Longer names that merely contain it
+/// (`MY_GH_HOST`, `GH_HOSTNAME`) do not count.
+fn mentions_gh_host(word: &str) -> bool {
+    const NAME: &str = "GH_HOST";
+    let bytes = word.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(offset) = word[from..].find(NAME) {
+        let start = from + offset;
+        let end = start + NAME.len();
+        from = end;
+        if (start > 0 && ident(bytes[start - 1])) || bytes.get(end).is_some_and(|&b| ident(b)) {
+            continue;
+        }
+        if start >= 1 && bytes[start - 1] == b'$' {
+            continue;
+        }
+        if start >= 2 && &bytes[start - 2..start] == b"${" && bytes.get(end) == Some(&b'}') {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// Resolve the host selected for one `gh` invocation.
 ///
 /// `default_host()` sees the hook process environment, not an assignment that
@@ -610,8 +843,12 @@ fn gh_api_subcommand_index(argv: &[String]) -> Option<usize> {
 ///
 /// Which tokens are stepped over as some other flag's value is decided by
 /// [`host_scan_flags`], per subcommand — never by `gh api`'s grammar wholesale.
-fn gh_command_host(command: &str) -> String {
-    let fallback = default_host();
+///
+/// `env_host` is the `GH_HOST` the gh process inherits — the hook's own
+/// default, or what an `export` earlier in the same command left behind (#548,
+/// see [`GhHostEnv`]). Inline and `--hostname` selections outrank it.
+fn gh_command_host(command: &str, env_host: &str) -> String {
+    let fallback = env_host.to_string();
     let Some((tokens, gh_index)) = gh_command_tokens(command) else {
         return fallback;
     };
@@ -660,12 +897,24 @@ fn gh_command_host(command: &str) -> String {
     flag_host.or(inline_host).unwrap_or(fallback)
 }
 
+#[cfg(test)]
 fn resolve_target_repo(
     command: &str,
     work_dir: &str,
     allowed_owners: &[AllowEntry],
 ) -> RepoResolution {
-    let dh = gh_command_host(command);
+    resolve_target_repo_on(command, work_dir, allowed_owners, &default_host())
+}
+
+/// [`resolve_target_repo`] with the inherited `GH_HOST` supplied by the caller
+/// — see [`gh_command_host`].
+fn resolve_target_repo_on(
+    command: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    env_host: &str,
+) -> RepoResolution {
+    let dh = gh_command_host(command, env_host);
 
     // 1. Explicit -R / --repo flag (targets the command-selected gh host).
     match repo_flag(command) {
@@ -941,7 +1190,12 @@ fn disallowed_message(
     // match the default host only. Tell them how to widen, mirroring
     // guard_push_remote's hint.
     let default = default_host();
-    let host_hint = if host != default && !extra_hosts.iter().any(|e| e == host) {
+    let host_hint = if host == UNRESOLVED_GH_HOST {
+        "\n   Host: `GH_HOST` is changed earlier in this command in a way this guard cannot \
+         resolve — name the host on the gh command itself (`--hostname <host>` or \
+         `GH_HOST=<host> gh …`)"
+            .to_string()
+    } else if host != default && !extra_hosts.iter().any(|e| e == host) {
         format!(
             "\n   Host scope: bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) or set `CADENCE_EXTRA_HOSTS={host}`"
         )
@@ -1932,8 +2186,9 @@ fn judge_write_segment(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
+    env_host: &str,
 ) -> Option<CheckResult> {
-    match resolve_target_repo(segment, work_dir, allowed_owners) {
+    match resolve_target_repo_on(segment, work_dir, allowed_owners, env_host) {
         RepoResolution::Fork {
             origin_host,
             origin,
@@ -2045,11 +2300,17 @@ fn judge_write_segment(
                 // on the same project — `evil/cool-tool` becomes
                 // `cameronsjo/cool-tool`, not a placeholder.
                 let repo_name = repo.split('/').next_back().unwrap_or(repo.as_str());
+                // An unresolved GH_HOST is not fixed by any `-R` (#548).
+                let fix = if host == UNRESOLVED_GH_HOST {
+                    "name the host on the gh command itself (--hostname <host>)".to_string()
+                } else {
+                    format!("-R {example_owner}/{repo_name}")
+                };
                 Some(CheckResult::block_structured(
                     disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
                     BlockMetadata {
                         rule_id: "gh-write-unauthorized-target".to_string(),
-                        fix: format!("-R {example_owner}/{repo_name}"),
+                        fix,
                         allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                         severity: "error",
                     },
@@ -2220,8 +2481,13 @@ impl Check for GhWriteGuard {
         // disallowed / unresolvable write segment blocks.
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
+        let mut gh_host_env = GhHostEnv::from_process();
 
         for segment in command_segments(command) {
+            // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
+            // it decides which host every later gh write reaches (#548).
+            gh_host_env.observe(&segment);
+
             if !segment_invokes_gh(&segment) {
                 continue;
             }
@@ -2292,14 +2558,20 @@ impl Check for GhWriteGuard {
                 // existing per-segment ownership check below.
             }
 
-            if let Some(block) = judge_write_segment(
-                &segment,
-                &work_dir,
-                &allowed_owners,
-                &allowed_repos,
-                &extra_hosts,
-            ) {
-                return block;
+            // Judged once per host gh may have inherited: an earlier export
+            // that might not have run (`false && export …`) leaves more than
+            // one, and the write must be owned on every one of them (#548).
+            for env_host in gh_host_env.candidates() {
+                if let Some(block) = judge_write_segment(
+                    &segment,
+                    &work_dir,
+                    &allowed_owners,
+                    &allowed_repos,
+                    &extra_hosts,
+                    env_host,
+                ) {
+                    return block;
+                }
             }
         }
 
@@ -6142,5 +6414,127 @@ mod tests {
                 );
             }
         });
+    }
+
+    // --- #548: an exported GH_HOST reaches gh ---
+
+    #[test]
+    fn exported_gh_host_is_judged_as_the_write_host() {
+        with_env(&owners_env(), || {
+            for command in [
+                "export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=evil.example.com && gh api repos/cameronsjo/x -X POST -f a=b",
+                "export GH_HOST=evil.example.com; gh release create v1 -R cameronsjo/x",
+                "cd /tmp && export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=evil.example.com; for i in 1 2; do gh issue create -R cameronsjo/x --title t; done",
+                "if true; then export GH_HOST=evil.example.com; fi; gh pr create -R cameronsjo/x --title t",
+                "H=evil.example.com; export GH_HOST=$H; gh pr create -R cameronsjo/x --title t",
+                "sh -c 'export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t'",
+                // Whether a later reset ran is unknowable, so the export stays a
+                // candidate.
+                "export GH_HOST=evil.example.com; false && unset GH_HOST; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=evil.example.com; export GH_HOST=github.com; gh pr create -R cameronsjo/x --title t",
+                // Exported, so a later bare assignment reaches gh too.
+                "export GH_HOST=a.example; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "set -a; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                let meta = result
+                    .block_metadata
+                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn unmodeled_gh_host_changes_resolve_to_an_unknown_host() {
+        with_env(&owners_env(), || {
+            for command in [
+                "export GH_HOST; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=$UNSET_ELSEWHERE; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=; gh pr create -R cameronsjo/x --title t",
+                "export -n GH_HOST; gh pr create -R cameronsjo/x --title t",
+                "declare -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "eval 'export GH_HOST=evil.example.com'; gh pr create -R cameronsjo/x --title t",
+                ": ${GH_HOST:=evil.example.com}; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST+=.evil; gh pr create -R cameronsjo/x --title t",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                let message = result.message.clone().unwrap_or_default();
+                let meta = result
+                    .block_metadata
+                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+                assert!(message.contains(UNRESOLVED_GH_HOST), "{command}: {message}");
+                assert!(meta.fix.contains("--hostname"), "{command}: {}", meta.fix);
+            }
+        });
+    }
+
+    #[test]
+    fn gh_host_forms_that_never_reach_gh_are_unchanged() {
+        with_env(&owners_env(), || {
+            for command in [
+                // A bare assignment is a shell variable gh never sees.
+                "GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOST=github.com && gh pr create -R cameronsjo/x --title t",
+                // The command's own selection outranks the inherited one.
+                "export GH_HOST=evil.example.com && gh pr create --hostname github.com -R cameronsjo/x --title t",
+                "export GH_HOST=evil.example.com && GH_HOST=github.com gh pr create -R cameronsjo/x --title t",
+                // Reads, and names that merely contain GH_HOST.
+                "echo $GH_HOST ${GH_HOST}; gh pr create -R cameronsjo/x --title t",
+                "export MY_GH_HOST=evil GH_HOSTNAME=evil; gh pr create -R cameronsjo/x --title t",
+                // Scoped to the one non-gh command it prefixes.
+                "GH_HOST=evil.example.com make docs; gh pr create -R cameronsjo/x --title t",
+                // A read is not a write, whatever the host.
+                "export GH_HOST=evil.example.com && gh pr view 1 -R cameronsjo/x",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "expected ALLOW: {command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn gh_host_env_accumulates_candidates() {
+        with_env(&owners_env(), || {
+            let mut env = GhHostEnv::from_process();
+            assert_eq!(env.candidates(), ["github.com"]);
+            env.observe("export GH_HOST=Evil.Example.com");
+            assert_eq!(env.candidates(), ["github.com", "evil.example.com"]);
+            env.observe("unset GH_HOST");
+            assert_eq!(env.candidates(), ["github.com", "evil.example.com"]);
+            env.observe("declare -x GH_HOST=x");
+            assert_eq!(
+                env.candidates(),
+                ["github.com", "evil.example.com", UNRESOLVED_GH_HOST]
+            );
+        });
+    }
+
+    #[test]
+    fn mentions_gh_host_ignores_reads_and_longer_names() {
+        for yes in [
+            "GH_HOST",
+            "GH_HOST=x",
+            "${GH_HOST:=x}",
+            "GH_HOST+=x",
+            "${GH_HOST=x}",
+        ] {
+            assert!(mentions_gh_host(yes), "{yes}");
+        }
+        for no in [
+            "$GH_HOST",
+            "${GH_HOST}",
+            "MY_GH_HOST=x",
+            "GH_HOSTNAME",
+            "x$GH_HOST/y",
+        ] {
+            assert!(!mentions_gh_host(no), "{no}");
+        }
     }
 }

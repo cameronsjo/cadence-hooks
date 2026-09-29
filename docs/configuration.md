@@ -312,11 +312,19 @@ an explicit `--hostname` (separate or `=` form) overrides an inline
 hook process's `GH_HOST` and finally the `github.com` default. Host comparisons
 are case-insensitive.
 
-Only those two spellings are read. An assignment `export`ed in an earlier segment
-of the same command string (`export GH_HOST=... && gh ...`) reaches gh but is not
-yet tracked, so the guard judges the write against the default host. A bare
-`GH_HOST=...; gh ...` needs no tracking: without `export` it stays a shell
-variable that gh never sees, so the guard and gh already agree.
+Below those two, an `export GH_HOST=...` in an earlier segment of the same
+command string (`export GH_HOST=... && gh ...`) replaces the hook process's
+`GH_HOST`. The guard cannot tell whether an earlier segment actually ran
+(`false && export ...`), so every host the command may have left in place is a
+candidate, and the write must be owned on each. An `unset GH_HOST` therefore adds
+the default host back as a candidate rather than removing the exported one. A bare
+`GH_HOST=...; gh ...` changes nothing: without `export` it stays a shell variable
+that gh never sees. It does count once the variable is exported: after an earlier
+`export GH_HOST`, after `set -a`, or when the hook process already carries
+`GH_HOST`. Any other write-shaped mention of `GH_HOST` resolves to an unknown host
+that matches no allowlist entry, so the write blocks. That covers `declare -x`,
+`eval`, `${GH_HOST:=...}`, `export -n`, and a value that is still a `$` expansion.
+A `source`d file is not read.
 
 **Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 
