@@ -78,6 +78,7 @@ Rules for wiring:
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
 | `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
+| `warn-instruction-narrative` | PreToolUse (Write, Edit, MultiEdit) | Nudge when an edit to `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` adds narrative: a paragraph past 3 sentences or 400 characters (fences and table rows stripped), or 2+ past-event markers (ISO date, `measured`, `incident`, …) with no pointer phrase (`commit history`, `see`, …). Judges only added lines |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
 | `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |

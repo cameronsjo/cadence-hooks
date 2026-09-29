@@ -41,6 +41,8 @@ pub mod validate_line_endings;
 pub mod warn_changelog_entry;
 /// Nudge to review documentation when creating a pull request.
 pub mod warn_docs_update;
+/// Nudge when an always-loaded instruction file gains narrative.
+pub mod warn_instruction_narrative;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
 

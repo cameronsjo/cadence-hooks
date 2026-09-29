@@ -97,6 +97,12 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
+    HookEntry {
+        name: "warn-instruction-narrative",
+        description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
@@ -576,6 +582,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // without measuring anything.
         ("guardrails", "guard-body-budget") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
+        ),
+        // warn-instruction-narrative only engages on a CLAUDE.md/AGENTS.md
+        // write; the generic sample is a Bash call and would allow unjudged.
+        ("cadence", "warn-instruction-narrative") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","tool_input":{"file_path":"/tmp/cadence-try/CLAUDE.md","old_string":"","new_string":"Pin the toolchain. It used to drift; verified on 2026-02-02."}}"#,
         ),
         // warn-amend-pushed only engages on an amending `git commit`; the
         // generic PreToolUse sample (`git status`) would never reach the probe.

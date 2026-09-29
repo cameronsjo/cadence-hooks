@@ -268,6 +268,8 @@ enum CadenceCommands {
     WarnChangelogEntry,
     /// Nudge to audit about-to-ship content for personal-context overshare
     WarnOvershare,
+    /// Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative
+    WarnInstructionNarrative,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
@@ -572,6 +574,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
             CadenceCommands::WarnChangelogEntry => "warn-changelog-entry",
             CadenceCommands::WarnOvershare => "warn-overshare",
+            CadenceCommands::WarnInstructionNarrative => "warn-instruction-narrative",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
@@ -738,6 +741,12 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             CadenceCommands::WarnOvershare => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::warn_overshare::WarnOvershare),
+                pre,
+            ),
+            CadenceCommands::WarnInstructionNarrative => CheckPlan::new(
+                Box::new(
+                    cadence_hooks_cadence::warn_instruction_narrative::WarnInstructionNarrative,
+                ),
                 pre,
             ),
             CadenceCommands::NudgePolishBeforePr => CheckPlan::new(
