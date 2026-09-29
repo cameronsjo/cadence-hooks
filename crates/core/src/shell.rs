@@ -3458,12 +3458,51 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
 pub fn strip_heredoc_bodies(command: &str) -> String {
-    strip_heredoc_bodies_bounded(command, MAX_HEREDOC_SPAN_DEPTH)
+    let mut work = WorkBudget::for_input(command.len());
+    strip_heredoc_bodies_bounded(command, MAX_HEREDOC_SPAN_DEPTH, &mut work)
 }
 
 /// How many levels of heredoc-inside-a-carried-span [`strip_heredoc_bodies`]
 /// resolves before splicing a span raw, so nesting cannot exhaust the stack.
 const MAX_HEREDOC_SPAN_DEPTH: usize = 8;
+
+/// One allowance of scanning work shared by a whole recursive pass, in bytes
+/// of input handed to a sub-scan.
+///
+/// A depth cap alone bounds the stack, not the work: each level of the
+/// carried-span recursion re-read nearly the whole input, so the cost was
+/// multiplicative, and a 12 KB nested-heredoc flood ran past the hook
+/// deadline. A hook that times out fails open, so slow is a bypass (review of
+/// cadence-hooks#1093, third round). Every sub-scan draws from one counter,
+/// capped at a small multiple of the input; once it is spent the caller KEEPS
+/// the text it would have transformed — it never drops content, so an
+/// exhausted budget shows the guards more, never less.
+#[derive(Debug)]
+pub(crate) struct WorkBudget {
+    left: usize,
+}
+
+impl WorkBudget {
+    /// `8 × len + 64 KiB`: room for the legitimate re-reads (a few nesting
+    /// levels, the both-readings widening) with headroom for short inputs.
+    pub(crate) fn for_input(len: usize) -> Self {
+        Self {
+            left: len.saturating_mul(8).saturating_add(64 * 1024),
+        }
+    }
+
+    /// Spend `n` bytes of work. `false` (and nothing spent) when the
+    /// allowance cannot cover it.
+    pub(crate) fn charge(&mut self, n: usize) -> bool {
+        match self.left.checked_sub(n) {
+            Some(rest) => {
+                self.left = rest;
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// Carry one substitution span onto the introducing line. The span is shell
 /// code the outer heredoc's body will run, and it may introduce a heredoc of
@@ -3471,15 +3510,31 @@ const MAX_HEREDOC_SPAN_DEPTH: usize = 8;
 /// Splicing it raw handed that inner body to the segment splitter as code, so
 /// the apostrophe opened a phantom quote that swallowed the `cat .env` bash
 /// runs. Resolving the span's own heredocs first reads it the way bash does.
-/// Past the depth budget the span is spliced raw (the prior behavior).
-fn carried_span(span: &str, budget: usize) -> String {
-    match budget.checked_sub(1) {
-        Some(rest) if span.contains("<<") => strip_heredoc_bodies_bounded(span, rest),
+/// Past the depth cap, or once the shared work budget is spent, the span is
+/// spliced raw (the prior behavior): unstripped, never dropped.
+fn carried_span(span: &str, depth: usize, work: &mut WorkBudget) -> String {
+    match depth.checked_sub(1) {
+        Some(rest) if span.contains("<<") && work.charge(span.len()) => {
+            strip_heredoc_bodies_bounded(span, rest, work)
+        }
         _ => span.to_string(),
     }
 }
 
-fn strip_heredoc_bodies_bounded(command: &str, budget: usize) -> String {
+/// The spans of `body`, charged to `work`. Past the budget the body is
+/// returned whole as one span — the shape the depth-cap carry already uses —
+/// so an exhausted budget carries more text, never less.
+fn budgeted_spans(body: &str, work: &mut WorkBudget) -> Vec<String> {
+    if work.charge(body.len()) {
+        substitution_spans(body)
+    } else if body.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![body.to_string()]
+    }
+}
+
+fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudget) -> String {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -3550,9 +3605,9 @@ fn strip_heredoc_bodies_bounded(command: &str, budget: usize) -> String {
                     // own, out of the comment's reach; this function already
                     // joins its output on `\n`, so the span still reaches
                     // `substitution_bodies` and `child_scripts` unchanged.
-                    for span in substitution_spans(&body_lines.join("\n")) {
+                    for span in budgeted_spans(&body_lines.join("\n"), work) {
                         line.push('\n');
-                        line.push_str(&carried_span(&span, budget));
+                        line.push_str(&carried_span(&span, depth, work));
                     }
                 }
             } else {
@@ -3569,12 +3624,15 @@ fn strip_heredoc_bodies_bounded(command: &str, budget: usize) -> String {
                 // BEFORE the `$(`, so expansion-depth tracking cannot see it).
                 // Carrying the spans separately means the payload survives
                 // whatever happens to the prose around it.
+                //
+                // These spans are spliced raw, not resolved through
+                // [`carried_span`]: the lines above already keep every one of
+                // them verbatim, and resolving each again re-read the rest of
+                // the input once per nesting level — the multiplicative cost
+                // the review of #1093 measured. Only the outermost spans are
+                // carried, and only once.
                 let rest = lines[body_start..].join("\n");
-                out.extend(
-                    substitution_spans(&rest)
-                        .iter()
-                        .map(|span| carried_span(span, budget)),
-                );
+                out.extend(budgeted_spans(&rest, work));
                 return out.join("\n");
             }
         }
@@ -4890,7 +4948,7 @@ fn scan_substitution_body_bounded(
     let arithmetic = chars.get(start) == Some(&'(');
     // Heredocs introduced on the current line, in order, waiting for the
     // newline that starts their bodies: (delimiter word, `<<-` tab strip).
-    let mut pending: Vec<(String, bool)> = Vec::new();
+    let mut pending: Vec<(Vec<char>, bool)> = Vec::new();
     while j < chars.len() {
         if quote_aware {
             // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
@@ -4942,7 +5000,7 @@ fn scan_substitution_body_bounded(
             {
                 body.extend(&chars[j..end]);
                 j = end;
-                pending.push((word, strip_tabs));
+                pending.push((word.chars().collect(), strip_tabs));
                 lexed = true;
                 boundary = false;
                 continue;
@@ -5152,7 +5210,7 @@ fn heredoc_delimiter(chars: &[char], mut k: usize) -> Option<(String, bool, usiz
 fn skip_heredoc_bodies(
     chars: &[char],
     mut j: usize,
-    pending: &mut Vec<(String, bool)>,
+    pending: &mut Vec<(Vec<char>, bool)>,
 ) -> Option<usize> {
     for (word, strip_tabs) in pending.drain(..) {
         loop {
@@ -5169,13 +5227,15 @@ fn skip_heredoc_bodies(
                     from += 1;
                 }
             }
-            let line: String = chars[from..eol].iter().collect();
-            if line == word {
+            // Compared in place: one allocation per body line made a long
+            // heredoc cost an allocator round-trip per line on every rescan.
+            let line = &chars[from..eol];
+            if line == word.as_slice() {
                 j = (eol + 1).min(chars.len());
                 break;
             }
-            if line.starts_with(word.as_str()) && line.contains(')') {
-                j = from + word.chars().count();
+            if line.starts_with(&word) && line.contains(&')') {
+                j = from + word.len();
                 break;
             }
             j = (eol + 1).min(chars.len());
@@ -9871,6 +9931,112 @@ mod tests {
             substitution_bodies("echo $(cat <<< 'it)' ; echo b) ; x"),
             vec!["cat <<< 'it)' ; echo b".to_string()]
         );
+    }
+
+    /// The nested-heredoc flood shapes from the third review of #1093, sized
+    /// to at least `target` bytes: quoted (the reported shape), unquoted, and
+    /// balanced nested heredocs that each close before the next opens.
+    fn heredoc_flood_shapes(target: usize) -> Vec<(&'static str, String)> {
+        let build = |name: &'static str, f: &dyn Fn(usize) -> String| {
+            let mut n = 1;
+            while f(n).len() < target {
+                n *= 2;
+            }
+            (name, f(n))
+        };
+        vec![
+            build("quoted", &|n| {
+                format!(
+                    "echo \"{}{}\" ; cat .env",
+                    "$(cat <<E\nx\n".repeat(n),
+                    "E\n)".repeat(n)
+                )
+            }),
+            build("unquoted", &|n| {
+                format!(
+                    "echo {}{} ; cat .env",
+                    "$(cat <<E\nx\n".repeat(n),
+                    "E\n)".repeat(n)
+                )
+            }),
+            build("balanced", &|n| {
+                format!(
+                    "echo \"{}{}\" ; cat .env",
+                    "$(cat <<E\nx\nE\n".repeat(n),
+                    ")".repeat(n)
+                )
+            }),
+        ]
+    }
+
+    #[test]
+    fn command_segments_nested_heredoc_floods_stay_linear() {
+        // Third review of #1093: `strip_heredoc_bodies` resolved heredocs
+        // inside carried spans by recursing into itself, and every level
+        // re-read nearly the whole input, so a 12 KB quoted flood grew to
+        // 88 KB after stripping and to 2.5 million segments downstream. The
+        // hook group hit its 4000 ms deadline and ALLOWED (main blocked in
+        // 0.08 s). One shared work budget now bounds the recursion, and the
+        // unterminated branch no longer re-resolves the spans it keeps.
+        //
+        // Three assertions per shape and size: the read still surfaces, the
+        // stripped text and the segment stream stay a small multiple of the
+        // input (measured flat at ~1.3 segments and ~14 B per input byte
+        // from 15 KB to 245 KB; the pre-fix stream was ~200 segments per
+        // input byte at 12 KB and growing), and a generous
+        // wall-clock bound for a debug build on a loaded runner.
+        for target in [10_000, 50_000, 200_000] {
+            for (name, input) in heredoc_flood_shapes(target) {
+                let len = input.len();
+                let started = std::time::Instant::now();
+                let stripped = strip_heredoc_bodies(&input);
+                let segs = command_segments(&input);
+                let took = started.elapsed();
+                assert!(
+                    segs.iter().any(|s| s == "cat .env"),
+                    "{name} ({len} B): the trailing read reached no segment"
+                );
+                assert!(
+                    stripped.len() <= 2 * len + 64 * 1024,
+                    "{name} ({len} B): stripping grew the text to {} B",
+                    stripped.len()
+                );
+                let seg_bytes: usize = segs.iter().map(String::len).sum();
+                assert!(
+                    seg_bytes <= 32 * len && segs.len() <= 2 * len,
+                    "{name} ({len} B): {} segments, {seg_bytes} B in all",
+                    segs.len()
+                );
+                assert!(
+                    took < std::time::Duration::from_secs(20),
+                    "{name} ({len} B): took {took:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_heredoc_bodies_keeps_spans_whole_once_the_work_budget_is_spent() {
+        // Budget exhaustion must widen, never drop: a spent budget splices
+        // the body whole where a span would have gone, so the read inside a
+        // nested heredoc still reaches the splitter.
+        let input = "cat <<EOF\n$(cat <<'X'\nit's\nX\ncat .env)\nEOF";
+        let mut spent = WorkBudget { left: 0 };
+        let out = strip_heredoc_bodies_bounded(input, MAX_HEREDOC_SPAN_DEPTH, &mut spent);
+        assert!(out.contains("cat .env"), "{out:?}");
+        // With room to work, the same input resolves the inner heredoc and
+        // the read becomes its own segment.
+        assert!(
+            command_segments(input)
+                .iter()
+                .any(|s| s.trim_end_matches(')') == "cat .env"),
+            "{:?}",
+            command_segments(input)
+        );
+        // The allowance is shared and refuses, rather than overdraws.
+        let mut work = WorkBudget::for_input(0);
+        assert!(work.charge(64 * 1024));
+        assert!(!work.charge(1));
     }
 
     #[test]
