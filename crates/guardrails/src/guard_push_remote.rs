@@ -8,8 +8,8 @@ use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_push_segments, host_and_repo_from_url, looks_like_push_url, parse_work_dir,
-    strip_quotes,
+    LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
+    parse_work_dir, segment_work_dirs, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -34,11 +34,13 @@ static GIT_PUSH_VERB: LazyLock<Regex> =
 /// really in command position — so the looseness costs a parse, not a verdict.
 /// Scanning bytes rather than lowercasing keeps the common case (every Bash
 /// command the hook sees) allocation-free.
+///
+/// `alias` passes too (cadence-hooks#1161): a `git -c alias.p='!…' p` or a
+/// `--config-env=alias.p=VAR` can run a push whose text never spells `push`.
 fn mentions_push(command: &str) -> bool {
-    command
-        .as_bytes()
-        .windows(4)
-        .any(|w| w.eq_ignore_ascii_case(b"push"))
+    let bytes = command.as_bytes();
+    bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"push"))
+        || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
 }
 
 /// Check if a URL's owner is in the allowed list.
@@ -618,8 +620,42 @@ struct PushWalk(std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation
 
 impl PushWalk {
     fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
-        self.0.get_or_init(|| push_locations(command, cwd))
+        self.0
+            .get_or_init(|| push_locations_both_readings(command, cwd))
     }
+}
+
+/// Every push [`push_locations`] finds, plus every push it places nowhere
+/// the per-segment reading does ([`segment_work_dirs`]): each top-level
+/// segment walked on its own, in the directory that segment runs in.
+///
+/// The push walk scopes a subshell only when the whole `( … )` is one
+/// segment, so `(true; cd <owned> ); git push` from an unowned checkout was
+/// judged in the owned one. The per-segment walk closes a subshell at its
+/// `)` wherever the splitter cut it. A push both readings place alike is
+/// listed once; one they place apart is listed in both places, so every
+/// directory check judges it in each and the sharpest verdict wins — this
+/// can add a verdict, never remove one.
+fn push_locations_both_readings(
+    command: &str,
+    cwd: &str,
+) -> Vec<cadence_hooks_core::push::PushInvocation> {
+    let mut pushes = push_locations(command, cwd);
+    let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
+        .iter()
+        .map(|push| (push.work_dir.clone(), push.repository.clone()))
+        .collect();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        if !mentions_push(&raw) {
+            continue;
+        }
+        for push in push_locations(strip_group_wrappers(&raw), &dir) {
+            if placed.insert((push.work_dir.clone(), push.repository.clone())) {
+                pushes.push(push);
+            }
+        }
+    }
+    pushes
 }
 
 /// The directory the command starts in: the payload's `cwd`, else the hook
@@ -731,8 +767,11 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // Structural safety checks first — these don't need the owner list
     // and must block even when unconfigured.
 
+    // One parse for both the chain and the loop analysis.
+    let (chain_result, loop_result) = loop_analysis::analyze_push_chain_and_loops(command);
+
     // Chain analysis: multiple pushes in && / ; chains
-    match loop_analysis::analyze_push_chain(command) {
+    match chain_result {
         ChainAnalysis::SameRemote(_) => {
             // All chained pushes target the same remote — safe to proceed
         }
@@ -782,7 +821,6 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     }
 
     // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
-    let loop_result = loop_analysis::analyze_push_loops(command);
     match &loop_result {
         LoopAnalysis::MissingTargets(cmds) => {
             let bare_pushes: Vec<String> = cmds
@@ -843,12 +881,9 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
 
     // Validate ownership of explicit remotes in loops
     if let LoopAnalysis::AllTargetsExplicit(cmds) = &loop_result {
-        let cwd_fallback_loop = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| ".".to_string());
-        let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
-        let work_dir_loop = parse_work_dir(command, cwd_loop);
+        // The same `parse_work_dir(command, cwd)` as above: recomputing it
+        // doubled the cost of a 200 KB `cd a; …` flood in front of a loop.
+        let work_dir_loop = &work_dir;
 
         // This loop is the one guard path that spawns a *command-controlled*
         // number of git probes (one per looped push), so it is the induced-
@@ -864,10 +899,21 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         // possibly-unowned push through, and no timing/count heuristic can
         // separate that flood from a slow host — a slow host inflates each
         // probe, keeping any completion-count discriminator under its bar.
+        // One probe per DISTINCT remote, and a bounded number of those
+        // (cadence-hooks#1161). A 200 KB `for …; do git push origin main;
+        // …; done;` flood spawned one `git remote get-url` per looped push —
+        // ~2300 subprocesses for one remote — and reached the hook deadline,
+        // which fails open.
+        let mut probed: Vec<&str> = Vec::new();
+        let mut spawned = 0;
         for cmd in cmds {
             let Some(remote) = &cmd.explicit_repo else {
                 continue;
             };
+            if probed.contains(&remote.as_str()) {
+                continue;
+            }
+            probed.push(remote);
 
             // An explicit URL is validated DIRECTLY, never looked up as a
             // remote name. `git remote get-url --push <url>` always fails,
@@ -893,7 +939,14 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 continue;
             }
 
-            match resolve_push_url(&work_dir_loop, Some(remote)) {
+            spawned += 1;
+            if spawned > MAX_PUSH_DIRECTORIES {
+                return CheckResult::block(
+                    "🚫 git-guardrails: too many push-loop remotes to verify\n   \
+                     Fix: run pushes individually so each remote is validated.",
+                );
+            }
+            match resolve_push_url(work_dir_loop, Some(remote)) {
                 PushUrlResolution::Url(url) => {
                     if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
                         return CheckResult::block(format!(
@@ -1782,6 +1835,51 @@ mod tests {
 
     /// Every row runs from an owned checkout, with `{other}` an unowned one:
     /// `(command, outcome)`.
+    /// A push is judged in the directory its own top-level segment runs in
+    /// as well as the whole-command one, and the sharpest verdict wins. The
+    /// push walk scoped a subshell only when the whole `( … )` was one
+    /// segment, so a `cd` in a subshell cut at a `;` leaked into the parent.
+    /// Every row is `(command, run from the owned checkout?, blocks?)`.
+    #[test]
+    fn push_is_judged_where_its_own_segment_runs() {
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let unowned = checkout_with_origin("https://github.com/evil/y.git");
+        let o = owned.path().to_string_lossy().to_string();
+        let u = unowned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, in_owned, blocks) in [
+                // Allowed on the base.
+                ("(true; cd {O} ); git push origin HEAD", false, true),
+                ("(true; cd {O}; true); git push origin HEAD", false, true),
+                (
+                    "(true; cd {O} ); for b in a c; do git push origin $b; done",
+                    false,
+                    true,
+                ),
+                // Blocked on the base by the push walk, and still.
+                ("echo hi\ncd {U}\ngit push origin HEAD", true, true),
+                ("true & cd {U}; git push origin HEAD", true, true),
+                ("{ cd {U}; }; git push origin HEAD", true, true),
+                ("cd {U} && git push origin HEAD", true, true),
+                ("git push origin HEAD", false, true),
+                // Controls.
+                ("cd {O} && git push origin HEAD", false, false),
+                ("cd {O}\ngit push origin HEAD", false, false),
+                ("git push origin HEAD", true, false),
+            ] {
+                let command = command.replace("{O}", &o).replace("{U}", &u);
+                let cwd = if in_owned { &o } else { &u };
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
     #[test]
     fn push_moved_to_another_repository_is_judged_there() {
         use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
@@ -2259,6 +2357,289 @@ mod tests {
                 "took {:?}",
                 started.elapsed()
             );
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn a_looped_push_flood_probes_each_remote_once() {
+        // cadence-hooks#1161: the loop arm spawned one `git remote get-url`
+        // per looped push — ~2300 for one remote at 200 KB — and hit the
+        // deadline. Probed once per distinct remote, the owned push is
+        // allowed well inside it, and a flood of distinct remote NAMES is
+        // refused rather than probed.
+        with_env(&owners_only(), || {
+            let repo = crate::github_origin_repo();
+            let cwd = repo.path().to_string_lossy();
+            let unit = "for i in 1; do git push origin main; git config user.name x; done;";
+            let flood = unit.repeat(200_000 / unit.len());
+            let started = std::time::Instant::now();
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&flood, &cwd));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+            let distinct: String = (0..6)
+                .map(|i| format!("for i in 1; do git push r{i} main; done;"))
+                .collect();
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&distinct, &cwd));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{:?}",
+                result.message
+            );
+        });
+    }
+
+    /// cadence-hooks#1161 and the `find -exec` lane: every row runs from an
+    /// owned checkout. Each Block row was ALLOW on main; the clone rows were
+    /// measured against real git with the unowned URL rewritten to a local
+    /// bare repository, which received the push.
+    #[test]
+    fn a_push_hidden_by_a_clone_an_alias_or_find_is_judged() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let other = checkout_with_origin("https://github.com/evil/y.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // A clone decides where a later push in its directory goes.
+                (
+                    "git clone https://github.com/evil/y d && cd d && git push".to_string(),
+                    Block,
+                ),
+                (
+                    "git clone https://github.com/evil/y.git && cd y && git push origin main".into(),
+                    Block,
+                ),
+                (
+                    "git clone --depth 1 -b main https://github.com/evil/y d && git -C d push".into(),
+                    Block,
+                ),
+                (
+                    "git clone https://github.com/evil/y ./d/ && cd d/sub && git push".into(),
+                    Block,
+                ),
+                ("gh repo clone evil/y && cd y && git push".into(), Block),
+                (
+                    "gh repo clone evil/y d -- --depth 1 && cd d && git push".into(),
+                    Block,
+                ),
+                (
+                    "(git clone https://github.com/evil/y d); cd d && git push".into(),
+                    Block,
+                ),
+                (
+                    "git clone -c remote.origin.pushurl=https://github.com/evil/y https://github.com/cameronsjo/z d && cd d && git push".into(),
+                    Block,
+                ),
+                // Unreadable: a built URL or directory, or the signed-in
+                // user's repository.
+                ("git clone \"$U\" d && cd d && git push".into(), Block),
+                (
+                    "git clone https://github.com/cameronsjo/z \"$D\" && cd z && git push".into(),
+                    Block,
+                ),
+                ("gh repo clone y && cd y && git push".into(), Block),
+                // An alias the command line defines.
+                (
+                    "git -c alias.p='push https://github.com/evil/y' p".into(),
+                    Block,
+                ),
+                ("git -c 'alias.p=push origin main' p".into(), Block),
+                ("git -c 'alias.p=!git pu\"\"sh origin main' p".into(), Block),
+                ("git -c alias.P='!true' p".into(), Block),
+                ("git --config-env=alias.p=X p".into(), Block),
+                (
+                    "git -c alias.p=q -c 'alias.q=push https://github.com/evil/y' p".into(),
+                    Block,
+                ),
+                // find runs the push, or runs it in each match's directory.
+                (
+                    format!("find . -maxdepth 0 -exec sh -c 'git -C {other} push origin main' \\;"),
+                    Block,
+                ),
+                (
+                    "find . -exec git push https://github.com/evil/y {} +".into(),
+                    Block,
+                ),
+                ("find . -ok git push https://github.com/evil/y ';'".into(), Block),
+                ("find . -execdir git push origin main \\;".into(), Block),
+                // Controls.
+                (
+                    "git clone https://github.com/cameronsjo/z d && cd d && git push".into(),
+                    Allow,
+                ),
+                ("gh repo clone cameronsjo/z && cd z && git push".into(), Allow),
+                (
+                    "git clone https://github.com/evil/y d; git push origin main".into(),
+                    Allow,
+                ),
+                ("git -c alias.st=status st".into(), Allow),
+                ("git -c alias.lg='log --oneline' lg && git push origin main".into(), Allow),
+                ("find . -maxdepth 0 -exec git push origin main \\;".into(), Allow),
+                ("find . -type f -exec wc -l {} \\;".into(), Allow),
+                ("find . -name '*.rs' -exec grep -l push {} +".into(), Allow),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// `gh repo clone OWNER/REPO` clones from `GH_HOST`, not always
+    /// github.com, so a push in the clone is judged against that host, the
+    /// way guard-gh-write judges a gh write. Each Block row was ALLOW before.
+    #[test]
+    fn a_gh_repo_clone_is_judged_on_the_gh_host() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // An inline, `env`, or earlier exported host.
+                (
+                    "GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "env GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HOST=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HO\"ST\"=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // A host the text cannot read.
+                (
+                    "export GH_HOST=\"$H\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HOS${T}=x; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    ": ${GH_HOST:=other.example}; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "GH_HOST=$H gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // A URL or `HOST/OWNER/REPO` names its own host.
+                (
+                    "gh repo clone https://other.example/cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "gh repo clone other.example:cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "gh repo clone other.example/cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // Controls.
+                ("gh repo clone cameronsjo/z && cd z && git push", Allow),
+                (
+                    "GH_HOST=github.com gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "export GH_HOST=github.com; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "unset GH_HOST; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "gh repo clone https://github.com/cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "GH_HOST=other.example gh repo clone cameronsjo/z && git push origin main",
+                    Allow,
+                ),
+                // A builtin with a non-literal VALUE names no host.
+                (
+                    "export PATH=\"$HOME/.cargo/bin:$PATH\" && gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -s)\" && gh repo clone cameronsjo/z && cd z && git push -u origin feat",
+                    Allow,
+                ),
+                (
+                    "printf '%s\\n' \"$x\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                // A builtin that can name GH_HOST without spelling it.
+                (
+                    "n=GH_HOST; export $n=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "read -r \"$n\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "printf -v \"$n\" other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "eval \"$x\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "eval \"$(direnv export bash)\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+        // A host the operator trusts is judged like any other push there.
+        let mut trusted = owners_only();
+        trusted.retain(|(name, _)| *name != "CADENCE_EXTRA_HOSTS");
+        trusted.push(("CADENCE_EXTRA_HOSTS", Some("other.example")));
+        with_env(&trusted, || {
+            let command = "GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push";
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+            assert_eq!(result.outcome, Allow, "{:?}", result.message);
+        });
+    }
+
+    #[test]
+    fn a_cd_flood_before_a_push_is_judged_before_the_deadline() {
+        // 200 KB of `cd a; ` before one push: each `cd` copied the whole
+        // path the walk had built, so the walk was quadratic and took ~0.5 s
+        // in release — at the hook deadline, which fails open. Now ~0.3 s in
+        // release; the bound is loose because `parse_work_dir`'s own flat
+        // scan still joins a fresh path per `cd`, which a debug build pays
+        // several times over.
+        with_env(&owners_only(), || {
+            let repo = crate::github_origin_repo();
+            let cwd = repo.path().to_string_lossy();
+            let command = format!("{}git push", "cd a; ".repeat(40_000));
+            let started = std::time::Instant::now();
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "took {:?}",
+                started.elapsed()
+            );
+            // Not a repository: git fails the push itself.
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }

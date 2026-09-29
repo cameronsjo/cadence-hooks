@@ -81,9 +81,23 @@ pub enum ChainAnalysis {
 /// Extracts all top-level (non-looped) `git push` commands from `&&`/`;` chains
 /// and determines if they all target the same remote.
 pub fn analyze_push_chain(command: &str) -> ChainAnalysis {
-    let program = match parse_command(command) {
-        Some(p) => p,
-        None => return ChainAnalysis::ParseFailed,
+    push_chain_of(parse_command(command).as_ref())
+}
+
+/// [`analyze_push_chain`] and [`analyze_push_loops`] from one parse. A 200 KB
+/// command costs the parser a large share of a guard's deadline, and the two
+/// read the same tree.
+pub fn analyze_push_chain_and_loops(command: &str) -> (ChainAnalysis, LoopAnalysis) {
+    let program = parse_command(command);
+    (
+        push_chain_of(program.as_ref()),
+        push_loops_of(program.as_ref()),
+    )
+}
+
+fn push_chain_of(program: Option<&brush_parser::ast::Program>) -> ChainAnalysis {
+    let Some(program) = program else {
+        return ChainAnalysis::ParseFailed;
     };
 
     let mut push_commands = Vec::new();
@@ -168,9 +182,12 @@ fn collect_top_level_pushes_from_pipeline(pipeline: &Pipeline, out: &mut Vec<Loo
 
 /// Parse a shell command and analyze any loops for `git push` commands.
 pub fn analyze_push_loops(command: &str) -> LoopAnalysis {
-    let program = match parse_command(command) {
-        Some(p) => p,
-        None => return LoopAnalysis::ParseFailed,
+    push_loops_of(parse_command(command).as_ref())
+}
+
+fn push_loops_of(program: Option<&brush_parser::ast::Program>) -> LoopAnalysis {
+    let Some(program) = program else {
+        return LoopAnalysis::ParseFailed;
     };
 
     let mut looped_commands = Vec::new();
