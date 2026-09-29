@@ -4665,6 +4665,33 @@ fn mutation_nudge_message(repo_root: &str, path: &str) -> String {
     )
 }
 
+/// Is the Edit/Write target a file git ignores and does not track
+/// (cadence-hooks#1001)? `CLAUDE.local.md`, `.env.local`, a
+/// `.claude/settings.local.json` kept out by a global ignore file: no worktree
+/// can ever hold such a file, so the block's own remedy cannot apply, and
+/// nothing written there can reach a commit without a deliberate `git add -f`
+/// — which the commit arm still judges.
+///
+/// One `git check-ignore` from the nearest existing directory, spawned only on
+/// the would-block path. `check-ignore` without `--no-index` never reports a
+/// TRACKED path, so a force-added file that also matches an ignore rule still
+/// blocks. Fails closed: only a printed match exempts — not-ignored (exit 1), a
+/// git error such as a path beyond a symlink (exit 128), a spawn failure, and a
+/// deadline all keep the block.
+fn is_ignored_untracked(dir: &Path, input: &HookInput, cwd: &str) -> bool {
+    let Some(file_path) = input.file_path() else {
+        return false;
+    };
+    let path = Path::new(cwd).join(file_path);
+    matches!(
+        cadence_hooks_core::shell::git_command_detailed(
+            &dir.to_string_lossy(),
+            &["check-ignore", "--", &path.to_string_lossy()],
+        ),
+        cadence_hooks_core::shell::GitQuery::Value(_)
+    )
+}
+
 /// Testable core: assess the hook input under the given environment.
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     let mut repo_allow = RepoAllowMain::default();
@@ -4719,7 +4746,13 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 probe.common_dir(Path::new(cwd)),
             ) {
                 (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
-                    assess_dir(&target_dir, cfg, None, &mut repo_allow, &mut probe)
+                    let result = assess_dir(&target_dir, cfg, None, &mut repo_allow, &mut probe);
+                    if result.outcome == Outcome::Block
+                        && is_ignored_untracked(&target_dir, input, cwd)
+                    {
+                        return CheckResult::allow();
+                    }
+                    result
                 }
                 _ => CheckResult::allow(),
             }
@@ -6189,6 +6222,46 @@ mod tests {
         let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "linked worktree must pass");
+    }
+
+    /// cadence-hooks#1001: a file git ignores AND does not track can never live
+    /// in a worktree, so the block's remedy cannot apply to it. A tracked file
+    /// that also matches an ignore rule (force-added) is ordinary tracked work
+    /// and keeps blocking, as does every file no ignore rule covers.
+    #[test]
+    fn edit_of_an_ignored_untracked_file_in_primary_is_allowed() {
+        let scratch = scratch("ignored-untracked");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        std::fs::write(
+            primary.join(".git/info/exclude"),
+            "CLAUDE.local.md\n*.log\nforced.txt\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("forced.txt"), "f").unwrap();
+        git_in(&primary, &["add", "-f", "forced.txt"]);
+        git_in(&primary, &["commit", "-qm", "force-add an ignored path"]);
+
+        let cases: &[(&str, Outcome)] = &[
+            ("CLAUDE.local.md", Outcome::Allow),
+            ("debug.log", Outcome::Allow),
+            // A not-yet-created subtree whose file an ignore rule still matches.
+            ("logs/nested/run.log", Outcome::Allow),
+            // Controls.
+            ("forced.txt", Outcome::Block),
+            ("src.rs", Outcome::Block),
+            ("CLAUDE.md", Outcome::Block),
+            ("notes/CLAUDE.local.md.bak", Outcome::Block),
+        ];
+        for &(rel, expected) in cases {
+            let input = edit_in(&primary, &primary.join(rel));
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, expected, "absolute target {rel}");
+            // The same target named relative to the session cwd.
+            let mut input = make_edit(rel, "a", "b");
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, expected, "relative target {rel}");
+        }
     }
 
     #[test]
