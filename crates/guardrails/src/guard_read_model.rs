@@ -146,6 +146,26 @@ impl Check for GuardReadModel {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        let read = |var: &str| std::env::var(var).unwrap_or_default();
+        self.run_with(
+            input,
+            &read(MODELS_VAR),
+            &read(MODE_VAR),
+            &read(ON_UNKNOWN_VAR),
+        )
+    }
+}
+
+impl GuardReadModel {
+    /// [`Check::run`] with the three policy values passed in rather than read
+    /// from process env, so tests need no env mutation (cadence-hooks#486).
+    fn run_with(
+        &self,
+        input: &HookInput,
+        models_raw: &str,
+        mode_raw: &str,
+        on_unknown_raw: &str,
+    ) -> CheckResult {
         // Only Read/Grep are gated; every other tool passes through.
         let tool = input.normalized_tool_name().unwrap_or("");
         if tool != "Read" && tool != "Grep" {
@@ -153,14 +173,13 @@ impl Check for GuardReadModel {
         }
 
         // Opt-in: an empty model list disables the guard entirely.
-        let models = cadence_hooks_core::config::env_list(MODELS_VAR);
+        let models = cadence_hooks_core::config::parse_env_list(models_raw);
         if models.is_empty() {
             return CheckResult::allow();
         }
 
-        let mode = Mode::from_env_value(&std::env::var(MODE_VAR).unwrap_or_default());
-        let on_unknown =
-            OnUnknown::from_env_value(&std::env::var(ON_UNKNOWN_VAR).unwrap_or_default());
+        let mode = Mode::from_env_value(mode_raw);
+        let on_unknown = OnUnknown::from_env_value(on_unknown_raw);
 
         // Resolve the current model from the transcript tail. Every failure to
         // read or parse is a fail-open path — routed through `judge(None, …)` →
@@ -363,26 +382,13 @@ mod tests {
 
     // --- Check::run glue ---
     //
-    // run() reads the three CADENCE_READ_MODEL_GUARD_* vars from the
-    // process-global environment, so every run()-based test serializes via
-    // the crate-shared with_env/CADENCE_ENV_TEST_LOCK and explicitly pins all
-    // three (restoring prior values) — this keeps the disabled-guard
-    // assertions deterministic even if the ambient env has MODELS set, and
-    // free of races with parallel tests (#446).
+    // The run()-based tests call `run_with` with the three
+    // CADENCE_READ_MODEL_GUARD_* values passed in explicitly, so they neither
+    // read nor mutate process env (cadence-hooks#486).
 
-    use crate::with_env;
-
-    /// Pin all three guard vars — a common base the per-test overrides adjust.
-    fn guard_env(
-        models: Option<&'static str>,
-        mode: Option<&'static str>,
-        on_unknown: Option<&'static str>,
-    ) -> Vec<(&'static str, Option<&'static str>)> {
-        vec![
-            (MODELS_VAR, models),
-            (MODE_VAR, mode),
-            (ON_UNKNOWN_VAR, on_unknown),
-        ]
+    /// Drive the guard with explicit `(models, mode, on_unknown)` values.
+    fn run_guard(input: &HookInput, models: &str, mode: &str, on_unknown: &str) -> CheckResult {
+        GuardReadModel.run_with(input, models, mode, on_unknown)
     }
 
     /// Write a one-line transcript naming `model` and return its temp file.
@@ -399,29 +405,32 @@ mod tests {
     #[test]
     fn non_read_grep_tool_allows() {
         // A denying policy is set, but Bash is not gated → allow before any env read.
-        with_env(&guard_env(Some("opus"), Some("deny"), None), || {
+        {
             let input = make_bash("echo hi");
-            assert_eq!(GuardReadModel.run(&input).outcome, Outcome::Allow);
-        });
+            assert_eq!(
+                run_guard(&input, "opus", "deny", "").outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
     fn read_with_guard_disabled_allows() {
         // A temp transcript names opus, but MODELS is unset → guard disabled → allow.
-        with_env(&guard_env(None, None, None), || {
+        {
             let tmp = transcript_with_model("claude-opus-4-8");
             let input = make_read("/tmp/secret", tmp.path().to_str());
-            assert_eq!(GuardReadModel.run(&input).outcome, Outcome::Allow);
-        });
+            assert_eq!(run_guard(&input, "", "", "").outcome, Outcome::Allow);
+        }
     }
 
     #[test]
     fn read_deny_hit_blocks_end_to_end() {
         // deny opus + a transcript resolving to opus → BLOCK through run().
-        with_env(&guard_env(Some("opus"), Some("deny"), None), || {
+        {
             let tmp = transcript_with_model("claude-opus-4-8");
             let input = make_read("/tmp/secret", tmp.path().to_str());
-            let result = GuardReadModel.run(&input);
+            let result = run_guard(&input, "opus", "deny", "");
             assert_eq!(result.outcome, Outcome::Block, "opus read must be blocked");
             assert!(
                 result
@@ -430,26 +439,29 @@ mod tests {
                     .unwrap_or_default()
                     .contains("claude-opus-4-8")
             );
-        });
+        }
     }
 
     #[test]
     fn read_deny_miss_allows_end_to_end() {
         // deny opus + a transcript resolving to sonnet → ALLOW through run().
-        with_env(&guard_env(Some("opus"), Some("deny"), None), || {
+        {
             let tmp = transcript_with_model("claude-sonnet-4-5");
             let input = make_read("/tmp/ok", tmp.path().to_str());
-            assert_eq!(GuardReadModel.run(&input).outcome, Outcome::Allow);
-        });
+            assert_eq!(
+                run_guard(&input, "opus", "deny", "").outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
     fn grep_allow_miss_blocks_end_to_end() {
         // allow-list = opus + a Grep under haiku → BLOCK through run().
-        with_env(&guard_env(Some("opus"), Some("allow"), None), || {
+        {
             let tmp = transcript_with_model("claude-haiku-4-5");
             let input = make_grep("pattern", tmp.path().to_str());
-            let result = GuardReadModel.run(&input);
+            let result = run_guard(&input, "opus", "allow", "");
             assert_eq!(result.outcome, Outcome::Block, "non-allowed grep blocks");
             assert!(
                 result
@@ -458,49 +470,51 @@ mod tests {
                     .unwrap_or_default()
                     .contains("claude-haiku-4-5")
             );
-        });
+        }
     }
 
     #[test]
     fn missing_transcript_path_allows_default() {
         // Policy set, but no transcript_path → resolved None → on_unknown default
         // allow: a missing transcript must never brick reads.
-        with_env(&guard_env(Some("opus"), Some("deny"), None), || {
+        {
             let input = make_read("/tmp/secret", None);
-            assert_eq!(GuardReadModel.run(&input).outcome, Outcome::Allow);
-        });
+            assert_eq!(
+                run_guard(&input, "opus", "deny", "").outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
     fn unreadable_transcript_allows_default() {
         // transcript_path points at a nonexistent file → read fails → resolved
         // None → on_unknown default allow (fail-open).
-        with_env(&guard_env(Some("opus"), Some("deny"), None), || {
+        {
             let input = make_read("/tmp/secret", Some("/no/such/transcript.jsonl"));
-            assert_eq!(GuardReadModel.run(&input).outcome, Outcome::Allow);
-        });
+            assert_eq!(
+                run_guard(&input, "opus", "deny", "").outcome,
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
     fn unknown_model_on_unknown_block_blocks_end_to_end() {
         // No assistant model in the transcript + on_unknown=block → BLOCK.
-        with_env(
-            &guard_env(Some("opus"), Some("deny"), Some("block")),
-            || {
-                let tmp = tempfile::NamedTempFile::new().unwrap();
-                std::fs::write(tmp.path(), r#"{"message":{"role":"user","content":"hi"}}"#)
-                    .unwrap();
-                let input = make_read("/tmp/secret", tmp.path().to_str());
-                let result = GuardReadModel.run(&input);
-                assert_eq!(result.outcome, Outcome::Block);
-                assert!(
-                    result
-                        .message
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains("unknown-block")
-                );
-            },
-        );
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), r#"{"message":{"role":"user","content":"hi"}}"#).unwrap();
+            let input = make_read("/tmp/secret", tmp.path().to_str());
+            let result = run_guard(&input, "opus", "deny", "block");
+            assert_eq!(result.outcome, Outcome::Block);
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unknown-block")
+            );
+        }
     }
 }
