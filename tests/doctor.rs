@@ -1537,3 +1537,21 @@ fn doctor_prune_apply_keeps_siblings_a_symlinked_intermediate_dir_reaches() {
         assert!(pinned_real.exists());
     }
 }
+
+/// The default gate (no bounds) refuses when the machine-wide registry exists
+/// but cannot be listed, here because a file sits where the directory goes.
+#[test]
+fn doctor_prune_apply_refuses_when_the_registry_cannot_be_listed() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    std::fs::create_dir_all(config.join("cadence")).unwrap();
+    std::fs::write(config.join("cadence/live-sessions"), "").unwrap();
+
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(stderr.contains("unreadable registry"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}

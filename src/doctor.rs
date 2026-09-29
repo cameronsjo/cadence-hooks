@@ -2637,6 +2637,33 @@ enum PruneGate {
     Blocked(Vec<String>),
 }
 
+/// What listing a session registry directory says about it.
+enum RegistryProbe {
+    /// It does not exist: no sessions registered there.
+    Absent,
+    /// It lists; the registry readers can be trusted on it.
+    Listable,
+    /// It exists but cannot be listed. Carries a sanitized
+    /// `unreadable registry <dir>` label for the refusal or notice.
+    Unlistable(String),
+}
+
+/// Probe a registry directory before reading sessions from it. The registry
+/// readers return nothing on ANY `read_dir` error, which reads an existing but
+/// unlistable registry as "no sessions" and lets a prune delete under it.
+/// Only a registry that does not exist is empty; every other error is a
+/// registry the prune gates cannot see into, and both refuse on it.
+fn probe_registry(dir: &Path) -> RegistryProbe {
+    match std::fs::read_dir(dir) {
+        Ok(_) => RegistryProbe::Listable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryProbe::Absent,
+        Err(_) => RegistryProbe::Unlistable(format!(
+            "unreadable registry {}",
+            display_safe_path_flagged(dir)
+        )),
+    }
+}
+
 /// Decide whether `--prune --apply` may run. Pure over its inputs so it is
 /// testable without a live registry.
 ///
@@ -2697,7 +2724,19 @@ fn prune_liveness_gate(
     // blocks instead, and `CADENCE_DOCTOR_PRUNE_FORCE=1` remains the way out.
     let mut unreadable: Vec<String> = Vec::new();
 
+    let mut unlistable: Vec<String> = Vec::new();
+
     for dir in sessions_dir.into_iter().chain(global_dir) {
+        match probe_registry(dir) {
+            RegistryProbe::Listable => {}
+            RegistryProbe::Absent => continue,
+            RegistryProbe::Unlistable(name) => {
+                if !unlistable.contains(&name) {
+                    unlistable.push(name);
+                }
+                continue;
+            }
+        }
         // Deduped: the local registry and the shared mirror hold records for
         // the same sessions, so the same base name can appear in both and the
         // refusal would otherwise read "2 unreadable session records (x.json,
@@ -2767,6 +2806,8 @@ fn prune_liveness_gate(
                 .join(", ")
         ));
     }
+
+    names.extend(unlistable);
 
     if names.is_empty() {
         return PruneGate::Proceed;
@@ -2899,14 +2940,10 @@ fn live_start_bound(
     let mut earliest: Option<u64> = None;
     let now = session_identity::now_epoch();
     for dir in sessions_dir.into_iter().chain(global_dir) {
-        // The registry readers return nothing on ANY `read_dir` error, which
-        // would read an existing but unreadable registry as "no sessions".
-        // Only a registry that does not exist is empty.
-        match std::fs::read_dir(dir) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                let name = format!("unreadable registry {}", display_safe_path_flagged(dir));
+        match probe_registry(dir) {
+            RegistryProbe::Listable => {}
+            RegistryProbe::Absent => continue,
+            RegistryProbe::Unlistable(name) => {
                 if !unknown.contains(&name) {
                     unknown.push(name);
                 }
@@ -7497,6 +7534,32 @@ mod tests {
             }
             PruneGate::Proceed => panic!("a live session must block the prune"),
         }
+    }
+
+    /// An existing but unlistable registry blocks the default gate and is
+    /// named; a missing one is still no sessions.
+    #[test]
+    fn prune_liveness_gate_blocks_on_an_unlistable_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            prune_liveness_gate(Some(&tmp.path().join("missing")), None, 600, false),
+            PruneGate::Proceed
+        ));
+        let not_a_dir = tmp.path().join("live-sessions");
+        fs::write(&not_a_dir, "").unwrap();
+        match prune_liveness_gate(None, Some(&not_a_dir), 600, false) {
+            PruneGate::Blocked(names) => assert!(
+                names
+                    .iter()
+                    .any(|n| n.starts_with("unreadable registry") && n.contains("live-sessions")),
+                "{names:?}"
+            ),
+            PruneGate::Proceed => panic!("an unlistable registry must block the prune"),
+        }
+        assert!(matches!(
+            prune_liveness_gate(None, Some(&not_a_dir), 600, true),
+            PruneGate::Proceed
+        ));
     }
 
     #[test]
