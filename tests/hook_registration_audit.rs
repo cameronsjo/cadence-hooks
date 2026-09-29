@@ -307,42 +307,9 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
-    // The five nudges-b hooks: built here, wired by the cadence-monorepo PR that
-    // follows (each entry leaves in that wiring PR).
-    ("cadence guard-held-close", "cameronsjo/cadence-hooks#612"),
-    (
-        "guardrails warn-chezmoi-apply",
-        "cameronsjo/cadence-hooks#514",
-    ),
-    (
-        "guardrails warn-entry-posture",
-        "cameronsjo/cadence-hooks#620",
-    ),
-    (
-        "guardrails warn-stacked-base-delete",
-        "cameronsjo/cadence-hooks#473",
-    ),
-    (
-        "guardrails warn-stale-pr-body",
-        "cameronsjo/cadence-hooks#766",
-    ),
-    // New nudges built ahead of their wiring: each hooks.json entry lands in a
-    // follow-up cadence-monorepo PR, which also removes the row here.
-    (
-        "cadence warn-instruction-narrative",
-        "cameronsjo/cadence-hooks#922",
-    ),
     (
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
-    ),
-    (
-        "cadence warn-plugin-root-cruft",
-        "cameronsjo/cadence-hooks#282",
-    ),
-    (
-        "guardrails warn-inline-body",
-        "cameronsjo/cadence-hooks#611",
     ),
 ];
 
@@ -494,6 +461,9 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "guardrails warn-branch-base",
     "guardrails warn-going-public",
     "guardrails warn-issue-tracker",
+    // Wired as two single-rule `if:` entries (`Bash(*git push*)` and
+    // `Bash(*gh pr merge*)`) because `if:` alternation is unsupported.
+    "guardrails warn-stacked-base-delete",
     "metrics log-polish-nudge",
     "session guard",
 ];

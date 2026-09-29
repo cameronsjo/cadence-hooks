@@ -23,6 +23,16 @@
         ]
       },
       {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-entry-posture",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "Agent|Task",
         "hooks": [
           {
@@ -198,6 +208,36 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-alias-parsing",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-inline-body",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-stale-pr-body",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-stacked-base-delete",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-stacked-base-delete",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-chezmoi-apply",
             "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
             "timeout": 5
           }
