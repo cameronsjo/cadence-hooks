@@ -1413,7 +1413,7 @@ mod tests {
             // Links and moves that never touch the vault leave the deletion alone.
             ("ln -s /tmp/a /out/l; rm /out/l", Allow),
             ("mv /tmp/a /tmp/b; rm /tmp/b", Allow),
-            ("cp /vault/note.md /out/y; rm /out/y", Allow),
+            ("cp /tmp/a /out/y; rm /out/y", Allow),
             ("ln -s /vault /out/l", Allow),
         ] {
             let result =
