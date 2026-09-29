@@ -4891,7 +4891,7 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
         if words.first().map(String::as_str) == Some("cd")
             && let Some(target) = words.get(1)
         {
-            effective = resolve_cd_target(target, &effective);
+            apply_cd_target(&mut effective, target);
         }
     }
     effective
@@ -4906,7 +4906,8 @@ pub struct LocatedSegment {
     pub raw: String,
     /// The directory the segment's own command runs in, shared by every
     /// segment that runs there so a flood of segments costs one copy.
-    /// [`UNRESOLVABLE_DIR`] once a `cd` chain grows it past [`MAX_DIR_LEN`].
+    /// [`UNRESOLVABLE_DIR`] where the walk cannot say. A segment that may
+    /// run in several directories is listed once for each.
     pub dir: std::rc::Rc<str>,
 }
 
@@ -4916,12 +4917,13 @@ pub struct LocatedSegment {
 /// which bounds the work a flood of relative `cd`s buys at linear.
 pub const MAX_DIR_LEN: usize = 4096;
 
-/// The directory [`segment_work_dirs`] reports once a `cd` chain grows past
-/// [`MAX_DIR_LEN`]. The NUL makes it no path at all: a git lookup in it
-/// fails to spawn, which every caller reads as "not a repository", the same
-/// answer the over-long path would get. A relative `cd` leaves it in place;
-/// an absolute one moves off it.
-pub const UNRESOLVABLE_DIR: &str = "\0unresolvable: directory path too long";
+/// The directory [`segment_work_dirs`] reports where it cannot say where the
+/// shell is: a `cd` chain grown past [`MAX_DIR_LEN`], or a directory change
+/// it cannot read (`popd`, `cd "$D"`, `eval "$s"`, `$c /u`). The NUL makes it
+/// no path at all: a git lookup in it fails to spawn, which every caller
+/// reads as "not a repository" — the gh-write guard blocks on it. A relative
+/// `cd` leaves it in place; an absolute one moves off it.
+pub const UNRESOLVABLE_DIR: &str = "\0unresolvable directory";
 
 /// Every [`command_segments`] segment of `command`, each paired with the
 /// directory its top-level segment runs in ([`segment_work_dirs`]), in
@@ -4931,30 +4933,668 @@ pub const UNRESOLVABLE_DIR: &str = "\0unresolvable: directory path too long";
 /// The per-segment reading a guard judges alongside the whole-command
 /// [`parse_work_dir`] one; see [`segment_work_dirs`].
 pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std::rc::Rc<str>)> {
-    segment_work_dirs(command, cwd)
-        .into_iter()
-        .flat_map(|LocatedSegment { raw, dir }| {
-            command_segments(&raw)
-                .into_iter()
-                .map(move |segment| (segment, dir.clone()))
-        })
-        .collect()
+    // A segment that may run in several directories is located once per
+    // directory, consecutively; expand it once.
+    let mut out = Vec::new();
+    let mut last: Option<(String, Vec<String>)> = None;
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        if last.as_ref().is_none_or(|(text, _)| *text != raw) {
+            let expanded = command_segments(&raw);
+            last = Some((raw, expanded));
+        }
+        if let Some((_, expanded)) = &last {
+            out.extend(expanded.iter().map(|segment| (segment.clone(), dir.clone())));
+        }
+    }
+    out
 }
 
-/// One open group while [`segment_work_dirs`] walks: the directory to go
+/// One open group while [`segment_work_dirs`] walks: the directories to go
 /// back to, and whether the group runs in its own process however it ends.
 struct Group {
     subshell: bool,
-    saved_dir: std::rc::Rc<str>,
+    saved: Vec<String>,
     after_pipe: bool,
+}
+
+/// A compound command [`segment_work_dirs`] is inside. Its body runs in the
+/// PARENT shell, so a `cd` there moves the parent — but only if the branch
+/// is taken, or as many times as the loop goes round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compound {
+    If,
+    Loop,
+    Case,
+}
+
+/// Most directories [`segment_work_dirs`] keeps as the possible directories
+/// of one point in the command. A conditional `cd` adds one; past the cap the
+/// set collapses to [`UNRESOLVABLE_DIR`], which a gh-write judgment blocks on.
+const MAX_POSSIBLE_DIRS: usize = 8;
+
+/// How deep [`segment_work_dirs`] follows an `eval`'d script or a function
+/// body into another; past it the directory is [`UNRESOLVABLE_DIR`].
+const MAX_DIR_WALK_DEPTH: usize = 8;
+
+/// Most segments [`segment_work_dirs`] replays from `eval`'d scripts and
+/// function bodies across one command; past it every further one leaves the
+/// directory [`UNRESOLVABLE_DIR`], so a flood of calls stays linear.
+const MAX_REPLAYED_SEGMENTS: usize = 4096;
+
+/// Where the walk may be, as a set: one directory after an unconditional
+/// `cd`, several after a `cd` that may or may not have run.
+struct DirSet {
+    dirs: Vec<String>,
+    shared: Option<Vec<std::rc::Rc<str>>>,
+}
+
+impl DirSet {
+    fn new(cwd: &str) -> Self {
+        Self {
+            dirs: vec![cwd.to_string()],
+            shared: None,
+        }
+    }
+
+    /// The directories, shared by every segment that runs there.
+    fn snapshot(&mut self) -> &[std::rc::Rc<str>] {
+        let dirs = &self.dirs;
+        self.shared
+            .get_or_insert_with(|| dirs.iter().map(|dir| std::rc::Rc::from(dir.as_str())).collect())
+    }
+
+    fn replace(&mut self, dirs: Vec<String>) {
+        if dirs != self.dirs {
+            self.dirs = dirs;
+            self.shared = None;
+        }
+    }
+
+    /// Add [`UNRESOLVABLE_DIR`]: the shell may be somewhere this walk cannot
+    /// name.
+    fn add_unresolvable(&mut self) {
+        let mut dirs = self.dirs.clone();
+        dirs.push(UNRESOLVABLE_DIR.to_string());
+        self.set(dirs);
+    }
+
+    /// Deduplicate and cap, then install.
+    fn set(&mut self, mut dirs: Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|dir| seen.insert(dir.clone()));
+        if dirs.len() > MAX_POSSIBLE_DIRS {
+            dirs = vec![UNRESOLVABLE_DIR.to_string()];
+        }
+        self.replace(dirs);
+    }
+
+    /// Apply a readable `cd` target. `keep` keeps the directories it moved
+    /// from as well (a conditional or ambiguous move).
+    fn move_to(&mut self, target: &str, keep: bool) {
+        let absolute = looks_absolute(target) || target.starts_with('~');
+        if !keep && self.dirs.len() == 1 {
+            // The common case, in place: a flood of relative `cd`s grows one
+            // path rather than copying it on every step.
+            let mut dirs = std::mem::take(&mut self.dirs);
+            move_dir(&mut dirs[0], target, absolute);
+            self.dirs = dirs;
+            self.shared = None;
+            return;
+        }
+        let mut next = if keep { self.dirs.clone() } else { Vec::new() };
+        for dir in &self.dirs {
+            let mut moved = dir.clone();
+            move_dir(&mut moved, target, absolute);
+            next.push(moved);
+        }
+        self.set(next);
+    }
+}
+
+/// One `cd` target applied to one directory: [`UNRESOLVABLE_DIR`] stays put
+/// under a relative target, and a path grown past [`MAX_DIR_LEN`] becomes it.
+fn move_dir(dir: &mut String, target: &str, absolute: bool) {
+    if dir == UNRESOLVABLE_DIR && !absolute {
+        return;
+    }
+    apply_cd_target(dir, target);
+    if dir.len() > MAX_DIR_LEN {
+        *dir = UNRESOLVABLE_DIR.to_string();
+    }
+}
+
+/// How a segment's command sits in the walk: under an `if`/`case` branch or a
+/// loop (in the segment or in the `eval`/function call that runs it).
+#[derive(Debug, Clone, Copy, Default)]
+struct DirContext {
+    conditional: bool,
+    looped: bool,
+}
+
+/// The state of one [`segment_work_dirs`] walk that outlives a script:
+/// every segment located so far, and the functions defined so far.
+#[derive(Default)]
+struct DirWalk {
+    located: Vec<LocatedSegment>,
+    /// Each defined function's body, or `None` when its body is a form this
+    /// walk does not record (`f() if …; fi`).
+    functions: std::collections::HashMap<String, Option<std::rc::Rc<[(String, Option<&'static str>)]>>>,
+    replayed: usize,
+}
+
+/// A function definition whose body segments are still being recorded.
+struct Definition {
+    name: String,
+    body: Vec<(String, Option<&'static str>)>,
+    depth: isize,
+}
+
+/// A function definition's head — `f()`, `f ( )`, `function f`,
+/// `function f()` — and the name it defines.
+static FUNCTION_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^(?:function[ \t]+([^\s(){}<>;&|'"\\$`]+)[ \t]*(?:\([ \t]*\))?|([^\s(){}<>;&|'"\\$`=]+)[ \t]*\([ \t]*\))[ \t]*"#,
+    )
+    .expect("pattern should compile")
+});
+
+/// A `case` pattern at the start of a segment: `x)`, `(x)`, `a|b)`, `*)`.
+static CASE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\(?[ \t]*[^\s()'"\;&|<>]+(?:[ \t]*\|[ \t]*[^\s()'"\;&|<>]+)*[ \t]*\)"#)
+        .expect("pattern should compile")
+});
+
+/// A `case WORD in` head.
+static CASE_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^case[ \t]+(?:"[^"]*"|'[^']*'|[^\s"']+)[ \t]+in(?:[ \t]+|$)"#)
+        .expect("pattern should compile")
+});
+
+/// What [`peel_segment`] found at the front of a segment.
+#[derive(Default)]
+struct Peeled<'s> {
+    brace_closes: usize,
+    /// Group openers, outermost first: `true` for `(`, `false` for `{`.
+    opens: Vec<bool>,
+    /// The command after the openers and reserved words, or `None` when the
+    /// segment carries none (`for x in a b`).
+    command: Option<&'s str>,
+    /// A segment in a `case` whose pattern could not be read.
+    unreadable: bool,
+}
+
+/// Peel a segment's group openers and closers and its reserved words
+/// (`if`, `then`, `do`, `fi`, `case x in x)`, `!`, `time`, …), keeping the
+/// `compounds` stack in step. `}` closes a brace group only as a word.
+fn peel_segment<'s>(raw: &'s str, compounds: &mut Vec<Compound>) -> Peeled<'s> {
+    let mut peeled = Peeled::default();
+    let mut rest = raw;
+    let mut pattern_position = compounds.last() == Some(&Compound::Case);
+    loop {
+        rest = rest.trim_start();
+        let word_end = rest
+            .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+            .unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        if pattern_position && word != "esac" {
+            pattern_position = false;
+            if let Some(found) = CASE_PATTERN.find(rest) {
+                rest = &rest[found.end()..];
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix('}')
+            && (after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || ";&|)".contains(c)))
+        {
+            peeled.brace_closes += 1;
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('(') {
+            peeled.opens.push(true);
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest
+            .strip_prefix('{')
+            .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            peeled.opens.push(false);
+            rest = after;
+            continue;
+        }
+        match word {
+            "if" => compounds.push(Compound::If),
+            "while" | "until" => compounds.push(Compound::Loop),
+            "then" | "else" | "elif" | "do" | "!" | "time" => {}
+            "fi" | "done" | "esac" => {
+                compounds.pop();
+            }
+            "for" | "select" => {
+                // The rest is the loop's word list, not a command.
+                compounds.push(Compound::Loop);
+                return peeled;
+            }
+            "case" => {
+                compounds.push(Compound::Case);
+                match CASE_HEAD.find(rest) {
+                    Some(head) => {
+                        rest = &rest[head.end()..];
+                        pattern_position = true;
+                        continue;
+                    }
+                    None => {
+                        peeled.unreadable = true;
+                        return peeled;
+                    }
+                }
+            }
+            _ => break,
+        }
+        rest = &rest[word_end..];
+        if word == "time" {
+            rest = rest.trim_start();
+            if let Some(after) = rest.strip_prefix("-p").filter(|after| {
+                after.is_empty() || after.starts_with(char::is_whitespace)
+            }) {
+                rest = after;
+            }
+        }
+    }
+    if !rest.is_empty() {
+        peeled.command = Some(rest);
+    }
+    peeled
+}
+
+/// The unescaped text of a token, and whether it carried a backslash —
+/// whose meaning quote removal hid (`\cd` runs the builtin, `'\cd'` does not).
+fn plain_word(token: &str) -> (String, bool) {
+    (unescape_word(token).into_owned(), token.contains('\\'))
+}
+
+/// Where a directory verb's target leaves the shell.
+enum VerbTarget {
+    /// A literal target.
+    To(String),
+    /// A target this walk cannot read: `popd`, `cd -`, `cd "$D"`, a flagged
+    /// `pushd`, more than one operand.
+    Unreadable,
+}
+
+/// Read a `cd`/`pushd`/`popd`'s target from its words (the verb first).
+/// Mirrors the push walk's `resolve_directory_verb`.
+fn verb_target(words: &[MarkedToken]) -> VerbTarget {
+    let verb = words[0].text.as_str();
+    let verb = unescape_word(verb);
+    if verb == "popd" {
+        return VerbTarget::Unreadable;
+    }
+    let stack_verb = verb == "pushd";
+    let mut idx = 1;
+    while let Some(word) = words.get(idx) {
+        let text = unescape_word(&word.text);
+        if text == "--" {
+            idx += 1;
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            break;
+        }
+        // `cd`'s own options pick how symlinks resolve; anything else, and
+        // every `pushd` option (`-n` does not move), is not read here.
+        if stack_verb || !text[1..].chars().all(|c| "LPe@".contains(c)) {
+            return VerbTarget::Unreadable;
+        }
+        idx += 1;
+    }
+    let mut operands = Vec::new();
+    let mut words = words[idx..].iter();
+    while let Some(word) = words.next() {
+        let quoted_operator = redirect_operator_span(&word.text)
+            .is_some_and(|(len, _)| word.unquoted_prefix_len < len);
+        if !quoted_operator && let Some((len, bare)) = redirect_operator_span(&word.text) {
+            if bare && len == word.text.len() {
+                words.next();
+            }
+            continue;
+        }
+        operands.push(word.text.as_str());
+    }
+    match operands.as_slice() {
+        [] if !stack_verb => VerbTarget::To("~".to_string()),
+        [target]
+            if unescape_word(target) != "-"
+                && !target.contains(['$', '`'])
+                && !(stack_verb && (target.starts_with('+') || target.starts_with('-'))) =>
+        {
+            VerbTarget::To((*target).to_string())
+        }
+        _ => VerbTarget::Unreadable,
+    }
+}
+
+/// Does a `trap` action change directory? Its action runs later — before
+/// every command under `DEBUG` — in the parent shell.
+fn trap_action_moves(words: &[MarkedToken], functions: &DirWalk) -> bool {
+    static MOVES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:^|[^\w-])(?:cd|pushd|popd|eval)(?:$|[^\w-])").expect("pattern should compile")
+    });
+    words.iter().skip(1).any(|word| {
+        MOVES.is_match(&word.text)
+            || tokenize(&word.text)
+                .iter()
+                .any(|inner| functions.functions.contains_key(inner.as_str()))
+    })
+}
+
+impl DirWalk {
+    /// Walk one script's segments. `dirs` is the parent shell's directory
+    /// set, which an `eval`'d script and a function body share.
+    fn walk(
+        &mut self,
+        segments: &[(String, Option<&'static str>)],
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+    ) {
+        let mut groups: Vec<Group> = Vec::new();
+        let mut compounds: Vec<Compound> = Vec::new();
+        let mut defining: Option<Definition> = None;
+        let mut previous_op: Option<&str> = None;
+        for (raw, op) in segments {
+            let op = *op;
+            if let Some(definition) = defining.as_mut() {
+                // A function body is recorded, not run: its `cd`s move
+                // nothing until the function is called.
+                definition.body.push((raw.clone(), op));
+                definition.depth += group_depth_change(raw);
+                if definition.depth <= 0 {
+                    let done = defining.take().expect("just matched");
+                    self.functions
+                        .insert(done.name, Some(std::rc::Rc::from(done.body)));
+                }
+                self.emit(raw, dirs);
+                previous_op = op;
+                continue;
+            }
+            let peeled = peel_segment(raw, &mut compounds);
+            for _ in 0..peeled.brace_closes {
+                if let Some(group) = groups.pop() {
+                    let forked =
+                        group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
+                    if forked {
+                        dirs.replace(group.saved);
+                    }
+                }
+            }
+            for &subshell in &peeled.opens {
+                groups.push(Group {
+                    subshell,
+                    saved: dirs.dirs.clone(),
+                    after_pipe: previous_op == Some("|"),
+                });
+            }
+            let command = peeled.command.unwrap_or("");
+            let shape = segment_shape(command);
+            let in_case = compounds.contains(&Compound::Case);
+            if peeled.unreadable || (in_case && shape.paren_closes > 0) {
+                // A `case` this walk cannot read: its `)`s may be patterns
+                // or subshell closers.
+                dirs.add_unresolvable();
+            }
+            let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
+            let here = DirContext {
+                conditional: context.conditional || !compounds.is_empty(),
+                looped: context.looped || compounds.contains(&Compound::Loop),
+            };
+            if let Some(head) = FUNCTION_HEAD.captures(command) {
+                let name = head.get(1).or(head.get(2)).map_or("", |m| m.as_str());
+                let body = &command[head.get(0).map_or(0, |m| m.end())..];
+                if body.starts_with(['{', '(']) {
+                    let depth_now = group_depth_change(body);
+                    let definition = Definition {
+                        name: name.to_string(),
+                        body: vec![(body.to_string(), op)],
+                        depth: depth_now,
+                    };
+                    if depth_now <= 0 {
+                        self.functions
+                            .insert(definition.name, Some(std::rc::Rc::from(definition.body)));
+                    } else {
+                        defining = Some(definition);
+                    }
+                } else {
+                    self.functions.insert(name.to_string(), None);
+                }
+            } else {
+                self.command(command, dirs, depth, here, own_process);
+            }
+            self.emit(raw, dirs);
+            for _ in 0..shape.paren_closes {
+                // A `)` closes the innermost subshell, and any brace group
+                // opened inside it with it.
+                while let Some(group) = groups.pop() {
+                    dirs.replace(group.saved);
+                    if group.subshell {
+                        break;
+                    }
+                }
+            }
+            // `echo $(true; cd /u)` is cut at the `;`: the `cd` runs in the
+            // substitution's subshell, which the `)` after it closes.
+            for _ in 0..shape.inner_open {
+                groups.push(Group {
+                    subshell: true,
+                    saved: dirs.dirs.clone(),
+                    after_pipe: false,
+                });
+            }
+            previous_op = op;
+        }
+        if let Some(definition) = defining {
+            // Never closed: the shell rejects it, but record what there is.
+            self.functions
+                .insert(definition.name, Some(std::rc::Rc::from(definition.body)));
+        }
+    }
+
+    fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
+        for dir in dirs.snapshot() {
+            self.located.push(LocatedSegment {
+                raw: raw.to_string(),
+                dir: dir.clone(),
+            });
+        }
+    }
+
+    /// Follow one command's effect on the directory: a directory verb, an
+    /// `eval`, a call of a function defined earlier, a `trap` whose action
+    /// moves, or a command word only expansion can name.
+    fn command(
+        &mut self,
+        command: &str,
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+        own_process: bool,
+    ) {
+        let body = strip_group_wrappers(command);
+        if body.is_empty() {
+            return;
+        }
+        let words = tokenize_marked(body);
+        let mut start = 0;
+        let mut ambiguous = false;
+        let mut builtin = false;
+        let mut command_prefixed = false;
+        while let Some(word) = words.get(start) {
+            let (text, escaped) = plain_word(&word.text);
+            if is_assignment_word(&text) {
+                start += 1;
+                continue;
+            }
+            if text == "builtin" {
+                ambiguous |= escaped;
+                builtin = true;
+                start += 1;
+                if words
+                    .get(start)
+                    .is_some_and(|next| unescape_word(&next.text).starts_with('-'))
+                {
+                    // `builtin` takes no options; bash refuses and stays.
+                    // Not read here.
+                    if !own_process {
+                        dirs.add_unresolvable();
+                    }
+                    return;
+                }
+                continue;
+            }
+            if text == "command" {
+                ambiguous |= escaped;
+                command_prefixed = true;
+                start += 1;
+                while let Some(flag) = words.get(start) {
+                    let flag = unescape_word(&flag.text);
+                    if flag == "-v" || flag == "-V" {
+                        // Describes the command; runs nothing.
+                        return;
+                    }
+                    if !flag.starts_with('-') || flag == "-" {
+                        break;
+                    }
+                    start += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let Some(first) = words.get(start) else {
+            return;
+        };
+        let (name, escaped) = plain_word(&first.text);
+        ambiguous |= escaped;
+        if first.text.contains(['$', '`']) {
+            // `$c /u` runs `cd` when `c=cd`: the command is whatever the
+            // expansion names, so where the shell is after it is not known.
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        }
+        let words = &words[start..];
+        if !builtin && !command_prefixed && self.functions.contains_key(&name) {
+            let body = self.functions.get(&name).cloned().flatten();
+            self.replay(body, dirs, depth, context, own_process);
+            return;
+        }
+        match name.as_str() {
+            "eval" => {
+                let script: Vec<&str> = words[1..]
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .skip_while(|word| *word == "--")
+                    .collect();
+                if script.iter().any(|word| word.contains(['$', '`', '\\'])) {
+                    if !own_process {
+                        dirs.add_unresolvable();
+                    }
+                    return;
+                }
+                let segments: std::rc::Rc<[(String, Option<&'static str>)]> =
+                    std::rc::Rc::from(split_segments_with_ops_joining_redirects(&script.join(" ")));
+                self.replay(Some(segments), dirs, depth, context, own_process);
+            }
+            "trap" if trap_action_moves(words, self) => {
+                if !own_process {
+                    dirs.add_unresolvable();
+                }
+            }
+            "cd" | "pushd" | "popd" if !own_process => match verb_target(words) {
+                VerbTarget::To(target) => {
+                    let absolute = looks_absolute(&target) || target.starts_with('~');
+                    // `command cd` does not move zsh; `\cd` moves where `'\cd'`
+                    // does not. Either way, judge both.
+                    dirs.move_to(&target, context.conditional || ambiguous || command_prefixed);
+                    if context.looped && !absolute {
+                        // Round a loop N times, a relative `cd` lands N deep.
+                        dirs.add_unresolvable();
+                    }
+                }
+                VerbTarget::Unreadable => dirs.add_unresolvable(),
+            },
+            _ => {}
+        }
+    }
+
+    /// Run an `eval`'d script or a function body in the parent shell's
+    /// directory set; piped or backgrounded, in a copy that is dropped.
+    fn replay(
+        &mut self,
+        body: Option<std::rc::Rc<[(String, Option<&'static str>)]>>,
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+        own_process: bool,
+    ) {
+        let Some(body) = body else {
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        };
+        if depth >= MAX_DIR_WALK_DEPTH || self.replayed + body.len() > MAX_REPLAYED_SEGMENTS {
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        }
+        self.replayed += body.len();
+        if own_process {
+            let mut copy = DirSet::new("");
+            copy.replace(dirs.dirs.clone());
+            self.walk(&body, &mut copy, depth + 1, context);
+        } else {
+            self.walk(&body, dirs, depth + 1, context);
+        }
+    }
+}
+
+/// How far a segment opens (positive) or closes (negative) groups — the
+/// depth a function body's definition is recorded by.
+fn group_depth_change(raw: &str) -> isize {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let shape = segment_shape(peeled.command.unwrap_or(""));
+    peeled.opens.len() as isize
+        - peeled.brace_closes as isize
+        - shape.paren_closes as isize
+        + shape.inner_open as isize
 }
 
 /// Every top-level segment of `command`, in command order, each with the
 /// directory it runs in — the per-segment counterpart of
 /// [`parse_work_dir`]'s one whole-command directory (cadence-hooks#997).
 ///
-/// - a `cd` (the segment's first word) applies to the segments after it,
+/// - a `cd` (the segment's command word) applies to the segments after it,
 ///   whatever separator follows it — a newline, `;`, `&&`, `||`;
+/// - `pushd DIR`, `builtin cd DIR`, and `X=1 cd DIR` move like `cd`;
+///   `command cd DIR` and an escaped `\cd DIR` move bash but not every shell,
+///   so the segments after them are judged in both directories;
+/// - a target this walk cannot read — `popd`, `cd -`, `cd "$D"`, a flagged
+///   `pushd`, two operands — adds [`UNRESOLVABLE_DIR`], and so does a
+///   command word only an expansion names (`$c /u`), and a `trap` whose
+///   action changes directory;
+/// - an `eval`'d script runs in this shell, so its segments are walked in
+///   line, in the directory in effect; one that needs expansion to read is
+///   [`UNRESOLVABLE_DIR`];
+/// - a function body is recorded where it is defined and walked where the
+///   function is called, so `f() { cd /u; }; f` moves to `/u`;
+/// - a `cd` inside `if`/`case`/`while`/`until`/`for` runs in THIS shell,
+///   but maybe not at all, so the segments after it are judged in both the
+///   old and the new directory; a relative one in a loop may run any number
+///   of times, and adds [`UNRESOLVABLE_DIR`];
 /// - a `( … )` subshell's `cd` ends with the subshell;
 /// - a `{ …; }` group shares its parent's directory, unless the group is a
 ///   pipeline stage or backgrounded, when it runs in its own process;
@@ -4962,7 +5602,9 @@ struct Group {
 ///   The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
 ///   ([`split_segments_with_ops_joining_redirects`]).
 ///
-/// Like [`parse_work_dir`], every `cd` is assumed to succeed.
+/// A segment that may run in several directories is listed once for each,
+/// at most [`MAX_POSSIBLE_DIRS`]; past that it is [`UNRESOLVABLE_DIR`]. Like
+/// [`parse_work_dir`], every `cd` is otherwise assumed to succeed.
 ///
 /// This is one reading, not a verdict: a guard that judges where a command
 /// runs judges each segment in BOTH this directory and the
@@ -4973,74 +5615,11 @@ struct Group {
 /// unpaired `)`, skipping quoted text and escaped characters
 /// ([`segment_shape`]).
 pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
-    let mut located = Vec::new();
-    let mut dir: std::rc::Rc<str> = std::rc::Rc::from(cwd);
-    let mut groups: Vec<Group> = Vec::new();
-    let mut previous_op: Option<&str> = None;
-    for (raw, op) in split_segments_with_ops_joining_redirects(command) {
-        let shape = segment_shape(&raw);
-        // A brace group closes at a segment whose first word is `}` (the
-        // splitter cut its `;`). Piped or backgrounded, or itself a later
-        // pipeline stage, it ran in its own process.
-        for _ in 0..shape.brace_closes {
-            if let Some(group) = groups.pop() {
-                let forked = group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
-                if forked {
-                    dir = group.saved_dir;
-                }
-            }
-        }
-        for subshell in shape.opens {
-            groups.push(Group {
-                subshell,
-                saved_dir: dir.clone(),
-                after_pipe: previous_op == Some("|"),
-            });
-        }
-        let body = strip_group_wrappers(&raw);
-        let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
-        // `cd` as the command word only; the word after it is the target.
-        if !own_process && body.trim_start().starts_with("cd") {
-            let words = tokenize(body);
-            if words.first().map(String::as_str) == Some("cd")
-                && let Some(target) = words.get(1)
-                && (&*dir != UNRESOLVABLE_DIR || looks_absolute(target) || target.starts_with('~'))
-            {
-                let resolved = resolve_cd_target(target, &dir);
-                dir = if resolved.len() > MAX_DIR_LEN {
-                    std::rc::Rc::from(UNRESOLVABLE_DIR)
-                } else {
-                    std::rc::Rc::from(resolved)
-                };
-            }
-        }
-        let segment_dir = dir.clone();
-        for _ in 0..shape.paren_closes {
-            // A `)` closes the innermost subshell, and any brace group
-            // opened inside it with it.
-            while let Some(group) = groups.pop() {
-                dir = group.saved_dir;
-                if group.subshell {
-                    break;
-                }
-            }
-        }
-        // `echo $(true; cd /u)` is cut at the `;`: the `cd` runs in the
-        // substitution's subshell, which the `)` after it closes.
-        for _ in 0..shape.inner_open {
-            groups.push(Group {
-                subshell: true,
-                saved_dir: dir.clone(),
-                after_pipe: false,
-            });
-        }
-        previous_op = op;
-        located.push(LocatedSegment {
-            raw,
-            dir: segment_dir,
-        });
-    }
-    located
+    let segments = split_segments_with_ops_joining_redirects(command);
+    let mut walk = DirWalk::default();
+    let mut dirs = DirSet::new(cwd);
+    walk.walk(&segments, &mut dirs, 0, DirContext::default());
+    walk.located
 }
 
 /// The group structure of one top-level segment.
@@ -5119,6 +5698,18 @@ fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char
         } else if c == quote {
             return;
         }
+    }
+}
+
+/// [`resolve_cd_target`] applied to `effective` in place. A relative target
+/// is appended rather than joined into a fresh string, so a walk that follows
+/// many `cd`s costs time linear in the path, not quadratic.
+pub fn apply_cd_target(effective: &mut String, target: &str) {
+    if looks_absolute(target) || target.starts_with('~') {
+        *effective = resolve_cd_target(target, effective);
+    } else {
+        effective.push('/');
+        effective.push_str(target);
     }
 }
 
@@ -17801,3 +18392,4 @@ mod tests {
         }
     }
 }
+
