@@ -13,7 +13,7 @@
 //! judged at their own command position, so `f=$(command ls | head -1)` stays
 //! silent and `f=$(ls | head -1)` nudges.
 
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{strip_heredoc_bodies, strip_quotes};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -116,8 +116,11 @@ impl Check for WarnAliasParsing {
             return CheckResult::allow();
         }
 
-        // Strip quoted strings so prose and quoted examples don't fire.
-        let stripped = strip_quotes(command);
+        // Strip heredoc bodies and quoted strings so prose and quoted examples
+        // don't fire. A heredoc body is data bash never runs, so a
+        // `cat f | jq .` written into one is not a pipeline
+        // (cameronsjo/cadence-hooks#1035).
+        let stripped = strip_quotes(&strip_heredoc_bodies(command));
 
         // Chain segments first (&&, ||, ;), then pipe stages within each.
         for chain in CHAIN_SPLIT.split(&stripped) {
@@ -207,6 +210,31 @@ mod tests {
         // "ls-files" is a git subcommand, "ls" is not the first token
         let result = WarnAliasParsing.run(&make_bash("git ls-files | grep test"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    /// cameronsjo/cadence-hooks#1035: text bash never runs as a pipeline —
+    /// quoted prose past an escaped quote, a heredoc body — stays silent, and
+    /// the real pipeline after an escaped quote still nudges.
+    #[test]
+    fn prose_past_an_escaped_quote_or_in_a_heredoc_body_is_not_a_pipeline() {
+        for (command, nudges) in [
+            ("echo \"a\\\"b ; cat f | jq . ; \\\"c\"", false),
+            ("echo \"{\\\"cmd\\\": \\\"cat f | jq .\\\"}\"", false),
+            ("cat > file <<'EOF'\ncat f | jq .\nEOF", false),
+            ("cat > file <<EOF\ncat f | jq .\nEOF", false),
+            // Controls: the same pipeline as real code nudges.
+            ("echo \"a\\\"b\" ; cat f | jq .", true),
+            ("cat > file <<'EOF'\nx\nEOF\ncat f | jq .", true),
+            ("cat f | jq .", true),
+        ] {
+            let result = WarnAliasParsing.run(&make_bash(command));
+            let want = if nudges {
+                Outcome::Nudge
+            } else {
+                Outcome::Allow
+            };
+            assert_eq!(result.outcome, want, "{command:?}");
+        }
     }
 
     // --- happy path: aliased producer piped to parser nudges ---
