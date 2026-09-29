@@ -359,9 +359,6 @@ const MAX_JUDGED_FLIPS: usize = 32;
 fn windowed_flips(command: &str) -> Vec<Vec<String>> {
     command_segments(command)
         .into_iter()
-        // A segment the shared matcher reads is left to it: slicing from `gh`
-        // here would drop an inline `GH_REPO=` in front of it.
-        .filter(|segment| gh_pr_segments(segment).is_empty())
         .flat_map(|segment| {
             let tokens = tokenize(&segment);
             // An inline retarget ahead of `gh` would be dropped by the slice
@@ -377,6 +374,14 @@ fn windowed_flips(command: &str) -> Vec<Vec<String>> {
                         && matches!(tokens[i + 2].as_str(), "ready" | "merge")
                 })
                 .collect();
+            // A segment the shared matcher reads is left to it: slicing from
+            // `gh` here would drop an inline `GH_REPO=` in front of it. Asked
+            // only once a window exists: the question re-expands the segment,
+            // and asking it of every segment made a wrapper-nested 200 KB
+            // command re-expand each of its copies (cadence-hooks#1144 review).
+            if starts.is_empty() || !gh_pr_segments(&segment).is_empty() {
+                return Vec::new();
+            }
             // Linear in the segment (cadence-hooks#1150): the first window
             // carries the whole tail — the argv its `gh` actually receives —
             // and each later one, a `gh pr …` sitting inside that argv, ends

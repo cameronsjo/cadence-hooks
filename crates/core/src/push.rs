@@ -32,7 +32,7 @@
 //! push through unscanned.
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
+    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts_within, command_word,
     executable_tokens_marked, git_output_detailed, installs_trap_action, is_assignment_word,
     peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
     unescape_word,
@@ -155,7 +155,15 @@ pub struct PushInvocation {
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let walk = Walk::for_command(command, true);
-    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
+    collect_push_invocations(
+        command,
+        cwd,
+        0,
+        Doubt::default(),
+        walk,
+        &mut out,
+        &mut Vec::new(),
+    );
     out
 }
 
@@ -169,7 +177,15 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let walk = Walk::for_command(command, false);
-    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
+    collect_push_invocations(
+        command,
+        cwd,
+        0,
+        Doubt::default(),
+        walk,
+        &mut out,
+        &mut Vec::new(),
+    );
     out
 }
 
@@ -262,6 +278,7 @@ fn collect_push_invocations(
     inherited: Doubt,
     walk: Walk,
     out: &mut Vec<PushInvocation>,
+    parent_bodies: &mut Vec<String>,
 ) {
     let mut effective_dir = cwd.to_string();
     // Set by an EARLIER segment of this scope, and outliving it: a persistent
@@ -403,8 +420,18 @@ fn collect_push_invocations(
                 repository: segment_unresolved || installs_trap_action(argv),
                 directory: segment_directory,
             };
-            for child in child_scripts(argv, segment) {
-                collect_push_invocations(&child, &segment_dir, depth + 1, child_doubt, walk, out);
+            // `child_scripts_within`: a wrapper's script repeats this
+            // segment's substitutions, and walking both doubled per level.
+            for mut child in child_scripts_within(argv, segment, parent_bodies) {
+                collect_push_invocations(
+                    &child.script,
+                    &segment_dir,
+                    depth + 1,
+                    child_doubt,
+                    walk,
+                    out,
+                    &mut child.inherited,
+                );
             }
         }
 

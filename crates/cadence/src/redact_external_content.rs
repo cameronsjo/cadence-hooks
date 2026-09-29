@@ -161,7 +161,7 @@ pub const NAMESPACES: &[&str] = &[
 /// one gate, no second hand-kept command list to drift.
 pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|comment|edit|review|reopen)\b|\bgit\s+commit\b|\btea\s+(pr|issue)\s+(create|comment|edit)\b",
+        r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|new|comment|edit|review|reopen)\b|\bgit\s+commit\b|\btea\s+(pr|issue)\s+(create|comment|edit)\b",
     )
     .expect("external-post pattern should compile")
 });

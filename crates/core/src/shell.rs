@@ -2087,8 +2087,10 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 /// deliberately different membership, and each admits words this set excludes:
 ///
 /// - `warn_alias_parsing::WRAPPERS` — `xargs`/`sudo`/`env`/`nice`/`timeout`
-/// - `prevent_secret_writes::COMMAND_WRAPPERS` — `sudo`/`command`/`nohup`/
-///   `time`/`xargs` (a **blocking** check)
+/// - [`COMMAND_RUNNERS`], walked by [`peel_command_runners`] — `sudo`/`xargs`/
+///   `nice`/`stdbuf`/`timeout`/`env`/`setsid` with their own flags; what
+///   `prevent_secret_writes` (a **blocking** check) peels since #1153 retired
+///   its private wrapper list
 /// - `doctor`'s stale-wiring scan — adds `sudo`/`stdbuf` and parses each
 ///   prefix's own flags; it reads plugin hook command lines, not what this
 ///   shell is about to run
@@ -2300,7 +2302,14 @@ pub fn polish_ship_anchor_for_origin(command: &str, origin: Option<&str>) -> Opt
 /// merge naming a PR/branch/number operand, or a retargeted merge with no
 /// resolvable repo values at all.
 pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
-    command_segments(command).iter().find_map(|segment| {
+    merge_anchor_repo_targets_in(&command_segments(command))
+}
+
+/// [`merge_anchor_repo_targets`] over segments the caller already holds from
+/// [`command_segments`], so a caller asking several questions of one command
+/// expands it once.
+pub fn merge_anchor_repo_targets_in(segments: &[String]) -> Option<Vec<String>> {
+    segments.iter().find_map(|segment| {
         let tokens = tokenize(strip_group_wrappers(segment));
         let invocation = gh_pr_invocation(&tokens)?;
         if invocation.subcommand != "merge"
@@ -2958,7 +2967,7 @@ fn gh_group_invocation<'a>(tokens: &'a [String], group: &str) -> Option<GhPrInvo
         repo_targets.extend(value);
         j = next;
     }
-    let subcommand = argv.get(j)?;
+    let subcommand = gh_canonical_verb(group, argv.get(j)?);
     let operands = argv.get(j + 1..).unwrap_or(&[]);
     let scan = scan_operands(operands);
     if !scan.repo_targets.is_empty() {
@@ -2967,7 +2976,7 @@ fn gh_group_invocation<'a>(tokens: &'a [String], group: &str) -> Option<GhPrInvo
     let pre_subcommand_repo_targets = repo_targets.clone();
     repo_targets.extend(scan.repo_targets);
     Some(GhPrInvocation {
-        subcommand: subcommand.as_str(),
+        subcommand,
         operands,
         retargeted,
         operands_flags_only: scan.flags_only,
@@ -3056,7 +3065,13 @@ pub struct ShipSegment {
 /// sibling command's flags cannot retarget a ship: in `gh pr list --head
 /// feat/x && gh pr create`, the `--head` belongs to `list`.
 pub fn polish_ship_segments_for_origin(command: &str, origin: Option<&str>) -> Vec<ShipSegment> {
-    command_segments(command)
+    polish_ship_segments_in(&command_segments(command), origin)
+}
+
+/// [`polish_ship_segments_for_origin`] over segments the caller already holds
+/// from [`command_segments`].
+pub fn polish_ship_segments_in(segments: &[String], origin: Option<&str>) -> Vec<ShipSegment> {
+    segments
         .iter()
         .filter_map(|segment| {
             let anchor = segment_ship_anchor(segment, origin)?;
@@ -3873,7 +3888,7 @@ pub fn gh_repo_flags(argv: &[String]) -> GhRepoFlags {
 /// to be boolean, and gh defines no boolean flag above the verb except
 /// `--help`, which runs nothing.
 pub fn gh_command_path(argv: &[String], depth: usize) -> Vec<&str> {
-    let mut words = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
     let mut i = 1;
     while let Some(token) = argv.get(i) {
         if words.len() >= depth || token == "--" {
@@ -3887,11 +3902,37 @@ pub fn gh_command_path(argv: &[String], depth: usize) -> Vec<&str> {
             continue;
         }
         if !token.is_empty() {
+            // The verb is read by its canonical name, so `gh pr new` is
+            // `pr create` to every caller ([`gh_canonical_verb`]).
+            let token = match words.first() {
+                Some(&group) => gh_canonical_verb(group, token),
+                None => token,
+            };
             words.push(token);
         }
         i += 1;
     }
     words
+}
+
+/// The canonical name of a gh verb spelled by one of its cobra aliases, or the
+/// verb unchanged. gh registers these aliases (cli/cli `pkg/cmd`, read
+/// 2026-09-29): `new` for `create` under `pr`, `issue`, `repo`, `gist` and
+/// `release`; `remove` for `delete` under `secret` and `variable`; `co` for
+/// `pr checkout`; and `ls` for `list` under every group that has one.
+///
+/// Every reader of a gh verb goes through this, so an alias can never be the
+/// spelling that slips past one of them: `gh pr new` was not a ship to the
+/// polish gate, and `gh pr new -R evil/x` not a write to `guard-gh-write`
+/// (cadence-hooks#996).
+pub fn gh_canonical_verb<'a>(group: &str, verb: &'a str) -> &'a str {
+    match (group, verb) {
+        ("pr" | "issue" | "repo" | "gist" | "release", "new") => "create",
+        ("secret" | "variable", "remove") => "delete",
+        ("pr", "co") => "checkout",
+        (_, "ls") => "list",
+        _ => verb,
+    }
 }
 
 /// A `-R`/`--repo`/`GH_REPO` value, split the way gh splits it.
@@ -6290,7 +6331,7 @@ pub fn command_segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let spent = std::cell::Cell::new(0);
     let mut assignments = AssignmentScope::root(&spent);
-    expand_segments(command, &mut assignments, 0, &mut out);
+    expand_segments(command, &mut assignments, 0, &mut out, &mut Vec::new());
     out
 }
 
@@ -6455,11 +6496,16 @@ impl<'a> AssignmentScope<'a> {
 /// Recursive worker for [`command_segments`]. `assignments` accumulates in
 /// execution order as segments are walked, so each segment only ever sees the
 /// assignments that precede it.
+///
+/// `parent_bodies` holds the substitution bodies the PARENT segment already
+/// expanded, when `command` is a script that segment's wrapper runs; see
+/// [`emit_segment`].
 fn expand_segments(
     command: &str,
     assignments: &mut AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
+    parent_bodies: &mut Vec<String>,
 ) {
     for segment in split_segments(command) {
         let mut defaults = Vec::new();
@@ -6480,7 +6526,7 @@ fn expand_segments(
             let alternate =
                 apply_assignments(&segment, assignments, &mut Vec::new(), true, &mut false);
             if alternate != expanded {
-                emit_segment(alternate, assignments, depth, out);
+                emit_segment(alternate, assignments, depth, out, parent_bodies);
             }
         }
         for (name, value) in defaults {
@@ -6492,7 +6538,7 @@ fn expand_segments(
         for assignment in segment_assignments(&expanded) {
             assignments.assign(assignment);
         }
-        emit_segment(expanded, assignments, depth, out);
+        emit_segment(expanded, assignments, depth, out, parent_bodies);
     }
 }
 
@@ -6503,6 +6549,7 @@ fn emit_segment(
     assignments: &AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
+    parent_bodies: &mut Vec<String>,
 ) {
     // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
     // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
@@ -6521,11 +6568,34 @@ fn emit_segment(
     // surfaced as its own segment. Accepted: the substitution text still
     // appears as a substring of the pushed segment, and three levels is
     // already generous.
+    //
+    // **A body is expanded once, by the shallowest segment that carries it.**
+    // A wrapper's script is built from the segment's own words, so a
+    // substitution in one of them (`watch "$(watch "$(…)")"`) is a body of
+    // this segment AND, textually, of the script's segment one level down.
+    // Expanding it at both levels doubled the work per nesting level, ~2^depth
+    // up to [`MAX_WRAPPER_DEPTH`], which put 200 KB inputs past the hook
+    // deadline (cadence-hooks#1144 review). So the bodies expanded here are
+    // handed to the script's walk, which skips each one once.
+    //
+    // The copy skipped is always the script's, never this one. The real shell
+    // runs the substitution HERE, in the parent, and hands the wrapper its
+    // OUTPUT — the script never holds that `$(…)` at all, so its copy is an
+    // artefact of reading the script from the segment's words. It is also the
+    // worse copy: the word it came from lost its quotes to [`tokenize`]
+    // (`"$(a "b c")"` reaches the script as `$(a b c)`), and it sits one level
+    // deeper, with less depth budget. The match is therefore by
+    // [`quote_blind`] text, which is what survives that quote removal (a copy
+    // that differs by an unescaped backslash is kept — see there); a
+    // script that carries the same substitution twice keeps the second copy.
+    // [`child_scripts_within`] is the same rule for the walkers.
+    let mut bodies = Vec::new();
     if depth < MAX_WRAPPER_DEPTH {
-        for body in substitution_bodies(&segment) {
+        bodies = unseen_substitution_bodies(&segment, parent_bodies);
+        for body in &bodies {
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
-            expand_segments(&body, &mut scope, depth + 1, out);
+            expand_segments(body, &mut scope, depth + 1, out, &mut Vec::new());
         }
     }
     let scripts = if depth < MAX_WRAPPER_DEPTH {
@@ -6534,13 +6604,27 @@ fn emit_segment(
         Vec::new()
     };
     out.push(segment);
+    let seen: Vec<String> = bodies.iter().map(|body| quote_blind(body)).collect();
     for inner in scripts {
         // A child shell inherits what is set so far, but its own
         // assignments die with the subshell — recurse on a snapshot so
         // they cannot reach the parent's later segments.
         let mut scope = assignments.child();
-        expand_segments(&inner, &mut scope, depth + 1, out);
+        expand_segments(&inner, &mut scope, depth + 1, out, &mut seen.clone());
     }
+}
+
+/// `text` without quote characters — what a substitution's text keeps after
+/// [`tokenize`]'s quote removal carried it from a segment's word into a
+/// wrapper's script. See [`emit_segment`].
+///
+/// Backslashes are deliberately kept. [`unescape_word`] also removes them on
+/// the way into the script, and that copy reads differently: in
+/// `bash -c "$(echo echo x \> .env)"` the script's copy of the body is
+/// `echo echo x > .env`, which carries the redirect the executed output
+/// performs, so it must stay a copy of its own.
+fn quote_blind(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\'' | '"')).collect()
 }
 
 /// Scripts a single segment will itself execute in a child shell context: a
@@ -6564,10 +6648,92 @@ fn emit_segment(
 /// tracked directory for segments the real shell still runs in the parent's
 /// cwd (issue #228).
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    out.extend(wrapped_scripts(argv));
-    out.extend(substitution_bodies(segment));
+    child_scripts_within(argv, segment, &mut Vec::new())
+        .into_iter()
+        .map(|child| child.script)
+        .collect()
+}
+
+/// One script [`child_scripts_within`] surfaces, with what to hand the walk
+/// of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildScript {
+    /// The script the child runs.
+    pub script: String,
+    /// The substitution bodies this segment already surfaced, to pass as
+    /// `inherited` to every `child_scripts_within` call the walk of
+    /// [`ChildScript::script`] makes. Empty for a substitution body.
+    pub inherited: Vec<String>,
+}
+
+/// [`child_scripts`] for a walker that recurses into each script, without the
+/// doubling [`emit_segment`] describes: a wrapper's script repeats the
+/// segment's own substitutions, so walking both re-walked each substitution
+/// once per nesting level — ~2^depth, past the hook deadline at 200 KB
+/// (cadence-hooks#1144 review). `inherited` is the [`ChildScript::inherited`]
+/// of the script being walked (empty at the top level); each body in it is
+/// skipped once, across that script's segments, and the copy skipped is the
+/// script's, never the parent's, for the reasons [`emit_segment`] gives.
+pub fn child_scripts_within(
+    argv: &[String],
+    segment: &str,
+    inherited: &mut Vec<String>,
+) -> Vec<ChildScript> {
+    let bodies = unseen_substitution_bodies(segment, inherited);
+    let seen: Vec<String> = bodies.iter().map(|body| quote_blind(body)).collect();
+    let mut out: Vec<ChildScript> = wrapped_scripts(argv)
+        .into_iter()
+        // A script that is nothing but one of those substitutions
+        // (`watch "$(cmd)"`) runs cmd's OUTPUT, which no walker can read, and
+        // cmd itself is walked as a body already — so the script is not
+        // walked a second time.
+        .filter(|script| !is_only_a_seen_substitution(script, &seen))
+        .map(|script| ChildScript {
+            script,
+            inherited: seen.clone(),
+        })
+        .collect();
+    out.extend(bodies.into_iter().map(|script| ChildScript {
+        script,
+        inherited: Vec::new(),
+    }));
     out
+}
+
+/// Whether `script`, quote-blind, is exactly `$(BODY)` or `` `BODY` `` for
+/// one of the `seen` bodies (already [`quote_blind`]).
+fn is_only_a_seen_substitution(script: &str, seen: &[String]) -> bool {
+    let blind = quote_blind(script);
+    let blind = blind.trim();
+    let inner = blind
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            blind
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        });
+    inner.is_some_and(|inner| seen.iter().any(|body| body == inner))
+}
+
+/// `segment`'s substitution bodies, less each one whose [`quote_blind`] text
+/// is in `inherited` — consumed as it matches, so a body carried twice is
+/// skipped once.
+fn unseen_substitution_bodies(segment: &str, inherited: &mut Vec<String>) -> Vec<String> {
+    let mut bodies = substitution_bodies(segment);
+    if !inherited.is_empty() {
+        bodies.retain(|body| {
+            let blind = quote_blind(body);
+            match inherited.iter().position(|seen| *seen == blind) {
+                Some(at) => {
+                    inherited.swap_remove(at);
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+    bodies
 }
 
 /// Push `text` onto `out` when it carries anything but whitespace.
@@ -10670,6 +10836,46 @@ mod tests {
         assert!(is_polish_ship_anchor("cd repo && gh pr create --fill"));
         // `--title x` (non-draft) is an anchor.
         assert!(is_polish_ship_anchor("gh pr create --title x"));
+    }
+
+    #[test]
+    fn gh_aliases_read_as_their_verbs() {
+        // cadence-hooks#996: `new` is `create`'s cobra alias in gh.
+        for (command, want) in [
+            ("gh pr new -t a -b b", Some("create")),
+            ("gh pr new --fill", Some("create")),
+            ("gh pr -R o/r new -t a", Some("create")),
+            ("gh pr --repo=o/r new -H feat/x", Some("create")),
+            ("gh pr new --draft -t a", None),
+            ("gh pr new -d", None),
+            ("gh pr ls", None),
+            ("gh pr co 12", None),
+        ] {
+            assert_eq!(polish_ship_anchor(command), want, "{command:?}");
+        }
+        for (argv, want) in [
+            (&["gh", "pr", "new"][..], &["pr", "create"][..]),
+            (&["gh", "-R", "o/r", "issue", "new"], &["issue", "create"]),
+            (&["gh", "repo", "new", "x"], &["repo", "create"]),
+            (&["gh", "gist", "new"], &["gist", "create"]),
+            (&["gh", "release", "new", "v1"], &["release", "create"]),
+            (&["gh", "secret", "remove", "X"], &["secret", "delete"]),
+            (&["gh", "variable", "remove", "X"], &["variable", "delete"]),
+            (&["gh", "pr", "co", "1"], &["pr", "checkout"]),
+            (&["gh", "issue", "ls"], &["issue", "list"]),
+            // Not an alias in that group: read as written.
+            (&["gh", "label", "new"], &["label", "new"]),
+            (&["gh", "new", "pr"], &["new", "pr"]),
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert_eq!(gh_command_path(&argv, 2), want, "{argv:?}");
+        }
+        assert_eq!(
+            gh_issue_calls("gh issue new -R o/r -t a")
+                .first()
+                .map(|call| call.subcommand.as_str()),
+            Some("create")
+        );
     }
 
     #[test]
@@ -16339,6 +16545,101 @@ mod tests {
         ] {
             assert_eq!(wrapped_scripts(&tokenize(command)), want, "{command:?}");
         }
+    }
+
+    /// `{wrapper} "$(` nested `depth` times around a 200 KB body of `fill`.
+    fn nested_substitution_flood(wrapper: &str, depth: usize, fill: &str) -> String {
+        let open = format!("{wrapper} \"$(").repeat(depth);
+        let close = ")\"".repeat(depth);
+        let body = fill.repeat((200 * 1024 - open.len()) / fill.len());
+        format!("{open}{body}{close}")
+    }
+
+    /// Every wrapper whose argument is a substitution, nested to past
+    /// [`MAX_WRAPPER_DEPTH`] (cadence-hooks#1144 review). A wrapper's script
+    /// repeats the segment's own substitution, and expanding both doubled the
+    /// work per level; each body is now expanded once, so the output stays a
+    /// small multiple of the input at any depth. The bound is structural, so
+    /// it holds in a debug build as surely as in release.
+    #[test]
+    fn a_substitution_inside_a_wrapper_is_expanded_once() {
+        for wrapper in [
+            "watch",
+            "env -S",
+            "flock /l",
+            "tmux new",
+            "su -c",
+            "script -c",
+            "bash -c",
+            "eval",
+        ] {
+            for fill in [" x", "x; "] {
+                let command = nested_substitution_flood(wrapper, 4, fill);
+                let segments = command_segments(&command);
+                let bytes: usize = segments.iter().map(String::len).sum();
+                assert!(
+                    bytes <= 8 * command.len(),
+                    "{wrapper:?} {fill:?}: {bytes} bytes from {}",
+                    command.len()
+                );
+            }
+        }
+    }
+
+    /// The walker form of the test above: recursing into every
+    /// [`child_scripts_within`] result, the way the push and enforce-worktree
+    /// walks do, visits each substitution body once.
+    #[test]
+    fn child_scripts_within_walks_a_substitution_once() {
+        fn walk(script: &str, depth: usize, inherited: &mut Vec<String>, walked: &mut usize) {
+            *walked += script.len();
+            for segment in split_segments(script) {
+                if depth >= MAX_WRAPPER_DEPTH {
+                    continue;
+                }
+                let tokens = executable_tokens(&segment);
+                for mut child in child_scripts_within(&tokens, &segment, inherited) {
+                    walk(&child.script, depth + 1, &mut child.inherited, walked);
+                }
+            }
+        }
+        for wrapper in ["watch", "env -S", "tmux new", "su -c", "bash -c", "eval"] {
+            let command = nested_substitution_flood(wrapper, 4, " x");
+            let mut walked = 0;
+            walk(&command, 0, &mut Vec::new(), &mut walked);
+            assert!(
+                walked <= 5 * command.len(),
+                "{wrapper:?}: walked {walked} bytes of {}",
+                command.len()
+            );
+        }
+        // Still surfaced: the body a substitution runs, and a script that
+        // carries more than the substitution.
+        let tokens = executable_tokens("watch \"$(cat .env)\"");
+        let children = child_scripts_within(&tokens, "watch \"$(cat .env)\"", &mut Vec::new());
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| c.script.as_str())
+                .collect::<Vec<_>>(),
+            ["cat .env"]
+        );
+        let segment = "bash -c \"cat $(echo .env)\"";
+        let children = child_scripts_within(&executable_tokens(segment), segment, &mut Vec::new());
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| c.script.as_str())
+                .collect::<Vec<_>>(),
+            ["cat $(echo .env)", "echo .env"]
+        );
+        // A backslash difference keeps the script's copy: it reads as the
+        // redirect the executed output performs.
+        let segments = command_segments("bash -c \"$(echo echo x \\> .env)\"");
+        assert!(
+            segments.iter().any(|s| s == "echo echo x > .env"),
+            "{segments:?}"
+        );
     }
 
     #[test]
