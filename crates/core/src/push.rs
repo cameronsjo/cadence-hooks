@@ -117,6 +117,16 @@ pub struct PushInvocation {
     /// The ref causes apply only when the refspecs are implicit — a named
     /// refspec replaces that computation anyway.
     pub unresolved: bool,
+    /// The **which repository** half of [`PushInvocation::unresolved`] alone:
+    /// the push may not run in [`PushInvocation::work_dir`], so neither its
+    /// history nor its remotes can be read from there. Set by every
+    /// which-repository cause listed on `unresolved` (a redirect flag or env
+    /// assignment, an unfollowable directory change — an `eval`, a `trap`
+    /// action, a `$` target — and a push hidden behind a prefix this walk
+    /// cannot peel), and by none of the which-refs causes. An ownership guard
+    /// reads this one: a `push.default=matching` repository changes what a
+    /// push publishes, never where it goes (cadence-hooks#1095).
+    pub repository_unresolved: bool,
     /// The repository argument as written — git's first positional, else a
     /// `--repo` value ([`crate::shell::push_repository_argument`]). `None` for
     /// a bare `git push`, where git uses the tracking remote. A remote name or
@@ -136,7 +146,20 @@ pub struct PushInvocation {
 /// push, and a scanner that only looked at top-level segments would miss it.
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    collect_push_invocations(command, cwd, 0, false, &mut out);
+    collect_push_invocations(command, cwd, 0, false, true, &mut out);
+    out
+}
+
+/// [`push_invocations`] without the repository config probe: every push the
+/// command runs, where it runs, and whether that location is knowable
+/// ([`PushInvocation::repository_unresolved`]). No subprocess is spawned, so
+/// [`PushInvocation::unresolved`] carries only the causes readable from the
+/// command text — a caller that needs the ref half must use
+/// [`push_invocations`]. For a guard that asks where a push goes, not what it
+/// publishes (cadence-hooks#1095).
+pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
+    let mut out = Vec::new();
+    collect_push_invocations(command, cwd, 0, false, false, &mut out);
     out
 }
 
@@ -159,6 +182,7 @@ fn collect_push_invocations(
     cwd: &str,
     depth: usize,
     inherited_unresolved: bool,
+    probe_config: bool,
     out: &mut Vec<PushInvocation>,
 ) {
     let mut effective_dir = cwd.to_string();
@@ -285,7 +309,14 @@ fn collect_push_invocations(
         if depth < MAX_WRAPPER_DEPTH {
             let child_unresolved = segment_unresolved || installs_trap_action(argv);
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(&child, &effective_dir, depth + 1, child_unresolved, out);
+                collect_push_invocations(
+                    &child,
+                    &effective_dir,
+                    depth + 1,
+                    child_unresolved,
+                    probe_config,
+                    out,
+                );
             }
         }
 
@@ -315,10 +346,11 @@ fn collect_push_invocations(
 
         if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &effective_dir) {
             invocation.unresolved |= segment_unresolved;
+            invocation.repository_unresolved |= segment_unresolved;
             // Only an implicit refspec stands on the `push.default`
             // computation; a named one replaces it, so the config question does
             // not arise and no git call is made.
-            if invocation.refspecs.iter().all(|refspec| refspec.implicit) {
+            if probe_config && invocation.refspecs.iter().all(|refspec| refspec.implicit) {
                 invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
             }
             out.push(invocation);
@@ -331,6 +363,7 @@ fn collect_push_invocations(
                 tags: false,
                 dry_run: false,
                 unresolved: true,
+                repository_unresolved: true,
                 repository: None,
             });
         }
@@ -1234,6 +1267,7 @@ fn push_invocation_of(
         tags: scan.tags,
         dry_run: scan.dry_run,
         unresolved: globals.foreign_redirect || (implicit && globals.push_config_override),
+        repository_unresolved: globals.foreign_redirect,
         repository: {
             let named = crate::shell::push_repository_argument(words);
             named.positional.or(named.repo_flag)
@@ -1521,6 +1555,50 @@ mod tests {
         let mut found = push_invocations(command, cwd);
         assert_eq!(found.len(), 1, "expected exactly one push in {command:?}");
         found.remove(0)
+    }
+
+    /// cadence-hooks#1095: `repository_unresolved` is the which-repository half
+    /// of `unresolved` — set where the push may not run in `work_dir`, and not
+    /// by a cause that only changes what it publishes.
+    #[test]
+    fn push_locations_mark_only_an_unknowable_repository() {
+        for (command, want_dir, repository_unresolved) in [
+            ("eval 'cd /other'; git push origin main", "/repo", true),
+            (
+                "trap 'cd /other; git push origin main' EXIT",
+                "/other",
+                true,
+            ),
+            ("cd \"$DIR\" && git push origin main", "/repo", true),
+            ("cd - && git push origin main", "/repo", true),
+            ("GIT_DIR=/x/.git git push origin main", "/repo", true),
+            (
+                "export GIT_DIR=/x/.git; git push origin main",
+                "/repo",
+                true,
+            ),
+            ("git --git-dir=/x/.git push origin main", "/repo", true),
+            ("command -p git push origin main", "/repo", true),
+            // Followed: a knowable directory, reported where the push runs.
+            ("git -C /other push origin main", "/other", false),
+            ("cd /other && git push origin main", "/other", false),
+            ("pushd /other; git push origin main", "/other", false),
+            ("builtin cd /other; git push origin main", "/other", false),
+            ("cd sub && git push", "/repo/sub", false),
+            // Which refs, not which repository.
+            ("git -c push.default=matching push origin", "/repo", false),
+            ("git push origin main", "/repo", false),
+        ] {
+            let found = push_locations(command, "/repo");
+            assert_eq!(found.len(), 1, "{command}: {found:?}");
+            assert_eq!(found[0].work_dir, want_dir, "{command}");
+            assert_eq!(
+                found[0].repository_unresolved, repository_unresolved,
+                "{command}"
+            );
+        }
+        // The ref-only cause still reaches `unresolved`.
+        assert!(push_locations("git -c push.default=matching push origin", "/repo")[0].unresolved);
     }
 
     #[test]

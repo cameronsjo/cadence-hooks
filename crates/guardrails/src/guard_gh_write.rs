@@ -762,10 +762,24 @@ const DECLARING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly"
 /// `${GH_HOST=…}`, `${GH_HOST:=…}`, `$(( GH_HOST = … ))`, `(( GH_HOST += … ))`.
 /// The only way a command that is not a declaring builtin can leave `GH_HOST`
 /// changed behind it; a mere mention (`rg GH_HOST`, a commit message) cannot.
-static GH_HOST_EXPANSION_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$\{GH_HOST:?=|\(\([^)]*\bGH_HOST\s*(?:<<|>>|[-+*/%&|^])?=(?:[^=]|$)")
-        .expect("pattern should compile")
-});
+static GH_HOST_EXPANSION_ASSIGNMENT: LazyLock<Regex> =
+    LazyLock::new(|| expansion_assignment_pattern("GH_HOST"));
+
+/// [`GH_HOST_EXPANSION_ASSIGNMENT`] for `GH_REPO` (cadence-hooks#1129).
+static GH_REPO_EXPANSION_ASSIGNMENT: LazyLock<Regex> =
+    LazyLock::new(|| expansion_assignment_pattern("GH_REPO"));
+
+fn expansion_assignment_pattern(name: &str) -> Regex {
+    Regex::new(&format!(
+        r"\$\{{{name}:?=|\(\([^)]*\b{name}\s*(?:<<|>>|[-+*/%&|^])?=(?:[^=]|$)"
+    ))
+    .expect("pattern should compile")
+}
+
+/// Stand-in `GH_REPO` for one this guard could not resolve (cadence-hooks#1129).
+/// It carries a `$`, so a write judged against it is the unexpanded-expansion
+/// block — never owned.
+const UNRESOLVED_GH_REPO: &str = "$GH_REPO";
 
 /// The `GH_HOST` values a gh process may inherit at a point in one command,
 /// tracked across its segments (#548).
@@ -800,8 +814,16 @@ static GH_HOST_EXPANSION_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// Not modeled, and so unchanged: a file that is `source`d, whose contents
 /// this guard never sees.
+///
+/// **The same walk tracks `GH_REPO`** (cadence-hooks#1129): an
+/// `export GH_REPO=evil/x` earlier in the command retargets every later
+/// un-flagged gh write exactly as the inline `GH_REPO=evil/x gh …` does. Built
+/// with [`Self::for_repo`], a candidate is a repo value, and the empty string
+/// stands for "no `GH_REPO`" — gh then resolves the target itself.
 #[derive(Debug)]
 struct GhHostEnv {
+    /// The variable tracked: `GH_HOST` or `GH_REPO`.
+    var: &'static str,
     candidates: Vec<String>,
     /// `GH_HOST` carries the export attribute, so a bare assignment reaches gh.
     exported: bool,
@@ -816,9 +838,20 @@ struct GhHostEnv {
 
 impl GhHostEnv {
     fn from_process() -> Self {
-        let inherited = std::env::var_os("GH_HOST").is_some();
+        Self::tracking("GH_HOST")
+    }
+
+    fn tracking(var: &'static str) -> Self {
+        let inherited = std::env::var_os(var).is_some();
+        let initial = if var == "GH_HOST" {
+            default_host()
+        } else {
+            // gh reads an inherited GH_REPO too; an empty one is unset.
+            std::env::var(var).unwrap_or_default()
+        };
         Self {
-            candidates: vec![default_host()],
+            var,
+            candidates: vec![initial],
             exported: inherited,
             allexport: false,
             inherited,
@@ -835,6 +868,32 @@ impl GhHostEnv {
         }
     }
 
+    /// The `GH_REPO` form of [`Self::for_command`].
+    fn for_repo(command: &str) -> Self {
+        Self {
+            raw_command: command.to_string(),
+            ..Self::tracking("GH_REPO")
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        self.var == "GH_HOST"
+    }
+
+    /// Does `word` name the tracked variable other than by a plain read?
+    fn mentions(&self, word: &str) -> bool {
+        mentions_var(word, self.var)
+    }
+
+    /// The candidate after `unset`: the process default host, or no repo.
+    fn unset_value(&self) -> String {
+        if self.is_host() {
+            default_host()
+        } else {
+            String::new()
+        }
+    }
+
     fn candidates(&self) -> &[String] {
         &self.candidates
     }
@@ -846,7 +905,12 @@ impl GhHostEnv {
     }
 
     fn add_unresolved(&mut self) {
-        self.add(UNRESOLVED_GH_HOST.to_string());
+        let marker = if self.is_host() {
+            UNRESOLVED_GH_HOST
+        } else {
+            UNRESOLVED_GH_REPO
+        };
+        self.add(marker.to_string());
     }
 
     /// Add the host a `GH_HOST=<value>` assignment names — or the unresolved
@@ -854,8 +918,10 @@ impl GhHostEnv {
     fn add_assigned(&mut self, value: &str) {
         if value.is_empty() || value.contains('$') || value.contains('`') {
             self.add_unresolved();
-        } else {
+        } else if self.is_host() {
             self.add(value.to_ascii_lowercase());
+        } else {
+            self.add(value.to_string());
         }
     }
 
@@ -888,7 +954,7 @@ impl GhHostEnv {
                 continue;
             }
             match token.split_once('=') {
-                Some(("GH_HOST", value)) => hosts.push(Some(value)),
+                Some((name, value)) if name == self.var => hosts.push(Some(value)),
                 Some((name, _)) if !is_literal_identifier(name) => hosts.push(None),
                 Some(_) => {}
                 None => {
@@ -983,7 +1049,7 @@ impl GhHostEnv {
                     || word == "unset"
             })
             && tokens.iter().any(|t| {
-                mentions_gh_host(t)
+                self.mentions(t)
                     || (!t.starts_with('-')
                         && t.split_once('=').is_some_and(|(name, _)| {
                             // `[ "$m" = export ]`: a bare `=` names nothing.
@@ -998,7 +1064,7 @@ impl GhHostEnv {
         // never shows (#1073 live review).
         if matches!(command, Some("source" | "."))
             && sources_inline_text(segment)
-            && (self.raw_command.contains("GH_HOST")
+            && (self.raw_command.contains(self.var)
                 || RAW_NONLITERAL_DECLARATION.is_match(&self.raw_command))
         {
             self.add_unresolved();
@@ -1013,7 +1079,7 @@ impl GhHostEnv {
         }
 
         if let Some(name) = command.filter(|c| DECLARING_BUILTINS.contains(c)) {
-            if prefix.iter().any(|w| mentions_gh_host(w)) {
+            if prefix.iter().any(|w| self.mentions(w)) {
                 self.add_unresolved();
             }
             self.observe_declaration(name, &rest[1..]);
@@ -1044,7 +1110,7 @@ impl GhHostEnv {
         if let Some(name) = command.filter(|c| NAME_OPERAND_BUILTINS.contains(c))
             && indirect_name_operands(name, &rest[1..])
                 .iter()
-                .any(|operand| !is_literal_identifier(operand) || operand == "GH_HOST")
+                .any(|operand| !is_literal_identifier(operand) || operand == self.var)
         {
             // `printf -v GH_HOS${X}T …`, `read GH_HOS${X}T` (#1073 review I-c).
             self.add_unresolved();
@@ -1058,7 +1124,10 @@ impl GhHostEnv {
                     return;
                 }
                 for word in prefix {
-                    if let Some(value) = word.strip_prefix("GH_HOST=") {
+                    if let Some(value) = word
+                        .strip_prefix(self.var)
+                        .and_then(|rest| rest.strip_prefix('='))
+                    {
                         self.add_assigned(value);
                     } else if mentions_gh_host(word) {
                         self.add_unresolved();
@@ -1067,13 +1136,13 @@ impl GhHostEnv {
             }
             Some("unset") => {
                 let args = &rest[1..];
-                if !tokens.iter().any(|t| mentions_gh_host(t)) {
+                if !tokens.iter().any(|t| self.mentions(t)) {
                     return;
                 }
-                let unsets = args.iter().any(|w| w == "GH_HOST");
-                if prefix.iter().any(|w| mentions_gh_host(w))
+                let unsets = args.iter().any(|w| w == self.var);
+                if prefix.iter().any(|w| self.mentions(w))
                     || args.iter().any(|w| w.starts_with('-') && w != "-v")
-                    || args.iter().any(|w| w != "GH_HOST" && mentions_gh_host(w))
+                    || args.iter().any(|w| w != self.var && self.mentions(w))
                 {
                     self.add_unresolved();
                 } else if unsets {
@@ -1083,12 +1152,12 @@ impl GhHostEnv {
                     if self.inherited {
                         self.add_unresolved();
                     } else {
-                        self.add(default_host());
+                        self.add(self.unset_value());
                     }
                 }
             }
             Some(name) if name == "eval" || VAR_SETTING_BUILTINS.contains(&name) => {
-                if tokens.iter().any(|t| mentions_gh_host(t)) {
+                if tokens.iter().any(|t| self.mentions(t)) {
                     self.add_unresolved();
                 }
             }
@@ -1096,7 +1165,12 @@ impl GhHostEnv {
             // command, and a mention is only a mention — just an assignment
             // inside an expansion can leave something behind.
             Some(_) => {
-                if GH_HOST_EXPANSION_ASSIGNMENT.is_match(segment) {
+                let expansion_assignment = if self.is_host() {
+                    &GH_HOST_EXPANSION_ASSIGNMENT
+                } else {
+                    &GH_REPO_EXPANSION_ASSIGNMENT
+                };
+                if expansion_assignment.is_match(segment) {
                     self.add_unresolved();
                 }
             }
@@ -1137,10 +1211,9 @@ impl GhHostEnv {
                 .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('n'));
         if nameref
             || (builtin != "export"
-                && args.iter().any(|w| {
-                    w.split_once('=')
-                        .is_some_and(|(_, v)| v.contains("GH_HOST"))
-                }))
+                && args
+                    .iter()
+                    .any(|w| w.split_once('=').is_some_and(|(_, v)| v.contains(self.var))))
         {
             self.add_unresolved();
         }
@@ -1155,7 +1228,7 @@ impl GhHostEnv {
                 self.add_unresolved();
                 continue;
             }
-            if name != "GH_HOST" && name != "GH_HOST+" {
+            if name.strip_suffix('+').unwrap_or(name) != self.var {
                 continue;
             }
             if builtin != "export" || unexport {
@@ -1165,7 +1238,10 @@ impl GhHostEnv {
                 continue;
             }
             self.exported = true;
-            match word.strip_prefix("GH_HOST=") {
+            match word
+                .strip_prefix(self.var)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
                 Some(value) => self.add_assigned(value),
                 // `export GH_HOST` exports whatever the shell variable holds;
                 // `GH_HOST+=…` appends to it.
@@ -1266,13 +1342,17 @@ fn is_shell_assignment(word: &str) -> bool {
 /// read (`$GH_HOST`, `${GH_HOST}`). Longer names that merely contain it
 /// (`MY_GH_HOST`, `GH_HOSTNAME`) do not count.
 fn mentions_gh_host(word: &str) -> bool {
-    const NAME: &str = "GH_HOST";
+    mentions_var(word, "GH_HOST")
+}
+
+/// [`mentions_gh_host`] for any variable name.
+fn mentions_var(word: &str, name: &str) -> bool {
     let bytes = word.as_bytes();
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut from = 0;
-    while let Some(offset) = word[from..].find(NAME) {
+    while let Some(offset) = word[from..].find(name) {
         let start = from + offset;
-        let end = start + NAME.len();
+        let end = start + name.len();
         from = end;
         if (start > 0 && ident(bytes[start - 1])) || bytes.get(end).is_some_and(|&b| ident(b)) {
             continue;
@@ -1392,7 +1472,7 @@ fn resolve_target_repo_on(
     allowed_owners: &[AllowEntry],
     env_host: &str,
 ) -> RepoResolution {
-    resolve_target_repos_on(command, work_dir, allowed_owners, env_host)
+    resolve_target_repos_on(command, work_dir, allowed_owners, env_host, "")
         .into_iter()
         .next()
         .unwrap_or(RepoResolution::Unresolvable)
@@ -1408,11 +1488,15 @@ fn resolve_target_repo_on(
 ///   without it (cadence-hooks#1069).
 /// - An inline `GH_REPO=` adds its value: gh reads it wherever `-R` is absent
 ///   or empty, and this guard cannot tell which subcommands honor it.
+/// - Without one, an `env_repo` the gh process inherits — exported earlier in
+///   the command, see [`GhHostEnv::for_repo`] — adds its value the same way
+///   (cadence-hooks#1129). Empty means none.
 fn resolve_target_repos_on(
     command: &str,
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     env_host: &str,
+    env_repo: &str,
 ) -> Vec<RepoResolution> {
     let dh = gh_command_host(command, env_host);
 
@@ -1425,6 +1509,8 @@ fn resolve_target_repos_on(
     };
     if let Some(repo) = inline_gh_repo(command) {
         resolutions.push(flag_value_resolution(&repo, &dh));
+    } else if !env_repo.is_empty() {
+        resolutions.push(flag_value_resolution(env_repo, &dh));
     }
     resolutions.push(resolve_unflagged_target(
         command,
@@ -2828,8 +2914,9 @@ fn judge_write_segment(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
     env_host: &str,
+    env_repo: &str,
 ) -> Option<CheckResult> {
-    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host)
+    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host, env_repo)
         .into_iter()
         .find_map(|resolution| {
             judge_resolution(
@@ -3203,6 +3290,7 @@ impl Check for GhWriteGuard {
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
         let mut gh_host_env = GhHostEnv::for_command(command);
+        let mut gh_repo_env = GhHostEnv::for_repo(command);
         for segment in command_segments(command) {
             // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
             // it decides which host every later gh write reaches (#548). A gh
@@ -3214,10 +3302,13 @@ impl Check for GhWriteGuard {
                 .any(|t| t.starts_with("BASH_ENV=") || t.starts_with("ENV="))
             {
                 gh_host_env.add_unresolved();
+                gh_repo_env.add_unresolved();
             }
             if !segment_invokes_gh(&segment) {
                 gh_host_env.observe_wrapper_prefix(&segment);
                 gh_host_env.observe(&segment);
+                gh_repo_env.observe_wrapper_prefix(&segment);
+                gh_repo_env.observe(&segment);
                 continue;
             }
 
@@ -3288,16 +3379,20 @@ impl Check for GhWriteGuard {
             // Judged once per host gh may have inherited: an earlier export
             // that might not have run (`false && export …`) leaves more than
             // one, and the write must be owned on every one of them (#548).
+            // The same for an inherited `GH_REPO` (cadence-hooks#1129).
             for env_host in gh_host_env.candidates() {
-                if let Some(block) = judge_write_segment(
-                    &segment,
-                    &work_dir,
-                    &allowed_owners,
-                    &allowed_repos,
-                    &extra_hosts,
-                    env_host,
-                ) {
-                    return block;
+                for env_repo in gh_repo_env.candidates() {
+                    if let Some(block) = judge_write_segment(
+                        &segment,
+                        &work_dir,
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
+                        env_host,
+                        env_repo,
+                    ) {
+                        return block;
+                    }
                 }
             }
         }
@@ -4692,7 +4787,7 @@ mod tests {
         });
     }
 
-    fn owners_env_212() -> [(&'static str, Option<&'static str>); 4] {
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 5] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
@@ -4700,6 +4795,8 @@ mod tests {
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
+            // An inherited GH_REPO retargets every un-flagged write (#1129).
+            ("GH_REPO", None),
         ]
     }
 
@@ -4769,7 +4866,7 @@ mod tests {
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-    fn owners_env() -> [(&'static str, Option<&'static str>); 4] {
+    fn owners_env() -> [(&'static str, Option<&'static str>); 5] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
@@ -4777,6 +4874,8 @@ mod tests {
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
+            // An inherited GH_REPO retargets every un-flagged write (#1129).
+            ("GH_REPO", None),
         ]
     }
 
@@ -7157,6 +7256,62 @@ mod tests {
                     .block_metadata
                     .unwrap_or_else(|| panic!("expected a structured block: {command}"));
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    /// cadence-hooks#1129: a `GH_REPO` exported earlier in the command — or set
+    /// on a wrapper whose child runs gh — retargets an un-flagged write the
+    /// same way the inline `GH_REPO=` prefix does. Every row runs from an owned
+    /// checkout: `(command, blocks?)`.
+    #[test]
+    fn exported_gh_repo_is_judged_like_an_inline_one() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                ("export GH_REPO=evil/x; gh issue create -t t -b b", true),
+                ("export GH_REPO=evil/x && gh issue create -t t -b b", true),
+                ("declare -x GH_REPO=evil/x; gh issue create -t t -b b", true),
+                ("set -a; GH_REPO=evil/x; gh issue create -t t -b b", true),
+                (
+                    "GH_REPO=evil/x; export GH_REPO; gh issue create -t t -b b",
+                    true,
+                ),
+                (
+                    "eval 'export GH_REPO=evil/x'; gh issue create -t t -b b",
+                    true,
+                ),
+                ("export GH_REP${X}O=evil/x; gh issue create -t t -b b", true),
+                ("export GH_REPO=$R; gh issue create -t t -b b", true),
+                ("GH_REPO=evil/x bash -c 'gh issue create -t t -b b'", true),
+                ("env GH_REPO=evil/x sh -c 'gh pr create -t t -b b'", true),
+                // The set only grows: a later `unset` may not have run.
+                (
+                    "export GH_REPO=evil/x; unset GH_REPO; gh issue create -t t -b b",
+                    true,
+                ),
+                // Controls. An owned value, a flag that outranks the variable,
+                // a bare assignment never exported, and a read.
+                (
+                    "export GH_REPO=cameronsjo/x; gh issue create -t t -b b",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh issue create -R cameronsjo/x -t t -b b",
+                    false,
+                ),
+                ("GH_REPO=evil/x; gh issue create -t t -b b", false),
+                ("export GH_REPO=evil/x; gh pr view 5", false),
+                ("gh issue create -t t -b b", false),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, &cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
             }
         });
     }
