@@ -241,6 +241,9 @@ fn unquoted_group_counts(segment: &str) -> (usize, usize, usize) {
 /// both letting `guard_gh_write` clear a write that lands somewhere else
 /// (cameronsjo/cadence-hooks#463 review).
 ///
+/// A backslash before a blank (space or tab) keeps the blank in the word, as
+/// bash does: `p\ repo` is one token, `p\ repo`.
+///
 /// A backslash anywhere else stays a literal character. `\gh` keeps its
 /// backslash for the callers that strip it themselves, and a Windows path
 /// (`C:\Users\x`) survives intact — consuming those would corrupt the very
@@ -536,6 +539,18 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
                     lead.boundary(current.len(), true);
+                }
+                // An escaped blank is part of the word to bash: `p\ repo` is
+                // ONE argv word. Splitting it handed every guard two words,
+                // so `git -C /p\ repo commit` read `repo` as the subcommand
+                // and no commit at all (PR #1140 review). The backslash stays
+                // in the text, as every other unquoted backslash does. A
+                // newline is excluded: `\<newline>` is a line continuation.
+                ' ' | '\t' if escaped => {
+                    lead.unquoted();
+                    current.push(c);
+                    structural.resize(current.len(), false);
+                    in_token = true;
                 }
                 c if c.is_whitespace() => {
                     if in_token {
@@ -10817,6 +10832,22 @@ mod tests {
             tokenize(r"cp C:\Users\x\file.txt \gh"),
             vec!["cp", r"C:\Users\x\file.txt", r"\gh"]
         );
+    }
+
+    #[test]
+    fn tokenize_keeps_an_escaped_blank_in_its_word() {
+        // bash: `p\ repo` is one word (PR #1140 review).
+        assert_eq!(
+            tokenize("git -C /p\\ repo commit"),
+            vec!["git", "-C", "/p\\ repo", "commit"]
+        );
+        assert_eq!(tokenize("a\\\tb c"), vec!["a\\\tb", "c"]);
+        // `\\ ` is an escaped backslash, then a real blank.
+        assert_eq!(tokenize("a\\\\ b"), vec!["a\\\\", "b"]);
+        // A continuation is not an escaped blank.
+        assert_eq!(tokenize("a\\\nb"), vec!["a\\", "b"]);
+        let marked = tokenize_marked("/p\\ q");
+        assert_eq!(marked[0].unquoted_prefix_len, marked[0].text.len());
     }
 
     #[test]

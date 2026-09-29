@@ -806,10 +806,7 @@ fn scan_either_path(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Pla
         // (`<<"E\"F"` then `E"F`) throws the joined reading's quote state off
         // for every later line, hiding what bash runs there. Dropping quotes
         // and escapes can only make more text read as code.
-        let bare: String = lines
-            .chars()
-            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-            .collect();
+        let bare = strip_quotes_and_escapes(&lines);
         merge_scan(&mut out, union_scan(&bare, cwd, env));
         if delims.is_none() && command.contains("commit") {
             // Where a substitution heredoc ends cannot be read, so neither can
@@ -820,6 +817,25 @@ fn scan_either_path(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Pla
             if !out.commits.iter().any(|c| c == cwd) {
                 out.commits.push(cwd.to_string());
             }
+        }
+    }
+    out
+}
+
+/// `text` with every quote and backslash dropped — the quote-blind reading
+/// [`scan_either_path`] falls back on — except that a backslash inside a
+/// word spelled as a native Windows path becomes `/`. Dropping it turned
+/// `cd D:\a\there` into a relative `D:athere`, a directory the shell never
+/// enters. A `/` is not an escape, so it can only make more text read as
+/// code, as the rest of this reading does.
+fn strip_quotes_and_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for chunk in text.split_inclusive(char::is_whitespace) {
+        let word: String = chunk.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+        if looks_native_windows(&word) {
+            out.push_str(&word.replace('\\', "/"));
+        } else {
+            out.extend(word.chars().filter(|&c| c != '\\'));
         }
     }
     out
@@ -3285,7 +3301,16 @@ fn cd_target(
     let [target] = rest else {
         return None;
     };
-    let text = target.text.as_str();
+    // A backslash in a word that is only partly quoted may sit on either
+    // side of the quote, which decides whether bash removes it.
+    if target.unquoted_prefix_len < target.text.len()
+        && target.text.contains('\\')
+        && !looks_native_windows(&target.text)
+    {
+        return None;
+    }
+    let text = shell_dir_value(&target.text, &here.pwd, env)?;
+    let text = text.as_ref();
     let landed = if text == "-" {
         // `cd -` is `cd "$OLDPWD"`: a relative value is relative to here.
         resolve_cd_target(here.oldpwd.as_deref()?, &here.pwd)
@@ -3477,6 +3502,54 @@ fn resolve_git_path(path: &str, base: &str) -> String {
     }
 }
 
+/// The directory a shell word names once bash has removed its backslashes,
+/// or `None` when the guard cannot tell (cadence-hooks PR #1140 review).
+///
+/// The tokenizer removes quotes and applies bash's in-quote backslash rules,
+/// but leaves a backslash OUTSIDE quotes in the word: `/p\#repo` arrives as
+/// written while bash hands `/p#repo` to git. Judging the raw spelling probed
+/// a path that does not exist and allowed a commit into the primary behind
+/// it. Every spelling that names a directory goes through this one function,
+/// so `--git-dir=<p>`, `--git-dir <p>`, `-C <p>`, `GIT_DIR=<p>` and `cd <p>`
+/// cannot drift apart again.
+///
+/// - A native Windows path (`C:\…`, `C:/…`, `\\host\…`) stays raw: the
+///   hook's own `cwd` and a Windows user's paths are spelled that way, and
+///   [`lexical_normalize`] reads its backslashes as separators.
+/// - Unreadable (`None`, which fails closed from a worktree): a drive-like
+///   prefix in any other shape (`C:x\y`, `C\:\x`); an escape in front of
+///   `$`, a backtick, `~` or a glob or group character, where bash's literal
+///   reading and the guard's expansion rules part ways; and a value whose
+///   literal-backslash spelling exists on disk. Quotes are gone by the time
+///   the value gets here, so a backslash that was quoted (and kept) cannot be
+///   told from one that was not (and removed); the two readings only name
+///   different directories when the literal one exists.
+/// - Anything else: bash's escape removal ([`unescape_word`]).
+fn shell_dir_value<'v>(raw: &'v str, base: &str, env: CdEnv<'_>) -> Option<Cow<'v, str>> {
+    if !raw.contains('\\') || looks_native_windows(raw) {
+        return Some(Cow::Borrowed(raw));
+    }
+    let bash = unescape_word(raw);
+    let ambiguous = drive_like(raw)
+        || drive_like(&bash)
+        || bash.contains(['$', '`', '~', '*', '?', '[', '{', '(', ')'])
+        || (env.file_exists)(&resolve_git_path(raw, base));
+    (!ambiguous).then_some(bash)
+}
+
+/// A native Windows absolute path: `C:\…`, `C:/…`, or UNC `\\host\…`.
+fn looks_native_windows(value: &str) -> bool {
+    let b = value.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+        || value.starts_with("\\\\")
+}
+
+/// Starts with a drive letter and a colon, in any shape.
+fn drive_like(value: &str) -> bool {
+    let b = value.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 /// Where a directory value that git or `env` `chdir`s into — a `git -C`,
 /// `--work-tree`, `--git-dir` or `GIT_DIR=`/`GIT_WORK_TREE=` value, or an
 /// `env -C` — lands from `base`, or `None` when the guard cannot read it.
@@ -3500,6 +3573,8 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// A value that is not a `$HOME` path is judged as the raw text, even where
 /// bash would not expand it (`'$V'`): that can only block.
 fn chdir_landing(value: &str, base: &str, env: CdEnv<'_>) -> Option<String> {
+    let value = shell_dir_value(value, base, env)?;
+    let value = value.as_ref();
     let home_rest = value
         .strip_prefix("${HOME}")
         .or_else(|| value.strip_prefix("$HOME"))
@@ -3774,8 +3849,8 @@ fn commit_targets_of(
     let mut idx = 1;
     while let Some(t) = argv.get(idx).map(String::as_str) {
         // The FLAG is read the way git receives it, after the shell's escape
-        // removal (`-\C` is `-C`); a value stays raw, as in core's push walk,
-        // so an unresolvable one fails closed rather than inventing a path.
+        // removal (`-\C` is `-C`). A value is passed on as written, and
+        // [`chdir_landing`] reads it as bash would ([`shell_dir_value`]).
         let flag = unescape_word(t);
         if !flag.starts_with('-') {
             break;
@@ -3829,11 +3904,10 @@ fn commit_targets_of(
         }
         // The `=` forms match their flag NAME after escape removal:
         // `--git-d\ir=<p>` is `--git-dir=<p>` to git (cadence-hooks#1058
-        // review I4). The VALUE stays raw, exactly like the space-separated
-        // form above and `-C`: a value unescaped here while its `--git-dir <p>`
-        // twin stays raw made the two spellings disagree, and on Windows the
-        // unescape turned a native `D:\repo\.git` into `D:repo.git`, a path
-        // naming no repo, so a commit into the primary read Allow.
+        // review I4). The VALUE is taken as written, like the space form's,
+        // and both reach [`chdir_landing`], which reads it the way bash does
+        // ([`shell_dir_value`]). Unescaping here alone made the two
+        // spellings disagree (PR #1140).
         if let Some(v) = eq_flag_value(t, "--work-tree=") {
             work_tree = Some(v);
         } else if let Some(v) = eq_flag_value(t, "--git-dir=") {
@@ -3907,8 +3981,8 @@ fn commit_targets_of(
 /// shell's escape removal, is `prefix` (which ends in `=`): `--git-d\ir=<p>`
 /// matches `--git-dir=`, and `<p>` comes back exactly as written.
 ///
-/// Only the name is unescaped. The value is left raw so both spellings of a
-/// flag — `--git-dir=<p>` and `--git-dir <p>` — read the same path.
+/// Only the name is unescaped here. The value goes on, like the space form's,
+/// to [`chdir_landing`], so both spellings are read by the same rule.
 fn eq_flag_value<'a>(word: &'a str, prefix: &str) -> Option<&'a str> {
     let eq = word.find('=')?;
     (unescape_word(&word[..=eq]) == prefix).then(|| &word[eq + 1..])
@@ -5121,14 +5195,12 @@ mod tests {
                 "windows spelling should resolve a commit target: {cmd}"
             );
         }
-        // Accepted miss, and it is the TOKENIZER's, not the verb classifier's:
-        // a backslash-escaped space splits `/c/Program\ Files/…` into two
-        // tokens, so the command word is `/c/Program\` before `command_word`
-        // ever runs. The quoted spelling above is the one that survives
-        // tokenization, and it resolves. Teaching `tokenize` about escaped
-        // spaces would move a primitive several block-capable guards share.
-        assert!(
-            git_commit_targets("/c/Program\\ Files/Git/cmd/git.exe commit -m x", "/cwd").is_empty()
+        // Once an accepted miss: the tokenizer split `/c/Program\ Files/…` at
+        // the escaped space, so the command word was `/c/Program\`. It keeps an
+        // escaped blank in its word now, as bash does (PR #1140 review).
+        assert_eq!(
+            git_commit_targets("/c/Program\\ Files/Git/cmd/git.exe commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
         );
     }
 
@@ -10367,6 +10439,122 @@ mod tests {
         assert_eq!(
             t(r"git --work-tree\=/p commit -m x"),
             vec!["/p".to_string()]
+        );
+    }
+
+    /// A POSIX shell word for `path` with `#` and space backslash-escaped,
+    /// the spelling bash turns back into `path` (PR #1140 review).
+    #[cfg(unix)]
+    fn backslash_escaped(path: &Path) -> String {
+        let mut out = String::new();
+        for c in path.to_string_lossy().chars() {
+            if matches!(c, '#' | ' ') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_escaped_directory_reads_as_bash_reads_it_in_every_spelling() {
+        // PR #1140 review: bash hands git `/p#repo` for `/p\#repo`, but the
+        // guard probed the raw spelling, found no repo, and allowed a commit
+        // from a worktree into the primary. Verified against real bash + git.
+        for (tag, name) in [("esc-hash", "p#repo"), ("esc-space", "p repo")] {
+            let scratch = scratch(tag);
+            let primary = scratch.path().join(name);
+            std::fs::create_dir(&primary).unwrap();
+            init_repo(&primary);
+            let wt = scratch.path().join(format!("{name}-wt"));
+            git_in(
+                &primary,
+                &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
+            );
+            let p = backslash_escaped(&primary);
+            let w = backslash_escaped(&wt);
+            let verdict = |cmd: &str| {
+                let mut input = make_bash(cmd);
+                input.cwd = Some(wt.to_string_lossy().into_owned());
+                run_enforce(&input, &cfg(false, false)).outcome
+            };
+            for cmd in [
+                format!("git --git-dir={p}/.git commit -m x"),
+                format!("git --git-dir {p}/.git commit -m x"),
+                format!("git --work-tree={p} commit -m x"),
+                format!("git --work-tree {p} commit -m x"),
+                format!("git -C {p} commit -m x"),
+                format!("cd {p} && git commit -m x"),
+                format!("cd {p}; git commit -m x"),
+                format!("GIT_DIR={p}/.git git commit -m x"),
+                format!("GIT_WORK_TREE={p} git commit -m x"),
+                format!("env -C {p} git commit -m x"),
+            ] {
+                assert_eq!(verdict(&cmd), Outcome::Block, "{cmd}");
+            }
+            // The same escapes naming the worktree itself still allow.
+            for cmd in [
+                format!("git -C {w} commit -m x"),
+                format!(
+                    "git --git-dir={p}/.git/worktrees/{}-wt commit -m x",
+                    name.replace(' ', "\\ ").replace('#', "\\#")
+                ),
+                format!("cd {w} && git commit -m x"),
+            ] {
+                assert_eq!(verdict(&cmd), Outcome::Allow, "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn shell_dir_value_keeps_windows_paths_and_refuses_what_it_cannot_read() {
+        // Nothing exists, so a literal-backslash spelling cannot collide.
+        let env = CdEnv {
+            file_exists: |_| false,
+            ..CdEnv::new(Some("/h"), true)
+        };
+        let read = |v: &str| shell_dir_value(v, "/w", env).map(Cow::into_owned);
+        assert_eq!(read(r"/p\#repo").as_deref(), Some("/p#repo"));
+        assert_eq!(read(r"/p\ q/.git").as_deref(), Some("/p q/.git"));
+        assert_eq!(read(r"/a\\b").as_deref(), Some(r"/a\b"));
+        assert_eq!(read("/plain").as_deref(), Some("/plain"));
+        // Native Windows spellings stay raw.
+        for v in [r"D:\a\repo", r"c:\x", "C:/x", r"\\host\share\x"] {
+            assert_eq!(read(v).as_deref(), Some(v), "{v}");
+        }
+        // Unreadable: a drive-like prefix in another shape, and an escape in
+        // front of something the shell would otherwise expand.
+        for v in [
+            r"C:x\y",
+            r"C\:\x",
+            r"\$HOME/x",
+            r"\~/x",
+            r"/p/\*",
+            r"/p/\{a,b\}",
+            r"/p/\`pwd\`",
+        ] {
+            assert_eq!(read(v), None, "{v}");
+        }
+        // A literal-backslash directory that exists: the quoted reading and
+        // the unquoted one name different places.
+        let env = CdEnv {
+            file_exists: |p| p == r"/w/a\ b",
+            ..CdEnv::new(None, true)
+        };
+        assert_eq!(shell_dir_value(r"a\ b", "/w", env), None);
+        assert_eq!(chdir_landing(r"a\ b", "/w", env), None);
+    }
+
+    #[test]
+    fn the_quote_blind_reading_keeps_a_windows_path_a_path() {
+        assert_eq!(
+            strip_quotes_and_escapes(r#"cd D:\a\there <<< x ; git commit -m "x""#),
+            "cd D:/a/there <<< x ; git commit -m x"
+        );
+        assert_eq!(
+            strip_quotes_and_escapes(r#"cd '/p\#r' && e\cho "a\"b""#),
+            "cd /p#r && echo ab"
         );
     }
 
