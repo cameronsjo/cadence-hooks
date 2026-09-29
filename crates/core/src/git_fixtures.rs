@@ -351,13 +351,55 @@ impl Drop for Scratch {
 /// have found — there is no shimmed-PATH hazard for this helper to guard
 /// against.
 pub fn git_in(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    assert!(ok, "git {args:?} failed in {dir:?}");
+    let mut cmd = std::process::Command::new("git");
+    // Immune to process-env mutation by a concurrent test (#1112): a leaked
+    // discovery var would redirect this command away from `dir`.
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd.args(args).current_dir(dir).output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => panic!(
+            "git {args:?} failed in {dir:?}: {}\nstderr: {}\nenv: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim(),
+            git_env_snapshot()
+        ),
+        Err(e) => panic!(
+            "git {args:?} could not run in {dir:?}: {e}\nenv: {}",
+            git_env_snapshot()
+        ),
+    }
+}
+
+/// The process env that git's repo discovery and config lookup read, for
+/// panic messages (cameronsjo/cadence-hooks#1112).
+fn git_env_snapshot() -> String {
+    let vars = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "HOME",
+        "XDG_CONFIG_HOME",
+    ];
+    vars.iter()
+        .map(|k| format!("{k}={:?}", std::env::var_os(k)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Initialize `dir` as a single-commit git repo on `main` — the minimal

@@ -243,8 +243,19 @@ mod tests {
     // other (env is process-global) or the globals mutated elsewhere in this
     // crate (#446).
 
-    fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
+    /// Runs the guard with no env lock. Only for callers already inside
+    /// `with_env`, whose mutex is not reentrant.
+    fn outcome_unlocked(cmd: &str) -> cadence_hooks_core::Outcome {
         GoingPublicGuard.run(&make_bash(cmd)).outcome
+    }
+
+    /// The guard reads `CADENCE_GOING_PUBLIC_TERMS`/`_IGNORE` live, so a
+    /// reader must hold the same lock the writers below do, or it can observe
+    /// their value mid-test (cameronsjo/cadence-hooks#1112).
+    fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
+        let mut out = None;
+        crate::with_env(&[], || out = Some(outcome_unlocked(cmd)));
+        out.expect("with_env ran the closure")
     }
 
     // --- create: fires regardless of visibility ---
@@ -415,7 +426,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    outcome("gh repo create sonarr-cfg --public"),
+                    outcome_unlocked("gh repo create sonarr-cfg --public"),
                     cadence_hooks_core::Outcome::Allow
                 );
             },
@@ -432,7 +443,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    outcome("gh repo create starr --public"),
+                    outcome_unlocked("gh repo create starr --public"),
                     cadence_hooks_core::Outcome::Allow
                 );
             },
@@ -450,7 +461,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    outcome("gh repo create skunkworks-notes --private"),
+                    outcome_unlocked("gh repo create skunkworks-notes --private"),
                     cadence_hooks_core::Outcome::Nudge
                 );
             },
@@ -466,7 +477,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    outcome("gh repo create skunkworks-notes --private"),
+                    outcome_unlocked("gh repo create skunkworks-notes --private"),
                     cadence_hooks_core::Outcome::Allow
                 );
             },
