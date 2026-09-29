@@ -452,6 +452,11 @@ mod tests {
             "D=$(mktemp -d); rm $D/../.env",
             "D=$(mktemp -d); echo x > $D/.ssh/id_rsa",
             "D=$(mktemp -d); rm \"$D/.env\"",
+            // #1097 delta review: an escaped backslash before a closing `"`
+            // must not leave the tracker inside double quotes.
+            r#"D=$(git rev-parse --show-toplevel); rm "a\\" $D/.env"#,
+            r#"D=$(git rev-parse --show-toplevel); echo "a\\" > $D/.env"#,
+            r#"D=$(git rev-parse --show-toplevel); rm "a\\\\" "$D/.env""#,
         ] {
             assert!(bash_targets_env_file(command), "{command}");
         }

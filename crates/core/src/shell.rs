@@ -4933,10 +4933,14 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
     let mut in_double = false;
     while i < chars.len() {
         let c = chars[i];
-        // An escaped `"` outside single quotes opens and closes nothing.
-        if c == '\\' && !in_single && chars.get(i + 1) == Some(&'"') {
+        // Outside single quotes a backslash consumes the next character, so an
+        // escaped `"` opens and closes nothing, `\\"` still closes a string,
+        // and `\$D` stays unexpanded, as in bash.
+        if c == '\\' && !in_single {
             out.push(c);
-            out.push('"');
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
             i += 2;
             continue;
         }
