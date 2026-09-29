@@ -169,7 +169,7 @@ use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
     is_transparent_prefix_word, looks_absolute, redirect_targets, resolve_cd_target,
     skip_transparent_prefixes, split_segments_with_ops, strip_heredoc_bodies, tokenize,
-    tokenize_marked,
+    tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -1189,33 +1189,46 @@ fn commit_targets_of(
     let mut work_tree: Option<&str> = None;
     let mut git_dir: Option<&str> = None;
     let mut idx = 1;
-    while idx < argv.len()
-        && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
-    {
-        let t = argv[idx].as_str();
-        let prev = argv[idx - 1].as_str();
-        // A token that is the VALUE of the preceding global is never re-read as
-        // a flag: `git -c --work-tree=/x commit` passes that string to `-c`, so
-        // treating it as a redirect would resolve a tree git never touches.
-        if VALUE_GLOBALS.contains(&prev) {
-            match prev {
-                // `-C` compounds: resolve this hop against the previous one.
-                "-C" => {
-                    let base = redirect.as_deref().unwrap_or(effective_dir);
-                    redirect = Some(resolve_git_path(t, base));
+    while let Some(t) = argv.get(idx).map(String::as_str) {
+        // The FLAG is read the way git receives it, after the shell's escape
+        // removal (`-\C` is `-C`); a value stays raw, as in core's push walk,
+        // so an unresolvable one fails closed rather than inventing a path.
+        let flag = unescape_word(t);
+        if !flag.starts_with('-') {
+            break;
+        }
+        // A value word is consumed WITH its flag, in one step, so it is never
+        // re-read as a flag on the next pass (cadence-hooks#885). Deciding that
+        // by looking BACK at the previous token instead misread a value that
+        // spells a global: in `git -c -C commit` the `-C` is `-c`'s value, but
+        // the look-back walk then read `commit` as `-C`'s value and never
+        // reached the subcommand. The same fix as core's push walk
+        // (`git_globals`). It also keeps `git -c --work-tree=/x commit` from
+        // resolving a tree git never touches: that string is `-c`'s value.
+        if VALUE_GLOBALS.contains(&flag.as_ref()) {
+            if let Some(value) = argv.get(idx + 1).map(String::as_str) {
+                match flag.as_ref() {
+                    // `-C` compounds: resolve this hop against the previous one.
+                    "-C" => {
+                        let base = redirect.as_deref().unwrap_or(effective_dir);
+                        redirect = Some(resolve_git_path(value, base));
+                    }
+                    "--work-tree" => work_tree = Some(value),
+                    "--git-dir" => git_dir = Some(value),
+                    _ => {}
                 }
-                "--work-tree" => work_tree = Some(t),
-                "--git-dir" => git_dir = Some(t),
-                _ => {}
             }
-        } else if let Some(v) = t.strip_prefix("--work-tree=") {
+            idx += 2;
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("--work-tree=") {
             work_tree = Some(v);
         } else if let Some(v) = t.strip_prefix("--git-dir=") {
             git_dir = Some(v);
         }
         idx += 1;
     }
-    if argv.get(idx).map(String::as_str) != Some("commit") {
+    if argv.get(idx).map(|w| unescape_word(w)).as_deref() != Some("commit") {
         return Vec::new();
     }
     // Every relative value — flag OR env — resolves against the cwd git is
@@ -5574,6 +5587,39 @@ mod tests {
         assert!(
             !GitProbe::default().is_commitless(&orphan),
             "orphan-HEAD established repo is NOT commitless (commits survive on other refs)"
+        );
+    }
+
+    // --- git global walk (#885) ---
+
+    #[test]
+    fn a_global_value_spelling_another_global_does_not_swallow_the_subcommand() {
+        // `-C` here is `-c`'s value; the look-back walk read `commit` as the
+        // value of that `-C` and never reached the subcommand.
+        assert_eq!(
+            git_commit_targets("git -c -C commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("git -c --git-dir commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        // Ordinary spellings are unchanged.
+        assert_eq!(
+            git_commit_targets("git -c a=b -C /x commit -m x", "/cwd"),
+            vec!["/x".to_string()]
+        );
+    }
+
+    #[test]
+    fn escaped_git_global_and_subcommand_are_read_as_git_reads_them() {
+        assert_eq!(
+            git_commit_targets(r"git -\C /x commit -m x", "/cwd"),
+            vec!["/x".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets(r"git \commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
         );
     }
 }
