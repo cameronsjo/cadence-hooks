@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **The plan-store reader judges the file it actually opened, not the path it checked.** `persist-plan-approval` and `lint-plan-shape` read the plan named by `planFilePath` only when it sits under `<config_dir>/plans`. The reader used to canonicalize and check that path, then open it in a second step, so a directory inside the store swapped for a symlink between the two was followed at open time. It now opens first (on Unix with `O_NOFOLLOW` and `O_NONBLOCK`, so a symlinked final component fails the open and a FIFO cannot stall it), then requires the opened handle to be a regular file that is the same file (device and inode) as the path's canonical in-store target. Other platforms compare length and timestamps instead, which is best-effort. (cameronsjo/cadence-hooks#763)
+
 ## [0.110.0] - 2026-09-29
 
 ### Changed
