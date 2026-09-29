@@ -6,8 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`record-polish --skip <reason>` records a dispositioned skip, and `nudge-polish-before-pr` accepts it.** The marker is branch-scoped like a run record, carries the reason and no roster, and the gate stays quiet on it while echoing the reason. The reason is required and non-trivial (not empty, `n/a`, `none`, `-`, `.`), at most 120 bytes of a small charset, checked on the record side (exit 2) and again on the read side before it reaches `additionalContext`; `--skip` cannot be combined with `--scope`, `--arm*` or `--fresh`. (cameronsjo/cadence-hooks#787)
+
 ### Security
 
+- **`polish_marker_present` requires the private marker directory.** It was a bare `.is_file()` while `read_polish_marker` already refused a degraded dir, so on the shared fail-open base a co-tenant could plant the predictable marker name and satisfy the gate. A degraded dir now reads as absent, which nudges. Part 1 of #565 only; the config-dir move and the `sha` staleness verdict are separate. (cameronsjo/cadence-hooks#565)
 - **`prevent-secret-writes` judges the file operands of an in-place `sed` or `perl` as write targets.** `sed -i d .env`, `sed -ni`, `sed --in-place=.bak`, `gsed -i "" d .env` and `perl -pi -e … .env` rewrote a secret file and were allowed; the script operand (first positional unless `-e`/`-f` supplies it) is skipped and each remaining operand is judged like a redirect target. (cameronsjo/cadence-hooks#1165)
 
 ### Changed

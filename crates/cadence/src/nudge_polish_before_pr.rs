@@ -164,6 +164,10 @@ pub enum MarkerState {
     /// a recycled branch name would otherwise inherit its predecessor's record
     /// (cadence-hooks#775).
     Expired,
+    /// A marker written by `record-polish --skip <reason>` (cadence-hooks#787):
+    /// the branch was dispositioned as a skip, with a stated, charset-bounded
+    /// reason. Satisfies the nudge and echoes the reason.
+    Skipped { reason: String },
     /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
     ///
     /// `security_model` is the attested model family for the security arm
@@ -251,6 +255,9 @@ fn judge_target(target: &MarkerTarget) -> Verdict {
         },
         (_, false, _) => MarkerState::Absent,
         (_, true, Some(record)) if record.is_expired() => MarkerState::Expired,
+        (_, true, Some(record)) if record.skip_reason.is_some() => MarkerState::Skipped {
+            reason: record.skip_reason.clone().unwrap_or_default(),
+        },
         (_, true, record) => MarkerState::Present {
             security_ran: record.as_ref().and_then(|r| r.security_ran()),
             security_model: record.as_ref().and_then(attested_security_family),
@@ -433,6 +440,8 @@ enum Verdict {
     StaleMarker,
     UnknownRoster,
     UnattestedSecurity,
+    /// A recorded dispositioned skip: satisfies the gate, echoes the reason.
+    Skipped(String),
     /// A clean allow that carries advisory annotations as exit-0 context.
     AllowAnnotated(String),
     Allow,
@@ -451,6 +460,7 @@ impl Verdict {
             Verdict::StaleMarker => CheckResult::nudge(stale_marker_nudge_message()),
             Verdict::UnknownRoster => CheckResult::nudge(unknown_roster_nudge_message()),
             Verdict::UnattestedSecurity => CheckResult::nudge(unattested_security_nudge_message()),
+            Verdict::Skipped(reason) => CheckResult::nudge(skipped_message(&reason)),
             Verdict::AllowAnnotated(annotations) => CheckResult::nudge(annotations),
             Verdict::Allow => CheckResult::allow(),
         }
@@ -469,6 +479,7 @@ fn judge(
         MarkerState::Absent => Verdict::Absent,
         MarkerState::CannotCheck { reason } => Verdict::CannotCheck(reason),
         MarkerState::Expired => Verdict::Expired,
+        MarkerState::Skipped { reason } => Verdict::Skipped(reason),
         MarkerState::Present {
             security_ran: Some(false),
             ..
@@ -573,6 +584,17 @@ fn cannot_check_message(reason: &str) -> String {
     format!(
         "Can't check polish for this PR: {reason}. Confirm `/polish` (with its security arm) \
          completed in the checkout that owns the branch."
+    )
+}
+
+/// The cadence-hooks#787 context line for a recorded dispositioned skip. The
+/// gate is satisfied; this only shows the reader what was recorded. `reason`
+/// is bounded on the read side ([`cadence_hooks_core::markers::is_skip_reason`]),
+/// which is what makes it safe to echo into `additionalContext`.
+fn skipped_message(reason: &str) -> String {
+    format!(
+        "Polish was dispositioned as a skip for this branch: {reason}. The polish gate is \
+         satisfied; a reviewer can veto the skip. Advisory only."
     )
 }
 

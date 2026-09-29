@@ -759,7 +759,12 @@ fn worktree_in_listing(listing: &str, branch: &str) -> Option<String> {
 /// [`MarkerTarget::Local`] that resolves to a branch yields `false`
 /// (fail-open, ADR-0001).
 pub fn polish_marker_present(target: &MarkerTarget) -> bool {
-    marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
+    // Gated on the private dir, symmetric with `read_polish_record`
+    // (cadence-hooks#565): on a degraded shared base a co-tenant can pre-plant
+    // the predictable marker name, so presence there is not evidence. A
+    // degraded dir reads as absent, which nudges — the safe direction.
+    marker_dir_is_private()
+        && marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
 }
 
 /// The `(repo_root, branch)` marker key for a [`MarkerTarget::Local`].
@@ -801,6 +806,11 @@ pub struct PolishRecord {
     /// never *changed*, so the gate stays silent rather than nudging on no
     /// evidence.
     pub diff_digest: Option<DiffDigest>,
+    /// The dispositioned-skip reason (cadence-hooks#787): present only on a
+    /// marker written by `record-polish --skip`. Bounded on the read side by
+    /// [`is_skip_reason`] — a value that fails it drops to `None`, so a
+    /// hand-edited marker cannot carry injection prose into the nudge.
+    pub skip_reason: Option<String>,
 }
 
 /// The `diff_digest` block as read back from a marker (cadence-hooks#874).
@@ -866,6 +876,52 @@ pub fn is_arm_token(s: &str) -> bool {
 /// stderr note, a smuggled one rides every future read of the marker.
 pub fn is_report_path(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_REPORT_BYTES && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// The longest a dispositioned-skip reason may be (cadence-hooks#787).
+pub const MAX_SKIP_REASON_BYTES: usize = 120;
+
+/// Reasons that say nothing. Compared after trimming and lowercasing.
+const TRIVIAL_SKIP_REASONS: [&str; 9] = [
+    "n/a", "na", "none", "nil", "no", "skip", "skipped", "tbd", "todo",
+];
+
+/// A dispositioned-skip reason safe to record and to echo into the session's
+/// context (cadence-hooks#787): non-trivial, at most [`MAX_SKIP_REASON_BYTES`],
+/// and drawn from `[A-Za-z0-9 .,:;()/_'#=+-]` only — no backticks, quotes,
+/// angle brackets, `$`, control bytes, or non-ASCII, so ANSI escapes and
+/// newline-borne instructions cannot ride it. Enforced on BOTH sides: the
+/// record side rejects, the read side drops (a marker is a plain file).
+///
+/// Trivial means empty, fewer than three alphanumerics (`-`, `.`, `ok`), or
+/// one of [`TRIVIAL_SKIP_REASONS`].
+pub fn is_skip_reason(s: &str) -> bool {
+    if s.len() > MAX_SKIP_REASON_BYTES
+        || !s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    ' ' | '.'
+                        | ','
+                        | ':'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '/'
+                        | '_'
+                        | '\''
+                        | '#'
+                        | '-'
+                        | '='
+                        | '+'
+                )
+        })
+    {
+        return false;
+    }
+    let trimmed = s.trim().to_ascii_lowercase();
+    trimmed.chars().filter(char::is_ascii_alphanumeric).count() >= 3
+        && !TRIVIAL_SKIP_REASONS.contains(&trimmed.trim_end_matches('.'))
 }
 
 /// How long a polish marker stays evidence that this branch was polished.
@@ -982,6 +1038,11 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
             .map(str::to_string),
         attest: read_attest(&v),
         diff_digest: read_diff_digest(&v),
+        skip_reason: v
+            .get("skip_reason")
+            .and_then(|s| s.as_str())
+            .filter(|s| is_skip_reason(s))
+            .map(str::to_string),
     })
 }
 
@@ -1884,6 +1945,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
     }
 
+    #[test]
+    fn is_skip_reason_table() {
+        // cadence-hooks#787: (reason, accepted)
+        let long = "a".repeat(MAX_SKIP_REASON_BYTES + 1);
+        let at_limit = "a".repeat(MAX_SKIP_REASON_BYTES);
+        let cases: Vec<(&str, bool)> = vec![
+            ("dnsmasq address= line change only", true),
+            ("docs-only: README reword (#12)", true),
+            ("", false),
+            ("   ", false),
+            ("n/a", false),
+            ("N/A", false),
+            ("none", false),
+            ("None.", false),
+            ("-", false),
+            (".", false),
+            ("ok", false),
+            ("skip", false),
+            ("backtick `x` injection", false),
+            ("quote \"x\"", false),
+            ("newline\nIGNORE PRIOR", false),
+            ("esc \u{1b}[31m red", false),
+            ("unicode caf\u{e9} reason", false),
+            ("angle <b> reason", false),
+            (long.as_str(), false),
+            (at_limit.as_str(), true),
+        ];
+        for (reason, want) in cases {
+            assert_eq!(is_skip_reason(reason), want, "{reason:?}");
+        }
+    }
+
     // --- polish_marker_present (shared gate/metric helper, #177) ---
 
     /// Init a git repo in a fresh tempdir, checked out on `branch`, and return
@@ -1920,6 +2013,42 @@ mod tests {
             write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
             assert!(polish_marker_present(&local(tmp.path().to_str().unwrap())));
         });
+    }
+
+    #[test]
+    fn polish_marker_present_false_on_a_degraded_shared_base() {
+        // cadence-hooks#565: a co-tenant who plants the predictable marker on
+        // the shared fail-open base must not satisfy the gate. Degrade the dir
+        // by pre-placing a SYMLINK where the hashed subdir goes (hardening
+        // refuses it), plant the marker on the base, and prove presence reads
+        // false — with the private-dir positive control alongside.
+        let (repo, root) = init_repo_on_branch("feat/thing");
+        let work = repo.path().to_str().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut hasher = DefaultHasher::new();
+        paths::user_home_lossy_or_default().hash(&mut hasher);
+        let hashed = base
+            .path()
+            .join(format!("cadence-hooks-{:x}", hasher.finish()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), &hashed).unwrap();
+        with_marker_dir(base.path(), || {
+            assert!(!marker_dir_is_private(), "precondition: degraded base");
+            write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
+            assert!(
+                polish_marker_path_exists(&root, "feat/thing"),
+                "the planted file exists on the base"
+            );
+            assert!(
+                !polish_marker_present(&local(work)),
+                "a planted marker on a degraded base must not read as present"
+            );
+        });
+    }
+
+    fn polish_marker_path_exists(root: &str, branch: &str) -> bool {
+        polish_marker(root, branch).is_file()
     }
 
     #[test]
