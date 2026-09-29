@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **`warn-going-public` now sees `gh repo rename`, `\gh`, `sudo`/`env -i`/`env -u` wrappers and `gh repo create -- <name>`.** A rename scans the new name for the same terms on any visibility (it makes no network call to learn whether the repo is public), the head is read through core's `command_word` and `peel_command_runners` (the local duplicate is removed), and the token after `--` is the positional name. `enforce-worktree` no longer reads `$$'` as an ANSI-C `$'` opener (bash: the PID, then a plain quote); commits to a primary checkout still block in those spellings. (cameronsjo/cadence-hooks#1171)
+- **`warn-going-public` now sees `gh repo rename`, `\gh`, `sudo`/`env -i`/`env -u` wrappers and `gh repo create -- <name>`.** A rename scans the new name for the same terms on any visibility (it makes no network call to learn whether the repo is public), the head is read through core's `command_word` and `peel_command_runners` (the local duplicate is removed), and the repo name is the first non-flag operand (value flags like `-d`/`-R` skip their value, an unknown flag skips alone, and the token after `--` is the name). `enforce-worktree` no longer reads `$$'` as an ANSI-C `$'` opener (bash: the PID, then a plain quote); commits to a primary checkout still block in those spellings. (cameronsjo/cadence-hooks#1171)
 
 ## [0.113.0] - 2026-09-29
 

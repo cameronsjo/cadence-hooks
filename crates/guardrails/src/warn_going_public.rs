@@ -120,20 +120,49 @@ fn find_match(haystack: &str, terms: &[String], ignore: &[String]) -> Option<Str
     None
 }
 
-/// The first positional token immediately after the subcommand (index 3), if it
-/// isn't a flag. Mirrors guard_gh_write's positional extraction — a dash-flag in
-/// that slot means the command carries no bare name. A lone `--` ends options,
-/// so the token after it is the name (`gh repo create -- <name>`).
+/// Flags of `gh repo create|edit|rename` that consume the next token as their
+/// value (gh docs). Boolean flags are skipped alone; the `--flag=value` form is
+/// a single token and needs no entry.
+const VALUE_FLAGS: &[&str] = &[
+    "-d",
+    "--description",
+    "-h",
+    "--homepage",
+    "-t",
+    "--team",
+    "-p",
+    "--template",
+    "-g",
+    "--gitignore",
+    "-l",
+    "--license",
+    "-s",
+    "--source",
+    "-r",
+    "--remote",
+    "-R",
+    "--repo",
+    "--visibility",
+];
+
+/// The repo name operand: the first non-flag token after the subcommand
+/// (index 3 on). Value-taking flags are skipped with their value, boolean and
+/// `--flag=value` flags alone. A lone `--` ends options, so the token after it
+/// is the name. An UNKNOWN flag is skipped alone, which makes a following word
+/// the name: the ambiguity resolves toward scanning it, because a nudge is
+/// cheap (cadence-hooks#1171).
 fn positional_name(tokens: &[String]) -> Option<&str> {
-    let at = if tokens.get(3).map(String::as_str) == Some("--") {
-        4
-    } else {
-        3
-    };
-    tokens
-        .get(at)
-        .map(String::as_str)
-        .filter(|t| at == 4 || !t.starts_with('-'))
+    let mut i = 3;
+    while let Some(tok) = tokens.get(i).map(String::as_str) {
+        if tok == "--" {
+            return tokens.get(i + 1).map(String::as_str);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(tok);
+        }
+        i += if VALUE_FLAGS.contains(&tok) { 2 } else { 1 };
+    }
+    None
 }
 
 /// Extract the `--description`/`-d` value across the separate-token
@@ -417,6 +446,18 @@ mod tests {
             ("gh repo create -- sonarr-cfg", Nudge),
             ("gh repo create -- my-widget", Allow),
             ("gh repo create --", Allow),
+            // flags before the name: value flags skip their value
+            ("gh repo create --public sonarr-x", Nudge),
+            ("gh repo create -d \"x\" sonarr-x", Nudge),
+            ("gh repo create --description=x sonarr-x", Nudge),
+            ("gh repo create -l mit -g Go --private sonarr-x", Nudge),
+            ("gh repo rename -R o/r sonarr-x", Nudge),
+            ("gh repo rename --repo o/r sonarr-x -y", Nudge),
+            ("gh repo create --frobnicate sonarr-x", Nudge),
+            ("gh repo create -d desc clean-name", Allow),
+            ("gh repo create --public my-widget", Allow),
+            ("gh repo rename -R sonarr/r my-widget", Allow),
+            ("gh repo create --public", Allow),
             // controls
             ("gh repo view sonarr-cfg", Allow),
             ("gh repo create my-widget --public", Allow),
