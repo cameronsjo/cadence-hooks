@@ -705,8 +705,32 @@ fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>
     if command_heredocs_suspect(command) {
         // Core may have stripped lines bash runs as heredoc body: read every
         // line as code too, with no heredoc stripping (#1084).
-        let lines = command.split('\n').collect::<Vec<_>>().join(" ; ");
+        let delims = substitution_heredoc_delims(command);
+        let lines = command
+            .split('\n')
+            .map(|line| split_early_heredoc_end(line, delims.as_deref().unwrap_or(&[])))
+            .collect::<Vec<_>>()
+            .join(" ; ");
         merge_scan(&mut out, union_scan(&lines, cwd, env));
+        // And quote-blind: a quote on a line bash reads as heredoc body
+        // (`<<"E\"F"` then `E"F`) throws the joined reading's quote state off
+        // for every later line, hiding what bash runs there. Dropping quotes
+        // and escapes can only make more text read as code.
+        let bare: String = lines
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+            .collect();
+        merge_scan(&mut out, union_scan(&bare, cwd, env));
+        if delims.is_none() && command.contains("commit") {
+            // Where a substitution heredoc ends cannot be read, so neither can
+            // what runs after it: judge a commit from the session cwd, and
+            // block it from a worktree as an unreadable cd would.
+            out.unresolved_cd
+                .get_or_insert_with(|| "… (unreadable heredoc in a substitution)".to_string());
+            if !out.commits.iter().any(|c| c == cwd) {
+                out.commits.push(cwd.to_string());
+            }
+        }
     }
     out
 }
@@ -1061,8 +1085,9 @@ fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
 
 /// Could core's heredoc reading disagree with bash's here? Core's
 /// `heredoc_introducers` does not model escapes (cadence-hooks#1084), so an
-/// escaped `\<` or an escaped quote before a `<<` can make it read a heredoc
-/// bash does not see — and strip, as body, lines bash runs. Also suspect:
+/// escaped `\<`, or an escaped quote anywhere near a `<<`, can make it read a
+/// heredoc (or a delimiter) bash does not see — and strip, as body, lines bash
+/// runs. Also suspect:
 /// `plain_carve`'s own heredoc count differing from core's on the same text.
 /// A suspect command is never plain, and the union path also reads it line by
 /// line with no heredoc stripping at all ([`scan_prepared`]).
@@ -1080,23 +1105,93 @@ fn heredoc_reading_suspect(command: &str, carved: &str, carve_heredocs: usize) -
     core_heredocs != carve_heredocs
 }
 
-/// An escaped `<` anywhere, or an escaped quote before the first `<<`: the
-/// shapes core's escape-blind heredoc reading gets wrong (#1084).
+/// An escaped `<` anywhere, or an escaped quote anywhere in a command with a
+/// `<<`: the shapes core's escape-blind heredoc reading gets wrong (#1084).
+/// An escaped quote inside a delimiter word (`<<"E\"F"`) changes the
+/// delimiter as much as one before the operator changes where it starts.
 fn escapes_hide_a_heredoc(command: &str) -> bool {
     command.contains("\\<")
-        || command.find("<<").is_some_and(|first| {
-            command[..first].contains("\\'") || command[..first].contains("\\\"")
-        })
+        || (command.contains("<<") && (command.contains("\\'") || command.contains("\\\"")))
 }
 
 /// [`heredoc_reading_suspect`] from the raw command alone. A command
 /// [`plain_carve`] refuses has no heredoc count to compare, so only the
 /// escape shapes count.
 fn command_heredocs_suspect(command: &str) -> bool {
+    if substitution_heredoc_ends_early(command) {
+        return true;
+    }
     match plain_carve(command) {
         Some((text, heredocs)) => heredoc_reading_suspect(command, &text, heredocs),
         None => escapes_hide_a_heredoc(command),
     }
+}
+
+/// The most distinct delimiters [`substitution_heredoc_delims`] collects;
+/// past it the delimiters are unreadable.
+const MAX_SUBSTITUTION_DELIMS: usize = 16;
+
+/// The delimiters of the heredocs a command opens after a `$(`, each with the
+/// byte its body can begin at. Read from the raw command with no quoting
+/// model: every `<<` anywhere after the first `$(`. `None` when one cannot be
+/// read, or past [`MAX_SUBSTITUTION_DELIMS`] distinct ones.
+fn substitution_heredoc_delims(command: &str) -> Option<Vec<(String, usize)>> {
+    let mut delims: Vec<(String, usize)> = Vec::new();
+    let Some(first_open) = command.find("$(") else {
+        return Some(delims);
+    };
+    for (at, _) in command[first_open..].match_indices("<<") {
+        let at = first_open + at;
+        if command[at..].starts_with("<<<") || command[..at].ends_with('<') {
+            continue;
+        }
+        let (heredoc, _) = parse_heredoc_operator(&command[at..])?;
+        // The first opener of a delimiter has the earliest body: keep it.
+        if delims.iter().any(|(d, _)| *d == heredoc.delim) {
+            continue;
+        }
+        if delims.len() == MAX_SUBSTITUTION_DELIMS {
+            return None;
+        }
+        let body = command[at..]
+            .find('\n')
+            .map_or(command.len(), |n| at + n + 1);
+        delims.push((heredoc.delim, body));
+    }
+    Some(delims)
+}
+
+/// Could a heredoc opened after a `$(` end early, at a body line bash 5.2
+/// reads as its end plus code ([`ends_a_substitution_heredoc`])? Core strips
+/// such a line and the ones after it as body, so the union path must also
+/// read the command line by line. Unreadable delimiters are suspect.
+fn substitution_heredoc_ends_early(command: &str) -> bool {
+    let Some(delims) = substitution_heredoc_delims(command) else {
+        return true;
+    };
+    delims.iter().any(|(delim, from)| {
+        command[*from..]
+            .split('\n')
+            .any(|line| ends_a_substitution_heredoc(line.trim_start_matches('\t'), delim))
+    })
+}
+
+/// `line` for the line-by-line reading: when bash could end a substitution
+/// heredoc on it ([`ends_a_substitution_heredoc`]), the code after each
+/// matching delimiter is appended as a command of its own — `EOFcd /p)` reads
+/// as `EOFcd /p) ; cd /p)` — since the tokenizer would otherwise glue it to
+/// the delimiter as one word.
+fn split_early_heredoc_end<'l>(line: &'l str, delims: &[(String, usize)]) -> Cow<'l, str> {
+    let bare = line.trim_start_matches('\t');
+    let mut out = Cow::Borrowed(line);
+    for (delim, _) in delims {
+        if ends_a_substitution_heredoc(bare, delim) {
+            let owned = out.to_mut();
+            owned.push_str(" ; ");
+            owned.push_str(&bare[delim.len()..]);
+        }
+    }
+    out
 }
 
 /// Is `text` on the plain-shape allowlist? ([`plain_carve`] and
@@ -1622,10 +1717,11 @@ fn heredoc_body_len(text: &str, heredoc: &Heredoc) -> Option<usize> {
 /// a body, a line that is exactly `DELIM` (after leading tabs, for `<<-`), and
 /// then only blanks and the `)`.
 ///
-/// A body line that is the delimiter, optional blanks, then `)` refuses:
-/// inside a command substitution bash also ends the heredoc at `DELIM)`, so
-/// what this would read as body, bash runs (cadence-hooks#1058 review). A
-/// line like `DELIMX` is ordinary body text. The
+/// A body line that starts with the delimiter and has a `)` anywhere after it
+/// refuses ([`ends_a_substitution_heredoc`]): inside a command substitution
+/// bash 5.2 also ends the heredoc there and runs the rest of the line as code,
+/// so what this would read as body, bash runs (cadence-hooks#1058 review). A
+/// line like `DELIMX` with no `)` is ordinary body text. The
 /// delimiter line is matched exactly — a trailing `\r` is not trimmed, and is
 /// refused anyway by [`plain_carve`].
 fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
@@ -1665,14 +1761,21 @@ fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
             }
             return Some(at + close + 1 + newline + 1 + offset + blanks + 1);
         }
-        if bare
-            .strip_prefix(delim)
-            .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with(')'))
-        {
+        if ends_a_substitution_heredoc(bare, delim) {
             return None;
         }
     }
     None
+}
+
+/// Could bash end a heredoc inside `$(…)` at this body line? Bash 5.2 ends it
+/// at any line that STARTS WITH the delimiter and has a `)` anywhere after it
+/// — `EOF)`, `EOF cd /p)`, `EOFecho x)` — and runs the rest of the line as
+/// code. Deliberately wider than bash's exact rule: a false positive only
+/// refuses a carve-out.
+fn ends_a_substitution_heredoc(line: &str, delim: &str) -> bool {
+    line.strip_prefix(delim)
+        .is_some_and(|rest| rest.contains(')'))
 }
 
 /// The argv a plain segment's command runs, and its `GIT_WORK_TREE=` /
@@ -1774,14 +1877,15 @@ impl<'a> CdScope<'a> {
     /// pre-cd directory becomes a fallback. `after_and` marks a cd reached
     /// through `&&` behind another command, which runs only if that command
     /// succeeded, so its pre-cd directories become fallbacks too. `None` when
-    /// a target cannot be read: the command is not plain.
+    /// a target cannot be read ([`cd_landing`]) or the fallbacks pass
+    /// [`MAX_CD_CANDIDATES`]: the command is not plain.
     fn apply_cd(&mut self, tokens: &[MarkedToken], cd: CdWord, after_and: bool) -> Option<()> {
         let before = std::mem::take(&mut self.dirs);
         let mut moved = Vec::new();
         let mut failed = Vec::new();
         for here in &before {
-            let dir = cd_target(tokens, cd, here, self.env)?;
-            if !(self.env.dir_exists)(&dir) {
+            let (dir, exists) = cd_landing(cd_target(tokens, cd, here, self.env)?, self.env)?;
+            if !exists {
                 failed.push(here.clone());
             }
             moved.push(here.moved_to(dir));
@@ -1795,8 +1899,26 @@ impl<'a> CdScope<'a> {
                 self.fallback.push(dir);
             }
         }
-        Some(())
+        (self.fallback.len() <= MAX_CD_CANDIDATES).then_some(())
     }
+}
+
+/// Where a logical `cd` to the joined path `raw` lands: its lexical
+/// normalization, and whether that is an existing directory. `None` when the
+/// normalization is not a directory but `raw` is: bash's `cd` then falls back
+/// to the PHYSICAL path, which follows a symlink before its `..` (`link/../x`
+/// with `link -> /p/sub` lands in `/p/x`), and a lexical walk cannot say where
+/// that is.
+///
+/// Storing the normalized path, never `raw`, also keeps a long run of
+/// `cd sub && cd ..` from growing the path each walk stats (#1058 review).
+fn cd_landing(raw: String, env: CdEnv<'_>) -> Option<(String, bool)> {
+    let dir = lexical_normalize(&raw);
+    let exists = (env.dir_exists)(&dir);
+    if !exists && dir != raw && (env.dir_exists)(&raw) {
+        return None;
+    }
+    Some((dir, exists))
 }
 
 /// Walk a plain command's segments in order, calling `visit` for each BEFORE
@@ -1952,7 +2074,16 @@ fn union_dirs(
                     }
                     let known = dirs.clone();
                     for base in &known {
-                        match cd_target(&marked, cd, &ShellDir::at(base), env) {
+                        let target = cd_target(&marked, cd, &ShellDir::at(base), env);
+                        // Only the first unresolved cd is reported, so once
+                        // one is, skip the stats that could only find another.
+                        let target = match target {
+                            Some(raw) if unresolved.is_none() => {
+                                cd_landing(raw.clone(), env).map(|_| raw)
+                            }
+                            other => other,
+                        };
+                        match target {
                             Some(dir) if dirs.len() < MAX_UNION_DIRS => {
                                 let dir = normalize_target(&dir);
                                 if !dirs.contains(&dir) {
@@ -8592,6 +8723,181 @@ mod tests {
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(w.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Allow,
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_substitution_heredoc_ends_at_a_line_starting_with_its_delimiter() {
+        // B1 (spec review, bash 5.2): inside `$(…)` a heredoc ends at any line
+        // that starts with the delimiter and has a `)` after it, and bash runs
+        // the rest of that line as code.
+        for body in [
+            "'EOF'\nEOF cd /p && git commit -m y)\nEOF\n)",
+            "'EOF'\nEOFecho x)\nEOF\n)",
+            "'EOF'\nEOF)\nEOF\n)",
+            "-'EOF'\n\tEOF x)\nEOF\n)",
+        ] {
+            assert_eq!(heredoc_substitution_len(body), None, "{body:?}");
+        }
+        // A delimiter-prefixed line with no `)` is still body text.
+        assert!(heredoc_substitution_len("'EOF'\nEOFX\nEOF\n)").is_some());
+        let env = CdEnv::new(None, false);
+        for cmd in [
+            "git commit -m \"$(cat <<'EOF'\nEOF cd /p && git commit -m y)\nEOF\n)\"",
+            "x=$(cat <<'EOF'\nEOF cd /p && git commit -m y)\nEOF\n); git commit -m x",
+            "git commit -m $(cat <<'EOF'\nEOF)\ncd /p && git commit -m y\nEOF\n)",
+            "git commit -m \"$(cat <<'EOF'\nEOFcd /p && git commit -m y)\nEOF\n)\"",
+        ] {
+            assert!(!is_plain_shape(cmd, "/w", env), "{cmd:?}");
+            assert!(command_heredocs_suspect(cmd), "{cmd:?}");
+            assert!(
+                sorted_targets(cmd, "/w").contains(&"/p".to_string()),
+                "{cmd:?}"
+            );
+        }
+        // A commit glued to the delimiter is found from the primary too.
+        let glued = "x=$(cat <<'EOF'\nEOFgit commit -m y)\nEOF\n)";
+        assert_eq!(sorted_targets(glued, "/p"), vec!["/p"]);
+        // Past MAX_SUBSTITUTION_DELIMS the delimiters are unreadable: the
+        // commit is judged from the session cwd and the scan is unresolved.
+        let many: String = (0..=MAX_SUBSTITUTION_DELIMS)
+            .map(|i| format!("x=$(cat <<'E{i}'\nE{i}\n)\n"))
+            .collect();
+        let hidden = format!("{many}y=$(cat <<'E0'\nE0cd /p && git commit -m y)\nE0\n)");
+        assert_eq!(substitution_heredoc_delims(&hidden), None);
+        let scan = scan_targets(&hidden, "/w", false);
+        assert!(scan.unresolved_cd.is_some());
+        assert!(scan.commits.contains(&"/w".to_string()));
+        // A compact `EOF)` close still reads the message as data.
+        let compact = "git commit -m \"$(cat <<'EOF'\nmsg\nEOF)\"";
+        assert_eq!(sorted_targets(compact, "/w"), vec!["/w"]);
+        assert!(scan_targets(compact, "/w", false).unresolved_cd.is_none());
+        // The standard message carve-out is still plain and not suspect.
+        let standard = "git commit -m \"$(cat <<'EOF'\nmsg (with parens)\nEOF\n)\"";
+        assert!(is_plain_shape(standard, "/w", env));
+        assert!(!command_heredocs_suspect(standard));
+        assert_eq!(sorted_targets(standard, "/w"), vec!["/w"]);
+    }
+
+    #[test]
+    fn an_escaped_quote_anywhere_with_a_heredoc_is_read_line_by_line() {
+        // B3: an escaped quote inside the delimiter word (`<<"E\"F"` ends at
+        // `E"F`), not only before the operator.
+        let env = CdEnv::new(None, false);
+        for cmd in [
+            "cat <<\"E\\\"F\"\nE\"F\ncd /p\nEF\ngit commit -m x",
+            // The body line's quote would also swallow every later line in
+            // the joined reading.
+            "cat <<\"E\\\"F\"\nE\"F\necho \"abc\n\" ; cd /p ; git commit -m x",
+            "cat <<'E\\'F'\nE\\F\ncd /p\ngit commit -m x",
+        ] {
+            assert!(escapes_hide_a_heredoc(cmd), "{cmd:?}");
+            assert!(!is_plain_shape(cmd, "/w", env), "{cmd:?}");
+            assert!(
+                sorted_targets(cmd, "/w").contains(&"/p".to_string()),
+                "{cmd:?}"
+            );
+        }
+        assert!(!escapes_hide_a_heredoc("echo \\\"x\\\" && git commit -m x"));
+    }
+
+    #[test]
+    fn a_long_cd_chain_keeps_the_walked_path_bounded() {
+        // PERF (#1058 review): the walk stored the unnormalized path, which
+        // grew with every cd and was stat'ed each time — quadratic, and a 4 s
+        // fail-open deadline away from a bypass.
+        let unit = "cd sub && cd .. && ";
+        let cmd = format!("{}git commit -m x", unit.repeat(100 * 1024 / unit.len()));
+        let env = CdEnv::new(None, false);
+        let plain = plain_of(&cmd, "/w", env).expect("plain");
+        let mut longest = 0;
+        let started = std::time::Instant::now();
+        let walked = walk_plain(&plain, "/w", env, |seg| {
+            for dir in seg.dirs {
+                longest = longest.max(dir.pwd.len());
+            }
+        });
+        assert!(walked.is_some());
+        assert!(longest <= "/w/sub".len(), "{longest}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(sorted_targets(&cmd, "/w"), vec!["/w"]);
+    }
+
+    #[test]
+    fn too_many_cd_fallbacks_are_not_plain() {
+        // Each `cd` behind `true &&` adds its pre-cd directory as a fallback;
+        // past MAX_CD_CANDIDATES the walk gives up to the union path.
+        let cmd = "true && cd /a && true && cd /b && true && cd /c && true && cd /d \
+                   && true && cd /e && git commit -m x";
+        let env = CdEnv::new(None, false);
+        let plain = plain_of(cmd, "/w", env).expect("plain shape");
+        assert!(walk_plain(&plain, "/w", env, |_| {}).is_none());
+        let got = sorted_targets(cmd, "/w");
+        for dir in ["/w", "/a", "/e"] {
+            assert!(got.contains(&dir.to_string()), "{dir}: {got:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spec_conformance_repros_block_end_to_end() {
+        let scratch = scratch("spec-conformance-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir(primary.join("sub")).unwrap();
+        std::fs::create_dir(primary.join("sub2")).unwrap();
+        std::os::unix::fs::symlink(primary.join("sub"), wt.join("link")).unwrap();
+        let p = primary.to_string_lossy().into_owned();
+        let w = wt.to_string_lossy().into_owned();
+        let from_w = [
+            // B1
+            format!("git commit -m \"$(cat <<'EOF'\nEOF cd {p} && git commit -m y)\nEOF\n)\""),
+            format!("x=$(cat <<'EOF'\nEOF cd {p} && git commit -m y)\nEOF\n); git commit -m x"),
+            format!("git commit -m $(cat <<'EOF'\nEOF)\ncd {p} && git commit -m y\nEOF\n)"),
+            format!("git commit -m \"$(cat <<'EOF'\nEOFcd {p} && git commit -m y)\nEOF\n)\""),
+            // B2: `link/..` is logically W, but W/sub2 and W/.git (a file in a
+            // worktree) are not directories, so bash's cd goes physical.
+            "cd link/../sub2 && git commit -m x".to_string(),
+            "cd link/../sub2; git commit -m x".to_string(),
+            "cd link/../.git && cd .. && git commit -m x".to_string(),
+            // B3
+            format!("cat <<\"E\\\"F\"\nE\"F\ncd {p}\nEF\ngit commit -m x"),
+            format!("cat <<\"E\\\"F\"\nE\"F\necho \"abc\n\" ; cd {p} ; git commit -m x"),
+        ];
+        let from_p = [
+            "cat <<\"E\\\"F\"\nE\"F\necho \"abc\n\" ; git commit -m x".to_string(),
+            "x=$(cat <<'EOF'\nEOFgit commit -m y)\nEOF\n)".to_string(),
+        ];
+        for (cmds, cwd) in [(&from_w[..], &w), (&from_p[..], &p)] {
+            for cmd in cmds {
+                let mut input = make_bash(cmd);
+                input.cwd = Some(cwd.clone());
+                assert_eq!(
+                    run_enforce(&input, &cfg(false, false)).outcome,
+                    Outcome::Block,
+                    "{cmd:?}"
+                );
+            }
+        }
+        let allowed = [
+            (
+                w.clone(),
+                "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"".to_string(),
+            ),
+            (
+                p.clone(),
+                format!("cd {w} && git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\""),
+            ),
+            (w.clone(), "cd link/.. && git commit -m x".to_string()),
+            (w.clone(), "cd sub && cd .. && git commit -m x".to_string()),
+        ];
+        for (cwd, cmd) in allowed {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(cwd);
             assert_eq!(
                 run_enforce(&input, &cfg(false, false)).outcome,
                 Outcome::Allow,
