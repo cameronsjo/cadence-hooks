@@ -114,28 +114,6 @@ pub trait GhRunner {
     fn run(&self, args: &[&str]) -> Option<String>;
 }
 
-/// Production `gh` runner: shells out to the system `gh` binary in the
-/// session cwd, so gh resolves the default repo and branch from the checkout
-/// the command starts in, with `env` (such as `GH_HOST`) scoped to the
-/// spawned process.
-pub struct RealGhRunner {
-    pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
-}
-
-impl GhRunner for RealGhRunner {
-    fn run(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = std::process::Command::new("gh");
-        cmd.current_dir(&self.cwd);
-        cmd.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let output = cmd.args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-}
-
 /// The tokens of the first `gh pr ready` / `gh pr merge` segment in
 /// `command`, or `None` when no segment is one. The matcher is the shared
 /// [`pr_flip_segments`], so the retargeted and prefixed spellings the ship
@@ -956,7 +934,10 @@ impl Check for WarnUnreviewedReadyFlip {
         };
 
         let ctx = FlipContext::for_target(&target, input);
-        let gh = RealGhRunner {
+        // Bounded per call (cadence-hooks#986): a gh answer slower than the
+        // bounded runner's cap reads as no answer, and the nudge stays silent
+        // rather than the external hooks.json timeout killing the hook.
+        let gh = crate::bounded_tool::BoundedGhRunner {
             cwd: PathBuf::from(&ctx.cwd),
             env: ctx.env,
         };

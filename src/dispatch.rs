@@ -280,6 +280,30 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
             Some(first),
         );
     }
+    // A payload whose operation-bearing field is present but unreadable (a
+    // `command` array, a numeric `file_path`) must not read as "no command"
+    // and allow (cadence-hooks#1087). Not an ADR-0001 case: the guard has no
+    // bug, the input is partly unreadable, so a security-critical guard cannot
+    // prove the operation safe and says so — the same reasoning as the
+    // unenumerable-patch arm below. Non-critical hooks run on the salvaged
+    // input, which still carries every field that did parse.
+    let unreadable = input.unreadable_operation_fields();
+    if !unreadable.is_empty() && any_security_critical(hook_names) {
+        // Static field names only (`core::TOOL_INPUT_KEYS`), never values, so
+        // the row keeps the ledger's no-payload posture.
+        let fields = unreadable.join(", ");
+        for hook_name in hook_names {
+            cadence_hooks_metrics::log_failopen(
+                "unreadable_input",
+                crate::registry::namespace_of(hook_name),
+                Some(hook_name),
+                env!("CARGO_PKG_VERSION"),
+                Some(&format!("wrong type: {fields}")),
+            );
+        }
+        eprintln!("{}", unreadable_operation_message(&unreadable));
+        process::exit(2);
+    }
     let normalized_inputs = match input.normalized_inputs() {
         Ok(inputs) => inputs,
         Err(error) => {
@@ -326,6 +350,18 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
         }
     };
     (input, normalized_inputs)
+}
+
+/// The block message for a payload whose operation could not be read
+/// (cadence-hooks#1087). `fields` are static key names, so nothing from the
+/// payload is echoed.
+fn unreadable_operation_message(fields: &[&'static str]) -> String {
+    format!(
+        "cadence-hooks: blocked because the tool input could not be read \
+         ({} present with the wrong type), so a security-critical guard cannot \
+         check this operation. Retry with a well-formed tool call.",
+        fields.join(", ")
+    )
 }
 
 /// Decide one check against an already-parsed payload and write its audit rows
