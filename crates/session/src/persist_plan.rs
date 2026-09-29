@@ -1826,7 +1826,7 @@ fn append_plan_links_row(row: &Value) {
         return;
     }
     let path = dir.join("plan-links.jsonl");
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = cadence_hooks_metrics::open_ledger(&path) {
         // One `write_all` of the record + newline (POSIX O_APPEND makes this
         // single small write atomic), so a concurrent append from another
         // session can't interleave a record with its trailing newline — same

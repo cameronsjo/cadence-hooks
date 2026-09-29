@@ -89,6 +89,38 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
     new_root
 }
 
+/// Open a metrics ledger for appending, creating it owner-only (`0600`).
+///
+/// Every `<metrics_dir>/*.jsonl` writer goes through here (cadence-hooks#425).
+/// Rows are privacy-safe by construction, but repo basenames and session ids
+/// are still metadata worth keeping from other local users, and the default
+/// `OpenOptions` mode is world-readable under a permissive umask. A ledger an
+/// older binary already created with group/other bits is tightened to `0600`
+/// through the open handle, so existing installs converge on their next write;
+/// a mode that is already tighter is left alone. Permissions are a Unix
+/// concept; elsewhere this is a plain create-and-append open. A failed
+/// tighten is ignored, so the append still happens (ADR-0001).
+pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
 /// Harness stamped on schema-v2 rows.
 ///
 /// Constant since the Codex adapters were retired (#1040). The field stays
@@ -130,11 +162,7 @@ fn append_transcript_diagnostic_to(
         "stream": stream,
         "priced": false,
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut file) = open_ledger(path) {
         let mut line = record.to_string();
         line.push('\n');
         let _ = file.write_all(line.as_bytes());
@@ -448,6 +476,51 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// #425: a new ledger is owner-only, whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_creates_owner_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        let mut file = open_ledger(&path).unwrap();
+        file.write_all(b"{}\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// #425: a ledger an older binary left world-readable is tightened on the
+    /// next append, and its contents are appended to, not replaced.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_tightens_an_existing_readable_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("subagents.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_ledger(&path).unwrap().write_all(b"b\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+    }
+
+    /// A mode already tighter than 0600 is never loosened.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_leaves_a_tighter_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        open_ledger(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o200);
+    }
 
     #[test]
     fn display_safe_is_unchanged_by_the_move_to_core() {

@@ -146,11 +146,7 @@ pub fn log_bypass(event: BypassEvent) {
     }
     let path = dir.join("bypasses.jsonl");
 
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = common::open_ledger(&path) {
         // One `write_all` of the record + newline, so a concurrent append from
         // another session can't interleave a record with its trailing newline.
         let mut line = record.to_string();

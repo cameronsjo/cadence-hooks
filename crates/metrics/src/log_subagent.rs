@@ -49,11 +49,7 @@ impl Logger for LogSubagent {
             add_cost_fields(&mut record, usage.as_ref(), &prices);
         }
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("subagents.jsonl"))
-        {
+        if let Ok(mut file) = common::open_ledger(dir.join("subagents.jsonl")) {
             // Build the whole line (record + newline) and write it in one
             // write_all, matching log_commit.rs — a single O_APPEND write is
             // atomic, so concurrent appends from parallel subagents can't

@@ -48,11 +48,7 @@ pub fn log_timing(
     }
     let path = dir.join("hooks.jsonl");
 
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = common::open_ledger(&path) {
         // One `write_all` of the record + newline, so a concurrent append from
         // another session can't interleave a record with its trailing newline.
         // `record` is compact JSON — one line, no embedded newlines.
