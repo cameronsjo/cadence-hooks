@@ -8133,9 +8133,14 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
                 .get(i + 1)
                 .is_some_and(|t| unescape_word(t).as_ref() == "--")
             {
-                return tokens.get(i + 2).cloned();
+                return tokens.get(i + 2).map(|s| unescape_word(s).into_owned());
             }
-            return tokens.get(i + 1).cloned();
+            // The script is the word the shell hands the wrapper, escapes
+            // removed: `bash -c cat\ .env` runs `cat .env`. Read raw, the
+            // escaped blank kept it one word and no guard saw an operand.
+            // As with `eval_script`, over-unescaping a single-quoted script
+            // can only add a block.
+            return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
         // (e.g. `sh script.sh`) — no inline script to expand.
@@ -12905,6 +12910,27 @@ mod tests {
         assert_eq!(
             shell_c_argument("bash -c -- -- echo"),
             Some("--".to_string())
+        );
+    }
+
+    #[test]
+    fn command_segments_unescapes_an_escaped_shell_c_script() {
+        // `bash -c cat\ .env` hands bash the script `cat .env`. With an
+        // escaped blank kept in its word, the raw script was one token and
+        // no guard saw an operand (PR #1140 review).
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "bash -c cat\\ .env",
+            "sh -c cat\\ .env",
+            "bash -lc cat\\ .env",
+            "bash -c -- cat\\ .env",
+            "sudo sh -c cat\\ .env",
+        ] {
+            assert!(command_segments(cmd).contains(&inner), "{cmd:?}");
+        }
+        assert_eq!(
+            shell_c_argument("bash -c git\\ push\\ --force\\ origin\\ main"),
+            Some("git push --force origin main".to_string())
         );
     }
 
