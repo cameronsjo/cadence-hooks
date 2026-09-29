@@ -464,6 +464,14 @@ impl Check for SopsDecryptGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        self.run_with_escape(input, std::env::var(ESCAPE_ENV).ok().as_deref())
+    }
+}
+
+impl SopsDecryptGuard {
+    /// [`Check::run`] with the escape's value passed in rather than read from
+    /// process env, so tests need no env mutation (cadence-hooks#486).
+    fn run_with_escape(&self, input: &HookInput, escape: Option<&str>) -> CheckResult {
         // No command to read — the guard cannot tell, so it allows (ADR-0001).
         let Some(command) = input.command() else {
             return CheckResult::allow();
@@ -486,7 +494,7 @@ impl Check for SopsDecryptGuard {
         // The escape is evaluated only once the guard WOULD have blocked, so an
         // operator who leaves it set does not generate a bypass row for every
         // unrelated command they run.
-        if is_truthy(std::env::var(ESCAPE_ENV).ok().as_deref()) {
+        if is_truthy(escape) {
             return CheckResult::allow_bypassed(env_switch(ESCAPE_ENV));
         }
 
@@ -511,19 +519,23 @@ mod tests {
         assert!(msg.contains("next session"), "{msg}");
         assert!(msg.contains("inline"), "{msg}");
     }
-    use crate::with_env;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_bash;
 
-    /// Run `f` with the escape explicitly UNSET. Every verdict test needs this:
-    /// a Claude session's ambient environment can carry the switch, which would
-    /// turn a block-expecting assertion into a confident false pass.
+    /// Run `f`. The escape is passed to the guard explicitly as UNSET by
+    /// [`run_unescaped`] rather than read from process env, so a Claude
+    /// session's ambient switch cannot turn a block-expecting assertion into a
+    /// confident false pass (cadence-hooks#486).
     fn without_escape(f: impl FnOnce()) {
-        with_env(&[(ESCAPE_ENV, None)], f);
+        f();
+    }
+
+    fn run_unescaped(input: &HookInput) -> CheckResult {
+        SopsDecryptGuard.run_with_escape(input, None)
     }
 
     fn outcome(command: &str) -> Outcome {
-        SopsDecryptGuard.run(&make_bash(command)).outcome
+        run_unescaped(&make_bash(command)).outcome
     }
 
     // --- positive controls: the guard is not a blanket refusal ---
@@ -592,7 +604,7 @@ mod tests {
                 cwd: None,
                 ..Default::default()
             };
-            assert_eq!(SopsDecryptGuard.run(&input).outcome, Outcome::Allow);
+            assert_eq!(run_unescaped(&input).outcome, Outcome::Allow);
         });
     }
 
@@ -1022,7 +1034,7 @@ mod tests {
     #[test]
     fn block_message_names_the_hazard_the_fix_and_the_escape() {
         without_escape(|| {
-            let result = SopsDecryptGuard.run(&make_bash("sops -d secrets.sops.yaml | grep token"));
+            let result = run_unescaped(&make_bash("sops -d secrets.sops.yaml | grep token"));
             let msg = result.message.unwrap_or_default();
             assert!(
                 msg.contains("transcript"),
@@ -1044,35 +1056,39 @@ mod tests {
 
     #[test]
     fn escape_allows_and_records_a_bypass() {
-        with_env(&[(ESCAPE_ENV, Some("1"))], || {
-            let result = SopsDecryptGuard.run(&make_bash("sops -d secrets.sops.yaml | grep token"));
+        {
+            let result = SopsDecryptGuard.run_with_escape(
+                &make_bash("sops -d secrets.sops.yaml | grep token"),
+                Some("1"),
+            );
             assert_eq!(result.outcome, Outcome::Allow);
             let bypass = result.bypass.expect("the escape must record a bypass row");
             assert_eq!(bypass.kind, BypassKind::EnvSwitch);
             assert_eq!(bypass.mechanism, ESCAPE_ENV);
-        });
+        }
     }
 
     #[test]
     fn escape_does_not_tag_an_unrelated_allow() {
-        with_env(&[(ESCAPE_ENV, Some("1"))], || {
-            let result = SopsDecryptGuard.run(&make_bash("ls -la"));
+        {
+            let result = SopsDecryptGuard.run_with_escape(&make_bash("ls -la"), Some("1"));
             assert_eq!(result.outcome, Outcome::Allow);
             assert!(
                 result.bypass.is_none(),
                 "a command the guard never judged is not a bypass"
             );
-        });
+        }
     }
 
     #[test]
     fn falsy_escape_still_blocks() {
-        with_env(&[(ESCAPE_ENV, Some("0"))], || {
-            assert_eq!(
-                outcome("sops -d secrets.sops.yaml | grep token"),
-                Outcome::Block
-            )
-        });
+        {
+            let result = SopsDecryptGuard.run_with_escape(
+                &make_bash("sops -d secrets.sops.yaml | grep token"),
+                Some("0"),
+            );
+            assert_eq!(result.outcome, Outcome::Block)
+        }
     }
 
     /// PR #1118 review: 5000 levels (~50 KB) of `{ (` around `inner`, in the
@@ -1162,7 +1178,7 @@ mod tests {
             command,
             repo.path().to_str().unwrap(),
         );
-        let r = SopsDecryptGuard.run(&input);
+        let r = run_unescaped(&input);
         (r.outcome, r.message.unwrap_or_default())
     }
 
