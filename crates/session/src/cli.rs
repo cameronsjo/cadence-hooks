@@ -230,13 +230,36 @@ pub fn run_status() -> u8 {
 /// Pure: the stdout text `session plans` prints for an already-resolved repo
 /// root. The empty answer names the directory it scanned — without that,
 /// "nothing in flight" is indistinguishable from "you are in the wrong repo".
-fn plans_text(repo_root: &std::path::Path) -> String {
-    crate::plan_scan::render_plans_report(repo_root).unwrap_or_else(|| {
-        format!(
+/// A scan that hit problems and found nothing prints nothing: "no in-flight
+/// plans" would be a claim the scan cannot back.
+fn plans_text(repo_root: &std::path::Path, scan: &crate::plan_scan::PlansReport) -> String {
+    match &scan.report {
+        Some(report) => report.clone(),
+        None if scan.problems.is_empty() => format!(
             "no in-flight plans under {}",
             repo_root.join("docs").join("plans").display()
-        )
-    })
+        ),
+        None => String::new(),
+    }
+}
+
+/// Pure: the stderr text for a partial scan, or `None` when it was complete.
+fn plans_problems_text(
+    repo_root: &std::path::Path,
+    scan: &crate::plan_scan::PlansReport,
+) -> Option<String> {
+    if scan.problems.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "session plans: the scan of {} was incomplete; plans in these entries are missing from the list:",
+        repo_root.join("docs").join("plans").display()
+    );
+    for problem in &scan.problems {
+        out.push_str("\n  ");
+        out.push_str(problem);
+    }
+    Some(out)
 }
 
 /// `session plans` — the tier-2 view of the SessionStart plan pointer: every
@@ -246,8 +269,11 @@ fn plans_text(repo_root: &std::path::Path) -> String {
 /// Read-only, and a plain print rather than a dispatched check: it reads no
 /// stdin payload, writes no metrics, and has no outcome for the hook contract
 /// to carry. Zero plans is a real answer and exits 0. Exit **2** when the scan
-/// could not be run at all (no git repository here), with the scanned root on
-/// stderr — a parser needs to tell an empty list from a question never asked.
+/// could not be run at all (no git repository here), or when it could not
+/// list, stat or read an entry in `docs/plans/` (cameronsjo/cadence-hooks#968),
+/// with the scanned root and each failed entry on stderr — a parser needs to
+/// tell an empty or complete list from a question never fully asked. Whatever
+/// the partial scan did find still prints on stdout.
 pub fn run_plans() -> u8 {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -256,7 +282,15 @@ pub fn run_plans() -> u8 {
         eprintln!("session plans: not inside a git repository. Scanned root: {cwd}");
         return 2;
     };
-    println!("{}", plans_text(&root));
+    let scan = crate::plan_scan::plans_report(&root);
+    let text = plans_text(&root, &scan);
+    if !text.is_empty() {
+        println!("{text}");
+    }
+    if let Some(problems) = plans_problems_text(&root, &scan) {
+        eprintln!("{problems}");
+        return 2;
+    }
     0
 }
 
@@ -280,7 +314,7 @@ mod tests {
             "2026-09-19-a.md",
             "---\nstatus: in-flight\nnext: \"ship it\"\nbranch: feat/x\npr: 12\n---\n\nbody\n",
         );
-        let out = plans_text(tmp.path());
+        let out = plans_text(tmp.path(), &crate::plan_scan::plans_report(tmp.path()));
         assert!(out.starts_with("1 in-flight plan in docs/plans/:"), "{out}");
         assert!(out.contains("2026-09-19-a"), "{out}");
         assert!(out.contains("next: \"ship it\""), "{out}");
@@ -293,7 +327,7 @@ mod tests {
         // The empty answer is a real answer, and it has to say *where* it
         // looked — otherwise "no plans" is indistinguishable from "wrong repo".
         let tmp = tempfile::TempDir::new().unwrap();
-        let out = plans_text(tmp.path());
+        let out = plans_text(tmp.path(), &crate::plan_scan::plans_report(tmp.path()));
         assert!(out.starts_with("no in-flight plans under "), "{out}");
         // Built with `join`, not a literal: the separator is `\` on Windows.
         let scanned = std::path::Path::new("docs").join("plans");
@@ -308,7 +342,28 @@ mod tests {
             "2026-09-01-done.md",
             "---\nstatus: done\n---\n\nbody\n",
         );
-        assert!(plans_text(tmp.path()).starts_with("no in-flight plans under "));
+        assert!(
+            plans_text(tmp.path(), &crate::plan_scan::plans_report(tmp.path()))
+                .starts_with("no in-flight plans under ")
+        );
+    }
+
+    #[test]
+    fn a_partial_scan_names_the_root_and_each_entry_on_stderr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scan = crate::plan_scan::PlansReport {
+            report: None,
+            problems: vec!["docs/plans/x.md: denied".into()],
+        };
+        // Nothing found plus problems: no "no in-flight plans" claim.
+        assert_eq!(plans_text(tmp.path(), &scan), "");
+        let err = plans_problems_text(tmp.path(), &scan).expect("problems reported");
+        let scanned = tmp.path().join("docs").join("plans");
+        assert!(err.contains(&scanned.display().to_string()), "{err}");
+        assert!(err.contains("docs/plans/x.md: denied"), "{err}");
+
+        let clean = crate::plan_scan::PlansReport::default();
+        assert!(plans_problems_text(tmp.path(), &clean).is_none());
     }
 
     #[test]
