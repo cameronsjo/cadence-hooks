@@ -1057,9 +1057,9 @@ fn print_hook_list() {
         // header. This line stays safe by containing whitespace and not ending
         // in `:`; keep both properties if you reword it.
         if bypass::BYPASS_EXEMPT_HOOKS.is_empty() {
-            println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
+            cadence_hooks_core::outln!("CADENCE_BYPASS=1 — all hooks bypassed\n");
         } else {
-            println!(
+            cadence_hooks_core::outln!(
                 "CADENCE_BYPASS=1 — all hooks bypassed except {}\n",
                 bypass::BYPASS_EXEMPT_HOOKS.join(", ")
             );
@@ -1070,15 +1070,15 @@ fn print_hook_list() {
     for hook in HOOKS {
         if hook.namespace != current_namespace {
             if !current_namespace.is_empty() {
-                println!();
+                cadence_hooks_core::outln!();
             }
-            println!("{}:", hook.namespace);
+            cadence_hooks_core::outln!("{}:", hook.namespace);
             current_namespace = hook.namespace;
         }
 
         let event = hook.events_label();
 
-        println!(
+        cadence_hooks_core::outln!(
             "  {:<28} {:<13} {}{}",
             hook.name,
             event,
@@ -1093,10 +1093,10 @@ fn print_hook_list() {
     if !summary.is_empty() {
         // One blank line separating the summary block from the hook rows, not
         // one before every line of it — the three verdicts belong together.
-        println!();
+        cadence_hooks_core::outln!();
     }
     for line in summary {
-        println!("{line}");
+        cadence_hooks_core::outln!("{line}");
     }
 }
 
@@ -1128,7 +1128,7 @@ fn print_hook_manifest(format: ManifestFormat) {
                     })
                 })
                 .collect::<Vec<_>>();
-            println!(
+            cadence_hooks_core::outln!(
                 "{}",
                 serde_json::json!({
                     "schemaVersion": 1,
@@ -1721,7 +1721,7 @@ fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissA
                 armed.armed_at,
                 armed.expires_at,
             ));
-            println!("{}", armed.confirmation);
+            cadence_hooks_core::outln!("{}", armed.confirmation);
             std::process::exit(0);
         }
         Err(()) => std::process::exit(1),

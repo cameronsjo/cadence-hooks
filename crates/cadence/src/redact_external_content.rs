@@ -1361,7 +1361,7 @@ pub fn run_status() -> u8 {
              parse: {e}\nFix the file to re-arm; nothing is being caught until then."
         ),
     };
-    println!("{report}");
+    cadence_hooks_core::outln!("{report}");
     // One source of truth for "is this a state the operator must be told
     // about" — the exit code derives from it rather than restating it per arm.
     u8::from(status.needs_notice())

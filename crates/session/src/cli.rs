@@ -92,7 +92,7 @@ fn apply_declaration(
 /// lane declaration so peers can assess collision risk.
 pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Option<String>) {
     let Some(sid) = resolve_session_id(session_id) else {
-        println!(
+        cadence_hooks_core::outln!(
             "session declare: no session id. Pass --session-id or run inside Claude Code \
              (CLAUDE_SESSION_ID or CLAUDE_CODE_SESSION_ID)."
         );
@@ -102,7 +102,9 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let Some(dir) = registry::sessions_dir(&cwd) else {
-        println!("session declare: not inside a git repository — no registry to declare in.");
+        cadence_hooks_core::outln!(
+            "session declare: not inside a git repository — no registry to declare in."
+        );
         return;
     };
 
@@ -136,7 +138,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
                 .take(identity::MAX_LANES)
                 .map(|t| identity::sanitize_field(t, identity::MAX_FIELD_DISPLAY))
                 .collect();
-            println!(
+            cadence_hooks_core::outln!(
                 "Declared: {} working on {}{}",
                 identity::sanitize_field(identity::short_id(&record.session_id), 8),
                 record
@@ -151,7 +153,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
                 }
             );
         }
-        Err(e) => println!("session declare: could not write registry: {e}"),
+        Err(e) => cadence_hooks_core::outln!("session declare: could not write registry: {e}"),
     }
 }
 
@@ -357,7 +359,7 @@ pub fn run_status() -> u8 {
         })
         .collect();
     let own = resolve_session_id(None);
-    println!("{}", status_text(&registries, own.as_deref(), list));
+    cadence_hooks_core::outln!("{}", status_text(&registries, own.as_deref(), list));
     0
 }
 
@@ -419,7 +421,7 @@ pub fn run_plans() -> u8 {
     let scan = crate::plan_scan::plans_report(&root);
     let text = plans_text(&root, &scan);
     if !text.is_empty() {
-        println!("{text}");
+        cadence_hooks_core::outln!("{text}");
     }
     if let Some(problems) = plans_problems_text(&root, &scan) {
         eprintln!("{problems}");
