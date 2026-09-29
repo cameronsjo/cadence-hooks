@@ -414,7 +414,13 @@ mod tests {
             "echo x > .en?",
             "rm -f .env.*",
             "rm .[e]nv",
-            "cp x .e{n,}v",
+            // Brace words are expanded before this guard reads them
+            // (cadence-hooks#1096), so the row names a write bash really does:
+            // `cp x .e{n,}v` runs `cp x .env .ev`, whose destination is `.ev`
+            // — it reads `.env`, which `prevent-secret-leaks` blocks, and
+            // judges exactly as that literal spelling does here.
+            "rm .e{n,}v",
+            "cp x .e{x,n}v",
             "rm *.key",
             "rm ~/.ssh/*",
             "tee ~/.aws/cred* < /dev/null",
