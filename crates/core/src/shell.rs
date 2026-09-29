@@ -3192,6 +3192,11 @@ pub struct ShipTarget {
     /// The PR head. Only `gh pr create` has a `--head` flag, so `ready` and
     /// `merge` are always [`ShipHead::Current`].
     pub head: ShipHead,
+    /// The positional selector is a PR number or a PR URL (cadence-hooks#1005).
+    /// The cwd branch cannot answer for such a PR when the cwd is on the
+    /// default branch, so the polish gate reads this to say it cannot check.
+    /// A bare `ready`/`merge`, or a branch-name selector, is `false`.
+    pub names_pr: bool,
 }
 
 impl ShipTarget {
@@ -3275,6 +3280,10 @@ pub fn ship_target(segment_tokens: &[String]) -> ShipTarget {
         repos,
         host,
         head: combine_heads(&scan.heads),
+        names_pr: matches!(
+            pr_selector(segment_tokens),
+            PrSelector::Number(_) | PrSelector::Url { .. }
+        ),
     }
 }
 
@@ -13141,6 +13150,28 @@ mod tests {
 
     fn named(branch: &str) -> ShipHead {
         ShipHead::Named(branch.to_string())
+    }
+
+    #[test]
+    fn ship_target_names_pr_only_for_a_number_or_url_selector() {
+        // cadence-hooks#1005: (command, selector is a PR number/URL)
+        let cases = [
+            ("gh pr ready 12", true),
+            ("gh pr ready https://github.com/o/r/pull/12", true),
+            ("gh pr ready 12 --repo o/r", true),
+            ("gh pr ready", false),
+            ("gh pr ready feat/x", false),
+            ("gh pr create -t x", false),
+            ("gh pr ready --undo 12 ; gh pr create", false),
+        ];
+        for (command, want) in cases {
+            let segments = polish_ship_segments_for_origin(command, None);
+            let Some(segment) = segments.first() else {
+                assert!(!want, "{command} should anchor");
+                continue;
+            };
+            assert_eq!(segment.target.names_pr, want, "{command}");
+        }
     }
 
     #[test]

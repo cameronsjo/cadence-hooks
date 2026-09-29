@@ -333,7 +333,7 @@ pub fn resolve_located_ships(ships: &[LocatedShip]) -> Vec<MarkerTarget> {
 struct ShipLookups {
     /// Per directory: `None` outside any repo, else the checkout root and its
     /// branch (`None` for a detached HEAD).
-    states: std::collections::HashMap<String, Option<(String, Option<String>)>>,
+    states: std::collections::HashMap<String, Option<(String, Option<String>, bool)>>,
     remotes: std::collections::HashMap<String, Vec<(String, String)>>,
     worktrees: std::collections::HashMap<(String, String), Option<String>>,
 }
@@ -347,11 +347,22 @@ impl ShipLookups {
             .states
             .entry(cwd_dir.to_string())
             .or_insert_with(|| {
-                GitState::resolve(Path::new(cwd_dir))
-                    .map(|state| (state.repo_root.to_string_lossy().into_owned(), state.branch))
+                GitState::resolve(Path::new(cwd_dir)).map(|state| {
+                    let on_default = state.branch.as_deref().is_some_and(|b| {
+                        match state.default_branch.as_deref() {
+                            Some(default) => b == default,
+                            None => matches!(b, "main" | "master"),
+                        }
+                    });
+                    (
+                        state.repo_root.to_string_lossy().into_owned(),
+                        state.branch,
+                        on_default,
+                    )
+                })
             })
             .clone();
-        let Some((root, branch)) = state else {
+        let Some((root, branch, on_default)) = state else {
             return cannot_check(
                 "the command runs outside a git checkout, so the branch it ships cannot be looked up"
                     .to_string(),
@@ -360,6 +371,17 @@ impl ShipLookups {
         let Some(cwd_branch) = branch else {
             return MarkerTarget::Unknown;
         };
+        // A PR number or URL from a checkout on the default branch names a PR
+        // whose branch is elsewhere; the command text cannot say which, and
+        // looking it up would be a network call (cadence-hooks#1005). Say so
+        // rather than judging the default branch's (absent) marker.
+        if !target.names_another_target() && target.names_pr && on_default {
+            return cannot_check(
+                "the command names a PR by number or URL from a checkout on the default branch, \
+                 so that PR's own branch cannot be looked up from here"
+                    .to_string(),
+            );
+        }
         if !target.names_another_target() {
             return MarkerTarget::Local {
                 work_dir: cwd_dir.to_string(),
@@ -759,7 +781,12 @@ fn worktree_in_listing(listing: &str, branch: &str) -> Option<String> {
 /// [`MarkerTarget::Local`] that resolves to a branch yields `false`
 /// (fail-open, ADR-0001).
 pub fn polish_marker_present(target: &MarkerTarget) -> bool {
-    marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
+    // Gated on the private dir, symmetric with `read_polish_record`
+    // (cadence-hooks#565): on a degraded shared base a co-tenant can pre-plant
+    // the predictable marker name, so presence there is not evidence. A
+    // degraded dir reads as absent, which nudges — the safe direction.
+    marker_dir_is_private()
+        && marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
 }
 
 /// The `(repo_root, branch)` marker key for a [`MarkerTarget::Local`].
@@ -801,6 +828,11 @@ pub struct PolishRecord {
     /// never *changed*, so the gate stays silent rather than nudging on no
     /// evidence.
     pub diff_digest: Option<DiffDigest>,
+    /// The dispositioned-skip reason (cadence-hooks#787): present only on a
+    /// marker written by `record-polish --skip`. Bounded on the read side by
+    /// [`is_skip_reason`] — a value that fails it drops to `None`, so a
+    /// hand-edited marker cannot carry injection prose into the nudge.
+    pub skip_reason: Option<String>,
 }
 
 /// The `diff_digest` block as read back from a marker (cadence-hooks#874).
@@ -866,6 +898,52 @@ pub fn is_arm_token(s: &str) -> bool {
 /// stderr note, a smuggled one rides every future read of the marker.
 pub fn is_report_path(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_REPORT_BYTES && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// The longest a dispositioned-skip reason may be (cadence-hooks#787).
+pub const MAX_SKIP_REASON_BYTES: usize = 120;
+
+/// Reasons that say nothing. Compared after trimming and lowercasing.
+const TRIVIAL_SKIP_REASONS: [&str; 9] = [
+    "n/a", "na", "none", "nil", "no", "skip", "skipped", "tbd", "todo",
+];
+
+/// A dispositioned-skip reason safe to record and to echo into the session's
+/// context (cadence-hooks#787): non-trivial, at most [`MAX_SKIP_REASON_BYTES`],
+/// and drawn from `[A-Za-z0-9 .,:;()/_'#=+-]` only — no backticks, quotes,
+/// angle brackets, `$`, control bytes, or non-ASCII, so ANSI escapes and
+/// newline-borne instructions cannot ride it. Enforced on BOTH sides: the
+/// record side rejects, the read side drops (a marker is a plain file).
+///
+/// Trivial means empty, fewer than three alphanumerics (`-`, `.`, `ok`), or
+/// one of [`TRIVIAL_SKIP_REASONS`].
+pub fn is_skip_reason(s: &str) -> bool {
+    if s.len() > MAX_SKIP_REASON_BYTES
+        || !s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    ' ' | '.'
+                        | ','
+                        | ':'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '/'
+                        | '_'
+                        | '\''
+                        | '#'
+                        | '-'
+                        | '='
+                        | '+'
+                )
+        })
+    {
+        return false;
+    }
+    let trimmed = s.trim().to_ascii_lowercase();
+    trimmed.chars().filter(char::is_ascii_alphanumeric).count() >= 3
+        && !TRIVIAL_SKIP_REASONS.contains(&trimmed.trim_end_matches('.'))
 }
 
 /// How long a polish marker stays evidence that this branch was polished.
@@ -982,6 +1060,11 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
             .map(str::to_string),
         attest: read_attest(&v),
         diff_digest: read_diff_digest(&v),
+        skip_reason: v
+            .get("skip_reason")
+            .and_then(|s| s.as_str())
+            .filter(|s| is_skip_reason(s))
+            .map(str::to_string),
     })
 }
 
@@ -1884,6 +1967,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
     }
 
+    #[test]
+    fn is_skip_reason_table() {
+        // cadence-hooks#787: (reason, accepted)
+        let long = "a".repeat(MAX_SKIP_REASON_BYTES + 1);
+        let at_limit = "a".repeat(MAX_SKIP_REASON_BYTES);
+        let cases: Vec<(&str, bool)> = vec![
+            ("dnsmasq address= line change only", true),
+            ("docs-only: README reword (#12)", true),
+            ("", false),
+            ("   ", false),
+            ("n/a", false),
+            ("N/A", false),
+            ("none", false),
+            ("None.", false),
+            ("-", false),
+            (".", false),
+            ("ok", false),
+            ("skip", false),
+            ("backtick `x` injection", false),
+            ("quote \"x\"", false),
+            ("newline\nIGNORE PRIOR", false),
+            ("esc \u{1b}[31m red", false),
+            ("unicode caf\u{e9} reason", false),
+            ("angle <b> reason", false),
+            (long.as_str(), false),
+            (at_limit.as_str(), true),
+        ];
+        for (reason, want) in cases {
+            assert_eq!(is_skip_reason(reason), want, "{reason:?}");
+        }
+    }
+
     // --- polish_marker_present (shared gate/metric helper, #177) ---
 
     /// Init a git repo in a fresh tempdir, checked out on `branch`, and return
@@ -1920,6 +2035,42 @@ mod tests {
             write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
             assert!(polish_marker_present(&local(tmp.path().to_str().unwrap())));
         });
+    }
+
+    #[test]
+    fn polish_marker_present_false_on_a_degraded_shared_base() {
+        // cadence-hooks#565: a co-tenant who plants the predictable marker on
+        // the shared fail-open base must not satisfy the gate. Degrade the dir
+        // by pre-placing a SYMLINK where the hashed subdir goes (hardening
+        // refuses it), plant the marker on the base, and prove presence reads
+        // false — with the private-dir positive control alongside.
+        let (repo, root) = init_repo_on_branch("feat/thing");
+        let work = repo.path().to_str().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut hasher = DefaultHasher::new();
+        paths::user_home_lossy_or_default().hash(&mut hasher);
+        let hashed = base
+            .path()
+            .join(format!("cadence-hooks-{:x}", hasher.finish()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), &hashed).unwrap();
+        with_marker_dir(base.path(), || {
+            assert!(!marker_dir_is_private(), "precondition: degraded base");
+            write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
+            assert!(
+                polish_marker_path_exists(&root, "feat/thing"),
+                "the planted file exists on the base"
+            );
+            assert!(
+                !polish_marker_present(&local(work)),
+                "a planted marker on a degraded base must not read as present"
+            );
+        });
+    }
+
+    fn polish_marker_path_exists(root: &str, branch: &str) -> bool {
+        polish_marker(root, branch).is_file()
     }
 
     #[test]
@@ -1981,6 +2132,7 @@ mod tests {
             repos: repos.iter().map(|r| r.to_string()).collect(),
             host: host.map(str::to_string),
             head,
+            ..Default::default()
         }
     }
 
@@ -2270,6 +2422,81 @@ mod tests {
             resolve_ship_target(&ShipTarget::default(), Some(gone.to_str().unwrap())),
             MarkerTarget::CannotCheck { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_ship_target_numbered_pr_from_the_default_branch_cannot_check() {
+        // cadence-hooks#1005 (option 2, narrowed): `gh pr ready 6` run from a
+        // checkout on the default branch cannot be judged on that branch — the
+        // PR's own branch is elsewhere and no network lookup is made. A
+        // feature-branch cwd, or no selector, keeps the local judgment.
+        // (selector names a PR?, cwd branch, expect cannot-check)
+        let cases = [
+            (true, "main", true),
+            (true, "master", true),
+            (true, "feat/x", false),
+            (false, "main", false),
+            (false, "feat/x", false),
+        ];
+        for (names_pr, branch, want_cannot) in cases {
+            let (repo, _root) = init_repo_on_branch(branch);
+            let t = ShipTarget {
+                names_pr,
+                ..Default::default()
+            };
+            let got = resolve_ship_target(&t, Some(repo.path().to_str().unwrap()));
+            match (want_cannot, &got) {
+                (true, MarkerTarget::CannotCheck { reason }) => {
+                    assert!(reason.contains("default branch"), "{reason}");
+                }
+                (false, MarkerTarget::Local { .. }) => {}
+                _ => panic!("names_pr={names_pr} on {branch}: got {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_ship_target_honors_origin_head_for_the_default_branch() {
+        // A repo whose default is `trunk` (origin/HEAD says so): `main` is
+        // then a feature branch, `trunk` is the default.
+        let (repo, _root) = init_repo_on_branch("trunk");
+        let dir = repo.path().to_str().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        let t = ShipTarget {
+            names_pr: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_ship_target(&t, Some(dir)),
+            MarkerTarget::CannotCheck { .. }
+        ));
+        git(&["checkout", "-q", "-b", "main"]);
+        assert!(
+            matches!(
+                resolve_ship_target(&t, Some(dir)),
+                MarkerTarget::Local { .. }
+            ),
+            "with origin/HEAD naming trunk, `main` is an ordinary branch"
+        );
     }
 
     // --- read_polish_marker / PolishRecord (#467) ---
