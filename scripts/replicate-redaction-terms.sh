@@ -41,6 +41,44 @@ count_terms() {
   printf '%s' "${c:-0}"
 }
 
+# Check the binary's own reading of the list against an independent one
+# (cameronsjo/cadence-hooks#589). `--status` reports `term_count` and
+# `term_digest`: the count of terms, and the first 12 hex characters of the
+# SHA-256 over the trimmed term values, sorted and joined by newlines. Every
+# other check here proves the file is well-formed; this is the one that can
+# tell a substituted term from the right one (19-vs-18 with a prose fragment
+# admitted and a real term displaced parsed cleanly and reported ARMED).
+# A mismatch is fatal. A binary too old to print the fields, or no python3 to
+# recompute with, is a warning: the check could not run, which is not a fail.
+verify_count_and_digest() {
+  local out="$1" count="$2" bin_count bin_digest want
+  bin_count=$(printf '%s\n' "$out" | sed -n 's/^term_count: //p' | head -1)
+  bin_digest=$(printf '%s\n' "$out" | sed -n 's/^term_digest: //p' | head -1)
+  if [ -z "$bin_count" ] || [ -z "$bin_digest" ]; then
+    warn "This cadence-hooks does not report term_count/term_digest — could not verify the list is the RIGHT one."
+    return 0
+  fi
+  if [ "$bin_count" != "$count" ]; then
+    die "Binary counts $bin_count term(s) but the file has $count [[terms]] header(s) — the file parses differently than it reads. Not trusting it."
+  fi
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import tomllib' 2>/dev/null; then
+    warn "python3 with tomllib (3.11+) not available — could not recompute the digest independently."
+    return 0
+  fi
+  want=$(python3 -c 'import sys,tomllib,hashlib
+d = tomllib.load(open(sys.argv[1], "rb"))
+v = sorted(t["term"].strip() for t in d.get("terms", []))
+print(hashlib.sha256("\n".join(v).encode()).hexdigest()[:12])' "$TARGET" 2>/dev/null)
+  if [ -z "$want" ]; then
+    warn "Could not recompute the term digest from $TARGET."
+    return 0
+  fi
+  if [ "$want" != "$bin_digest" ]; then
+    die "Term digest mismatch: binary $bin_digest, recomputed $want. The binary and this script disagree about which terms are in $TARGET. Not trusting it."
+  fi
+  ok "Term digest $bin_digest matches an independent recomputation ($count terms)."
+}
+
 # Independent confirmation from the binary, not this script's own bookkeeping.
 # Factored out because the reentrant path needs it too: counting `[[terms]]`
 # headers proves a header exists, not that the file parses — a TOML truncated
@@ -79,10 +117,13 @@ verify_with_binary() {
   say "Verifying with the binary ($ver):"
   # Capture the exit code DIRECTLY. An `if cmd; then …; fi` whose condition
   # fails and has no else returns 0, so a trailing `rc=$?` reads 0 regardless.
-  cadence-hooks cadence redact-scan --status
+  local status_out
+  status_out=$(cadence-hooks cadence redact-scan --status)
   local rc=$?
+  printf '%s\n' "$status_out"
   say ""
   if [ "$rc" -eq 0 ]; then
+    verify_count_and_digest "$status_out" "$count"
     say "VERDICT: ${G}armed${N} ($count terms)"
     exit 0
   fi
