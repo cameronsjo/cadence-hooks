@@ -1051,26 +1051,27 @@ pub(crate) fn read_plan_store_file(path: &str) -> Option<String> {
 /// injected so tests never mutate `CLAUDE_CONFIG_DIR` (a process-global other
 /// tests read concurrently).
 ///
-/// **Open once, then judge the opened handle** (cadence-hooks#763). The old
-/// shape canonicalized and containment-checked the PATH, then opened it in a
-/// second step, so a swap inside `<config>/plans` between the two (a
-/// directory component replaced by a symlink leading out of the store) was
-/// followed at open time: the check vouched for one object and the read
-/// returned another. Now the path is opened first
-/// ([`open_plan_store_candidate`]) and [`opened_plan_is_contained`] decides
-/// on the object actually opened.
+/// Containment is decided by how the file is OPENED, never by comparing
+/// paths after the fact (cadence-hooks#763). The earlier shape canonicalized
+/// and nesting-checked the path, then opened it; any re-resolution of a path
+/// after (or before) the open leaves a window in which a directory inside the
+/// store can be swapped for a symlink leading out of it. See
+/// [`open_contained_plan`] for what each platform guarantees.
+///
+/// On top of containment, the opened handle must be a regular file with a
+/// single link: a hardlink placed in the store to a file outside it (a
+/// credential, a key) is the same inode under an in-store `.md` name, so no
+/// name-based check can see it; `nlink == 1` does (Unix only — std has no
+/// stable link count elsewhere).
 fn read_plan_store_file_within(path: &str, plan_store_root: &Path) -> Option<String> {
     use std::io::Read as _;
     let path = Path::new(path);
     if path.extension().is_none_or(|ext| ext != "md") {
         return None;
     }
-    // Cheap early answer only; the decision is made on the opened handle.
-    if !fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let file = open_plan_store_candidate(path).ok()?;
-    if !opened_plan_is_contained(&file, path, plan_store_root) {
+    let file = open_contained_plan(path, plan_store_root)?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || !single_link(&meta) {
         return None;
     }
     let mut content = String::new();
@@ -1083,74 +1084,119 @@ fn read_plan_store_file_within(path: &str, plan_store_root: &Path) -> Option<Str
     Some(content)
 }
 
-/// Open a plan-store candidate for reading. On Unix the final component is
-/// opened `O_NOFOLLOW` (a symlink fails the open rather than being followed),
-/// `O_NONBLOCK` (a path swapped for a FIFO cannot stall the hook on a writer
-/// that never comes; the handle is then rejected as non-regular), and
-/// `O_NOCTTY`. Elsewhere a plain open; [`opened_plan_is_contained`] is the
-/// check that decides either way.
-fn open_plan_store_candidate(path: &Path) -> std::io::Result<fs::File> {
-    #[cfg(unix)]
-    {
+/// The candidate's path components below the store root, or `None` when it
+/// is not lexically under the root as given or under its canonical form, or
+/// when any component is not a plain name (`..`, a root, a prefix).
+fn plan_store_relative_names<'p>(
+    path: &'p Path,
+    root: &Path,
+    canonical_root: &Path,
+) -> Option<Vec<&'p std::ffi::OsStr>> {
+    let relative = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(canonical_root))
+        .ok()?;
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => names.push(name),
+            _ => return None,
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// Open `path` only if it names a file inside `plan_store_root`.
+///
+/// **Unix (the guarantee).** Only the store ROOT is canonicalized (it may
+/// itself be a symlink, e.g. `~/.claude` pointing elsewhere) and opened as a
+/// directory. The candidate's components below it
+/// ([`plan_store_relative_names`]) are then walked with `openat`: every
+/// intermediate name `O_DIRECTORY | O_NOFOLLOW`, the final name
+/// `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY` (a FIFO cannot stall the open; the
+/// caller's fstat rejects it). A symlink at ANY level below the root fails
+/// the walk, and no path is resolved again after the root, so a concurrent
+/// swap cannot redirect the open out of the store: the handle returned is
+/// always a file reached through real directories under the root as it was
+/// when the root was opened. Consequence, deliberate: a directory symlink
+/// INSIDE the store is unsupported even when it stays inside — Claude Code
+/// writes plans flat into the store, so nothing legitimate needs one.
+///
+/// **Other platforms (best-effort).** No `openat` in std: the path is
+/// canonicalized and nesting-checked, opened, and the opened handle is
+/// compared to the canonical path's metadata by length, modified, and created
+/// time. That narrows but does not close the swap window, and an attacker able
+/// to forge those on a decoy defeats the comparison.
+#[cfg(unix)]
+fn open_contained_plan(path: &Path, plan_store_root: &Path) -> Option<fs::File> {
+    let canonical_root = plan_store_root.canonicalize().ok()?;
+    let names = plan_store_relative_names(path, plan_store_root, &canonical_root)?;
+    let (last, dirs) = names.split_last()?;
+    let mut dir = {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(path)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&canonical_root)
+            .ok()?
+    };
+    for name in dirs {
+        dir = openat(
+            &dir,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
     }
-    #[cfg(not(unix))]
-    {
-        fs::File::open(path)
-    }
+    openat(
+        &dir,
+        last,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+    )
 }
 
-/// Is the OPENED `file` a regular file that `path` resolves to inside
-/// `plan_store_root` right now?
-///
-/// Runs strictly after the open: `fstat` the handle, then canonicalize `path`
-/// and require nesting under the canonical root, then require the object at
-/// the canonical path to BE the opened object. A swap before the open that is
-/// undone before this check fails the identity comparison (the opened handle
-/// is the out-of-store file, the path now names an in-store one); a swap left
-/// in place fails the nesting check. So the handle read is always one the
-/// store contains at check time.
-///
-/// Identity is `(dev, ino)` on Unix. std exposes no stable file id on other
-/// platforms, so the fallback compares length plus modified and created
-/// times: a best-effort match that an attacker able to set file times on a
-/// same-length decoy can defeat, which is the residual window there.
-fn opened_plan_is_contained(file: &fs::File, path: &Path, plan_store_root: &Path) -> bool {
-    let Ok(opened) = file.metadata() else {
-        return false;
-    };
-    if !opened.is_file() {
-        return false;
-    }
-    let (Ok(canonical), Ok(canonical_root)) = (path.canonicalize(), plan_store_root.canonicalize())
-    else {
-        return false;
-    };
-    if !canonical.starts_with(&canonical_root) {
-        return false;
-    }
-    let Ok(at_path) = fs::metadata(&canonical) else {
-        return false;
-    };
-    same_file(&opened, &at_path)
-}
-
+/// `openat(dir, name, flags)` as an owned [`fs::File`]; `None` on any error,
+/// including a name that cannot be a C string.
 #[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
+fn openat(dir: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -> Option<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+    // SAFETY: `dir` is an open descriptor for the duration of the call and
+    // `name` is a NUL-terminated string; a non-negative return is a fresh
+    // descriptor this function takes sole ownership of.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    (fd >= 0).then(|| unsafe { fs::File::from_raw_fd(fd) })
 }
 
 #[cfg(not(unix))]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    b.is_file()
-        && a.len() == b.len()
-        && a.modified().ok() == b.modified().ok()
-        && a.created().ok() == b.created().ok()
+fn open_contained_plan(path: &Path, plan_store_root: &Path) -> Option<fs::File> {
+    let canonical_root = plan_store_root.canonicalize().ok()?;
+    plan_store_relative_names(path, plan_store_root, &canonical_root)?;
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let at_path = fs::metadata(&canonical).ok()?;
+    let same = opened.len() == at_path.len()
+        && opened.modified().ok() == at_path.modified().ok()
+        && opened.created().ok() == at_path.created().ok();
+    same.then_some(file)
+}
+
+#[cfg(unix)]
+fn single_link(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn single_link(_meta: &fs::Metadata) -> bool {
+    true
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -3669,8 +3715,8 @@ mod tests {
             None
         );
 
-        // A symlinked .md in-store pointing outside — rejected: the whole
-        // final path canonicalizes before the nesting check.
+        // A symlinked .md in-store pointing outside — rejected: the final
+        // component is opened `O_NOFOLLOW` (cadence-hooks#763).
         #[cfg(unix)]
         {
             let link = root.join("escape.md");
@@ -3682,115 +3728,217 @@ mod tests {
         }
     }
 
-    /// cadence-hooks#763: containment is judged on the OPENED handle, so a
-    /// swap between the path check and the open can no longer hand the reader
-    /// an object the check never vouched for. Each row opens a candidate,
-    /// optionally mutates the tree (the attacker's move between open and
-    /// check), then asks [`opened_plan_is_contained`]. `path_check_passes`
-    /// records what the pre-#763 path-only check (canonicalize + nesting)
-    /// said at that same moment: the rows where it is `true` but the verdict
-    /// is `false` are exactly the oracle this closes.
+    /// cadence-hooks#763, end to end through [`read_plan_store_file_within`].
+    /// Each row builds a tree under one temp dir (`store/`, `outside/`) and
+    /// returns (root, candidate, expect a read). The walk opens every level
+    /// `O_NOFOLLOW`, so a symlink anywhere below the root reads as "no plan".
+    /// A write-temp-then-rename of an in-store plan during the read yields
+    /// either the old or the new in-store file (both reached by the walk); on
+    /// the non-Unix fallback the same race degrades to `None`, which is the
+    /// intended fail-open answer (ADR-0001).
     #[cfg(unix)]
     #[test]
-    fn plan_store_containment_is_judged_on_the_opened_handle() {
-        type Setup = fn(&Path, &Path) -> (fs::File, PathBuf);
-        fn open(p: &Path) -> fs::File {
-            open_plan_store_candidate(p).expect("candidate must open")
+    fn plan_store_read_walks_the_store_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+        type Setup = fn(&Path) -> (PathBuf, PathBuf);
+        fn plan(dir: &Path, name: &str, text: &str) -> PathBuf {
+            fs::create_dir_all(dir).unwrap();
+            let p = dir.join(name);
+            fs::write(&p, text).unwrap();
+            p
         }
-        fn in_store_file(root: &Path, _outside: &Path) -> (fs::File, PathBuf) {
-            let p = root.join("plan.md");
-            fs::write(&p, "# Plan").unwrap();
-            (open(&p), p)
+        fn store(base: &Path) -> PathBuf {
+            let s = base.join("store");
+            fs::create_dir_all(&s).unwrap();
+            s
         }
-        fn swap_then_undo(root: &Path, outside: &Path) -> (fs::File, PathBuf) {
-            // Open while `sub` is a symlink leading out of the store...
-            fs::write(outside.join("plan.md"), "SECRET").unwrap();
-            std::os::unix::fs::symlink(outside, root.join("sub")).unwrap();
-            let p = root.join("sub/plan.md");
-            let file = open(&p);
-            // ...then put a real in-store file back at the same path.
-            fs::remove_file(root.join("sub")).unwrap();
-            fs::create_dir(root.join("sub")).unwrap();
-            fs::write(&p, "# Decoy").unwrap();
-            (file, p)
+        fn flat(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            (s.clone(), plan(&s, "plan.md", "# Plan"))
         }
-        fn swap_left_in_place(root: &Path, outside: &Path) -> (fs::File, PathBuf) {
-            fs::write(outside.join("plan.md"), "SECRET").unwrap();
-            std::os::unix::fs::symlink(outside, root.join("sub")).unwrap();
-            let p = root.join("sub/plan.md");
-            (open(&p), p)
+        fn nested_real_dir(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            (s.clone(), plan(&s.join("sub"), "plan.md", "# Plan"))
         }
-        fn replaced_by_other_in_store_file(root: &Path, _o: &Path) -> (fs::File, PathBuf) {
-            let p = root.join("plan.md");
-            fs::write(&p, "# Original").unwrap();
-            let file = open(&p);
-            fs::remove_file(&p).unwrap();
-            fs::write(&p, "# Replacement").unwrap();
-            (file, p)
+        fn root_is_a_symlink(base: &Path) -> (PathBuf, PathBuf) {
+            plan(&base.join("real"), "plan.md", "# Plan");
+            symlink(base.join("real"), base.join("store")).unwrap();
+            (base.join("store"), base.join("store/plan.md"))
         }
-        fn fifo_at_final_component(root: &Path, _o: &Path) -> (fs::File, PathBuf) {
-            let p = root.join("plan.md");
+        fn root_symlink_candidate_in_canonical_form(base: &Path) -> (PathBuf, PathBuf) {
+            let p = plan(&base.join("real"), "plan.md", "# Plan");
+            symlink(base.join("real"), base.join("store")).unwrap();
+            (base.join("store"), p.canonicalize().unwrap())
+        }
+        fn intermediate_dir_symlink_out(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            plan(&base.join("outside"), "plan.md", "SECRET");
+            symlink(base.join("outside"), s.join("sub")).unwrap();
+            (s.clone(), s.join("sub/plan.md"))
+        }
+        // Intentional: a directory symlink that stays INSIDE the store is
+        // refused too. Claude Code writes plans flat; nothing needs one.
+        fn intermediate_dir_symlink_in_store(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            plan(&s.join("real"), "plan.md", "# Plan");
+            symlink(s.join("real"), s.join("sub")).unwrap();
+            (s.clone(), s.join("sub/plan.md"))
+        }
+        fn final_symlink_out(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            let secret = plan(&base.join("outside"), "secret.md", "SECRET");
+            symlink(secret, s.join("plan.md")).unwrap();
+            (s.clone(), s.join("plan.md"))
+        }
+        fn final_symlink_in_store(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            let real = plan(&s, "real.md", "# Plan");
+            symlink(real, s.join("plan.md")).unwrap();
+            (s.clone(), s.join("plan.md"))
+        }
+        fn fifo(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            let p = s.join("plan.md");
             let c = std::ffi::CString::new(p.to_string_lossy().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-            // O_NONBLOCK: this open returns at once instead of waiting for a writer.
-            (open(&p), p)
+            (s, p)
+        }
+        fn hardlink_to_outside(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            let secret = plan(&base.join("outside"), "credentials", "SECRET");
+            fs::hard_link(secret, s.join("plan.md")).unwrap();
+            (s.clone(), s.join("plan.md"))
+        }
+        fn dot_dot_escape(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            plan(&base.join("outside"), "plan.md", "SECRET");
+            (s.clone(), s.join("../outside/plan.md"))
+        }
+        fn not_under_root(base: &Path) -> (PathBuf, PathBuf) {
+            let s = store(base);
+            (s, plan(&base.join("outside"), "plan.md", "SECRET"))
         }
 
-        let rows: [(&str, Setup, bool, bool); 5] = [
-            ("in-store regular file", in_store_file, true, true),
+        let rows: [(&str, Setup, bool); 12] = [
+            ("flat in-store plan", flat, true),
+            ("nested real subdirectory", nested_real_dir, true),
             (
-                "swap before open, undone before check",
-                swap_then_undo,
+                "store root is a symlink to a real dir",
+                root_is_a_symlink,
                 true,
-                false,
             ),
             (
-                "swap before open, left in place",
-                swap_left_in_place,
-                false,
-                false,
-            ),
-            (
-                "path re-pointed at another in-store file",
-                replaced_by_other_in_store_file,
+                "candidate named via the canonical root",
+                root_symlink_candidate_in_canonical_form,
                 true,
+            ),
+            (
+                "intermediate dir symlink leading out",
+                intermediate_dir_symlink_out,
                 false,
             ),
             (
-                "FIFO at the final component",
-                fifo_at_final_component,
-                true,
+                "intermediate dir symlink inside the store",
+                intermediate_dir_symlink_in_store,
                 false,
             ),
+            ("final symlink leading out", final_symlink_out, false),
+            (
+                "final symlink inside the store",
+                final_symlink_in_store,
+                false,
+            ),
+            ("FIFO (must not block)", fifo, false),
+            ("hardlink to an outside file", hardlink_to_outside, false),
+            ("dot-dot escape", dot_dot_escape, false),
+            ("candidate not under the root", not_under_root, false),
         ];
-        for (name, setup, path_check_passes, want) in rows {
-            let store = TempDir::new().unwrap();
-            let outside = TempDir::new().unwrap();
-            let (file, path) = setup(store.path(), outside.path());
-            let path_only = path
-                .canonicalize()
-                .is_ok_and(|c| c.starts_with(store.path().canonicalize().unwrap()));
-            assert_eq!(path_only, path_check_passes, "{name}: path-only control");
-            assert_eq!(
-                opened_plan_is_contained(&file, &path, store.path()),
-                want,
-                "{name}"
-            );
+        for (name, setup, want) in rows {
+            let base = TempDir::new().unwrap();
+            let (root, candidate) = setup(base.path());
+            let got = read_plan_store_file_within(&candidate.to_string_lossy(), &root);
+            assert_eq!(got.is_some(), want, "{name}: {got:?}");
+            if let Some(text) = got {
+                assert!(!text.contains("SECRET"), "{name}");
+            }
         }
     }
 
-    /// A symlinked final component fails the open itself (`O_NOFOLLOW`), even
-    /// when the link stays inside the store.
-    #[cfg(unix)]
+    /// Portable rows: the plain accept/reject shapes hold on every platform,
+    /// including the non-Unix best-effort fallback.
     #[test]
-    fn plan_store_open_refuses_a_symlinked_final_component() {
-        let store = TempDir::new().unwrap();
-        let target = store.path().join("real.md");
-        fs::write(&target, "# Plan").unwrap();
-        let link = store.path().join("link.md");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open_plan_store_candidate(&link).is_err());
-        assert!(open_plan_store_candidate(&target).is_ok());
+    fn plan_store_read_accepts_a_flat_plan_and_rejects_escapes_on_every_platform() {
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(base.path().join("outside")).unwrap();
+        fs::write(root.join("plan.md"), "# Plan").unwrap();
+        fs::write(base.path().join("outside/plan.md"), "SECRET").unwrap();
+        let rows: [(PathBuf, bool); 4] = [
+            (root.join("plan.md"), true),
+            (root.join("..").join("outside").join("plan.md"), false),
+            (base.path().join("outside").join("plan.md"), false),
+            (root.clone(), false),
+        ];
+        for (candidate, want) in rows {
+            let got = read_plan_store_file_within(&candidate.to_string_lossy(), &root);
+            assert_eq!(got.is_some(), want, "{}", candidate.display());
+        }
+    }
+
+    /// The race the walk closes, driven for real: a thread flips `store/sub`
+    /// between a real directory and a symlink to `outside/` with
+    /// `renameat2(RENAME_EXCHANGE)` while the reader reads `store/sub/plan.md`.
+    /// The pre-walk reader leaked here (834 of 200k attempts in review). With
+    /// the walk a symlinked `sub` fails its `O_NOFOLLOW` open, so the leak
+    /// count is zero by construction, not by timing, and the test cannot flake
+    /// toward a false failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plan_store_read_never_leaks_under_a_live_directory_swap() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("store");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/plan.md"), "# Plan").unwrap();
+        fs::create_dir_all(base.path().join("outside")).unwrap();
+        fs::write(base.path().join("outside/plan.md"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(base.path().join("outside"), root.join("evil")).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let a = std::ffi::CString::new(root.join("sub").to_string_lossy().as_bytes()).unwrap();
+            let b = std::ffi::CString::new(root.join("evil").to_string_lossy().as_bytes()).unwrap();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: two valid NUL-terminated paths; the return value
+                    // is ignored (an exchange failure just skips a flip).
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            libc::AT_FDCWD,
+                            a.as_ptr(),
+                            libc::AT_FDCWD,
+                            b.as_ptr(),
+                            libc::RENAME_EXCHANGE,
+                        );
+                    }
+                }
+            })
+        };
+        let candidate = root.join("sub/plan.md").to_string_lossy().into_owned();
+        let mut leaks = 0;
+        for _ in 0..20_000 {
+            if read_plan_store_file_within(&candidate, &root).is_some_and(|t| t.contains("SECRET"))
+            {
+                leaks += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(leaks, 0);
     }
 
     #[test]
