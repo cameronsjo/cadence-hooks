@@ -312,7 +312,7 @@ const MAX_CLOSE_DIRS: usize = 16;
 fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
     let mut dirs = vec![parse_work_dir(command, cwd)];
     for (segment, dir) in command_segments_with_dirs(command, cwd) {
-        if dirs.contains(&dir)
+        if dirs.iter().any(|seen| *seen == *dir)
             || !gh_issue_calls(&segment)
                 .iter()
                 .any(|call| call.subcommand == "close")
@@ -322,7 +322,7 @@ fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
         if dirs.len() == MAX_CLOSE_DIRS {
             return None;
         }
-        dirs.push(dir);
+        dirs.push(dir.to_string());
     }
     let mut slugs: Vec<Slug> = dirs.iter().flat_map(|dir| remote_slugs(dir)).collect();
     slugs.sort();
@@ -602,5 +602,63 @@ mod tests {
             ledger_path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
         };
         assert_eq!(missing.run(&input).outcome, Outcome::Allow);
+    }
+
+    /// A hermetic checkout whose `origin` is `url`.
+    fn origin_checkout(url: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", url]);
+        repo
+    }
+
+    /// A bare close is matched against the remotes of the whole-command
+    /// directory AND of the directory its own segment runs in. Every row is
+    /// `(command, run from the held repo's checkout?, blocks?)`; `{H}` is the
+    /// checkout whose origin carries a held number, `{F}` one that does not.
+    #[test]
+    fn bare_close_is_judged_where_its_own_segment_runs() {
+        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
+            return;
+        }
+        let held = origin_checkout("https://github.com/cameronsjo/cadence-ecosystem.git");
+        let free = origin_checkout("https://github.com/cameronsjo/free.git");
+        let h = held.path().to_str().unwrap();
+        let f = free.path().to_str().unwrap();
+        let ledger_dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_dir.path().join("held.txt");
+        std::fs::write(&ledger, LEDGER).unwrap();
+        let guard = GuardHeldClose {
+            ledger_path: Some(ledger.to_string_lossy().into_owned()),
+        };
+        for (command, in_held, blocks) in [
+            // Allowed on the base.
+            ("echo hi\ncd {H}\ngh issue close 354", false, true),
+            ("true & cd {H}; gh issue close 354", false, true),
+            ("{ cd {H}; }; gh issue close 354", false, true),
+            ("(true; cd {F} ); gh issue close 354", true, true),
+            // Blocked on the base, and still.
+            ("cd {H} && gh issue close 354", false, true),
+            ("gh issue close 354", true, true),
+            // Controls.
+            ("gh issue close 354", false, false),
+            ("cd {F} && gh issue close 354", true, false),
+            (
+                "(cd {H} && gh issue view 354); gh issue close 354",
+                false,
+                false,
+            ),
+        ] {
+            let command = command.replace("{H}", h).replace("{F}", f);
+            let cwd = if in_held { h } else { f };
+            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&command, cwd);
+            let result = guard.run(&input);
+            assert_eq!(
+                result.outcome == Outcome::Block,
+                blocks,
+                "{command} (from {cwd}): {:?}",
+                result.message
+            );
+        }
     }
 }

@@ -230,7 +230,7 @@ fn resolve_current_branch(input: &HookInput, command: &str) -> BranchResolution 
     let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
     let mut dirs = vec![parse_work_dir(command, cwd)];
     for (segment, dir) in command_segments_with_dirs(command, cwd) {
-        if dirs.contains(&dir) {
+        if dirs.iter().any(|seen| *seen == *dir) {
             continue;
         }
         let norm_tokens = normalize_git_command(strip_group_wrappers(&segment));
@@ -241,7 +241,7 @@ fn resolve_current_branch(input: &HookInput, command: &str) -> BranchResolution 
         if dirs.len() == MAX_BRANCH_DIRS {
             return BranchResolution::Unresolvable;
         }
-        dirs.push(dir);
+        dirs.push(dir.to_string());
     }
     sharpest_branch(dirs.iter().map(|dir| branch_in(dir)))
 }
@@ -2185,6 +2185,76 @@ mod tests {
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,
                 "{command}"
+            );
+        }
+    }
+
+    /// A hermetic checkout on `branch`.
+    fn checkout_on(branch: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["checkout", "-q", "-B", branch]);
+        repo
+    }
+
+    /// A bare-`HEAD` force push reads the branch where its own segment runs
+    /// as well as in the whole-command directory, and the sharpest answer
+    /// wins. Every row is `(command, run from the `main` checkout?,
+    /// blocks?)`; `{M}` is on `main`, `{F}` on a feature branch.
+    #[test]
+    fn bare_head_force_push_reads_the_branch_where_its_segment_runs() {
+        let main = checkout_on("main");
+        let feat = checkout_on("feat");
+        let m = main.path().to_str().unwrap();
+        let f = feat.path().to_str().unwrap();
+        for (command, on_main, blocks) in [
+            // Allowed on the base.
+            ("echo hi\ncd {M}\ngit push --force origin HEAD", false, true),
+            ("true & cd {M}; git push --force origin HEAD", false, true),
+            ("{ cd {M}; }; git push --force origin HEAD", false, true),
+            ("(true; cd {F} ); git push --force origin HEAD", true, true),
+            // Blocked on the base, and still.
+            ("cd {M} && git push --force origin HEAD", false, true),
+            ("git push --force origin HEAD", true, true),
+            // Controls.
+            ("git push --force origin HEAD", false, false),
+            ("cd {F} && git push --force origin HEAD", true, false),
+            (
+                "(cd {M} && git status); git push --force origin HEAD",
+                false,
+                false,
+            ),
+        ] {
+            let command = command.replace("{M}", m).replace("{F}", f);
+            let cwd = if on_main { m } else { f };
+            let result = GitSafetyGuard.run(&make_bash_with_cwd(&command, cwd));
+            assert_eq!(
+                result.outcome == cadence_hooks_core::Outcome::Block,
+                blocks,
+                "{command} (from {cwd}): {:?}",
+                result.message
+            );
+        }
+    }
+
+    #[test]
+    fn sharpest_branch_ranks_protected_then_unresolvable_then_timeout() {
+        use BranchResolution::{Branch, TimedOut, Unresolvable};
+        let feat = || Branch("feat".to_string());
+        let main = || Branch("main".to_string());
+        for (resolutions, want) in [
+            (vec![feat(), main()], main()),
+            (vec![main(), Unresolvable], main()),
+            (vec![feat(), Unresolvable], Unresolvable),
+            (vec![TimedOut, Unresolvable], Unresolvable),
+            (vec![feat(), TimedOut], TimedOut),
+            (vec![feat(), Branch("other".to_string())], feat()),
+            (vec![], Unresolvable),
+        ] {
+            assert_eq!(
+                sharpest_branch(resolutions.clone()),
+                want,
+                "{resolutions:?}"
             );
         }
     }

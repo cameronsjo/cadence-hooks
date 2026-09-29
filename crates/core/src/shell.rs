@@ -4902,9 +4902,24 @@ pub struct LocatedSegment {
     /// The segment as the top-level splitter cut it, group openers and
     /// closers included.
     pub raw: String,
-    /// The directory the segment's own command runs in.
-    pub dir: String,
+    /// The directory the segment's own command runs in, shared by every
+    /// segment that runs there so a flood of segments costs one copy.
+    /// [`UNRESOLVABLE_DIR`] once a `cd` chain grows it past [`MAX_DIR_LEN`].
+    pub dir: std::rc::Rc<str>,
 }
+
+/// Longest directory [`segment_work_dirs`] tracks, in bytes — Linux's
+/// `PATH_MAX`. No `chdir` accepts a longer path, so a git lookup in one
+/// fails either way; past it the walk tracks [`UNRESOLVABLE_DIR`] instead,
+/// which bounds the work a flood of relative `cd`s buys at linear.
+pub const MAX_DIR_LEN: usize = 4096;
+
+/// The directory [`segment_work_dirs`] reports once a `cd` chain grows past
+/// [`MAX_DIR_LEN`]. The NUL makes it no path at all: a git lookup in it
+/// fails to spawn, which every caller reads as "not a repository", the same
+/// answer the over-long path would get. A relative `cd` leaves it in place;
+/// an absolute one moves off it.
+pub const UNRESOLVABLE_DIR: &str = "\0unresolvable: directory path too long";
 
 /// Every [`command_segments`] segment of `command`, each paired with the
 /// directory its top-level segment runs in ([`segment_work_dirs`]), in
@@ -4913,7 +4928,7 @@ pub struct LocatedSegment {
 ///
 /// The per-segment reading a guard judges alongside the whole-command
 /// [`parse_work_dir`] one; see [`segment_work_dirs`].
-pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, String)> {
+pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std::rc::Rc<str>)> {
     segment_work_dirs(command, cwd)
         .into_iter()
         .flat_map(|LocatedSegment { raw, dir }| {
@@ -4928,7 +4943,7 @@ pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, Stri
 /// back to, and whether the group runs in its own process however it ends.
 struct Group {
     subshell: bool,
-    saved_dir: String,
+    saved_dir: std::rc::Rc<str>,
     after_pipe: bool,
 }
 
@@ -4957,7 +4972,7 @@ struct Group {
 /// ([`segment_shape`]).
 pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
     let mut located = Vec::new();
-    let mut dir = cwd.to_string();
+    let mut dir: std::rc::Rc<str> = std::rc::Rc::from(cwd);
     let mut groups: Vec<Group> = Vec::new();
     let mut previous_op: Option<&str> = None;
     for (raw, op) in split_segments_with_ops_joining_redirects(command) {
@@ -4987,8 +5002,14 @@ pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
             let words = tokenize(body);
             if words.first().map(String::as_str) == Some("cd")
                 && let Some(target) = words.get(1)
+                && (&*dir != UNRESOLVABLE_DIR || looks_absolute(target) || target.starts_with('~'))
             {
-                dir = resolve_cd_target(target, &dir);
+                let resolved = resolve_cd_target(target, &dir);
+                dir = if resolved.len() > MAX_DIR_LEN {
+                    std::rc::Rc::from(UNRESOLVABLE_DIR)
+                } else {
+                    std::rc::Rc::from(resolved)
+                };
             }
         }
         let segment_dir = dir.clone();
@@ -16383,6 +16404,128 @@ mod tests {
             assert!(command.len() >= 200_000);
             let start = std::time::Instant::now();
             let _ = parse_work_dir(&command, "/unowned");
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(500),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    // --- segment_work_dirs ---
+
+    /// The directory the LAST segment runs in, per [`segment_work_dirs`].
+    /// Each row's bash behavior was checked with a `pwd` canary.
+    #[test]
+    fn segment_work_dirs_follows_where_each_segment_runs() {
+        for (command, want) in [
+            // A `cd` applies after any separator, a newline included.
+            ("echo hi\ncd /u\ngh pr create", "/u"),
+            ("cd /u; gh pr create", "/u"),
+            ("cd /u && gh pr create", "/u"),
+            ("true || cd /u\ngh pr create", "/u"),
+            // `&` backgrounds the command before it, not the `cd` after it.
+            ("true & cd /u; gh pr create", "/u"),
+            // A brace group shares the parent's directory...
+            ("{ cd /u; }; gh pr create", "/u"),
+            // ...unless it is piped or backgrounded.
+            ("echo x | { cd /u; }; gh pr create", "/cwd"),
+            ("{ cd /u; } & gh pr create", "/cwd"),
+            // A subshell's `cd` ends with it, however it was cut.
+            ("(cd /u); gh pr create", "/cwd"),
+            ("(true; cd /u ); gh pr create", "/cwd"),
+            ("(true; cd /u; true); gh pr create", "/cwd"),
+            ("(cd /u && gh pr view 1); gh pr create", "/cwd"),
+            // A `cd` in a pipeline stage or backgrounded moves nothing.
+            ("cd /u | cat; gh pr create", "/cwd"),
+            ("cd /u & gh pr create", "/cwd"),
+            // A `cd` in quoted text is not one.
+            ("echo \"; cd /u\"; gh pr create", "/cwd"),
+            // Relative targets accumulate.
+            ("cd a\ncd b\ngh pr create", "/cwd/a/b"),
+        ] {
+            let located = segment_work_dirs(command, "/cwd");
+            assert_eq!(
+                located.last().map(|segment| &*segment.dir),
+                Some(want),
+                "{command:?}: {located:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_shape_skips_quotes_and_pairs_inner_parens() {
+        let shape = |opens: &[bool], brace_closes, paren_closes| SegmentShape {
+            opens: opens.to_vec(),
+            brace_closes,
+            paren_closes,
+            inner_open: 0,
+        };
+        for (segment, want) in [
+            ("gh pr create", shape(&[], 0, 0)),
+            ("(cd x", shape(&[true], 0, 0)),
+            ("( (cd x", shape(&[true, true], 0, 0)),
+            ("gh pr create)", shape(&[], 0, 1)),
+            ("gh pr create) ", shape(&[], 0, 1)),
+            ("(cd x)", shape(&[true], 0, 1)),
+            ("cd x))", shape(&[], 0, 2)),
+            ("echo $(pwd)", shape(&[], 0, 0)),
+            ("echo $(pwd))", shape(&[], 0, 1)),
+            ("diff <(a) >(b))", shape(&[], 0, 1)),
+            ("{ (cd x", shape(&[false, true], 0, 0)),
+            ("{ cd x", shape(&[false], 0, 0)),
+            ("{cat,.env}", shape(&[], 0, 0)),
+            ("}", shape(&[], 1, 0)),
+            ("} }", shape(&[], 2, 0)),
+            ("echo \\)", shape(&[], 0, 0)),
+            ("echo \\))", shape(&[], 0, 1)),
+            ("grep \"fn main(\" f)", shape(&[], 0, 1)),
+            ("echo \":(\")", shape(&[], 0, 1)),
+            ("echo ')')", shape(&[], 0, 1)),
+            ("echo \"a\\\")\")", shape(&[], 0, 1)),
+            ("echo $'\\')')", shape(&[], 0, 1)),
+            ("echo 'unterminated )", shape(&[], 0, 0)),
+            (
+                "echo $(true",
+                SegmentShape {
+                    inner_open: 1,
+                    ..shape(&[], 0, 0)
+                },
+            ),
+        ] {
+            assert_eq!(segment_shape(segment), want, "{segment}");
+        }
+    }
+
+    #[test]
+    fn segment_work_dirs_marks_an_over_long_directory_unresolvable() {
+        let deep = "cd aaaaaaaa\n".repeat(MAX_DIR_LEN / 8);
+        for (command, want) in [
+            (format!("{deep}gh pr create"), UNRESOLVABLE_DIR),
+            // A relative `cd` leaves it there; an absolute one moves off.
+            (format!("{deep}cd b\ngh pr create"), UNRESOLVABLE_DIR),
+            (format!("{deep}cd /u\ngh pr create"), "/u"),
+        ] {
+            let located = segment_work_dirs(&command, "/cwd");
+            assert_eq!(located.last().map(|segment| &*segment.dir), Some(want));
+        }
+    }
+
+    #[test]
+    fn segment_work_dirs_stays_fast_on_adversarial_input() {
+        let relative = "cd a;".repeat(40_000);
+        let newlines = "cd a\n".repeat(40_000);
+        let absolute = format!("cd /{};", "a".repeat(4000)).repeat(50);
+        let subshells = "(true; cd /u ); ".repeat(13_000);
+        let groups = "{ cd /u; }; ".repeat(17_000);
+        let nested = format!("{}cd /u{}", "( ".repeat(70_000), " )".repeat(70_000));
+        let writes = "cd a; gh pr create -t x; ".repeat(8_000);
+        for command in [
+            relative, newlines, absolute, subshells, groups, nested, writes,
+        ] {
+            assert!(command.len() >= 200_000, "{}", command.len());
+            let start = std::time::Instant::now();
+            let _ = command_segments_with_dirs(&command, "/unowned");
             assert!(
                 start.elapsed() < std::time::Duration::from_millis(500),
                 "{:?}",

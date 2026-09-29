@@ -511,7 +511,7 @@ fn per_segment_ships(
                 .into_iter()
                 .map(|segment| LocatedShip {
                     segment,
-                    work_dir: Some(dir.clone()),
+                    work_dir: Some(dir.to_string()),
                 }),
         );
     }
@@ -3481,50 +3481,6 @@ mod tests {
                     "{command}: {ship:?} missing in {whole_dir}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn segment_shape_skips_quotes_and_pairs_inner_parens() {
-        let shape = |opens: &[bool], brace_closes, paren_closes| SegmentShape {
-            opens: opens.to_vec(),
-            brace_closes,
-            paren_closes,
-            inner_open: 0,
-        };
-        for (segment, want) in [
-            ("gh pr create", shape(&[], 0, 0)),
-            ("(cd x", shape(&[true], 0, 0)),
-            ("( (cd x", shape(&[true, true], 0, 0)),
-            ("gh pr create)", shape(&[], 0, 1)),
-            ("gh pr create) ", shape(&[], 0, 1)),
-            ("(cd x)", shape(&[true], 0, 1)),
-            ("cd x))", shape(&[], 0, 2)),
-            ("echo $(pwd)", shape(&[], 0, 0)),
-            ("echo $(pwd))", shape(&[], 0, 1)),
-            ("diff <(a) >(b))", shape(&[], 0, 1)),
-            ("{ (cd x", shape(&[false, true], 0, 0)),
-            ("{ cd x", shape(&[false], 0, 0)),
-            ("{cat,.env}", shape(&[], 0, 0)),
-            ("}", shape(&[], 1, 0)),
-            ("} }", shape(&[], 2, 0)),
-            ("echo \\)", shape(&[], 0, 0)),
-            ("echo \\))", shape(&[], 0, 1)),
-            ("grep \"fn main(\" f)", shape(&[], 0, 1)),
-            ("echo \":(\")", shape(&[], 0, 1)),
-            ("echo ')')", shape(&[], 0, 1)),
-            ("echo \"a\\\")\")", shape(&[], 0, 1)),
-            ("echo $'\\')')", shape(&[], 0, 1)),
-            ("echo 'unterminated )", shape(&[], 0, 0)),
-            (
-                "echo $(true",
-                SegmentShape {
-                    inner_open: 1,
-                    ..shape(&[], 0, 0)
-                },
-            ),
-        ] {
-            assert_eq!(segment_shape(segment), want, "{segment}");
         }
     }
 

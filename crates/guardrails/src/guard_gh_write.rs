@@ -3348,7 +3348,7 @@ impl Check for GhWriteGuard {
         let work_dir = parse_work_dir(command, cwd);
         let whole = command_segments(command)
             .into_iter()
-            .map(|segment| (segment, work_dir.clone()))
+            .map(|segment| (segment, std::rc::Rc::from(work_dir.as_str())))
             .collect();
         let mut judged = WriteJudgments::default();
         for readings in [whole, command_segments_with_dirs(command, cwd)] {
@@ -3384,7 +3384,7 @@ struct WriteJudgments {
     /// (segment, directory, inherited host, inherited repo) already judged.
     seen: std::collections::HashSet<[String; 4]>,
     /// Distinct directories besides the whole-command one judged so far.
-    dirs: Vec<String>,
+    dirs: Vec<std::rc::Rc<str>>,
 }
 
 /// The block for a command whose writes run in more than
@@ -3420,7 +3420,7 @@ fn too_many_dirs_block(
 /// inherits is tracked along the reading's own order.
 fn judge_write_segments(
     command: &str,
-    segments: Vec<(String, String)>,
+    segments: Vec<(String, std::rc::Rc<str>)>,
     whole_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
@@ -3518,7 +3518,7 @@ fn judge_write_segments(
         // that might not have run (`false && export …`) leaves more than
         // one, and the write must be owned on every one of them (#548).
         // The same for an inherited `GH_REPO` (cadence-hooks#1129).
-        if dir != whole_dir && !judged.dirs.contains(&dir) {
+        if &*dir != whole_dir && !judged.dirs.contains(&dir) {
             if judged.dirs.len() == MAX_SEGMENT_DIRS {
                 return Some(too_many_dirs_block(&segment, allowed_owners, allowed_repos));
             }
@@ -3528,7 +3528,7 @@ fn judge_write_segments(
             for env_repo in gh_repo_env.candidates() {
                 // A repeat of a judged (segment, directory, host, repo) can
                 // only repeat its verdict; skip its git probes.
-                let key = [&segment, &dir, env_host, env_repo].map(|s| s.to_string());
+                let key = [&segment, &*dir, env_host, env_repo].map(str::to_string);
                 if !judged.seen.insert(key) {
                     continue;
                 }
@@ -8272,6 +8272,108 @@ mod tests {
                     start.elapsed()
                 );
             }
+        });
+    }
+
+    /// Each gh write is judged in the whole-command `parse_work_dir`
+    /// directory AND the directory its own segment runs in, and the sharpest
+    /// verdict wins. Every row is `(command, run from the owned checkout?,
+    /// blocks?)`; `{O}`/`{U}` are the owned/unowned checkouts. The bash
+    /// behavior each bypass row relies on was checked with a `pwd` canary.
+    #[test]
+    fn gh_write_is_judged_where_its_own_segment_runs() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, in_owned, blocks) in [
+                // Allowed on the base: `parse_work_dir` sees no `cd` on a
+                // later line, after a background `&`, or in a brace group.
+                ("echo hi\ncd {U}\ngh pr create -t x", true, true),
+                ("true & cd {U}; gh pr create -t x", true, true),
+                ("{ cd {U}; }; gh pr create -t x", true, true),
+                ("echo hi\ncd {U}\ngh issue comment 1 -b x", true, true),
+                (
+                    "echo hi\ncd {U}\nfor i in 1; do gh pr create -t x; done",
+                    true,
+                    true,
+                ),
+                // Allowed on the base: the subshell's `cd` leaked into the
+                // parent, so the write was judged in the owned checkout.
+                ("(true; cd {O} ); gh pr create -t x", false, true),
+                ("(true; cd {O}; true); gh pr create -t x", false, true),
+                // Blocked on the base, and still: the whole-command reading
+                // is kept, so no block is lost.
+                ("cd {U} && gh pr create -t x", true, true),
+                ("cd {U} | cat; gh pr create -t x", true, true),
+                ("true || cd {U}\ngh pr create -t x", true, true),
+                ("gh pr create -t x", false, true),
+                // Controls.
+                ("cd {O} && gh pr create -t x", false, false),
+                ("cd {O} && gh pr create -t x", true, false),
+                ("cd {O}\ngh pr create -t x", false, false),
+                ("gh pr create -t x", true, false),
+                ("(cd {U} && gh pr view 1); gh pr create -t x", true, false),
+                ("(cd {U}); gh pr create -t x", true, false),
+                ("echo x | { cd {U}; }; gh pr create -t x", true, false),
+                ("{ cd {U}; } & gh pr create -t x", true, false),
+                (
+                    "echo hi\ncd {U}\ngh pr create -R cameronsjo/x -t x",
+                    true,
+                    false,
+                ),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
+                let cwd = if in_owned { o } else { u };
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A flood of writes, each after a `cd` to a distinct directory, blocks
+    /// past [`MAX_SEGMENT_DIRS`] rather than spending a git lookup on each
+    /// and running past the hook deadline.
+    #[test]
+    fn writes_in_too_many_directories_block() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let o = owned.path().to_str().unwrap();
+        for i in 0..=MAX_SEGMENT_DIRS {
+            std::fs::create_dir(owned.path().join(format!("d{i}"))).unwrap();
+        }
+        with_env(&owners_env(), || {
+            // Every directory is inside the owned checkout, so each write
+            // alone is allowed: only the count blocks.
+            let within: String = (0..MAX_SEGMENT_DIRS)
+                .map(|i| format!("echo\ncd {o}/d{i}\ngh pr create -t x\n"))
+                .collect();
+            let allowed = GhWriteGuard.run(&input_with(&within, o));
+            assert!(
+                !matches!(allowed.outcome, cadence_hooks_core::Outcome::Block),
+                "{:?}",
+                allowed.message
+            );
+            let past = format!("{within}echo\ncd {o}/d{MAX_SEGMENT_DIRS}\ngh pr create -t x");
+            let result = GhWriteGuard.run(&input_with(&past, o));
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "{:?}",
+                result.message
+            );
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("directories")),
+                "{:?}",
+                result.message
+            );
         });
     }
 }
