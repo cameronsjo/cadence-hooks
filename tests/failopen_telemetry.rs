@@ -310,6 +310,26 @@ fn object_shaped_mismatch_writes_schema_drift_row() {
     }
 }
 
+/// #364: a `group` fan-out writes the drift rows once for the payload, not
+/// once per member.
+#[test]
+fn group_fan_out_writes_schema_drift_once() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(
+        &[
+            "group",
+            "cadence/git-safety",
+            "cadence/prevent-secret-leaks",
+            "cadence/prevent-secret-writes",
+        ],
+        payload,
+    );
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "one drift row per payload key: {rows:?}");
+    assert_eq!(rows[0]["reason"], "schema_drift");
+    assert_eq!(rows[0]["subcommand"], "git-safety");
+}
+
 /// #364: expected per-tool variance (a non-object response) stays silent.
 #[test]
 fn non_object_tool_response_writes_no_failopen_row() {

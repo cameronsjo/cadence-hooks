@@ -270,11 +270,14 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
             process::exit(0);
         }
     };
-    for hook_name in hook_names {
+    // One payload, one set of drift rows: a `group` fan-out shares the parse,
+    // so the rows are attributed to its first member rather than repeated per
+    // member.
+    if let Some(first) = hook_names.first() {
         log_schema_drift(
             &input.schema_drift,
-            crate::registry::namespace_of(hook_name),
-            Some(hook_name),
+            crate::registry::namespace_of(first),
+            Some(first),
         );
     }
     let normalized_inputs = match input.normalized_inputs() {
@@ -915,7 +918,14 @@ pub fn run_logged_logger(
 /// observable. `drift` holds static key names from `core::schema_drift`, so the
 /// row carries no payload content. Silent on stderr: nothing failed for the
 /// user, and a real drift fires on every matching call.
+///
+/// At most once per process: every dispatch path parses stdin once, and the
+/// latch keeps a second caller from repeating the same rows.
 fn log_schema_drift(drift: &[&'static str], namespace: Option<&str>, hook: Option<&str>) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if drift.is_empty() || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     for key in drift {
         cadence_hooks_metrics::log_failopen(
             "schema_drift",
