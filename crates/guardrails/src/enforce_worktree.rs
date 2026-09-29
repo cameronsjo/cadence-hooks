@@ -663,12 +663,21 @@ fn is_shell_absolute(path: &str) -> bool {
 /// closed #1018.
 ///
 /// `on_disk` is true in production; see [`CdEnv`].
+#[cfg(test)]
 fn scan_targets(command: &str, cwd: &str, on_disk: bool) -> Scan {
     let home = dollar_home(command);
     let env = CdEnv::new(home.as_deref(), on_disk);
-    if let Some(plain) = plain_text(command, cwd, env) {
+    let plain = plain_of(command, cwd, env);
+    scan_prepared(command, cwd, env, plain.as_ref())
+}
+
+/// [`scan_targets`] over an already computed [`plain_of`] — [`run_enforce`]
+/// computes it once for both this and the in-chain dismiss scan, since the
+/// segmenter's cost grows with the command's line continuations.
+fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>) -> Scan {
+    if let Some(plain) = plain {
         let mut out = Scan::default();
-        let walked = walk_plain(&plain, cwd, env, |seg| {
+        let walked = walk_plain(plain, cwd, env, |seg| {
             if seg.is_cd {
                 return;
             }
@@ -849,12 +858,14 @@ fn detect_mutations(
 }
 
 /// What one walk found: the block channel, the nudge channel, and — on the
-/// union path only — the first `cd` whose target it could not read.
+/// union path only — the first `cd` whose target it could not read, and the
+/// directories its `cd`s name (for the block message's `git -C` suggestion).
 #[derive(Default)]
 struct Scan {
     commits: Vec<CommitTarget>,
     mutations: Vec<MutationTarget>,
     unresolved_cd: Option<String>,
+    union_cd_dirs: Vec<String>,
 }
 
 /// The words a segment's command runs with: every unquoted redirection (and a
@@ -992,39 +1003,52 @@ const PLAIN_REDIRECTS: &[&str] = &[
     "2>&1",
 ];
 
-/// The command with each `$(cat <<'DELIM' … DELIM)` commit-message argument
-/// replaced by a placeholder word, when it is plain; else `None`.
-fn plain_text(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<String> {
-    let text = carve_out_heredoc_messages(command);
-    is_plain_shape(&text, cwd, env).then_some(text)
+/// A plain command, analysed once: its segments, with each carved-out message
+/// already replaced by `MSG`.
+struct Plain {
+    segments: Vec<(String, Option<&'static str>)>,
 }
 
-/// Is `text` on the plain-shape allowlist?
+/// The command as a [`Plain`] when its shape is plain, else `None`.
+fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
+    let text = plain_carve(command)?;
+    let segments = split_segments_with_ops_joining_redirects(&text);
+    plain_segments_ok(&segments, cwd, env).then_some(Plain { segments })
+}
+
+/// Is `text` on the plain-shape allowlist? ([`plain_carve`] and
+/// [`plain_segments_ok`] together.)
+#[cfg(test)]
+fn is_plain_shape(text: &str, cwd: &str, env: CdEnv<'_>) -> bool {
+    plain_of(text, cwd, env).is_some()
+}
+
+/// The segment half of the plain-shape allowlist:
 ///
 /// - segments are joined only by `&&`, `;`, a newline, or a `|` between two
 ///   commands that are not `cd`s — no `||`, no `&`;
-/// - no subshell, group, function definition, array or brace expansion: no
-///   unquoted `(`, `)`, `{` or `}`;
-/// - no `$(`, backtick, `$[`, `${…}` other than `${HOME}`, or `$'…'` (outside
-///   single quotes), so no command substitution, process substitution or
-///   parameter expansion that could assign;
+/// - each segment is free of active expansion and grouping
+///   ([`has_active_expansion_or_grouping`]) — checked again here on the
+///   segments the core splitter produced after it stripped heredoc bodies and
+///   comments, so a disagreement with [`plain_carve`]'s own reading of them can
+///   only refuse;
 /// - no head in [`NON_PLAIN_HEADS`], no `printf -v`, and no segment that only
 ///   assigns;
 /// - every redirection is in [`PLAIN_REDIRECTS`], is a heredoc, or reads an
 ///   existing file.
 ///
 /// Every `cd` must also resolve, which [`walk_plain`] checks as it goes.
-fn is_plain_shape(text: &str, cwd: &str, env: CdEnv<'_>) -> bool {
-    if has_active_expansion_or_grouping(&strip_heredoc_bodies(text)) {
-        return false;
-    }
-    let segments = split_segments_with_ops_joining_redirects(text);
+fn plain_segments_ok(
+    segments: &[(String, Option<&'static str>)],
+    cwd: &str,
+    env: CdEnv<'_>,
+) -> bool {
     let is_cd: Vec<bool> = segments
         .iter()
         .map(|(raw, _)| cd_word(&tokenize_marked(raw)).is_some())
         .collect();
     for (i, (raw, op)) in segments.iter().enumerate() {
-        if matches!(op, Some("||" | "&")) {
+        if matches!(op, Some("||" | "&")) || has_active_expansion_or_grouping(raw) {
             return false;
         }
         let piped_out = *op == Some("|");
@@ -1112,8 +1136,8 @@ fn redirects_are_plain(marked: &[MarkedToken], cwd: &str, env: CdEnv<'_>) -> boo
         if PLAIN_REDIRECTS.contains(&spelled.as_str()) {
             continue;
         }
-        // A heredoc: its body is data (a `$(…)` in an unquoted body runs in a
-        // subshell and cannot move this shell).
+        // A heredoc: [`plain_carve`] has already refused an unquoted-delimiter
+        // body that expands anything.
         if spelled.starts_with("<<") && !spelled.starts_with("<<<") {
             continue;
         }
@@ -1130,46 +1154,222 @@ fn redirects_are_plain(marked: &[MarkedToken], cwd: &str, env: CdEnv<'_>) -> boo
     true
 }
 
-/// Replace every `$(cat <<'DELIM'` … `DELIM` … `)` in `command` with the word
-/// `MSG`.
+/// The raw half of the plain-shape allowlist: `command` with each live
+/// `$(cat <<'DELIM' … DELIM)` commit-message substitution replaced by the
+/// word `MSG`, or `None` when the raw text is not plain.
 ///
-/// This is the one substitution a plain command may carry: the idiomatic
-/// multi-line commit message. With a quoted delimiter the body is inert text,
-/// and the substitution runs only `cat`, so it cannot move the shell. Any
-/// other shape — an unquoted delimiter, text after the closing delimiter
-/// before `)`, a different command — is left in place and makes the command
-/// non-plain.
-fn carve_out_heredoc_messages(command: &str) -> String {
-    const OPEN: &str = "$(cat <<";
+/// One left-to-right scan that tracks what bash tracks — single and double
+/// quotes, backslash escapes, `#` comments, and heredoc bodies — so a
+/// substitution is only recognized where bash would run it. A `$(` in live
+/// context must be exactly a carve-out ([`heredoc_substitution_len`]), else
+/// the command is not plain and the scan stops there. Text in single quotes,
+/// in a comment or in a heredoc body is never matched as an opener: matching
+/// the opener as bare text let a carve-out swallow commands bash runs
+/// (cadence-hooks#1058 review). Also refused here:
+///
+/// - any control character other than newline and tab, and any Unicode
+///   whitespace other than space and tab: bash splits words on space and tab
+///   only, while the tokenizer splits on all Unicode whitespace, so a `\r`,
+///   NBSP, VT or FF would be read as a boundary bash does not have;
+/// - backticks, `$[`, `${…}` other than `${HOME}`, `$'…'`, and unquoted
+///   grouping characters — the checks [`plain_segments_ok`] repeats per
+///   segment;
+/// - an unquoted-delimiter heredoc whose body expands a substitution or a
+///   parameter.
+///
+/// Linear in the command: each carve-out is measured once and skipped, and
+/// the first opener that is not one ends the scan.
+fn plain_carve(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
     let mut out = String::with_capacity(command.len());
-    let mut rest = command;
-    while let Some(pos) = rest.find(OPEN) {
-        let after_open = &rest[pos + OPEN.len()..];
-        match heredoc_substitution_len(after_open) {
-            Some(len) => {
-                out.push_str(&rest[..pos]);
+    let mut i = 0;
+    let mut single = false;
+    let mut double = false;
+    // At the start of a word: where a `#` begins a comment.
+    let mut word_start = true;
+    // Heredocs whose bodies begin after the current line.
+    let mut pending: Vec<Heredoc> = Vec::new();
+    while let Some(c) = command[i..].chars().next() {
+        let width = c.len_utf8();
+        if is_foreign_blank(c) {
+            return None;
+        }
+        if single {
+            out.push(c);
+            if c == '\'' {
+                single = false;
+            }
+            i += width;
+            continue;
+        }
+        let next = bytes.get(i + 1).copied();
+        match c {
+            '\\' => {
+                out.push(c);
+                i += 1;
+                if let Some(escaped) = command[i..].chars().next() {
+                    if is_foreign_blank(escaped) {
+                        return None;
+                    }
+                    out.push(escaped);
+                    i += escaped.len_utf8();
+                }
+                word_start = false;
+                continue;
+            }
+            '#' if !double && word_start => {
+                // A comment runs to the end of the line and is inert.
+                let end = command[i..].find('\n').map_or(command.len(), |n| i + n);
+                if command[i..end].chars().any(is_foreign_blank) {
+                    return None;
+                }
+                out.push_str(&command[i..end]);
+                i = end;
+                continue;
+            }
+            '$' if next == Some(b'(') => {
+                const OPEN: &str = "$(cat <<";
+                let len = command[i..]
+                    .strip_prefix(OPEN)
+                    .and_then(heredoc_substitution_len)?;
                 out.push_str("MSG");
-                rest = &after_open[len..];
+                i += OPEN.len() + len;
+                word_start = false;
+                continue;
             }
-            None => {
-                out.push_str(&rest[..pos + OPEN.len()]);
-                rest = after_open;
+            '$' if command[i..].starts_with("${HOME}") => {
+                out.push_str("${HOME}");
+                i += "${HOME}".len();
+                word_start = false;
+                continue;
             }
+            '$' if matches!(next, Some(b'[' | b'{')) => return None,
+            '$' if next == Some(b'\'') && !double => return None,
+            '`' => return None,
+            '(' | ')' | '{' | '}' if !double => return None,
+            '"' => double = !double,
+            '\'' if !double => single = true,
+            '<' if !double && next == Some(b'<') && bytes.get(i + 2) != Some(&b'<') => {
+                let (heredoc, consumed) = parse_heredoc_operator(&command[i..])?;
+                out.push_str(&command[i..i + consumed]);
+                pending.push(heredoc);
+                i += consumed;
+                word_start = false;
+                continue;
+            }
+            '\n' if !double => {
+                out.push('\n');
+                i += 1;
+                for heredoc in std::mem::take(&mut pending) {
+                    let body_len = heredoc_body_len(&command[i..], &heredoc)?;
+                    out.push_str(&command[i..i + body_len]);
+                    i += body_len;
+                }
+                word_start = true;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        word_start = !double && matches!(c, ' ' | '\t' | ';' | '&' | '|');
+        i += width;
+    }
+    (!single && !double).then_some(out)
+}
+
+/// A character bash does not treat as the tokenizer does: a control character
+/// other than newline and tab, or Unicode whitespace other than space and tab.
+fn is_foreign_blank(c: char) -> bool {
+    c != '\n' && c != '\t' && (c.is_control() || (c.is_whitespace() && c != ' '))
+}
+
+/// A heredoc waiting for its body: the delimiter, whether `<<-` strips leading
+/// tabs, and whether the delimiter was quoted (a quoted one makes the body
+/// inert).
+struct Heredoc {
+    delim: String,
+    strip_tabs: bool,
+    quoted: bool,
+}
+
+/// Parse the heredoc operator at the start of `text` (`<<` or `<<-`, blanks,
+/// then the delimiter word), returning it and the bytes consumed. `None` for
+/// an empty or expanding delimiter.
+fn parse_heredoc_operator(text: &str) -> Option<(Heredoc, usize)> {
+    let mut at = 2;
+    let strip_tabs = text[at..].starts_with('-');
+    if strip_tabs {
+        at += 1;
+    }
+    at += text[at..].len() - text[at..].trim_start_matches([' ', '\t']).len();
+    let rest = &text[at..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')'))
+        .unwrap_or(rest.len());
+    let word = &rest[..end];
+    if word.contains(['$', '`']) {
+        return None;
+    }
+    let quoted = word.contains(['\'', '"', '\\']);
+    let delim: String = word
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    if delim.is_empty() {
+        return None;
+    }
+    Some((
+        Heredoc {
+            delim,
+            strip_tabs,
+            quoted,
+        },
+        at + end,
+    ))
+}
+
+/// The byte length of a heredoc body starting at `text`, through its
+/// delimiter line or to the end. `None` when an unquoted-delimiter body
+/// expands a substitution or a parameter.
+fn heredoc_body_len(text: &str, heredoc: &Heredoc) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        let bare = if heredoc.strip_tabs {
+            bare.trim_start_matches('\t')
+        } else {
+            bare
+        };
+        if bare == heredoc.delim {
+            return Some(offset);
+        }
+        if !heredoc.quoted && (line.contains("$(") || line.contains('`') || line.contains("${")) {
+            return None;
         }
     }
-    out.push_str(rest);
-    out
+    Some(offset)
 }
 
 /// For the text after `$(cat <<`, the length through the substitution's
-/// closing `)` when it is exactly `'DELIM'` or `"DELIM"` (optionally after
-/// `-`), a newline, a body, a line that is `DELIM`, and then only blanks and
-/// the `)`.
+/// closing `)` when it is exactly: an optional `-`, blanks, a quoted
+/// delimiter `'DELIM'` or `"DELIM"` of word characters, the end of the line,
+/// a body, a line that is exactly `DELIM` (after leading tabs, for `<<-`), and
+/// then only blanks and the `)`.
+///
+/// A body line that merely STARTS with the delimiter refuses: inside a
+/// command substitution bash also ends the heredoc at a line like `DELIM)`, so
+/// what this would read as body, bash runs (cadence-hooks#1058 review). The
+/// delimiter line is matched exactly — a trailing `\r` is not trimmed, and is
+/// refused anyway by [`plain_carve`].
 fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
-    let (dash, rest) = match after_open.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, after_open),
-    };
+    let mut at = 0;
+    let dash = after_open.starts_with('-');
+    if dash {
+        at += 1;
+    }
+    at += after_open[at..].len() - after_open[at..].trim_start_matches([' ', '\t']).len();
+    let rest = &after_open[at..];
     let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
     let close = rest[1..].find(quote)? + 1;
     let delim = &rest[1..close];
@@ -1178,13 +1378,13 @@ fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
     }
     let after_delim = &rest[close + 1..];
     let newline = after_delim.find('\n')?;
-    if !after_delim[..newline].trim().is_empty() {
+    if !after_delim[..newline].trim_matches([' ', '\t']).is_empty() {
         return None;
     }
     let body = &after_delim[newline + 1..];
     let mut offset = 0;
     for line in body.split_inclusive('\n') {
-        let bare = line.trim_end_matches(['\n', '\r']);
+        let bare = line.strip_suffix('\n').unwrap_or(line);
         let bare = if dash {
             bare.trim_start_matches('\t')
         } else {
@@ -1193,12 +1393,14 @@ fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
         offset += line.len();
         if bare == delim {
             let tail = &body[offset..];
-            let blanks = tail.len() - tail.trim_start().len();
+            let blanks = tail.len() - tail.trim_start_matches([' ', '\t', '\n']).len();
             if !tail[blanks..].starts_with(')') {
                 return None;
             }
-            let consumed = (dash as usize) + close + 1 + newline + 1 + offset + blanks + 1;
-            return Some(consumed);
+            return Some(at + close + 1 + newline + 1 + offset + blanks + 1);
+        }
+        if bare.starts_with(delim) {
+            return None;
         }
     }
     None
@@ -1334,7 +1536,7 @@ impl<'a> CdScope<'a> {
 /// substitution that runs a child script (`sh -c '…'`), or more than
 /// [`MAX_CD_CANDIDATES`] directories — the caller then takes the union path.
 fn walk_plain(
-    plain: &str,
+    plain: &Plain,
     cwd: &str,
     env: CdEnv<'_>,
     mut visit: impl FnMut(PlainSeg<'_>),
@@ -1342,7 +1544,8 @@ fn walk_plain(
     let mut scope = CdScope::new(cwd, env);
     let mut prev_op: Option<&str> = None;
     let mut prev_was_cd = false;
-    for (raw, next_op) in split_segments_with_ops_joining_redirects(plain) {
+    for (raw, next_op) in &plain.segments {
+        let next_op = *next_op;
         let segment = raw.trim();
         let marked = tokenize_marked(segment);
         let cd = cd_word(&marked);
@@ -1392,6 +1595,7 @@ fn union_scan(command: &str, cwd: &str, env: CdEnv<'_>) -> Scan {
     union_dirs(command, 0, env, &mut dirs, &mut unresolved);
     let mut out = Scan {
         unresolved_cd: unresolved,
+        union_cd_dirs: dirs[1..].to_vec(),
         ..Scan::default()
     };
     union_commits(command, 0, &dirs, (None, None), &mut out);
@@ -2026,29 +2230,41 @@ fn cow_strip_prefix<'a>(word: &Cow<'a, str>, prefix: &str) -> Option<Cow<'a, str
 ///   `|`/`&`/newline) breaks the chain — the dismiss might fail and the commit
 ///   still run — so the active dismiss set is cleared on any non-`&&` connector,
 ///   and such a commit still BLOCKS (fail closed).
+#[cfg(test)]
 fn inchain_dismissed_commits(
     command: &str,
     cwd: &str,
     on_disk: bool,
+) -> HashMap<CommitTarget, Option<String>> {
+    let home = dollar_home(command);
+    let env = CdEnv::new(home.as_deref(), on_disk);
+    let plain = plain_of(command, cwd, env);
+    inchain_dismissed_prepared(command, cwd, env, plain.as_ref())
+}
+
+/// [`inchain_dismissed_commits`] over an already computed [`plain_of`].
+fn inchain_dismissed_prepared(
+    command: &str,
+    cwd: &str,
+    env: CdEnv<'_>,
+    plain: Option<&Plain>,
 ) -> HashMap<CommitTarget, Option<String>> {
     let mut dismissed: HashMap<CommitTarget, Option<String>> = HashMap::new();
     // Repos with an active leading dismiss in the CURRENT unbroken `&&` chain:
     // target dir → parsed `--reason`. Cleared whenever a non-`&&` connector
     // breaks the chain.
     let mut active: HashMap<CommitTarget, Option<String>> = HashMap::new();
-    let home = dollar_home(command);
-    let env = CdEnv::new(home.as_deref(), on_disk);
     // A PLAIN command is walked as the block channel walks it. A non-plain
     // command licenses an in-chain commit only when it names no directory at
     // all — no `cd`/`pushd`, nothing unreadable — so every commit in it runs
     // in the session cwd, as the union path judges it (#1058).
-    let Some(plain) = plain_text(command, cwd, env) else {
+    let Some(plain) = plain else {
         return inchain_dismissed_without_cd(command, cwd, env);
     };
     // The SAME walk and the same per-segment commit resolution the block
     // channel uses ([`scan_targets`]), so the dismiss map, keyed by resolved
     // target strings, matches the targets it is checked against (#378).
-    let walked = walk_plain(&plain, cwd, env, |seg| {
+    let walked = walk_plain(plain, cwd, env, |seg| {
         let (argv, work_tree, git_dir) = plain_command(&seg.words);
         if seg.is_cd {
             // Moved by the walk itself.
@@ -2277,6 +2493,33 @@ fn with_unresolved_cd_hint(mut result: CheckResult, unresolved: Option<&str>) ->
              or `$HOME` in a command the guard cannot confirm leaves HOME alone), so the \
              commit was judged from every directory the command could be in. If it really \
              lands elsewhere, name the path literally or use `git -C <path> commit`."
+        ));
+    }
+    result
+}
+
+/// On a union-path block, name a linked worktree one of the command's `cd`s
+/// leads into, and the spelling that commits there in any shape: the command
+/// could not be followed step by step, so its `cd` into the worktree does not
+/// clear the session cwd (cadence-hooks#1058).
+fn with_union_worktree_hint(
+    mut result: CheckResult,
+    union_cd_dirs: &[String],
+    probe: &mut GitProbe,
+) -> CheckResult {
+    let worktree = union_cd_dirs.iter().find_map(|dir| {
+        probe
+            .repo_root(Path::new(dir))
+            .filter(|root| !is_primary_checkout(root))
+    });
+    if let (Some(root), Some(message)) = (worktree, result.message.as_mut()) {
+        let root = sanitize_field(&root, MAX_PATH_DISPLAY);
+        message.push_str(&format!(
+            "\nThis command's shape can't be followed step by step (a subshell, `||`, `&`, a \
+             file redirection, a substitution, …), so the commit was judged from every \
+             directory it could be in, including the session cwd. To commit in the worktree, \
+             run `git -C {} commit …`.",
+            shell_single_quote(&root)
         ));
     }
     result
@@ -2643,11 +2886,16 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // evaluated FIRST — the composition contract is block-first: a
             // `uv add && git commit` into the primary must BLOCK (commit wins),
             // never double-fire a nudge.
+            // The plain-shape analysis runs once, for both walks below.
+            let home = dollar_home(command);
+            let env = CdEnv::new(home.as_deref(), true);
+            let plain = plain_of(command, cwd, env);
             let Scan {
                 commits: commit_targets,
                 mutations: mutation_targets,
                 unresolved_cd,
-            } = scan_targets(command, cwd, true);
+                union_cd_dirs,
+            } = scan_prepared(command, cwd, env, plain.as_ref());
             // A leading `&&`-chained `dismiss-enforce-worktree` for the SAME
             // repo licenses a commit ordered after it (#323): the dismiss will
             // have armed the snooze before the commit runs, so honoring it here
@@ -2655,7 +2903,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // actually do. Top-level only, `&&`-chain only (see
             // [`inchain_dismissed_commits`]); the map is keyed by the same
             // resolved target strings the commit channel produces.
-            let dismissed = inchain_dismissed_commits(command, cwd, true);
+            let dismissed = inchain_dismissed_prepared(command, cwd, env, plain.as_ref());
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -2689,7 +2937,8 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                         }
                         continue;
                     }
-                    return with_unresolved_cd_hint(result, unresolved_cd.as_deref());
+                    let result = with_unresolved_cd_hint(result, unresolved_cd.as_deref());
+                    return with_union_worktree_hint(result, &union_cd_dirs, &mut probe);
                 }
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
@@ -2705,7 +2954,11 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     .repo_root(Path::new(cwd))
                     .is_some_and(|root| !is_primary_checkout(&root))
             {
-                return CheckResult::block(unresolved_cd_block_message(target));
+                return with_union_worktree_hint(
+                    CheckResult::block(unresolved_cd_block_message(target)),
+                    &union_cd_dirs,
+                    &mut probe,
+                );
             }
             // No commit blocked. The mutation nudge fires ONLY IF no commit
             // rode a bypass either — a snooze/env exemption on any commit in the
@@ -7385,9 +7638,18 @@ mod tests {
     #[test]
     fn a_quoted_delimiter_heredoc_message_is_carved_out() {
         let cmd = "git commit -m \"$(cat <<'EOF'\nfix(x): y\n\nbody `z`\nEOF\n)\"";
-        assert_eq!(carve_out_heredoc_messages(cmd), "git commit -m \"MSG\"");
+        assert_eq!(plain_carve(cmd).as_deref(), Some("git commit -m \"MSG\""));
         let dashed = "git commit -m \"$(cat <<-\"EOF\"\n\tbody\n\tEOF\n)\"";
-        assert_eq!(carve_out_heredoc_messages(dashed), "git commit -m \"MSG\"");
+        assert_eq!(
+            plain_carve(dashed).as_deref(),
+            Some("git commit -m \"MSG\"")
+        );
+        // Blanks after `<<` are accepted.
+        let spaced = "git commit -m \"$(cat << 'EOF'\nbody\nEOF\n)\"";
+        assert_eq!(
+            plain_carve(spaced).as_deref(),
+            Some("git commit -m \"MSG\"")
+        );
         // An unquoted delimiter expands its body; text after the delimiter
         // runs; neither is carved out.
         for cmd in [
@@ -7395,7 +7657,7 @@ mod tests {
             "git commit -m \"$(cat <<'EOF'\nx\nEOF\ncd /p)\"",
             "git commit -m \"$(cat <<'EOF'\nx\n)\"",
         ] {
-            assert_eq!(carve_out_heredoc_messages(cmd), cmd, "{cmd:?}");
+            assert_eq!(plain_carve(cmd), None, "{cmd:?}");
         }
     }
 
@@ -7643,5 +7905,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- rule-7 carve-out conformance (#1058 spec review) ---
+
+    #[test]
+    fn a_carve_out_opener_is_only_matched_where_bash_runs_it() {
+        // 1: an opener in single quotes, after a comment, or in an unquoted
+        // outer heredoc body used to swallow the commands after it.
+        let in_single_quotes =
+            "echo 'x $(cat <<\"EOF\"\n'; cd /p; git commit -m x; echo '\nEOF\n)'";
+        assert_eq!(sorted_targets(in_single_quotes, "/w"), vec!["/p"]);
+        let after_comment = "true # $(cat <<'EOF'\ncd /p; git commit -m x\nEOF\n)";
+        assert!(sorted_targets(after_comment, "/w").contains(&"/p".to_string()));
+        let in_heredoc_body = "cat <<X\n$(cat <<'EOF'\nX\ncd /p; git commit -m x\nEOF\n)";
+        assert!(sorted_targets(in_heredoc_body, "/w").contains(&"/p".to_string()));
+        // A quoted outer heredoc body is inert, carve-out text and all.
+        assert!(plain_carve("cat <<'X'\n$(cat <<'EOF'\nX\ngit commit -m x").is_some());
+    }
+
+    #[test]
+    fn a_line_that_starts_with_the_delimiter_ends_the_carve_out() {
+        // 2: inside `$(…)` bash ends the heredoc at `EOF)` too.
+        let cmd = "git commit -m \"$(cat <<'EOF'\nmsg\nEOF)\"; cd /p; git commit -m y\nEOF\n)\"";
+        assert_eq!(plain_carve(cmd), None);
+        assert!(sorted_targets(cmd, "/w").contains(&"/p".to_string()));
+        // The delimiter line is matched exactly: `EOF\r` is not `EOF`.
+        assert_eq!(
+            plain_carve("git commit -m \"$(cat <<'EOF'\nm\nEOF\r\n)\""),
+            None
+        );
+    }
+
+    #[test]
+    fn a_blank_bash_does_not_split_on_is_not_plain() {
+        // 3: the tokenizer splits on all Unicode whitespace, bash on space and
+        // tab only.
+        let env = CdEnv::new(None, false);
+        for blank in ['\r', '\u{a0}', '\u{b}', '\u{c}', '\u{2003}', '\u{0}'] {
+            let cmd = format!("cd /w{blank}; git commit -m x");
+            assert!(!is_plain_shape(&cmd, "/p", env), "{cmd:?}");
+            assert!(
+                sorted_targets(&cmd, "/p").contains(&"/p".to_string()),
+                "{cmd:?}"
+            );
+        }
+        assert!(!is_plain_shape("cd /w\r\ngit commit -m x", "/p", env));
+        assert!(is_plain_shape("cd /w\n\tgit commit -m x", "/p", env));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_union_block_names_the_worktree_and_git_dash_c() {
+        // 4.
+        let scratch = scratch("union-hint-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let w = wt.to_string_lossy().into_owned();
+        let mut input = make_bash(&format!("(cd {w} && git commit -m x)"));
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("can't be followed step by step"), "{msg}");
+        assert!(msg.contains("git -C "), "{msg}");
+        // …and that spelling passes in every shape.
+        for cmd in [
+            format!("git -C {w} commit -m x"),
+            format!("true || git -C {w} commit -m x"),
+            format!("(git -C {w} commit -m x)"),
+            format!("git -C {w} commit -m x > /tmp/log.txt"),
+            format!("cd /tmp && git -C {w} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Allow,
+                "{cmd}"
+            );
+        }
+        // A plain block carries no such line.
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let msg = run_enforce(&input, &cfg(false, false)).message.unwrap();
+        assert!(!msg.contains("step by step"), "{msg}");
+    }
+
+    #[test]
+    fn an_unterminated_carve_out_times_ten_thousand_is_linear() {
+        // The first opener that is not a carve-out ends the scan.
+        let cmd = "git commit -m \"$(cat <<'EOF'\n".repeat(10_000);
+        let started = std::time::Instant::now();
+        assert_eq!(plain_carve(&cmd), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        // And ten thousand GOOD ones are one pass.
+        let good = "git commit -m \"$(cat <<'EOF'\nm\nEOF\n)\"\n".repeat(10_000);
+        let started = std::time::Instant::now();
+        assert!(plain_carve(&good).is_some());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn eight_thousand_continuations_split_once_per_walk() {
+        // The segmenter is quadratic in backslash-newlines (core, filed
+        // separately); the plain analysis splits once and both walks reuse it.
+        let cmd = format!("{}git commit -m x", "true && \\\n".repeat(8_000));
+        let env = CdEnv::new(None, false);
+        let started = std::time::Instant::now();
+        let plain = plain_of(&cmd, "/w", env);
+        let once = started.elapsed();
+        assert!(plain.is_some());
+        let started = std::time::Instant::now();
+        let scan = scan_prepared(&cmd, "/w", env, plain.as_ref());
+        let _ = inchain_dismissed_prepared(&cmd, "/w", env, plain.as_ref());
+        let walks = started.elapsed();
+        assert_eq!(scan.commits, vec!["/w".to_string()]);
+        // Both walks together cost no more than a few splits' worth.
+        assert!(
+            walks < once * 3 + std::time::Duration::from_millis(200),
+            "{walks:?} vs {once:?}"
+        );
     }
 }
