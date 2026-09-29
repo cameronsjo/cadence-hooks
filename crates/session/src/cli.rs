@@ -197,7 +197,93 @@ fn status_row(peer: &registry::Peer, own_session_id: Option<&str>) -> String {
     out
 }
 
-/// `session status` — list live and stale sessions in this repo's registry.
+/// Every per-checkout registry belonging to the repository `cwd` is in: the
+/// checkout `cwd` resolves to FIRST, then each other worktree `git worktree
+/// list` names, in its order (cameronsjo/cadence-hooks#845).
+///
+/// A worktree has its own `.claude/sessions`, so reading only the cwd's one
+/// shows a branch-mode repo exactly the sessions that are, by policy, not doing
+/// the work. The second field is `false` when the worktree list could not be
+/// read: the caller must then say it scanned only this checkout, never let a
+/// short list pass for a complete one. Bare entries have no checkout and are
+/// skipped; duplicates (the same directory reached by two spellings) collapse
+/// on the canonical path.
+fn repo_registries(cwd: &str, own_dir: std::path::PathBuf) -> (Vec<std::path::PathBuf>, bool) {
+    use cadence_hooks_core::shell::{GitOutput, git_output_detailed};
+    let key = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own_root = registry::repo_root_of_registry(&own_dir);
+    let mut dirs = vec![own_dir];
+    let mut seen: Vec<std::path::PathBuf> = own_root.iter().map(|r| key(r)).collect();
+    let porcelain = match git_output_detailed(cwd, &["worktree", "list", "--porcelain", "-z"]) {
+        GitOutput::Ok(text) => text,
+        _ => return (dirs, false),
+    };
+    for entry in crate::unpushed_worktrees::parse_worktree_list(&porcelain) {
+        if entry.bare || entry.path.is_empty() {
+            continue;
+        }
+        let root = std::path::PathBuf::from(&entry.path);
+        let k = key(&root);
+        if seen.contains(&k) {
+            continue;
+        }
+        seen.push(k);
+        dirs.push(root.join(".claude").join("sessions"));
+    }
+    (dirs, true)
+}
+
+/// Pure: the stdout text `session status` prints for already-read registries.
+///
+/// `sections` is every registry scanned, the caller's own checkout first. Only
+/// registries holding a record get a heading — ten empty worktree registries
+/// would bury the one that matters — but the footer counts every one scanned,
+/// so an empty or short list reads as "none in these N registries" rather than
+/// "none anywhere" (cameronsjo/cadence-hooks#845). `worktrees_listed` false
+/// means sibling worktrees could not be enumerated, and the footer says so.
+fn status_text(
+    sections: &[(std::path::PathBuf, Vec<registry::Peer>)],
+    own_session_id: Option<&str>,
+    worktrees_listed: bool,
+) -> String {
+    let mut out = String::new();
+    for (dir, peers) in sections.iter().filter(|(_, p)| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("Sessions in {}:\n\n", dir.display()));
+        for peer in peers {
+            out.push_str(&status_row(peer, own_session_id));
+            out.push('\n');
+        }
+    }
+    let own_dir = sections
+        .first()
+        .map(|(d, _)| d.display().to_string())
+        .unwrap_or_default();
+    if out.is_empty() {
+        out.push_str(&format!("No sessions registered in {own_dir}\n"));
+    } else {
+        out.push('\n');
+    }
+    let siblings = sections.len().saturating_sub(1);
+    if worktrees_listed {
+        out.push_str(&format!(
+            "Scanned {} registr{}: this checkout and {siblings} sibling worktree{}.",
+            sections.len(),
+            if sections.len() == 1 { "y" } else { "ies" },
+            if siblings == 1 { "" } else { "s" },
+        ));
+    } else {
+        out.push_str(&format!(
+            "Scanned only this checkout's registry ({own_dir}): the worktree list could not be read, so sessions in sibling worktrees are not shown."
+        ));
+    }
+    out
+}
+
+/// `session status` — list live and stale sessions in every registry of this
+/// repository: the checkout you are in and each of its worktrees (#845).
 /// Returns the process exit code.
 ///
 /// Exit 1 with the message on STDERR when there is no registry to read (not a
@@ -213,17 +299,20 @@ pub fn run_status() -> u8 {
         return 1;
     };
     let stale_secs = registry::stale_minutes() * 60;
+    let (dirs, worktrees_listed) = repo_registries(&cwd, dir);
     // Pass an id no real session can have so every entry is listed.
-    let all = registry::read_peers(&dir, "", stale_secs);
-    if all.is_empty() {
-        println!("No sessions registered in {}", dir.display());
-        return 0;
-    }
+    let sections: Vec<_> = dirs
+        .into_iter()
+        .map(|d| {
+            let peers = registry::read_peers(&d, "", stale_secs);
+            (d, peers)
+        })
+        .collect();
     let own = resolve_session_id(None);
-    println!("Sessions in {}:\n", dir.display());
-    for peer in &all {
-        println!("{}", status_row(peer, own.as_deref()));
-    }
+    println!(
+        "{}",
+        status_text(&sections, own.as_deref(), worktrees_listed)
+    );
     0
 }
 
@@ -297,6 +386,7 @@ pub fn run_plans() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // --- session plans: the tier-2 view of the SessionStart plan pointer ---
 
@@ -464,6 +554,147 @@ mod tests {
             age_secs: 2400,
             stale: false,
         }
+    }
+
+    // --- status across worktrees (#845) ---
+
+    #[test]
+    fn status_text_lists_a_sibling_worktree_session_and_counts_every_registry() {
+        let sections = vec![
+            (
+                PathBuf::from("/repo/.claude/sessions"),
+                vec![status_peer("aaaaaaaa-1", Some("main"))],
+            ),
+            (PathBuf::from("/repo/wt/a/.claude/sessions"), vec![]),
+            (
+                PathBuf::from("/repo/wt/b/.claude/sessions"),
+                vec![status_peer("bbbbbbbb-2", Some("feat/b"))],
+            ),
+        ];
+        let text = status_text(&sections, None, true);
+        assert!(
+            text.contains("Sessions in /repo/.claude/sessions:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Sessions in /repo/wt/b/.claude/sessions:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("bbbbbbbb"),
+            "the worktree session must be listed: {text}"
+        );
+        assert!(
+            !text.contains("/repo/wt/a/"),
+            "an empty registry gets no heading: {text}"
+        );
+        assert!(
+            text.contains("Scanned 3 registries: this checkout and 2 sibling worktrees."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_text_names_what_it_did_not_scan_when_the_worktree_list_failed() {
+        let sections = vec![(PathBuf::from("/repo/.claude/sessions"), vec![])];
+        let text = status_text(&sections, None, false);
+        assert!(
+            text.starts_with("No sessions registered in /repo/.claude/sessions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Scanned only this checkout's registry"),
+            "{text}"
+        );
+        assert!(text.contains("sibling worktrees are not shown"), "{text}");
+    }
+
+    #[test]
+    fn status_text_empty_everywhere_still_says_how_many_registries_it_read() {
+        let sections = vec![
+            (PathBuf::from("/repo/.claude/sessions"), vec![]),
+            (PathBuf::from("/repo/wt/a/.claude/sessions"), vec![]),
+        ];
+        let text = status_text(&sections, None, true);
+        assert!(
+            text.starts_with("No sessions registered in /repo/.claude/sessions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Scanned 2 registries: this checkout and 1 sibling worktree."),
+            "{text}"
+        );
+    }
+
+    fn registries_scratch_root() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/status-registries-scratch")
+    }
+
+    fn canon(p: &std::path::Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    /// The #845 shape end to end: a primary checkout and a linked worktree, each
+    /// with its own registry. From EITHER side, both registries are scanned,
+    /// the caller's own first, and no directory appears twice.
+    #[test]
+    fn repo_registries_unions_the_primary_checkout_and_every_worktree() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let scratch = Scratch::new(&registries_scratch_root(), "union");
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = scratch.path().join("wt-a");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/a",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+
+        let from_primary = repo.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&from_primary).unwrap();
+        let (dirs, listed) = repo_registries(&from_primary, own);
+        assert!(listed);
+        let got: Vec<PathBuf> = dirs
+            .iter()
+            .map(|d| canon(d.parent().unwrap().parent().unwrap()))
+            .collect();
+        assert_eq!(got, vec![canon(&repo), canon(&wt)]);
+
+        let from_wt = wt.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&from_wt).unwrap();
+        let (dirs, listed) = repo_registries(&from_wt, own);
+        assert!(listed);
+        let got: Vec<PathBuf> = dirs
+            .iter()
+            .map(|d| canon(d.parent().unwrap().parent().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![canon(&wt), canon(&repo)],
+            "own checkout first, sibling next"
+        );
+    }
+
+    #[test]
+    fn repo_registries_reports_an_unlisted_scan_outside_a_repo() {
+        let dir = std::env::temp_dir();
+        let own = PathBuf::from("/nowhere/.claude/sessions");
+        // `git worktree list` fails outside a repository: only the own dir, flagged.
+        let (dirs, listed) = repo_registries(
+            &dir.join("definitely-not-a-dir-845").to_string_lossy(),
+            own.clone(),
+        );
+        assert_eq!(dirs, vec![own]);
+        assert!(!listed);
     }
 
     #[test]
