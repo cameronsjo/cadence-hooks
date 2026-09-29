@@ -19,7 +19,7 @@
 //! reaches the metrics writer, and only it knows the canonical registry name.
 
 use crate::common;
-use cadence_hooks_core::{BypassProvenance, HookInput};
+use cadence_hooks_core::{BypassKind, BypassProvenance, HookInput};
 use serde_json::{Value, json};
 use std::io::Write;
 
@@ -69,6 +69,34 @@ impl BypassEvent {
             mechanism: prov.mechanism.clone(),
             reason: prov.reason.clone(),
             expires_at: prov.expires_at,
+            armed_at: None,
+        }
+    }
+
+    /// A **process-wide gate** in `main.rs` (`CADENCE_BYPASS` / `CADENCE_DISABLE`)
+    /// fired. Recorded as a `used` event, but there is no hook payload: the gate
+    /// exits before stdin is read, so the tool, agent, and session-from-payload
+    /// are unknown. `hook` is the canonical name (disable) or the sanitized argv
+    /// subcommand (blanket bypass, which precedes clap); `session` comes from the
+    /// environment; `cwd` only ever contributes its repo basename.
+    pub fn global(
+        kind: BypassKind,
+        mechanism: &str,
+        hook: Option<&str>,
+        session: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Self {
+        Self {
+            event: "used",
+            hook: hook.map(str::to_string),
+            tool: None,
+            repo: Some(common::repo_basename(cwd)),
+            session: session.map(str::to_string),
+            agent: None,
+            kind: kind.as_str(),
+            mechanism: mechanism.to_string(),
+            reason: None,
+            expires_at: None,
             armed_at: None,
         }
     }
@@ -159,7 +187,7 @@ pub fn log_bypass(event: BypassEvent) {
 mod tests {
     use super::*;
     use crate::common::ENV_LOCK;
-    use cadence_hooks_core::{BypassKind, ToolInput};
+    use cadence_hooks_core::ToolInput;
 
     fn used_input() -> HookInput {
         // A payload carrying sensitive fields — the record must expose none.
@@ -244,6 +272,32 @@ mod tests {
         assert_eq!(rec["mechanism"], "CADENCE_ALLOW_MAIN");
         assert!(rec["reason"].is_null());
         assert!(rec["expiresAt"].is_null());
+    }
+
+    #[test]
+    fn global_gate_records_carry_kind_and_no_payload_fields() {
+        for (kind, token, mech) in [
+            (
+                BypassKind::GlobalBypass,
+                "global_bypass",
+                "CADENCE_BYPASS=1",
+            ),
+            (
+                BypassKind::GlobalDisable,
+                "global_disable",
+                "CADENCE_DISABLE",
+            ),
+        ] {
+            let rec = BypassEvent::global(kind, mech, Some("warn-x"), Some("s-1"), Some("/tmp"))
+                .to_record();
+            assert_eq!(rec["event"], "used");
+            assert_eq!(rec["kind"], token);
+            assert_eq!(rec["mechanism"], mech);
+            assert_eq!(rec["hook"], "warn-x");
+            assert_eq!(rec["sessionId"], "s-1");
+            assert!(rec["tool"].is_null() && rec["agentId"].is_null());
+            assert!(rec["reason"].is_null() && rec["expiresAt"].is_null());
+        }
     }
 
     #[test]

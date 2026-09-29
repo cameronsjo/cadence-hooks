@@ -1247,6 +1247,41 @@ fn panic_stderr_text(
     }
 }
 
+/// Record a `CADENCE_BYPASS` / `CADENCE_DISABLE` gate firing to `bypasses.jsonl`.
+/// Fail-open (ADR-0001): `log_bypass` swallows every I/O error. Privacy: only the
+/// hook label, the session id from the environment, and the cwd's repo basename.
+fn record_global_gate(kind: cadence_hooks_core::BypassKind, mechanism: &str, hook: Option<&str>) {
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string));
+    cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::global(
+        kind,
+        mechanism,
+        hook,
+        session.as_deref(),
+        cwd.as_deref(),
+    ));
+}
+
+/// `"<namespace> <subcommand>"` from raw argv, keeping only kebab-case tokens so
+/// a stray argument (a path, a flag value) can never reach the ledger.
+fn argv_hook_label(argv: &[String]) -> Option<String> {
+    let tokens: Vec<&str> = argv
+        .iter()
+        .map(String::as_str)
+        .take_while(|t| {
+            !t.is_empty()
+                && t.len() <= 40
+                && t.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition before anything can write to
     // stdout. Rust leaves SIGPIPE ignored, which turns `cadence-hooks … | head`
@@ -1274,6 +1309,15 @@ fn main() {
     let bypass_exempt =
         is_bypass_exempt(positional.next().as_deref(), positional.next().as_deref());
     if bypassed && !bypass_exempt {
+        // Provenance at the gate: it exits before the dispatch seam, so the
+        // `CheckResult.bypass` route cannot see it (cadence-hooks#223). `hook`
+        // is the argv subcommand — clap has not run — sanitized to kebab tokens.
+        let argv: Vec<String> = std::env::args().skip(1).take(2).collect();
+        record_global_gate(
+            cadence_hooks_core::BypassKind::GlobalBypass,
+            "CADENCE_BYPASS=1",
+            argv_hook_label(&argv).as_deref(),
+        );
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
@@ -1422,6 +1466,11 @@ fn main() {
     if let Some(name) = hook_name(&cli.command) {
         match bypass::resolve(name) {
             BypassState::Disabled => {
+                record_global_gate(
+                    cadence_hooks_core::BypassKind::GlobalDisable,
+                    "CADENCE_DISABLE",
+                    Some(name),
+                );
                 eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
                 process::exit(0);
             }
@@ -1783,6 +1832,22 @@ fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissA
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn argv_hook_label_keeps_only_kebab_tokens() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argv_hook_label(&a(&["cadence", "git-safety"])).as_deref(),
+            Some("cadence git-safety")
+        );
+        // A path or flag stops the label rather than reaching the ledger.
+        assert_eq!(
+            argv_hook_label(&a(&["cadence", "/secret/x"])).as_deref(),
+            Some("cadence")
+        );
+        assert_eq!(argv_hook_label(&a(&["--flag"])), None);
+        assert_eq!(argv_hook_label(&a(&[])), None);
+    }
+
     use super::*;
 
     #[test]

@@ -32,7 +32,7 @@ use crate::registry;
 use crate::unpushed_worktrees::{self, MAX_WORKTREES, UnpushedWorktree};
 use cadence_hooks_core::paths;
 use cadence_hooks_core::shell::git_command;
-use cadence_hooks_core::{Check, CheckResult, HookInput, Logger, MetricsInput};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Logger, MetricsInput};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -313,7 +313,12 @@ impl Check for BackstopWarn {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         if suppressed() {
-            return CheckResult::allow();
+            // The `backstop-record` logger half has no `CheckResult` to carry
+            // provenance and writes no nudge, so only this warn half records
+            // the opt-out (cadence-hooks#223).
+            return CheckResult::allow_bypassed(BypassProvenance::env_switch(
+                "CADENCE_NO_OUTRO_BACKSTOP",
+            ));
         }
         let Some(cwd) = input.cwd.as_deref() else {
             return CheckResult::allow();
@@ -645,7 +650,12 @@ mod tests {
         // SAFETY: serialized by LOCK; removed again before returning.
         unsafe { std::env::set_var("CADENCE_NO_OUTRO_BACKSTOP", "1") };
         let on = suppressed();
+        let warned = BackstopWarn.run(&HookInput::default());
         unsafe { std::env::remove_var("CADENCE_NO_OUTRO_BACKSTOP") };
+        assert_eq!(
+            warned.bypass.expect("opt-out records provenance").mechanism,
+            "CADENCE_NO_OUTRO_BACKSTOP"
+        );
         let off = suppressed();
         assert!(on, "non-empty value suppresses");
         assert!(!off, "unset does not suppress");

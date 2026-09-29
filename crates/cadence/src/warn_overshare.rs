@@ -15,7 +15,7 @@
 //! (vault primary, gitignored fallback), so retro paths no longer have a
 //! sanctioned repo destination to exempt.
 
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome};
 
 /// Bash token sequences that surface about-to-ship content but are NOT
 /// external-posting verbs the shared [`is_external_post`] gate covers. Only
@@ -38,7 +38,7 @@ impl Check for WarnOvershare {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let bypass = std::env::var("CADENCE_SKIP_OVERSHARE_AUDIT").ok();
+        let bypass = std::env::var(BYPASS_ENV).ok();
         let vault = std::env::var("OBSIDIAN_VAULT").ok();
         run_with_env(input, bypass.as_deref(), vault.as_deref())
     }
@@ -49,10 +49,24 @@ impl Check for WarnOvershare {
 /// Split out from `Check::run` so unit tests exercise the decision tree
 /// without mutating process env (unsafe in Rust 2024) or serializing tests.
 fn run_with_env(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) -> CheckResult {
+    let result = assess(input, vault);
+    // The bypass only counts as ridden when the nudge would have fired
+    // (cadence-hooks#223): an unrelated tool call under a standing
+    // `CADENCE_SKIP_OVERSHARE_AUDIT=1` is not a bypass event.
     if is_bypass_set(bypass) {
-        return CheckResult::allow();
+        return if result.outcome == Outcome::Allow {
+            CheckResult::allow()
+        } else {
+            CheckResult::allow_bypassed(BypassProvenance::env_switch(BYPASS_ENV))
+        };
     }
+    result
+}
 
+const BYPASS_ENV: &str = "CADENCE_SKIP_OVERSHARE_AUDIT";
+
+/// The decision with no bypass consulted.
+fn assess(input: &HookInput, vault: Option<&str>) -> CheckResult {
     match input.normalized_tool_name() {
         Some("Bash") => {
             let Some(command) = input.command() else {
@@ -154,6 +168,17 @@ mod tests {
 
     fn run_with_vault(input: &HookInput, vault: &str) -> CheckResult {
         run_with_env(input, None, Some(vault))
+    }
+
+    #[test]
+    fn bypass_records_provenance_only_when_the_nudge_would_have_fired() {
+        let fired = run_bypassed(&make_bash("git push origin main"));
+        assert_eq!(fired.outcome, Outcome::Allow);
+        let prov = fired.bypass.expect("a ridden bypass records provenance");
+        assert_eq!(prov.mechanism, "CADENCE_SKIP_OVERSHARE_AUDIT");
+        assert_eq!(prov.kind, cadence_hooks_core::BypassKind::EnvSwitch);
+        assert!(run_bypassed(&make_bash("ls")).bypass.is_none());
+        assert!(run(&make_bash("git push origin main")).bypass.is_none());
     }
 
     // --- Guard clauses ---
