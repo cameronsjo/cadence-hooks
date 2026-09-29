@@ -2271,6 +2271,38 @@ fn write_config_atomically(
 #[cfg(test)]
 static TERMS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+thread_local! {
+    static TERMS_ENV_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A hold on [`TERMS_ENV_LOCK`] that a nested call on the same thread shares
+/// instead of re-locking: `std::sync::Mutex` is not reentrant, and the plain
+/// `run` helper must serialize against env-mutating tests (a concurrent
+/// `with_env` setting `CADENCE_ALLOWED_OWNERS`/`GH_REPO` silenced its nudge)
+/// while also being called from inside those tests' locked scopes.
+#[cfg(test)]
+struct TermsEnvGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for TermsEnvGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            TERMS_ENV_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+#[cfg(test)]
+fn lock_terms_env() -> TermsEnvGuard {
+    if TERMS_ENV_HELD.with(|held| held.get()) {
+        return TermsEnvGuard(None);
+    }
+    let guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    TERMS_ENV_HELD.with(|held| held.set(true));
+    TermsEnvGuard(Some(guard))
+}
+
 /// Removes the named env vars when dropped — including on unwind.
 ///
 /// An `assert!` inside a test closure panics, and a plain set-call-remove
@@ -2303,7 +2335,7 @@ fn with_terms_cleared<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_terms_env();
     let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
     // SAFETY: serialized by TERMS_ENV_LOCK, held for this whole scope.
     unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
@@ -2471,6 +2503,7 @@ mod tests {
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
 
     fn run(cmd: &str) -> CheckResult {
+        let _guard = lock_terms_env();
         RedactExternalContent.run(&make_bash(cmd))
     }
 
@@ -3458,7 +3491,7 @@ mod tests {
     where
         F: FnOnce() -> R,
     {
-        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_terms_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, toml_body).unwrap();
@@ -3857,7 +3890,7 @@ term = "acmecorp"
 
     #[test]
     fn absent_terms_file_is_inert_not_a_hard_failure() {
-        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_terms_env();
         let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
         unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", "/nonexistent/redaction.toml") };
         let r = run("git commit -m \"fix the acmecorp integration\"");
@@ -3953,7 +3986,7 @@ term = "acmecorp"
 
     #[test]
     fn run_scan_unarmed_source_still_exits_0() {
-        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_terms_env();
         let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
         // SAFETY: serialized by TERMS_ENV_LOCK, held for this whole scope.
         unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", "/nonexistent/redaction.toml") };
@@ -4242,7 +4275,7 @@ term = "acmecorp"
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, FIXTURE).unwrap();
 
-        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_terms_env();
         let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
         unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", &path) };
 
