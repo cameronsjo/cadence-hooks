@@ -9277,7 +9277,7 @@ enum SubstBound {
 /// unclosed flood (`"$("` × 60 000) fails at every opener, ~17 levels each —
 /// 0.3-0.6 s at 200 KB, in a hook whose deadline fails open. Past the cap the
 /// pass reads the rest character by character, as it always did.
-const MAX_TOO_DEEP_RETRIES: usize = 4096;
+const MAX_TOO_DEEP_RETRIES: usize = 1024;
 
 /// Whether a pass has stopped asking [`quoted_substitution_bound`].
 #[derive(Default)]
@@ -16491,7 +16491,7 @@ mod tests {
         for n in [1usize, 15, 16, 17, 18, 20, 40] {
             let cmd = format!(
                 "{}; git commit -m \"$(cat <<'EOF'\nit\"s\nEOF\n)\"; cat .env",
-                "echo \"$(".repeat(n) + &"echo x".to_string() + &")\"".repeat(n),
+                "echo \"$(".repeat(n) + "echo x" + &")\"".repeat(n),
             );
             for (name, segs) in [
                 ("split_segments", split_segments(&cmd)),
