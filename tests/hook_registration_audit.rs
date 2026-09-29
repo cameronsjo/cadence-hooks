@@ -307,6 +307,24 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
+    // New nudges built ahead of their wiring: each hooks.json entry lands in a
+    // follow-up cadence-monorepo PR, which also removes the row here.
+    (
+        "cadence warn-instruction-narrative",
+        "cameronsjo/cadence-hooks#922",
+    ),
+    (
+        "cadence warn-live-memory-write",
+        "cameronsjo/cadence-hooks#618",
+    ),
+    (
+        "cadence warn-plugin-root-cruft",
+        "cameronsjo/cadence-hooks#282",
+    ),
+    (
+        "guardrails warn-inline-body",
+        "cameronsjo/cadence-hooks#611",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
