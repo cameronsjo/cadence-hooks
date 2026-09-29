@@ -1264,9 +1264,25 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// (cameronsjo/cadence-hooks#1103). So the skip is allowed only when the
 /// command carries none of the characters that can build a word; otherwise
 /// the caller must judge the tokenized words.
+///
+/// A second, cheaper skip: a letter no byte of the command carries can come
+/// only from an escape (`\x67`, `\147`), a command's output (`$(…)`, a
+/// backtick), or a variable set outside the command, which no guard can read
+/// anyway. So a command with none of the needle's first letter, no `\\`, no
+/// backtick and no `$(` cannot spell it — whatever quoting or plain `$NAME`
+/// it carries — and a padded chain of plain assignments skips the full parse.
 pub fn may_spell_word(command: &str, needle: &str) -> bool {
-    contains_ignoring_ascii_case(command, needle)
-        || command.contains(['$', '\'', '"', '\\', '`', '{'])
+    if contains_ignoring_ascii_case(command, needle) {
+        return true;
+    }
+    if !command.contains(['$', '\'', '"', '\\', '`', '{']) {
+        return false;
+    }
+    let Some(first) = needle.bytes().next() else {
+        return true;
+    };
+    let carries_first = command.bytes().any(|b| b.eq_ignore_ascii_case(&first));
+    carries_first || command.contains(['\\', '`']) || command.contains("$(")
 }
 
 /// `segment` re-spelled from its decoded words: each [`tokenize`] word joined
@@ -5338,75 +5354,125 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
 /// "every command that will actually execute" view.
 pub fn command_segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut assignments = AssignmentScope::default();
+    let spent = std::cell::Cell::new(0);
+    let mut assignments = AssignmentScope::root(&spent);
     expand_segments(command, &mut assignments, 0, &mut out);
     out
 }
 
-/// Most distinct variable names [`AssignmentScope`] tracks for one command.
-///
-/// A name first assigned past the cap is not recorded, so its later
-/// references stay literal `$NAME` text: content is never dropped, the guards
-/// just see the unexpanded word, exactly as they see an environment-sourced
-/// variable. Real commands set a handful of names; the cap only bounds the
-/// cost of a padded one (cadence-hooks#1114).
-const MAX_TRACKED_ASSIGNMENTS: usize = 256;
-
-/// Longest value [`AssignmentScope`] records. `D=ab; D=$D$D; D=$D$D; …`
+/// Longest value [`AssignmentScope`] stores whole. `D=ab; D=$D$D; D=$D$D; …`
 /// doubles the value per segment, so forty segments asked for a terabyte and
-/// the guard hung past its deadline (cadence-hooks#1114). A longer value
-/// untracks the name, leaving its references literal.
+/// the guard hung past its deadline (cadence-hooks#1114). A longer value is
+/// stored CLIPPED — its first and last [`CLIPPED_VALUE_HALF`] bytes — never
+/// dropped: dropping it left `$D` literal, and a padded `D=<./ ×2100>.env;
+/// echo hi > $D` wrote `.env` unseen (PR #1118 review). The tail is what names
+/// a file (`….env`), the head what names a command.
 const MAX_ASSIGNMENT_VALUE_LEN: usize = 4096;
 
-/// Most bytes all `$NAME` substitutions may add across one command. Each
-/// value is capped, but a segment of 100 000 `$D` references would still
-/// multiply one. Past the budget, references stay literal.
+/// Half of a clipped stored value; see [`MAX_ASSIGNMENT_VALUE_LEN`].
+const CLIPPED_VALUE_HALF: usize = MAX_ASSIGNMENT_VALUE_LEN / 2;
+
+/// Bytes `$NAME` substitutions may add across one command at full length.
+/// Past it every reference is still substituted, but a value longer than
+/// [`SHORT_SUBSTITUTION_LEN`] goes in clipped to its head and tail, so output
+/// stays linear in the command's length. Leaving a reference literal once the
+/// budget ran out was a miss: a 5 KB prefix of `: $P $P …` spent it, and the
+/// `D=.env; cat $D` after it read `.env` unseen (PR #1118 review).
 const MAX_EXPANSION_BYTES: usize = 1 << 20;
 
-/// The visible `VAR=value` assignments at one point in a command, indexed by
-/// name. Re-assigning a name replaces its value (newest wins), and a name
-/// already tracked is always updated, even at the cap — otherwise a stale value
-/// would be substituted for the one the shell actually uses.
-///
-/// Held as a map, not an append-ordered list: a reverse linear search per `$`
-/// made a padded chain of `Dn=$(x y);` quadratic (9.9 s at 200 KB, past the
-/// hook deadline, so the guard failed open — cadence-hooks#1114), and the
-/// per-substitution snapshot clone was quadratic too. The cap keeps each
-/// snapshot bounded. The expansion budget is shared by every snapshot of one
-/// command, so subshell scopes cannot each spend it afresh.
-#[derive(Clone, Default)]
-struct AssignmentScope {
-    values: std::collections::HashMap<String, String>,
-    spent: std::rc::Rc<std::cell::Cell<usize>>,
+/// Longest value substituted whole once [`MAX_EXPANSION_BYTES`] is spent.
+const SHORT_SUBSTITUTION_LEN: usize = 64;
+
+/// `value` cut to its first `head` and last `tail` bytes (on char
+/// boundaries), or unchanged when it is no longer than the two together.
+fn clip_value(value: &str, head: usize, tail: usize) -> Cow<'_, str> {
+    if value.len() <= head + tail {
+        return Cow::Borrowed(value);
+    }
+    let mut h = head;
+    while !value.is_char_boundary(h) {
+        h -= 1;
+    }
+    let mut t = value.len() - tail;
+    while !value.is_char_boundary(t) {
+        t += 1;
+    }
+    Cow::Owned(format!("{}{}", &value[..h], &value[t..]))
 }
 
-impl AssignmentScope {
-    fn set(&mut self, name: String, value: String) {
-        if value.len() > MAX_ASSIGNMENT_VALUE_LEN {
-            // Untrack rather than keep the older value: the shell now holds
-            // the new one, and a stale substitution would mislead the guards.
-            self.values.remove(&name);
-        } else if let Some(slot) = self.values.get_mut(&name) {
-            *slot = value;
-        } else if self.values.len() < MAX_TRACKED_ASSIGNMENTS {
-            self.values.insert(name, value);
+/// The visible `VAR=value` assignments at one point in a command, indexed by
+/// name; a re-assignment replaces the value (newest wins).
+///
+/// Held as maps, not an append-ordered list: a reverse linear search per `$`
+/// made a padded chain of `Dn=$(x y);` quadratic (9.9 s at 200 KB, past the
+/// hook deadline, so the guard failed open — cadence-hooks#1114).
+///
+/// A subshell (a substitution body, a `-c` script) gets a CHILD scope that
+/// borrows its parent instead of cloning it: cloning per substitution was
+/// quadratic too. The walk is synchronous — the child is finished before the
+/// parent's next segment — so a borrow sees exactly the parent's state at that
+/// point, and the child's own assignments die with it. The chain is at most
+/// [`MAX_WRAPPER_DEPTH`] deep. No name is ever dropped for size: every bound
+/// here clips a value, never leaves a reference literal.
+struct AssignmentScope<'a> {
+    parent: Option<&'a AssignmentScope<'a>>,
+    values: std::collections::HashMap<String, String>,
+    /// Full-length substitution bytes spent, shared by the whole command.
+    spent: &'a std::cell::Cell<usize>,
+}
+
+impl<'a> AssignmentScope<'a> {
+    fn root(spent: &'a std::cell::Cell<usize>) -> Self {
+        Self {
+            parent: None,
+            values: std::collections::HashMap::new(),
+            spent,
         }
     }
 
-    /// The value to substitute for `$name`, charged against the command's
-    /// expansion budget; `None` leaves the reference literal.
-    fn take(&self, name: &str) -> Option<&str> {
-        let value = self.values.get(name)?;
-        let spent = self.spent.get().saturating_add(value.len());
-        if spent > MAX_EXPANSION_BYTES {
-            return None;
+    fn child<'b>(&'b self) -> AssignmentScope<'b> {
+        AssignmentScope {
+            parent: Some(self),
+            values: std::collections::HashMap::new(),
+            spent: self.spent,
         }
-        self.spent.set(spent);
-        Some(value)
+    }
+
+    fn set(&mut self, name: String, value: String) {
+        let value = match clip_value(&value, CLIPPED_VALUE_HALF, CLIPPED_VALUE_HALF) {
+            Cow::Borrowed(_) => value,
+            Cow::Owned(clipped) => clipped,
+        };
+        self.values.insert(name, value);
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        let mut scope = Some(self);
+        while let Some(s) = scope {
+            if let Some(value) = s.values.get(name) {
+                return Some(value);
+            }
+            scope = s.parent;
+        }
+        None
+    }
+
+    /// The text to substitute for `$name`: the value whole while the
+    /// command's budget lasts, then clipped to [`SHORT_SUBSTITUTION_LEN`].
+    /// `None` only for a name never assigned (environment-sourced).
+    fn take(&self, name: &str) -> Option<Cow<'_, str>> {
+        let value = self.get(name)?;
+        let spent = self.spent.get().saturating_add(value.len());
+        if spent <= MAX_EXPANSION_BYTES {
+            self.spent.set(spent);
+            return Some(Cow::Borrowed(value));
+        }
+        let half = SHORT_SUBSTITUTION_LEN / 2;
+        Some(clip_value(value, half, half))
     }
 
     fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.values.is_empty() && self.parent.is_none_or(AssignmentScope::is_empty)
     }
 }
 
@@ -5415,7 +5481,7 @@ impl AssignmentScope {
 /// assignments that precede it.
 fn expand_segments(
     command: &str,
-    assignments: &mut AssignmentScope,
+    assignments: &mut AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
 ) {
@@ -5446,8 +5512,8 @@ fn expand_segments(
         // already generous.
         if depth < MAX_WRAPPER_DEPTH {
             for body in substitution_bodies(&segment) {
-                // A substitution is its own subshell too — snapshot.
-                let mut scope = assignments.clone();
+                // A substitution is its own subshell too — a child scope.
+                let mut scope = assignments.child();
                 expand_segments(&body, &mut scope, depth + 1, out);
             }
         }
@@ -5457,7 +5523,7 @@ fn expand_segments(
                 // A child shell inherits what is set so far, but its own
                 // assignments die with the subshell — recurse on a snapshot so
                 // they cannot reach the parent's later segments.
-                let mut scope = assignments.clone();
+                let mut scope = assignments.child();
                 expand_segments(&inner, &mut scope, depth + 1, out);
             }
             _ => out.push(segment),
@@ -6278,7 +6344,7 @@ fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
 /// outside single quotes. Only names present in `assignments` are touched; an
 /// unknown (environment-sourced) variable is left as-is (fail open).
-fn apply_assignments(segment: &str, assignments: &AssignmentScope) -> String {
+fn apply_assignments(segment: &str, assignments: &AssignmentScope<'_>) -> String {
     if assignments.is_empty() || !segment.contains('$') {
         return segment.to_string();
     }
@@ -6332,10 +6398,10 @@ fn apply_assignments(segment: &str, assignments: &AssignmentScope) -> String {
                 // goes in quoted: the word boundaries stay where bash's are.
                 if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
                     out.push('"');
-                    out.push_str(value);
+                    out.push_str(&value);
                     out.push('"');
                 } else {
-                    out.push_str(value);
+                    out.push_str(&value);
                 }
                 i = j;
                 continue;
@@ -12836,40 +12902,71 @@ mod tests {
 
     // --- cadence-hooks#1114 item 1: bounded, indexed assignment tracking ---
 
+    /// The three padded shapes from the PR #1118 review, each of which turned
+    /// a size bound into a literal `$D` (a miss), plus the plain controls.
+    fn padded_prefixes() -> Vec<(&'static str, String)> {
+        let p = format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" "));
+        let names: String = (0..300).map(|n| format!("V{n}=v{n}; ")).collect();
+        vec![("none", String::new()), ("budget", p), ("names", names)]
+    }
+
     #[test]
-    fn assignment_scope_resolves_like_the_shell_within_its_bounds() {
-        let over = "x".repeat(MAX_ASSIGNMENT_VALUE_LEN + 1);
-        let cases: Vec<(String, &str, &str)> = vec![
-            // Newest wins.
-            ("D=a; D=b; rm $D/.env".into(), "rm b/.env", "re-assignment"),
-            // Braced reference.
-            ("D=a; rm ${D}/.env".into(), "rm a/.env", "braced"),
-            // A value past the length cap untracks the name: the reference
-            // stays literal rather than keeping the stale `a`.
-            (
-                format!("D=a; D={over}; rm $D/.env"),
-                "rm $D/.env",
-                "value over the cap",
-            ),
-        ];
-        for (command, want, label) in cases {
+    fn assignment_scope_never_leaves_a_padded_reference_literal() {
+        for (label, prefix) in padded_prefixes() {
+            let command = format!("{prefix}D=.env; cat $D");
             let segments = command_segments(&command);
-            assert_eq!(segments.last().map(String::as_str), Some(want), "{label}");
+            assert_eq!(
+                segments.last().map(String::as_str),
+                Some("cat .env"),
+                "{label}"
+            );
         }
     }
 
     #[test]
-    fn assignment_scope_past_the_name_cap_keeps_references_literal() {
-        let mut command: String = (0..MAX_TRACKED_ASSIGNMENTS)
-            .map(|n| format!("V{n}=v{n}; "))
-            .collect();
-        // One name past the cap is not tracked; a tracked one still updates.
-        command.push_str("LATE=late; V0=new; echo $LATE $V0 $V1");
+    fn assignment_scope_resolves_like_the_shell() {
+        let cases = [
+            ("D=a; D=b; rm $D/.env", "rm b/.env"),
+            ("D=a; rm ${D}/.env", "rm a/.env"),
+            // A substitution is a subshell: its assignment dies with it.
+            ("echo $(D=a); echo $D", "echo $D"),
+            // A subshell sees its parent's assignments.
+            ("D=.env; echo $(cat $D)", "cat .env"),
+            ("D=.env; sh -c \"cat $D\"", "cat .env"),
+        ];
+        for (command, want) in cases {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|s| s == want),
+                "{command}: {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_clipped_to_head_and_tail_not_dropped() {
+        let command = format!("D={}.env; echo hi > $D", "./".repeat(2100));
         let segments = command_segments(&command);
-        assert_eq!(
-            segments.last().map(String::as_str),
-            Some("echo $LATE new v1")
+        let last = segments.last().expect("segments");
+        assert!(last.starts_with("echo hi > ./"), "{last}");
+        assert!(last.ends_with("/.env"), "{last}");
+        assert!(
+            last.len() <= MAX_ASSIGNMENT_VALUE_LEN + 16,
+            "{}",
+            last.len()
         );
+    }
+
+    #[test]
+    fn clip_value_keeps_char_boundaries() {
+        let cases = [
+            ("short", 3, 3, "short"),
+            ("abcdefgh", 2, 2, "abgh"),
+            ("ééééé", 3, 3, "éé"),
+        ];
+        for (value, head, tail, want) in cases {
+            assert_eq!(clip_value(value, head, tail), want, "{value}");
+        }
     }
 
     #[test]
@@ -12884,21 +12981,21 @@ mod tests {
                 .iter()
                 .all(|s| s.len() <= 3 * MAX_ASSIGNMENT_VALUE_LEN)
         );
-        // Once the value outgrows the cap the name is untracked, so later
-        // segments carry literal `$D` text — the `/.env` component survives.
         let last = segments.last().expect("segments");
         assert!(
-            last.starts_with("rm $D") && last.ends_with("/.env"),
+            last.starts_with("rm ab") && last.ends_with("ab/.env"),
             "{last}"
         );
     }
 
     #[test]
-    fn expansion_budget_caps_total_substituted_bytes() {
+    fn substitution_output_stays_linear_past_the_budget() {
         let value = "x".repeat(MAX_ASSIGNMENT_VALUE_LEN);
-        let command = format!("D={value}; echo {}", vec!["$D"; 1000].join(" "));
+        let refs = 10_000;
+        let command = format!("D={value}; echo {}", vec!["$D"; refs].join(" "));
         let total: usize = command_segments(&command).iter().map(String::len).sum();
-        assert!(total <= MAX_EXPANSION_BYTES + command.len() * 2, "{total}");
+        let ceiling = MAX_EXPANSION_BYTES + refs * (SHORT_SUBSTITUTION_LEN + 1) + 2 * command.len();
+        assert!(total <= ceiling, "{total} > {ceiling}");
     }
 
     // --- cadence-hooks#1103: raw-text prechecks vs shell word building ---
@@ -12917,6 +13014,12 @@ mod tests {
             ("{g,}it push", "git", true),
             // Only plain text without the word may skip.
             ("ls -la", "git", false),
+            // No `g`, no escape, no substitution, no backtick: plain `$NAME`
+            // and quoting cannot produce the letter.
+            ("D=.env; cat \"$D\" {a,b}", "gh", false),
+            (r"$'\147it' push", "git", true),
+            ("$(tr a-z n-za-m <<< tvg) push", "git", true),
+            ("`tr a-z n-za-m <<< tvg` push", "git", true),
             ("npm test && cargo build", "gh", false),
         ];
         for (command, needle, want) in cases {

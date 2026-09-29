@@ -417,7 +417,7 @@ pub fn is_dangerous_secret_token(token: &str) -> bool {
 /// token names a file — a redirection target, a writer verb's operand, or an
 /// operand of a command that does nothing but read files.
 pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
-    secret_token_verdict(token, position, true)
+    unescaped_verdict(token, position, true) || secret_token_verdict(token, position, true)
 }
 
 /// [`is_dangerous_secret_token_at`] without the glob judgment, for a word
@@ -426,21 +426,41 @@ pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
 /// literal secret name still counts, and so does a brace group, which the
 /// shell expands into separate words before the command runs.
 pub fn is_dangerous_secret_name_at(token: &str, position: Filename) -> bool {
-    secret_token_verdict(token, position, false)
+    unescaped_verdict(token, position, false) || secret_token_verdict(token, position, false)
 }
 
-fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
-    // The shell removes an unquoted backslash — `cat .e\nv` reads `.env` —
-    // but the tokenizer keeps it outside quotes, so the unescaped spelling is
-    // judged as well (cameronsjo/cadence-hooks#1103). Additive only: the
-    // escaped form is still judged below, and a quoted backslash dropped here
-    // can only over-block.
-    if token.contains('\\') {
-        let unescaped = cadence_hooks_core::shell::unescape_word(token);
-        if unescaped != token && secret_token_verdict(&unescaped, position, globs) {
+/// True when a backslash in `token` escapes a brace- or glob-expansion
+/// character, which bash then reads literally.
+/// The shell removes an unquoted backslash — `cat .e\nv` reads `.env` —
+/// but the tokenizer keeps it outside quotes, so a whole word's unescaped
+/// spelling is judged as well (cameronsjo/cadence-hooks#1103). Additive only,
+/// and applied to the WHOLE word, never to the pieces brace analysis splits it
+/// into: that analysis keeps a piece's backslashes on purpose so an escaped
+/// group (`\{cat,.env\}`, one literal file to bash) stays non-matching. For
+/// the same reason a word that escapes a brace or glob character is skipped.
+/// A quoted backslash dropped here can only over-block.
+fn unescaped_verdict(token: &str, position: Filename, globs: bool) -> bool {
+    if !token.contains('\\') || escapes_expansion_syntax(token) {
+        return false;
+    }
+    let unescaped = cadence_hooks_core::shell::unescape_word(token);
+    unescaped != token && secret_token_verdict(&unescaped, position, globs)
+}
+
+fn escapes_expansion_syntax(token: &str) -> bool {
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.next()
+            && matches!(next, '{' | '}' | ',' | '*' | '?' | '[' | ']')
+        {
             return true;
         }
     }
+    false
+}
+
+fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
     // Checked before any brace or glob analysis, both of which grow with the
     // token: a 100 KB `{{{…` took seconds (#1097 review). Nothing legitimate
     // needs a 4 KiB word with glob syntax in it.

@@ -2006,4 +2006,24 @@ mod tests {
             );
         }
     }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_force_push() {
+        for prefix in padded_prefixes_1118() {
+            let command = format!("{prefix}F=main; git push --force origin $F");
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        }
+    }
 }

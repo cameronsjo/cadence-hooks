@@ -16,7 +16,8 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, command_segments, command_word, executable_tokens,
-    is_assignment_word, skip_git_global_options, split_segments, strip_group_wrappers, strip_heredoc_bodies, tokenize,
+    is_assignment_word, skip_git_global_options, split_segments, strip_group_wrappers,
+    strip_heredoc_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -8598,6 +8599,34 @@ mod tests {
                 cadence_hooks_core::Outcome::Allow,
                 "{command}"
             );
+        }
+    }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_read() {
+        let long = format!("D={}.env; cat $D", "./".repeat(2100));
+        for prefix in padded_prefixes_1118() {
+            for tail in ["D=.env; cat $D", long.as_str()] {
+                let command = format!("{prefix}{tail}");
+                let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Block,
+                    "{}",
+                    &command[command.len().saturating_sub(60)..]
+                );
+            }
         }
     }
 }

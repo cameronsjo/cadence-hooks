@@ -2708,6 +2708,18 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         }
 
+        // Nesting past what the shell parser is fed is unreadable here, and
+        // at ~900 levels it used to overflow the stack and abort — a noisy
+        // fail-open (PR #1118 review). Fail closed instead.
+        if loop_analysis::group_nesting_depth(command) > loop_analysis::MAX_PARSE_NESTING {
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: command nests groups more than {} levels deep — \
+                 too deep to verify its gh targets\n   \
+                 Fix: flatten the command, or run each gh command on its own",
+                loop_analysis::MAX_PARSE_NESTING
+            ));
+        }
+
         let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
@@ -7210,6 +7222,56 @@ mod tests {
                 assert!(
                     matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
                     "{command}"
+                );
+            }
+        });
+    }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_write() {
+        with_env(&owners_env_212(), || {
+            for prefix in padded_prefixes_1118() {
+                let command = format!("{prefix}R=repo; gh $R delete x/y --yes");
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            }
+        });
+    }
+
+    #[test]
+    fn deep_group_nesting_fails_closed_instead_of_overflowing() {
+        // PR #1118 review: ~900 levels of `{ (` overflowed the parser's stack
+        // and aborted the hook, a noisy fail-open.
+        with_env(&owners_env_212(), || {
+            let nest =
+                |k: usize, inner: &str| format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k));
+            let cases = [
+                // Nothing here can spell `gh`: the fast path skips it, so it
+                // never reaches the parser at all.
+                (nest(1000, "echo $HOME"), false),
+                (nest(1000, "echo $(date)"), true),
+                (nest(1000, "gh repo delete x/y --yes"), true),
+                (nest(3, "gh repo delete x/y --yes"), true),
+                (nest(3, "gh pr list"), false),
+            ];
+            for (command, blocks) in cases {
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{}",
+                    &command[..command.len().min(40)]
                 );
             }
         });

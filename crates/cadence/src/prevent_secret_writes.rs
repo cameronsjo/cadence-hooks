@@ -1748,4 +1748,30 @@ mod tests {
         let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
         assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
     }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_write() {
+        let long = format!("D={}.env; echo hi > $D", "./".repeat(2100));
+        for prefix in padded_prefixes_1118() {
+            for tail in ["D=.env; echo hi > $D", "D=.env; rm $D", long.as_str()] {
+                let command = format!("{prefix}{tail}");
+                assert!(
+                    bash_targets_env_file(&command),
+                    "{}",
+                    &command[command.len().saturating_sub(60)..]
+                );
+            }
+        }
+    }
 }

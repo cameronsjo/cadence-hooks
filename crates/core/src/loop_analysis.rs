@@ -321,7 +321,47 @@ fn body_walk_pipeline(pipeline: &Pipeline, found: &mut bool) {
     }
 }
 
+/// Deepest grouping nesting [`parse_command`] hands to the parser. The parser
+/// recurses once per `(`/`{` level, and around 900 levels of `{ (` overflow
+/// the main thread's stack — an abort, which a hook reports as a non-blocking
+/// error: a noisy fail-open (PR #1118 review). Real commands nest a few levels.
+pub const MAX_PARSE_NESTING: usize = 64;
+
+/// The deepest `(`/`{` nesting in `command`, outside single quotes and
+/// backslash escapes. Deliberately over-counts: a `(` inside `"…"` counts, as
+/// `"$( … )"` really does nest there. Linear, and never recurses.
+pub fn group_nesting_depth(command: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_single = false;
+    let mut escaped = false;
+    for c in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            in_single = c != '\'';
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' => in_single = true,
+            '(' | '{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            ')' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
+    if group_nesting_depth(command) > MAX_PARSE_NESTING {
+        return None;
+    }
     let reader = std::io::Cursor::new(command);
     let options = ParserOptions::default();
     let source_info = SourceInfo::default();
@@ -1394,5 +1434,22 @@ mod tests {
             matches!(result, ChainAnalysis::DifferentRemotes(_)),
             "globals before `push` hid both pushes: {result:?}"
         );
+    }
+
+    #[test]
+    fn group_nesting_depth_counts_unquoted_openers() {
+        let cases = [
+            ("echo hi", 0),
+            ("{ (cat x) }", 2),
+            ("echo '((((('", 0),
+            (r"echo \( \(", 0),
+            ("echo \"$(a $(b))\"", 2),
+            ("(a) (b) (c)", 1),
+        ];
+        for (command, want) in cases {
+            assert_eq!(group_nesting_depth(command), want, "{command}");
+        }
+        let deep = format!("{}x{}", "{ ( ".repeat(1000), " ) }".repeat(1000));
+        assert!(matches!(analyze_gh_loops(&deep), LoopAnalysis::ParseFailed));
     }
 }
