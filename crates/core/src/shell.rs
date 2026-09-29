@@ -3627,9 +3627,35 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
     let mut quote: Option<Quote> = None;
-    let mut chars = command.chars().peekable();
+    let all: Vec<char> = command.chars().collect();
+    let mut chars = all.iter().copied().peekable();
 
     while let Some(c) = chars.next() {
+        // A substitution inside `"…"` is copied whole: its own quoting belongs
+        // to the nested parse bash runs, not to this run, so an inner `"` must
+        // not close it (cameronsjo/cadence-hooks#830). Only the double-quoted
+        // state changes here — unquoted text keeps splitting inside `$(…)` as
+        // before, which is what lets plain `split_segments` callers see the
+        // commands a substitution runs.
+        //
+        // `\$` and `` \` `` inside `"…"` are literal to bash and open nothing;
+        // the pair is consumed together so the opener after the backslash is
+        // never read as one.
+        if quote == Some(Quote::Double) && c == '\\' && matches!(chars.peek(), Some('$' | '`')) {
+            current.push(c);
+            current.push(chars.next().expect("peeked"));
+            continue;
+        }
+        if quote == Some(Quote::Double) && matches!(c, '$' | '`') {
+            let i = all.len() - chars.len() - 1;
+            if let Some(end) = quoted_substitution_end(&all, i) {
+                current.extend(&all[i..end]);
+                for _ in i + 1..end {
+                    chars.next();
+                }
+                continue;
+            }
+        }
         if let Some(q) = quote {
             // Inside `"…"`, `\` escapes `"` and `\`; inside `$'…'` it escapes
             // ANYTHING, `'` included. Either way the escaped character is
@@ -3802,8 +3828,44 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     let mut backticks = false;
     let mut boundary = true;
     let mut chars = text.char_indices().peekable();
+    // Char view + byte offsets, built only if a double-quoted substitution
+    // needs bounding — most inputs never pay for it.
+    let mut table: Option<(Vec<char>, Vec<usize>)> = None;
 
     while let Some((i, c)) = chars.next() {
+        // A substitution inside `"…"` is skipped whole, the same way
+        // [`split_segments_with_ops`] copies it: an inner `"` belongs to the
+        // nested parse and must not close this run. Reading it as data closed
+        // the run early, so a later `#` read as a comment and deleted the
+        // `;` and the command behind it — `echo "$(echo "a # )" ; cat .env)"`
+        // reached no guard while bash ran the read (cameronsjo/cadence-hooks#831).
+        // `\$` and `` \` `` are literal inside `"…"` and open nothing.
+        if quote == Some(Quote::Double) {
+            if c == '\\' && matches!(chars.peek().map(|&(_, n)| n), Some('$' | '`')) {
+                chars.next();
+                continue;
+            }
+            if matches!(c, '$' | '`') {
+                let (all, byte_of) = table.get_or_insert_with(|| {
+                    let all: Vec<char> = text.chars().collect();
+                    let byte_of = text
+                        .char_indices()
+                        .map(|(b, _)| b)
+                        .chain(std::iter::once(text.len()))
+                        .collect();
+                    (all, byte_of)
+                });
+                let at = byte_of.binary_search(&i).expect("char boundary");
+                if let Some(end) = quoted_substitution_end(all, at) {
+                    let end_byte = byte_of[end];
+                    while chars.peek().is_some_and(|&(j, _)| j < end_byte) {
+                        chars.next();
+                    }
+                    boundary = false;
+                    continue;
+                }
+            }
+        }
         if let Some(q) = quote {
             let escapes = match q {
                 Quote::Double => matches!(chars.peek().map(|&(_, n)| n), Some('"' | '\\')),
@@ -4472,6 +4534,45 @@ fn scan_substitution_body_bounded(
         return Err(ScanStop::QuoteUnresolved);
     }
     Err(ScanStop::Unterminated)
+}
+
+/// Index just past the backtick that closes the `` `…` `` span opening at
+/// `chars[i]`, or `None` when no unescaped backtick follows.
+///
+/// Bash ends a backtick substitution at the first UNESCAPED backtick, whatever
+/// quoting sits between — see [`substitution_spans`] for the measurements — so
+/// only a backslash is honored here, and it escapes whatever follows it.
+fn backtick_span_end(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '`' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Index just past the command substitution — `$(…)` or `` `…` `` — opening at
+/// `chars[i]`, when one opens there AND its terminator can be located.
+///
+/// For a parser walking a double-quoted run: bash re-parses a substitution
+/// inside `"…"` on its own, so a `"` or `'` in its body neither closes the
+/// outer run nor opens a new one. A walker that reads the body as plain
+/// quoted data lets that inner `"` close its `Quote::Double`, and the rest of
+/// the command — separators included — is then misread as quoted text
+/// (cameronsjo/cadence-hooks#830). `None` means "no substitution here, or
+/// none this scanner can bound": the caller keeps its old character-by-
+/// character reading, which is the status quo rather than a new deletion.
+fn quoted_substitution_end(chars: &[char], i: usize) -> Option<usize> {
+    match chars[i] {
+        '$' if chars.get(i + 1) == Some(&'(') => scan_substitution_body(chars, i + 2, true)
+            .ok()
+            .map(|(_, end)| end),
+        '`' => backtick_span_end(chars, i),
+        _ => None,
+    }
 }
 
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
@@ -8813,6 +8914,56 @@ mod tests {
                 "flood #{idx} ({len} chars) dropped the trailing payload"
             );
         }
+    }
+
+    #[test]
+    fn split_segments_substitution_inside_double_quotes_keeps_its_own_quoting() {
+        // cadence-hooks#830: a `$( )` or `` `…` `` inside `"…"` is re-parsed by
+        // bash on its own, so a `"`/`'` in its body neither closes the outer run
+        // nor opens a new one. The splitter read the body as quoted data, let
+        // the inner `"` close its run, opened a phantom `'…'` on the next
+        // apostrophe, and swallowed the `;` and the command behind it. Every
+        // row runs `cat .env` in bash (payload-free twins measured).
+        for input in [
+            r#"echo $(echo "$(echo '")')" ; cat .env)"#,
+            "cat <<EOF\n$(echo \"$(echo '\")')\" ; cat .env)\nEOF",
+            r#"echo "`echo "'"`" ; cat .env"#,
+            r#"echo $(echo "`echo "'"`" ; cat .env)"#,
+            "cat <<EOF\n$(echo \"`echo \"'\"`\" ; cat .env)\nEOF",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                // `cat .env)` is the unquoted splitter's existing cut through
+                // an outer `$( )` — still its own command to the guards.
+                out.iter().any(|s| s.trim_end_matches(')') == "cat .env"),
+                "{input:?}: the sibling command reached no segment: {out:?}"
+            );
+        }
+        assert_eq!(
+            split_segments(r#"echo "$(echo '")')" ; cat .env"#),
+            vec![r#"echo "$(echo '")')""#.to_string(), "cat .env".to_string()],
+        );
+        // Controls: an escaped opener inside `"…"` is literal to bash and opens
+        // nothing, and a separator inside a plain quoted run still splits
+        // nothing — the new arm changes quote tracking, not what is quoted.
+        assert_eq!(
+            split_segments(r#"echo "\$(" ; cat .env"#),
+            vec![r#"echo "\$(""#.to_string(), "cat .env".to_string()],
+        );
+        assert_eq!(
+            split_segments(r#"echo "\`" ; cat .env"#),
+            vec![r#"echo "\`""#.to_string(), "cat .env".to_string()],
+        );
+        assert_eq!(
+            split_segments(r#"echo "a ; $(echo b) ; c""#),
+            vec![r#"echo "a ; $(echo b) ; c""#.to_string()],
+        );
+        // Unquoted substitutions keep splitting inside, as before — plain
+        // `split_segments` callers rely on seeing the commands they run.
+        assert_eq!(
+            split_segments("echo $(echo a ; cat .env)"),
+            vec!["echo $(echo a".to_string(), "cat .env)".to_string()],
+        );
     }
 
     #[test]
