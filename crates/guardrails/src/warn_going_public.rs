@@ -28,7 +28,7 @@
 use cadence_hooks_cadence::redact_external_content::TermMatch;
 #[cfg(not(test))]
 use cadence_hooks_cadence::redact_external_content::identity_matches;
-use cadence_hooks_core::config::env_list;
+use cadence_hooks_core::config::parse_env_list;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
     command_segments, command_word, contains_ignoring_ascii_case, executable_tokens,
@@ -72,13 +72,9 @@ static ARR_FAMILY: LazyLock<Regex> =
 
 /// Effective term set: [`DEFAULT_TERMS`] ∪ `CADENCE_GOING_PUBLIC_TERMS`, each
 /// lowercased. The `*arr` regex is applied separately by [`find_match`].
-fn effective_terms() -> Vec<String> {
+fn effective_terms(extra_raw: &str) -> Vec<String> {
     let mut terms: Vec<String> = DEFAULT_TERMS.iter().map(|s| s.to_lowercase()).collect();
-    terms.extend(
-        env_list("CADENCE_GOING_PUBLIC_TERMS")
-            .iter()
-            .map(|s| s.to_lowercase()),
-    );
+    terms.extend(parse_env_list(extra_raw).iter().map(|s| s.to_lowercase()));
     terms
 }
 
@@ -208,6 +204,20 @@ impl Check for GoingPublicGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        let read = |var: &str| std::env::var(var).unwrap_or_default();
+        self.run_with(
+            input,
+            &read("CADENCE_GOING_PUBLIC_TERMS"),
+            &read("CADENCE_GOING_PUBLIC_IGNORE"),
+        )
+    }
+}
+
+impl GoingPublicGuard {
+    /// [`Check::run`] with `CADENCE_GOING_PUBLIC_TERMS` / `_IGNORE` passed in
+    /// rather than read from process env, so tests need no env mutation
+    /// (cadence-hooks#486).
+    fn run_with(&self, input: &HookInput, terms_raw: &str, ignore_raw: &str) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
@@ -220,8 +230,8 @@ impl Check for GoingPublicGuard {
             return CheckResult::allow();
         }
 
-        let terms = effective_terms();
-        let ignore = env_list("CADENCE_GOING_PUBLIC_IGNORE");
+        let terms = effective_terms(terms_raw);
+        let ignore = parse_env_list(ignore_raw);
 
         // Judge each executable segment independently so a quoted `gh repo
         // create …` inside an `echo` (command word ≠ gh) never fires, while a
@@ -337,27 +347,21 @@ fn nudge_message(term: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::with_env;
     use cadence_hooks_core::test_builders::make_bash;
 
-    // Tests that mutate CADENCE_GOING_PUBLIC_TERMS / _IGNORE serialize via the
-    // crate-shared with_env/CADENCE_ENV_TEST_LOCK so they don't race each
-    // other (env is process-global) or the globals mutated elsewhere in this
-    // crate (#446).
+    // The guard is driven through `run_with`, which takes the
+    // CADENCE_GOING_PUBLIC_TERMS / _IGNORE values as parameters, so these tests
+    // neither read nor mutate process env (cadence-hooks#486).
 
-    /// Runs the guard with no env lock. Only for callers already inside
-    /// `with_env`, whose mutex is not reentrant.
-    fn outcome_unlocked(cmd: &str) -> cadence_hooks_core::Outcome {
-        GoingPublicGuard.run(&make_bash(cmd)).outcome
+    fn outcome_with(cmd: &str, terms: &str, ignore: &str) -> cadence_hooks_core::Outcome {
+        GoingPublicGuard
+            .run_with(&make_bash(cmd), terms, ignore)
+            .outcome
     }
 
-    /// The guard reads `CADENCE_GOING_PUBLIC_TERMS`/`_IGNORE` live, so a
-    /// reader must hold the same lock the writers below do, or it can observe
-    /// their value mid-test (cameronsjo/cadence-hooks#1112).
+    /// The guard with neither env var set.
     fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
-        let mut out = None;
-        crate::with_env(&[], || out = Some(outcome_unlocked(cmd)));
-        out.expect("with_env ran the closure")
+        outcome_with(cmd, "", "")
     }
 
     // --- create: fires regardless of visibility ---
@@ -590,34 +594,24 @@ mod tests {
         // reaches only the `gh` process, never this hook, and it used to
         // "work" only because the assignment word hid the whole segment —
         // including the redaction terms the list may never relieve (#793).
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", None),
-                ("CADENCE_GOING_PUBLIC_IGNORE", None),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked(
-                        "CADENCE_GOING_PUBLIC_IGNORE=sonarr gh repo create sonarr-cfg --public"
-                    ),
-                    cadence_hooks_core::Outcome::Nudge
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with(
+                    "CADENCE_GOING_PUBLIC_IGNORE=sonarr gh repo create sonarr-cfg --public",
+                    "",
+                    ""
+                ),
+                cadence_hooks_core::Outcome::Nudge
+            );
+        };
         // The documented form — the session environment — still relieves a
         // prefixed command.
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", None),
-                ("CADENCE_GOING_PUBLIC_IGNORE", Some("sonarr")),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked("X=1 gh repo create sonarr-cfg --public"),
-                    cadence_hooks_core::Outcome::Allow
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with("X=1 gh repo create sonarr-cfg --public", "", "sonarr"),
+                cadence_hooks_core::Outcome::Allow
+            );
+        };
     }
 
     // --- *arr family regex ---
@@ -634,69 +628,53 @@ mod tests {
 
     #[test]
     fn ignore_relieves_concrete_term() {
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", None),
-                ("CADENCE_GOING_PUBLIC_IGNORE", Some("sonarr")),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked("gh repo create sonarr-cfg --public"),
-                    cadence_hooks_core::Outcome::Allow
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with("gh repo create sonarr-cfg --public", "", "sonarr"),
+                cadence_hooks_core::Outcome::Allow
+            );
+        };
     }
 
     #[test]
     fn ignore_relieves_arr_family_surname() {
         // `starr` matches the *arr regex but is a surname — IGNORE relieves it.
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", None),
-                ("CADENCE_GOING_PUBLIC_IGNORE", Some("starr")),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked("gh repo create starr --public"),
-                    cadence_hooks_core::Outcome::Allow
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with("gh repo create starr --public", "", "starr"),
+                cadence_hooks_core::Outcome::Allow
+            );
+        };
     }
 
     // --- env-supplied custom term ---
 
     #[test]
     fn custom_env_term_nudges() {
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", Some("skunkworks")),
-                ("CADENCE_GOING_PUBLIC_IGNORE", None),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked("gh repo create skunkworks-notes --private"),
-                    cadence_hooks_core::Outcome::Nudge
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with(
+                    "gh repo create skunkworks-notes --private",
+                    "skunkworks",
+                    ""
+                ),
+                cadence_hooks_core::Outcome::Nudge
+            );
+        };
     }
 
     #[test]
     fn ignore_suppresses_env_term() {
-        with_env(
-            &[
-                ("CADENCE_GOING_PUBLIC_TERMS", Some("skunkworks")),
-                ("CADENCE_GOING_PUBLIC_IGNORE", Some("skunkworks")),
-            ],
-            || {
-                assert_eq!(
-                    outcome_unlocked("gh repo create skunkworks-notes --private"),
-                    cadence_hooks_core::Outcome::Allow
-                );
-            },
-        );
+        {
+            assert_eq!(
+                outcome_with(
+                    "gh repo create skunkworks-notes --private",
+                    "skunkworks",
+                    "skunkworks"
+                ),
+                cadence_hooks_core::Outcome::Allow
+            );
+        };
     }
 
     // --- nudge message content ---
@@ -723,10 +701,9 @@ mod tests {
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, toml).unwrap();
         IDENTITY_SOURCE.with(|s| *s.borrow_mut() = Some(path));
-        let mut out = None;
-        crate::with_env(&[], || out = Some(GoingPublicGuard.run(&make_bash(cmd))));
+        let out = GoingPublicGuard.run_with(&make_bash(cmd), "", "");
         IDENTITY_SOURCE.with(|s| *s.borrow_mut() = None);
-        out.unwrap()
+        out
     }
 
     const TERMS: &str = r#"
@@ -772,22 +749,15 @@ allow = [{ pattern = "zorblax corp fan club" }]
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, TERMS).unwrap();
         IDENTITY_SOURCE.with(|s| *s.borrow_mut() = Some(path));
-        let mut out = None;
-        crate::with_env(
-            &[(
-                "CADENCE_GOING_PUBLIC_IGNORE",
-                Some("zorblax corp,zorblax-corp-tools"),
-            )],
-            || {
-                out = Some(
-                    GoingPublicGuard
-                        .run(&make_bash("gh repo create zorblax-corp-tools"))
-                        .outcome,
-                )
-            },
-        );
+        let out = GoingPublicGuard
+            .run_with(
+                &make_bash("gh repo create zorblax-corp-tools"),
+                "",
+                "zorblax corp,zorblax-corp-tools",
+            )
+            .outcome;
         IDENTITY_SOURCE.with(|s| *s.borrow_mut() = None);
-        assert_eq!(out, Some(cadence_hooks_core::Outcome::Nudge));
+        assert_eq!(out, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]

@@ -46,9 +46,12 @@ fn is_default_branch(branch: &str) -> bool {
 /// `main`. Truthy is `"1"`/`"true"`/`"yes"` (trimmed, case-insensitive) via the
 /// shared [`is_truthy`](cadence_hooks_core::worktree::is_truthy). Absent /
 /// unparsable settings declare nothing and fall through (ADR-0001).
-fn is_main_allowed(repo_root: &Path) -> bool {
+///
+/// The process-env `CADENCE_ALLOW_MAIN` value is passed in (`env_value`) rather
+/// than read here, so tests need no env mutation (cadence-hooks#486).
+fn is_main_allowed_with(repo_root: &Path, env_value: Option<&str>) -> bool {
     use cadence_hooks_core::worktree::{is_primary_checkout, is_truthy};
-    let env_allowed = is_truthy(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref());
+    let env_allowed = is_truthy(env_value);
     if env_allowed {
         return true;
     }
@@ -295,6 +298,14 @@ impl Check for WarnMainBranch {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        self.run_with_env_allow(input, std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref())
+    }
+}
+
+impl WarnMainBranch {
+    /// [`Check::run`] with the process-env `CADENCE_ALLOW_MAIN` value passed in
+    /// rather than read live, so tests need no env mutation (cadence-hooks#486).
+    fn run_with_env_allow(&self, input: &HookInput, env_allow: Option<&str>) -> CheckResult {
         let dir = git_dir_for_input(input);
 
         // Edits inside a `.claude/` directory are tooling, config, or worktree
@@ -316,7 +327,7 @@ impl Check for WarnMainBranch {
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
         let snoozed = dismiss_main_branch_warn::is_snoozed_now(input, Path::new(&repo_root));
-        let allowed = is_main_allowed(Path::new(&repo_root));
+        let allowed = is_main_allowed_with(Path::new(&repo_root), env_allow);
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
 
@@ -862,7 +873,7 @@ mod tests {
         let input = edit_input_in(tmp.path(), "warn-bypass-a");
         arm_snooze(&input, &root, Some("wrap-up edits on dotfiles"));
 
-        let r = WarnMainBranch.run(&input);
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(
             r.outcome,
             Outcome::Allow,
@@ -890,7 +901,7 @@ mod tests {
             + 3600;
         cadence_hooks_core::markers::write_marker(&marker, &format!("{until}\n")).unwrap();
 
-        let r = WarnMainBranch.run(&input);
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("still attributes a dismissal");
         assert_eq!(prov.kind, BypassKind::Dismissal);
@@ -911,7 +922,7 @@ mod tests {
             cadence_hooks_core::markers::session_marker(&input, "main-branch-warned", Some(&root));
         cadence_hooks_core::markers::write_marker(&warned, "").unwrap();
 
-        let r = WarnMainBranch.run(&input);
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             r.bypass.is_none(),
@@ -925,20 +936,17 @@ mod tests {
         let (tmp, _root) = init_repo_on_main();
         git_in(tmp.path(), &["checkout", "-q", "-b", "feat/x"]);
         let input = edit_input_in(tmp.path(), "warn-bypass-feat");
-        let r = WarnMainBranch.run(&input);
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(r.bypass.is_none(), "feature-branch allow is not a bypass");
     }
 
     // --- repo-declared CADENCE_ALLOW_MAIN (#164 resolution collapse) ---
     //
-    // `is_main_allowed` reads real process env, which a caller's own
-    // environment may already set (CLAUDE.md: Claude sessions can ambiently
-    // carry `CADENCE_ALLOW_MAIN=true`) — clear it for the test that must prove
-    // the *repo-declared* source is what allows, serialized against every other
-    // `CADENCE_ALLOW_MAIN`-mutating test *across the crate* (not just this
-    // module) via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK`
-    // (cadence-hooks#298 — `warn_branch_base` mutates the same var).
+    // These tests drive `run_with_env_allow(.., None)`, so the process-env
+    // `CADENCE_ALLOW_MAIN` (which a Claude session may ambiently set) is never
+    // read and the *repo-declared* source is what allows; no env lock is needed
+    // (cadence-hooks#486).
 
     #[test]
     fn repo_declared_allow_main_suppresses_nudge() {
@@ -947,16 +955,6 @@ mod tests {
         // by-design-main repo that opted out in settings is no longer nudged on
         // `main`. This is the intended behavior change; everything else is
         // verdict-locked.
-        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
-        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below. With
-        // process env cleared, the only allow source is the settings file.
-        unsafe {
-            std::env::remove_var("CADENCE_ALLOW_MAIN");
-        }
-
         let (tmp, _root) = init_repo_on_main();
         let claude = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
@@ -967,15 +965,7 @@ mod tests {
         .unwrap();
 
         let input = edit_input_in(tmp.path(), "warn-allow-repo-declared");
-        let r = WarnMainBranch.run(&input);
-
-        // SAFETY: serialized via ALLOW_MAIN_ENV_LOCK.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
-                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
-            }
-        }
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
 
         assert_eq!(
             r.outcome,
@@ -993,27 +983,6 @@ mod tests {
     // Each case pins the verdict AND the marker key the old git spawns
     // produced: `repo_root` must equal `git rev-parse --show-toplevel` byte for
     // byte, or a session already warned under the old key would be re-warned.
-
-    /// Run `f` with `CADENCE_ALLOW_MAIN` cleared, serialized crate-wide.
-    fn without_allow_main<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
-        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below.
-        unsafe {
-            std::env::remove_var("CADENCE_ALLOW_MAIN");
-        }
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
-                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
-            }
-        }
-        out.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
 
     /// Run git in a fixture repo. Repository-location variables are removed:
     /// set (as they are when `cargo test` runs from a git hook), they override
@@ -1057,7 +1026,7 @@ mod tests {
     fn main_edit_nudges_and_marks_git_toplevel() {
         let (tmp, root) = init_repo_on_main();
         let input = edit_input_in(tmp.path(), "warn-parity-main");
-        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Nudge, "an edit on main nudges");
         let marker = WarnMainBranch::marker_path(&input, &root);
         assert!(
@@ -1072,7 +1041,7 @@ mod tests {
         let sub = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&sub).unwrap();
         let input = edit_input_at(&sub.join("f.rs"), tmp.path(), "warn-parity-sub");
-        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Nudge);
         assert!(WarnMainBranch::marker_path(&input, &root).exists());
     }
@@ -1096,12 +1065,12 @@ mod tests {
         .unwrap();
 
         let in_wt = edit_input_in(&wt, "warn-parity-wt");
-        let r = without_allow_main(|| WarnMainBranch.run(&in_wt));
+        let r = WarnMainBranch.run_with_env_allow(&in_wt, None);
         assert_eq!(r.outcome, Outcome::Nudge, "worktree on main nudges");
         assert!(WarnMainBranch::marker_path(&in_wt, &wt_root).exists());
 
         let in_primary = edit_input_in(tmp.path(), "warn-parity-wt-primary");
-        let r = without_allow_main(|| WarnMainBranch.run(&in_primary));
+        let r = WarnMainBranch.run_with_env_allow(&in_primary, None);
         assert_eq!(
             r.outcome,
             Outcome::Allow,
@@ -1114,7 +1083,7 @@ mod tests {
         let (tmp, _root) = init_repo_on_main();
         git_in(tmp.path(), &["checkout", "-q", "--detach"]);
         let input = edit_input_in(tmp.path(), "warn-parity-detached");
-        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -1125,7 +1094,7 @@ mod tests {
         let (tmp, _root) = init_repo_on_main();
         let file = tmp.path().join("not").join("yet").join("f.rs");
         let input = edit_input_at(&file, tmp.path(), "warn-parity-missing");
-        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -1133,7 +1102,7 @@ mod tests {
     fn outside_any_repo_allows() {
         let tmp = tempfile::tempdir().unwrap();
         let input = edit_input_in(tmp.path(), "warn-parity-norepo");
-        let r = without_allow_main(|| WarnMainBranch.run(&input));
+        let r = WarnMainBranch.run_with_env_allow(&input, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
