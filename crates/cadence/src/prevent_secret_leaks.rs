@@ -13,7 +13,8 @@ use crate::secret_patterns::{
     is_dangerous_secret_token_at, is_safe_template, is_secret_shaped_var_name,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, is_assignment_word, split_segments, tokenize,
+    command_segments, command_word, executable_tokens, is_assignment_word, skip_git_global_options,
+    split_segments, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -327,7 +328,9 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
     if cmd_word == "forgectl" && tokens.first().is_some_and(|head| head == "forgectl") {
         return forgectl_env_leak(argv);
     }
-    if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
+    if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref())
+        && !(cmd_word == "git" && git_reads_worktree_file(&argv[1..]))
+    {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -352,9 +355,50 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
     argv.iter()
         .enumerate()
         .filter(|(i, _)| Some(*i) != jq_filter)
-        .filter_map(|(_, t)| dangerous_secret_operand(t, position))
+        .filter_map(|(_, t)| {
+            // `dd` names its input as `if=FILE` — one token whose basename
+            // split sees `if=.env`, which matches no secret pattern (#850).
+            // Peeled for `dd` alone: a generic `KEY=value` split would block
+            // every path-valued assignment (`make ENV=.env`, `export F=.env`),
+            // the #771 false-block class. dd reads that operand, so it is a
+            // known filename.
+            if cmd_word == "dd"
+                && let Some(input) = t.strip_prefix("if=")
+            {
+                return dangerous_secret_operand(input, Filename::Known);
+            }
+            dangerous_secret_operand(t, position)
+        })
         .map(|value| (cmd_word.to_string(), value.to_string()))
         .collect()
+}
+
+/// `git` subcommands that print a WORKING-TREE file's bytes whether or not git
+/// tracks it — the reason the blanket `git` entry in
+/// [`METADATA_SAFE_COMMANDS`] is wrong for them (#850). That entry's accepted
+/// residual is committed content (`git show HEAD:.env`), justified by `.env`
+/// being gitignored; these two read the file on disk, so gitignore is no
+/// defense. `git diff` counts whole, not only under `--no-index`: git implies
+/// `--no-index` when a path lies outside the work tree
+/// (`git diff /dev/null .env`), and a tracked `.env`'s diff is its content too.
+const GIT_CONTENT_SUBCOMMANDS: &[&str] = &["diff", "stripspace"];
+
+/// Does this `git` argv (the tokens AFTER the verb) print a working-tree file?
+///
+/// Fails CLOSED: a global option [`skip_git_global_options`] cannot classify
+/// leaves a `-`-led token where the subcommand should be, and that loses the
+/// exemption rather than guessing. `--no-index` anywhere is also enough on its
+/// own. Both only ever REMOVE the metadata exemption — the operands are then
+/// scanned like any other command's, so a `git diff` with no secret operand
+/// still allows.
+fn git_reads_worktree_file(args: &[String]) -> bool {
+    if args.iter().any(|t| t == "--no-index") {
+        return true;
+    }
+    match skip_git_global_options(args).first() {
+        Some(sub) => sub.starts_with('-') || GIT_CONTENT_SUBCOMMANDS.contains(&sub.as_str()),
+        None => false,
+    }
 }
 
 /// Heads a command may use anywhere and still let the jq filter exemption
@@ -5371,5 +5415,80 @@ mod tests {
         assert_eq!(jq_filter_index(&argv("jq -- -r")), None);
         assert_eq!(jq_filter_index(&argv("jq --arg a")), None);
         assert_eq!(jq_filter_index(&argv("jq -f p.jq x.json")), None);
+    }
+
+    #[test]
+    fn dd_input_operand_naming_a_secret_blocks() {
+        // #850: `if=.env` is one token whose basename is `if=.env`, so the
+        // classifier saw no secret while dd printed the file.
+        assert_bash(
+            &[
+                "dd if=.env",
+                "dd if=.env of=/dev/stdout",
+                "dd bs=1 if=config/.env.production",
+                "dd if=/home/u/.ssh/id_rsa",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "dd's if= names the file it reads",
+        );
+    }
+
+    #[test]
+    fn dd_peel_does_not_reach_other_assignments() {
+        // Controls: the `KEY=value` peel is dd-only and input-only. `of=` is a
+        // write (the writes guard's shape), and a path-valued assignment on
+        // another command is the #771 false-block class.
+        assert_bash(
+            &[
+                "dd if=/dev/zero of=out.bin bs=1 count=1",
+                "dd if=.env.example",
+                "make ENV=.env",
+                "node --env-file=.env app.js",
+                "export F=.env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only dd's if= operand is peeled",
+        );
+    }
+
+    #[test]
+    fn git_subcommands_that_print_a_worktree_file_block() {
+        // #850: `git` is metadata-safe, but these two print the file on disk,
+        // tracked or not.
+        assert_bash(
+            &[
+                "git diff --no-index /dev/null .env",
+                "git diff /dev/null .env",
+                "git diff -- .env",
+                "git -C . diff --no-index /dev/null .env",
+                "git --no-pager diff --no-index /dev/null .env",
+                "git stripspace <.env",
+                "git stripspace < .env",
+                "git log --no-index .env",
+                // An unclassifiable global option fails closed.
+                "git --bogus diff .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "git reading a working-tree secret is a read",
+        );
+    }
+
+    #[test]
+    fn git_metadata_subcommands_stay_exempt() {
+        assert_bash(
+            &[
+                "git diff",
+                "git diff --stat",
+                "git diff HEAD~1 -- src/main.rs",
+                "git diff -- .env.example",
+                "git add .env",
+                "git status .env",
+                "git log -- .env",
+                "git check-ignore .env",
+                "git rm --cached .env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only content-emitting git subcommands lose the exemption",
+        );
     }
 }
