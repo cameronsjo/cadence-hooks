@@ -8345,6 +8345,88 @@ mod tests {
         });
     }
 
+    /// Directory changes neither reading followed: a function body, `pushd`,
+    /// `eval`, `builtin cd`, and a `cd` inside a compound. From an owned
+    /// checkout each ran the write in the unowned one (checked with a real
+    /// `bash` `pwd` canary) and was allowed.
+    #[test]
+    fn gh_write_follows_every_directory_change_form() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                // Allowed on the base.
+                ("f() { cd {U}; }; f; gh pr create -t x", true),
+                ("f() {\ncd {U}\n}\nf\ngh pr create -t x", true),
+                ("function f { cd {U}; }; f; gh pr create -t x", true),
+                ("f() { cd {U}; }; f && gh pr create -t x", true),
+                ("g() { f; }; f() { cd {U}; }; g; gh pr create -t x", true),
+                ("cd() { builtin cd {U}; }; cd {O}; gh pr create -t x", true),
+                ("f() { gh pr create -t x; }; (cd {U}; f)", true),
+                ("pushd {U}; gh pr create -t x", true),
+                ("pushd {U} >/dev/null; gh pr create -t x", true),
+                ("eval 'cd {U}'; gh pr create -t x", true),
+                ("eval cd {U}; gh pr create -t x", true),
+                ("builtin cd {U}; gh pr create -t x", true),
+                ("command cd {U}; gh pr create -t x", true),
+                ("\\cd {U}; gh pr create -t x", true),
+                ("X=1 cd {U}; gh pr create -t x", true),
+                ("! cd {U}; gh pr create -t x", true),
+                ("time cd {U}; gh pr create -t x", true),
+                ("if true; then cd {U}; fi; gh pr create -t x", true),
+                ("if cd {U}; then true; fi; gh pr create -t x", true),
+                ("{ if true; then cd {U}; fi; }; gh pr create -t x", true),
+                (
+                    "while true; do cd {U}; break; done; gh pr create -t x",
+                    true,
+                ),
+                ("for d in {U}; do cd $d; done; gh pr create -t x", true),
+                ("case x in x) cd {U};; esac; gh pr create -t x", true),
+                ("c=cd; $c {U}; gh pr create -t x", true),
+                ("trap 'cd {U}' DEBUG; gh pr create -t x", true),
+                // Unreadable: the shell is somewhere this walk cannot name.
+                ("cd {U}; popd; gh pr create -t x", true),
+                ("eval \"$S\"; gh pr create -t x", true),
+                // Controls: the same forms into the owned checkout, or
+                // forms that move nothing.
+                ("cd {O} && gh pr create -t x", false),
+                ("f() { echo; }; f; gh pr create -t x", false),
+                ("if true; then echo; fi; gh pr create -t x", false),
+                ("f() { cd {O}; }; f; gh pr create -t x", false),
+                ("pushd {O} >/dev/null && gh pr create -t x && popd", false),
+                ("eval 'cd {O}'; gh pr create -t x", false),
+                ("builtin cd {O}; gh pr create -t x", false),
+                ("if true; then cd {O}; fi; gh pr create -t x", false),
+                (
+                    "while true; do cd {O}; break; done; gh pr create -t x",
+                    false,
+                ),
+                ("f() (cd {U}); f; gh pr create -t x", false),
+                ("f() { cd {U}; }; f | cat; gh pr create -t x", false),
+                ("(f() { cd {U}; }; f); gh pr create -t x", false),
+                ("f() { cd {U}; gh pr create -t x; }; echo", false),
+                ("for f in a b; do echo $f; done; gh pr create -t x", false),
+                (
+                    "case x in y) echo;; *) echo;; esac; gh pr create -t x",
+                    false,
+                ),
+                ("eval 'echo hi'; gh pr create -t x", false),
+                ("trap 'rm -f x' EXIT; gh pr create -t x", false),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
+                let result = GhWriteGuard.run(&input_with(&command, o));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
     /// A flood of writes, each after a `cd` to a distinct directory, blocks
     /// past [`MAX_SEGMENT_DIRS`] rather than spending a git lookup on each
     /// and running past the hook deadline.
