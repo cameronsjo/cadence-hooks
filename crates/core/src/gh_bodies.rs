@@ -181,6 +181,42 @@ pub fn read_body_file(path: &str, base_dir: &str) -> Result<String, BodyFileErro
     crate::paths::read_untrusted_config_detailed(&full)
 }
 
+/// Every value of one flag in ONE segment's tokens, in argument order: the
+/// separate (`--desc x`, `-d x`), `=`-joined long (`--desc=x`) and glued short
+/// (`-dx`) spellings. ALL occurrences, not the last — a scanner reading more
+/// than `gh` posts errs toward seeing, which is the direction a leak guard
+/// wants. Pure.
+pub fn flag_values(tokens: &[String], long: &str, short: Option<char>) -> Vec<String> {
+    let short = short.map(|c| format!("-{c}"));
+    let joined = format!("{long}=");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            break;
+        }
+        if tok == long || short.as_deref() == Some(tok) {
+            if let Some(v) = tokens.get(i + 1) {
+                out.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix(joined.as_str()) {
+            out.push(v.to_string());
+        } else if let Some(s) = short.as_deref()
+            && !tok.starts_with("--")
+            && tok.len() > 2
+            && let Some(v) = tok.strip_prefix(s)
+        {
+            out.push(v.to_string());
+        }
+        i += 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // `gh api` request bodies (cadence-hooks#930)
 // ---------------------------------------------------------------------------
@@ -211,6 +247,11 @@ pub struct ApiRequest {
     pub body: Option<ApiField>,
     /// The LAST `title` field.
     pub title: Option<ApiField>,
+    /// EVERY `-f`/`-F` field in argument order, keys included — `name`,
+    /// `description`, `message`, nested `labels[]`, graphql `query` and its
+    /// variables. A scanner reads all of them; [`Self::body`] and
+    /// [`Self::title`] are the last-wins views a size budget needs.
+    pub fields: Vec<(String, ApiField)>,
     /// The `--input` source, when given. gh sends that file as the request
     /// body and turns every field into a query parameter instead.
     pub input: Option<ApiField>,
@@ -295,7 +336,8 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
     while i < argv.len() && argv[i].starts_with('-') {
         i += 1;
     }
-    if argv.get(i).map(String::as_str) != Some("api") {
+    // The shell drops an unquoted word's backslashes, so `a\pi` runs `api`.
+    if argv.get(i).map(|w| crate::shell::unescape_word(w)).as_deref() != Some("api") {
         return None;
     }
     i += 1;
@@ -345,10 +387,11 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
                         req.has_fields = true;
                         if let Some((key, field)) = api_field(value, long == "--field") {
                             match key {
-                                "body" => req.body = Some(field),
-                                "title" => req.title = Some(field),
+                                "body" => req.body = Some(field.clone()),
+                                "title" => req.title = Some(field.clone()),
                                 _ => {}
                             }
+                            req.fields.push((key.to_string(), field));
                         }
                     }
                     "--input" => {

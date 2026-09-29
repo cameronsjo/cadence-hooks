@@ -55,7 +55,9 @@
 //! `--body-file`, a parse miss, or no hits all proceed without a message. In
 //! nudge mode, silent failure beats false positives.
 
-use cadence_hooks_core::gh_bodies::extract_bodies;
+use cadence_hooks_core::gh_bodies::{
+    ApiField, ApiRequest, extract_bodies, flag_values, parse_gh_api, read_body_file,
+};
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
     skip_git_global_options, strip_quotes, unescape_word,
@@ -173,6 +175,9 @@ pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
 /// [`EXTERNAL_POST`] spells as text, read here from the parsed argv.
 const GH_POST_GROUPS: &[&str] = &["pr", "issue", "release", "gist", "discussion"];
 const GH_POST_VERBS: &[&str] = &["create", "comment", "edit", "review", "reopen"];
+/// Posting `gh` commands outside the group × verb grid above: a merge commit's
+/// subject and body, and a repository's description (cadence-hooks#1164).
+const GH_EXTRA_POSTS: &[(&str, &[&str])] = &[("pr", &["merge"]), ("repo", &["create", "edit"])];
 const TEA_POST_GROUPS: &[&str] = &["pr", "issue"];
 const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
 
@@ -209,8 +214,14 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
     };
     match command_word(head).as_ref() {
         "gh" => {
+            if let Some(req) = parse_gh_api(argv) {
+                return api_posts(&req);
+            }
             let path = gh_command_path(argv, 2);
-            in_set(path.first(), GH_POST_GROUPS) && in_set(path.get(1), GH_POST_VERBS)
+            (in_set(path.first(), GH_POST_GROUPS) && in_set(path.get(1), GH_POST_VERBS))
+                || GH_EXTRA_POSTS.iter().any(|(group, verbs)| {
+                    in_set(path.first(), &[group]) && in_set(path.get(1), verbs)
+                })
         }
         "git" => skip_git_global_options(&argv[1..])
             .first()
@@ -220,6 +231,181 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
             in_set(words.first(), TEA_POST_GROUPS) && in_set(words.get(1), TEA_POST_VERBS)
         }
         _ => false,
+    }
+}
+
+/// Does this `gh api` request publish text (cadence-hooks#1164)? It must send
+/// a payload (a literal `GET`/`HEAD` sends its fields as a query string) and
+/// carry one — a field or an `--input` file. Every endpoint counts, not only
+/// `repos/…`: `gists`, `user`, `orgs/…/repos` publish text too, and a write
+/// the guard cannot classify is read rather than waved through.
+///
+/// `graphql` always POSTs, reads included, so there the operation decides: a
+/// query visible as literal text with no `mutation` keyword reads and is
+/// allowed; a mutation — or a query the hook cannot see (`-F query=@file`,
+/// stdin) — publishes.
+fn api_posts(req: &ApiRequest) -> bool {
+    if !req.sends_payload() || (!req.has_fields && req.input.is_none()) {
+        return false;
+    }
+    if req.endpoint_path() != "graphql" || req.input.is_some() {
+        return true;
+    }
+    match req.fields.iter().rev().find(|(key, _)| key == "query") {
+        Some((_, ApiField::Literal(q))) => GRAPHQL_MUTATION.is_match(q),
+        _ => true,
+    }
+}
+
+/// The GraphQL `mutation` keyword. Case-sensitive, as GraphQL keywords are;
+/// a query that merely contains the word elsewhere is read as a mutation,
+/// which is the see-more direction.
+static GRAPHQL_MUTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bmutation\b").expect("mutation pattern should compile"));
+
+/// Every text ONE gate-passing segment publishes: body flags, titles and
+/// descriptions, or a `gh api` request's fields. Callers gate first (#424) —
+/// file-valued flags are read here.
+fn posted_texts(segment: &str, base_dir: &str) -> Vec<String> {
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    if let Some(req) = parse_gh_api(argv) {
+        return api_texts(&req, base_dir);
+    }
+    let mut texts = extract_bodies(segment, base_dir);
+    texts.extend(headline_texts(argv, base_dir));
+    texts
+}
+
+/// Literal- and file-valued flags a posting command publishes beyond the body
+/// flags [`extract_bodies`] reads (cadence-hooks#1164). Keyed by command,
+/// because a letter means different things per command: `gh repo create -t`
+/// is a team and `git commit -t` a template file, neither of them text.
+fn headline_texts(argv: &[String], base_dir: &str) -> Vec<String> {
+    let Some(head) = argv.first() else {
+        return Vec::new();
+    };
+    let rest = &argv[1..];
+    let mut literal: Vec<(&str, Option<char>)> = Vec::new();
+    let mut file: Vec<(&str, Option<char>)> = Vec::new();
+    match command_word(head).as_ref() {
+        "gh" => match gh_command_path(argv, 1).first().map(|g| unescape_word(g)) {
+            Some(g) if matches!(g.as_ref(), "pr" | "issue" | "release" | "discussion") => {
+                literal.push(("--title", Some('t')));
+                literal.push(("--subject", None));
+                if g == "release" {
+                    literal.push(("--notes", Some('n')));
+                    file.push(("--notes-file", None));
+                }
+            }
+            Some(g) if g == "gist" => literal.push(("--desc", Some('d'))),
+            Some(g) if g == "repo" => literal.push(("--description", Some('d'))),
+            _ => {}
+        },
+        "tea" => {
+            literal.push(("--title", Some('t')));
+            literal.push(("--description", Some('d')));
+        }
+        "git" => {
+            file.push(("--file", None));
+            return git_commit_texts(rest, base_dir, &file);
+        }
+        _ => {}
+    }
+    let mut texts: Vec<String> = Vec::new();
+    for (long, short) in literal {
+        texts.extend(flag_values(rest, long, short));
+    }
+    for (long, short) in file {
+        for path in flag_values(rest, long, short) {
+            texts.extend(read_body_file(&path, base_dir).ok());
+        }
+    }
+    texts
+}
+
+/// `git commit`'s messages beyond `-m`/`-F`: `--file`, and `-m`/`-F` bundled
+/// behind git's boolean short flags (`-am msg`, `-vmmsg`, `-aF path`), which
+/// git parses as the flags one by one and [`extract_bodies`] reads as a word
+/// that is neither.
+fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>)]) -> Vec<String> {
+    /// git commit's short flags that take no value, so a bundle can continue
+    /// past them.
+    const BOOLEAN_SHORTS: &str = "aeinopqsvz";
+    let mut texts: Vec<String> = Vec::new();
+    for (long, short) in file {
+        for path in flag_values(rest, long, *short) {
+            texts.extend(read_body_file(&path, base_dir).ok());
+        }
+    }
+    for (i, tok) in rest.iter().enumerate() {
+        if tok == "--" {
+            break;
+        }
+        let Some(bundle) = tok.strip_prefix('-').filter(|b| !b.starts_with('-')) else {
+            continue;
+        };
+        let Some(at) = bundle.find(['m', 'F']) else {
+            continue;
+        };
+        // A bare `-m`/`-F` or a glued `-mMSG` is extract_bodies' to read.
+        if at == 0 || !bundle[..at].chars().all(|c| BOOLEAN_SHORTS.contains(c)) {
+            continue;
+        }
+        let glued = &bundle[at + 1..];
+        let value = if glued.is_empty() {
+            rest.get(i + 1).map(String::as_str)
+        } else {
+            Some(glued)
+        };
+        match (value, &bundle[at..=at]) {
+            (Some(v), "m") => texts.push(v.to_string()),
+            (Some(p), _) => texts.extend(read_body_file(p, base_dir).ok()),
+            (None, _) => {}
+        }
+    }
+    texts
+}
+
+/// Every text a publishing `gh api` request carries: each field's key and
+/// value (a `-F key=@path` value read from its file), and the `--input` file —
+/// its JSON strings, keys included, or its raw text when it is not JSON, since
+/// gh sends the bytes as they are. `@-` and `--input -` are standard input,
+/// which the hook cannot see.
+fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    for (key, field) in &req.fields {
+        texts.push(key.clone());
+        match field {
+            ApiField::Literal(v) => texts.push(v.clone()),
+            ApiField::File(p) => texts.extend(read_body_file(p, base_dir).ok()),
+            ApiField::Stdin => {}
+        }
+    }
+    if let Some(ApiField::File(p)) = &req.input
+        && let Ok(raw) = read_body_file(p, base_dir)
+    {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => json_strings(&value, &mut texts),
+            Err(_) => texts.push(raw),
+        }
+    }
+    texts
+}
+
+/// Collect every string in a JSON document, object keys included. Decoding
+/// first is what makes `"zorbl\u0061x"` read as the text gh posts.
+fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| json_strings(v, out)),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                json_strings(v, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -433,7 +619,7 @@ impl Check for RedactExternalContent {
         let mut bodies: Vec<String> = Vec::new();
         for segment in command_segments(command) {
             if is_external_post(&segment) {
-                bodies.extend(extract_bodies(&segment, &base_dir));
+                bodies.extend(posted_texts(&segment, &base_dir));
             }
         }
         if bodies.is_empty() {
