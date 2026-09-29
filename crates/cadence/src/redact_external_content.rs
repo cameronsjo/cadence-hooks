@@ -58,7 +58,7 @@
 
 use cadence_hooks_core::gh_bodies::{
     ApiField, ApiRequest, BodySource, extract_bodies_sourced, flag_values, parse_gh_api,
-    read_body_file,
+    read_body_file, strip_flag_prefix,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
@@ -379,10 +379,13 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
         }
     }
     for (i, tok) in rest.iter().enumerate() {
-        if tok == "--" {
+        // The bundle is read as the shell passes it (`-a\m` is `-am`); the
+        // glued value stays raw, as every other word value does.
+        let name = unescape_word(tok);
+        if name == "--" {
             break;
         }
-        let Some(bundle) = tok.strip_prefix('-').filter(|b| !b.starts_with('-')) else {
+        let Some(bundle) = name.strip_prefix('-').filter(|b| !b.starts_with('-')) else {
             continue;
         };
         let Some(at) = bundle.find(['m', 'F']) else {
@@ -392,7 +395,12 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
         if at == 0 || !bundle[..at].chars().all(|c| BOOLEAN_SHORTS.contains(c)) {
             continue;
         }
-        let glued = &bundle[at + 1..];
+        let glued = strip_flag_prefix(tok, &name[..at + 2]).unwrap_or_default();
+        let glued = if unescape_word(glued).is_empty() {
+            ""
+        } else {
+            glued
+        };
         let value = if glued.is_empty() {
             rest.get(i + 1).map(String::as_str)
         } else {

@@ -21,11 +21,12 @@
 use cadence_hooks_core::config::SectionLoad;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::gh_bodies::{
-    ApiField, BodyFileError, extract_title, parse_gh_api, read_body_file,
+    ApiField, BodyFileError, extract_title, glued_short_value, parse_gh_api, read_body_file,
+    strip_flag_prefix,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, skip_transparent_prefixes,
-    strip_group_wrappers, tokenize,
+    strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -255,42 +256,42 @@ pub fn last_body_flag(segment: &str) -> Option<BodyArg> {
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
-        if matches!(tok, "--body" | "-b")
+        // Flag names are read as the shell passes them: `--bo\dy` is `--body`.
+        let name = unescape_word(tok);
+        if matches!(name.as_ref(), "--body" | "-b")
             && let Some(v) = tokens.get(i + 1)
         {
             found = Some(BodyArg::Inline(v.clone()));
             i += 2;
             continue;
         }
-        if matches!(tok, "--body-file" | "-F")
+        if matches!(name.as_ref(), "--body-file" | "-F")
             && let Some(p) = tokens.get(i + 1)
         {
             found = Some(BodyArg::File(p.clone()));
             i += 2;
             continue;
         }
-        if let Some(v) = tok.strip_prefix("--body=") {
+        if let Some(v) = strip_flag_prefix(tok, "--body=") {
             found = Some(BodyArg::Inline(v.to_string()));
             i += 1;
             continue;
         }
-        if let Some(p) = tok.strip_prefix("--body-file=") {
+        if let Some(p) = strip_flag_prefix(tok, "--body-file=") {
             found = Some(BodyArg::File(p.to_string()));
             i += 1;
             continue;
         }
         // Glued short forms: `-bBODY`, `-FPATH`.
-        if !tok.starts_with("--") && tok.len() > 2 {
-            if let Some(v) = tok.strip_prefix("-b") {
-                found = Some(BodyArg::Inline(v.to_string()));
-                i += 1;
-                continue;
-            }
-            if let Some(p) = tok.strip_prefix("-F") {
-                found = Some(BodyArg::File(p.to_string()));
-                i += 1;
-                continue;
-            }
+        if let Some(v) = glued_short_value(tok, "-b") {
+            found = Some(BodyArg::Inline(v.to_string()));
+            i += 1;
+            continue;
+        }
+        if let Some(p) = glued_short_value(tok, "-F") {
+            found = Some(BodyArg::File(p.to_string()));
+            i += 1;
+            continue;
         }
         i += 1;
     }

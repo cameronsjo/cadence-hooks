@@ -10,7 +10,7 @@
 //! so handing this a non-posting segment performs I/O the guard has no business
 //! doing (cadence-hooks#424).
 
-use crate::shell::tokenize;
+use crate::shell::{tokenize, unescape_word};
 use std::path::Path;
 
 /// Why a `--body-file` read yielded no text.
@@ -20,6 +20,51 @@ use std::path::Path;
 /// Re-exported from [`crate::paths`] so the cap discipline and the error
 /// vocabulary stay one thing.
 pub use crate::paths::CappedReadError as BodyFileError;
+
+/// Does the word `tok` name the flag `name` as the program receives it? The
+/// shell drops an unquoted word's backslashes before `gh` or `git` parses its
+/// flags, so `--bo\dy` and `-\m` ARE `--body` and `-m`; comparing the
+/// tokenizer's raw text let a single backslash hide a flag's value from every
+/// reader.
+///
+/// The tokenizer no longer says which backslashes were quoted, so a quoted
+/// `'--bo\dy'` (which bash passes as written, not a flag) also reads as the
+/// flag — the see-more direction for a reader of posted text.
+pub fn is_flag(tok: &str, name: &str) -> bool {
+    unescape_word(tok) == name
+}
+
+/// `tok` with the flag spelling `prefix` removed, matched the way the shell
+/// passes the word (see [`is_flag`]), or `None` when it does not start with
+/// it. The remainder is the RAW text after the prefix, so a joined or glued
+/// value keeps its own backslashes for the caller to read, as a separate-token
+/// value does: `--bo\dy=a\b` yields `a\b`.
+pub fn strip_flag_prefix<'a>(tok: &'a str, prefix: &str) -> Option<&'a str> {
+    if !tok.contains('\\') {
+        return tok.strip_prefix(prefix);
+    }
+    let mut rest = tok;
+    for want in prefix.chars() {
+        let mut chars = rest.chars();
+        let got = match chars.next()? {
+            '\\' => chars.next()?,
+            c => c,
+        };
+        if got != want {
+            return None;
+        }
+        rest = chars.as_str();
+    }
+    Some(rest)
+}
+
+/// A glued short flag's value (`-mMSG` → `MSG`): the word starts with `short`
+/// (read as [`strip_flag_prefix`] does) and something follows it. A word that
+/// is the bare flag, or the flag plus a lone trailing backslash the shell
+/// drops, yields `None`.
+pub fn glued_short_value<'a>(tok: &'a str, short: &str) -> Option<&'a str> {
+    strip_flag_prefix(tok, short).filter(|rest| !unescape_word(rest).is_empty())
+}
 
 /// Flags whose value is a separate token that must never be read as another
 /// flag. Skipping their value keeps a body like `--body --title` from
@@ -77,7 +122,8 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         // Separate-token literal body flags.
-        if matches!(tok, "--body" | "-b" | "-m" | "--message")
+        let name = unescape_word(tok);
+        if matches!(name.as_ref(), "--body" | "-b" | "-m" | "--message")
             && let Some(v) = tokens.get(i + 1)
         {
             bodies.push((v.clone(), BodySource::Word));
@@ -87,7 +133,7 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
         // Separate-token file-body flags (value is a path → read it). The flag
         // consumes two tokens whether or not the file reads, so the i-advance
         // stays outside the read-success branch.
-        if matches!(tok, "--body-file" | "-F")
+        if matches!(name.as_ref(), "--body-file" | "-F")
             && let Some(p) = tokens.get(i + 1)
         {
             if let Ok(content) = read_body_file(p, base_dir) {
@@ -97,15 +143,14 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
             continue;
         }
         // `=`-joined long forms.
-        if let Some(v) = tok
-            .strip_prefix("--body=")
-            .or_else(|| tok.strip_prefix("--message="))
+        if let Some(v) =
+            strip_flag_prefix(tok, "--body=").or_else(|| strip_flag_prefix(tok, "--message="))
         {
             bodies.push((v.to_string(), BodySource::Word));
             i += 1;
             continue;
         }
-        if let Some(p) = tok.strip_prefix("--body-file=") {
+        if let Some(p) = strip_flag_prefix(tok, "--body-file=") {
             if let Ok(content) = read_body_file(p, base_dir) {
                 bodies.push((content, BodySource::File));
             }
@@ -113,19 +158,17 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
             continue;
         }
         // Glued short forms: `-mMSG`, `-bBODY` (literal), `-FPATH` (file).
-        if !tok.starts_with("--") && tok.len() > 2 {
-            if let Some(v) = tok.strip_prefix("-m").or_else(|| tok.strip_prefix("-b")) {
-                bodies.push((v.to_string(), BodySource::Word));
-                i += 1;
-                continue;
+        if let Some(v) = glued_short_value(tok, "-m").or_else(|| glued_short_value(tok, "-b")) {
+            bodies.push((v.to_string(), BodySource::Word));
+            i += 1;
+            continue;
+        }
+        if let Some(p) = glued_short_value(tok, "-F") {
+            if let Ok(content) = read_body_file(p, base_dir) {
+                bodies.push((content, BodySource::File));
             }
-            if let Some(p) = tok.strip_prefix("-F") {
-                if let Ok(content) = read_body_file(p, base_dir) {
-                    bodies.push((content, BodySource::File));
-                }
-                i += 1;
-                continue;
-            }
+            i += 1;
+            continue;
         }
         i += 1;
     }
@@ -152,7 +195,8 @@ pub fn extract_title(segment: &str) -> Option<String> {
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
-        if matches!(tok, "--title" | "-t") {
+        let name = unescape_word(tok);
+        if matches!(name.as_ref(), "--title" | "-t") {
             if let Some(v) = tokens.get(i + 1) {
                 found = Some(v.clone());
                 i += 2;
@@ -161,23 +205,19 @@ pub fn extract_title(segment: &str) -> Option<String> {
             // A bare trailing flag has no value; leave the previous one.
             break;
         }
-        if let Some(v) = tok.strip_prefix("--title=") {
+        if let Some(v) = strip_flag_prefix(tok, "--title=") {
             found = Some(v.to_string());
             i += 1;
             continue;
         }
-        // Glued short form `-tTITLE`. `--title` is excluded by the `--` guard;
-        // a bare `-t` is excluded by the length guard.
-        if !tok.starts_with("--")
-            && tok.len() > 2
-            && let Some(v) = tok.strip_prefix("-t")
-        {
+        // Glued short form `-tTITLE`; a bare `-t` has no glued value.
+        if let Some(v) = glued_short_value(tok, "-t") {
             found = Some(v.to_string());
             i += 1;
             continue;
         }
         // Another flag's value is data, not a flag.
-        if VALUE_FLAGS.contains(&tok) {
+        if VALUE_FLAGS.contains(&name.as_ref()) {
             i += 2;
             continue;
         }
@@ -216,22 +256,21 @@ pub fn flag_values(tokens: &[String], long: &str, short: Option<char>) -> Vec<St
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
-        if tok == "--" {
+        let name = unescape_word(tok);
+        if name == "--" {
             break;
         }
-        if tok == long || short.as_deref() == Some(tok) {
+        if name == long || short.as_deref() == Some(name.as_ref()) {
             if let Some(v) = tokens.get(i + 1) {
                 out.push(v.clone());
             }
             i += 2;
             continue;
         }
-        if let Some(v) = tok.strip_prefix(joined.as_str()) {
+        if let Some(v) = strip_flag_prefix(tok, joined.as_str()) {
             out.push(v.to_string());
         } else if let Some(s) = short.as_deref()
-            && !tok.starts_with("--")
-            && tok.len() > 2
-            && let Some(v) = tok.strip_prefix(s)
+            && let Some(v) = glued_short_value(tok, s)
         {
             out.push(v.to_string());
         }
@@ -356,7 +395,7 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
         return None;
     }
     let mut i = 1;
-    while i < argv.len() && argv[i].starts_with('-') {
+    while i < argv.len() && unescape_word(&argv[i]).starts_with('-') {
         i += 1;
     }
     // The shell drops an unquoted word's backslashes, so `a\pi` runs `api`.
@@ -373,9 +412,11 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
     let mut endpoint: Option<String> = None;
     while i < argv.len() {
         let tok = argv[i].as_str();
+        // Flag names are read as the shell passes them: `-\f` is `-f`.
+        let name = unescape_word(tok);
         // Resolve (long name, value, tokens consumed) for a value flag.
         let mut hit: Option<(&str, &str, usize)> = None;
-        if tok == "--" {
+        if name == "--" {
             if endpoint.is_none() {
                 endpoint = argv.get(i + 1).cloned();
             }
@@ -383,7 +424,7 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
         }
         for (long, short) in API_VALUE_FLAGS {
             let short_s = short.map(|c| format!("-{c}"));
-            if tok == *long || short_s.as_deref() == Some(tok) {
+            if name == *long || short_s.as_deref() == Some(name.as_ref()) {
                 if let Some(v) = argv.get(i + 1) {
                     hit = Some((long, v.as_str(), 2));
                 } else {
@@ -391,17 +432,14 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
                 }
                 break;
             }
-            if let Some(v) = tok
-                .strip_prefix(long)
-                .and_then(|rest| rest.strip_prefix('='))
+            if let Some(v) =
+                strip_flag_prefix(tok, long).and_then(|rest| strip_flag_prefix(rest, "="))
             {
                 hit = Some((long, v, 1));
                 break;
             }
             if let Some(s) = short_s.as_deref()
-                && !tok.starts_with("--")
-                && tok.len() > 2
-                && let Some(v) = tok.strip_prefix(s)
+                && let Some(v) = glued_short_value(tok, s)
             {
                 hit = Some((long, v, 1));
                 break;
@@ -414,7 +452,9 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
                     "--field" | "--raw-field" => {
                         req.has_fields = true;
                         if let Some((key, field)) = api_field(value, long == "--field") {
-                            match key {
+                            // gh reads the key the shell passes: `bo\dy=x`
+                            // sets `body`.
+                            match unescape_word(key).as_ref() {
                                 "body" => req.body = Some(field.clone()),
                                 "title" => req.title = Some(field.clone()),
                                 _ => {}
@@ -434,7 +474,7 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
                 i += used;
             }
             None => {
-                if !tok.starts_with('-') && endpoint.is_none() {
+                if !name.starts_with('-') && endpoint.is_none() {
                     endpoint = Some(tok.to_string());
                 }
                 i += 1;
