@@ -8,10 +8,12 @@ Never touches the network: every page is the saved fixture in
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -158,6 +160,27 @@ class Refresh(unittest.TestCase):
         self.assertEqual(models["claude-opus-5"]["cacheReadPerMTok"], 0.125)
         self.assertTrue(any("cacheReadPerMTok" in note for note in notes))
 
+    def test_new_row_below_rate_floor_is_rejected(self):
+        tiny = dict(OPUS_RATES, cacheReadPerMTok=0.0005)
+        with self.assertRaises(gp.PricingError) as ctx:
+            gp.refresh(
+                committed({"claude-opus-5": OPUS_RATES}),
+                {"claude-opus-5": dict(OPUS_RATES), "claude-opus-6": tiny},
+                allow_removals=False,
+                today="2026-09-29",
+            )
+        self.assertIn("claude-opus-6", str(ctx.exception))
+
+    def test_new_row_at_the_cheapest_real_rate_is_accepted(self):
+        cheap = dict(OPUS_RATES, cacheReadPerMTok=0.08)
+        _, models, _, _ = gp.refresh(
+            committed({"claude-opus-5": OPUS_RATES}),
+            {"claude-opus-5": dict(OPUS_RATES), "claude-opus-6": cheap},
+            allow_removals=False,
+            today="2026-09-29",
+        )
+        self.assertEqual(models["claude-opus-6"]["cacheReadPerMTok"], 0.08)
+
 
 class RenderAndCheck(unittest.TestCase):
     def test_render_is_sorted_and_round_trips(self):
@@ -214,7 +237,25 @@ class RenderAndCheck(unittest.TestCase):
             self.assertNotIn("Batch", text)
 
 
+class SlugPattern(unittest.TestCase):
+    def test_trailing_newline_slug_is_rejected(self):
+        # `$` matches before a trailing newline; the pattern must match the whole id.
+        with self.assertRaises(gp.PricingError):
+            gp.validate_models({"claude-opus-5\n": OPUS_RATES})
+        gp.validate_models({"claude-opus-5": OPUS_RATES})
+
+
 class FetchGuards(unittest.TestCase):
+    def test_http_exception_is_reported_by_class_name_only(self):
+        marker = "PARTIAL-BODY-MARKER"
+        opener = mock.Mock()
+        opener.open.side_effect = http.client.IncompleteRead(marker.encode())
+        with mock.patch.object(gp.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(gp.PricingError) as ctx:
+                gp.fetch()
+        self.assertEqual(str(ctx.exception), "fetch failed (IncompleteRead)")
+        self.assertNotIn(marker, str(ctx.exception))
+
     def test_media_type_ignores_parameters(self):
         self.assertEqual(gp.media_type("text/markdown; charset=utf-8"), "text/markdown")
         self.assertEqual(gp.media_type("Text/Markdown"), "text/markdown")
