@@ -133,12 +133,14 @@ fn session_start_context(remote_owners: Option<&str>, bypass: bool) -> Option<St
     }
     let v: Value = serde_json::from_str(stdout.trim()).expect("json");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-    Some(
-        v["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-    )
+    // The scratch CADENCE_METRICS_DIR trips the armed-switch line, which comes
+    // first; the cloud status is the last line of the same context.
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let last = ctx.lines().last().unwrap();
+    last.starts_with("cadence-hooks: ")
+        .then(|| last.to_string())
 }
 
 #[test]
@@ -159,9 +161,9 @@ fn session_start_reports_armed_or_inert_in_the_cloud() {
 fn session_start_is_silent_outside_the_cloud() {
     let payload = r#"{"session_id":"s","hook_event_name":"SessionStart","source":"startup"}"#;
     let out = run("guardrails", "enforcement-status", payload, false, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
+        !stdout.contains("ARMED") && !stdout.contains("INERT"),
+        "{stdout}"
     );
 }
