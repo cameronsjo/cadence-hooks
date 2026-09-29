@@ -340,9 +340,12 @@ impl Check for GhDangerousGuard {
                 && contains_ignoring_ascii_case(segment, "gh")
                 && brace_expansion_overflows(segment)
         }) {
-            return CheckResult::block(crate::messages::repo_delete_blocked_message(
-                "a gh command whose brace expansion is too large to read",
-            ));
+            return CheckResult::block(
+                "🚫 git-guardrails: gh command uses a brace expansion too large to read\n   \
+                 It may spell `gh repo delete`, which is irreversible, and this guard cannot \
+                 rule that out.\n   \
+                 Fix: spell the gh command out without the brace expansion",
+            );
         }
         // Coarse wrapper pass, kept ALONGSIDE the per-segment loop rather than
         // replaced by it. `command_segments` expands a wrapper only when it can

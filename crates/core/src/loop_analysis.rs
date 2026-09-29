@@ -629,12 +629,12 @@ fn is_git_push_command(cmd: &SimpleCommand) -> bool {
 ///
 /// Read by the shared parser ([`crate::shell::gh_repo_flags`],
 /// cadence-hooks#937), so this agrees with `guard_gh_write` on every spelling
-/// (`-R=o/r` included), on `--`, and on which readings count. Only a CERTAIN
-/// target is explicit: readings that disagree, or that may each be another
-/// flag's value (`--body -Ro/r`), give `None`, which routes the loop to the
-/// missing-target policy instead of vouching for a repo gh may never touch.
-/// The old last-wins read let `--repo evil/x --body -Rown/r` resolve to the
-/// decoy.
+/// (`-R=o/r` included), on `--`, and on which readings count. Certain readings
+/// resolve last-wins, as pflag does. A reading that may be another flag's
+/// value (`--body -Ro/r`, or anything after a `--` such a flag may have taken)
+/// gives `None` unless it agrees, which routes the loop to the missing-target
+/// policy instead of vouching for a repo gh may never touch — the old raw
+/// last-wins read let `--repo evil/x --body -Rown/r` resolve to the decoy.
 fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
     let mut argv = vec!["gh".to_string()];
     argv.extend(suffix_words(cmd));
@@ -928,13 +928,12 @@ mod tests {
         }
     }
 
-    /// Every spelling reads through the shared parser (cadence-hooks#937), and
-    /// only a target every reading agrees on is explicit. gh obeys the last
-    /// REAL `-R`, but whether a later `-R`-shaped token is real depends on a
-    /// flag table this analysis lacks, so disagreement is not explicit — the
+    /// Every spelling reads through the shared parser (cadence-hooks#937).
+    /// Certain readings resolve last-wins, as pflag does; a reading that may
+    /// be another flag's value is not an explicit target, so the
     /// missing-target policy and `guard_gh_write`'s per-segment check decide.
     #[test]
-    fn repo_flag_readings_are_explicit_only_when_they_agree() {
+    fn repo_flag_readings_resolve_with_gh_grammar() {
         for (flags, expected) in [
             ("-R own/a", Some("own/a")),
             ("-Rown/a", Some("own/a")),
@@ -942,13 +941,15 @@ mod tests {
             ("--repo own/a", Some("own/a")),
             ("--repo=own/a", Some("own/a")),
             ("-R own/a --repo=own/a", Some("own/a")),
-            ("-R first/a --repo second/b", None),
-            ("--repo first/a -Rsecond/b", None),
-            ("--repo=first/a -R second/b", None),
-            ("-Rfirst/a --repo=second/b", None),
+            ("-R first/a --repo second/b", Some("second/b")),
+            ("--repo first/a -Rsecond/b", Some("second/b")),
+            ("--repo=first/a -R second/b", Some("second/b")),
+            ("-Rfirst/a --repo=second/b", Some("second/b")),
             // `-R` takes the next token whatever it is, so `--repo=first/value`
-            // is a value here — and it disagrees with the later reading.
-            ("-R --repo=first/value -Rfinal/target", None),
+            // is a value here, and the later reading wins.
+            ("-R --repo=first/value -Rfinal/target", Some("final/target")),
+            // `--` after a value-taking flag may be its value (#1128 review).
+            ("-b -- -R evil/x", None),
             // A reading that may be `--body`'s value is not a certain target:
             // gh may use it, or no override at all.
             ("--body -Rown/a", None),

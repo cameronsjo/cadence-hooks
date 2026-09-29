@@ -3538,14 +3538,15 @@ pub enum GhRepoFlag {
 impl GhRepoFlags {
     /// Collapse the readings into what gh will target.
     ///
-    /// **Why agreement, when pflag is last-wins.** gh obeys the last REAL
-    /// `-R`, but a `-R`-shaped token after an unknown flag may be that flag's
-    /// value, and telling them apart needs each subcommand's flag table.
-    /// Guessing either way resolves toward ALLOW for somebody: skipping a real
-    /// flag falls back to the cwd, keeping a decoy judges a repo gh never
-    /// touches. So disagreeing readings are [`GhRepoFlag::Ambiguous`], and a
-    /// reading that may be a value leaves the fallback in play
-    /// ([`GhRepoFlag::TargetOrAbsent`]). Readings that agree are exact.
+    /// **pflag is last-wins, and that is exact when the readings are certain.**
+    /// Every reading before the last CERTAIN one is overridden by it, so only
+    /// that one and the uncertain readings after it can decide. Those after
+    /// it may be real flags or another flag's value (`--body -Ro/r`), and
+    /// telling them apart needs each subcommand's flag table; guessing either
+    /// way resolves toward ALLOW for somebody. So when they name another
+    /// repository the result is [`GhRepoFlag::Ambiguous`], and when no reading
+    /// is certain at all the fallback stays in play
+    /// ([`GhRepoFlag::TargetOrAbsent`]).
     ///
     /// An empty value is gh's "no override" (`-R ''` falls back to `GH_REPO`
     /// and the cwd), so it counts as the fallback, not as a repo. A value
@@ -3556,26 +3557,25 @@ impl GhRepoFlags {
         if self.unattributable {
             return GhRepoFlag::Ambiguous;
         }
-        let usable = self
+        let usable: Vec<&(String, bool)> = self
             .readings
             .iter()
-            .filter(|(value, _)| !value.contains(char::is_whitespace));
+            .filter(|(value, _)| !value.contains(char::is_whitespace))
+            .collect();
+        let last_certain = usable.iter().rposition(|(_, certain)| *certain);
+        let deciding = &usable[last_certain.unwrap_or(0)..];
         let mut values: Vec<&str> = Vec::new();
-        let mut certain = false;
-        let mut resets = false;
-        for (value, is_certain) in usable {
+        let mut resets = last_certain.is_none();
+        for (value, _) in deciding {
             if value.is_empty() {
                 resets = true;
-                continue;
-            }
-            certain |= is_certain;
-            if !values.contains(&value.as_str()) {
+            } else if !values.contains(&value.as_str()) {
                 values.push(value);
             }
         }
         match values.as_slice() {
             [] => GhRepoFlag::Absent,
-            [value] if certain && !resets => GhRepoFlag::Target((*value).to_string()),
+            [value] if !resets => GhRepoFlag::Target((*value).to_string()),
             [value] => GhRepoFlag::TargetOrAbsent((*value).to_string()),
             _ => GhRepoFlag::Ambiguous,
         }
@@ -3615,11 +3615,13 @@ const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
 /// Read every repo override in a gh argv (`argv[0]` is `gh` itself), with
 /// gh's own grammar: every spelling [`read_gh_repo_flag`] reads, in ANY
 /// position — cobra takes the persistent `-R` before the command group as
-/// readily as after the verb — up to a `--`, after which cobra reads nothing
+/// readily as after the verb — up to a `--` that ends the flags, after which cobra reads nothing
 /// as a flag.
 ///
 /// A reading is **certain** when the token before it cannot have consumed it
-/// as a value: that token is `gh`, a positional, a flag with its value
+/// as a value (and no `--` before it could have ended the flags — a `--`
+/// after a flag that may take a value is that value or the terminator): that
+/// token is `gh`, a positional, a flag with its value
 /// attached (`--x=y`), or a value a certain separate `-R` already took. After
 /// any other flag (`--body -Ro/r`, `-t -Ro/r`) the reading is uncertain,
 /// since the flag may take a value. A separate `-R` that is itself uncertain
@@ -3628,14 +3630,25 @@ const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
 pub fn gh_repo_flags(argv: &[String]) -> GhRepoFlags {
     let mut out = GhRepoFlags::default();
     let mut prev_may_consume = false;
+    let mut past_possible_terminator = false;
     let mut i = 1;
     while let Some(token) = argv.get(i) {
         let token = token.as_str();
         if token == "--" {
-            break;
+            // pflag hands `--` to a value-taking flag as its value (`-b --
+            // -R o/r` targets o/r), so it ends the flags only when nothing
+            // before it can consume it. Otherwise it may be either, and every
+            // later reading is uncertain.
+            if !prev_may_consume {
+                break;
+            }
+            past_possible_terminator = true;
+            prev_may_consume = false;
+            i += 1;
+            continue;
         }
         if let Some(read) = read_gh_repo_flag(argv, i) {
-            let certain = !prev_may_consume;
+            let certain = !prev_may_consume && !past_possible_terminator;
             let separate = read.next == i + 2;
             if let Some(value) = read.value {
                 out.readings.push((value, certain));
@@ -9772,12 +9785,28 @@ mod tests {
             ("gh pr -Ro/r create", target("o/r")),
             ("gh pr create -R=o/r", target("o/r")),
             ("gh issue create -R o/r --repo=o/r", target("o/r")),
-            // Disagreement: gh obeys the last REAL flag, which needs a table.
-            ("gh issue create -R own/a -R evil/b", GhRepoFlag::Ambiguous),
+            // Certain readings: pflag's last-wins is exact.
+            ("gh issue create -R own/a -R evil/b", target("evil/b")),
+            ("gh -R evil/b issue create --repo own/a", target("own/a")),
+            ("gh issue create -R own/a --repo=", GhRepoFlag::Absent),
+            // An uncertain reading after the last certain one may win.
             (
-                "gh -R own/a issue create --repo evil/b",
+                "gh -R own/a issue create --body -Revil/b",
                 GhRepoFlag::Ambiguous,
             ),
+            ("gh -R own/a issue create --body -Rown/a", target("own/a")),
+            // pflag hands `--` to a value-taking flag as its value, so it only
+            // ends the flags when nothing before it can take it.
+            ("gh issue create -b -- -R evil/b -t t", maybe("evil/b")),
+            ("gh issue create --title -- -R evil/b", maybe("evil/b")),
+            ("gh issue create -t -- --repo evil/b", maybe("evil/b")),
+            ("gh pr merge 5 --body -- -R evil/b", maybe("evil/b")),
+            (
+                "gh -R own/a issue create -b -- -R evil/b",
+                GhRepoFlag::Ambiguous,
+            ),
+            ("gh pr create --draft -- -R evil/b", GhRepoFlag::Absent),
+            ("gh issue create -R own/a -- -- -R evil/b", target("own/a")),
             // Nothing after `--` is a flag.
             ("gh issue create -R own/a -- -R evil/b", target("own/a")),
             ("gh issue create -- -R evil/b", GhRepoFlag::Absent),
@@ -9791,7 +9820,11 @@ mod tests {
             ("gh pr merge --squash -R own/a", target("own/a")),
             ("gh pr create --draft -R own/a", target("own/a")),
             // `-R ''` is gh's "no override".
-            ("gh issue create -R own/a --repo=", maybe("own/a")),
+            (
+                "gh issue create --body -Rown/a --body --repo=",
+                maybe("own/a"),
+            ),
+            ("gh issue create --body --repo= -R own/a", target("own/a")),
             // A cluster with R after its first letter needs a table.
             ("gh pr create -fRown/a", GhRepoFlag::Ambiguous),
             ("gh pr create -t=Release", GhRepoFlag::Absent),
@@ -9832,6 +9865,9 @@ mod tests {
             // An unknown flag consumes the next word, as cobra's stripFlags does.
             ("gh --foo pr create", vec!["create"]),
             ("gh -- pr create", vec![]),
+            // A flag that takes `--` as its value does not end the search.
+            ("gh -b -- pr create", vec!["pr", "create"]),
+            ("gh --title -- issue create", vec!["issue", "create"]),
             ("gh", vec![]),
         ] {
             assert_eq!(gh_command_path(&argv(command), 2), expected, "{command}");

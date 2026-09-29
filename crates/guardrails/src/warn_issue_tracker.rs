@@ -187,7 +187,7 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
 /// `parse_gh_repo_value`, cadence-hooks#937) from the issue-create segment's
 /// parsed argv — not by splitting the raw text on whitespace, which let a
 /// `-R` quoted inside `--title` win over the real flag (cadence-hooks#737) and
-/// took the FIRST of two flags where gh takes the last. URL-shaped and
+/// took the FIRST of two flags where gh takes the last (it now takes the last). URL-shaped and
 /// `HOST/OWNER/REPO` values now resolve to the repo they name.
 pub fn judge_issue_command(command: &str, work_dir: &Path) -> Option<IssueNudge> {
     let stripped = strip_quotes(command);
@@ -443,10 +443,23 @@ mod tests {
                         "gh issue create -R ghe.example/cameronsjo/random -t t",
                         None,
                     ),
-                    // #937: first-wins read a repo gh does not act on; any
-                    // disagreement is now an unreadable-target nudge.
+                    // #937: first-wins read a repo gh does not act on; gh's
+                    // last-wins picks the later flag.
                     (
                         "gh issue create -R cameronsjo/cadence -R cameronsjo/random -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh issue create -R cameronsjo/random -R cameronsjo/cadence -t t",
+                        None,
+                    ),
+                    // A `--` a flag may take as its value does not end the flags.
+                    (
+                        "gh issue create -b -- -R cameronsjo/random -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh issue create -R cameronsjo/cadence -b -- -R cameronsjo/random",
                         unreadable("-R/--repo readings that disagree or cannot be attributed"),
                     ),
                     (

@@ -256,16 +256,17 @@ pub(crate) enum RepoFlag {
 /// `eval "gh … -R evil/target"` wrapper is peeled like every other arm already
 /// peels it (#463).
 ///
-/// **Disagreement fails closed, because "which `-R` wins" is not answerable
-/// here.** gh obeys the last *real* repo flag, but a token that merely looks
-/// like one may be another flag's value — `--body -Rcameronsjo/allowed` is a
-/// body, not a target. Distinguishing them needs gh's per-subcommand flag
-/// table, and both wrong guesses resolve toward ALLOW. So disagreeing readings
-/// are [`RepoFlag::Ambiguous`] and the caller blocks; and a lone reading that
-/// may be a value is [`RepoFlag::TargetOrAbsent`], which judges the cwd
-/// fallback too — without that, `--body -Rcameronsjo/x` from an unowned
-/// checkout was judged as the owned decoy while gh wrote to the checkout's own
-/// repo (cadence-hooks#1069).
+/// **Certain readings resolve last-wins, as pflag does; uncertain ones fail
+/// closed.** A token that merely looks like a repo flag may be another flag's
+/// value — `--body -Rcameronsjo/allowed` is a body, not a target — and
+/// telling them apart needs gh's per-subcommand flag table, with both wrong
+/// guesses resolving toward ALLOW. So an uncertain reading after the last
+/// certain one that names another repo is [`RepoFlag::Ambiguous`] (the caller
+/// blocks), and a lone reading that may be a value is
+/// [`RepoFlag::TargetOrAbsent`], which judges the cwd fallback too — without
+/// that, `--body -Rcameronsjo/x` from an unowned checkout was judged as the
+/// owned decoy while gh wrote to the checkout's own repo (cadence-hooks#1069).
+/// A `--` ends the flags only where no earlier flag can take it as its value.
 pub(crate) fn repo_flag(command: &str) -> RepoFlag {
     let Some(words) = gh_argv(command) else {
         return RepoFlag::Absent;
@@ -6105,35 +6106,47 @@ mod tests {
     }
 
     #[test]
-    fn disagreeing_repo_flags_block() {
-        // Was `last_repo_flag_wins_over_a_benign_leading_one`. Still BLOCKS —
-        // the security outcome is unchanged — but the reason moved: taking the
-        // last reading is itself exploitable when the last token is another
-        // flag's VALUE, so disagreement now fails closed instead of picking a
-        // side. Hence the unresolvable rule id rather than unauthorized-target.
+    fn repeated_repo_flags_resolve_last_wins_only_when_certain() {
+        // Was `disagreeing_repo_flags_block`. Taking the last reading is
+        // exploitable only when that reading may be another flag's VALUE. A
+        // reading after a positional or an attached value cannot be, so certain
+        // readings resolve last-wins exactly as pflag does (#1128 review); an
+        // uncertain one after the last certain one still fails closed.
         with_env(&owners_env(), || {
-            let input = input_with(
-                "gh issue comment 42 -R cameronsjo/allowed -R evil/target --body x",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+            for (command, rule) in [
+                (
+                    "gh issue comment 42 -R cameronsjo/allowed -R evil/target --body x",
+                    Some("gh-write-unauthorized-target"),
+                ),
+                (
+                    "gh issue comment 42 -R evil/target -R cameronsjo/allowed --body x",
+                    None,
+                ),
+                (
+                    "gh issue comment 42 -R evil/target --body -Rcameronsjo/allowed",
+                    Some("gh-write-target-unresolvable"),
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                let got = result.block_metadata.map(|meta| meta.rule_id);
+                assert_eq!(got.as_deref(), rule, "{command}");
+            }
         });
     }
 
     #[test]
-    fn disagreement_is_detected_across_all_four_spellings() {
-        // Was `last_repo_flag_wins_across_all_four_spellings`, asserting
-        // `Some("b/second")`. Every form gh accepts must still be READ — the
-        // change is only in what happens when two readings disagree.
+    fn certain_readings_resolve_last_wins_across_all_four_spellings() {
+        // Every form gh accepts is READ, and certain readings resolve last-wins.
         for command in [
             "gh pr create -R a/first --repo b/second",
             "gh pr create --repo=a/first -Rb/second",
             "gh pr create -Ra/first --repo=b/second",
         ] {
-            assert_eq!(repo_flag(command), RepoFlag::Ambiguous, "{command}");
+            assert_eq!(
+                repo_flag(command),
+                RepoFlag::Target("b/second".to_string()),
+                "{command}"
+            );
         }
     }
 
@@ -7279,6 +7292,38 @@ mod tests {
                 ),
                 ("gh issue create -R cameronsjo/x -t t", false, false),
                 ("gh pr merge --squash -R cameronsjo/x", false, false),
+                // #1128 review: pflag hands `--` to a value-taking flag, so
+                // it ends the flags only when no flag before it can take it.
+                ("gh issue create -b -- -R stranger/y -t t", true, true),
+                ("gh issue create --title -- -R stranger/y", true, true),
+                ("gh issue create -t -- --repo stranger/y", true, true),
+                ("gh pr merge 5 --body -- -R stranger/y", true, true),
+                (
+                    "gh -R cameronsjo/x issue create -b -- -R stranger/y",
+                    false,
+                    true,
+                ),
+                (
+                    "gh -R cameronsjo/x issue create -b -- -R stranger/y",
+                    true,
+                    true,
+                ),
+                (
+                    "gh issue create -R cameronsjo/x -t t -- -R stranger/y",
+                    false,
+                    false,
+                ),
+                // Certain readings resolve last-wins, as pflag does.
+                (
+                    "gh issue create -R stranger/y -R cameronsjo/x -t t",
+                    false,
+                    false,
+                ),
+                (
+                    "gh issue create -R cameronsjo/x -R stranger/y -t t",
+                    true,
+                    true,
+                ),
                 // #1115: the brace-expanded argv is what runs.
                 ("gh {pr,} create -R evil/x -t t", true, true),
                 ("{gh,} pr create -R evil/x -t t", true, true),
