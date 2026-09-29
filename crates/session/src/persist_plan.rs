@@ -526,8 +526,12 @@ fn persist_plan_body(
     // re-approved in the same session is never skipped silently.
     let user_plans_root = env.user_plans_dir.canonicalize().ok();
     if own_write.is_none()
-        && let Some(earlier) =
-            session_already_persisted(&body_hash, session_id, user_plans_root.as_deref())
+        && let Some(earlier) = session_already_persisted(
+            &recognizer.ledger,
+            &body_hash,
+            session_id,
+            user_plans_root.as_deref(),
+        )
         && !numbered_candidates(&plans_dir, &stem)
             .into_iter()
             .chain(std::iter::once(fallback_path(
@@ -1311,12 +1315,21 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
     file_matches(path, body_hash, body_hash, true)
 }
 
-/// The `plan-links.jsonl` rows, as (`body_sha256`, `plan_path`) pairs, read
-/// once per persist from the same bounded tail [`session_already_persisted`]
-/// reads. An unreadable ledger is empty, which falls back to the file checks.
+/// One `plan-links.jsonl` row, reduced to the fields recognition reads.
+struct LedgerRow {
+    body_hash: String,
+    plan_path: Option<String>,
+    child_session_id: Option<String>,
+}
+
+/// The `plan-links.jsonl` rows, read once per persist from a bounded tail
+/// ([`PLAN_LINKS_SCAN_MAX_BYTES`]), in file order. Both
+/// [`session_already_persisted`] and [`Recognizer::holds_this_plan`] read
+/// these rows. An unreadable ledger is empty, which falls back to the file
+/// checks.
 #[derive(Default)]
 struct PlanLedger {
-    rows: Vec<(String, String)>,
+    rows: Vec<LedgerRow>,
 }
 
 impl PlanLedger {
@@ -1331,25 +1344,38 @@ impl PlanLedger {
             .lines()
             .filter_map(|line| {
                 let row = serde_json::from_str::<Value>(line).ok()?;
-                Some((
-                    row.get("body_sha256")?.as_str()?.to_string(),
-                    row.get("plan_path")?.as_str()?.to_string(),
-                ))
+                let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+                Some(LedgerRow {
+                    body_hash: text("body_sha256")?,
+                    plan_path: text("plan_path"),
+                    child_session_id: text("child_session_id"),
+                })
             })
             .collect();
         Self { rows }
     }
 
-    /// Did this hook write `plan_path` for this exact body?
-    fn wrote(&self, body_hash: &str, plan_path: &str) -> bool {
+    /// The rows recording that this hook wrote `plan_path` for this body.
+    fn rows_for<'s>(
+        &'s self,
+        body_hash: &'s str,
+        plan_path: &'s str,
+    ) -> impl Iterator<Item = &'s LedgerRow> + 's {
         self.rows
             .iter()
-            .any(|(h, p)| h == body_hash && p == plan_path)
+            .filter(move |r| r.body_hash == body_hash && r.plan_path.as_deref() == Some(plan_path))
+    }
+
+    /// Does any row record `plan_path` for this body?
+    fn wrote(&self, body_hash: &str, plan_path: &str) -> bool {
+        self.rows_for(body_hash, plan_path).next().is_some()
     }
 
     /// Does any row name `plan_path`?
     fn knows_path(&self, plan_path: &str) -> bool {
-        self.rows.iter().any(|(_, p)| p == plan_path)
+        self.rows
+            .iter()
+            .any(|r| r.plan_path.as_deref() == Some(plan_path))
     }
 }
 
@@ -1404,25 +1430,49 @@ impl<'a> Recognizer<'a> {
         }
     }
 
-    /// Does the file at `path` hold this approval? It must exist; then a
+    /// Does the file at `path` hold this approval? It must exist. Then a
     /// ledger row saying this hook wrote this path for this body answers yes
-    /// without reading it (a ticked plan re-approved by another session,
-    /// #1085 review), and otherwise [`file_matches`] decides.
+    /// (a ticked plan re-approved by another session, #1085 review), but only
+    /// when the file's own leading `session_id:` names that row's writer.
+    /// `plan_path` is repo-relative and the row names no repo, so without
+    /// that check a row from another checkout sharing the metrics dir, or a
+    /// path deleted and reused by a different plan, would pass a foreign file
+    /// off as this one and the approval would be lost. Otherwise
+    /// [`file_matches`] decides, with the legacy tier allowed where the
+    /// ledger does not know the path or records it for this body.
     fn holds_this_plan(&self, path: &Path) -> bool {
         if fs::symlink_metadata(path).is_err() {
             return false;
         }
         let plan_path = self.ledger_path(path);
-        if self.ledger.wrote(&self.body_hash, &plan_path) {
+        let writers: Vec<&str> = self
+            .ledger
+            .rows_for(&self.body_hash, &plan_path)
+            .filter_map(|r| r.child_session_id.as_deref())
+            .collect();
+        if !writers.is_empty()
+            && frontmatter_session_id(path).is_some_and(|sid| writers.contains(&sid.as_str()))
+        {
             return true;
         }
         file_matches(
             path,
             &self.body_hash,
             &self.past_frontmatter_hash,
-            !self.ledger.knows_path(&plan_path),
+            !self.ledger.knows_path(&plan_path) || self.ledger.wrote(&self.body_hash, &plan_path),
         )
     }
+}
+
+/// The first `session_id:` in the file's leading frontmatter block. The hook
+/// emits its own lines first and drops a plan-authored `session_id:`, so on a
+/// document this hook rendered this is the writer's id.
+fn frontmatter_session_id(path: &Path) -> Option<String> {
+    let content = read_capped_at_idempotency_limit(path)?;
+    let recorded = leading_frontmatter_block(&content)?
+        .lines()
+        .find_map(|l| l.strip_prefix("session_id:"))?;
+    Some(yaml_unquote(recorded.trim()))
 }
 
 /// Normalize a plan text for the own-write affinity check: drop leading
@@ -1452,17 +1502,25 @@ fn affinity_normal_form(text: &str) -> String {
 }
 
 /// Does `content` look like this approval (#1085 review)? Either it is the
-/// approval up to [`affinity_normal_form`], or it carries the approval's first
-/// ATX heading line verbatim.
+/// approval up to [`affinity_normal_form`], or its first ATX heading past
+/// frontmatter is the approval's first heading line verbatim. An approval
+/// with nothing past its frontmatter has no affinity with anything, so an
+/// empty file is never adopted.
 fn has_affinity(content: &str, body: &str) -> bool {
-    if affinity_normal_form(content) == affinity_normal_form(body) {
+    let approval = affinity_normal_form(body);
+    if approval.is_empty() {
+        return false;
+    }
+    if affinity_normal_form(content) == approval {
         return true;
     }
-    strip_leading_frontmatter(body)
-        .lines()
-        .find(|line| heading_text(line).is_some())
-        .map(str::trim)
-        .is_some_and(|heading| content.lines().any(|line| line.trim() == heading))
+    let first_heading = |text: &str| {
+        strip_leading_frontmatter(text)
+            .lines()
+            .find(|line| heading_text(line).is_some())
+            .map(|line| line.trim().to_string())
+    };
+    first_heading(body).is_some_and(|heading| first_heading(content) == Some(heading))
 }
 
 /// The plan file the triggering `Write` just saved, when the hook should adopt
@@ -1509,6 +1567,9 @@ fn adoptable_own_write(input: &HookInput, plans_dir: &Path, body: &str) -> Optio
         return None;
     }
     let adopted = plans_dir.join(path.file_name()?);
+    if !fs::symlink_metadata(&adopted).ok()?.file_type().is_file() {
+        return None;
+    }
     let content = read_capped_at_idempotency_limit(&adopted)?;
     has_affinity(&content, body).then_some(adopted)
 }
@@ -1988,7 +2049,7 @@ fn plan_links_row(
     row
 }
 
-/// How much of `plan-links.jsonl`'s tail [`session_already_persisted`] reads.
+/// How much of `plan-links.jsonl`'s tail [`PlanLedger::load`] reads.
 /// Rows run ~350 bytes, so this covers thousands of recent persists.
 // debt: a row older than this window no longer suppresses; raise it or index by session if a resume that late ever duplicates.
 const PLAN_LINKS_SCAN_MAX_BYTES: u64 = 1024 * 1024;
@@ -2059,26 +2120,22 @@ struct EarlierCopy {
 /// is per metrics dir, and an unreadable one reads as "not persisted" (fail
 /// open toward writing).
 fn session_already_persisted(
+    ledger: &PlanLedger,
     body_hash: &str,
     session_id: &str,
     user_plans_root: Option<&Path>,
 ) -> Option<EarlierCopy> {
-    let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
-    let tail = cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)?;
-    tail.lines()
-        .filter(|line| line.contains(body_hash) && line.contains(session_id))
-        .find_map(|line| {
-            let row = serde_json::from_str::<Value>(line).ok()?;
-            let matches = row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
-                && row.get("child_session_id").and_then(Value::as_str) == Some(session_id);
-            matches.then(|| {
-                let recorded = row.get("plan_path").and_then(Value::as_str);
-                let label = echoable_plan_path(recorded, user_plans_root);
-                let path = recorded
-                    .filter(|_| label.starts_with('`'))
-                    .map(str::to_string);
-                EarlierCopy { label, path }
-            })
+    ledger
+        .rows
+        .iter()
+        .find(|r| r.body_hash == body_hash && r.child_session_id.as_deref() == Some(session_id))
+        .map(|r| {
+            let recorded = r.plan_path.as_deref();
+            let label = echoable_plan_path(recorded, user_plans_root);
+            let path = recorded
+                .filter(|_| label.starts_with('`'))
+                .map(str::to_string);
+            EarlierCopy { label, path }
         })
 }
 
@@ -4184,6 +4241,40 @@ mod tests {
         }
     }
 
+    /// #1085 delta review: the ledger records a repo-relative `plan_path` and
+    /// no repo, so a row from another checkout sharing the metrics dir must
+    /// not vouch for a different plan that happens to sit at the same path in
+    /// this one. The shortcut needs the file's own `session_id:` to name the
+    /// row's writer, so here the approval lands in `-2` instead of being lost.
+    #[test]
+    fn a_ledger_row_from_another_repo_does_not_vouch_for_a_foreign_file() {
+        let plan = "# Eight\n\n- [ ] one\n- [ ] two";
+        let metrics = TempDir::new().unwrap();
+        let repo_one = TempDir::new().unwrap();
+        init_repo(repo_one.path());
+        approve_on(repo_one.path(), metrics.path(), "sid-a", plan);
+        let repo_two = TempDir::new().unwrap();
+        init_repo(repo_two.path());
+        let plans = repo_two.path().join("docs/plans");
+        fs::create_dir_all(&plans).unwrap();
+        let foreign = "---\nstatus: in-flight\nsession_id: \"someone-else\"\n---\n\n\
+                       # Something Else\n\nunrelated\n";
+        fs::write(plans.join("2026-07-20-eight.md"), foreign).unwrap();
+        let r = approve_on(repo_two.path(), metrics.path(), "sid-b", plan);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(
+            plan_names(repo_two.path()),
+            ["2026-07-20-eight-2.md", "2026-07-20-eight.md"],
+            "{:?}",
+            r.message
+        );
+        assert!(r.message.unwrap().contains("2026-07-20-eight-2.md"));
+        assert_eq!(
+            fs::read_to_string(plans.join("2026-07-20-eight.md")).unwrap(),
+            foreign
+        );
+    }
+
     /// #1085 review N2: a legacy `body_sha256:` key is believed only where the
     /// ledger cannot contradict it. A ledger that knows the path under a
     /// different hash wins; a ledger that has never seen the path leaves the
@@ -4214,7 +4305,11 @@ mod tests {
             &base,
             &disposition,
             PlanLedger {
-                rows: vec![("another-hash".into(), rel.clone())],
+                rows: vec![LedgerRow {
+                    body_hash: "another-hash".into(),
+                    plan_path: Some(rel.clone()),
+                    child_session_id: None,
+                }],
             },
         );
         assert!(!contradicting.holds_this_plan(&path));
@@ -4223,7 +4318,11 @@ mod tests {
             &base,
             &disposition,
             PlanLedger {
-                rows: vec![(hash, rel)],
+                rows: vec![LedgerRow {
+                    body_hash: hash,
+                    plan_path: Some(rel),
+                    child_session_id: None,
+                }],
             },
         );
         assert!(confirming.holds_this_plan(&path));
@@ -4724,6 +4823,55 @@ mod tests {
         }
     }
 
+    /// #1085 delta review nit 4: a path that reaches outside through a
+    /// symlinked component is judged by where its parent really is.
+    #[cfg(unix)]
+    #[test]
+    fn injected_arm_does_not_adopt_through_a_symlinked_parent_or_dotdot() {
+        // `docs/plans/link/../x.md` with `link` pointing outside: the parent
+        // resolves to the outside dir's parent, not the plans dir.
+        let (tmp, r) = injected_fire(|root| {
+            let outside = root.join("elsewhere/sub");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(
+                root.join("elsewhere/2026-08-24-injected-plan.md"),
+                HAND_COPY,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("docs/plans/link")).unwrap();
+            Some(
+                root.join("docs/plans/link/../2026-08-24-injected-plan.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
+        assert_eq!(
+            plan_names(tmp.path()),
+            ["2026-08-25-injected-plan.md", "link"],
+            "{:?}",
+            r.message
+        );
+
+        // A symlinked directory inside the plans dir pointing outside.
+        let (tmp, r) = injected_fire(|root| {
+            let outside = root.join("elsewhere");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("2026-08-24-injected-plan.md"), HAND_COPY).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("docs/plans/linkdir")).unwrap();
+            Some(
+                root.join("docs/plans/linkdir/2026-08-24-injected-plan.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
+        assert_eq!(
+            plan_names(tmp.path()),
+            ["2026-08-25-injected-plan.md", "linkdir"],
+            "{:?}",
+            r.message
+        );
+    }
+
     #[test]
     fn own_write_without_an_absolute_cwd_is_not_adopted() {
         let tmp = TempDir::new().unwrap();
@@ -4761,6 +4909,11 @@ mod tests {
             body
         ));
         assert!(has_affinity("prose\n# Plan Title\nmore", body));
+        // Nit 2: only the content's FIRST heading counts.
+        assert!(!has_affinity("# Other\n\n# Plan Title\n", body));
+        // Nit 3: an approval with nothing past its frontmatter adopts nothing.
+        assert!(!has_affinity("", "---\nstatus: x\n---\n"));
+        assert!(!has_affinity("---\na: b\n---\n", "---\nstatus: x\n---\n"));
         assert!(!has_affinity("# Other Title\n\n- [ ] one\n", body));
         assert!(!has_affinity("mentions Plan Title inline", body));
         // No heading: only the normalized-equality path.
