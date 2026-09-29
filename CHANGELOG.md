@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **`prevent-secret-writes` judges the file operands of an in-place `sed` or `perl` as write targets.** `sed -i d .env`, `sed -ni`, `sed --in-place=.bak`, `gsed -i "" d .env` and `perl -pi -e … .env` rewrote a secret file and were allowed; the script operand (first positional unless `-e`/`-f` supplies it) is skipped and each remaining operand is judged like a redirect target. (cameronsjo/cadence-hooks#1165)
+
+### Changed
+
+- **The Bash block message for a `.envrc` write says a pure-loader `.envrc` can be written with the Write tool.** The Bash write keeps blocking, per the #248 ruling; the Write and Edit path already allows a pure-loader `.envrc` (#149), which is also what #533 asked for. (cameronsjo/cadence-hooks#248)
 - **The per-segment directory walk treats a `CDPATH`-searched `cd` as unresolvable.** A relative `cd sub` (or `pushd sub`) with `CDPATH` set lands in the first match on the path, not in `./sub`, so `guard-gh-write` judged `cd sub; gh pr create` in a directory the shell never entered. A relative target that is not `.`, `..`, `./…` or `../…` now adds an unresolvable directory, which `guard-gh-write` blocks on, when `CDPATH` is non-empty in the hook's environment or named anywhere in the command (`CDPATH=…`, `export CDPATH=…`); with it unset, nothing changes. `source FILE` / `. FILE` and shell aliases are deliberately not followed: activation scripts are common and benign. (cameronsjo/cadence-hooks#1171)
 - **`guard-gh-write` reads a variable command word as the `gh` the command assigned it.** `G=gh; $G pr create -t x`, `"$G"`, `${G}`, `export G=gh` and `G=/usr/bin/gh` ran a gh write the guard never recognized as one. When the same command assigns the variable a literal `gh`, the segment is now judged as `gh …`; a variable assigned something unreadable, or never assigned, is left as before (an accepted gap). (cameronsjo/cadence-hooks#1171)
 

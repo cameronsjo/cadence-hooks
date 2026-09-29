@@ -202,15 +202,111 @@ fn writer_targets(segment: &str) -> Vec<String> {
         "wget" => wget_write_targets(argv),
         // #1130: a file the sed/awk program writes by itself — `sed 'w .env'`,
         // `awk '{print > ".env"}'`.
-        "sed" | "gsed" | "awk" | "gawk" | "mawk" | "nawk" => argv_program_opens(cmd, argv)
-            .into_iter()
-            .filter_map(|open| match open {
-                ProgramOpen::Write(file) => Some(file),
-                _ => None,
-            })
-            .collect(),
+        "sed" | "gsed" | "awk" | "gawk" | "mawk" | "nawk" => {
+            let mut targets: Vec<String> = argv_program_opens(cmd, argv)
+                .into_iter()
+                .filter_map(|open| match open {
+                    ProgramOpen::Write(file) => Some(file),
+                    _ => None,
+                })
+                .collect();
+            // #1165: `sed -i` rewrites its file operands in place.
+            if matches!(cmd, "sed" | "gsed") {
+                targets.extend(inplace_file_operands(argv, InplaceGrammar::Sed));
+            }
+            targets
+        }
+        // #1165: `perl -i` / `-pi -e` rewrites its file operands in place.
+        "perl" => inplace_file_operands(argv, InplaceGrammar::Perl),
         _ => Vec::new(),
     }
+}
+
+/// Which option grammar [`inplace_file_operands`] reads.
+#[derive(Clone, Copy)]
+enum InplaceGrammar {
+    Sed,
+    Perl,
+}
+
+/// The file operands an in-place `sed` / `perl` rewrites (#1165), or nothing
+/// when the argv carries no in-place option.
+///
+/// The script operand is the first positional unless `-e`/`-f`/`--expression`/
+/// `--file` (sed) or `-e`/`-E` (perl) supplies the script; it is never a
+/// target. GNU permutes options past operands, so the whole argv is scanned.
+/// Bundled clusters (`-ni`, `-Ei`, `-pi`) and GNU long-option abbreviations
+/// (`--in`) count. `-i[SUFFIX]` ends its cluster: the rest is the suffix.
+/// Ambiguity resolves to more targets, never fewer: an unrecognized option is
+/// a flag, so a misread can only make a script or option value a candidate
+/// file, and a candidate is judged by name and is harmless unless it is a
+/// secret path.
+fn inplace_file_operands(argv: &[String], grammar: InplaceGrammar) -> Vec<String> {
+    let mut in_place = false;
+    let mut script_given = false;
+    let mut positionals: Vec<&String> = Vec::new();
+    let mut options_done = false;
+    let mut i = 1;
+    while let Some(t) = argv.get(i) {
+        i += 1;
+        if options_done || t == "-" || !t.starts_with('-') {
+            positionals.push(t);
+            continue;
+        }
+        if t == "--" {
+            options_done = true;
+            continue;
+        }
+        if let (InplaceGrammar::Sed, Some(long)) = (grammar, t.strip_prefix("--")) {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let abbrev = |full: &str, min: usize| name.len() >= min && full.starts_with(name);
+            if abbrev("in-place", 1) {
+                in_place = true;
+            } else if abbrev("expression", 1) || abbrev("file", 2) {
+                script_given = true;
+                if value.is_none() {
+                    i += 1;
+                }
+            } else if abbrev("line-length", 2) && value.is_none() {
+                i += 1;
+            }
+            continue;
+        }
+        let cluster = &t[1..];
+        for (at, c) in cluster.char_indices() {
+            let rest_empty = cluster[at + c.len_utf8()..].is_empty();
+            match (grammar, c) {
+                (_, 'i') => {
+                    in_place = true;
+                    break;
+                }
+                (InplaceGrammar::Sed, 'e' | 'f') | (InplaceGrammar::Perl, 'e' | 'E') => {
+                    script_given = true;
+                    if rest_empty {
+                        i += 1;
+                    }
+                    break;
+                }
+                (InplaceGrammar::Sed, 'l') | (InplaceGrammar::Perl, 'I') => {
+                    if rest_empty {
+                        i += 1;
+                    }
+                    break;
+                }
+                // perl options whose value is the rest of the cluster.
+                (InplaceGrammar::Perl, 'M' | 'm' | 'F' | 'C' | 'V' | 'x' | 'd' | 'D') => break,
+                _ => {}
+            }
+        }
+    }
+    if !in_place {
+        return Vec::new();
+    }
+    let skip = usize::from(!script_given);
+    positionals.into_iter().skip(skip).cloned().collect()
 }
 
 /// Shell commands a `sed`/`awk` program in this segment runs (#1130) — `sed
@@ -470,11 +566,23 @@ impl Check for SecretWritesGuard {
                     // rendered. The hint's path is the literal `<path>`
                     // placeholder, so nothing derived from the command text
                     // reaches the message.
-                    return CheckResult::block(with_forgectl_hint(
-                        "🚫 BLOCKED: prevent-secret-writes: command would write or delete a secret file\n\
-                         Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, rm) targeting a deny-set secret file (.env family, id_rsa, .aws/credentials, .git-credentials, .pgpass, .kube/config, .netrc, …)\n\
+                    let mut message = "🚫 BLOCKED: prevent-secret-writes: command would write or delete a secret file\n\
+                         Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, sed -i, perl -i, rm) targeting a deny-set secret file (.env family, id_rsa, .aws/credentials, .git-credentials, .pgpass, .kube/config, .netrc, …)\n\
                          Fix: modify secret files manually outside Claude Code.\n\
-                         Allowed: safe templates (.env.example, id_rsa.pub, …) and non-secret targets.".to_string(),
+                         Allowed: safe templates (.env.example, id_rsa.pub, …) and non-secret targets.".to_string();
+                    // #248: a Bash write to `.envrc` keeps blocking, but the
+                    // Write tool can land a pure-loader one.
+                    if target
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(".envrc"))
+                    {
+                        message.push_str(
+                            "\nNote: a pure-loader .envrc (dotenv, source_env, use …, layout …, watch_file lines only) can be written with the Write tool instead.",
+                        );
+                    }
+                    return CheckResult::block(with_forgectl_hint(
+                        message,
                         HintKind::Write,
                         None,
                         &target,
@@ -2128,6 +2236,79 @@ mod tests {
         for command in allowed {
             assert!(!bash_targets_env_file(command), "{command}");
         }
+    }
+
+    #[test]
+    fn inplace_sed_and_perl_operands_are_write_targets() {
+        // #1165: the in-place file operands are judged like redirect targets.
+        for (command, blocked) in [
+            ("sed -i d .env", true),
+            ("sed -i d ./.env", true),
+            ("sed -i d $D/.env", true),
+            ("sed -i d sub/.env", true),
+            ("sed -i '' d .env", true),
+            ("gsed -i \"\" d .env", true),
+            ("sed -ni p .env", true),
+            ("sed -Ei s/a/b/ .env.local", true),
+            ("sed -i.bak s/a/b/ .env", true),
+            ("sed --in-place d .env", true),
+            ("sed --in-place=.bak d .env", true),
+            ("sed --in d .env", true),
+            ("sed -i -e d .env", true),
+            ("sed -i -f s.sed .env", true),
+            ("sed --expression=d -i .env", true),
+            ("sed d -i .env", true),
+            ("sed -i -- d .env", true),
+            ("sed -i d a.txt .env", true),
+            ("sed -i s/a/b/ .aws/credentials", true),
+            ("sudo sed -i d .env", true),
+            ("perl -i -pe s/a/b/ .env", true),
+            ("perl -pi -e s/a/b/ .env", true),
+            ("perl -i.bak -pe 1 .env", true),
+            ("perl -pie s/a/b/ .env", true),
+            ("perl -pi -e 1 src/a.pl .env", true),
+            // Everyday controls stay allowed.
+            ("sed -i s/a/b/ src/main.rs", false),
+            ("sed -i '' s/a/b/ src/main.rs", false),
+            ("sed -n p .env.example", false),
+            ("sed -i s/a/b/ .env.example", false),
+            ("sed s/a/b/ .env", false),
+            ("sed -n -e p .env", false),
+            ("sed -i s/.env/x/ src/a.rs", false),
+            ("sed -i .env src/a.rs", false),
+            ("sed -f .env src/a.rs", false),
+            ("perl -pi -e s/a/b/ src/a.pl", false),
+            ("perl -i .env src/a.pl", false),
+            ("perl -e print .env", false),
+            ("perl -pe 1 .env", false),
+        ] {
+            assert_eq!(bash_targets_env_file(command), blocked, "{command}");
+        }
+    }
+
+    #[test]
+    fn envrc_bash_block_points_at_the_write_tool() {
+        // #248: the Bash write keeps blocking; the message names the Write
+        // tool, and only for `.envrc`.
+        let guard = SecretWritesGuard::default();
+        let envrc = guard.run(&make_bash_input("echo 'use flake' > .envrc"));
+        assert_eq!(envrc.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            envrc
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Write tool"),
+            "{:?}",
+            envrc.message
+        );
+        let env = guard.run(&make_bash_input("echo X=1 > .env"));
+        assert_eq!(env.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            !env.message.as_deref().unwrap_or("").contains("Write tool"),
+            "{:?}",
+            env.message
+        );
     }
 
     #[test]
