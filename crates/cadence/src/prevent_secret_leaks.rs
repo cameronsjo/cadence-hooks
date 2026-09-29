@@ -611,7 +611,11 @@ fn segment_env_reads_at(
     let unwrapped = strip_group_wrappers(trimmed);
     if trimmed.starts_with(['(', '{']) && unwrapped != trimmed {
         let _live = LiveScope::set(substitutions_live(unwrapped));
-        for read in segment_direct_reads(&tokenize(unwrapped), context) {
+        let (u_tokens, u_globs): (Vec<String>, Vec<bool>) = tokenize_marked(unwrapped)
+            .into_iter()
+            .map(|t| (t.text, t.unquoted_glob))
+            .unzip();
+        for read in segment_direct_reads(&u_tokens, &u_globs, context) {
             if !found.contains(&read) {
                 found.push(read);
             }
