@@ -84,6 +84,46 @@ invalid JSON is ignored and the block stands (fail-open, ADR-0001).
 entry in document order that matches both the path and the term decides. An entry
 matches the term when `terms` is omitted/empty or contains it.
 
+### `redaction` — tune the shaped tier of `redact-external-content`
+
+`redact-external-content` scans the body of an external post (`gh pr`/`issue`/
+`release`/`gist`/`discussion` create/comment/edit, `git commit`, `tea pr`/`issue`)
+for harness-internal vocabulary in four categories: `skill-id`
+(`cadence:attune`), `marketplace` (plugin-cache paths), `local-path`
+(`/Users/…`, `~/.claude/…`), and `harness-noun` (`tool_input`,
+`tool_response`). A hit **nudges**; it never blocks. The `redaction` section
+tunes this shaped tier only. The identity tier, which blocks on terms from
+`~/.config/cadence/redaction.toml`, reads no repo config and cannot be softened
+here.
+
+A hit is reported when the post's destination tier is wider than the hit's
+ceiling. The tiers, narrow to wide: `owned-internal`, `private-external`,
+`public`. The ceiling `always` reports at every destination.
+
+```jsonc
+{
+  "version": 1,
+  "redaction": {
+    "originAudience": "private-external",
+    "categories": { "local-path": { "ceiling": "private-external" } },
+    "additionalPatterns": [
+      { "pattern": "Project Falcon", "replacement": "the project", "ceiling": "always" }
+    ],
+    "allowlist": ["cadence:writing-skills", "cadence-forge", "tool_input"]
+  }
+}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `originAudience` | `public` | The destination tier of posts from this repo. `CADENCE_AUDIENCE` overrides it. An unknown value means `public`, which reports the most. |
+| `categories` | every category at `owned-internal` | Per-category ceiling, keyed by category name: `{ "<name>": { "ceiling": "<tier>" } }`. Raising a ceiling reports that category at fewer destinations. An unknown ceiling means `owned-internal`. |
+| `additionalPatterns` | none | Extra regexes to report, as `category: custom`. Each entry takes `pattern` (required), `replacement` (shown in the nudge), and `ceiling` (default `owned-internal`; `always` for a term that must never ship). A pattern that fails to compile is skipped. |
+| `allowlist` | none | Entries that suppress a hit. An entry containing `:` suppresses only that exact text. A bare entry suppresses a whole skill namespace for `skill-id` hits (`cadence-forge` matches `cadence-forge:*`, not `cadence-forge-x:*`), and the exact text for every other category (`tool_input`). |
+
+A malformed field is dropped and named in the nudge; the rest of the section
+still applies. A missing, unreadable or invalid file applies no tuning.
+
 ### `body_budget` — size the gh body budgets
 
 `guard-body-budget` measures the body a `gh` posting command would send and
