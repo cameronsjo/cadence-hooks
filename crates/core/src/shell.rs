@@ -7492,15 +7492,12 @@ fn split_segments_impl(
             && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
         {
             let i = all.len() - chars.len() - 1;
-            match scan_exhausted.bound(&all, i) {
-                SubstBound::Bounded(end) => {
-                    current.extend(&all[i..end]);
-                    for _ in i + 1..end {
-                        chars.next();
-                    }
-                    continue;
+            if let SubstBound::Bounded(end) = scan_exhausted.bound(&all, i) {
+                current.extend(&all[i..end]);
+                for _ in i + 1..end {
+                    chars.next();
                 }
-                _ => {}
+                continue;
             }
         }
         if let Some(q) = quote {
