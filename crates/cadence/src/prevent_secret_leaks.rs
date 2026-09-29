@@ -4141,7 +4141,7 @@ fn envrc_bash_read_allowed(
 const ENVRC_INERT_VERBS: &[&str] = &[
     "cat", "head", "tail", "grep", "egrep", "fgrep", "wc", "cut", "tr", "nl", "echo", "printf",
     "true", "false", ":", "cd", "pushd", "popd", "ls", "pwd", "which", "type", "test", "[", "stat",
-    "file", "date", "whoami", "id", "uname", "diff", "jq", "more", "bat",
+    "file", "date", "whoami", "id", "uname", "diff", "jq", "more",
 ];
 
 /// Shells whose `-c` script [`command_segments`] expands into segments of
@@ -4154,8 +4154,26 @@ const DIRENV_INERT_SUBCOMMANDS: &[&str] = &["allow", "deny", "reload", "status",
 
 /// A single-dash cluster (not `--long`) carrying the short option `flag`.
 fn short_cluster_has(arg: &str, flag: char) -> bool {
-    arg.strip_prefix('-')
-        .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(flag))
+    short_cluster_has_before_value(arg, flag, &[])
+}
+
+/// [`short_cluster_has`] for a command whose `valued` letters take the rest
+/// of the cluster as their value: `awk -F'i'` is `-F` with the value `i`,
+/// not an `-i`, and `sort -t'o'` is no `-o`. The valued letter itself still
+/// counts when it is `flag`.
+fn short_cluster_has_before_value(arg: &str, flag: char, valued: &[char]) -> bool {
+    let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+        return false;
+    };
+    for c in cluster.chars() {
+        if c == flag {
+            return true;
+        }
+        if valued.contains(&c) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Can this resolved command run without replacing a file or running another
@@ -4166,10 +4184,13 @@ fn verb_is_inert(word: &str, argv: &[String]) -> bool {
         return true;
     }
     match word {
-        // `sort -o FILE` writes.
-        "sort" => !args
-            .iter()
-            .any(|a| a.starts_with("--o") || short_cluster_has(a, 'o')),
+        // `sort -o FILE` writes; `--compress-program` (`--co` is its unique
+        // abbreviation) runs a program.
+        "sort" => !args.iter().any(|a| {
+            a.starts_with("--o")
+                || a.starts_with("--co")
+                || short_cluster_has_before_value(a, 'o', &['t', 'k', 'S', 'T'])
+        }),
         // `uniq IN OUT` writes OUT.
         "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
         // `less -o`/`-O`/`--log-file` writes a log.
@@ -4190,8 +4211,8 @@ fn verb_is_inert(word: &str, argv: &[String]) -> bool {
             !args.iter().any(|a| {
                 a.starts_with("--in-place")
                     || a.starts_with("--file")
-                    || short_cluster_has(a, 'i')
-                    || short_cluster_has(a, 'f')
+                    || short_cluster_has_before_value(a, 'i', &['e', 'l'])
+                    || short_cluster_has_before_value(a, 'f', &['e', 'l'])
             }) && program_writes_nothing(word, argv)
         }
         // `-i` loads an extension (`-i inplace`), `-f`/`-E` a program file.
@@ -4201,12 +4222,13 @@ fn verb_is_inert(word: &str, argv: &[String]) -> bool {
                     || a.starts_with("--file")
                     || a.starts_with("--exec")
                     || a.starts_with("--load")
-                    || short_cluster_has(a, 'i')
-                    || short_cluster_has(a, 'f')
-                    || short_cluster_has(a, 'E')
-                    || short_cluster_has(a, 'l')
+                    || ['i', 'f', 'E', 'l']
+                        .iter()
+                        .any(|flag| short_cluster_has_before_value(a, *flag, &['F', 'v']))
             }) && program_writes_nothing(word, argv)
         }
+        // `--pager` runs a program of the caller's choosing.
+        "bat" => !args.iter().any(|a| a.starts_with("--pager")),
         "direnv" => {
             args.len() <= 2
                 && args
@@ -4253,56 +4275,133 @@ fn git_is_read_only(args: &[String]) -> bool {
 /// Split one segment into its words with redirections removed, and whether
 /// any output redirection can write a file (#1078).
 ///
-/// Quote-aware: [`executable_tokens_marked`] reports how much of each word
-/// was unquoted, so `echo "a>b"` is one quoted word and `echo ">"` a quoted
-/// operator — neither redirects. An unquoted operator counts when it writes
-/// (`>`, `>>`, `>|`, `&>`, `<>`) to anything but `/dev/null` or a descriptor
-/// (`2>&1`, `>&-`); `>&1.envrc` writes a file named `1.envrc`. A trailing
-/// bare operator with no target is the `&`-split `2>&1` (see
-/// [`redirection_file_targets`]), whose target lands in a segment judged on
-/// its own.
+/// The write verdict comes from [`segment_writes_a_file`], a quote-aware scan
+/// of the raw text, so it does not depend on the tokenizer's quote marks at
+/// all: an attached redirect (`echo A=1>.envrc`, `x>>y`) and one after a
+/// quoted span (`echo "a">y`) are both seen, while `echo "a>b"` is not.
+///
+/// The words only feed the operand rules of [`verb_is_inert`], so a mistake
+/// here can only leave a redirect word in view, which those rules refuse.
+/// A word whose unquoted part holds `>`/`<` is cut there: the head is a word
+/// unless it is an fd number, and the rest is the redirect.
 fn segment_words_and_writes(segment: &str) -> (Vec<String>, bool) {
+    let writes = segment_writes_a_file(segment);
     let (tokens, unquoted) = executable_tokens_marked(segment);
     let mut words = Vec::new();
-    let mut writes = false;
     let mut i = 0;
     while let Some(token) = tokens.get(i) {
-        let digits = token.len() - token.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        let after_fd = &token[digits..];
-        let amp = usize::from(after_fd.starts_with('&'));
-        let body = &after_fd[amp..];
-        let operator_len = body.len() - body.trim_start_matches(['>', '<', '|', '&']).len();
-        let is_redirect =
-            body.starts_with(['>', '<']) && unquoted.get(i).copied().unwrap_or(0) > digits + amp;
-        if !is_redirect {
+        let unquoted_len = unquoted.get(i).copied().unwrap_or(0).min(token.len());
+        let Some(at) = token[..unquoted_len].find(['>', '<']) else {
             words.push(token.clone());
             i += 1;
             continue;
-        }
-        let operator = &body[..operator_len];
-        let attached = &body[operator_len..];
-        let target = if attached.is_empty() {
-            tokens.get(i + 1).map(String::as_str)
-        } else {
-            Some(attached)
         };
-        let to_descriptor = |t: &str| {
-            let t = if operator.ends_with('&') {
-                t
-            } else {
-                match t.strip_prefix('&') {
-                    Some(rest) => rest,
-                    None => return false,
-                }
-            };
-            t == "-" || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
-        };
-        if operator.contains('>') && target.is_some_and(|t| t != "/dev/null" && !to_descriptor(t)) {
-            writes = true;
+        let head = &token[..at];
+        if !head.is_empty() && !head.chars().all(|c| c.is_ascii_digit()) && head != "&" {
+            words.push(head.to_string());
         }
-        i += if attached.is_empty() { 2 } else { 1 };
+        let operator_only = token[at..]
+            .chars()
+            .all(|c| matches!(c, '>' | '<' | '|' | '&'));
+        i += if operator_only { 2 } else { 1 };
     }
     (words, writes)
+}
+
+/// Does `segment` carry an output redirection that can write a file?
+///
+/// A quote-aware scan of the raw text: `'…'`, `"…"`, `$'…'` and a backslash
+/// escape hide a `>`; nothing else does, so a `>` inside a substitution or a
+/// heredoc body counts (an over-block, the safe direction). Each unquoted `>`
+/// (`>`, `>>`, `>|`, `&>`, `N>`, `>&`, and `<>`) writes unless its target is
+/// `/dev/null` or a descriptor (`2>&1`, `>&-`) — `>&1.envrc` writes a file
+/// named `1.envrc` — or is missing, the `&`-split `2>&1` whose target lands
+/// in a segment of its own. A process substitution `>(…)` counts as a write:
+/// its body runs a command.
+fn segment_writes_a_file(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' => {
+                // `$'…'` honours backslash escapes; `'…'` does not.
+                let ansi = i > 0 && bytes[i - 1] == b'$';
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += if ansi && bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'>' => {
+                let mut end = i + 1;
+                while end < bytes.len() && matches!(bytes[end], b'>' | b'|' | b'&') {
+                    end += 1;
+                }
+                let dup = bytes[end - 1] == b'&';
+                let (target, next) = redirect_target(segment, end);
+                let harmless = match target {
+                    None => true,
+                    Some(target) => {
+                        target == "/dev/null"
+                            || (dup
+                                && (target == "-"
+                                    || (!target.is_empty()
+                                        && target.chars().all(|c| c.is_ascii_digit()))))
+                    }
+                };
+                if !harmless {
+                    return true;
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// The target word after a redirect operator ending at `from`, with quotes
+/// removed, and where scanning resumes. `None` when no word follows (end of
+/// segment). A `(` right after the operator is a process substitution; it is
+/// returned as the target `(`, which is never harmless.
+fn redirect_target(segment: &str, from: usize) -> (Option<String>, usize) {
+    let bytes = segment.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return (None, i);
+    }
+    if bytes[i] == b'(' {
+        return (Some("(".to_string()), i + 1);
+    }
+    let mut target = Vec::new();
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => target.push(c),
+            None if c == b'\'' || c == b'"' => quote = Some(c),
+            None if c == b'\\' && i + 1 < bytes.len() => {
+                target.push(bytes[i + 1]);
+                i += 1;
+            }
+            None if c.is_ascii_whitespace() || b";|&<>()`".contains(&c) => break,
+            None => target.push(c),
+        }
+        i += 1;
+    }
+    (Some(String::from_utf8_lossy(&target).into_owned()), i)
 }
 
 /// Can a segment of `command` put different content at a `.envrc` path before
@@ -4336,6 +4435,15 @@ fn command_may_replace_envrc(command: &str) -> bool {
         let Some((word, argv)) = resolve_command(&words) else {
             return false;
         };
+        // Any assignment in front of the verb revokes: `LESSOPEN=…` and
+        // `PAGER=…` make a reader run a program, and `BASH_ENV=f` makes a shell
+        // source a file.
+        if words[..words.len() - argv.len()]
+            .iter()
+            .any(|t| is_assignment_word(t))
+        {
+            return false;
+        }
         // A shell running a script the expansion reached is judged by that
         // script's segments, already in `segments`. One it did not reach
         // (`bash -c "$X"`, `bash s.sh`) could do anything, so it is not inert,
@@ -4343,7 +4451,6 @@ fn command_may_replace_envrc(command: &str) -> bool {
         // sources `f` first.
         verb_is_inert(&word, argv)
             || (ENVRC_TRANSPARENT_SHELLS.contains(&word.as_ref())
-                && !words.iter().any(|t| is_assignment_word(t))
                 && command_segments(segment) != [segment.clone()])
     })
 }
@@ -10528,6 +10635,21 @@ mod tests {
             "echo x &>y; cat .envrc",
             "echo x >>y; cat .envrc",
             "echo x >|y; cat .envrc",
+            // Attached redirects, and one after a quoted span.
+            "echo A=1>.envrc; cat .envrc",
+            "echo x>y; cat .envrc",
+            "echo x>>y; cat .envrc",
+            "echo x>&1.envrc; cat .envrc",
+            "echo \"a\">y; cat .envrc",
+            "echo $'\\''>y; cat .envrc",
+            "echo x >(mv a .envrc); cat .envrc",
+            // Options that run a program, and assignments in front of a verb.
+            "sort --compress-program=sh x; cat .envrc",
+            "sort --compress-program sh x; cat .envrc",
+            "bat --pager=sh x; cat .envrc",
+            "LESSOPEN='|mv a .envrc' less x; cat .envrc",
+            "env LESSOPEN=x less y; cat .envrc",
+            "PAGER=x git log; cat .envrc",
         ] {
             assert_relative_envrc_read(command, cadence_hooks_core::Outcome::Block);
         }
@@ -10572,6 +10694,16 @@ mod tests {
             // A quoted `>` is data, not a redirect.
             "echo \"a>b\" && cat .envrc",
             "echo x '>' y; cat .envrc",
+            "echo 'x>y'; cat .envrc",
+            "echo x>/dev/null; cat .envrc",
+            "echo x >&2; cat .envrc",
+            "git status 2>&1 | head; cat .envrc",
+            "echo A=1; cat .envrc",
+            // A valued short option's value is not a flag cluster.
+            "awk -F'i' '{print $1}' x; cat .envrc",
+            "awk -vfoo=bar 1 x; cat .envrc",
+            "sort -t'o' -k2 x; cat .envrc",
+            "bat x; cat .envrc",
         ] {
             assert_envrc_read_allowed(command);
         }
