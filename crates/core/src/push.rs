@@ -117,6 +117,11 @@ pub struct PushInvocation {
     /// The ref causes apply only when the refspecs are implicit — a named
     /// refspec replaces that computation anyway.
     pub unresolved: bool,
+    /// The repository argument as written — git's first positional, else a
+    /// `--repo` value ([`crate::shell::push_repository_argument`]). `None` for
+    /// a bare `git push`, where git uses the tracking remote. A remote name or
+    /// a URL; resolving it is the caller's job.
+    pub repository: Option<String>,
 }
 
 /// Every `git push` the command runs, in command order.
@@ -326,6 +331,7 @@ fn collect_push_invocations(
                 tags: false,
                 dry_run: false,
                 unresolved: true,
+                repository: None,
             });
         }
     }
@@ -1228,6 +1234,10 @@ fn push_invocation_of(
         tags: scan.tags,
         dry_run: scan.dry_run,
         unresolved: globals.foreign_redirect || (implicit && globals.push_config_override),
+        repository: {
+            let named = crate::shell::push_repository_argument(words);
+            named.positional.or(named.repo_flag)
+        },
     })
 }
 

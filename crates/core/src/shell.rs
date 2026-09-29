@@ -1456,6 +1456,49 @@ pub fn gh_pr_segments(command: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// One `gh issue <sub>` call, read by the same walk as `gh pr` ones
+/// ([`gh_group_invocation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhIssueCall {
+    /// The issue subcommand (`close`, `create`, …).
+    pub subcommand: String,
+    /// Every token after the subcommand — its own flags and operands.
+    pub operands: Vec<String>,
+    /// Every `-R`/`--repo`/`GH_REPO=` value, in any position. A repo flag with
+    /// no readable value contributes nothing here but still sets
+    /// [`GhIssueCall::retargeted`].
+    pub repo_targets: Vec<String>,
+    /// Anything pointed the call away from the cwd's repository.
+    pub retargeted: bool,
+    /// A `GH_HOST=` assignment prefix was present.
+    pub host_overridden: bool,
+}
+
+/// Every `gh issue <sub>` call in `command`, in [`command_segments`] order.
+/// Segments are reduced the way [`gh_pr_segments`] reduces them (reserved
+/// words and group punctuation stripped, a path-qualified `gh` accepted).
+pub fn gh_issue_calls(command: &str) -> Vec<GhIssueCall> {
+    command_segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let mut tokens = executable_tokens(segment);
+            let head = tokens.len() - skip_transparent_prefixes(&tokens).len();
+            if command_word(tokens.get(head)?).as_ref() != "gh" {
+                return None;
+            }
+            tokens[head] = "gh".to_string();
+            let inv = gh_group_invocation(&tokens, "issue")?;
+            Some(GhIssueCall {
+                subcommand: inv.subcommand.to_string(),
+                operands: inv.operands.to_vec(),
+                repo_targets: inv.repo_targets.clone(),
+                retargeted: inv.retargeted,
+                host_overridden: inv.host_overridden,
+            })
+        })
+        .collect()
+}
+
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
 /// create` that gh reads as no draft ([`create_is_draft`]) *in that same
 /// segment*. Scoping the draft-flag scan to one segment is what keeps an
@@ -1938,6 +1981,15 @@ fn strip_named_fd(rest: &str) -> Option<&str> {
 /// looks at them. That is why the scan reads the *skipped* prefix region rather
 /// than only `argv`.
 fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
+    gh_group_invocation(tokens, "pr")
+}
+
+/// [`gh_pr_invocation`]'s walk for any gh command group (`pr`, `issue`): the
+/// same command-word anchoring, transparent-prefix and assignment handling,
+/// and global/group-level repo-flag skipping, with only the literal group
+/// token varying. One walk, so a spelling the ship anchor sees is seen by the
+/// `issue` readers too.
+fn gh_group_invocation<'a>(tokens: &'a [String], group: &str) -> Option<GhPrInvocation<'a>> {
     let argv = skip_transparent_prefixes(tokens);
     if argv.first().map(String::as_str) != Some("gh") {
         return None;
@@ -1972,7 +2024,7 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
             i += 1;
         }
     }
-    if argv.get(i).map(String::as_str) != Some("pr") {
+    if argv.get(i).map(String::as_str) != Some(group) {
         return None;
     }
     // gh also takes the repo override between `pr` and the subcommand
@@ -2946,7 +2998,25 @@ pub enum GitQuery {
 /// the reader a budget and takes whatever bytes have arrived, returning
 /// [`GitSpawn::Truncated`] when EOF was never observed.
 pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
+    run_bounded_capped(cmd, timeout, None)
+}
+
+/// [`run_bounded_with`] with an optional cap on collected stdout.
+///
+/// With `max_stdout: Some(limit)`, the reader stops once more than `limit`
+/// bytes have arrived: the child is killed and reaped and the call returns
+/// [`GitSpawn::Truncated`] holding at most `limit` bytes, so a tool that loops
+/// output costs bounded memory and returns promptly instead of filling RAM
+/// until the wall-clock bound. Overflow is not a deadline hit and is not
+/// recorded as one. `None` keeps the uncapped behaviour the git probes rely
+/// on.
+pub fn run_bounded_capped(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    max_stdout: Option<usize>,
+) -> GitSpawn {
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -2972,9 +3042,13 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
     // closure and no clone is kept here: a sender alive in the parent would
     // never disconnect, turning every drain into a full-budget stall.
     let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // Set by the reader when `max_stdout` is exceeded; checked before any
+    // "complete" verdict so a capped read never reports as Completed.
+    let overflow = Arc::new(AtomicBool::new(false));
     let done = child.stdout.take().map(|mut out| {
         let (tx, rx) = mpsc::channel::<()>();
         let sink = Arc::clone(&sink);
+        let overflow = Arc::clone(&overflow);
         // The thread is deliberately leaked when it is still blocked on a read
         // the orphan holds open — joining it IS the hang this function exists
         // to avoid. Bounded in practice for hooks, which are short-lived
@@ -2992,10 +3066,18 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
                     // parity with the previous `read_to_end`, which also
                     // discarded its error, and is kept deliberately.
                     Ok(0) | Err(_) => break,
-                    Ok(n) => sink
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let mut buf = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match max_stdout {
+                            Some(limit) if buf.len() + n > limit => {
+                                let room = limit.saturating_sub(buf.len());
+                                buf.extend_from_slice(&chunk[..room]);
+                                overflow.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            _ => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                 }
             }
             let _ = tx.send(());
@@ -3024,10 +3106,30 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
 
     let started = std::time::Instant::now();
     loop {
+        if overflow.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let status = child.wait();
+            let _ = drained(Duration::ZERO);
+            return match status {
+                Ok(status) => GitSpawn::Truncated(std::process::Output {
+                    status,
+                    stdout: bytes_so_far(),
+                    stderr: Vec::new(),
+                }),
+                Err(_) => GitSpawn::SpawnFailed,
+            };
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
                 let complete = drained(budget);
+                if overflow.load(Ordering::SeqCst) {
+                    return GitSpawn::Truncated(std::process::Output {
+                        status,
+                        stdout: bytes_so_far(),
+                        stderr: Vec::new(),
+                    });
+                }
                 let output = std::process::Output {
                     status,
                     stdout: bytes_so_far(),
@@ -6879,6 +6981,44 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_unbounded_output_is_truncated_at_the_limit_and_returns_promptly() {
+        // `yes` never stops writing; uncapped, this is the ~1.9 GB RSS case.
+        let mut cmd = Command::new("yes");
+        let started = std::time::Instant::now();
+        let result = run_bounded_capped(
+            &mut cmd,
+            std::time::Duration::from_secs(10),
+            Some(64 * 1024),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "an overflow must end the run, not wait out the timeout"
+        );
+        match result {
+            GitSpawn::Truncated(out) => assert_eq!(out.stdout.len(), 64 * 1024),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_output_under_the_limit_completes() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf abc"]);
+        match run_bounded_capped(&mut cmd, std::time::Duration::from_secs(10), Some(3)) {
+            GitSpawn::Completed(out) => assert_eq!(out.stdout, b"abc"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf abcd"]);
+        assert!(matches!(
+            run_bounded_capped(&mut cmd, std::time::Duration::from_secs(10), Some(3)),
+            GitSpawn::Truncated(_)
+        ));
     }
 
     #[cfg(unix)]
