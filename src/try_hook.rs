@@ -73,13 +73,13 @@ pub fn run(
         Some(e) => e.name(),
         None => "logger (reacts to hook_event_name in the payload)",
     };
-    println!("Hook:     {namespace} {subcommand} — {}", entry.description);
-    println!("Event:    {event_label}");
-    println!(
+    cadence_hooks_core::outln!("Hook:     {namespace} {subcommand} — {}", entry.description);
+    cadence_hooks_core::outln!("Event:    {event_label}");
+    cadence_hooks_core::outln!(
         "Payload:  {}",
         payload_preview(payload.trim(), payload_file.is_some(), show_payload)
     );
-    println!();
+    cadence_hooks_core::outln!();
 
     // A metrics logger writes unconditionally and silently (no stdout on
     // success), so without this override `try` appends a real row to the
@@ -155,21 +155,21 @@ pub fn run(
     let code = output.status.code().unwrap_or(-1);
     let kind = classify_stdout(&output.stdout);
 
-    println!("Outcome:  {} (exit {code})", outcome_label(code, &kind));
+    cadence_hooks_core::outln!("Outcome:  {} (exit {code})", outcome_label(code, &kind));
     match &kind {
-        StdoutKind::Empty => println!("Stdout:   (none)"),
+        StdoutKind::Empty => cadence_hooks_core::outln!("Stdout:   (none)"),
         StdoutKind::Nudge(ctx) => {
-            println!("Context injected (what Claude sees):");
-            println!();
+            cadence_hooks_core::outln!("Context injected (what Claude sees):");
+            cadence_hooks_core::outln!();
             print_text_block(ctx);
         }
         StdoutKind::LoopBlock(reason) => {
-            println!("Re-prompt reason (fed back to Claude):");
-            println!();
+            cadence_hooks_core::outln!("Re-prompt reason (fed back to Claude):");
+            cadence_hooks_core::outln!();
             print_text_block(reason);
         }
         StdoutKind::OtherJson(pretty) => {
-            println!("Stdout:");
+            cadence_hooks_core::outln!("Stdout:");
             print_text_block(pretty);
         }
         StdoutKind::Raw(_) => print_stream("Stdout", &output.stdout),
@@ -244,9 +244,9 @@ fn outcome_label(code: i32, kind: &StdoutKind) -> &'static str {
 fn print_text_block(text: &str) {
     for line in text.lines() {
         if line.is_empty() {
-            println!();
+            cadence_hooks_core::outln!();
         } else {
-            println!("  {line}");
+            cadence_hooks_core::outln!("  {line}");
         }
     }
 }
@@ -328,13 +328,13 @@ fn print_stream(label: &str, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let trimmed = text.trim_end();
     if trimmed.is_empty() {
-        println!("{label}:   (none)");
+        cadence_hooks_core::outln!("{label}:   (none)");
     } else if trimmed.lines().count() == 1 {
-        println!("{label}:   {trimmed}");
+        cadence_hooks_core::outln!("{label}:   {trimmed}");
     } else {
-        println!("{label}:");
+        cadence_hooks_core::outln!("{label}:");
         for line in trimmed.lines() {
-            println!("  {line}");
+            cadence_hooks_core::outln!("  {line}");
         }
     }
 }

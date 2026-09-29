@@ -1127,11 +1127,13 @@ fn plan_store_relative_names<'p>(
 /// (`~/.claude`), which already lets an attacker rewrite the hooks in
 /// `settings.json`, so that is outside this check's threat model.
 ///
-/// **Other platforms (best-effort). See cadence-hooks#1147.** No `openat` in std: the path is
-/// canonicalized and nesting-checked, opened, and the opened handle is
-/// compared to the canonical path's metadata by length, modified, and created
-/// time. That narrows but does not close the swap window, and an attacker able
-/// to forge those on a decoy defeats the comparison.
+/// **Windows (cadence-hooks#1147).** No `openat` in std, so the path is
+/// canonicalized and nesting-checked, opened, and the handle verified with
+/// `GetFileInformationByHandle` (volume serial + file index equal to a second
+/// handle on the canonical path, link count 1, not a directory) and
+/// `GetFinalPathNameByHandleW` (final path under the canonical root) — see
+/// [`windows_identity_ok`]. Forged timestamps no longer matter. **Other
+/// platforms** keep the old length/modified/created comparison, best-effort.
 #[cfg(unix)]
 fn open_contained_plan(path: &Path, plan_store_root: &Path) -> Option<fs::File> {
     let canonical_root = plan_store_root.canonicalize().ok()?;
@@ -1173,7 +1175,114 @@ fn openat(dir: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -> Option<
     (fd >= 0).then(|| unsafe { fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
+/// What Windows reports for an open handle: the volume serial number and
+/// 64-bit file index (together the file's identity, immune to path games),
+/// the hard-link count, and whether it is a directory.
+#[cfg_attr(unix, allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandleIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    links: u32,
+    is_dir: bool,
+}
+
+/// Whether a handle opened from the requested path is the plan-store file it
+/// claims to be (cadence-hooks#1147). All must hold: a regular file with a
+/// single link (an NTFS hardlink to an outside file shares its index but has
+/// a link count above one), the same volume serial and file index as a second
+/// handle opened on the canonical path (a swap between the two opens changes
+/// the index), and a final path that lies under the canonical store root.
+/// Pure so it is testable off Windows; any doubt is a refusal.
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_identity_ok(
+    opened: HandleIdentity,
+    at_canonical: HandleIdentity,
+    final_path: &Path,
+    canonical_root: &Path,
+) -> bool {
+    !opened.is_dir
+        && opened.links == 1
+        && opened.volume_serial == at_canonical.volume_serial
+        && opened.file_index == at_canonical.file_index
+        && final_path.starts_with(canonical_root)
+}
+
+#[cfg(windows)]
+fn handle_identity(file: &fs::File) -> Option<HandleIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, GetFileInformationByHandle,
+    };
+    // SAFETY: an all-zero struct is a valid out-parameter, and the handle is
+    // open for the duration of the call.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    (ok != 0).then(|| HandleIdentity {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        links: info.nNumberOfLinks,
+        is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+    })
+}
+
+/// The handle's final path (`VOLUME_NAME_DOS`, `\\?\`-verbatim like
+/// `canonicalize`); `None` on any failure.
+#[cfg(windows)]
+fn handle_final_path(file: &fs::File) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `buf` is valid for `buf.len()` u16 writes; the handle is open.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return Some(std::ffi::OsString::from_wide(&buf[..n]).into());
+        }
+        // Too small: `n` is the required size including the NUL.
+        if n > 32 * 1024 {
+            return None;
+        }
+        buf.resize(n, 0);
+    }
+}
+
+#[cfg(windows)]
+fn open_contained_plan(path: &Path, plan_store_root: &Path) -> Option<fs::File> {
+    let canonical_root = plan_store_root.canonicalize().ok()?;
+    plan_store_relative_names(path, plan_store_root, &canonical_root)?;
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let again = fs::File::open(&canonical).ok()?;
+    windows_identity_ok(
+        handle_identity(&file)?,
+        handle_identity(&again)?,
+        &handle_final_path(&file)?,
+        &canonical_root,
+    )
+    .then_some(file)
+}
+
+/// Neither Unix nor Windows: no handle identity API is wired, so the
+/// best-effort length/time comparison remains. See cadence-hooks#1147.
+#[cfg(not(any(unix, windows)))]
 fn open_contained_plan(path: &Path, plan_store_root: &Path) -> Option<fs::File> {
     let canonical_root = plan_store_root.canonicalize().ok()?;
     plan_store_relative_names(path, plan_store_root, &canonical_root)?;
@@ -1199,6 +1308,8 @@ fn single_link(meta: &fs::Metadata) -> bool {
     meta.nlink() == 1
 }
 
+/// Non-Unix: the link count needs a handle, so Windows checks it in
+/// [`windows_identity_ok`] inside `open_contained_plan` instead.
 #[cfg(not(unix))]
 fn single_link(_meta: &fs::Metadata) -> bool {
     true
@@ -5416,6 +5527,53 @@ mod tests {
             "",
         ] {
             assert_eq!(strip_windows_drive(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn windows_identity_ok_is_table_driven() {
+        let id = |serial, index, links, is_dir| HandleIdentity {
+            volume_serial: serial,
+            file_index: index,
+            links,
+            is_dir,
+        };
+        let root = Path::new("C:/store");
+        let inside = Path::new("C:/store/plan.md");
+        let good = id(7, 42, 1, false);
+        for (name, opened, other, fin, want) in [
+            ("same file, inside", good, good, inside, true),
+            (
+                "hardlink (links 2)",
+                id(7, 42, 2, false),
+                good,
+                inside,
+                false,
+            ),
+            ("zero links", id(7, 42, 0, false), good, inside, false),
+            ("directory", id(7, 42, 1, true), good, inside, false),
+            ("swapped index", good, id(7, 43, 1, false), inside, false),
+            ("other volume", good, id(8, 42, 1, false), inside, false),
+            (
+                "outside root",
+                good,
+                good,
+                Path::new("C:/elsewhere/plan.md"),
+                false,
+            ),
+            (
+                "sibling prefix",
+                good,
+                good,
+                Path::new("C:/store2/plan.md"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                windows_identity_ok(opened, other, fin, root),
+                want,
+                "{name}"
+            );
         }
     }
 

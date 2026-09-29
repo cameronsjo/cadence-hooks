@@ -130,7 +130,7 @@ impl Finding {
     }
 
     fn print(&self) {
-        println!("{}", self.render());
+        cadence_hooks_core::outln!("{}", self.render());
     }
 }
 
@@ -434,7 +434,7 @@ fn print_quiet_blockers(
     let version = env!("CARGO_PKG_VERSION");
     let token = blocker_set_token(version, diagnoses);
     if cadence_hooks_core::markers::claim_today("doctor-blockers", &token) {
-        println!(
+        cadence_hooks_core::outln!(
             "{}",
             quiet_blocker_envelope(version, n_errors, n_inert, upgrade_fixes, channel)
         );
@@ -2271,7 +2271,7 @@ fn print_platform_drift_status() {
         cc_version.as_deref(),
         cache_root.as_deref(),
     ) {
-        println!("{line}");
+        cadence_hooks_core::outln!("{line}");
     }
 }
 
@@ -2284,7 +2284,7 @@ fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
         return;
     }
     let days = window.as_secs() / 86_400;
-    println!(
+    cadence_hooks_core::outln!(
         "cadence-hooks doctor: {count} session-registry sweep(s) in the last {days} days (sweeps.jsonl)"
     );
 }
@@ -3314,7 +3314,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
 
     let Some(pinned) = manifest_install_paths(&manifest) else {
         if !quiet {
-            println!(
+            cadence_hooks_core::outln!(
                 "cadence-hooks doctor --prune: no installed-plugins manifest at {} — nothing to prune",
                 display_safe_path(&manifest)
             );
@@ -3354,7 +3354,9 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
         .collect();
     if dirs.is_empty() {
         if !quiet {
-            println!("cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found");
+            cadence_hooks_core::outln!(
+                "cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found"
+            );
         }
         return 0;
     }
@@ -3454,8 +3456,8 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
                 let line =
                     render_orphan_dir_line(&dir, dir_size_bytes(&dir), orphaned_at(&dir).is_some());
                 match reason {
-                    Some(r) => println!("{line} — keep: {}", r.label()),
-                    None => println!("{line}"),
+                    Some(r) => cadence_hooks_core::outln!("{line} — keep: {}", r.label()),
+                    None => cadence_hooks_core::outln!("{line}"),
                 }
             }
             match reason {
@@ -3472,7 +3474,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
                 // plugin loader when it retires a version dir, not by anything
                 // in this repo — surfacing it here is advisory ("this one was
                 // already flagged upstream"), not a marker this codebase creates.
-                println!(
+                cadence_hooks_core::outln!(
                     "{}",
                     render_orphan_dir_line(dir, size, dir.join(".orphaned_at").exists())
                 );
@@ -3558,14 +3560,14 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
             String::new()
         };
         if apply {
-            println!(
+            cadence_hooks_core::outln!(
                 "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB{kept_note}"
             );
-            println!(
+            cadence_hooks_core::outln!(
                 "  If any Claude Code session is currently running, run /reload-plugins in it now."
             );
         } else {
-            println!(
+            cadence_hooks_core::outln!(
                 "cadence-hooks doctor --prune: {removed} orphaned version dir(s) (~{freed_mib:.1} MiB) would be removed{kept_note} — dry-run, nothing deleted. Re-run with --apply to remove them."
             );
         }
@@ -4158,15 +4160,15 @@ pub fn run(
 
     // Default (verbose) mode. Notes alone still read as clean.
     if errors.is_empty() && warnings.is_empty() {
-        println!("cadence-hooks doctor: clean ({scanned} scanned)");
+        cadence_hooks_core::outln!("cadence-hooks doctor: clean ({scanned} scanned)");
         for note in &notes {
-            println!();
+            cadence_hooks_core::outln!();
             note.print();
         }
         return 0;
     }
 
-    println!(
+    cadence_hooks_core::outln!(
         "cadence-hooks doctor: {} finding(s) in {scanned}:\n",
         errors.len() + warnings.len()
     );
@@ -4174,7 +4176,7 @@ pub fn run(
     // Errors first, then warnings, then notes.
     for finding in errors.iter().chain(warnings.iter()).chain(notes.iter()) {
         finding.print();
-        println!();
+        cadence_hooks_core::outln!();
     }
 
     let n_err = errors.len();
@@ -4183,7 +4185,9 @@ pub fn run(
         0 => String::new(),
         n => format!(", {n} note(s)"),
     };
-    println!("cadence-hooks doctor: {n_err} error(s), {n_warn} warning(s){n_note}");
+    cadence_hooks_core::outln!(
+        "cadence-hooks doctor: {n_err} error(s), {n_warn} warning(s){n_note}"
+    );
 
     if n_err > 0 { 2 } else { 1 }
 }

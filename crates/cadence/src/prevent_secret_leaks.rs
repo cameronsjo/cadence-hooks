@@ -510,28 +510,42 @@ fn normalized_secret_name(text: &str) -> Option<String> {
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
         .collect();
+    // Brace groups are kept whole for the piece judgment, which expands them
+    // (`{a,.env}` reads `.env`, #1099): splitting at `{`/`}` left the piece
+    // `a,.env`, a name no pattern matches. A piece past the glob cap, or one
+    // with no comma group, is also judged split at its braces, as before, so a
+    // long minified JSON blob is not refused for its braces alone.
+    let judge = |piece: &str| {
+        !piece.is_empty()
+            && (is_dangerous_secret_token_at(piece, Filename::Unqualified)
+                // Past the cap no command grammar vouches for a file, so
+                // a key-material name blocks wherever it sits (#1097
+                // review: a padded `cat prod.key` allowed).
+                || is_key_material_name(
+                    piece.rsplit('/').next().unwrap_or(piece).to_lowercase().as_str(),
+                    Filename::Known,
+                ))
+    };
     normalized
         .split(|c: char| {
             c.is_whitespace()
                 || matches!(
                     c,
-                    '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '{' | '}' | '='
+                    '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '='
                         // git's `<rev>:<path>` names a committed file
                         // (`HEAD:.env`), and past the cap no grammar says
                         // which words are object spellings.
                         | ':'
                 )
         })
-        .find(|piece| {
-            !piece.is_empty()
-                && (is_dangerous_secret_token_at(piece, Filename::Unqualified)
-                    // Past the cap no command grammar vouches for a file, so
-                    // a key-material name blocks wherever it sits (#1097
-                    // review: a padded `cat prod.key` allowed).
-                    || is_key_material_name(
-                        piece.rsplit('/').next().unwrap_or(piece).to_lowercase().as_str(),
-                        Filename::Known,
-                    ))
+        .find_map(|piece| {
+            // 4096 is `secret_patterns`' glob-token cap, past which the
+            // judgment refuses a braced word unread.
+            if piece.len() <= 4096 && piece.contains('{') && piece.contains(',') && judge(piece) {
+                Some(piece)
+            } else {
+                piece.split(['{', '}']).find(|part| judge(part))
+            }
         })
         .map(str::to_string)
 }
@@ -593,6 +607,19 @@ fn segment_env_reads_at(
     // argument into fragments (#815 delta review I-a). Command-level
     // stripping already drops these bodies outside double quotes.
     let segment = strip_quoted_heredoc_bodies(segment);
+    // An input process substitution `<(…)` is a command of its own, not a
+    // run of the outer command's operands: cut out, its quoted `'*(#'` was read
+    // as a file operand of the outer `grep -f` (#1166). The outer command sees
+    // the `/dev/fd/N` bash hands it, and each body is judged below as the
+    // command segments it is.
+    let (segment, process_bodies) = if depth < NESTED_SCAN_DEPTH {
+        split_input_process_substitutions(segment.as_ref())
+            .map_or((segment, Vec::new()), |(outer, bodies)| {
+                (Cow::Owned(outer), bodies)
+            })
+    } else {
+        (segment, Vec::new())
+    };
     let segment = segment.as_ref();
     let (tokens, globs): (Vec<String>, Vec<bool>) = tokenize_marked(segment)
         .into_iter()
@@ -636,7 +663,10 @@ fn segment_env_reads_at(
         }
     }
     if depth < NESTED_SCAN_DEPTH {
-        for script in nested_command_strings(&tokens) {
+        for script in process_bodies
+            .into_iter()
+            .chain(nested_command_strings(&tokens))
+        {
             if !budget.spend(&script) {
                 break;
             }
@@ -658,6 +688,70 @@ fn segment_env_reads_at(
         }
     }
     found
+}
+
+/// `segment` with each unquoted input process substitution `<(BODY)` replaced
+/// by `/dev/fd/63`, plus the bodies, or `None` when there is none to cut or one
+/// cannot be bounded with confidence — an unclosed group, an ANSI-C `$'…'`
+/// (whose escaped quote this scan does not follow), or a `<<(` — in which case
+/// the segment is judged whole, as before. `>(…)` is left alone: its body
+/// consumes the outer command's output rather than feeding it operands.
+fn split_input_process_substitutions(segment: &str) -> Option<(String, Vec<String>)> {
+    if !segment.contains("<(") || segment.contains("$'") {
+        return None;
+    }
+    let bytes = segment.as_bytes();
+    let mut outer = String::with_capacity(segment.len());
+    let mut bodies = Vec::new();
+    let mut copied = 0;
+    let mut i = 0;
+    let (mut single, mut double) = (false, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !single => i += 1,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'<' if !single && !double && bytes.get(i + 1) == Some(&b'(') => {
+                if i > 0 && bytes[i - 1] == b'<' {
+                    return None;
+                }
+                let body_start = i + 2;
+                let (mut depth, mut j) = (1usize, body_start);
+                let (mut s, mut d) = (false, false);
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' if !s => j += 1,
+                        b'\'' if !d => s = !s,
+                        b'"' if !s => d = !d,
+                        b'(' if !s && !d => depth += 1,
+                        b')' if !s && !d => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth != 0 || j >= bytes.len() {
+                    return None;
+                }
+                outer.push_str(&segment[copied..i]);
+                outer.push_str("/dev/fd/63");
+                bodies.push(segment[body_start..j].to_string());
+                copied = j + 1;
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if bodies.is_empty() {
+        return None;
+    }
+    outer.push_str(&segment[copied..]);
+    Some((outer, bodies))
 }
 
 /// Reads for a segment with a substitution-bearing word, judged with every
@@ -1429,6 +1523,33 @@ fn kube_config_file(value: &str) -> bool {
         && parts.next() == Some(".kube")
         && !name.is_empty()
         && !is_dangerous_secret_token_at(name, Filename::Known)
+}
+
+/// The one assignment exempt from the operand scan (#771): a word spelled
+/// exactly `KUBECONFIG=VALUE` (`export KUBECONFIG=~/.kube/config`) whose VALUE
+/// is a plain literal path under a `.kube` directory. The assignment reads no
+/// file and prints nothing; the value is a path handed to `kubectl` later.
+///
+/// **Only this name.** A general assignment exemption would let
+/// `V=.env; cat $V` skip the prefilter, so every other name (`V=`, `FOO=`,
+/// `kubeconfig=`) keeps the full scan. The value takes no expansion, quote,
+/// glob, list separator (`:`), whitespace or `..` component, so it cannot name
+/// anything but a file inside `.kube`.
+fn kubeconfig_assignment(token: &str) -> bool {
+    let Some(value) = token.strip_prefix("KUBECONFIG=") else {
+        return false;
+    };
+    let mut parts: Vec<&str> = value.split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    !name.is_empty()
+        && name != ".."
+        && !value.contains([
+            '<', '>', '`', '*', '?', '[', '{', '$', '\\', '\'', '"', '(', ')', ';', '|', '&', ':',
+            '=', '!',
+        ])
+        && !value.chars().any(char::is_whitespace)
+        && !parts.contains(&"..")
+        && parts.contains(&".kube")
 }
 
 /// Operands a recognized verb consumes as configuration without printing,
@@ -2491,23 +2612,23 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
 }
 
 /// The CLOSED set of `forgectl env` subcommands audited to emit no secret
-/// VALUE on stdout — for `redact`, no `KEY=value` value: it passes `#` comment
-/// lines through verbatim (cadence-hooks#855). Anything outside it fails closed: an unknown subcommand is
+/// VALUE on stdout. `redact` is deliberately NOT in it: it prints `#` comment
+/// lines verbatim, and a comment can carry a secret (cadence-hooks#855), so
+/// `forgectl env redact` is judged like any other read. Anything outside the
+/// set fails closed: an unknown subcommand is
 /// an unaudited one, and the exemption is a metadata-only carve-out from an
 /// otherwise-blocking scan, so refusing it costs a false block on a legitimate
 /// new reader and nothing else.
-const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"];
+const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check"];
 
 /// `forgectl env` (cameronsjo/forgectl#82) is a purpose-built safe `.env`
-/// manager: every subcommand (`keys`, `set`, `get`, `check`, `redact`) is
-/// structurally value-free on stdout by design — `set`/`get` require piped
-/// stdin/`--clipboard` and print only a confirmation line (key name, not
-/// value), `redact` masks every `KEY=value` line, and `keys`/`check` print
-/// names only. Measured against forgectl 0.17.3, `redact` passes `#` COMMENT
-/// lines through verbatim, so a secret written into a comment is not masked
-/// (cadence-hooks#855) — the exemption's premise is about value lines, and
-/// this comment says so rather than overclaiming.
-/// A `.env`-shaped `--file` operand is therefore safe under exactly those five
+/// manager: four subcommands (`keys`, `set`, `get`, `check`) are structurally
+/// value-free on stdout by design — `set`/`get` require piped stdin/`--clipboard`
+/// and print only a confirmation line (key name, not value), and `keys`/`check`
+/// print names only. `redact` is not one of them: measured against forgectl
+/// 0.17.3 it passes `#` COMMENT lines through verbatim, so a secret written
+/// into a comment is printed (cadence-hooks#855).
+/// A `.env`-shaped `--file` operand is therefore safe under exactly those four
 /// subcommands (#315). Every other spelling — another `forgectl` command group,
 /// an unrecognized `env` subcommand, or a bare `forgectl env` with none — falls
 /// through to the standard dangerous-token scan, same as any non-allowlisted
@@ -2523,17 +2644,16 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// it was audited to handle.
 ///
 /// "Audited to handle" is a **shape**, not "whatever follows `--file`". The
-/// forgectl#82 audit is about dotenv files: `redact` masks `KEY=value` lines,
-/// and a file with no such lines — `id_rsa` is exactly that shape — has no
+/// forgectl#82 audit is about dotenv files: the audited subcommands handle
+/// `KEY=value` lines, and a file with no such lines — `id_rsa` is exactly that shape — has no
 /// masking rule to apply. Exempting an arbitrary `--file` value would have made
 /// this guard depend on forgectl's own `--file` restriction, an external
 /// control this code neither knows about nor tests and which could relax
 /// without a word here. Each value is gated on
 /// [`is_forgectl_env_file`] instead, so the guard's own predicate decides.
 ///
-/// debt: the safe set is CLOSED — the five subcommands named in
-/// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free (`redact` for value lines
-/// only, #855) — so a new `forgectl env`
+/// debt: the safe set is CLOSED — the four subcommands named in
+/// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free — so a new `forgectl env`
 /// subcommand fails closed and blocks until it is reviewed and added here.
 /// The upgrade trigger is a legitimate new value-free reader being blocked.
 fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
@@ -2580,8 +2700,7 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<usize> {
     // The target is what matters, not the operator (#853), and the argument
     // runs separately for each direction.
     //
-    // OUT: every audited subcommand is value-free on stdout ([`SAFE_ENV_SUBCOMMANDS`];
-    // `redact` for `KEY=value` lines only — it echoes `#` comments, #855), so
+    // OUT: every audited subcommand is value-free on stdout ([`SAFE_ENV_SUBCOMMANDS`]), so
     // sending that stdout to a file which is not itself a secret cannot expose
     // a value the transcript would not already have shown. Refusing on
     // `>/dev/null` bought nothing and cost every script that writes one.
@@ -2895,6 +3014,9 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 /// allow of a real read. [`substitution_operand_is_secret`] classifies what
 /// the substitution can be shown to produce; anything else keeps the firewall.
 fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
+    if kubeconfig_assignment(token) {
+        return None;
+    }
     let value = attached_input_redirection_target(token).unwrap_or(token);
     whole_word_secret(value, position).or_else(|| {
         glued_operands(value, position)
@@ -3547,35 +3669,17 @@ fn redirection_of(token: &str) -> Option<bool> {
 /// names rather than a boolean is what let that judgment move to the caller
 /// without a second parser.
 ///
-/// **The tokens arrive already cut at `&`.** `core::shell::split_segments`
-/// treats a bare `&` as a control operator, so `forgectl env check --file .env
-/// --json 2>&1` reaches this guard as two segments — `forgectl … --json 2>` and
-/// `1` — and an fd duplication is only ever seen as a TRAILING bare operator
-/// with its target gone. Reading that as an fd duplication is what fixes #846,
-/// and it is **not exact**: `cmd >& out.txt` leaves the same trailing `>` while
-/// bash redirects BOTH descriptors into the file `out.txt`. What contains that
-/// is the target landing in a segment of its own, where the standard scan
-/// judges it — not this function, which cannot see it. Every remaining way a
-/// bare operator ends a segment (`cmd >`, `cmd > ; x`) is a bash syntax error
-/// that runs nothing.
+/// **The segmenter keeps `>&` joined.** `core::shell::split_segments` no longer
+/// cuts `2>&1`, `>&2` or `>& out.txt` at the `&` (#848), so an fd duplication
+/// arrives whole and a `>& out.txt` target arrives as its own token, judged
+/// here like any other. A trailing bare operator with no target is still read
+/// as an fd duplication rather than a file, because every remaining way a bare
+/// operator ends a segment (`cmd >`, `cmd > ; x`) is a bash syntax error that
+/// runs nothing.
 ///
-/// The exact fix is to teach the shared segmenter to keep `>&` joined the way
-/// it already keeps `>|` (`ends_with_unescaped_gt` in `core::shell`). That
-/// moves the segmenter toward FEWER segments, which its own doc calls the
-/// unsafe direction, and every guard inherits it — so it earns its own change
-/// and its own adversarial review rather than riding along here.
-///
-/// Fail-closed on the branches an unquoted `&` never reaches today: a `>&`/`<&`
+/// Fail-closed on the branches an unquoted `&` never reaches: a `>&`/`<&`
 /// whose next token is not a bare fd number or `-` counts as opening a file,
-/// because bash reads `ls >& f` as a file redirect. Those branches are live
-/// only for a quoted or escaped `&`, which the segmenter does not cut — which
-/// is why `redirection_file_targets_extracts_each_operator_shape` exercises
-/// this function directly rather than through the guard.
-// debt: a trailing bare `>` cannot tell `2>&1` from `>& out.txt`; containment
-// rests on the target's own segment being scanned. Upgrade trigger: the
-// `core::shell` segmenter learning to keep `>&` joined (cadence-hooks#848),
-// after which the `Some(true)` fd branch below becomes reachable and this
-// ceases to be an approximation.
+/// because bash reads `ls >& f` as a file redirect.
 fn redirection_file_targets(tokens: &[String]) -> Vec<&str> {
     let mut targets = Vec::new();
     let mut rest = tokens.iter().peekable();
@@ -3584,7 +3688,7 @@ fn redirection_file_targets(tokens: &[String]) -> Vec<&str> {
             // `> out.sh`, `< .env`, `>& 2` — the target is the next token. It
             // is an fd when the operator itself ends in `&` AND that token is a
             // bare descriptor number or the close marker `-`, or when the
-            // target is missing entirely (the `&`-split case above).
+            // target is missing entirely (a bare trailing operator).
             Some(true) => {
                 let Some(target) = rest.next().map(String::as_str) else {
                     continue;
@@ -5352,10 +5456,21 @@ mod tests {
     // --- #315: forgectl env value-free readers ---
 
     #[test]
-    fn bash_forgectl_env_redact_env_file_allowed() {
-        let result =
-            SecretLeaksGuard::default().run(&make_bash_input("forgectl env redact --file .env"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    fn bash_forgectl_env_redact_env_file_blocked() {
+        // #855: `redact` prints `#` comment lines verbatim, so it is judged like
+        // any other read of the file.
+        for command in [
+            "forgectl env redact --file .env",
+            "forgectl env redact -f .env.local",
+            "forgectl --no-icons env redact --file .env",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
     }
 
     #[test]
@@ -5400,9 +5515,8 @@ mod tests {
     fn bash_forgectl_leading_global_flag_env_file_allowed() {
         // A leading boolean global flag (forgectl's only persistent flag)
         // must not hide the `env` subcommand from the check.
-        let result = SecretLeaksGuard::default().run(&make_bash_input(
-            "forgectl --no-icons env redact --file .env",
-        ));
+        let result = SecretLeaksGuard::default()
+            .run(&make_bash_input("forgectl --no-icons env keys --file .env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
@@ -5949,7 +6063,7 @@ mod tests {
     #[test]
     fn bash_forgectl_file_operand_must_be_env_shaped() {
         // The audit behind the exemption (forgectl#82) is about dotenv files:
-        // `redact` masks KEY=value lines, and a file with none — an SSH key,
+        // the audited subcommands handle KEY=value lines, and a file with none — an SSH key,
         // a `.pgpass` — has no masking rule to apply. Exempting whatever
         // follows `--file` would have made this guard depend on forgectl's own
         // `--file` restriction, an external control it neither knows about nor
@@ -9002,7 +9116,7 @@ mod tests {
                 "forgectl env keys --file .env .env",
                 "forgectl env keys .env --file .env",
                 "forgectl env keys --file=.env .env",
-                "forgectl env redact -f .env .env",
+                "forgectl env keys -f .env .env",
                 "forgectl env keys --file .env <.env",
             ],
             cadence_hooks_core::Outcome::Block,
@@ -9012,7 +9126,7 @@ mod tests {
             &[
                 "forgectl env keys --file .env",
                 "forgectl env keys --file=.env",
-                "forgectl env redact -f .env.local",
+                "forgectl env keys -f .env.local",
                 "forgectl env keys --file .env --file .env.prod",
             ],
             cadence_hooks_core::Outcome::Allow,
@@ -9813,7 +9927,6 @@ mod tests {
         assert_bash(
             &[
                 "cat ~/.kube/config",
-                "export KUBECONFIG=${KUBECONFIG:-~/.kube/config}",
                 "kubectl --kubeconfig ~/.kube/config config view --raw",
                 "kubectl config view --raw --kubeconfig=~/.kube/config",
                 "kubectl --kubeconfig ~/.kube/config get pods; cat ~/.kube/config",
@@ -10927,6 +11040,119 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "no secret file in the value",
+        );
+    }
+
+    // --- #1166: an input process substitution is a command of its own
+
+    #[test]
+    fn input_process_substitution_bodies_are_their_own_commands() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_bash(
+            &[
+                "grep -f <(grep -vE '*(#' f.txt) g.txt",
+                "grep -f <(grep -vE '^[[:space:]]*(#|$)' f.txt) g.txt",
+                "diff <(grep -vE '*(#' f) <(sort g)",
+            ],
+            Allow,
+            "a quoted regex in a process substitution is not an operand of the outer command",
+        );
+        assert_bash(
+            &[
+                "diff <(cat .env) x",
+                "diff <(sort .env) x",
+                "cat <(cat <(cat .env))",
+                "grep -f <(grep -vE '*(#' f) <(cat .env)",
+                "grep -f <(grep -vE '*(#' f.txt) .env",
+                "cat <(echo 'a)b'; cat .env)",
+                "source <(cat .env)",
+                "cat <(x $'a\\'b') .env",
+                "cat <(unterminated .env",
+            ],
+            Block,
+            "a real secret read inside or beside <(...) still blocks",
+        );
+    }
+
+    // --- #1099: an unknown $VAR in a filename is `*` where the literal names a family
+
+    #[test]
+    fn unknown_variable_in_a_filename_is_a_glob_where_the_literal_names_a_family() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_bash(
+            &[
+                "cat .env$X",
+                "cat .env${X}",
+                "cat id_rsa$X",
+                "cat id_rsa${X}",
+                "cat $X.env",
+                "cat ${X}/.env",
+                "cat ~/.ssh/$KEY",
+            ],
+            Block,
+            "the literal part names a deny-set family",
+        );
+        assert_bash(
+            &[
+                "cat $X.json",
+                "cat $X",
+                "cat \"$OUT\"/*.pem",
+                "git commit -m \"$MSG\"",
+                "npm run build $FLAGS",
+                "cat foo$(echo x).json",
+            ],
+            Allow,
+            "no family in the literal part: judged as the `*` spelling is",
+        );
+    }
+
+    #[test]
+    fn oversized_commands_expand_brace_groups() {
+        let pad = "x ".repeat(STRUCTURED_SCAN_LIMIT);
+        for (tail, blocks) in [
+            ("cat {a,.env}", true),
+            ("cat {a,b}/.env", true),
+            ("cat .e{nv,x}", true),
+            ("cat {a,b}.txt", false),
+            ("echo {\"a\":1,\"b\":2}", false),
+        ] {
+            let command = format!("{pad}{tail}");
+            assert!(command.len() > STRUCTURED_SCAN_LIMIT);
+            assert_eq!(normalized_secret_name(&command).is_some(), blocks, "{tail}");
+        }
+    }
+
+    // --- #771: only `KUBECONFIG=` with a literal `.kube/` path is exempt
+
+    #[test]
+    fn kubeconfig_assignment_is_the_only_exempt_assignment() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_bash(
+            &[
+                "export KUBECONFIG=~/.kube/config",
+                "KUBECONFIG=~/.kube/config kubectl get pods",
+                "export KUBECONFIG=/home/u/.kube/prod",
+                "export KUBECONFIG=.kube/config",
+                "export KUBECONFIG=${KUBECONFIG:-~/.kube/config}",
+            ],
+            Allow,
+            "a literal .kube path assigned to KUBECONFIG reads nothing",
+        );
+        assert_bash(
+            &[
+                "V=.env; cat $V",
+                "export KUBECONFIG=~/.kube/config; cat $KUBECONFIG",
+                "export KUBECONFIG=~/.kube/config; cat ~/.kube/config",
+                "export KUBECONFIG=~/.ssh/id_rsa",
+                "export KUBECONFIG=~/.kube/../.ssh/id_rsa",
+                "export KUBECONFIG=~/.kube/a:~/.ssh/id_rsa",
+                "export kubeconfig=~/.kube/config",
+                "export FOO=~/.kube/config",
+                "export KUBECONFIG=$HOME/.kube/config",
+                "cat KUBECONFIG=~/.kube/config ~/.kube/config",
+            ],
+            Block,
+            "any other name, path or read keeps the full scan",
         );
     }
 }

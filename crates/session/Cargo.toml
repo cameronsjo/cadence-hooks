@@ -18,6 +18,13 @@ sha2.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Handle identity for the plan-store reader on Windows: volume serial + file
+# index + link count (`GetFileInformationByHandle`) and the final path
+# (`GetFinalPathNameByHandleW`), cadence-hooks#1147. Already in the lock file
+# transitively via tempfile; features kept to the two calls' modules.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 # Dev-only: the run_start ↔ enforce-worktree parity test drives the actual
