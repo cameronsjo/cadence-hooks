@@ -200,7 +200,7 @@ fn status_row(peer: &registry::Peer, own_session_id: Option<&str>) -> String {
 
 /// How the sibling-worktree enumeration behind `session status` went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeList {
+pub(crate) enum WorktreeList {
     /// `git worktree list` answered; every worktree it names was checked.
     Listed,
     /// git ran out of its deadline before answering.
@@ -230,7 +230,7 @@ struct Registry {
 /// directory reached by two spellings) collapse on the canonical path. A
 /// worktree whose directory is gone is still returned — its registry simply
 /// does not exist, which the footer counts separately.
-fn repo_registries(
+pub(crate) fn repo_registries(
     cwd: &str,
     own_dir: std::path::PathBuf,
 ) -> (Vec<std::path::PathBuf>, WorktreeList) {
