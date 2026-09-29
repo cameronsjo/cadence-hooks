@@ -37,6 +37,42 @@ fn is_destructive(command: &str) -> bool {
     is_destructive_at(command, 0)
 }
 
+/// Substrings that mark a deleting verb inside text the scan will not peel.
+const DELETING_SPELLINGS: &[&str] = &[
+    "rm", "unlink", "shred", "truncate", "find", "git", "-delete", ">",
+];
+
+/// A run of `eval` words longer than [`MAX_NESTED_DEPTH`] is a nest the walk
+/// gives up on, and expanding it costs seconds per thousand words
+/// (`eval ` × 30,000 took 27.7 s and the hook deadline fails OPEN). Read
+/// linearly instead: `Some(true)` when the text past the run could carry a
+/// deleting verb or a redirect (ambiguity blocks), `Some(false)` when it cannot, `None`
+/// when there is no such run and the ordinary walk applies.
+fn eval_flood(command: &str) -> Option<bool> {
+    let mut run = 0;
+    let mut start = None;
+    for (offset, word) in word_offsets(command) {
+        if word == "eval" {
+            run += 1;
+            if run > MAX_NESTED_DEPTH {
+                start = Some(offset);
+                break;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    let start = start?;
+    let rest = &command[start..];
+    Some(DELETING_SPELLINGS.iter().any(|verb| rest.contains(verb)))
+}
+
+/// Whitespace-separated words with their byte offsets.
+fn word_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split_whitespace()
+        .map(move |word| (word.as_ptr() as usize - text.as_ptr() as usize, word))
+}
+
 /// True when the command at the head of an already-peeled `argv` deletes or
 /// zeroes the file it is handed.
 ///
@@ -547,6 +583,10 @@ fn collect_operands(
 /// Resolve a deletion operand lexically against `cwd` (`~` against `home`,
 /// `..` collapsed). `None` for a `~user` form, which no text settles.
 fn resolve_operand(operand: &str, cwd: &str, home: Option<&str>) -> Option<String> {
+    let root = operand.trim().starts_with('/') && normalize_path(operand).is_empty();
+    if root {
+        return Some("/".to_string());
+    }
     let operand = normalize_path(operand);
     let joined = if operand == "~" || operand.starts_with("~/") {
         format!("{}{}", normalize_path(home?), &operand[1..])
@@ -558,6 +598,72 @@ fn resolve_operand(operand: &str, cwd: &str, home: Option<&str>) -> Option<Strin
         format!("{cwd}/{operand}")
     };
     looks_absolute(&joined).then(|| collapse_dots(&joined))
+}
+
+/// Judge an operand containing an expansion by its literal prefix. The shell
+/// expands the rest, so the prefix may name the vault, something in it, or a
+/// partial name of the vault or one of its ancestors (`~/Doc*`). An empty
+/// prefix says nothing and is not judged.
+fn operand_lexically_touches_vault(
+    operand: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+) -> bool {
+    let Some(at) = operand.find(GLOB_CHARS) else {
+        return resolve_operand(operand, cwd, home).is_some_and(|path| touches_vault(&path, vault));
+    };
+    let prefix = &operand[..at];
+    if prefix.is_empty() {
+        return false;
+    }
+    let literal = if normalize_path(prefix).is_empty() {
+        Some("/".to_string())
+    } else {
+        resolve_operand(prefix, cwd, home)
+    };
+    literal.is_some_and(|l| vault.starts_with(&l) || touches_vault(&l, vault))
+}
+
+/// Characters after which an operand's text is no longer its final path.
+const GLOB_CHARS: &[char] = &['*', '?', '[', '{', '$', '`'];
+
+/// Does a sibling segment of the deletion re-point or move a path into the
+/// vault (`ln -s <vault> /out/l`, `mv <vault>/x /out/y`, `cp -s …`)? Such a
+/// segment is not inert ([`is_inert_segment`], the rule the inside-the-vault
+/// path applies), so a deletion that follows can reach the vault through what
+/// it made: the physical check reads the disk before the link exists.
+fn sibling_reshapes_vault(command: &str, cwd: &str, vault: &str, home: Option<&str>) -> bool {
+    for segment in command_segments(command) {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+        let argv = peel_command_runners(&tokens);
+        let Some(first) = argv.first() else {
+            continue;
+        };
+        let verb = command_word(first);
+        let makes_link = match verb.as_ref() {
+            "ln" | "mv" => true,
+            "cp" => argv.iter().skip(1).any(|a| {
+                a == "--symbolic-link"
+                    || a == "--link"
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains(['s', 'l']))
+            }),
+            _ => false,
+        };
+        if !makes_link || is_inert_segment(argv, &segment) {
+            continue;
+        }
+        let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
+        let mut operands = Vec::new();
+        collect_operands(argv, lens, 1, false, &mut operands);
+        if operands
+            .iter()
+            .any(|operand| operand_lexically_touches_vault(operand, cwd, vault, home))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Most `canonicalize` calls one command may cost (cadence-hooks#1171).
@@ -581,6 +687,12 @@ fn operands_touch_vault(
     let mut calls = 0;
     let mut canonical_vault: Option<Option<String>> = None;
     for operand in operands {
+        if operand.contains(GLOB_CHARS) {
+            if operand_lexically_touches_vault(&operand, cwd, vault, home) {
+                return true;
+            }
+            continue;
+        }
         let Some(path) = resolve_operand(&operand, cwd, home) else {
             continue;
         };
@@ -646,6 +758,21 @@ fn check_destructive_in_vault_at(
     let cwd = normalize_path(cwd);
     let vault_prefix = format!("{vault}/");
 
+    // A flood the walk gives up on is not judged operand by operand: expanding
+    // it is the cost, so it is answered from a linear read of its text.
+    match eval_flood(command) {
+        Some(true) => {
+            return CheckResult::block(format!(
+                "🚫 Obsidian vault detected. This command nests `eval` past what the guard \
+                 can read and may delete or truncate vault files.\n\n\
+                 .trash/ is Obsidian's built-in recycle bin. Move files there instead:\n  \
+                 mkdir -p {vault}/.trash && mv <file> {vault}/.trash/"
+            ));
+        }
+        Some(false) => return CheckResult::allow(),
+        None => {}
+    }
+
     if is_destructive(command) {
         let cwd_in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
         let mut in_vault = cwd_in_vault && !deletions_all_outside_vault(command, &vault, meta);
@@ -683,7 +810,8 @@ fn check_destructive_in_vault_at(
             // relative climb, or a symlink parent needs the operands resolved
             // (cadence-hooks#1171).
             if !in_vault {
-                in_vault = operands_touch_vault(command, &cwd, &vault, home, meta);
+                in_vault = operands_touch_vault(command, &cwd, &vault, home, meta)
+                    || sibling_reshapes_vault(command, &cwd, &vault, home);
             }
         }
 
@@ -1235,6 +1363,88 @@ mod tests {
             assert_eq!(judge("rm link/notes/x.md"), Block);
             assert_eq!(judge("rm link"), Allow);
         }
+    }
+
+    #[test]
+    fn deletion_from_outside_cwd_judges_a_glob_by_its_literal_prefix() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let vault = "/home/me/Documents/Vault";
+        for (cwd, command, expected) in [
+            ("/home/me", "rm -rf ~/Doc*", Block),
+            ("/home/me", "rm -rf ~/Documents/*", Block),
+            ("/home/me", "rm -rf ~/Documents/Vault/*.md", Block),
+            ("/home/me", "rm -rf ~/D?cuments", Block),
+            ("/home/me", "rm -rf /home/me/Documents/V*", Block),
+            ("/home/me", "rm -rf /*", Block),
+            ("/home/me", "rm -rf /home/*", Block),
+            ("/home/me", "rm -rf Doc*", Block),
+            ("/home/me", "rm -rf ~/Documents/{Vault,x}", Block),
+            ("/home/me", "rm -rf ~/Documents/$X", Block),
+            ("/home/me", "rm -rf ~/Downloads/*", Allow),
+            ("/home/me", "rm -rf ~/Documents2/*", Allow),
+            ("/home/me", "rm -rf ~/Documents/Other/*", Allow),
+            ("/home/me/project", "rm -rf D*", Allow),
+            ("/tmp", "rm -rf /tmp/*", Allow),
+            // An empty literal prefix keeps the verdict the rest of the scan reached.
+            ("/home/me", "rm $X", Allow),
+            ("/home/me", "rm *.log", Allow),
+        ] {
+            let result = check_destructive_in_vault_at(
+                command,
+                cwd,
+                vault,
+                Some("/home/me"),
+                &FakeFs::default(),
+            );
+            assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+        }
+    }
+
+    #[test]
+    fn deletion_from_outside_cwd_after_a_link_or_move_of_the_vault_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, expected) in [
+            ("ln -s /vault /out/l; rm /out/l/x", Block),
+            ("ln -s /vault/notes /out/l && rm -r /out/l/x", Block),
+            ("mv /vault/note.md /out/y; rm /out/y", Block),
+            ("cp -s /vault/note.md /out/y; rm /out/y", Block),
+            ("cp -rs /vault /out/y; rm -r /out/y/x", Block),
+            ("ln -s / /out/l; rm /out/l/x", Block),
+            // Links and moves that never touch the vault leave the deletion alone.
+            ("ln -s /tmp/a /out/l; rm /out/l", Allow),
+            ("mv /tmp/a /tmp/b; rm /tmp/b", Allow),
+            ("cp /vault/note.md /out/y; rm /out/y", Allow),
+            ("ln -s /vault /out/l", Allow),
+        ] {
+            let result =
+                check_destructive_in_vault_at(command, "/work", "/vault", None, &FakeFs::default());
+            assert_eq!(result.outcome, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn an_eval_flood_is_answered_without_expanding_it() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let start = std::time::Instant::now();
+        let flood = "eval ".repeat(30_000);
+        for (command, expected) in [
+            (format!("{flood}rm x"), Block),
+            (format!("{flood}find . -delete"), Block),
+            (format!("{flood}echo hi > f"), Block),
+            (format!("{flood}echo hi"), Allow),
+        ] {
+            for cwd in ["/home/me", "/vault"] {
+                let result = check_destructive_in_vault_at(
+                    &command,
+                    cwd,
+                    "/vault",
+                    None,
+                    &FakeFs::default(),
+                );
+                assert_eq!(result.outcome, expected, "cwd={cwd}");
+            }
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
