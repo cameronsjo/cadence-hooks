@@ -327,6 +327,39 @@ mod tests {
     // --- positive controls: the guard is not a blanket refusal ---
 
     #[test]
+    fn a_decrypt_behind_a_path_spelled_or_terminated_prefix_blocks() {
+        // cadence-hooks#888: the shared transparent-prefix test did not basename
+        // and read `--` as the prefix's own flag, so each prefix stayed the
+        // command word and the `sops` behind it was never examined. Every row
+        // runs sops under bash; every one was Allow at the parent commit.
+        without_escape(|| {
+            for command in [
+                "nohup -- sops -d secrets.yaml",
+                "nohup -- sops -d secrets.yaml | grep x",
+                "/usr/bin/nohup -- sops -d secrets.yaml | grep x",
+                "/usr/bin/nohup sops -d secrets.yaml",
+                "/usr/bin/env sops -d secrets.yaml",
+                "command -- sops -d secrets.yaml",
+                "exec -- sops -d secrets.yaml",
+                "eval 'sops -d secrets.yaml' | grep x",
+                "trap 'sops -d secrets.yaml | grep x' EXIT",
+                // cadence-hooks#1089 review: an `eval` chain past the wrapper
+                // depth, and backslash-escaped operators inside `eval`.
+                "eval eval eval eval sops -d secrets.yaml",
+                "eval echo a\\; sops -d x",
+                "eval echo a \\&\\& sops -d x",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command:?}");
+            }
+            // Control: the stdin-consumer shape stays allowed behind a prefix.
+            assert_eq!(
+                outcome("/usr/bin/nohup -- sops -d s.yaml | curl --config -"),
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
     fn unrelated_command_allowed() {
         without_escape(|| assert_eq!(outcome("ls -la"), Outcome::Allow));
     }

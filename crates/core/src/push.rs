@@ -33,7 +33,7 @@
 
 use crate::shell::{
     COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
-    executable_tokens_marked, git_output_detailed, is_assignment_word, is_redirect_token,
+    executable_tokens_marked, git_output_detailed, installs_trap_action, is_assignment_word,
     peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
     unescape_word,
 };
@@ -207,11 +207,11 @@ fn collect_push_invocations(
         //
         // So: a `}` in the trailing trim run whose preceding character is
         // neither whitespace nor `;` is a real word byte the trim is about to
-        // eat. Fixed locally rather than in the shared primitive, which is
-        // byte-identical to `origin/main` and shared with `enforce_worktree` —
-        // teaching the tokenizer that a trailing `}` is a word character
-        // belongs behind its own issue (cadence-hooks#237 security review,
-        // F28/F29/F30).
+        // eat. The shared primitive now keeps such a `}` itself
+        // (cadence-hooks#889), so the refspec and directory it reports are the
+        // real words; this refusal stays as the belt to that brace, and still
+        // covers the one shape the primitive trims by design — a `}` after `)`
+        // (cadence-hooks#237 security review, F28/F29/F30).
         let trailing_trim_run =
             trimmed.len() - trimmed.trim_end_matches([')', '}', ';', ' ', '\t']).len();
         //
@@ -277,15 +277,15 @@ fn collect_push_invocations(
         // their `cd`s die with the subshell. What this walk cannot vouch for is
         // the opposite: an env redirect crosses into the child, and a directory
         // this walk has lost track of is lost for the child too.
+        //
+        // A `trap` action is the exception to "the directory in effect HERE":
+        // it runs when the signal fires, in whatever directory the parent has
+        // reached by then (`trap 'git push origin main' EXIT; cd /other` pushes
+        // from `/other`), so its child starts unresolved.
         if depth < MAX_WRAPPER_DEPTH {
+            let child_unresolved = segment_unresolved || installs_trap_action(argv);
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(
-                    &child,
-                    &effective_dir,
-                    depth + 1,
-                    segment_unresolved,
-                    out,
-                );
+                collect_push_invocations(&child, &effective_dir, depth + 1, child_unresolved, out);
             }
         }
 
@@ -731,9 +731,11 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
     // `None`, which the caller reads as "not a directory verb at all": it kept
     // the STALE directory and the later push reported `unresolved: false`
     // against the session's own checkout, while bash, zsh and sh had all moved
-    // (measured). Over-refuses `eval echo hi`, which is explainable; the
-    // structural fix is `child_scripts` learning `eval`, tracked as
-    // cameronsjo/cadence-hooks#886 (cadence-hooks#237 security review, F20).
+    // (measured). Over-refuses `eval echo hi`, which is explainable.
+    // `child_scripts` now surfaces the `eval`'d script (cadence-hooks#886), so
+    // a push inside one is found — but it walks that script in its own scope,
+    // and an `eval`'d `cd` moves the PARENT, so this refusal is still what
+    // keeps the later segments honest (cadence-hooks#237 security review, F20).
     if unescape_word(candidate).as_ref() == "eval" {
         return Some(DirectoryVerb::Unknowable);
     }
@@ -865,7 +867,7 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
 ///
 /// A redirect arrives as one token when its target is glued on (`>/dev/null`,
 /// `2>&1`) and as two when the operator stands alone (`> log`), so the standalone
-/// form consumes the word after it. [`is_redirect_token`] is core's own test for
+/// form consumes the word after it. [`crate::shell::is_redirect_token`] is core's own test for
 /// the operator, shared rather than re-spelled.
 /// [`strip_redirections`], but a token the shell QUOTED is never a redirection.
 ///
@@ -971,16 +973,8 @@ struct RedirectOperator {
 /// leading `&` where this strips every one, and only the gate keeps that from
 /// mattering.
 fn redirect_operator(word: &str) -> Option<RedirectOperator> {
-    if !is_redirect_token(word) {
-        return None;
-    }
-    let after_ampersands = word.trim_start_matches('&');
-    let after_digits = after_ampersands.trim_start_matches(|c: char| c.is_ascii_digit());
-    let after_operators = after_digits.trim_start_matches(['>', '<']);
-    Some(RedirectOperator {
-        len: word.len() - after_operators.len(),
-        is_whole_word: after_operators.is_empty(),
-    })
+    let (len, is_whole_word) = crate::shell::redirect_operator_span(word)?;
+    Some(RedirectOperator { len, is_whole_word })
 }
 
 fn strip_redirections(words: &[String]) -> Vec<&String> {
@@ -2041,7 +2035,6 @@ mod tests {
             "exec -a name git push origin main",
             "exec -c git push origin main",
             "exec -l git push origin main",
-            "nohup -- git push origin main",
             "time -p git push origin main",
             // Over-refused on purpose: `builtin -p git push` fails in all three
             // shells, so nothing is published. An unresolvable push a caller can
@@ -2054,13 +2047,29 @@ mod tests {
             assert!(invocation.refspecs.is_empty(), "{command:?}");
         }
         // `eval` joins the same fallback: it is in neither TRANSPARENT nor
-        // COMMAND_RUNNERS, so the whole segment was invisible.
-        assert!(only("eval git push origin main", "/repo").unresolved);
+        // COMMAND_RUNNERS, so the whole segment was invisible. `child_scripts`
+        // now also surfaces the `eval`'d script (cadence-hooks#886), so the push
+        // is described too — alongside the fallback's refusal, never instead of
+        // it.
+        let found = push_invocations("eval git push origin main", "/repo");
+        assert!(found.iter().any(|push| push.unresolved), "{found:?}");
+        assert!(
+            found.iter().any(|push| push
+                .refspecs
+                .iter()
+                .any(|r| r.source.as_deref() == Some("main"))),
+            "{found:?}"
+        );
         // Controls: `env`/`nice` are ALSO command runners, whose peel has a real
-        // flag grammar, so these resolve fully and must keep doing so.
+        // flag grammar, so these resolve fully and must keep doing so. A `--`
+        // after any transparent prefix is that prefix's end of options, and the
+        // shared skip reads it so (cadence-hooks#888): the push behind it
+        // resolves rather than falling back to a refusal.
         for command in [
             "env -i git push origin main",
             "nice -n 5 git push origin main",
+            "nohup -- git push origin main",
+            "/usr/bin/nohup -- git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert!(!invocation.unresolved, "{command:?}");
@@ -2089,17 +2098,25 @@ mod tests {
         // binaries in /usr/bin, so this is not a theoretical spelling: each row below runs
         // under bash, zsh and sh (measured) and yielded nothing at all.
         for command in [
-            "/usr/bin/nohup -- git push origin main",
             "/usr/bin/time -p git push origin main",
-            "/usr/bin/nohup git push origin main",
-            "/usr/bin/time git push origin main",
-            "./nohup -- git push origin main",
             "command.exe -p git push origin main",
         ] {
             assert!(
                 only(command, "/repo").unresolved,
                 "{command:?} must refuse, not vanish"
             );
+        }
+        // The shared skip now basenames too (cadence-hooks#888), so an unflagged
+        // or `--`-terminated path-spelled prefix no longer needs the fallback:
+        // the push behind it resolves fully.
+        for command in [
+            "/usr/bin/nohup -- git push origin main",
+            "/usr/bin/nohup git push origin main",
+            "/usr/bin/time git push origin main",
+            "./nohup -- git push origin main",
+        ] {
+            assert_eq!(sources(command, "/repo"), ["main"], "{command:?}");
+            assert!(!only(command, "/repo").unresolved, "{command:?}");
         }
         // Controls: `env`/`nice` already survived a path because they are also
         // command runners, whose peel basenames. They must keep resolving fully.
@@ -2109,8 +2126,8 @@ mod tests {
         ] {
             assert_eq!(sources(command, "/repo"), ["main"], "{command:?}");
         }
-        // Control: the bare spelling, unchanged.
-        assert!(only("nohup -- git push origin main", "/repo").unresolved);
+        // Control: the bare spelling resolves the same way.
+        assert_eq!(sources("nohup -- git push origin main", "/repo"), ["main"]);
     }
 
     #[test]
@@ -2123,16 +2140,27 @@ mod tests {
             "command -p git -C /other push origin main",
             "exec -a x git -C /other push origin main",
             "time -p git -C /other push origin main",
-            "nohup -- git -c a=b push origin main",
             "command -p git --git-dir=/x push origin main",
             "command -p git -c foo=bar push origin main",
-            "eval git -C /other push origin main",
         ] {
             assert!(
                 only(command, "/repo").unresolved,
                 "{command:?} must refuse, not vanish"
             );
         }
+        // `eval` keeps the fallback's refusal, and `child_scripts` now also
+        // describes the push it runs (cadence-hooks#886) — two records, one of
+        // them unresolved, so a caller still refuses.
+        let found = push_invocations("eval git -C /other push origin main", "/repo");
+        assert!(found.iter().any(|push| push.unresolved), "{found:?}");
+        assert!(
+            found.iter().any(|push| push.work_dir == "/other"),
+            "{found:?}"
+        );
+        // `nohup --` is skipped by the shared prefix walk (cadence-hooks#888),
+        // so the structured read sees the `-C` and resolves the push THERE.
+        let invocation = only("nohup -- git -C /other push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/other");
         // Controls: the shapes that already worked must keep working.
         for command in [
             "command -p git push origin main",
@@ -2268,6 +2296,43 @@ mod tests {
     }
 
     #[test]
+    fn a_push_inside_eval_or_trap_is_found_and_a_trap_s_is_unresolved() {
+        // cadence-hooks#886: `eval` hands its operands back to the parser, and
+        // the walk saw zero invocations. Found now, in the directory in effect
+        // at the `eval` — which is where bash runs it.
+        for command in [
+            "eval 'git push origin main'",
+            "eval \"git push origin main\"",
+            "GIT_DIR=/x eval 'git push origin main'",
+        ] {
+            let found = push_invocations(command, "/repo");
+            assert!(
+                found.iter().any(|push| push
+                    .refspecs
+                    .iter()
+                    .any(|r| r.source.as_deref() == Some("main"))),
+                "{command:?} must be found, got {found:?}"
+            );
+        }
+        // cadence-hooks#1059: a trap action runs when the signal fires, in the
+        // directory the parent has reached BY THEN — so the walk cannot vouch
+        // for where it runs and must refuse rather than report `/repo`.
+        for command in [
+            "trap 'git push origin main' EXIT",
+            "trap 'git push origin main' EXIT; cd /other",
+        ] {
+            let found = push_invocations(command, "/repo");
+            assert!(!found.is_empty(), "{command:?} must not vanish");
+            assert!(
+                found.iter().all(|push| push.unresolved),
+                "{command:?} must refuse, got {found:?}"
+            );
+        }
+        // Control: a trap that installs nothing contributes nothing.
+        assert!(push_invocations("trap - EXIT", "/repo").is_empty());
+    }
+
+    #[test]
     fn an_unbalanced_group_closer_refuses_rather_than_reporting_a_trimmed_word() {
         // `strip_group_wrappers` trims a trailing `}`/`)` unconditionally, so a
         // segment whose last token legitimately ends in one loses those bytes
@@ -2361,16 +2426,12 @@ mod tests {
                 "{command:?} must refuse — the quoted `${{` opens nothing"
             );
         }
-        // **An expansion as the LAST token still loses its brace, and the
-        // carve-out above cannot reach it.** `executable_tokens` re-applies
-        // `strip_group_wrappers` internally, so the trim happens a second time
-        // below this walk; keeping the byte needs a `core::shell` change this
-        // branch has deferred throughout. It refuses either way — the `$` fails
-        // `is_safe_ref`, so the range is `Unresolved` and a caller must refuse —
-        // but the refspec is recorded truncated, so the row is named in the
-        // plan's open list rather than claimed closed.
-        assert_eq!(sources("git push origin ${BRANCH}", "/repo"), ["${BRANCH"]);
-        assert!(!is_safe_ref("${BRANCH"));
+        // **An expansion as the LAST token keeps its brace.** The shared
+        // `strip_group_wrappers` trims a `}` only where it stands as its own word
+        // (cadence-hooks#889), so the refspec is recorded whole. It still refuses
+        // — the `$` fails `is_safe_ref`, so the range is `Unresolved`.
+        assert_eq!(sources("git push origin ${BRANCH}", "/repo"), ["${BRANCH}"]);
+        assert!(!is_safe_ref("${BRANCH}"));
         // Quoting was always the shape that survived, and still is.
         assert_eq!(
             sources("git push origin \"${BRANCH}\"", "/repo"),
@@ -2412,7 +2473,13 @@ mod tests {
         assert!(only("git >log push --all", "/repo").all_or_mirror);
         // The prefix-wrapped spellings reach the fallback, which strips too.
         assert!(only("command -p git >log push origin main", "/repo").unresolved);
-        assert!(only("nohup -- git 2>/dev/null push origin main", "/repo").unresolved);
+        assert!(only("time -p git 2>/dev/null push origin main", "/repo").unresolved);
+        // `nohup --` is skipped by the shared prefix walk (cadence-hooks#888),
+        // so the structured read strips the redirect itself.
+        assert_eq!(
+            sources("nohup -- git 2>/dev/null push origin main", "/repo"),
+            ["main"]
+        );
         // Control: the trailing spelling, unchanged.
         assert_eq!(sources("git push origin main >log", "/repo"), ["main"]);
     }

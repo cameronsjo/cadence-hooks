@@ -289,7 +289,7 @@ during maintenance.
 | Command | What it does |
 |---------|--------------|
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
-| `session status` | List live and stale sessions registered in this repo (exit 1 outside a git repository) |
+| `session status` | List live and stale sessions registered in this repo: the current checkout and every worktree `git worktree list` names, with a footer counting the worktrees checked (exit 1 outside a git repository) |
 | `session plans` | List every in-flight and blocked plan in `docs/plans/` with its next step, branch, and PR — the detail behind the SessionStart plan pointer, with no cap on the file count. Exit 2 outside a git repository, or when an entry in `docs/plans/` could not be listed or read (each named on stderr) |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
 | `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |
