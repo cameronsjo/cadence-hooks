@@ -12,9 +12,9 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_segments_with_dirs, command_word,
-    evaluated_static_substitutions, executable_tokens, is_assignment_word, may_spell_word,
-    names_command_by_unknown_substitution, parse_work_dir, peel_command_runners,
+    ExpansionWork, carries_substitution, command_segments, command_segments_with_dirs,
+    command_word, evaluated_static_substitutions, executable_tokens, is_assignment_word,
+    may_spell_word, names_command_by_unknown_substitution, parse_work_dir, peel_command_runners,
     skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -731,15 +731,29 @@ fn shell_script_file(argv: &[String]) -> Option<&str> {
 /// A segment is judged as the shell reads it, literal `echo`/`printf`
 /// substitutions evaluated, so `eval "$(echo git status)"` is the `git status`
 /// it runs and not an opaque `eval`.
-fn unseen_execution(command: &str) -> Option<&'static str> {
+fn unseen_execution(command: &str, segments: Option<&[String]>) -> Option<&'static str> {
     if !may_run_unseen_text(command) {
         return None;
     }
-    for segment in command_segments(command) {
-        if is_alias_definition(&segment) {
+    // A nudge is not worth a hook past its deadline: a command this large to
+    // read goes unnudged, and the walk stops at the allowance.
+    let _work = ExpansionWork::arm(command.len().saturating_mul(8).saturating_add(64 * 1024));
+    let owned;
+    let segments = match segments {
+        Some(segments) => segments,
+        None => {
+            owned = command_segments(command);
+            if ExpansionWork::spent() {
+                return None;
+            }
+            &owned
+        }
+    };
+    for segment in segments {
+        if is_alias_definition(segment) {
             continue;
         }
-        let read = evaluated_static_substitutions(&segment).unwrap_or_else(|| segment.clone());
+        let read = evaluated_static_substitutions(segment).unwrap_or_else(|| segment.clone());
         if names_command_by_unknown_substitution(&read) {
             return Some("a command named by a substitution");
         }
@@ -790,8 +804,8 @@ impl Check for GitSafetyGuard {
         // A fast path only: the shell can build `git` from text that does not
         // contain it (`$'\x67it'`, `g''it`, `g\it`), so the skip is taken only
         // when the command carries none of that syntax (#1103).
-        if !may_spell_word(command, "git") && !carries_substitution(command) {
-            return unseen_execution_nudge(command);
+        if !may_spell_word(command, "git") {
+            return unseen_execution_nudge(command, None);
         }
 
         // Judge each command segment independently so a benign first command
@@ -802,10 +816,11 @@ impl Check for GitSafetyGuard {
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
         let mut resolved_branch: Option<BranchResolution> = None;
-        for segment in command_segments(command) {
+        let segments = command_segments(command);
+        for segment in &segments {
             // Per-segment alias check: a `git config alias.x …` segment is
             // exempt, but a destructive sibling in the same chain is not.
-            if is_alias_definition(&segment) {
+            if is_alias_definition(segment) {
                 continue;
             }
 
@@ -814,7 +829,7 @@ impl Check for GitSafetyGuard {
             // `main)`, which no check recognizes, while bash runs the push
             // (found during the PR #1118 review). The wrapper-stripped segment
             // is what the shell executes.
-            let norm_tokens = normalize_git_command(strip_group_wrappers(&segment));
+            let norm_tokens = normalize_git_command(strip_group_wrappers(segment));
             let tokens: Vec<&str> = norm_tokens.iter().map(String::as_str).collect();
             // Joined form is only for the substring-based reflog/gc checks; the
             // git-word match runs on the span-preserved token list above.
@@ -849,14 +864,14 @@ impl Check for GitSafetyGuard {
             ));
         }
 
-        unseen_execution_nudge(command)
+        unseen_execution_nudge(command, Some(&segments))
     }
 }
 
 /// The nudge for a command that is otherwise allowed but runs text this guard
 /// cannot read, once per command however many segments do (cadence-hooks#456).
-fn unseen_execution_nudge(command: &str) -> CheckResult {
-    match unseen_execution(command) {
+fn unseen_execution_nudge(command: &str, segments: Option<&[String]>) -> CheckResult {
+    match unseen_execution(command, segments) {
         Some(what) => CheckResult::nudge(format!(
             "git-safety cannot see inside {what}: the executed command is not visible to \
              the guards, so a destructive git operation there would not be caught. \

@@ -11,10 +11,9 @@
 use crate::guard_gh_write::gh_argv;
 use cadence_hooks_cadence::prevent_secret_leaks::piped_shell_scripts;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, brace_expansion_overflows, carries_substitution, command_segments,
-    command_word, contains_ignoring_ascii_case, fold_verb, gh_command_path, heredoc_introducers,
-    logical_lines, may_spell_word, requote_words, strip_comments, strip_heredoc_bodies,
-    strip_quotes, tokenize,
+    MAX_WRAPPER_DEPTH, brace_expansion_overflows, command_segments, command_word,
+    contains_ignoring_ascii_case, fold_verb, gh_command_path, heredoc_introducers, logical_lines,
+    may_spell_word, requote_words, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -319,9 +318,7 @@ impl GhDangerousGuard {
         //
         // Nor may it be stricter than the shell's word building: `$'\x67h'`
         // and `g''h` run `gh` from text without the substring (#1103).
-        // A substitution can print the word (`$(echo g)h repo delete`), which
-        // the segment pass below reads evaluated (cadence-hooks#1142).
-        if !may_spell_word(command, "gh") && !carries_substitution(command) {
+        if !may_spell_word(command, "gh") {
             return CheckResult::allow();
         }
 

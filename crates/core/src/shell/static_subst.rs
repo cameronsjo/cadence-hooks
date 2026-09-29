@@ -122,7 +122,7 @@ fn literal_words(text: &str) -> Option<Vec<String>> {
 /// tokenizers read it. Glob characters stay unquoted on purpose: bash globs
 /// a substitution's output, and the guards judge the glob.
 fn is_plain(c: char) -> bool {
-    c.is_alphanumeric() || "_./:=@%+,-*?[]~^".contains(c)
+    c.is_alphanumeric() || "_./:=@%+,-*?[]^".contains(c)
 }
 
 /// `output` as the source text that makes bash see the same words. In
@@ -359,6 +359,72 @@ mod tests {
         }
     }
 
+    /// The evaluated reading passes bash the same words the original does,
+    /// measured by running both under bash in an empty directory. Skipped
+    /// where no bash is installed.
+    #[test]
+    fn evaluated_reading_hands_bash_the_same_words() {
+        let dir = std::env::temp_dir().join(format!("cadence-subst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let run = |command: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("f() {{ printf '[%s]' \"$@\"; echo; }}; {command}"))
+                .current_dir(&dir)
+                .env_remove("BASH_ENV")
+                .output()
+                .ok()
+        };
+        if run("true").is_none() {
+            return;
+        }
+        for command in [
+            "f $(echo a b)",
+            "f x$(echo ' a')y",
+            "f x$(echo 'a ')y",
+            "f \"$(echo 'a  b')\"",
+            "f x\"$(echo 'a b')\"y",
+            "f $(echo ';')",
+            "f $(echo '>')",
+            "f $(echo 'a;b' c)",
+            "f x$(echo)y",
+            "f a$(echo '')b",
+            "f \"$(printf %s a b)\"",
+            "f $(printf 'a b')",
+            "f $(echo -n hi)",
+            "f $(echo -e hi)",
+            "f $(echo '#x' y)",
+            "f $(echo '~')",
+            "f $(echo '~root')",
+            "f $(echo '{a,b}')",
+            "f $(echo '*')",
+            "f $(echo 'a&b')",
+            "f $(echo '(x)')",
+            "f $(echo '!x')",
+            "f `echo a b`",
+            "f \"`echo a b`\"",
+            "f $(echo a) $(echo b)",
+            "f $(echo \"it's\")",
+            "f \"$(echo 'say \\\"hi\\\"')\"",
+        ] {
+            let Some(evaluated) = evaluated_static_substitutions(command) else {
+                // Refused rows are the ones the module cannot spell safely.
+                assert!(
+                    command.contains("it's") || command.contains("say"),
+                    "unexpectedly unread: {command}"
+                );
+                continue;
+            };
+            let (a, b) = (run(command).expect("bash"), run(&evaluated).expect("bash"));
+            assert_eq!(
+                String::from_utf8_lossy(&a.stdout),
+                String::from_utf8_lossy(&b.stdout),
+                "{command}  =>  {evaluated}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rewrite_leaves_what_it_cannot_read() {
         for segment in [
@@ -419,6 +485,104 @@ mod tests {
                 want,
                 "{segment}"
             );
+        }
+    }
+
+    fn surfaced(command: &str, wanted: &str) -> bool {
+        crate::shell::command_segments(command)
+            .iter()
+            .any(|segment| segment.trim() == wanted)
+    }
+
+    /// cadence-hooks#1142 / #1134: `command_segments` carries the readings.
+    #[test]
+    fn command_segments_surface_the_readings() {
+        for (command, wanted) in [
+            ("$(echo git) push --force", "git push --force"),
+            (
+                "git push $(echo --force) origin main",
+                "git push --force origin main",
+            ),
+            ("cat .env$(true)", "cat .env*"),
+            ("echo x > .env$(: a b)", "echo x > .env*"),
+            ("eval \"$(echo 'cat .env')\"", "cat .env"),
+            ("bash -c \"$(printf 'rm .env')\"", "rm .env"),
+            ("D=x; cat ${D/x/.env}", "cat .env"),
+            ("D=x; cat ${D//x/.env}", "cat .env"),
+            ("D=xyx; cat ${D/y/.env}", "cat x.envx"),
+            ("D=x; cat ${D/q/.env}", "cat .env"),
+            ("D=abc; cat ${D/#a/.env}", "cat .envbc"),
+            ("D=abc; cat ${D/%c/.env}", "cat ab.env"),
+            ("a[1]=.env; cat ${a[1]}", "cat .env"),
+            ("m[k]=.env; cat ${m[k]}", "cat .env"),
+            ("a=(x y); a[2]=z; echo ${a[2]}", "echo z"),
+            ("C=x; ${C:-sops} -d f", "x -d f"),
+            ("C=x; ${C:-sops} -d f", "sops -d f"),
+        ] {
+            assert!(
+                surfaced(command, wanted),
+                "{command} did not surface {wanted}"
+            );
+        }
+    }
+
+    /// Nothing is invented for what stays as written, and the segment as
+    /// written is always kept.
+    #[test]
+    fn command_segments_keep_what_is_written() {
+        for command in [
+            "$(echo git) push",
+            "cat .env$(true)",
+            "cat \"$(pwd)\"",
+            "echo '$(echo git)'",
+            "D=x; cat ${D/x/y}",
+        ] {
+            assert!(
+                crate::shell::command_segments(command)
+                    .iter()
+                    .any(|segment| segment.trim() == command || command.contains(segment.trim())),
+                "{command}"
+            );
+        }
+        assert!(!surfaced("echo '$(echo git)' push", "echo 'git' push"));
+        assert!(!surfaced("cat \"$(pwd)\"", "cat \"*\""));
+    }
+
+    #[test]
+    fn resolved_readings_keep_the_pipeline() {
+        let readings = crate::shell::resolved_readings("C=x; ${C:-sops} -d f | grep k");
+        assert!(
+            readings.iter().any(|r| r.contains("sops -d f | grep k")),
+            "{readings:?}"
+        );
+        let readings = crate::shell::resolved_readings("$(echo sops) -d f && ls");
+        assert_eq!(readings, ["sops -d f && ls"]);
+        assert!(crate::shell::resolved_readings("ls -la").is_empty());
+        assert!(crate::shell::resolved_readings("echo $(date)").is_empty());
+    }
+
+    /// The 0.5 s budget is the release one; debug only catches a return to
+    /// quadratic work.
+    #[test]
+    fn adversarial_inputs_stay_fast() {
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
+        let n = 200_000;
+        for command in [
+            "$(echo a)x ".repeat(n / 11),
+            "x$(y) ".repeat(n / 6),
+            "$(".repeat(n / 2),
+            format!("{}{}", "$(x ".repeat(n / 8), ")".repeat(n / 8)),
+            "`a`b ".repeat(n / 5),
+            "a[1]=x; ".repeat(n / 8),
+            "D=x; ${D/x/y} ".repeat(n / 14),
+            "echo $(echo $(echo ".repeat(n / 19),
+            "C=x; ${C:-sops} -d f; ".repeat(n / 22),
+        ] {
+            let started = std::time::Instant::now();
+            let _ = crate::shell::command_segments(&command);
+            let _ = crate::shell::resolved_readings(&command);
+            assert!(started.elapsed() < limit, "{:?}", started.elapsed());
         }
     }
 }
