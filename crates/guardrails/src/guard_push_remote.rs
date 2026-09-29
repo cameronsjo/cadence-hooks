@@ -8,8 +8,8 @@ use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_push_segments, host_and_repo_from_url, looks_like_push_url, parse_work_dir,
-    strip_quotes,
+    LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
+    parse_work_dir, segment_work_dirs, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -620,8 +620,42 @@ struct PushWalk(std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation
 
 impl PushWalk {
     fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
-        self.0.get_or_init(|| push_locations(command, cwd))
+        self.0
+            .get_or_init(|| push_locations_both_readings(command, cwd))
     }
+}
+
+/// Every push [`push_locations`] finds, plus every push it places nowhere
+/// the per-segment reading does ([`segment_work_dirs`]): each top-level
+/// segment walked on its own, in the directory that segment runs in.
+///
+/// The push walk scopes a subshell only when the whole `( … )` is one
+/// segment, so `(true; cd <owned> ); git push` from an unowned checkout was
+/// judged in the owned one. The per-segment walk closes a subshell at its
+/// `)` wherever the splitter cut it. A push both readings place alike is
+/// listed once; one they place apart is listed in both places, so every
+/// directory check judges it in each and the sharpest verdict wins — this
+/// can add a verdict, never remove one.
+fn push_locations_both_readings(
+    command: &str,
+    cwd: &str,
+) -> Vec<cadence_hooks_core::push::PushInvocation> {
+    let mut pushes = push_locations(command, cwd);
+    let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
+        .iter()
+        .map(|push| (push.work_dir.clone(), push.repository.clone()))
+        .collect();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        if !mentions_push(&raw) {
+            continue;
+        }
+        for push in push_locations(strip_group_wrappers(&raw), &dir) {
+            if placed.insert((push.work_dir.clone(), push.repository.clone())) {
+                pushes.push(push);
+            }
+        }
+    }
+    pushes
 }
 
 /// The directory the command starts in: the payload's `cwd`, else the hook
@@ -1801,6 +1835,51 @@ mod tests {
 
     /// Every row runs from an owned checkout, with `{other}` an unowned one:
     /// `(command, outcome)`.
+    /// A push is judged in the directory its own top-level segment runs in
+    /// as well as the whole-command one, and the sharpest verdict wins. The
+    /// push walk scoped a subshell only when the whole `( … )` was one
+    /// segment, so a `cd` in a subshell cut at a `;` leaked into the parent.
+    /// Every row is `(command, run from the owned checkout?, blocks?)`.
+    #[test]
+    fn push_is_judged_where_its_own_segment_runs() {
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let unowned = checkout_with_origin("https://github.com/evil/y.git");
+        let o = owned.path().to_string_lossy().to_string();
+        let u = unowned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, in_owned, blocks) in [
+                // Allowed on the base.
+                ("(true; cd {O} ); git push origin HEAD", false, true),
+                ("(true; cd {O}; true); git push origin HEAD", false, true),
+                (
+                    "(true; cd {O} ); for b in a c; do git push origin $b; done",
+                    false,
+                    true,
+                ),
+                // Blocked on the base by the push walk, and still.
+                ("echo hi\ncd {U}\ngit push origin HEAD", true, true),
+                ("true & cd {U}; git push origin HEAD", true, true),
+                ("{ cd {U}; }; git push origin HEAD", true, true),
+                ("cd {U} && git push origin HEAD", true, true),
+                ("git push origin HEAD", false, true),
+                // Controls.
+                ("cd {O} && git push origin HEAD", false, false),
+                ("cd {O}\ngit push origin HEAD", false, false),
+                ("git push origin HEAD", true, false),
+            ] {
+                let command = command.replace("{O}", &o).replace("{U}", &u);
+                let cwd = if in_owned { &o } else { &u };
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
     #[test]
     fn push_moved_to_another_repository_is_judged_there() {
         use cadence_hooks_core::Outcome::{Allow, Block, Nudge};

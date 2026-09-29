@@ -3095,7 +3095,7 @@ fn read_repo_flag(argv: &[String], i: usize) -> Option<(Option<String>, usize)> 
 }
 
 /// The branch a ship command names as its PR head (cadence-hooks#995).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum ShipHead {
     /// No `--head`: gh ships the branch checked out where the command runs.
     #[default]
@@ -3113,7 +3113,7 @@ pub enum ShipHead {
 /// This is a reading of the command text, with the same limits
 /// [`GhPrInvocation::targets_the_current_branch`] documents: an exported
 /// `GH_REPO` or `GH_HOST` leaves no token behind, so it cannot appear here.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ShipTarget {
     /// Every repo value the segment carries: `-R`/`--repo` in global and
     /// post-subcommand position (every spelling), and an inline `GH_REPO=`.
@@ -3139,7 +3139,7 @@ impl ShipTarget {
 
 /// One anchoring segment of a ship command: the anchor it trips and where it
 /// points gh (cadence-hooks#995).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShipSegment {
     /// `"create"`, `"ready"`, or `"merge"`, as [`polish_ship_anchor`] names it.
     pub anchor: &'static str,
@@ -4831,97 +4831,1249 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    // Group 1: separator (&&, ;, ||, or empty for start-of-string)
-    // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
-    //
-    // The bare-path class excludes ASCII whitespace, not just a space: a
-    // newline has to TERMINATE the path. Swallowing it produced a target with
-    // the next line's command glued on — a directory that cannot exist — which
-    // is the cadence-hooks#394/#368 false-nudge.
-    //
-    // The class names bash's default IFS literally — space, tab, newline —
-    // rather than `\s`. This crate takes `regex` with default features, so a
-    // bare `\s` means `\p{White_Space}`: U+00A0, U+2028, U+3000 and friends.
-    // Every one of those is an ORDINARY character in an unquoted bash word, so
-    // a Unicode-aware class truncates a path bash keeps whole. That divergence
-    // runs in the fail-open direction: a truncated prefix can name a DIFFERENT
-    // real checkout than the one the command runs in, and `guard-push-remote`
-    // allows when it cannot resolve a git dir. Matching bash's own splitting
-    // set is the only spelling that cannot invent a target (security review,
-    // PR #414). Spelled as a literal class rather than `(?-u:…)`, which would
-    // let the pattern match invalid UTF-8 and is rejected by the `&str` API.
-    //
-    // A newline is deliberately NOT a separator: adding one would recognize a
-    // `cd` on its own line after an earlier command, but it would also match
-    // every line-initial `cd` in prose this tool routinely composes — a
-    // heredoc PR body carrying a shell snippet — and `\s*` would match an
-    // indented one inside a fenced block. That is a much wider accidental
-    // trigger surface for a primitive three block-capable guards resolve
-    // through, bought for a shape neither issue reports.
-    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ \t\n&;|]+))"#)
-        .expect("pattern should compile")
-});
-
 /// Extract the effective working directory from `cd` chains in a command.
 ///
-/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`),
-/// and accumulates directory changes:
+/// Walks the command's top-level segments left-to-right
+/// ([`split_segments_with_ops`]) and accumulates directory changes:
 /// - `cd a && cd b` → `cwd/a/b` (both apply on success path)
 /// - `cd /abs && cd rel` → `/abs/rel`
-/// - `cd a || cmd` → `cwd` (cd before `||` only runs on failure path)
+/// - `cd a || cmd` → `cwd/a` (assume-success; see below)
 /// - `cd /wt` ⏎ `gh pr create` → `/wt` (the newline ends the path)
 /// - `~` expanded via `$HOME`
 /// - No `cd` found returns `cwd` unchanged
 ///
-/// A newline **ends** a `cd` target but does not **separate** commands here, so
-/// a `cd` on its own line *after* an earlier command is still not recognized —
-/// unchanged behavior, and deliberate (see [`CD_PATTERN`]).
+/// **A `cd` counts only where bash would run it.** The
+/// segments come from the shared splitter, which is quote-, escape-,
+/// comment-, and heredoc-aware, so a `cd` inside a string (`echo "; cd /x"`),
+/// behind an escaped separator (`echo \; cd /x`), in a `#` comment, or in a
+/// heredoc body is text, not a directory change. This used to be a raw-text
+/// regex that matched all four, and a guard judging "the repo this command
+/// runs in" was then pointed at a repo the command never enters: from an
+/// unowned checkout, `echo "; cd <owned>" && gh pr create` was judged in the
+/// owned repo and allowed.
 ///
-/// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]), the same way
-/// [`split_segments_with_ops`] does and for the same reason: a heredoc body is
-/// DATA bash never executes, so a `cd` written in prose there must not re-point
-/// the resolver. Without this, `git commit -F - <<'EOF'` carrying the ordinary
-/// `mkdir -p <dir> && cd <dir>` idiom re-pointed every guard that resolves
-/// through here — and once the target resolves to a real checkout, the two
-/// consumers that treat "unresolvable" as a deliberate fail-CLOSED block
-/// (`git_safety`'s bare-HEAD force-push check, `guard_gh_write`'s ownership
-/// check) silently judge the wrong directory instead of blocking. The
-/// segmenter already stripped; this resolver did not, and that asymmetry was
-/// the bug (security review, PR #414).
+/// The segment is a `cd` when its first word is the literal `cd` and the
+/// segment follows the start of the command, `&&`, `;`, or `||` — exactly
+/// the positions the old pattern recognized. The narrowing is deliberate, so
+/// that for every unquoted `cd` the old resolver applied this one applies
+/// the same target:
+/// - a `cd` on a line after an earlier command (a newline separator) is not
+///   recognized — unchanged;
+/// - a `cd` after `|` or `&` (its own process) is not recognized — unchanged;
+/// - a `cd` glued to a group opener (`(cd x`, `{ cd x`) is not recognized —
+///   unchanged. The segment is tokenized raw, NOT through
+///   [`executable_tokens`], which strips a `(` and would newly apply a
+///   subshell's `cd` to the parent shell.
 ///
-/// This is otherwise a **raw-string scan, not a shell parse**, and it does not
-/// model subshells, pipelines, or backgrounding: a `cd` in any of those
-/// resolves as though it applied to the parent, even though bash would give it
-/// its own process and discard it. Long-standing behavior — stated here so a
-/// reader does not mistake the newline handling for a general shell-grammar
-/// model.
+/// Assumes every recognized `cd` succeeds — aligns with `git_commit_targets`
+/// (issue #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+/// left-associative, so a succeeding `cd` before `||` still changes the
+/// directory for what follows (`cd x || exit; git push` pushes from `x`
+/// whenever the cd works).
+///
+/// This does not model subshells, pipelines, or backgrounding beyond the
+/// positions above: a recognized `cd` inside a `( … )` that an earlier
+/// segment opened still resolves as though it applied to the parent.
+/// Long-standing behavior — stated so a reader does not mistake this for a
+/// general shell-grammar model. A guard judging where a write runs pairs
+/// this with [`segment_work_dirs`], which does follow those, and keeps the
+/// sharpest verdict of the two.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
+    let mut previous_op: Option<&str> = None;
+    for (segment, op) in split_segments_with_ops(command) {
+        let after_chain = matches!(previous_op, None | Some("&&" | ";" | "||"));
+        previous_op = op;
+        if !after_chain || !segment.starts_with("cd") {
+            continue;
+        }
+        let words = tokenize(&segment);
+        if words.first().map(String::as_str) == Some("cd")
+            && let Some(target) = words.get(1)
+        {
+            apply_cd_target(&mut effective, target);
+        }
+    }
+    effective
+}
 
-    // Prose in a heredoc body is data, not commands — see the doc comment.
-    let command = strip_heredoc_bodies(command);
+/// One top-level segment of a command and the directory it runs in
+/// ([`segment_work_dirs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedSegment {
+    /// The segment as the top-level splitter cut it, group openers and
+    /// closers included.
+    pub raw: String,
+    /// The directory the segment's own command runs in, shared by every
+    /// segment that runs there so a flood of segments costs one copy.
+    /// [`UNRESOLVABLE_DIR`] where the walk cannot say. A segment that may
+    /// run in several directories is listed once for each.
+    pub dir: std::rc::Rc<str>,
+}
 
-    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
-    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
-    // left-associative, so a succeeding `cd` before `||` still changes the
-    // directory for what follows (`cd x || exit; git push` pushes from `x`
-    // whenever the cd works). The earlier "cd before `||` is a no-op"
-    // heuristic misjudged that common `|| exit` idiom; both resolvers now
-    // apply every `cd` the pattern finds, in order.
-    for caps in CD_PATTERN.captures_iter(&command) {
-        let target = caps
-            .get(2)
-            .or(caps.get(3))
-            .or(caps.get(4))
-            .map(|m| m.as_str().to_string());
+/// Longest directory [`segment_work_dirs`] tracks, in bytes — Linux's
+/// `PATH_MAX`. No `chdir` accepts a longer path, so a git lookup in one
+/// fails either way; past it the walk tracks [`UNRESOLVABLE_DIR`] instead,
+/// which bounds the work a flood of relative `cd`s buys at linear.
+pub const MAX_DIR_LEN: usize = 4096;
 
-        let Some(target) = target else { continue };
+/// The directory [`segment_work_dirs`] reports where it cannot say where the
+/// shell is: a `cd` chain grown past [`MAX_DIR_LEN`], or a directory change
+/// it cannot read (`popd`, `cd "$D"`, `eval "$s"`, `$c /u`). The NUL makes it
+/// no path at all: a git lookup in it fails to spawn, which every caller
+/// reads as "not a repository" — the gh-write guard blocks on it. A relative
+/// `cd` leaves it in place; an absolute one moves off it.
+pub const UNRESOLVABLE_DIR: &str = "\0unresolvable directory";
 
-        effective = resolve_cd_target(&target, &effective);
+/// Every [`command_segments`] segment of `command`, each paired with the
+/// directory its top-level segment runs in ([`segment_work_dirs`]), in
+/// command order. A segment a wrapper expands (`sh -c '…'`) takes the
+/// directory of the top-level segment that carries it.
+///
+/// The per-segment reading a guard judges alongside the whole-command
+/// [`parse_work_dir`] one; see [`segment_work_dirs`].
+pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std::rc::Rc<str>)> {
+    // Each distinct segment text is expanded once: a segment that may run in
+    // several directories is located once per directory, and a flood repeats
+    // one segment (`f; f; …`).
+    let mut out = Vec::new();
+    let mut expanded: std::collections::HashMap<String, std::rc::Rc<[String]>> =
+        std::collections::HashMap::new();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        let segments = match expanded.get(&raw) {
+            Some(segments) => segments.clone(),
+            None => {
+                let segments: std::rc::Rc<[String]> = command_segments(&raw).into();
+                expanded.insert(raw, segments.clone());
+                segments
+            }
+        };
+        out.extend(
+            segments
+                .iter()
+                .map(|segment| (segment.clone(), dir.clone())),
+        );
+    }
+    out
+}
+
+/// One open group while [`segment_work_dirs`] walks: the directories to go
+/// back to, and whether the group runs in its own process however it ends.
+struct Group {
+    subshell: bool,
+    saved: Vec<String>,
+    after_pipe: bool,
+}
+
+/// A compound command [`segment_work_dirs`] is inside. Its body runs in the
+/// PARENT shell, so a `cd` there moves the parent — but only if the branch
+/// is taken, or as many times as the loop goes round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compound {
+    If,
+    Loop,
+    Case,
+}
+
+/// Most directories [`segment_work_dirs`] keeps as the possible directories
+/// of one point in the command. A conditional `cd` adds one; past the cap the
+/// set collapses to [`UNRESOLVABLE_DIR`], which a gh-write judgment blocks on.
+const MAX_POSSIBLE_DIRS: usize = 8;
+
+/// How deep [`segment_work_dirs`] follows an `eval`'d script or a function
+/// body into another; past it the directory is [`UNRESOLVABLE_DIR`].
+const MAX_DIR_WALK_DEPTH: usize = 8;
+
+/// Most segments [`segment_work_dirs`] replays from `eval`'d scripts and
+/// function bodies across one command; past it every further one leaves the
+/// directory [`UNRESOLVABLE_DIR`], so a flood of calls stays linear.
+const MAX_REPLAYED_SEGMENTS: usize = 4096;
+
+/// Where the walk may be, as a set: one directory after an unconditional
+/// `cd`, several after a `cd` that may or may not have run.
+struct DirSet {
+    dirs: Vec<String>,
+    shared: Option<Vec<std::rc::Rc<str>>>,
+}
+
+impl DirSet {
+    fn new(cwd: &str) -> Self {
+        Self {
+            dirs: vec![cwd.to_string()],
+            shared: None,
+        }
     }
 
-    effective
+    /// The directories, shared by every segment that runs there.
+    fn snapshot(&mut self) -> &[std::rc::Rc<str>] {
+        let dirs = &self.dirs;
+        self.shared.get_or_insert_with(|| {
+            dirs.iter()
+                .map(|dir| std::rc::Rc::from(dir.as_str()))
+                .collect()
+        })
+    }
+
+    fn replace(&mut self, dirs: Vec<String>) {
+        if dirs != self.dirs {
+            self.dirs = dirs;
+            self.shared = None;
+        }
+    }
+
+    /// Add [`UNRESOLVABLE_DIR`]: the shell may be somewhere this walk cannot
+    /// name.
+    fn add_unresolvable(&mut self) {
+        if self.dirs.iter().any(|dir| dir == UNRESOLVABLE_DIR) {
+            return;
+        }
+        let mut dirs = self.dirs.clone();
+        dirs.push(UNRESOLVABLE_DIR.to_string());
+        self.set(dirs);
+    }
+
+    /// Deduplicate and cap, then install.
+    fn set(&mut self, dirs: Vec<String>) {
+        // A handful at most, past which the set collapses: a linear dedup.
+        let mut unique: Vec<String> = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            if !unique.contains(&dir) {
+                unique.push(dir);
+            }
+        }
+        let mut dirs = unique;
+        if dirs.len() > MAX_POSSIBLE_DIRS {
+            dirs = vec![UNRESOLVABLE_DIR.to_string()];
+        }
+        self.replace(dirs);
+    }
+
+    /// Apply a readable `cd` target. `keep` keeps the directories it moved
+    /// from as well (a conditional or ambiguous move).
+    fn move_to(&mut self, target: &str, keep: bool) {
+        let absolute = looks_absolute(target) || target.starts_with('~');
+        if !keep && self.dirs.len() == 1 {
+            // The common case, in place: a flood of relative `cd`s grows one
+            // path rather than copying it on every step.
+            let mut dirs = std::mem::take(&mut self.dirs);
+            move_dir(&mut dirs[0], target, absolute);
+            self.dirs = dirs;
+            self.shared = None;
+            return;
+        }
+        let mut next = if keep { self.dirs.clone() } else { Vec::new() };
+        for dir in &self.dirs {
+            let mut moved = dir.clone();
+            move_dir(&mut moved, target, absolute);
+            next.push(moved);
+        }
+        self.set(next);
+    }
+}
+
+/// One `cd` target applied to one directory: [`UNRESOLVABLE_DIR`] stays put
+/// under a relative target, and a path grown past [`MAX_DIR_LEN`] becomes it.
+fn move_dir(dir: &mut String, target: &str, absolute: bool) {
+    if dir == UNRESOLVABLE_DIR && !absolute {
+        return;
+    }
+    apply_cd_target(dir, target);
+    if dir.len() > MAX_DIR_LEN {
+        *dir = UNRESOLVABLE_DIR.to_string();
+    }
+}
+
+/// How a segment's command sits in the walk: under an `if`/`case` branch or a
+/// loop (in the segment or in the `eval`/function call that runs it).
+#[derive(Debug, Clone, Copy, Default)]
+struct DirContext {
+    conditional: bool,
+    looped: bool,
+}
+
+/// A script's segments as the splitter cut them, shared between the
+/// definition of a function and its every call.
+type Script = std::rc::Rc<[(String, Option<&'static str>)]>;
+
+/// The state of one [`segment_work_dirs`] walk that outlives a script:
+/// every segment located so far, and the functions defined so far.
+#[derive(Default)]
+struct DirWalk {
+    /// The whole command, where [`DirWalk::expansion_may_name_a_mover`]
+    /// looks for what a variable was set to.
+    command: String,
+    /// What each variable the command sets was set to, per
+    /// [`literal_values_of`], looked up once per name.
+    variables: std::collections::HashMap<String, Option<VariableValues>>,
+    /// [`variable_mentions`] of the command, built at the first expansion
+    /// in command position.
+    mentions: Option<std::collections::HashMap<String, Vec<usize>>>,
+    located: Vec<LocatedSegment>,
+    /// Each defined function's body, or `None` when its body is a form this
+    /// walk does not record (`f() if …; fi`).
+    functions: std::collections::HashMap<String, Option<Script>>,
+    replayed: usize,
+}
+
+/// What a command sets one variable to ([`literal_values_of`]).
+#[derive(Clone)]
+enum VariableValues {
+    /// A form this walk does not read, or a directory verb, `eval`,
+    /// `builtin`, `command`, or `trap`.
+    MayMove,
+    /// Plain values, one of which may still name a function.
+    Plain(std::rc::Rc<std::collections::HashSet<String>>),
+}
+
+/// A function definition whose body segments are still being recorded.
+struct Definition {
+    name: String,
+    body: Vec<(String, Option<&'static str>)>,
+    depth: isize,
+}
+
+/// A function definition's head — `f()`, `f ( )`, `function f`,
+/// `function f()` — and the name it defines.
+static FUNCTION_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^(?:function[ \t]+([^\s(){}<>;&|'"\\$`]+)[ \t]*(?:\([ \t]*\))?|([^\s(){}<>;&|'"\\$`=]+)[ \t]*\([ \t]*\))[ \t]*"#,
+    )
+    .expect("pattern should compile")
+});
+
+/// A `case` pattern at the start of a segment: `x)`, `(x)`, `a|b)`, `*)`.
+static CASE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\(?[ \t]*[^\s()'"\;&|<>]+(?:[ \t]*\|[ \t]*[^\s()'"\;&|<>]+)*[ \t]*\)"#)
+        .expect("pattern should compile")
+});
+
+/// A `case` pattern alternative the splitter cut at its `|`: `x` or `(x`.
+static CASE_ALTERNATIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:case[ \t]+(?:"[^"]*"|'[^']*'|[^\s"']+)[ \t]+in[ \t]+)?\(?[ \t]*[^\s()'"\\;&|<>]+[ \t]*$"#)
+        .expect("pattern should compile")
+});
+
+/// A `case WORD in` head.
+static CASE_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^case[ \t]+(?:"[^"]*"|'[^']*'|[^\s"']+)[ \t]+in(?:[ \t]+|$)"#)
+        .expect("pattern should compile")
+});
+
+/// What [`peel_segment`] found at the front of a segment.
+#[derive(Default)]
+struct Peeled<'s> {
+    brace_closes: usize,
+    /// Group openers, outermost first: `true` for `(`, `false` for `{`.
+    opens: Vec<bool>,
+    /// The command after the openers and reserved words, or `None` when the
+    /// segment carries none (`for x in a b`).
+    command: Option<&'s str>,
+    /// A segment in a `case` whose pattern could not be read.
+    unreadable: bool,
+}
+
+/// Peel a segment's group openers and closers and its reserved words
+/// (`if`, `then`, `do`, `fi`, `case x in x)`, `!`, `time`, …), keeping the
+/// `compounds` stack in step. `}` closes a brace group only as a word.
+fn peel_segment<'s>(raw: &'s str, compounds: &mut Vec<Compound>) -> Peeled<'s> {
+    let mut peeled = Peeled::default();
+    let mut rest = raw;
+    let mut pattern_position = compounds.last() == Some(&Compound::Case);
+    loop {
+        rest = rest.trim_start();
+        let word_end = rest
+            .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+            .unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        if pattern_position && word != "esac" {
+            pattern_position = false;
+            if let Some(found) = CASE_PATTERN.find(rest) {
+                rest = &rest[found.end()..];
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix('}')
+            && (after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || ";&|)".contains(c)))
+        {
+            peeled.brace_closes += 1;
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('(') {
+            peeled.opens.push(true);
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest
+            .strip_prefix('{')
+            .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            peeled.opens.push(false);
+            rest = after;
+            continue;
+        }
+        match word {
+            "if" => compounds.push(Compound::If),
+            "while" | "until" => compounds.push(Compound::Loop),
+            "then" | "else" | "elif" | "do" | "!" | "time" => {}
+            "fi" | "done" | "esac" => {
+                compounds.pop();
+            }
+            "for" | "select" => {
+                // The rest is the loop's word list, not a command.
+                compounds.push(Compound::Loop);
+                return peeled;
+            }
+            "case" => {
+                compounds.push(Compound::Case);
+                match CASE_HEAD.find(rest) {
+                    Some(head) => {
+                        rest = &rest[head.end()..];
+                        pattern_position = true;
+                        continue;
+                    }
+                    None => {
+                        peeled.unreadable = true;
+                        return peeled;
+                    }
+                }
+            }
+            _ => break,
+        }
+        rest = &rest[word_end..];
+        if word == "time" {
+            rest = rest.trim_start();
+            if let Some(after) = rest
+                .strip_prefix("-p")
+                .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+            {
+                rest = after;
+            }
+        }
+    }
+    if !rest.is_empty() {
+        peeled.command = Some(rest);
+    }
+    peeled
+}
+
+/// The unescaped text of a token, and whether it carried a backslash —
+/// whose meaning quote removal hid (`\cd` runs the builtin, `'\cd'` does not).
+fn plain_word(token: &str) -> (String, bool) {
+    (unescape_word(token).into_owned(), token.contains('\\'))
+}
+
+/// Does a command word carry a `/` outside every expansion in it? Then
+/// whatever the expansions give, it names a file — `"$VENV/bin/python"` —
+/// and never a builtin such as `cd`.
+fn names_a_path(word: &str) -> bool {
+    let mut depth = 0usize;
+    let mut backtick = false;
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => backtick = !backtick,
+            '$' if matches!(chars.peek(), Some('(' | '{')) => {
+                chars.next();
+                depth += 1;
+            }
+            '(' | '{' if depth > 0 => depth += 1,
+            ')' | '}' if depth > 0 => depth -= 1,
+            '/' if depth == 0 && !backtick => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Where each name in `command` is mentioned other than as a plain
+/// `$name`/`${name}` read — an assignment `name=…`, `read name`, `for name
+/// in`, `${name:=…}` — as the byte offset just after the name. Built in one
+/// pass, so a flood of distinct variables costs linear time.
+fn variable_mentions(command: &str) -> std::collections::HashMap<String, Vec<usize>> {
+    static IDENT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("pattern should compile"));
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut mentions: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for found in IDENT.find_iter(command) {
+        let before = &command[..found.start()];
+        let after = &command[found.end()..];
+        if before.ends_with(is_word)
+            || before.ends_with('$')
+            || (before.ends_with("${") && after.starts_with('}'))
+        {
+            continue;
+        }
+        mentions
+            .entry(found.as_str().to_string())
+            .or_default()
+            .push(found.end());
+    }
+    mentions
+}
+
+/// The values `command` gives a variable whose mentions end at `ends`
+/// in `mentions` ([`variable_mentions`]), when every mention is a plain `name=literal`
+/// assignment; `None` otherwise. A quoted value is read whole, and one with
+/// a blank or an expansion in it is not read: `c=' cd'; $c /u` splits to
+/// `cd /u`.
+fn literal_values_of(
+    command: &str,
+    mentions: &std::collections::HashMap<String, Vec<usize>>,
+    ends: &[usize],
+) -> Option<Vec<String>> {
+    if mentions.contains_key("IFS") {
+        // A changed field separator splits a value anywhere.
+        return None;
+    }
+    let mut values = Vec::new();
+    for &end in ends {
+        let value = command[end..].strip_prefix('=')?;
+        if value.starts_with('=') {
+            return None;
+        }
+        let stop = value
+            .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+            .unwrap_or(value.len());
+        let word = &value[..stop];
+        let read = match word.chars().next() {
+            Some(quote @ ('\'' | '"')) => {
+                let inner = &value[1..];
+                let close = inner.find(quote)?;
+                let rest = &inner[close + 1..];
+                if !rest.is_empty()
+                    && !rest.starts_with(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+                {
+                    return None;
+                }
+                &inner[..close]
+            }
+            _ => word,
+        };
+        if read.contains(|c: char| c.is_whitespace() || "$`\\'\"".contains(c)) {
+            return None;
+        }
+        values.push(read.to_string());
+    }
+    Some(values)
+}
+
+/// The index after the assignment word at `start` and every word its
+/// unclosed `$(`/backtick swallows (`c=$(echo cd)` tokenizes as `c=$(echo`
+/// and `cd)`), or `None` when that is unreadable.
+///
+/// Quote removal hides whether a paren past a word's first quote was quoted,
+/// so such a paren is counted either way — which mostly reads right
+/// (`c=$(echo "a b")`) — but a word whose own `$(` is one (`X="$("`), or a
+/// substitution left open at the end of the segment after counting one, is
+/// unreadable: `X="$(" cd /u` runs the `cd`.
+fn assignment_end(words: &[MarkedToken], start: usize) -> Option<usize> {
+    let mut depth = 0isize;
+    let mut backticks = false;
+    let mut uncertain = false;
+    let mut index = start;
+    while let Some(word) = words.get(index) {
+        for (at, c) in word.text.char_indices() {
+            if !matches!(c, '(' | ')' | '`') {
+                continue;
+            }
+            if at >= word.unquoted_prefix_len {
+                uncertain = true;
+            }
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => backticks = !backticks,
+            }
+        }
+        index += 1;
+        if depth <= 0 && !backticks {
+            return Some(index);
+        }
+        if index == start + 1 && uncertain {
+            return None;
+        }
+    }
+    (!uncertain).then_some(index)
+}
+
+/// Split a redirection glued to the end of the word at `index`
+/// (`cd>/dev/null`) into a word of its own, so the verb before it reads as
+/// the verb. Only an unquoted `<`/`>` splits.
+fn split_glued_redirection(words: &mut Vec<MarkedToken>, index: usize) {
+    let Some(word) = words.get(index) else {
+        return;
+    };
+    let split = word
+        .text
+        .char_indices()
+        .find(|&(at, c)| at > 0 && at < word.unquoted_prefix_len && matches!(c, '<' | '>'))
+        .map(|(at, _)| at);
+    if let Some(at) = split {
+        let mut rest = word.clone();
+        rest.text = word.text[at..].to_string();
+        rest.unquoted_prefix_len = word.unquoted_prefix_len - at;
+        rest.expanding_prefix_len = word.expanding_prefix_len.saturating_sub(at);
+        let first = &mut words[index];
+        first.text.truncate(at);
+        first.unquoted_prefix_len = at;
+        first.expanding_prefix_len = first.expanding_prefix_len.min(at);
+        words.insert(index + 1, rest);
+    }
+}
+
+/// Where a directory verb's target leaves the shell.
+enum VerbTarget {
+    /// A literal target.
+    To(String),
+    /// A target this walk cannot read: `popd`, `cd -`, `cd "$D"`, a flagged
+    /// `pushd`, more than one operand.
+    Unreadable,
+}
+
+/// Read a `cd`/`pushd`/`popd`'s target from its words (the verb first).
+/// Mirrors the push walk's `resolve_directory_verb`.
+fn verb_target(words: &[MarkedToken]) -> VerbTarget {
+    let verb = words[0].text.as_str();
+    let verb = unescape_word(verb);
+    if verb == "popd" {
+        return VerbTarget::Unreadable;
+    }
+    let stack_verb = verb == "pushd";
+    let mut idx = 1;
+    while let Some(word) = words.get(idx) {
+        let text = unescape_word(&word.text);
+        if text == "--" {
+            idx += 1;
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            break;
+        }
+        // `cd`'s own options pick how symlinks resolve; anything else, and
+        // every `pushd` option (`-n` does not move), is not read here.
+        if stack_verb || !text[1..].chars().all(|c| "LPe@".contains(c)) {
+            return VerbTarget::Unreadable;
+        }
+        idx += 1;
+    }
+    let mut operands = Vec::new();
+    let mut words = words[idx..].iter();
+    while let Some(word) = words.next() {
+        let quoted_operator = redirect_operator_span(&word.text)
+            .is_some_and(|(len, _)| word.unquoted_prefix_len < len);
+        if !quoted_operator && let Some((len, bare)) = redirect_operator_span(&word.text) {
+            if bare && len == word.text.len() {
+                words.next();
+            }
+            continue;
+        }
+        operands.push(word.text.as_str());
+    }
+    match operands.as_slice() {
+        [] if !stack_verb => VerbTarget::To("~".to_string()),
+        [target]
+            if unescape_word(target) != "-"
+                && !target.contains(['$', '`'])
+                && !(stack_verb && (target.starts_with('+') || target.starts_with('-'))) =>
+        {
+            VerbTarget::To((*target).to_string())
+        }
+        _ => VerbTarget::Unreadable,
+    }
+}
+
+/// Does a `trap` action change directory? Its action runs later — before
+/// every command under `DEBUG` — in the parent shell.
+fn trap_action_moves(words: &[MarkedToken], functions: &DirWalk) -> bool {
+    static MOVES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:^|[^\w-])(?:cd|pushd|popd|eval)(?:$|[^\w-])")
+            .expect("pattern should compile")
+    });
+    words.iter().skip(1).any(|word| {
+        MOVES.is_match(&word.text)
+            || tokenize(&word.text)
+                .iter()
+                .any(|inner| functions.functions.contains_key(inner.as_str()))
+    })
+}
+
+impl DirWalk {
+    /// Walk one script's segments. `dirs` is the parent shell's directory
+    /// set, which an `eval`'d script and a function body share.
+    fn walk(
+        &mut self,
+        segments: &[(String, Option<&'static str>)],
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+    ) {
+        let mut groups: Vec<Group> = Vec::new();
+        let mut compounds: Vec<Compound> = Vec::new();
+        let mut defining: Option<Definition> = None;
+        let mut previous_op: Option<&str> = None;
+        for (raw, op) in segments {
+            let op = *op;
+            if let Some(definition) = defining.as_mut() {
+                // A function body is recorded, not run: its `cd`s move
+                // nothing until the function is called.
+                definition.body.push((raw.clone(), op));
+                definition.depth += group_depth_change(raw);
+                if definition.depth <= 0 {
+                    let done = defining.take().expect("just matched");
+                    self.functions
+                        .insert(done.name, Some(std::rc::Rc::from(done.body)));
+                }
+                self.emit(raw, dirs);
+                previous_op = op;
+                continue;
+            }
+            let opens_case = raw.trim_start().starts_with("case");
+            if (opens_case || compounds.last() == Some(&Compound::Case))
+                && op == Some("|")
+                && CASE_ALTERNATIVE.is_match(raw)
+            {
+                if opens_case {
+                    compounds.push(Compound::Case);
+                }
+                // `x|y) cd /u` is cut at the `|`, which here separates
+                // pattern alternatives, not pipeline stages: the branch
+                // runs in this shell.
+                self.emit(raw, dirs);
+                previous_op = None;
+                continue;
+            }
+            let peeled = peel_segment(raw, &mut compounds);
+            for _ in 0..peeled.brace_closes {
+                if let Some(group) = groups.pop() {
+                    let forked =
+                        group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
+                    if forked {
+                        dirs.replace(group.saved);
+                    }
+                }
+            }
+            for &subshell in &peeled.opens {
+                groups.push(Group {
+                    subshell,
+                    saved: dirs.dirs.clone(),
+                    after_pipe: previous_op == Some("|"),
+                });
+            }
+            let command = peeled.command.unwrap_or("");
+            let shape = segment_shape(command);
+            let in_case = compounds.contains(&Compound::Case);
+            if peeled.unreadable || (in_case && shape.paren_closes > 0) {
+                // A `case` this walk cannot read: its `)`s may be patterns
+                // or subshell closers.
+                dirs.add_unresolvable();
+            }
+            let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
+            let here = DirContext {
+                conditional: context.conditional || !compounds.is_empty(),
+                looped: context.looped || compounds.contains(&Compound::Loop),
+            };
+            let may_define = command.contains('(') || command.starts_with("function");
+            if let Some(head) = may_define
+                .then(|| FUNCTION_HEAD.captures(command))
+                .flatten()
+            {
+                let name = head.get(1).or(head.get(2)).map_or("", |m| m.as_str());
+                let body = &command[head.get(0).map_or(0, |m| m.end())..];
+                if body.starts_with(['{', '(']) {
+                    let depth_now = group_depth_change(body);
+                    let definition = Definition {
+                        name: name.to_string(),
+                        body: vec![(body.to_string(), op)],
+                        depth: depth_now,
+                    };
+                    if depth_now <= 0 {
+                        self.functions
+                            .insert(definition.name, Some(std::rc::Rc::from(definition.body)));
+                    } else {
+                        defining = Some(definition);
+                    }
+                } else {
+                    // `f() if …; fi`: not recorded, so a call is unreadable.
+                    // Its body is walked where it stands, as a compound, so
+                    // its `cd`s count only as maybe-moves.
+                    self.functions.insert(name.to_string(), None);
+                    peel_segment(body, &mut compounds);
+                }
+            } else {
+                self.command(command, dirs, depth, here, own_process);
+            }
+            self.emit(raw, dirs);
+            for _ in 0..shape.paren_closes {
+                // A `)` closes the innermost subshell, and any brace group
+                // opened inside it with it.
+                while let Some(group) = groups.pop() {
+                    dirs.replace(group.saved);
+                    if group.subshell {
+                        break;
+                    }
+                }
+            }
+            // `echo $(true; cd /u)` is cut at the `;`: the `cd` runs in the
+            // substitution's subshell, which the `)` after it closes.
+            for _ in 0..shape.inner_open {
+                groups.push(Group {
+                    subshell: true,
+                    saved: dirs.dirs.clone(),
+                    after_pipe: false,
+                });
+            }
+            previous_op = op;
+        }
+        if let Some(definition) = defining {
+            // Never closed, by this walk's reading: the shell rejects an
+            // unclosed body, but a misread close would have swallowed every
+            // later segment unwalked. Walk them again as maybe-run, which can
+            // only add directories.
+            let body: Script = std::rc::Rc::from(definition.body);
+            self.functions.insert(definition.name, Some(body.clone()));
+            let maybe = DirContext {
+                conditional: true,
+                looped: context.looped,
+            };
+            self.replay(Some(body), dirs, depth, maybe, false);
+        }
+    }
+
+    /// Could a command word that is an expansion run a directory verb, an
+    /// `eval`, or a function this command defined?
+    ///
+    /// A command substitution or a special parameter (`$1`, `$@`) can name
+    /// anything. A variable the command never sets names what the session's
+    /// environment gave it (`$EDITOR`, `"$PY"`) — a program, not `cd`. One
+    /// the command does set counts by what it was set to, and only when
+    /// every place the command names it is a plain `NAME=literal`: `read c`,
+    /// `for c in …`, `${c:=…}`, `c+=…`, a value with an expansion, or a word
+    /// gluing a set variable to more text (`${c}d`) is not read here.
+    fn expansion_may_name_a_mover(&mut self, word: &str) -> bool {
+        static EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(.))")
+                .expect("pattern should compile")
+        });
+        if word.contains('`') || word.contains("$(") {
+            return true;
+        }
+        let mut set_values = Vec::new();
+        for caps in EXPANSION.captures_iter(word) {
+            let Some(name) = caps.get(1).or(caps.get(2)) else {
+                // `$1`, `$@`, `${x:-…}`, `$'…'`.
+                return true;
+            };
+            let command = &self.command;
+            let mentions = self
+                .mentions
+                .get_or_insert_with(|| variable_mentions(command));
+            // `None`: never set here.
+            let set = self
+                .variables
+                .entry(name.as_str().to_string())
+                .or_insert_with(|| {
+                    mentions.get(name.as_str()).map(|ends| {
+                        match literal_values_of(command, mentions, ends) {
+                            Some(values)
+                                if !values.iter().any(|value| {
+                                    matches!(
+                                        value.as_str(),
+                                        "cd" | "pushd"
+                                            | "popd"
+                                            | "eval"
+                                            | "builtin"
+                                            | "command"
+                                            | "trap"
+                                    )
+                                }) =>
+                            {
+                                VariableValues::Plain(std::rc::Rc::new(
+                                    values.into_iter().collect(),
+                                ))
+                            }
+                            _ => VariableValues::MayMove,
+                        }
+                    })
+                });
+            if let Some(values) = set {
+                set_values.push(values.clone());
+            }
+        }
+        let whole_word = EXPANSION
+            .find(word)
+            .is_some_and(|m| m.as_str().len() == word.len());
+        match set_values.as_slice() {
+            [] => false,
+            [VariableValues::Plain(values)] if whole_word => {
+                if values.len() < self.functions.len() {
+                    values
+                        .iter()
+                        .any(|value| self.functions.contains_key(value))
+                } else {
+                    self.functions.keys().any(|name| values.contains(name))
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
+        for dir in dirs.snapshot() {
+            self.located.push(LocatedSegment {
+                raw: raw.to_string(),
+                dir: dir.clone(),
+            });
+        }
+    }
+
+    /// Follow one command's effect on the directory: a directory verb, an
+    /// `eval`, a call of a function defined earlier, a `trap` whose action
+    /// moves, or a command word only expansion can name.
+    fn command(
+        &mut self,
+        command: &str,
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+        own_process: bool,
+    ) {
+        let body = strip_group_wrappers(command);
+        // Most commands name a plain program in their first word; tokenizing
+        // every segment re-expanded each brace word of a flood.
+        let special = |word: &str| word.contains(['$', '`', '\\', '\'', '"', '{', '(', ')']);
+        // Plain `NAME=value` prefixes first: they run nothing.
+        let first_word = body
+            .split([' ', '\t', '\n'])
+            .filter(|word| !word.is_empty())
+            .find(|word| !is_assignment_word(word) || special(word))
+            .unwrap_or("");
+        // `cd>/dev/null /u` is `cd` with a redirection glued on.
+        let first_word = first_word.split(['<', '>']).next().unwrap_or("");
+        let plain = !special(first_word) && !first_word.contains('=');
+        if first_word.is_empty()
+            || plain
+                && !matches!(
+                    first_word,
+                    "builtin" | "command" | "eval" | "trap" | "cd" | "pushd" | "popd"
+                )
+                && !self.functions.contains_key(first_word)
+        {
+            return;
+        }
+        let mut words = tokenize_marked(body);
+        let mut start = 0;
+        let mut ambiguous = false;
+        let mut builtin = false;
+        let mut command_prefixed = false;
+        while let Some(word) = words.get(start) {
+            let (text, escaped) = plain_word(&word.text);
+            if is_assignment_word(&text) {
+                // `c=$(echo cd)` tokenizes as `c=$(echo` and `cd)`: the
+                // substitution's words are the value, not the command.
+                match assignment_end(&words, start) {
+                    Some(end) if end < words.len() => {
+                        start = end;
+                        continue;
+                    }
+                    // Its substitution runs past the segment (the splitter cut
+                    // it at a `;` inside): there is no command here.
+                    Some(_) => return,
+                    None => {
+                        if !own_process {
+                            dirs.add_unresolvable();
+                        }
+                        return;
+                    }
+                }
+            }
+            if text == "builtin" {
+                ambiguous |= escaped;
+                builtin = true;
+                start += 1;
+                if words
+                    .get(start)
+                    .is_some_and(|next| unescape_word(&next.text).starts_with('-'))
+                {
+                    // `builtin` takes no options; bash refuses and stays.
+                    // Not read here.
+                    if !own_process {
+                        dirs.add_unresolvable();
+                    }
+                    return;
+                }
+                continue;
+            }
+            if text == "command" {
+                ambiguous |= escaped;
+                command_prefixed = true;
+                start += 1;
+                while let Some(flag) = words.get(start) {
+                    let flag = unescape_word(&flag.text);
+                    if flag == "-v" || flag == "-V" {
+                        // Describes the command; runs nothing.
+                        return;
+                    }
+                    if !flag.starts_with('-') || flag == "-" {
+                        break;
+                    }
+                    start += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        split_glued_redirection(&mut words, start);
+        let Some(first) = words.get(start) else {
+            return;
+        };
+        let (name, escaped) = plain_word(&first.text);
+        ambiguous |= escaped;
+        if first.text.contains(['$', '`'])
+            && !names_a_path(&first.text)
+            && self.expansion_may_name_a_mover(&first.text)
+        {
+            // `$c /u` runs `cd` when `c=cd`: the command is whatever the
+            // expansion names, so where the shell is after it is not known.
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        }
+        let words = &words[start..];
+        if !builtin && !command_prefixed && self.functions.contains_key(&name) {
+            let body = self.functions.get(&name).cloned().flatten();
+            self.replay(body, dirs, depth, context, own_process);
+            return;
+        }
+        match name.as_str() {
+            "eval" => {
+                let script: Vec<&str> = words[1..]
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .skip_while(|word| *word == "--")
+                    .collect();
+                if script.iter().any(|word| word.contains(['$', '`', '\\'])) {
+                    if !own_process {
+                        dirs.add_unresolvable();
+                    }
+                    return;
+                }
+                let segments: Script =
+                    std::rc::Rc::from(split_segments_with_ops_joining_redirects(&script.join(" ")));
+                self.replay(Some(segments), dirs, depth, context, own_process);
+            }
+            "trap" if trap_action_moves(words, self) => {
+                if !own_process {
+                    dirs.add_unresolvable();
+                }
+            }
+            "cd" | "pushd" | "popd" if !own_process => match verb_target(words) {
+                VerbTarget::To(target) => {
+                    let absolute = looks_absolute(&target) || target.starts_with('~');
+                    // `command cd` does not move zsh; `\cd` moves where `'\cd'`
+                    // does not. Either way, judge both.
+                    dirs.move_to(
+                        &target,
+                        context.conditional || ambiguous || command_prefixed,
+                    );
+                    if context.looped && !absolute {
+                        // Round a loop N times, a relative `cd` lands N deep.
+                        dirs.add_unresolvable();
+                    }
+                }
+                VerbTarget::Unreadable => dirs.add_unresolvable(),
+            },
+            _ => {}
+        }
+    }
+
+    /// Run an `eval`'d script or a function body in the parent shell's
+    /// directory set; piped or backgrounded, in a copy that is dropped.
+    fn replay(
+        &mut self,
+        body: Option<Script>,
+        dirs: &mut DirSet,
+        depth: usize,
+        context: DirContext,
+        own_process: bool,
+    ) {
+        let Some(body) = body else {
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        };
+        if depth >= MAX_DIR_WALK_DEPTH || self.replayed + body.len() > MAX_REPLAYED_SEGMENTS {
+            if !own_process {
+                dirs.add_unresolvable();
+            }
+            return;
+        }
+        self.replayed += body.len();
+        if own_process {
+            let mut copy = DirSet::new("");
+            copy.replace(dirs.dirs.clone());
+            self.walk(&body, &mut copy, depth + 1, context);
+        } else {
+            self.walk(&body, dirs, depth + 1, context);
+        }
+    }
+}
+
+/// How far a segment opens (positive) or closes (negative) groups — the
+/// depth a function body's definition is recorded by.
+fn group_depth_change(raw: &str) -> isize {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let shape = segment_shape(peeled.command.unwrap_or(""));
+    peeled.opens.len() as isize - peeled.brace_closes as isize - shape.paren_closes as isize
+        + shape.inner_open as isize
+}
+
+/// Every top-level segment of `command`, in command order, each with the
+/// directory it runs in — the per-segment counterpart of
+/// [`parse_work_dir`]'s one whole-command directory (cadence-hooks#997).
+///
+/// - a `cd` (the segment's command word) applies to the segments after it,
+///   whatever separator follows it — a newline, `;`, `&&`, `||`;
+/// - `pushd DIR`, `builtin cd DIR`, and `X=1 cd DIR` move like `cd`;
+///   `command cd DIR` and an escaped `\cd DIR` move bash but not every shell,
+///   so the segments after them are judged in both directories;
+/// - a target this walk cannot read — `popd`, `cd -`, `cd "$D"`, a flagged
+///   `pushd`, two operands — adds [`UNRESOLVABLE_DIR`], and so does a
+///   command word only an expansion names (`$c /u`), and a `trap` whose
+///   action changes directory;
+/// - an `eval`'d script runs in this shell, so its segments are walked in
+///   line, in the directory in effect; one that needs expansion to read is
+///   [`UNRESOLVABLE_DIR`];
+/// - a function body is recorded where it is defined and walked where the
+///   function is called, so `f() { cd /u; }; f` moves to `/u`;
+/// - a `cd` inside `if`/`case`/`while`/`until`/`for` runs in THIS shell,
+///   but maybe not at all, so the segments after it are judged in both the
+///   old and the new directory; a relative one in a loop may run any number
+///   of times, and adds [`UNRESOLVABLE_DIR`];
+/// - a `( … )` subshell's `cd` ends with the subshell;
+/// - a `{ …; }` group shares its parent's directory, unless the group is a
+///   pipeline stage or backgrounded, when it runs in its own process;
+/// - a `cd` in a pipeline stage or a backgrounded segment moves nothing.
+///   The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
+///   ([`split_segments_with_ops_joining_redirects`]).
+///
+/// A segment that may run in several directories is listed once for each,
+/// at most [`MAX_POSSIBLE_DIRS`]; past that it is [`UNRESOLVABLE_DIR`]. Like
+/// [`parse_work_dir`], every `cd` is otherwise assumed to succeed.
+///
+/// This is one reading, not a verdict: a guard that judges where a command
+/// runs judges each segment in BOTH this directory and the
+/// [`parse_work_dir`] one and keeps the sharpest verdict, so whatever this
+/// walk gets wrong can only add a verdict, never replace one.
+///
+/// Subshell nesting is read from each segment's leading `(` and its
+/// unpaired `)`, skipping quoted text and escaped characters
+/// ([`segment_shape`]).
+pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
+    let segments = split_segments_with_ops_joining_redirects(command);
+    let mut walk = DirWalk {
+        command: command.to_string(),
+        ..DirWalk::default()
+    };
+    let mut dirs = DirSet::new(cwd);
+    walk.walk(&segments, &mut dirs, 0, DirContext::default());
+    walk.located
+}
+
+/// The group structure of one top-level segment.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SegmentShape {
+    /// Leading group openers, outermost first: `true` for `(`, `false` for
+    /// `{`.
+    opens: Vec<bool>,
+    /// Leading `}` words — the brace groups this segment closes.
+    brace_closes: usize,
+    /// Unquoted, unescaped `)` with no inner `(` to pair with.
+    paren_closes: usize,
+    /// Inner `(` still open at the end of the segment: a `$(…)` the
+    /// splitter cut at a `;` inside it. What follows, up to its `)`, runs
+    /// in the substitution's subshell.
+    inner_open: usize,
+}
+
+/// Read [`SegmentShape`] from a segment. Quoted text (`'…'`, `"…"`,
+/// `$'…'`) and backslash-escaped characters are skipped, so `grep "fn
+/// main("` and `echo ":("` open and close nothing. Past the leading
+/// openers, an unquoted `(` (`$(`, `<(`, `>(`, `=(`, a function's `f ()`)
+/// opens an inner group that its `)` closes; only a `)` left unpaired
+/// closes a subshell.
+fn segment_shape(segment: &str) -> SegmentShape {
+    let mut shape = SegmentShape::default();
+    let mut rest = segment.trim_start();
+    while let Some(after) = rest.strip_prefix('}') {
+        shape.brace_closes += 1;
+        rest = after.trim_start();
+    }
+    loop {
+        if let Some(after) = rest.strip_prefix('(') {
+            shape.opens.push(true);
+            rest = after.trim_start();
+        } else if let Some(after) = rest
+            .strip_prefix('{')
+            .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            shape.opens.push(false);
+            rest = after.trim_start();
+        } else {
+            break;
+        }
+    }
+    let mut inner = 0usize;
+    let mut previous: Option<char> = None;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+                previous = Some('x');
+                continue;
+            }
+            '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
+            '\'' => skip_quoted(&mut chars, '\'', false),
+            '"' => skip_quoted(&mut chars, '"', true),
+            '(' => inner += 1,
+            ')' if inner > 0 => inner -= 1,
+            ')' => shape.paren_closes += 1,
+            _ => {}
+        }
+        previous = Some(c);
+    }
+    shape.inner_open = inner;
+    shape
+}
+
+/// Advance past a quoted run up to its closing `quote`; `escapes` honors
+/// `\` inside it (`"…"`, `$'…'`). An unterminated quote runs to the end.
+fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char, escapes: bool) {
+    while let Some(c) = chars.next() {
+        if escapes && c == '\\' {
+            chars.next();
+        } else if c == quote {
+            return;
+        }
+    }
+}
+
+/// [`resolve_cd_target`] applied to `effective` in place. A relative target
+/// is appended rather than joined into a fresh string, so a walk that follows
+/// many `cd`s costs time linear in the path, not quadratic.
+pub fn apply_cd_target(effective: &mut String, target: &str) {
+    if looks_absolute(target) || target.starts_with('~') {
+        *effective = resolve_cd_target(target, effective);
+    } else {
+        effective.push('/');
+        effective.push_str(target);
+    }
 }
 
 /// [`resolve_cd_target`] applied to `effective` in place. A relative target
@@ -16318,6 +17470,442 @@ mod tests {
             parse_work_dir("echo hi\ncd /wt\ngh pr create --title x", "/home"),
             "/home"
         );
+    }
+
+    #[test]
+    fn cd_bash_never_runs_does_not_repoint_the_resolver() {
+        // A `cd` in a string, a comment, or behind an escaped separator is
+        // text. The raw-text regex took each as a directory change, so from
+        // an unowned checkout `echo "; cd <owned>" && gh pr create` was judged
+        // in the owned repo and allowed.
+        for command in [
+            "echo \"; cd /owned \" && gh pr create -t x -b y",
+            "echo '; cd /owned' && gh pr create -t x -b y",
+            "echo \"a && cd /owned\"; gh pr create -t x -b y",
+            "echo $'x\\'; cd /owned' && gh pr create -t x -b y",
+            "echo x # ; cd /owned\ngh pr create -t x -b y",
+            "echo x #; cd /owned && gh pr create -t x -b y",
+            "# cd /owned\ngh pr create -t x -b y",
+            "echo x \\; cd /owned && gh pr create -t x -b y",
+            "echo x \\&\\& cd /owned && gh pr create -t x -b y",
+            "gh pr create -t x -b \"see; cd /owned\"",
+            "gh pr create -t x -b \"$(printf '%s' '; cd /owned')\"",
+            "git commit -m \"x || cd /owned\" && git push",
+        ] {
+            assert_eq!(parse_work_dir(command, "/unowned"), "/unowned", "{command}");
+        }
+    }
+
+    #[test]
+    fn cd_bash_runs_resolves_exactly_as_before() {
+        // Every real, unquoted `cd` the regex applied applies the same target,
+        // so no guard loses a verdict it reached on a real directory change.
+        for (command, expected) in [
+            ("cd /owned && gh pr create", "/owned"),
+            ("cd /owned; gh pr create", "/owned"),
+            ("cd /owned;gh pr create", "/owned"),
+            ("cd /owned || exit; gh pr create", "/owned"),
+            ("  cd /owned && gh pr create", "/owned"),
+            ("\ncd /owned && gh pr create", "/owned"),
+            ("echo hi; cd /owned && gh pr create", "/owned"),
+            ("echo hi;\ncd /owned && gh pr create", "/owned"),
+            ("echo \"a; b\" && cd /owned && gh pr create", "/owned"),
+            ("cd \"/owned dir\" && gh pr create", "/owned dir"),
+            ("cd '/owned dir' && gh pr create", "/owned dir"),
+            ("cd /owned 2>&1 && gh pr create", "/owned"),
+            ("cd /owned &>/dev/null && gh pr create", "/owned"),
+            ("cd /owned | cat; gh pr create", "/owned"),
+            ("cd /owned # comment\ngh pr create", "/owned"),
+            ("cd - && gh pr create", "/unowned/-"),
+            (
+                "cd $(git rev-parse --show-toplevel) && gh pr create",
+                "/unowned/$(git rev-parse --show-toplevel)",
+            ),
+            // Positions the old pattern never recognized stay unrecognized.
+            ("echo hi | cd /owned; gh pr create", "/unowned"),
+            ("sleep 1 & cd /owned; gh pr create", "/unowned"),
+            ("(cd /owned) ; gh pr create", "/unowned"),
+            ("{ cd /owned; } ; gh pr create", "/unowned"),
+        ] {
+            assert_eq!(parse_work_dir(command, "/unowned"), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn parse_work_dir_stays_fast_on_adversarial_input() {
+        let quoted = format!("echo \"{}\" && gh pr create", "; cd /owned ".repeat(20_000));
+        let chained = "cd /a && ".repeat(25_000);
+        let relative = "cd a;".repeat(40_000);
+        let commented = format!("echo x #{}\ngh pr create", "; cd /owned".repeat(20_000));
+        for command in [quoted, chained, relative, commented] {
+            assert!(command.len() >= 200_000);
+            let start = std::time::Instant::now();
+            let _ = parse_work_dir(&command, "/unowned");
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(500),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    // --- segment_work_dirs ---
+
+    /// The directory the LAST segment runs in, per [`segment_work_dirs`].
+    /// Each row's bash behavior was checked with a `pwd` canary.
+    #[test]
+    fn segment_work_dirs_follows_where_each_segment_runs() {
+        for (command, want) in [
+            // A `cd` applies after any separator, a newline included.
+            ("echo hi\ncd /u\ngh pr create", "/u"),
+            ("cd /u; gh pr create", "/u"),
+            ("cd /u && gh pr create", "/u"),
+            ("true || cd /u\ngh pr create", "/u"),
+            // `&` backgrounds the command before it, not the `cd` after it.
+            ("true & cd /u; gh pr create", "/u"),
+            // A brace group shares the parent's directory...
+            ("{ cd /u; }; gh pr create", "/u"),
+            // ...unless it is piped or backgrounded.
+            ("echo x | { cd /u; }; gh pr create", "/cwd"),
+            ("{ cd /u; } & gh pr create", "/cwd"),
+            // A subshell's `cd` ends with it, however it was cut.
+            ("(cd /u); gh pr create", "/cwd"),
+            ("(true; cd /u ); gh pr create", "/cwd"),
+            ("(true; cd /u; true); gh pr create", "/cwd"),
+            ("(cd /u && gh pr view 1); gh pr create", "/cwd"),
+            // A `cd` in a pipeline stage or backgrounded moves nothing.
+            ("cd /u | cat; gh pr create", "/cwd"),
+            ("cd /u & gh pr create", "/cwd"),
+            // A `cd` in quoted text is not one.
+            ("echo \"; cd /u\"; gh pr create", "/cwd"),
+            // Relative targets accumulate.
+            ("cd a\ncd b\ngh pr create", "/cwd/a/b"),
+        ] {
+            let located = segment_work_dirs(command, "/cwd");
+            assert_eq!(
+                located.last().map(|segment| &*segment.dir),
+                Some(want),
+                "{command:?}: {located:?}"
+            );
+        }
+    }
+
+    /// Every directory the LAST segment may run in, per [`segment_work_dirs`].
+    fn last_dirs(command: &str) -> Vec<String> {
+        let located = segment_work_dirs(command, "/cwd");
+        let last = located.last().map(|segment| segment.raw.clone());
+        located
+            .iter()
+            .filter(|segment| Some(&segment.raw) == last.as_ref())
+            .map(|segment| segment.dir.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Directory changes the walk used to miss. Each row's bash behavior was
+    /// checked with a `pwd` canary; a conditional or shell-dependent move is
+    /// judged in both directories.
+    #[test]
+    fn segment_work_dirs_follows_every_directory_change_form() {
+        const X: &str = UNRESOLVABLE_DIR;
+        for (command, want) in [
+            // Builtin spellings of `cd`.
+            ("pushd /u; gh pr create", &["/u"][..]),
+            ("pushd /u >/dev/null; gh pr create", &["/u"]),
+            ("builtin cd /u; gh pr create", &["/u"]),
+            ("X=1 cd /u; gh pr create", &["/u"]),
+            ("cd -P /u; gh pr create", &["/u"]),
+            ("! cd /u; gh pr create", &["/u"]),
+            ("time -p cd /u; gh pr create", &["/u"]),
+            (
+                "cd; gh pr create",
+                &[crate::paths::user_home_lossy_or_default().leak() as &str],
+            ),
+            // bash moves, zsh does not; `'\cd'` does not, `\cd` does.
+            ("command cd /u; gh pr create", &["/cwd", "/u"]),
+            ("\\cd /u; gh pr create", &["/cwd", "/u"]),
+            // Unreadable targets.
+            ("popd; gh pr create", &["/cwd", X]),
+            ("cd -; gh pr create", &["/cwd", X]),
+            ("cd \"$D\"; gh pr create", &["/cwd", X]),
+            ("pushd -n /u; gh pr create", &["/cwd", X]),
+            ("cd a b; gh pr create", &["/cwd", X]),
+            ("builtin -p cd /u; gh pr create", &["/cwd", X]),
+            // A variable the command sets names what it was set to.
+            ("c=cd; $c /u; gh pr create", &["/cwd", X]),
+            ("c='cd'; ${c} /u; gh pr create", &["/cwd", X]),
+            ("f() { cd /u; }; c=f; $c; gh pr create", &["/cwd", X]),
+            ("read c <<< cd; $c /u; gh pr create", &["/cwd", X]),
+            ("for c in cd; do $c /u; done; gh pr create", &["/cwd", X]),
+            (": ${c:=cd}; $c /u; gh pr create", &["/cwd", X]),
+            ("c=c; ${c}d /u; gh pr create", &["/cwd", X]),
+            ("c=$(echo cd); $c /u; gh pr create", &["/cwd", X]),
+            ("c=$(cd /u; echo); gh pr create", &["/cwd"]),
+            ("c=`echo cd` d=1; gh pr create", &["/cwd"]),
+            ("X=$(echo \"a b\") cd /u; gh pr create", &["/u"]),
+            ("X=\"$(\" cd /u; gh pr create", &["/cwd", X]),
+            ("t=\"feat(x): y\"; gh pr create", &["/cwd"]),
+            ("c=' cd'; $c /u; gh pr create", &["/cwd", X]),
+            ("c=\"cd\"; $c /u; gh pr create", &["/cwd", X]),
+            ("c=cd/u; IFS=/; $c; gh pr create", &["/cwd", X]),
+            ("c='gh'; $c pr view 1; gh pr create", &["/cwd"]),
+            ("f() { $1 /u; }; f cd; gh pr create", &["/cwd", X]),
+            // One it never sets names a program from the environment.
+            ("$c /u; gh pr create", &["/cwd"]),
+            ("G=gh; $G pr view 1; gh pr create", &["/cwd"]),
+            ("$EDITOR x; gh pr create", &["/cwd"]),
+            ("\"$PY\" x.py; gh pr create", &["/cwd"]),
+            ("$(echo cd) /u; gh pr create", &["/cwd", X]),
+            (
+                "$(echo /x >/dev/null; echo cd) /u; gh pr create",
+                &["/cwd", X],
+            ),
+            ("\"$VENV/bin/python\" x; gh pr create", &["/cwd"]),
+            ("${D}/run /u; gh pr create", &["/cwd"]),
+            ("trap 'cd /u' DEBUG; gh pr create", &["/cwd", X]),
+            // `eval` runs its script in this shell.
+            ("eval 'cd /u'; gh pr create", &["/u"]),
+            ("eval cd /u; gh pr create", &["/u"]),
+            ("eval \"$s\"; gh pr create", &["/cwd", X]),
+            ("eval 'cd /u' | cat; gh pr create", &["/cwd"]),
+            // A function body runs where the function is called.
+            ("f() { cd /u; }; f; gh pr create", &["/u"]),
+            ("function f { cd /u; }\nf\ngh pr create", &["/u"]),
+            ("f() {\ncd /u\n}\nf\ngh pr create", &["/u"]),
+            ("f() { cd a; }; f; f; gh pr create", &["/cwd/a/a"]),
+            ("g() { f; }; f() { cd /u; }; g; gh pr create", &["/u"]),
+            ("cd() { builtin cd /u; }; cd /o; gh pr create", &["/u"]),
+            ("f() { cd /u; }; gh pr create", &["/cwd"]),
+            // A body whose close this walk misses is walked as maybe-run.
+            ("f() { true\ncd /u\ngh pr create", &["/cwd", "/u"]),
+            ("cd>/dev/null /u; gh pr create", &["/u"]),
+            ("f() (cd /u); f; gh pr create", &["/cwd"]),
+            ("f() { cd /u; }; f | cat; gh pr create", &["/cwd"]),
+            ("f() { cd /u; }; (f); gh pr create", &["/cwd"]),
+            // Recursion stops at the depth cap: where it ends is not known.
+            ("f() { f; }; f; gh pr create", &["/cwd", X]),
+            (
+                "f() { cd a; f; }; f; gh pr create",
+                &["/cwd/a/a/a/a/a/a/a/a", X],
+            ),
+            (
+                "f() if true; then cd /u; fi; f; gh pr create",
+                &["/cwd", "/u", X],
+            ),
+            // A compound's body runs in this shell, maybe.
+            ("if true; then cd /u; fi; gh pr create", &["/cwd", "/u"]),
+            ("if true\nthen\ncd /u\nfi\ngh pr create", &["/cwd", "/u"]),
+            ("if cd /u; then true; fi; gh pr create", &["/cwd", "/u"]),
+            (
+                "if x; then cd /a; else cd /b; fi; gh pr create",
+                &["/a", "/b", "/cwd"],
+            ),
+            (
+                "{ if true; then cd /u; fi; }; gh pr create",
+                &["/cwd", "/u"],
+            ),
+            ("(if true; then cd /u; fi); gh pr create", &["/cwd"]),
+            (
+                "while true; do cd /u; break; done; gh pr create",
+                &["/cwd", "/u"],
+            ),
+            ("for d in a; do cd /u; done; gh pr create", &["/cwd", "/u"]),
+            (
+                "for d in a; do cd a; done; gh pr create",
+                &["/cwd", "/cwd/a", X],
+            ),
+            ("case x in x) cd /u;; esac; gh pr create", &["/cwd", "/u"]),
+            (
+                "case x in\n(x|y) cd /u ;;\nesac\ngh pr create",
+                &["/cwd", "/u"],
+            ),
+            ("case x in x|y) cd /u;; esac; gh pr create", &["/cwd", "/u"]),
+            ("case x in x) echo | cd /u;; esac; gh pr create", &["/cwd"]),
+            (
+                "f() { cd /u; }; if x; then f; fi; gh pr create",
+                &["/cwd", "/u"],
+            ),
+            // Past the cap, the set collapses.
+            (
+                "if x; then cd /1; cd /2; fi; if x; then cd /3; fi; if x; then cd /4; fi; \
+                 if x; then cd /5; fi; if x; then cd /6; fi; if x; then cd /7; fi; \
+                 if x; then cd /8; fi; if x; then cd /9; fi; gh pr create",
+                &[X, "/9"],
+            ),
+            // Controls: nothing moves.
+            ("f() { echo; }; f; gh pr create", &["/cwd"]),
+            ("if true; then echo; fi; gh pr create", &["/cwd"]),
+            ("case x in y) echo;; esac; gh pr create", &["/cwd"]),
+            ("eval 'echo hi'; gh pr create", &["/cwd"]),
+            ("trap 'rm -f x' EXIT; gh pr create", &["/cwd"]),
+            ("command -v cd; gh pr create", &["/cwd"]),
+            ("echo cd /u; gh pr create", &["/cwd"]),
+        ] {
+            let mut want: Vec<String> = want.iter().map(|dir| dir.to_string()).collect();
+            want.sort();
+            assert_eq!(last_dirs(command), want, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn apply_cd_target_matches_resolve_cd_target() {
+        for (target, effective) in [
+            ("sub", "/cwd"),
+            ("../x", "/cwd/a"),
+            ("/abs", "/cwd"),
+            ("C:\\other", "C:\\primary"),
+            ("D:/other", "/cwd"),
+            ("~/x", "/cwd"),
+            ("$(git rev-parse --show-toplevel)", "/cwd"),
+        ] {
+            let mut applied = effective.to_string();
+            apply_cd_target(&mut applied, target);
+            assert_eq!(applied, resolve_cd_target(target, effective), "{target}");
+        }
+    }
+
+    /// `parse_work_dir` extends its path in place; the answer is the one the
+    /// joining fold it replaced gives.
+    #[test]
+    fn parse_work_dir_matches_the_joining_fold() {
+        fn joined(command: &str, cwd: &str) -> String {
+            let mut effective = cwd.to_string();
+            let mut previous_op: Option<&str> = None;
+            for (segment, op) in split_segments_with_ops(command) {
+                let after_chain = matches!(previous_op, None | Some("&&" | ";" | "||"));
+                previous_op = op;
+                let words = tokenize(&segment);
+                if after_chain
+                    && words.first().map(String::as_str) == Some("cd")
+                    && let Some(target) = words.get(1)
+                {
+                    effective = resolve_cd_target(target, &effective);
+                }
+            }
+            effective
+        }
+        for command in [
+            "cd a && cd b && gh pr create",
+            "cd /abs; cd rel; cd ../x",
+            "cd ~/x && cd y",
+            "cd C:\\repo && cd sub",
+            "echo hi | cd /x; cd y",
+            &"cd a;".repeat(300),
+        ] {
+            assert_eq!(
+                parse_work_dir(command, "/cwd"),
+                joined(command, "/cwd"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_shape_skips_quotes_and_pairs_inner_parens() {
+        let shape = |opens: &[bool], brace_closes, paren_closes| SegmentShape {
+            opens: opens.to_vec(),
+            brace_closes,
+            paren_closes,
+            inner_open: 0,
+        };
+        for (segment, want) in [
+            ("gh pr create", shape(&[], 0, 0)),
+            ("(cd x", shape(&[true], 0, 0)),
+            ("( (cd x", shape(&[true, true], 0, 0)),
+            ("gh pr create)", shape(&[], 0, 1)),
+            ("gh pr create) ", shape(&[], 0, 1)),
+            ("(cd x)", shape(&[true], 0, 1)),
+            ("cd x))", shape(&[], 0, 2)),
+            ("echo $(pwd)", shape(&[], 0, 0)),
+            ("echo $(pwd))", shape(&[], 0, 1)),
+            ("diff <(a) >(b))", shape(&[], 0, 1)),
+            ("{ (cd x", shape(&[false, true], 0, 0)),
+            ("{ cd x", shape(&[false], 0, 0)),
+            ("{cat,.env}", shape(&[], 0, 0)),
+            ("}", shape(&[], 1, 0)),
+            ("} }", shape(&[], 2, 0)),
+            ("echo \\)", shape(&[], 0, 0)),
+            ("echo \\))", shape(&[], 0, 1)),
+            ("grep \"fn main(\" f)", shape(&[], 0, 1)),
+            ("echo \":(\")", shape(&[], 0, 1)),
+            ("echo ')')", shape(&[], 0, 1)),
+            ("echo \"a\\\")\")", shape(&[], 0, 1)),
+            ("echo $'\\')')", shape(&[], 0, 1)),
+            ("echo 'unterminated )", shape(&[], 0, 0)),
+            (
+                "echo $(true",
+                SegmentShape {
+                    inner_open: 1,
+                    ..shape(&[], 0, 0)
+                },
+            ),
+        ] {
+            assert_eq!(segment_shape(segment), want, "{segment}");
+        }
+    }
+
+    #[test]
+    fn segment_work_dirs_marks_an_over_long_directory_unresolvable() {
+        let deep = "cd aaaaaaaa\n".repeat(MAX_DIR_LEN / 8);
+        for (command, want) in [
+            (format!("{deep}gh pr create"), UNRESOLVABLE_DIR),
+            // A relative `cd` leaves it there; an absolute one moves off.
+            (format!("{deep}cd b\ngh pr create"), UNRESOLVABLE_DIR),
+            (format!("{deep}cd /u\ngh pr create"), "/u"),
+        ] {
+            let located = segment_work_dirs(&command, "/cwd");
+            assert_eq!(located.last().map(|segment| &*segment.dir), Some(want));
+        }
+    }
+
+    #[test]
+    fn segment_work_dirs_stays_fast_on_adversarial_input() {
+        let relative = "cd a;".repeat(40_000);
+        let newlines = "cd a\n".repeat(40_000);
+        let absolute = format!("cd /{};", "a".repeat(4000)).repeat(50);
+        let subshells = "(true; cd /u ); ".repeat(13_000);
+        let groups = "{ cd /u; }; ".repeat(17_000);
+        let nested = format!("{}cd /u{}", "( ".repeat(70_000), " )".repeat(70_000));
+        let writes = "cd a; gh pr create -t x; ".repeat(8_000);
+        let calls = format!(
+            "f() {{ cd a; gh pr create -t x; }}; {}",
+            "f; ".repeat(70_000)
+        );
+        let evals = "eval 'cd a; true'; ".repeat(11_000);
+        let branches = "if x; then cd /a; else cd b; fi; gh pr create; ".repeat(5_000);
+        let loops = "while x; do cd a; done; gh pr create; ".repeat(6_000);
+        let cases = "case x in x) cd /u;; y) cd v;; esac; gh pr create; ".repeat(5_000);
+        let deep_eval = "eval \"eval 'eval cd /u'\"; ".repeat(8_000);
+        let variables = (0..14_000)
+            .map(|i| format!("v{i}=gh; $v{i} x; "))
+            .collect::<String>();
+        let same_variable = "c=gh; $c /u; gh pr create; ".repeat(8_000);
+        // Release bound 0.5 s (the hook deadline fails open); debug is slower.
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
+        for command in [
+            relative,
+            newlines,
+            absolute,
+            subshells,
+            groups,
+            nested,
+            writes,
+            calls,
+            evals,
+            branches,
+            loops,
+            cases,
+            deep_eval,
+            variables,
+            same_variable,
+        ] {
+            assert!(command.len() >= 200_000, "{}", command.len());
+            let start = std::time::Instant::now();
+            let _ = command_segments_with_dirs(&command, "/unowned");
+            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+        }
     }
 
     // --- LOOP_PATTERN ---

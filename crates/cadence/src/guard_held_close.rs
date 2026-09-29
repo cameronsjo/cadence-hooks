@@ -41,7 +41,8 @@
 //! guard's own failure to read the ledger allows (ADR-0001).
 
 use cadence_hooks_core::shell::{
-    GhIssueCall, command_segments, gh_issue_calls, git_command, parse_work_dir, tokenize,
+    GhIssueCall, command_segments, command_segments_with_dirs, gh_issue_calls, git_command,
+    parse_work_dir, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::collections::BTreeSet;
@@ -295,6 +296,51 @@ fn remote_slugs(work_dir: &str) -> Vec<Slug> {
     slugs
 }
 
+/// Most distinct directories [`close_repos`] reads remotes in. Each is a git
+/// spawn, and a hook that runs past its deadline fails open.
+const MAX_CLOSE_DIRS: usize = 16;
+
+/// Slugs of every remote a bare `gh issue close` in `command` may resolve
+/// against, or `None` past [`MAX_CLOSE_DIRS`] directories.
+///
+/// Read in two directories and unioned, so a held number matches in either:
+/// the whole-command [`parse_work_dir`] one, and the one each close's own
+/// segment runs in ([`command_segments_with_dirs`]). The whole-command scan
+/// misses a `cd` on a later line, after a backgrounded command, or in a
+/// `{ …; }` group, and lets a subshell's `cd` leak into the parent. The
+/// slugs are unioned, and a directory with no readable remote empties the
+/// list — [`held_targets`] reads an empty list as "any repository" — so
+/// either reading can only add a hit, never remove one.
+fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
+    let mut dirs = vec![parse_work_dir(command, cwd)];
+    for (segment, dir) in command_segments_with_dirs(command, cwd) {
+        if dirs.iter().any(|seen| *seen == *dir)
+            || !gh_issue_calls(&segment)
+                .iter()
+                .any(|call| call.subcommand == "close")
+        {
+            continue;
+        }
+        if dirs.len() == MAX_CLOSE_DIRS {
+            return None;
+        }
+        dirs.push(dir.to_string());
+    }
+    let mut slugs: Vec<Slug> = Vec::new();
+    for dir in &dirs {
+        let found = remote_slugs(dir);
+        // No remote read means a bare close matches a held number in any
+        // repository, the widest reading, so it wins outright.
+        if found.is_empty() {
+            return Some(Vec::new());
+        }
+        slugs.extend(found);
+    }
+    slugs.sort();
+    slugs.dedup();
+    Some(slugs)
+}
+
 /// Blocks `gh issue close` against the HELD ledger.
 pub struct GuardHeldClose {
     /// The ledger file named by `--ledger`, if any.
@@ -334,8 +380,13 @@ impl Check for GuardHeldClose {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| ".".to_string());
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-        let work_dir = parse_work_dir(command, cwd);
-        let cwd_repos = remote_slugs(&work_dir);
+        let Some(cwd_repos) = close_repos(command, cwd) else {
+            return CheckResult::block(format!(
+                "guard-held-close: the `gh issue close` calls in this command run in more \
+                 than {MAX_CLOSE_DIRS} directories, too many to check against the HELD \
+                 ledger. Run the closes in fewer commands."
+            ));
+        };
         let hits: BTreeSet<HeldIssue> = calls
             .iter()
             .flat_map(|c| held_targets(c, command, &ledger, &cwd_repos))
@@ -562,5 +613,68 @@ mod tests {
             ledger_path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
         };
         assert_eq!(missing.run(&input).outcome, Outcome::Allow);
+    }
+
+    /// A hermetic checkout whose `origin` is `url`.
+    fn origin_checkout(url: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", url]);
+        repo
+    }
+
+    /// A bare close is matched against the remotes of the whole-command
+    /// directory AND of the directory its own segment runs in. Every row is
+    /// `(command, run from the held repo's checkout?, blocks?)`; `{H}` is the
+    /// checkout whose origin carries a held number, `{F}` one that does not.
+    #[test]
+    fn bare_close_is_judged_where_its_own_segment_runs() {
+        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
+            return;
+        }
+        let held = origin_checkout("https://github.com/cameronsjo/cadence-ecosystem.git");
+        let free = origin_checkout("https://github.com/cameronsjo/free.git");
+        let h = held.path().to_str().unwrap();
+        let f = free.path().to_str().unwrap();
+        let ledger_dir = tempfile::tempdir().unwrap();
+        let ledger = ledger_dir.path().join("held.txt");
+        std::fs::write(&ledger, LEDGER).unwrap();
+        let guard = GuardHeldClose {
+            ledger_path: Some(ledger.to_string_lossy().into_owned()),
+        };
+        for (command, in_held, blocks) in [
+            // Allowed on the base.
+            ("echo hi\ncd {H}\ngh issue close 354", false, true),
+            ("true & cd {H}; gh issue close 354", false, true),
+            ("{ cd {H}; }; gh issue close 354", false, true),
+            ("(true; cd {F} ); gh issue close 354", true, true),
+            // Blocked on the base, and still.
+            ("cd {H} && gh issue close 354", false, true),
+            ("gh issue close 354", true, true),
+            // Controls.
+            ("gh issue close 354", false, false),
+            ("cd {F} && gh issue close 354", true, false),
+            (
+                "(cd {H} && gh issue view 354); gh issue close 354",
+                false,
+                false,
+            ),
+            // A directory with no readable remote matches any repository in
+            // either reading, and still does when the other has a remote.
+            ("(true; cd /nonexistent ); gh issue close 354", false, true),
+            ("cd /nonexistent | cat; gh issue close 354", false, true),
+            ("echo hi\ncd /nonexistent\ngh issue close 354", false, true),
+        ] {
+            let command = command.replace("{H}", h).replace("{F}", f);
+            let cwd = if in_held { h } else { f };
+            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&command, cwd);
+            let result = guard.run(&input);
+            assert_eq!(
+                result.outcome == Outcome::Block,
+                blocks,
+                "{command} (from {cwd}): {:?}",
+                result.message
+            );
+        }
     }
 }
