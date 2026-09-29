@@ -94,6 +94,34 @@ fn head_deletes(argv: &[String]) -> bool {
                 == Some("rm"))
 }
 
+/// The command a `coproc` runs, given the `argv` that starts with `coproc`
+/// (cadence-hooks#546). `coproc [NAME] command`: bash reads NAME only when the
+/// command is a compound one (`{`, `(`, a loop or conditional keyword), so a
+/// bare `coproc rm note.md` runs `rm` and `rm` is not a name. `None` when
+/// nothing follows.
+///
+/// **Documented limit, not a bug:** a verb PRODUCED by a substitution in command
+/// position (`$(echo rm) note.md`, `` `echo rm` note.md ``) is unknowable
+/// without running it, so this guard does not judge it. Fail-closed on every
+/// unresolvable command word would block `$EDITOR note.md`; the operator ruled
+/// (#546, option b) to leave that shape and say so.
+fn coproc_command(argv: &[String]) -> Option<&[String]> {
+    const COMPOUND_STARTS: &[&str] = &[
+        "{", "(", "((", "[[", "if", "while", "until", "for", "select", "case",
+    ];
+    let rest = argv.get(1..).filter(|rest| !rest.is_empty())?;
+    let is_name = |word: &str| {
+        !word.is_empty()
+            && !word.starts_with(|c: char| c.is_ascii_digit())
+            && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let rest = match rest {
+        [name, next, ..] if is_name(name) && COMPOUND_STARTS.contains(&next.as_str()) => &rest[1..],
+        _ => rest,
+    };
+    Some(peel_command_runners(rest))
+}
+
 /// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
 fn is_destructive_at(command: &str, depth: usize) -> bool {
     for segment in command_segments(command) {
@@ -120,6 +148,16 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
             && depth < MAX_NESTED_DEPTH
             && argv.len() > 1
             && is_destructive_at(&argv[1..].join(" "), depth + 1)
+        {
+            return true;
+        }
+        // `coproc` is a reserved word that runs a command, not a prefix with
+        // flags, so the verb behind it is invisible to a head test. Its
+        // operand is judged as a command in its own right, like `eval`'s.
+        if verb == "coproc"
+            && depth < MAX_NESTED_DEPTH
+            && let Some(rest) = coproc_command(argv)
+            && is_destructive_at(&rest.join(" "), depth + 1)
         {
             return true;
         }
@@ -538,6 +576,11 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
             }
         } else if verb == "eval" && depth < MAX_NESTED_DEPTH && argv.len() > 1 {
             deletion_operands(&argv[1..].join(" "), depth + 1, out);
+        } else if verb == "coproc"
+            && depth < MAX_NESTED_DEPTH
+            && let Some(rest) = coproc_command(argv)
+        {
+            deletion_operands(&rest.join(" "), depth + 1, out);
         }
     }
 }
@@ -884,6 +927,61 @@ fn check_delete_in_vault(path: &str, cwd: &str, vault: &str) -> CheckResult {
     CheckResult::allow()
 }
 
+/// Judge a `Write` whose content is empty or whitespace-only (cadence-hooks#534).
+///
+/// A `Write` replaces the file's whole content, so an empty one zeroes an
+/// existing file exactly as `truncate -s0` or a `>` redirect does, and it is
+/// judged the same way `rm` of that file is: blocked when the target resolves
+/// inside the vault. Three shapes are deliberately untouched: a `Write` with
+/// real content (an ordinary note update), a `Write` to a file that does not
+/// exist yet (creating an empty note deletes nothing), and a target outside the
+/// vault. A target reached through a symlink parent that lands in the vault is
+/// judged by its physical location, like the operand walk above. "Whitespace"
+/// is Unicode `White_Space`, so a lone newline or NBSP counts as empty: the
+/// note is gone either way. A substantially-shorter overwrite is NOT judged;
+/// that needs a size heuristic and would be noisy on legitimate rewrites.
+fn check_truncate_in_vault(
+    path: &str,
+    content: &str,
+    cwd: &str,
+    vault: &str,
+    meta: &dyn FileMeta,
+) -> CheckResult {
+    if !content.trim().is_empty() {
+        return CheckResult::allow();
+    }
+    let vault = normalize_path(vault);
+    let cwd = normalize_path(cwd);
+    let vault_prefix = format!("{vault}/");
+    let target = normalize_path(path);
+    let absolute = if looks_absolute(&target) {
+        target
+    } else {
+        normalize_path(&format!("{cwd}/{target}"))
+    };
+    let lexical = collapse_dots(&absolute);
+    let resolved = if lexical.starts_with(&vault_prefix) {
+        Some(lexical)
+    } else {
+        // A symlinked parent can land the write in the vault from outside it.
+        meta.physical(&lexical).filter(|physical| {
+            std::iter::once(vault.clone())
+                .chain(meta.physical(&vault))
+                .any(|v| physical.starts_with(&format!("{v}/")))
+        })
+    };
+    match resolved {
+        Some(resolved) if meta.exists(&resolved) => CheckResult::block(format!(
+            "🚫 Obsidian vault detected. This `Write` carries no content, so it empties an \
+             existing vault file, bypassing recoverability.\n\n\
+             .trash/ is Obsidian's built-in recycle bin. Move the file there instead:\n  \
+             mkdir -p {vault}/.trash && mv {resolved} {vault}/.trash/\n\n\
+             Write real content to keep the note, or target a new filename."
+        )),
+        _ => CheckResult::allow(),
+    }
+}
+
 /// Blocks destructive commands (rm, unlink, shred, truncate, or find -delete)
 /// inside an Obsidian vault and suggests `.trash/` instead.
 pub struct ObsidianTrashGuard;
@@ -907,6 +1005,12 @@ impl Check for ObsidianTrashGuard {
             if result.outcome == cadence_hooks_core::Outcome::Block {
                 return result;
             }
+        }
+
+        if input.normalized_tool_name() == Some("Write")
+            && let (Some(path), Some(content)) = (input.file_path(), input.content())
+        {
+            return check_truncate_in_vault(&path, content, cwd, &vault, &RealFs);
         }
 
         input.command().map_or_else(CheckResult::allow, |command| {
@@ -2760,5 +2864,164 @@ mod tests {
             &FakeFs::default(),
         );
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// cadence-hooks#546: `coproc` takes a command, not flags, so the verb behind
+    /// it sat outside the head scan. Rows that block delete a real file under
+    /// bash; the allow rows are the false positives the head scan exists to
+    /// avoid, plus the documented `$(…)` in command position.
+    #[test]
+    fn coproc_runs_its_command_through_the_verb_gate() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("coproc rm note.md", Block),
+            ("coproc rm -f note.md", Block),
+            ("coproc /bin/rm note.md", Block),
+            ("coproc sudo rm note.md", Block),
+            ("coproc unlink note.md", Block),
+            ("coproc git rm note.md", Block),
+            ("coproc { rm note.md; }", Block),
+            ("coproc DEL { rm note.md; }", Block),
+            ("coproc DEL ( rm note.md )", Block),
+            ("coproc coproc rm note.md", Block),
+            ("echo hi && coproc rm note.md", Block),
+            ("coproc eval 'rm note.md'", Block),
+            ("coproc sh -c 'rm note.md'", Block),
+            ("coproc find . -delete", Block),
+            // Controls: the false positives the narrowing removed stay removed.
+            ("npm run format", Allow),
+            ("terraform destroy", Allow),
+            ("coproc npm run format", Allow),
+            ("coproc terraform destroy", Allow),
+            ("coproc cat note.md", Allow),
+            // Bash reads NAME only before a compound command; here `DEL` is the
+            // command and nothing is deleted (measured under bash 5).
+            ("coproc DEL rm note.md", Allow),
+            ("coproc DEL { cat note.md; }", Allow),
+            ("coproc", Allow),
+            ("echo coproc rm note.md", Allow),
+            // Documented limit (#546): a substitution-produced verb is unknowable.
+            ("$(echo rm) note.md", Allow),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(outcome_in_vault(command), *expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn coproc_deletion_from_outside_the_vault_is_judged_by_its_operand() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("coproc rm /vault/note.md", Block),
+            ("coproc DEL { rm /vault/note.md; }", Block),
+            ("coproc rm /tmp/scratch", Allow),
+            ("coproc cat /vault/note.md", Allow),
+        ];
+        for (command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/home/me", "/vault", &FakeFs::default());
+            assert_eq!(result.outcome, *expected, "{command}");
+        }
+    }
+
+    fn write_input(path: &str, content: Option<&str>, cwd: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(path.into()),
+                content: content.map(Into::into),
+                ..Default::default()
+            }),
+            cwd: Some(cwd.into()),
+            ..Default::default()
+        }
+    }
+
+    /// cadence-hooks#534: an empty `Write` to an existing vault file is a
+    /// deletion. Real content, a new file, and a target outside the vault are
+    /// untouched.
+    #[test]
+    fn empty_write_to_an_existing_vault_file_is_judged_like_a_deletion() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        // (path, content, cwd, seeded as existing, expected)
+        let cases: &[(&str, &str, &str, bool, cadence_hooks_core::Outcome)] = &[
+            ("/vault/note.md", "", "/home/me", true, Block),
+            ("/vault/note.md", "  \n\t\r\n", "/home/me", true, Block),
+            ("/vault/note.md", "\n", "/home/me", true, Block),
+            ("/vault/note.md", "\u{a0}", "/home/me", true, Block),
+            ("/vault/sub/note.md", "", "/home/me", true, Block),
+            ("note.md", "", "/vault", true, Block),
+            ("../vault/note.md", "", "/home", true, Block),
+            ("/home/me/../../vault/note.md", "", "/", true, Block),
+            ("/vault/./sub/../note.md", "", "/", true, Block),
+            // Real content is a note update.
+            ("/vault/note.md", "x", "/home/me", true, Allow),
+            ("/vault/note.md", "# Title\n", "/home/me", true, Allow),
+            ("/vault/note.md", " x ", "/home/me", true, Allow),
+            // A new file deletes nothing.
+            ("/vault/new.md", "", "/home/me", false, Allow),
+            // Outside the vault.
+            ("/tmp/note.md", "", "/home/me", true, Allow),
+            ("/vault2/note.md", "", "/home/me", true, Allow),
+            ("/vault/../elsewhere/note.md", "", "/", true, Allow),
+            ("note.md", "", "/home/me", true, Allow),
+        ];
+        for (path, content, cwd, exists, expected) in cases {
+            let meta = if *exists {
+                FakeFs::with(&[
+                    "/vault/note.md",
+                    "/vault/sub/note.md",
+                    "/vault2/note.md",
+                    "/tmp/note.md",
+                    "/elsewhere/note.md",
+                    "/home/me/note.md",
+                ])
+            } else {
+                FakeFs::default()
+            };
+            let result = check_truncate_in_vault(path, content, cwd, "/vault", &meta);
+            assert_eq!(result.outcome, *expected, "{path} {content:?} cwd={cwd}");
+        }
+    }
+
+    #[test]
+    fn empty_write_is_judged_only_for_the_write_tool_through_the_entry_point() {
+        use cadence_hooks_core::Outcome::Allow;
+        with_vault_env(|| {
+            // Nothing is at /vault on the real disk, so an empty Write is a
+            // new-file creation: allowed, and the arm is reached without error.
+            let write = write_input("/vault/note.md", Some(""), "/home/me");
+            assert_eq!(ObsidianTrashGuard.run(&write).outcome, Allow);
+            // A Write with no content field is malformed, not a truncation.
+            let missing = write_input("/vault/note.md", None, "/home/me");
+            assert_eq!(ObsidianTrashGuard.run(&missing).outcome, Allow);
+            // An Edit is not a Write, even with an empty replacement.
+            let mut edit = write_input("/vault/note.md", None, "/home/me");
+            edit.tool_name = Some("Edit".into());
+            edit.tool_input.as_mut().unwrap().new_string = Some(String::new());
+            assert_eq!(ObsidianTrashGuard.run(&edit).outcome, Allow);
+        });
+    }
+
+    #[test]
+    fn empty_write_to_a_real_vault_file_blocks_through_the_entry_point() {
+        let dir = std::env::temp_dir().join(format!("cadence-trash-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.md");
+        std::fs::write(&file, "keep me").unwrap();
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let previous = std::env::var_os("OBSIDIAN_VAULT");
+        // SAFETY: serialized by ENV_LOCK and restored below.
+        unsafe { std::env::set_var("OBSIDIAN_VAULT", &dir) };
+        let path = file.to_string_lossy().into_owned();
+        let empty = ObsidianTrashGuard.run(&write_input(&path, Some(""), "/"));
+        let real = ObsidianTrashGuard.run(&write_input(&path, Some("x"), "/"));
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OBSIDIAN_VAULT", value) },
+            None => unsafe { std::env::remove_var("OBSIDIAN_VAULT") },
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(empty.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(real.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
