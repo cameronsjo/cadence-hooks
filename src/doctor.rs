@@ -2869,6 +2869,116 @@ fn prune_liveness_gate(
     PruneGate::Blocked(names)
 }
 
+/// What the running-process check says about `--prune --apply`
+/// (cameronsjo/cadence-hooks#902, option b).
+///
+/// The registry gate cannot see two kinds of live session: one idle at the
+/// prompt past the staleness window (its peers' sweep deleted its record) and
+/// one whose cwd is outside any git repo (it never registers). A running
+/// `claude` process answers "is anyone using this" directly.
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessGate {
+    /// Every running `claude` process is accounted for by a live registry
+    /// record, or there are none.
+    Proceed,
+    /// More `claude` processes run than live records vouch for: at least one
+    /// live session is invisible to the registry. Carries the process count.
+    Unaccounted { processes: usize, registered: usize },
+    /// The process list could not be read, so nothing can be ruled out.
+    /// Carries a sanitized reason. Fails CLOSED.
+    Unknown(String),
+}
+
+/// Pure decision behind [`ProcessGate`]: `processes` is the count of running
+/// `claude` processes (or why it could not be counted), `registered` the number
+/// of distinct sessions the registries call live.
+fn prune_process_gate(processes: Result<usize, String>, registered: usize) -> ProcessGate {
+    match processes {
+        Err(reason) => ProcessGate::Unknown(reason),
+        Ok(n) if n > registered => ProcessGate::Unaccounted {
+            processes: n,
+            registered,
+        },
+        Ok(_) => ProcessGate::Proceed,
+    }
+}
+
+/// The last path component of `s`, split on both separators so a macOS `comm`
+/// (a full path) and a Windows-style one read the same.
+fn path_base(s: &str) -> &str {
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
+/// Count the `claude` processes in `ps -axo pid=,comm=,args=` output.
+///
+/// A line counts when the executable (`comm`) or the first argument is named
+/// `claude`, or when an interpreter (`node`, `bun`, `deno`) was handed a
+/// script named `claude` or a `claude-code` package path as its first
+/// argument. Deliberately narrow: `vim claude` and `grep claude` do not count.
+/// A miss under-counts, which the registry gate still backstops; a false hit
+/// only blocks, and `CADENCE_DOCTOR_PRUNE_FORCE=1` is the way out.
+fn count_claude_processes(ps_output: &str) -> usize {
+    ps_output
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let (Some(_pid), Some(comm)) = (fields.next(), fields.next()) else {
+                return false;
+            };
+            let args: Vec<&str> = fields.collect();
+            let comm = path_base(comm);
+            let argv0 = args.first().map(|a| path_base(a)).unwrap_or("");
+            if comm == "claude" || argv0 == "claude" {
+                return true;
+            }
+            matches!(comm, "node" | "bun" | "deno")
+                && args
+                    .get(1)
+                    .is_some_and(|a| path_base(a) == "claude" || a.contains("claude-code/"))
+        })
+        .count()
+}
+
+/// Count local `claude` processes via `ps`, or say why that was impossible.
+///
+/// `CADENCE_DOCTOR_PS` names the executable, a seam so tests never depend on
+/// the machine's real process table. Fails CLOSED: a missing `ps`, a spawn
+/// error, or a non-zero exit is an `Err`, never a zero count. No network.
+fn enumerate_claude_processes() -> Result<usize, String> {
+    let ps = std::env::var("CADENCE_DOCTOR_PS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ps".to_string());
+    let output = std::process::Command::new(&ps)
+        .args(["-axo", "pid=,comm=,args="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run `ps` ({e})"))?;
+    if !output.status.success() {
+        return Err(format!("`ps` exited with {}", output.status));
+    }
+    Ok(count_claude_processes(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Distinct session ids the registries call live, over both registries like
+/// [`prune_liveness_gate`].
+fn live_session_count(
+    sessions_dir: Option<&Path>,
+    global_dir: Option<&Path>,
+    stale_secs: u64,
+) -> usize {
+    let mut ids = std::collections::BTreeSet::new();
+    for dir in sessions_dir.into_iter().chain(global_dir) {
+        for peer in session_registry::live_peers(dir, "", stale_secs) {
+            ids.insert(peer.record.session_id);
+        }
+    }
+    ids.len()
+}
+
 /// The staleness window the prune gate reads sessions on: the LONGER of this
 /// process's `CADENCE_SESSION_STALE_MINUTES` and the default.
 ///
@@ -3270,7 +3380,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
     let (to_remove, kept) = if limits.is_active() {
         // Per-dir decision (cameronsjo/cadence-hooks#904). Read in dry-run too,
         // so the preview shows what `--apply` would keep.
-        let live = if gate_on && !force {
+        let mut live = if gate_on && !force {
             live_start_bound(
                 sessions_dir().as_deref(),
                 Some(global_dir.as_path()),
@@ -3279,6 +3389,46 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
         } else {
             LiveStart::None
         };
+        // A running `claude` no registry record vouches for (idle past the
+        // window, or outside any repo) cannot say when it loaded its plugins,
+        // so every dir it could be reading stays (cameronsjo/cadence-hooks#902).
+        // An unreadable process list refuses `--apply` outright.
+        if gate_on && !force {
+            let registered = live_session_count(
+                sessions_dir().as_deref(),
+                Some(global_dir.as_path()),
+                stale_secs,
+            );
+            match prune_process_gate(enumerate_claude_processes(), registered) {
+                ProcessGate::Proceed => {}
+                ProcessGate::Unaccounted {
+                    processes,
+                    registered,
+                } => {
+                    let note = format!(
+                        "{} running claude process(es) but {} live session record(s)",
+                        processes, registered
+                    );
+                    live = match live {
+                        LiveStart::Unknown(mut names) => {
+                            names.push(note);
+                            LiveStart::Unknown(names)
+                        }
+                        _ => LiveStart::Unknown(vec![note]),
+                    };
+                }
+                ProcessGate::Unknown(reason) => {
+                    if apply {
+                        eprintln!(
+                            "cadence-hooks doctor --prune --apply: refusing to prune — cannot tell whether other claude sessions are running: {reason}. \
+                             Re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway."
+                        );
+                        return 0;
+                    }
+                    live = LiveStart::Unknown(vec![format!("running sessions unknown: {reason}")]);
+                }
+            }
+        }
         if let LiveStart::Unknown(names) = &live {
             let shown: Vec<String> = names.iter().take(MAX_NAMED_PEERS).cloned().collect();
             let more = names.len().saturating_sub(shown.len());
@@ -3351,6 +3501,36 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
                     names.join(", ")
                 );
                 return 0;
+            }
+            // The registry cannot see a session idle past its window or one
+            // outside any repo; a running `claude` process can
+            // (cameronsjo/cadence-hooks#902).
+            if !force {
+                let registered = live_session_count(
+                    sessions_dir().as_deref(),
+                    Some(global_dir.as_path()),
+                    stale_secs,
+                );
+                match prune_process_gate(enumerate_claude_processes(), registered) {
+                    ProcessGate::Proceed => {}
+                    ProcessGate::Unaccounted {
+                        processes,
+                        registered,
+                    } => {
+                        eprintln!(
+                            "cadence-hooks doctor --prune --apply: refusing to prune — {processes} claude process(es) are running but only {registered} live session record(s) account for them, so a session idle past the staleness window or outside any git repo may be pinned to these version dirs. \
+                             End those sessions, or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway."
+                        );
+                        return 0;
+                    }
+                    ProcessGate::Unknown(reason) => {
+                        eprintln!(
+                            "cadence-hooks doctor --prune --apply: refusing to prune — cannot tell whether other claude sessions are running: {reason}. \
+                             Re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway."
+                        );
+                        return 0;
+                    }
+                }
             }
         }
         (dirs, 0)
@@ -7317,6 +7497,57 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(outside.exists(), "outside dir must survive");
         assert!(outside.join("keepme").exists());
+    }
+
+    // ── prune process gate (#902) ───────────────────────────────────────────
+
+    #[test]
+    fn count_claude_processes_table() {
+        // (ps output, expected count)
+        let cases: Vec<(&str, usize)> = vec![
+            ("", 0),
+            ("  10 claude claude --resume\n", 1),
+            ("  10 /usr/local/bin/claude /usr/local/bin/claude\n", 1),
+            ("  10 node node /opt/claude-code/cli.js --x\n", 1),
+            (
+                "  10 node node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js\n",
+                1,
+            ),
+            ("  10 node node /home/u/bin/claude\n", 1),
+            (
+                "  10 bash -bash\n  11 vim vim claude\n  12 grep grep claude\n",
+                0,
+            ),
+            ("  10 node node server.js claude\n", 0),
+            (
+                "  10 claude claude\n  11 claude claude\n  12 sshd sshd\n",
+                2,
+            ),
+            ("garbage\n\n", 0),
+        ];
+        for (out, want) in cases {
+            assert_eq!(count_claude_processes(out), want, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn prune_process_gate_table() {
+        // (processes, registered live sessions, verdict)
+        assert_eq!(prune_process_gate(Ok(0), 0), ProcessGate::Proceed);
+        assert_eq!(prune_process_gate(Ok(2), 2), ProcessGate::Proceed);
+        assert_eq!(prune_process_gate(Ok(1), 3), ProcessGate::Proceed);
+        assert_eq!(
+            prune_process_gate(Ok(3), 2),
+            ProcessGate::Unaccounted {
+                processes: 3,
+                registered: 2
+            }
+        );
+        assert_eq!(
+            prune_process_gate(Err("no ps".into()), 5),
+            ProcessGate::Unknown("no ps".into()),
+            "an unreadable process list fails closed even with registered sessions"
+        );
     }
 
     // ── prune_liveness_gate (#305) ──────────────────────────────────────────

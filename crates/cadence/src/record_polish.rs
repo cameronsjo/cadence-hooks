@@ -53,8 +53,8 @@
 use cadence_hooks_core::branch_diff::{WorkingTreeDigest, working_tree_digest};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::markers::{
-    ArmAttestation, MAX_REPORT_BYTES, MAX_TOKEN_BYTES, is_arm_token, is_report_path, polish_marker,
-    read_polish_record, write_marker,
+    ArmAttestation, MAX_REPORT_BYTES, MAX_SKIP_REASON_BYTES, MAX_TOKEN_BYTES, is_arm_token,
+    is_report_path, is_skip_reason, polish_marker, read_polish_record, write_marker,
 };
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::time::utc_timestamp;
@@ -414,6 +414,20 @@ fn marker_content(
     v.to_string()
 }
 
+/// The dispositioned-skip marker body (cadence-hooks#787): the same
+/// `branch`/`head_sha`/`recorded_at` provenance as a run record, plus
+/// `skip_reason`. Deliberately carries no `scope`, roster, or digest — a skip
+/// reviewed nothing, and the gate must not read a run's claims into it.
+fn skip_marker_content(branch: &str, head_sha: &str, reason: &str) -> String {
+    json!({
+        "branch": branch,
+        "head_sha": head_sha,
+        "recorded_at": utc_timestamp(),
+        "skip_reason": reason,
+    })
+    .to_string()
+}
+
 /// One-line success verdict: the marker path (the payload a caller probes to
 /// confirm the pre-PR gate is satisfied) plus the (repo@branch, scope) key —
 /// and the arm roster when one was recorded, so the caller sees what the gate
@@ -463,6 +477,7 @@ fn record_verdict(
 /// A usage error is the caller mis-spelling the record rather than the
 /// environment degrading, and recording it anyway would land a marker the gate
 /// silently misreads (cadence-hooks#775).
+#[allow(clippy::too_many_arguments)]
 pub fn run_record(
     repo_root: Option<String>,
     branch: Option<String>,
@@ -471,7 +486,34 @@ pub fn run_record(
     arm_model: Vec<String>,
     arm_report: Vec<String>,
     fresh: bool,
+    skip: Option<String>,
 ) -> u8 {
+    // A dispositioned skip (cadence-hooks#787) is a different record, not a
+    // modifier of a run: mixing the two would store a roster or scope beside a
+    // "skipped" claim. Both usage errors are checked BEFORE any resolution.
+    if let Some(reason) = skip.as_deref() {
+        if scope.is_some()
+            || !arm.is_empty()
+            || !arm_model.is_empty()
+            || !arm_report.is_empty()
+            || fresh
+        {
+            eprintln!(
+                "cadence-hooks record-polish: --skip records a dispositioned skip and cannot be \
+                 combined with --scope, --arm, --arm-model, --arm-report, or --fresh — no marker \
+                 recorded."
+            );
+            return 2;
+        }
+        if !is_skip_reason(reason) {
+            eprintln!(
+                "cadence-hooks record-polish: invalid --skip reason {reason:?} — state why the \
+                 pass is skipped (not empty, n/a, none, -, or .), at most {MAX_SKIP_REASON_BYTES} \
+                 bytes of [A-Za-z0-9 .,:;()/_'#=+-] — no marker recorded."
+            );
+            return 2;
+        }
+    }
     // Validated BEFORE any resolution or write — mirrors `redact-scan`, whose
     // `--audience` check precedes even `--init`.
     let scope = match validate_scope(scope.as_deref()) {
@@ -547,6 +589,27 @@ pub fn run_record(
             return 1;
         }
     };
+
+    if let Some(reason) = skip.as_deref() {
+        let content = skip_marker_content(&branch, &head_sha, reason);
+        let path = polish_marker(&repo_root, &branch);
+        return match write_marker(&path, &content) {
+            Ok(()) => {
+                cadence_hooks_core::outln!(
+                    "recorded polish SKIP marker: {} ({repo_root:?}@{branch:?} reason={reason:?})",
+                    path.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!(
+                    "cadence-hooks record-polish: marker write failed ({e}) — this record did \
+                     not land."
+                );
+                1
+            }
+        };
+    }
 
     let incoming_arms = parse_arms(&arm);
     let prior = read_polish_record(&repo_root, &branch);
@@ -777,6 +840,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             assert_eq!(code, 2, "an invalid --scope is a usage error");
@@ -804,6 +868,7 @@ mod tests {
                     vec![],
                     vec![],
                     false,
+                    None,
                 );
                 assert_eq!(code, 0, "{scope} must be accepted");
                 let content = std::fs::read_to_string(polish_marker(repo, &branch)).unwrap();
@@ -859,6 +924,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -868,6 +934,7 @@ mod tests {
                 vec![],
                 vec![],
                 true,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -931,6 +998,7 @@ mod tests {
                 vec![],
                 vec![],
                 true,
+                None,
             );
 
             let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
@@ -964,6 +1032,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -973,6 +1042,7 @@ mod tests {
                 vec![],
                 vec![],
                 true,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1103,6 +1173,7 @@ mod tests {
                 vec!["security=opus".into()],
                 vec!["security=/tmp/x.md".into()],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
@@ -1133,6 +1204,7 @@ mod tests {
                 vec!["security=opus".into(), "tests=sonnet".into()],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -1142,6 +1214,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
@@ -1172,6 +1245,7 @@ mod tests {
                 vec!["security=opus".into()],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -1181,6 +1255,7 @@ mod tests {
                 vec![],
                 vec![],
                 true,
+                None,
             );
 
             let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
@@ -1209,6 +1284,7 @@ mod tests {
                 vec!["security=opus".into()],
                 vec![format!("security={}", report.display())],
                 false,
+                None,
             );
 
             let record = read_polish_record(repo, branch).expect("marker reads");
@@ -1240,6 +1316,7 @@ mod tests {
                 vec![],
                 vec!["security=/tmp/definitely-not-here-775.md".into()],
                 false,
+                None,
             );
 
             assert_eq!(code, 0, "a missing report must not fail the record");
@@ -1280,6 +1357,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1315,6 +1393,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
@@ -1365,6 +1444,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let state = GitState::resolve(dir).expect("repo resolves");
@@ -1425,6 +1505,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             assert!(path.is_file(), "marker should exist at {path:?}");
@@ -1457,6 +1538,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -1466,6 +1548,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1492,6 +1575,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             run_record(
                 Some(repo.into()),
@@ -1501,6 +1585,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1526,6 +1611,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1551,6 +1637,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1576,6 +1663,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -1608,6 +1696,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 0, "an attached checkout records");
             // Also the positive control for `marker_dir_has_any_file`: the
@@ -1677,6 +1766,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 1, "a detached HEAD records nothing, so it is not 0");
             assert!(
@@ -1719,6 +1809,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 2, "a branch git itself refuses is a usage error");
             assert!(
@@ -1742,6 +1833,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 2, "an empty --branch is a usage error");
             assert!(!marker_dir_has_any_file(marker_tmp.path()));
@@ -1768,6 +1860,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 0, "a C1 branch is git-legal and must record");
             assert!(polish_marker(repo, branch).is_file());
@@ -1802,6 +1895,7 @@ mod tests {
                 vec![],
                 vec![],
                 false,
+                None,
             );
             assert_eq!(code, 1, "a failed write recorded nothing, so it is not 0");
             assert!(path.is_dir(), "the blocker must still be what it was");

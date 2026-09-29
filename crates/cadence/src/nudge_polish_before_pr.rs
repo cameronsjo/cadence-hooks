@@ -164,6 +164,10 @@ pub enum MarkerState {
     /// a recycled branch name would otherwise inherit its predecessor's record
     /// (cadence-hooks#775).
     Expired,
+    /// A marker written by `record-polish --skip <reason>` (cadence-hooks#787):
+    /// the branch was dispositioned as a skip, with a stated, charset-bounded
+    /// reason. Satisfies the nudge and echoes the reason.
+    Skipped { reason: String },
     /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
     ///
     /// `security_model` is the attested model family for the security arm
@@ -251,6 +255,9 @@ fn judge_target(target: &MarkerTarget) -> Verdict {
         },
         (_, false, _) => MarkerState::Absent,
         (_, true, Some(record)) if record.is_expired() => MarkerState::Expired,
+        (_, true, Some(record)) if record.skip_reason.is_some() => MarkerState::Skipped {
+            reason: record.skip_reason.clone().unwrap_or_default(),
+        },
         (_, true, record) => MarkerState::Present {
             security_ran: record.as_ref().and_then(|r| r.security_ran()),
             security_model: record.as_ref().and_then(attested_security_family),
@@ -263,14 +270,13 @@ fn judge_target(target: &MarkerTarget) -> Verdict {
     // Advisory annotations ride the otherwise-silent allow — they never
     // escalate a verdict (ADR-0001).
     let mut annotations = Vec::new();
-    if present {
-        // #775 item 7: a non-private marker dir makes `read_polish_marker`
-        // return `None` while presence still passes, so the whole roster
-        // mechanism dies with no signal. Only the dir path is named — never
-        // its contents.
-        if !marker_dir_is_private() {
-            annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
-        }
+    // #775 item 7, reshaped by #565: a non-private marker dir means no marker
+    // is trusted at all (presence needs the private dir too), so the gate reads
+    // absent — and says why, since a nudge on a branch that visibly WAS
+    // polished otherwise reads as a false positive. Only the dir path is
+    // named — never its contents.
+    if !marker_dir_is_private() {
+        annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
     }
     // The diff subprocess is handed to `judge` as a LAZY predicate, so it
     // runs only when a guard actually consults it — the common full-polish
@@ -427,12 +433,17 @@ fn decide(
 enum Verdict {
     CannotCheck(String),
     Absent,
+    /// Absent because the marker dir is degraded (cadence-hooks#565): carries
+    /// the degrade annotation to prepend to the no-polish nudge.
+    AbsentDegraded(String),
     Expired,
     SecuritySkipped,
     WrongFamily(String),
     StaleMarker,
     UnknownRoster,
     UnattestedSecurity,
+    /// A recorded dispositioned skip: satisfies the gate, echoes the reason.
+    Skipped(String),
     /// A clean allow that carries advisory annotations as exit-0 context.
     AllowAnnotated(String),
     Allow,
@@ -445,12 +456,16 @@ impl Verdict {
             // would read as "checked and fine" (cadence-hooks#995).
             Verdict::CannotCheck(reason) => CheckResult::nudge(cannot_check_message(&reason)),
             Verdict::Absent => CheckResult::nudge(nudge_message()),
+            Verdict::AbsentDegraded(note) => {
+                CheckResult::nudge(format!("{note} {}", nudge_message()))
+            }
             Verdict::Expired => CheckResult::nudge(expired_nudge_message()),
             Verdict::SecuritySkipped => CheckResult::nudge(security_nudge_message()),
             Verdict::WrongFamily(family) => CheckResult::nudge(wrong_family_nudge_message(&family)),
             Verdict::StaleMarker => CheckResult::nudge(stale_marker_nudge_message()),
             Verdict::UnknownRoster => CheckResult::nudge(unknown_roster_nudge_message()),
             Verdict::UnattestedSecurity => CheckResult::nudge(unattested_security_nudge_message()),
+            Verdict::Skipped(reason) => CheckResult::nudge(skipped_message(&reason)),
             Verdict::AllowAnnotated(annotations) => CheckResult::nudge(annotations),
             Verdict::Allow => CheckResult::allow(),
         }
@@ -466,9 +481,13 @@ fn judge(
     annotations: &[String],
 ) -> Verdict {
     match marker {
+        MarkerState::Absent if !annotations.is_empty() => {
+            Verdict::AbsentDegraded(annotations.join(" "))
+        }
         MarkerState::Absent => Verdict::Absent,
         MarkerState::CannotCheck { reason } => Verdict::CannotCheck(reason),
         MarkerState::Expired => Verdict::Expired,
+        MarkerState::Skipped { reason } => Verdict::Skipped(reason),
         MarkerState::Present {
             security_ran: Some(false),
             ..
@@ -573,6 +592,17 @@ fn cannot_check_message(reason: &str) -> String {
     format!(
         "Can't check polish for this PR: {reason}. Confirm `/polish` (with its security arm) \
          completed in the checkout that owns the branch."
+    )
+}
+
+/// The cadence-hooks#787 context line for a recorded dispositioned skip. The
+/// gate is satisfied; this only shows the reader what was recorded. `reason`
+/// is bounded on the read side ([`cadence_hooks_core::markers::is_skip_reason`]),
+/// which is what makes it safe to echo into `additionalContext`.
+fn skipped_message(reason: &str) -> String {
+    format!(
+        "Polish was dispositioned as a skip for this branch: {reason}. The polish gate is \
+         satisfied; a reviewer can veto the skip. Advisory only."
     )
 }
 
@@ -2251,9 +2281,9 @@ mod tests {
 
     #[test]
     fn run_degraded_marker_dir_announces_itself() {
-        // #775 RED: on a non-private marker dir `read_polish_record` returns
-        // None while presence still passes, so the roster mechanism dies
-        // silently — every gate read degrades with no signal at all.
+        // #775 RED, reshaped by #565: a non-private marker dir is not trusted
+        // for presence either, so a planted marker reads as absent and the
+        // nudge names the degraded dir instead of looking like a false alarm.
         let (tmp, root) = init_repo_on_branch("feat/degraded-dir");
         let base = tempfile::tempdir().unwrap();
         // Occupy the per-user hashed subdir with a regular file so
@@ -2276,6 +2306,10 @@ mod tests {
             assert!(
                 msg.contains(&marker_dir().display().to_string()),
                 "the degrade must name the marker dir: {msg}"
+            );
+            assert!(
+                msg.contains("No polish recorded"),
+                "a planted marker on a degraded dir must not satisfy the gate: {msg}"
             );
         });
     }
