@@ -70,3 +70,28 @@ fn process_gh_host_moves_the_default_host_and_hostname_outranks_it() {
         );
     }
 }
+
+/// Once the shell inherits `GH_HOST`, the variable is already exported, so a
+/// bare assignment in an earlier segment reaches gh (#548). And `unset` then
+/// hands gh a default this guard never read, so it resolves to an unknown host.
+#[test]
+fn inherited_gh_host_makes_a_bare_assignment_reach_gh() {
+    for command in [
+        "GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+        "unset GH_HOST; gh pr create -R cameronsjo/x --title t",
+    ] {
+        assert_eq!(
+            guard(command, "git.sjo.lol"),
+            2,
+            "inherited GH_HOST is exported: {command}"
+        );
+    }
+    assert_eq!(
+        guard(
+            "GH_HOST=git.sjo.lol; gh pr create -R cameronsjo/x --title t",
+            "git.sjo.lol"
+        ),
+        0,
+        "re-assigning the inherited host changes nothing"
+    );
+}
