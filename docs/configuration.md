@@ -318,7 +318,7 @@ yet tracked, so the guard judges the write against the default host. A bare
 `GH_HOST=...; gh ...` needs no tracking: without `export` it stays a shell
 variable that gh never sees, so the guard and gh already agree.
 
-**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`.
+**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 
 **Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
 

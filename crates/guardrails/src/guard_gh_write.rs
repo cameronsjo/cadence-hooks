@@ -1889,6 +1889,39 @@ fn repo_has_unexpanded_expansion(repo: &str) -> bool {
     repo.contains('$') || repo.contains('`')
 }
 
+/// Build the block message for a gh write in a fork whose remotes are not both
+/// owned. Each remote is `(host, owner/repo, owned)`.
+///
+/// Only an OWNED remote is offered as a `-R` fix. Suggesting `-R <upstream>`
+/// for an upstream off the allowlist sent the operator straight into this
+/// guard's own unowned-target block (#1032), so an unowned remote instead gets
+/// the path that actually works: the user runs that write themselves.
+fn fork_block_message(origin: (&str, &str, bool), upstream: (&str, &str, bool)) -> String {
+    let (origin_host, origin_repo, origin_owned) = origin;
+    let (upstream_host, upstream_repo, upstream_owned) = upstream;
+    let line = |label: &str, repo: &str, owned: bool| {
+        if repo.is_empty() {
+            format!("The {label} remote URL could not be parsed, so it cannot be targeted here")
+        } else if owned {
+            format!("Use -R {repo} to target {label}")
+        } else {
+            format!(
+                "{repo} is not on your allowlist, so `-R {repo}` is blocked too — if the user \
+                 intends to write to {label}, write the command for them to run themselves"
+            )
+        }
+    };
+    format!(
+        "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
+         Fork:     {origin_host}/{origin_repo}\n   \
+         Upstream: {upstream_host}/{upstream_repo}\n\n   \
+         {}\n   \
+         {}",
+        line("your fork", origin_repo, origin_owned),
+        line("upstream", upstream_repo, upstream_owned),
+    )
+}
+
 /// Resolve and judge a single gh write segment's target. Returns `Some(block)`
 /// when the segment targets a repo outside the allowlist (or one that can't be
 /// resolved), `None` when it's allowed. Per-segment resolution is what stops a
@@ -1920,12 +1953,19 @@ fn judge_write_segment(
             ) {
                 None
             } else {
-                Some(CheckResult::block(format!(
-                    "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
-                     Fork:     {origin_host}/{origin}\n   \
-                     Upstream: {upstream_host}/{upstream}\n\n   \
-                     Use -R {origin} to target your fork\n   \
-                     Use -R {upstream} to target upstream (if intended)"
+                let owned = |host: &str, repo: &str| {
+                    !repo.is_empty()
+                        && is_allowed_with_extras(
+                            host,
+                            repo,
+                            allowed_owners,
+                            allowed_repos,
+                            extra_hosts,
+                        )
+                };
+                Some(CheckResult::block(fork_block_message(
+                    (&origin_host, &origin, owned(&origin_host, &origin)),
+                    (&upstream_host, &upstream, owned(&upstream_host, &upstream)),
                 )))
             }
         }
@@ -5977,6 +6017,68 @@ mod tests {
                 "/tmp",
             ));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // --- #1032: the fork block offers `-R` only for an owned remote ---
+
+    #[test]
+    fn fork_message_does_not_offer_an_unowned_upstream() {
+        let message = fork_block_message(
+            ("github.com", "cameronsjo/x", true),
+            ("github.com", "other/x", false),
+        );
+        assert!(message.contains("Use -R cameronsjo/x to target your fork"));
+        assert!(!message.contains("Use -R other/x"), "{message}");
+        assert!(message.contains("run themselves"), "{message}");
+    }
+
+    #[test]
+    fn fork_message_offers_whichever_remote_is_owned() {
+        let message = fork_block_message(
+            ("github.com", "other/x", false),
+            ("github.com", "cameronsjo/x", true),
+        );
+        assert!(message.contains("Use -R cameronsjo/x to target upstream"));
+        assert!(!message.contains("Use -R other/x"), "{message}");
+        let unparsed = fork_block_message(("", "", false), ("github.com", "other/x", false));
+        assert!(!unparsed.contains("Use -R"), "{unparsed}");
+        assert!(unparsed.contains("could not be parsed"), "{unparsed}");
+    }
+
+    #[test]
+    fn fork_block_from_a_real_checkout_omits_the_unowned_upstream_fix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs")
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cameronsjo/x.git",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/other/x.git",
+        ]);
+        let cwd = dir.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with("gh pr create --title t", cwd));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            assert!(message.contains("Write operation in a fork"), "{message}");
+            assert!(message.contains("Use -R cameronsjo/x"), "{message}");
+            assert!(!message.contains("Use -R other/x"), "{message}");
         });
     }
 
