@@ -584,7 +584,7 @@ pub fn run_record(
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
         Ok(()) => {
-            println!(
+            cadence_hooks_core::outln!(
                 "{}",
                 record_verdict(&repo_root, &branch, &scope, &arms, &path)
             );

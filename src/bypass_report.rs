@@ -460,7 +460,7 @@ pub(crate) fn print_bypass_status() {
     let bypass_raw = std::env::var(bypass::BYPASS_VAR).ok();
     let disable_raw = std::env::var(bypass::DISABLE_VAR).ok();
     for line in bypass_status_lines(bypass_raw.as_deref(), disable_raw.as_deref()) {
-        println!("{line}");
+        cadence_hooks_core::outln!("{line}");
     }
 }
 
@@ -470,7 +470,7 @@ pub(crate) fn print_quiet_status() {
     let bypass_raw = std::env::var(bypass::BYPASS_VAR).ok();
     let disable_raw = std::env::var(bypass::DISABLE_VAR).ok();
     for line in quiet_status_lines(bypass_raw.as_deref(), disable_raw.as_deref()) {
-        println!("{line}");
+        cadence_hooks_core::outln!("{line}");
     }
 }
 
