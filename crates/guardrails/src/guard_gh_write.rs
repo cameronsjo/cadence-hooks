@@ -9,9 +9,9 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
-    carries_substitution, command_segments, command_segments_with_dirs, command_word,
-    contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
+    COMMAND_RUNNERS, CommandWordVariables, GhRepoFlag, LOOP_PATTERN, TRANSPARENT,
+    brace_expansion_overflows, carries_substitution, command_segments, command_segments_with_dirs,
+    command_word, contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
     strip_quotes, tokenize,
 };
@@ -3496,7 +3496,11 @@ fn judge_write_segments(
     // and a segment that may run in several directories arrives once per
     // directory, back to back, as does every `f` of an `f; f; …` flood.
     let mut observed: Option<String> = None;
+    // `G=gh; $G pr create` runs gh: read a variable command word as the `gh`
+    // the same command assigned it. Unreadable or unassigned stays as written.
+    let mut word_variables = CommandWordVariables::for_command(command);
     for (segment, dir) in segments {
+        let segment = word_variables.resolve_gh(&segment).unwrap_or(segment);
         // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
         // it decides which host every later gh write reaches (#548). A gh
         // segment is a child process and cannot change it.
@@ -8409,6 +8413,108 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// A `gh` named through a variable is judged as `gh`
+    /// (cameronsjo/cadence-hooks#1171). Every row is `(command, run from the
+    /// owned checkout?, blocks?)`; the unowned checkout blocks a bare write.
+    /// A variable never assigned, or assigned something unreadable, is the
+    /// accepted gap and stays allowed.
+    #[test]
+    fn a_variable_command_word_is_judged_as_the_gh_it_was_assigned() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, in_owned, blocks) in [
+                ("G=gh; $G pr create -t x", false, true),
+                ("G=gh; \"$G\" pr create -t x", false, true),
+                ("G=gh; ${G} pr create -t x", false, true),
+                ("G=gh; \"${G}\" pr create -t x", false, true),
+                ("export G=gh; $G pr create -t x", false, true),
+                ("G=/usr/bin/gh; $G pr create -t x", false, true),
+                ("G='gh'; $G pr create -t x", false, true),
+                ("G=gh\n$G pr create -t x", false, true),
+                ("G=gh; { $G pr create -t x; }", false, true),
+                ("G=gh; X=1 $G pr create -t x", false, true),
+                ("G=gh; $G -R evil/x pr create -t x", true, true),
+                ("G=gh; $G issue comment 1 -b x", false, true),
+                ("G=ls; G=gh; $G pr create -t x", false, true),
+                ("sh -c 'G=gh; $G pr create -t x'", false, true),
+                // Controls: owned target, read-only verb, not gh.
+                ("G=gh; $G pr create -t x", true, false),
+                ("G=gh; $G pr create -R cameronsjo/x -t x", false, false),
+                ("G=gh; $G pr view 1", false, false),
+                ("G=ls; $G pr create -t x", false, false),
+                // The accepted gap: never assigned, or unreadable.
+                ("$G pr create -t x", false, false),
+                ("G=$(which gh); $G pr create -t x", false, false),
+                ("G=\"g$H\"; $G pr create -t x", false, false),
+                ("read G; $G pr create -t x", false, false),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
+                let cwd = if in_owned { o } else { u };
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A relative `cd` target searches `CDPATH`, so where the write runs is
+    /// unknown and it blocks (cameronsjo/cadence-hooks#1171). `CDPATH` is
+    /// pinned in the same lock as the owner allowlist. Rows are `(CDPATH in
+    /// the hook env, command, blocks?)`, run from the owned checkout.
+    #[test]
+    fn a_cd_that_cdpath_may_redirect_blocks_the_write_after_it() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let o = owned.path().to_str().unwrap();
+        for (cdpath, command, blocks) in [
+            (Some("/elsewhere"), "cd sub && gh pr create -t x", true),
+            (Some("/elsewhere"), "cd sub\ngh pr create -t x", true),
+            (Some("/elsewhere"), "pushd sub; gh pr create -t x", true),
+            (None, "CDPATH=/e; cd sub; gh pr create -t x", true),
+            (None, "export CDPATH=/e; cd sub; gh pr create -t x", true),
+            (None, "CDPATH=/e cd sub; gh pr create -t x", true),
+            // Not searched: `.` and absolute (`..`, `./…`, `../…` are pinned in
+            // the walk's own table).
+            (Some("/elsewhere"), "cd . && gh pr create -t x", false),
+            (
+                Some("/elsewhere"),
+                "cd /nope && gh pr create -R cameronsjo/x -t x",
+                false,
+            ),
+            // Unset or empty CDPATH: unchanged.
+            (None, "cd sub && gh pr create -R cameronsjo/x -t x", false),
+            (
+                Some(""),
+                "cd sub && gh pr create -R cameronsjo/x -t x",
+                false,
+            ),
+            // A write that names its target is not moved by the cd.
+            (
+                Some("/elsewhere"),
+                "cd sub && gh pr create -R cameronsjo/x -t x",
+                false,
+            ),
+        ] {
+            let mut env = owners_env().to_vec();
+            env.push(("CDPATH", cdpath));
+            with_env(&env, || {
+                let result = GhWriteGuard.run(&input_with(command, o));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "CDPATH={cdpath:?} {command}: {:?}",
+                    result.message
+                );
+            });
+        }
     }
 
     /// The fast paths decline only segments the full reading declines too.
