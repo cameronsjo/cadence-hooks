@@ -333,7 +333,11 @@ so the write blocks:
 - Inside a subshell, function body, or case arm, a declaring or name-writing
   builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
   fails closed wherever the command position is not recognized.
-- Any `trap`, whose body runs later from a string.
+- A `trap` action or an `eval` string that sets it. Both are read like a
+  command. An `eval` or `trap` whose command word comes from an expansion is
+  text the guard cannot read, so it also blocks: `eval "$X"`, `eval "$(…)"`,
+  `` eval `…` ``. That includes `eval "$(direnv export bash)"` and
+  `eval "$(ssh-agent -s)"` in front of a `-R` write.
 - A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
   names `GH_HOST` or declares a non-literal name.
 - An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
@@ -346,7 +350,9 @@ so the write blocks:
 
 A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
 command's own `--title` or `--body`. A gh segment runs as a child process, so it
-is never read for changes. A `source`d file is not read.
+is never read for changes. A `source`d file is not read. That includes a file
+written earlier in the same command, the same class as `source
+.venv/bin/activate`.
 
 **Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 

