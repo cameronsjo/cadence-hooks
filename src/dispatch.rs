@@ -408,7 +408,7 @@ fn decide_member(
         );
         cadence_hooks_metrics::log_timing(
             hook_name,
-            crate::registry::namespace_of(hook_name).unwrap_or("unknown"),
+            crate::registry::namespace_of(hook_name),
             event.name(),
             started.elapsed().as_millis(),
             input.session_id(),
@@ -940,7 +940,7 @@ pub fn run_logged_logger(
     log_deadline_degradation(hook.unwrap_or("unknown"), namespace, false);
     cadence_hooks_metrics::log_timing(
         hook.unwrap_or("unknown"),
-        namespace.unwrap_or("metrics"),
+        namespace,
         "logger",
         started.elapsed().as_millis(),
         session_id.as_deref(),
