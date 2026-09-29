@@ -10328,6 +10328,22 @@ mod tests {
     }
 
     #[test]
+    fn segment_write_scan_reads_escaped_or_paired_dollar_quote_as_plain() {
+        // `\$'a\'` and `$$'a\'` end at the second `'` in bash, so the `>` after
+        // them is a live redirect (`bash -c` writes `out` for both). Reading
+        // the `'` as `$'…'` honoured `\'` and hid the write.
+        for (segment, writes) in [
+            (r"echo $$'a\' >out", true),
+            (r"echo \$'a\' >out", true),
+            (r"echo $$$'a\' >out'", false),
+            (r"echo $'a\' >out'", false),
+            (r"echo 'a\' >out", true),
+        ] {
+            assert_eq!(segment_writes_a_file(segment), writes, "{segment:?}");
+        }
+    }
+
+    #[test]
     fn escaped_or_doubled_dollar_does_not_open_ansi_c_quoting() {
         // #815 delta review I3: `\$'` and `$$'` open a PLAIN single-quoted
         // string, where `\` is literal — reading it as `$'…'` skipped the

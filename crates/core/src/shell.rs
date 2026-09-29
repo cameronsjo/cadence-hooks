@@ -12875,6 +12875,122 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_escaped_or_paired_dollar_opens_a_plain_single_quote() {
+        // bash's `$'…'` needs a `$` that is itself syntax: an escaped `\$` or
+        // the second `$` of `$$` is text, and the `'` after it opens a PLAIN
+        // single-quoted string where `\` is literal. Every row's expected text
+        // is what `printf '%s\n'` prints under bash 5.2 (with `$$` kept as
+        // written), except that the tokenizer keeps an unquoted backslash.
+        let cases: &[(&str, &[&str])] = &[
+            // The canary: bash prints the one word `$a\b c`.
+            (r"\$'a\'b' c'", &[r"\$a\b c"]),
+            (r"$$'a\'b' c'", &[r"$$a\b c"]),
+            (r"a$$'b'", &["a$$b"]),
+            (r"x\$'y'z", &[r"x\$yz"]),
+            (r"\$'\n'", &[r"\$\n"]),
+            (r"$\$'x'", &[r"$\$x"]),
+            (r"\\\$'a\'b' c'", &[r"\\\$a\b c"]),
+            // An odd `$` run ends in a sigil; a backslash pair escapes itself.
+            (r"$$$'a\'b'", &["$$a'b"]),
+            (r"$$$$'x'", &["$$$$x"]),
+            (r"\\$'a\'b'", &[r"\\a'b"]),
+            (r"$'a\'b'", &["a'b"]),
+            // The phantom quote no longer swallows the next command's words.
+            (r"echo $$'a\' ; cat x", &["echo", r"$$a\", ";", "cat", "x"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(tokenize(command), *want, "tokenize({command:?})");
+        }
+    }
+
+    #[test]
+    fn segmenters_read_escaped_or_paired_dollar_quote_as_plain() {
+        // `\$'a\'` and `$$'a\'` end at the second `'` in bash, so the `;`
+        // after them separates a command bash runs (`bash -c` with
+        // `echo RAN` in place of `cat x` prints RAN for every row). Reading
+        // the `'` as `$'…'` honoured `\'` and swallowed the rest.
+        let cases: &[(&str, &[&str])] = &[
+            (r"echo $$'a\' ; cat x", &[r"echo $$'a\'", "cat x"]),
+            (r"echo \$'a\' ; cat x", &[r"echo \$'a\'", "cat x"]),
+            (r"echo $$'a\' && cat x", &[r"echo $$'a\'", "cat x"]),
+            // A `#` bash reads inside `' # '` is not a comment.
+            (r"echo $$'a\'' # '; cat x", &[r"echo $$'a\'' # '", "cat x"]),
+            // Control: a real `$'…'` still honours `\'`.
+            (r"echo $$$'a\' ; cat x'", &[r"echo $$$'a\' ; cat x'"]),
+            (r"echo $'a\'' # '; cat x", &[r"echo $'a\''"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(
+                split_segments(command),
+                *want,
+                "split_segments({command:?})"
+            );
+        }
+        // The comment scanner reads the same boundary: bash's `' # '` is quoted.
+        assert_eq!(
+            strip_comments(r"echo $$'a\'' # '; cat x"),
+            r"echo $$'a\'' # '; cat x"
+        );
+        assert_eq!(strip_comments(r"echo $'a\'' # '; cat x"), r"echo $'a\'' ");
+        assert_eq!(strip_quotes(r"echo $$'a\' ; x"), "echo $$ ; x");
+        assert_eq!(strip_quotes(r"echo \$'a\' ; x"), r"echo \$ ; x");
+        assert_eq!(strip_quotes(r"echo $'a\' ; x'"), "echo $");
+    }
+
+    #[test]
+    fn redirect_target_after_escaped_or_paired_dollar_is_a_plain_string() {
+        // `> $$'a\x'` writes `<pid>a\x` and `> \$'.en\x76'` writes `$.en\x76`:
+        // no ANSI-C decoding of a string whose `$` is text.
+        assert_eq!(redirect_targets(r"echo hi > $$'a\x'"), vec![r"$$a\x"]);
+        assert_eq!(redirect_targets(r"echo hi > $'.en\x76'"), vec![".env"]);
+    }
+
+    #[test]
+    fn heredoc_delimiter_keeps_a_paired_dollar() {
+        // `<<$$'E'` and `<<$$"E"` end at the line `$$E` in bash; `<<\$'E'` at
+        // `$E`; `<<$$$'E'` at `$$E`.
+        let cases: &[(&str, &str)] = &[
+            (r"<<$$'E'", "$$E"),
+            (r#"<<$$"E""#, "$$E"),
+            (r"<<\$'E'", "$E"),
+            (r#"<<\$"E""#, "$E"),
+            (r"<<$$$'E'", "$$E"),
+            (r"<<$'E'", "E"),
+        ];
+        for (text, want) in cases {
+            let chars: Vec<char> = text.chars().collect();
+            let got = heredoc_delimiter(&chars, 2).map(|d| d.word);
+            assert_eq!(got.as_deref(), Some(*want), "{text:?}");
+        }
+        // The body line `$E` is data under `<<$$'E'`; `cat x` stays in the body.
+        let stripped = strip_heredoc_bodies("cat <<$$'E'\n$E\ncat x\n$$E\necho after");
+        assert!(!stripped.contains("cat x"), "{stripped:?}");
+        assert!(stripped.contains("echo after"), "{stripped:?}");
+    }
+
+    #[test]
+    fn escaped_or_paired_dollar_quote_flood_stays_linear() {
+        // Each `$'` walks back over one `$` run and one backslash run, so a
+        // flood of either spelling stays linear.
+        for unit in [r"\$'a\'", r"$$'a\'", "$$$$$$$$'", r"\\\\$'"] {
+            let command = format!("echo {}", unit.repeat(200_000 / unit.len()));
+            let started = std::time::Instant::now();
+            let _ = tokenize(&command);
+            let _ = split_segments(&command);
+            let _ = strip_quotes(&command);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit:?} flood took {:?}",
+                started.elapsed()
+            );
+        }
+        let long = format!("echo {}'x'", "$".repeat(200_000));
+        let started = std::time::Instant::now();
+        let _ = split_segments(&long);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
     fn tokenize_locale_quote_flood_stays_linear() {
         // 200 KB of `$""` (empty locale strings) and of unterminated `$"`
         // openers must tokenize well inside the hook deadline.

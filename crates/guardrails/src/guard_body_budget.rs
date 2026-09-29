@@ -184,9 +184,16 @@ pub fn detect_surfaces(command: &str) -> Vec<(Surface, String)> {
         let (Some(noun), Some(verb)) = (rest.get(1), rest.get(2)) else {
             continue;
         };
+        // The noun and verb are read as the shell passes them to gh: bash
+        // drops an unquoted backslash, so `gh pr c\omment` and `gh i\ssue
+        // create` post like the plain spelling. Comparing the raw token left
+        // their bodies unmeasured. A backslash that quotes keep (`'c\omment'`)
+        // is read as removed too — gh rejects that verb, so the extra
+        // measurement is of a post that never happens (the see-more side).
+        let (noun, verb) = (unescape_word(noun), unescape_word(verb));
         if let Some((_, _, surface)) = POSTING_SUBCOMMANDS
             .iter()
-            .find(|(n, v, _)| n == noun && v == verb)
+            .find(|(n, v, _)| *n == noun.as_ref() && *v == verb.as_ref())
         {
             found.push((*surface, stripped.to_string()));
         }
@@ -1579,6 +1586,33 @@ mod tests {
                 r#"gh pr comment 1 --body "use gh pr create next time""#,
                 Some(Surface::Comment),
             ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(
+                detect_surface(cmd).map(|(s, _)| s),
+                *want,
+                "detect_surface({cmd:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_surface_reads_the_noun_and_verb_the_way_the_shell_passes_them() {
+        // bash drops an unquoted backslash before gh parses its subcommand, so
+        // each escaped spelling posts like the plain one (`printf '%s\n'`
+        // prints `pr`, `comment` for `p\r c\omment`).
+        let cases: &[(&str, Option<Surface>)] = &[
+            (r"gh pr c\omment 3 --body y", Some(Surface::Comment)),
+            (r"gh i\ssue create --body y", Some(Surface::Issue)),
+            (r"gh \issue comment 3 --body y", Some(Surface::Comment)),
+            (r"gh p\r cr\eate --body y", Some(Surface::Pr)),
+            (r"gh pr e\dit 3 --body y", Some(Surface::Pr)),
+            (r"gh pr r\eview 3 --body y", Some(Surface::Comment)),
+            // Controls: a read stays unmeasured escaped too, and an escaped
+            // blank joins two words into one noun gh does not know.
+            (r"gh pr v\iew 3", None),
+            (r"gh i\ssue l\ist", None),
+            (r"gh pr\ edit 3 --body y", None),
         ];
         for (cmd, want) in cases {
             assert_eq!(
