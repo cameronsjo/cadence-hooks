@@ -21,10 +21,10 @@
 use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::{
-    ShipHead, ShipSegment, ShipTarget, command_segments, git_command, merge_anchor_repo_targets_in,
-    origin_triple, parse_work_dir, polish_ship_segments_for_origin, polish_ship_segments_in,
-    remote_host_and_slug, repo_value_names_remote, resolve_cd_target,
-    split_segments_with_ops_joining_redirects, strip_group_wrappers, tokenize,
+    LocatedSegment, ShipHead, ShipSegment, ShipTarget, command_segments, git_command,
+    merge_anchor_repo_targets_in, origin_triple, parse_work_dir, polish_ship_segments_for_origin,
+    polish_ship_segments_in, remote_host_and_slug, repo_value_names_remote, segment_work_dirs,
+    strip_group_wrappers,
 };
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
@@ -425,22 +425,13 @@ const MERGE_LOOKAHEAD: usize = 64;
 ///    #997, so judging it too means the gate can never nudge less than it
 ///    did: whatever the per-segment walk gets wrong, it can only add a
 ///    verdict, never replace one.
-/// 2. **The per-segment reading** — the top-level segments walked in order,
-///    each ship in the directory its own segment runs in:
-///    - a `cd` (the segment's first word) applies to the segments after it;
-///    - a `( … )` subshell's `cd` ends with the subshell;
-///    - a `{ …; }` group shares its parent's directory, unless the group is
-///      a pipeline stage or backgrounded, when it runs in its own process;
-///    - a `cd` in a pipeline stage or a backgrounded segment moves nothing.
-///      The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
-///      ([`split_segments_with_ops_joining_redirects`]).
+/// 2. **The per-segment reading** — each ship in the directory its own
+///    top-level segment runs in ([`segment_work_dirs`]: a `cd` applies to
+///    the segments after it, a `( … )` subshell's `cd` ends with it, a
+///    `cd` in a pipeline stage or a backgrounded segment moves nothing).
 ///
 /// A ship both readings place in the same directory is listed once, and so
 /// is any exact repeat of a (ship, directory) pair.
-///
-/// Subshell nesting is read from each segment's leading `(` and its
-/// unpaired `)`, skipping quoted text and escaped characters
-/// ([`segment_shape`]).
 pub fn located_ship_segments(command: &str, cwd: Option<&str>) -> Vec<LocatedShip> {
     let Some(cwd) = cwd else {
         return polish_ship_segments_for_origin(command, None)
@@ -503,56 +494,17 @@ fn dedup_ships(ships: Vec<LocatedShip>) -> Vec<LocatedShip> {
         .collect()
 }
 
-/// One open group while [`per_segment_ships`] walks: the directory to go
-/// back to, and whether the group runs in its own process however it ends.
-struct Group {
-    subshell: bool,
-    saved_dir: String,
-    after_pipe: bool,
-}
-
-/// The per-segment reading of [`located_ship_segments`].
+/// The per-segment reading of [`located_ship_segments`]: each top-level
+/// segment's ships, judged in the directory [`segment_work_dirs`] says the
+/// segment runs in.
 fn per_segment_ships(
     whole: &WholeSegments<'_>,
     cwd: &str,
     origins: &mut OriginCache,
 ) -> Vec<LocatedShip> {
-    let command = whole.command;
     let mut located = Vec::new();
-    let mut dir = cwd.to_string();
-    let mut groups: Vec<Group> = Vec::new();
-    let mut previous_op: Option<&str> = None;
-    for (raw, op) in split_segments_with_ops_joining_redirects(command) {
-        let shape = segment_shape(&raw);
-        // A brace group closes at a segment whose first word is `}` (the
-        // splitter cut its `;`). Piped or backgrounded, or itself a later
-        // pipeline stage, it ran in its own process.
-        for _ in 0..shape.brace_closes {
-            if let Some(group) = groups.pop() {
-                let forked = group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
-                if forked {
-                    dir = group.saved_dir;
-                }
-            }
-        }
-        for subshell in shape.opens {
-            groups.push(Group {
-                subshell,
-                saved_dir: dir.clone(),
-                after_pipe: previous_op == Some("|"),
-            });
-        }
+    for LocatedSegment { raw, dir } in segment_work_dirs(whole.command, cwd) {
         let body = strip_group_wrappers(&raw);
-        let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
-        // `cd` as the command word only; the word after it is the target.
-        if !own_process && body.trim_start().starts_with("cd") {
-            let words = tokenize(body);
-            if words.first().map(String::as_str) == Some("cd")
-                && let Some(target) = words.get(1)
-            {
-                dir = resolve_cd_target(target, &dir);
-            }
-        }
         let origin = origins.for_command(&whole.of(body), &dir);
         located.extend(
             polish_ship_segments_in(&whole.of(&raw), origin.as_deref())
@@ -562,26 +514,6 @@ fn per_segment_ships(
                     work_dir: Some(dir.clone()),
                 }),
         );
-        for _ in 0..shape.paren_closes {
-            // A `)` closes the innermost subshell, and any brace group
-            // opened inside it with it.
-            while let Some(group) = groups.pop() {
-                dir = group.saved_dir;
-                if group.subshell {
-                    break;
-                }
-            }
-        }
-        // `echo $(true; cd /u)` is cut at the `;`: the `cd` runs in the
-        // substitution's subshell, which the `)` after it closes.
-        for _ in 0..shape.inner_open {
-            groups.push(Group {
-                subshell: true,
-                saved_dir: dir.clone(),
-                after_pipe: false,
-            });
-        }
-        previous_op = op;
     }
     located
 }
@@ -614,85 +546,6 @@ fn merge_in_command_order(whole: Vec<LocatedShip>, located: Vec<LocatedShip>) ->
     out.extend(pending);
     out.extend(located);
     out
-}
-
-/// The group structure of one top-level segment.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SegmentShape {
-    /// Leading group openers, outermost first: `true` for `(`, `false` for
-    /// `{`.
-    opens: Vec<bool>,
-    /// Leading `}` words — the brace groups this segment closes.
-    brace_closes: usize,
-    /// Unquoted, unescaped `)` with no inner `(` to pair with.
-    paren_closes: usize,
-    /// Inner `(` still open at the end of the segment: a `$(…)` the
-    /// splitter cut at a `;` inside it. What follows, up to its `)`, runs
-    /// in the substitution's subshell.
-    inner_open: usize,
-}
-
-/// Read [`SegmentShape`] from a segment. Quoted text (`'…'`, `"…"`,
-/// `$'…'`) and backslash-escaped characters are skipped, so `grep "fn
-/// main("` and `echo ":("` open and close nothing. Past the leading
-/// openers, an unquoted `(` (`$(`, `<(`, `>(`, `=(`, a function's `f ()`)
-/// opens an inner group that its `)` closes; only a `)` left unpaired
-/// closes a subshell.
-fn segment_shape(segment: &str) -> SegmentShape {
-    let mut shape = SegmentShape::default();
-    let mut rest = segment.trim_start();
-    while let Some(after) = rest.strip_prefix('}') {
-        shape.brace_closes += 1;
-        rest = after.trim_start();
-    }
-    loop {
-        if let Some(after) = rest.strip_prefix('(') {
-            shape.opens.push(true);
-            rest = after.trim_start();
-        } else if let Some(after) = rest
-            .strip_prefix('{')
-            .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
-        {
-            shape.opens.push(false);
-            rest = after.trim_start();
-        } else {
-            break;
-        }
-    }
-    let mut inner = 0usize;
-    let mut previous: Option<char> = None;
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-                previous = Some('x');
-                continue;
-            }
-            '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
-            '\'' => skip_quoted(&mut chars, '\'', false),
-            '"' => skip_quoted(&mut chars, '"', true),
-            '(' => inner += 1,
-            ')' if inner > 0 => inner -= 1,
-            ')' => shape.paren_closes += 1,
-            _ => {}
-        }
-        previous = Some(c);
-    }
-    shape.inner_open = inner;
-    shape
-}
-
-/// Advance past a quoted run up to its closing `quote`; `escapes` honors
-/// `\` inside it (`"…"`, `$'…'`). An unterminated quote runs to the end.
-fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char, escapes: bool) {
-    while let Some(c) = chars.next() {
-        if escapes && c == '\\' {
-            chars.next();
-        } else if c == quote {
-            return;
-        }
-    }
 }
 
 /// `git remote get-url origin` in `dir`, read as the canonical

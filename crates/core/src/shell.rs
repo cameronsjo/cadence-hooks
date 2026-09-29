@@ -4895,6 +4895,210 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     effective
 }
 
+/// One top-level segment of a command and the directory it runs in
+/// ([`segment_work_dirs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedSegment {
+    /// The segment as the top-level splitter cut it, group openers and
+    /// closers included.
+    pub raw: String,
+    /// The directory the segment's own command runs in.
+    pub dir: String,
+}
+
+/// Every [`command_segments`] segment of `command`, each paired with the
+/// directory its top-level segment runs in ([`segment_work_dirs`]), in
+/// command order. A segment a wrapper expands (`sh -c '…'`) takes the
+/// directory of the top-level segment that carries it.
+///
+/// The per-segment reading a guard judges alongside the whole-command
+/// [`parse_work_dir`] one; see [`segment_work_dirs`].
+pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, String)> {
+    segment_work_dirs(command, cwd)
+        .into_iter()
+        .flat_map(|LocatedSegment { raw, dir }| {
+            command_segments(&raw)
+                .into_iter()
+                .map(move |segment| (segment, dir.clone()))
+        })
+        .collect()
+}
+
+/// One open group while [`segment_work_dirs`] walks: the directory to go
+/// back to, and whether the group runs in its own process however it ends.
+struct Group {
+    subshell: bool,
+    saved_dir: String,
+    after_pipe: bool,
+}
+
+/// Every top-level segment of `command`, in command order, each with the
+/// directory it runs in — the per-segment counterpart of
+/// [`parse_work_dir`]'s one whole-command directory (cadence-hooks#997).
+///
+/// - a `cd` (the segment's first word) applies to the segments after it,
+///   whatever separator follows it — a newline, `;`, `&&`, `||`;
+/// - a `( … )` subshell's `cd` ends with the subshell;
+/// - a `{ …; }` group shares its parent's directory, unless the group is a
+///   pipeline stage or backgrounded, when it runs in its own process;
+/// - a `cd` in a pipeline stage or a backgrounded segment moves nothing.
+///   The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
+///   ([`split_segments_with_ops_joining_redirects`]).
+///
+/// Like [`parse_work_dir`], every `cd` is assumed to succeed.
+///
+/// This is one reading, not a verdict: a guard that judges where a command
+/// runs judges each segment in BOTH this directory and the
+/// [`parse_work_dir`] one and keeps the sharpest verdict, so whatever this
+/// walk gets wrong can only add a verdict, never replace one.
+///
+/// Subshell nesting is read from each segment's leading `(` and its
+/// unpaired `)`, skipping quoted text and escaped characters
+/// ([`segment_shape`]).
+pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
+    let mut located = Vec::new();
+    let mut dir = cwd.to_string();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut previous_op: Option<&str> = None;
+    for (raw, op) in split_segments_with_ops_joining_redirects(command) {
+        let shape = segment_shape(&raw);
+        // A brace group closes at a segment whose first word is `}` (the
+        // splitter cut its `;`). Piped or backgrounded, or itself a later
+        // pipeline stage, it ran in its own process.
+        for _ in 0..shape.brace_closes {
+            if let Some(group) = groups.pop() {
+                let forked = group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
+                if forked {
+                    dir = group.saved_dir;
+                }
+            }
+        }
+        for subshell in shape.opens {
+            groups.push(Group {
+                subshell,
+                saved_dir: dir.clone(),
+                after_pipe: previous_op == Some("|"),
+            });
+        }
+        let body = strip_group_wrappers(&raw);
+        let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
+        // `cd` as the command word only; the word after it is the target.
+        if !own_process && body.trim_start().starts_with("cd") {
+            let words = tokenize(body);
+            if words.first().map(String::as_str) == Some("cd")
+                && let Some(target) = words.get(1)
+            {
+                dir = resolve_cd_target(target, &dir);
+            }
+        }
+        let segment_dir = dir.clone();
+        for _ in 0..shape.paren_closes {
+            // A `)` closes the innermost subshell, and any brace group
+            // opened inside it with it.
+            while let Some(group) = groups.pop() {
+                dir = group.saved_dir;
+                if group.subshell {
+                    break;
+                }
+            }
+        }
+        // `echo $(true; cd /u)` is cut at the `;`: the `cd` runs in the
+        // substitution's subshell, which the `)` after it closes.
+        for _ in 0..shape.inner_open {
+            groups.push(Group {
+                subshell: true,
+                saved_dir: dir.clone(),
+                after_pipe: false,
+            });
+        }
+        previous_op = op;
+        located.push(LocatedSegment {
+            raw,
+            dir: segment_dir,
+        });
+    }
+    located
+}
+
+/// The group structure of one top-level segment.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SegmentShape {
+    /// Leading group openers, outermost first: `true` for `(`, `false` for
+    /// `{`.
+    opens: Vec<bool>,
+    /// Leading `}` words — the brace groups this segment closes.
+    brace_closes: usize,
+    /// Unquoted, unescaped `)` with no inner `(` to pair with.
+    paren_closes: usize,
+    /// Inner `(` still open at the end of the segment: a `$(…)` the
+    /// splitter cut at a `;` inside it. What follows, up to its `)`, runs
+    /// in the substitution's subshell.
+    inner_open: usize,
+}
+
+/// Read [`SegmentShape`] from a segment. Quoted text (`'…'`, `"…"`,
+/// `$'…'`) and backslash-escaped characters are skipped, so `grep "fn
+/// main("` and `echo ":("` open and close nothing. Past the leading
+/// openers, an unquoted `(` (`$(`, `<(`, `>(`, `=(`, a function's `f ()`)
+/// opens an inner group that its `)` closes; only a `)` left unpaired
+/// closes a subshell.
+fn segment_shape(segment: &str) -> SegmentShape {
+    let mut shape = SegmentShape::default();
+    let mut rest = segment.trim_start();
+    while let Some(after) = rest.strip_prefix('}') {
+        shape.brace_closes += 1;
+        rest = after.trim_start();
+    }
+    loop {
+        if let Some(after) = rest.strip_prefix('(') {
+            shape.opens.push(true);
+            rest = after.trim_start();
+        } else if let Some(after) = rest
+            .strip_prefix('{')
+            .filter(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            shape.opens.push(false);
+            rest = after.trim_start();
+        } else {
+            break;
+        }
+    }
+    let mut inner = 0usize;
+    let mut previous: Option<char> = None;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+                previous = Some('x');
+                continue;
+            }
+            '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
+            '\'' => skip_quoted(&mut chars, '\'', false),
+            '"' => skip_quoted(&mut chars, '"', true),
+            '(' => inner += 1,
+            ')' if inner > 0 => inner -= 1,
+            ')' => shape.paren_closes += 1,
+            _ => {}
+        }
+        previous = Some(c);
+    }
+    shape.inner_open = inner;
+    shape
+}
+
+/// Advance past a quoted run up to its closing `quote`; `escapes` honors
+/// `\` inside it (`"…"`, `$'…'`). An unterminated quote runs to the end.
+fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char, escapes: bool) {
+    while let Some(c) = chars.next() {
+        if escapes && c == '\\' {
+            chars.next();
+        } else if c == quote {
+            return;
+        }
+    }
+}
+
 /// Resolve a single cd target against the current effective directory.
 pub fn resolve_cd_target(target: &str, effective: &str) -> String {
     if looks_absolute(target) {
