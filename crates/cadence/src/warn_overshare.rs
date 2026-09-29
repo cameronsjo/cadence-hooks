@@ -18,12 +18,12 @@
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Bash token sequences that surface about-to-ship content but are NOT
-/// external-posting verbs the shared [`EXTERNAL_POST`] gate covers. Only
+/// external-posting verbs the shared [`is_external_post`] gate covers. Only
 /// `git push` qualifies — the former `git commit` and four `gh` sequences
 /// were strict subsets of the gate and were pruned when it was adopted
 /// (#385): a second hand-kept list is exactly the drift this change kills.
 ///
-/// [`EXTERNAL_POST`]: crate::redact_external_content::EXTERNAL_POST
+/// [`is_external_post`]: crate::redact_external_content::is_external_post
 const BASH_TWO_TOKEN_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
 
 const FIELD_REPORTS_MARKER: &str = "/docs/field-reports/";
@@ -86,11 +86,13 @@ fn is_bypass_set(value: Option<&str>) -> bool {
 }
 
 /// True when `command` carries `git push`, or any segment matches the redact
-/// engine's [`EXTERNAL_POST`] gate (cadence-hooks#385: overshare's hand-kept
+/// engine's [`is_external_post`] gate (cadence-hooks#385: overshare's hand-kept
 /// six-command list missed `gh pr comment`, `gh pr review`, `gh issue edit`,
 /// `gh release/gist/discussion`, and `tea` — every one an external-posting
 /// surface the leak scanner already gated). One gate, two consumers: a new
 /// posting verb added there is covered here for free.
+///
+/// [`is_external_post`]: crate::redact_external_content::is_external_post
 ///
 /// Precision caveat, accepted: quote-stripping each segment keeps a QUOTED
 /// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an
@@ -111,10 +113,10 @@ fn is_bash_overshare_trigger(command: &str) -> bool {
         return true;
     }
 
-    use cadence_hooks_core::shell::{command_segments, strip_quotes};
+    use cadence_hooks_core::shell::command_segments;
     command_segments(command)
         .iter()
-        .any(|seg| crate::redact_external_content::EXTERNAL_POST.is_match(&strip_quotes(seg)))
+        .any(|seg| crate::redact_external_content::is_external_post(seg))
 }
 
 /// True when `path` is under the Obsidian vault.
