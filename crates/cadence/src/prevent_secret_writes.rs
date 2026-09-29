@@ -433,6 +433,28 @@ mod tests {
     }
 
     #[test]
+    fn bash_writes_under_a_substituted_directory_blocked() {
+        // #1097 review R1: an unquoted `$D` holding a whole `$(…)` value must
+        // stay one word, or the write target reads as `-d)/.env`.
+        for command in [
+            "D=$(git rev-parse --show-toplevel); rm $D/.env",
+            "D=$(git rev-parse --show-toplevel); echo x > $D/.env",
+            "D=$(git rev-parse --show-toplevel); mv x $D/.env",
+            "D=$(git rev-parse --show-toplevel); truncate -s0 $D/.env",
+            "D=$(realpath .); echo x > $D/.env",
+            "D=$(mktemp -d); echo x > $D/../.env",
+            "D=$(mktemp -d); rm $D/../.env",
+            "D=$(mktemp -d); echo x > $D/.ssh/id_rsa",
+            "D=$(mktemp -d); rm \"$D/.env\"",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        assert!(!bash_targets_env_file(
+            "D=$(mktemp -d); echo x > $D/out.txt"
+        ));
+    }
+
+    #[test]
     fn bash_env_template_allowed() {
         assert!(!bash_targets_env_file("cat .env.example"));
     }

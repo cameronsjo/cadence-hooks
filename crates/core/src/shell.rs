@@ -4930,9 +4930,21 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
     let mut out = String::with_capacity(segment.len());
     let mut i = 0;
     let mut in_single = false;
+    let mut in_double = false;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\'' {
+        // An escaped `"` outside single quotes opens and closes nothing.
+        if c == '\\' && !in_single && chars.get(i + 1) == Some(&'"') {
+            out.push(c);
+            out.push('"');
+            i += 2;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+        }
+        // An apostrophe inside `"…"` is a literal, not a single quote.
+        if c == '\'' && !in_double {
             in_single = !in_single;
             out.push(c);
             i += 1;
@@ -4954,7 +4966,18 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
             if !name.is_empty()
                 && let Some((_, value)) = assignments.iter().rev().find(|(n, _)| *n == name)
             {
-                out.push_str(value);
+                // A whole `$(…)` value carrying whitespace (#970) is one word
+                // only inside `"…"`. Unquoted, the tokenizers downstream would
+                // split it at its spaces and a `$D/.env` write target would
+                // read as `-d)/.env`, hiding it from the writes guard, so it
+                // goes in quoted: the word boundaries stay where bash's are.
+                if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
+                    out.push('"');
+                    out.push_str(value);
+                    out.push('"');
+                } else {
+                    out.push_str(value);
+                }
                 i = j;
                 continue;
             }
@@ -9804,7 +9827,10 @@ mod tests {
                 "D=$(mktemp -d /x.XXXX); touch \"$D/.env\"",
                 "touch \"$(mktemp -d /x.XXXX)/.env\"",
             ),
-            ("export D=$(mktemp -d); ls $D/a", "ls $(mktemp -d)/a"),
+            // Unquoted, the value goes in quoted so it stays one word.
+            ("export D=$(mktemp -d); ls $D/a", "ls \"$(mktemp -d)\"/a"),
+            // An apostrophe inside `"…"` does not open a single quote.
+            ("D=/x; echo \"it's $D\"", "echo \"it's /x\""),
             ("D=$(pwd)x; cat $D", "cat $(pwd)x"),
         ] {
             let out = command_segments(command);
