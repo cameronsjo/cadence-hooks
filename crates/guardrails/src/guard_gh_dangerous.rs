@@ -12,8 +12,9 @@ use crate::guard_gh_write::gh_argv;
 use cadence_hooks_cadence::prevent_secret_leaks::piped_shell_scripts;
 use cadence_hooks_core::shell::{
     ExpansionWork, MAX_WRAPPER_DEPTH, brace_expansion_overflows, command_segments, command_word,
-    contains_ignoring_ascii_case, fold_verb, gh_command_path, heredoc_introducers, logical_lines,
-    may_spell_word, requote_words, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
+    contains_ignoring_ascii_case, ends_inside_quote, fold_verb, gh_command_path,
+    heredoc_introducers, logical_lines, may_spell_word, requote_words, strip_comments,
+    strip_heredoc_bodies, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -98,92 +99,13 @@ static API_REPO_PATH: LazyLock<Regex> =
 /// Deliberately narrower than tokenization otherwise: it exists only to keep a
 /// malformed quote from erasing a destructive command from the conservative
 /// fallback below. It does, however, distinguish all three quoting kinds the
-/// shell has — see [`QuoteRun`]. Folding `$'…'` into `'…'` is not a harmless
+/// shell has — see [`ends_inside_quote`]. Folding `$'…'` into `'…'` is not a harmless
 /// simplification: it makes an escaped apostrophe close the run early, so a
 /// balanced command reads as unbalanced and the fallback blocks prose the
 /// shell runs cleanly.
 fn has_unmatched_quote(command: &str) -> bool {
     let command = strip_comments(&strip_heredoc_bodies(command));
     ends_inside_quote(&command)
-}
-
-/// Which kind of quoted run the scan is inside.
-///
-/// Mirrors `core::shell`'s private `Quote`, variant for variant, because the
-/// three kinds close on different rules and collapsing any two of them is a
-/// boundary the shell does not have. Kept local rather than promoted into
-/// `core::shell`: that file is concurrently gaining helpers on a sibling
-/// branch, and one shared scan is worth its own change rather than a conflict
-/// resolved under time pressure. Consolidating the three quote-tracking
-/// implementations in this repo is tracked separately.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum QuoteRun {
-    /// `'…'` — fully literal; the first `'` closes (POSIX). A backslash inside
-    /// is an ordinary character.
-    Posix,
-    /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, **including `'`**.
-    /// Treating this as [`QuoteRun::Posix`] made a well-formed
-    /// `$'it\'s dangerous'` read as unbalanced, so the conservative fallback
-    /// fired on prose bash runs cleanly.
-    AnsiC,
-    /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
-    Double,
-}
-
-/// The raw quote-state scan [`has_unmatched_quote`] runs on its narrowed view.
-fn ends_inside_quote(command: &str) -> bool {
-    let mut quote: Option<QuoteRun> = None;
-    let mut escaped = false;
-    // A `'` opens an ANSI-C run only when the run of `$` immediately before it
-    // is of ODD length: `$'` and `$$$'` are ANSI-C, while `$$'` is the `$$` PID
-    // expansion followed by an ordinary POSIX `'…'`. Toggling rather than
-    // setting is what encodes that parity — setting on every `$` read `$$'` as
-    // ANSI-C and diverged from bash. Verified against `bash -n` as an oracle
-    // over every string of length <= 5 in the quote alphabet: toggling
-    // diverges on 0 of 3,905, setting on 1.
-    let mut dollar_pending = false;
-    for ch in command.chars() {
-        if escaped {
-            escaped = false;
-            dollar_pending = false;
-            continue;
-        }
-        match quote {
-            Some(QuoteRun::Posix) => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some(QuoteRun::AnsiC) => {
-                if ch == '\\' {
-                    escaped = true;
-                } else if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some(QuoteRun::Double) => {
-                if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    quote = None;
-                }
-            }
-            None => match ch {
-                '\\' => escaped = true,
-                '\'' => {
-                    quote = Some(if dollar_pending {
-                        QuoteRun::AnsiC
-                    } else {
-                        QuoteRun::Posix
-                    });
-                }
-                '"' => quote = Some(QuoteRun::Double),
-                _ => {}
-            },
-        }
-        dollar_pending = ch == '$' && quote.is_none() && !dollar_pending;
-    }
-    quote.is_some()
 }
 
 /// True when `command` introduces a heredoc whose consumer is a shell — i.e.

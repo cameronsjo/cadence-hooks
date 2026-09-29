@@ -50,6 +50,36 @@ pub fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// Does `command` end inside an unclosed quoted run (`'…'`, `"…"`, `$'…'`)?
+///
+/// The one shared answer to "is this quoting balanced?", read through the same
+/// [`Quote`] model as [`tokenize`] and [`split_segments_with_ops`], so a caller
+/// cannot drift from bash on the three closing rules or on the odd-run rule
+/// for a `$` sigil ([`dollar_is_quote_sigil`]). Two hand-rolled copies
+/// each got one of those wrong (cameronsjo/cadence-hooks#549).
+///
+/// A raw scan: comments and heredoc bodies are NOT removed, so an apostrophe in
+/// either reads as an opener. Callers that need bash's view of those strip them
+/// first ([`strip_heredoc_bodies`], [`strip_comments`]). Linear.
+///
+/// Quote scanners that deliberately stay separate, because each answers a
+/// different question than "does this end inside a quote?": `loop_analysis`'s
+/// `group_nesting_depth` (over-counts nesting; only `'` matters), the
+/// substitution finders in `prevent_secret_leaks` (`substitutions_live`,
+/// `unquoted_substitution_bodies`; they need where each run ends and carry the
+/// same odd-`$` rule), `command_is_plain_jq_pipeline` (bails on any `$` or `\`),
+/// and enforce_worktree's `has_unquoted_grouping` / `has_active_expansion_or_grouping`
+/// (detect grouping or expansion, after refusing `$'…'` upstream).
+pub fn ends_inside_quote(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut quote: Option<Quote> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        i = scan_quote_syntax(&chars, i, &mut quote).unwrap_or(i + 1);
+    }
+    quote.is_some()
+}
+
 /// How a shell parser reads the quoted run it is currently inside.
 ///
 /// Shared by [`tokenize`] and [`split_segments_with_ops`] on purpose. The two
@@ -20972,5 +21002,91 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "{command}");
         }
+    }
+
+    // --- ends_inside_quote (cadence-hooks#549) ---
+
+    #[test]
+    fn ends_inside_quote_control_rows() {
+        let rows: &[(&str, bool)] = &[
+            // ANSI-C: a backslash escapes the closing quote.
+            (r"$'it\'s dangerous'", false),
+            // Even `$` run: `$$` is the PID, the run is plain POSIX.
+            (r"$$'a\'", false),
+            // Odd `$` run: ANSI-C, `\'` is an escape.
+            (r"$$$'a\'b'", false),
+            // Double quotes escape `\"`.
+            (r#""say \"careful\"""#, false),
+            ("echo it's", true),
+            ("echo 'a' \"b", true),
+            (r"\'", false),
+            // An escaped `$` is no sigil: `'a\'` is plain, the last `'` opens.
+            (r"\$'a\'b'", true),
+            ("", false),
+        ];
+        for (command, want) in rows {
+            assert_eq!(ends_inside_quote(command), *want, "{command}");
+        }
+    }
+
+    #[test]
+    fn ends_inside_quote_ignores_quotes_in_stripped_heredocs_and_comments() {
+        for command in [
+            "cat <<'EOF'\nDon't\nEOF\n",
+            "cat <<EOF\nit's\nEOF\n",
+            "echo hi # don't",
+        ] {
+            let stripped = strip_comments(&strip_heredoc_bodies(command));
+            assert!(!ends_inside_quote(&stripped), "{command:?} -> {stripped:?}");
+        }
+    }
+
+    /// Every string of length <= 5 over the quote alphabet, judged by
+    /// `bash -n`: bash reports a syntax error for an unterminated quote and for
+    /// nothing else in this alphabet. Slow (one bash per string), so it is
+    /// opt-in: `cargo test -p cadence-hooks-core ends_inside_quote_matches_bash -- --ignored`.
+    #[test]
+    #[ignore = "spawns bash ~9,330 times; run with --ignored"]
+    fn ends_inside_quote_matches_bash_n_oracle() {
+        use std::process::{Command, Stdio};
+        if Command::new("bash").arg("--version").output().is_err() {
+            eprintln!("skipping bash -n oracle sweep: bash not found");
+            return;
+        }
+        const ALPHABET: [char; 6] = ['\'', '"', '$', '\\', 'a', ' '];
+        let mut strings = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for base in &frontier {
+                for c in ALPHABET {
+                    let mut t = base.clone();
+                    t.push(c);
+                    next.push(t);
+                }
+            }
+            strings.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut diverged = Vec::new();
+        for s in &strings {
+            let status = Command::new("bash")
+                .args(["-n", "-c", s])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run bash -n");
+            let bash_unbalanced = !status.success();
+            if bash_unbalanced != ends_inside_quote(s) {
+                diverged.push(s.clone());
+            }
+        }
+        assert!(
+            diverged.is_empty(),
+            "{} of {} strings diverge from bash -n: {diverged:?}",
+            diverged.len(),
+            strings.len()
+        );
     }
 }
