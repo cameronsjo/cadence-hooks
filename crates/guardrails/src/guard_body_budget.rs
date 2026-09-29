@@ -1314,8 +1314,13 @@ fn segment_writes_file(segment: &str, path: &str) -> bool {
 /// posting `segment` in the same command. The file on disk at hook time is
 /// then stale: measuring it can call a 500-word body 5 words
 /// (cameronsjo/cadence-hooks#984). Pure.
-fn body_written_earlier(command: &str, segment: &str, path: &str) -> bool {
-    let segs = command_segments(command);
+fn body_written_earlier(segs: &[String], segment: &str, path: &str) -> bool {
+    // Past this many segments the walk (segments x posting segments) is not
+    // worth its cost: say "cannot measure" instead of scanning (perf bound).
+    const MAX_SEGMENTS: usize = 256;
+    if segs.len() > MAX_SEGMENTS {
+        return true;
+    }
     let Some(pos) = segs.iter().position(|s| strip_group_wrappers(s) == segment) else {
         return false;
     };
@@ -1336,7 +1341,7 @@ struct SegmentOutcome {
 /// segment must not end the walk for the others.
 fn evaluate_segment(
     surface: Surface,
-    command: &str,
+    all_segments: &[String],
     segment: &str,
     base_dir: &str,
     budgets: &Budgets,
@@ -1371,7 +1376,7 @@ fn evaluate_segment(
     // A body file this same command writes first is stale on disk: nudge
     // rather than measure the wrong bytes (cameronsjo/cadence-hooks#984).
     if let Some(BodySource::File(p) | BodySource::JsonFile(p)) = &source
-        && body_written_earlier(command, segment, p)
+        && body_written_earlier(all_segments, segment, p)
     {
         log_unmeasured("body-written-by-same-command");
         let (soft, hard) = budgets.for_surface(surface);
@@ -1467,11 +1472,12 @@ impl Check for GuardBodyBudget {
         // Every segment is measured. The worst verdict decides the outcome, and
         // every segment that had something to say says it — a command posting
         // two bodies gets both lines.
+        let all_segments = command_segments(command);
         let mut worst = 0u8;
         let mut messages: Vec<String> = Vec::new();
         let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
         for (surface, segment) in &posts {
-            let outcome = evaluate_segment(*surface, command, segment, &base_dir, &budgets);
+            let outcome = evaluate_segment(*surface, &all_segments, segment, &base_dir, &budgets);
             let sev = severity(&outcome.verdict);
             worst = worst.max(sev);
             match outcome.verdict {
