@@ -1502,3 +1502,38 @@ fn doctor_prune_limits_keep_every_dir_when_a_live_session_cannot_vouch() {
     assert!(stderr.contains("cleared0"), "names the session: {stderr}");
     assert!(three_days.exists() && one_day.exists() && pinned.exists());
 }
+
+/// `is_contained` is lexical: a pin under a symlinked intermediate dir inside
+/// the cache makes that dir's real siblings, outside the cache, look like
+/// orphans. They are kept.
+#[cfg(unix)]
+#[test]
+fn doctor_prune_apply_keeps_siblings_a_symlinked_intermediate_dir_reaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let pinned_real = orphan(outside.path(), "pinned-sha", None);
+    let victim = orphan(outside.path(), "victim-sha", Some(1));
+    std::fs::create_dir_all(tmp.path().join("workbench")).unwrap();
+    let linked = tmp.path().join("workbench/my-plugin");
+    std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+    write_installed_plugins_manifest(
+        tmp.path(),
+        "my-plugin@workbench",
+        &linked.join("pinned-sha"),
+    );
+
+    for extra in [vec!["--apply"], vec!["--keep-newest", "0", "--apply"]] {
+        let out = prune_with_root(tmp.path(), &extra);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{extra:?} stderr: {stderr}");
+        assert!(
+            stderr.contains("resolves outside the plugin cache root"),
+            "{extra:?}: {stderr}"
+        );
+        assert!(
+            victim.exists(),
+            "{extra:?}: an out-of-cache dir must survive"
+        );
+        assert!(pinned_real.exists());
+    }
+}

@@ -2886,7 +2886,8 @@ enum LiveStart {
 /// Fails closed on everything it cannot vouch for: an unreadable record, a
 /// record without `start_verified` (a `/clear`, `/compact`, resume or fork
 /// registration, a heartbeat-recreated record, or one from an older binary), and
-/// a zero `started_epoch` all make the answer [`LiveStart::Unknown`]. A session
+/// a zero or future `started_epoch`, and a registry directory that exists but
+/// cannot be listed all make the answer [`LiveStart::Unknown`]. A session
 /// in both registries is read in both, so a disagreement between its copies
 /// resolves to the more cautious one.
 fn live_start_bound(
@@ -2896,7 +2897,22 @@ fn live_start_bound(
 ) -> LiveStart {
     let mut unknown: Vec<String> = Vec::new();
     let mut earliest: Option<u64> = None;
+    let now = session_identity::now_epoch();
     for dir in sessions_dir.into_iter().chain(global_dir) {
+        // The registry readers return nothing on ANY `read_dir` error, which
+        // would read an existing but unreadable registry as "no sessions".
+        // Only a registry that does not exist is empty.
+        match std::fs::read_dir(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                let name = format!("unreadable registry {}", display_safe_path_flagged(dir));
+                if !unknown.contains(&name) {
+                    unknown.push(name);
+                }
+                continue;
+            }
+        }
         for name in session_registry::unreadable_records(dir) {
             let name = format!("unreadable record {name}");
             if !unknown.contains(&name) {
@@ -2905,7 +2921,9 @@ fn live_start_bound(
         }
         for peer in session_registry::live_peers(dir, "", stale_secs) {
             let rec = &peer.record;
-            if !rec.start_verified || rec.started_epoch == 0 {
+            // A start in the future is clock skew or a forged record; it
+            // bounds nothing.
+            if !rec.start_verified || rec.started_epoch == 0 || rec.started_epoch > now {
                 let name = session_identity::sanitize_field(
                     session_identity::short_id(&rec.session_id),
                     8,
@@ -3025,6 +3043,18 @@ fn overlaps_a_pin(dir: &Path, pinned_real: &[PathBuf]) -> bool {
         .any(|pin| pin.starts_with(&real) || real.starts_with(pin))
 }
 
+/// Whether `dir`, symlinks resolved, sits under `cache_root_real` (the cache
+/// root, already canonicalized). [`is_contained`] is lexical, so a symlinked
+/// intermediate dir inside the cache could otherwise nominate siblings that
+/// live outside it. `None` (the root would not resolve) or a dir that will not
+/// resolve is outside.
+fn resolves_inside(dir: &Path, cache_root_real: Option<&Path>) -> bool {
+    let Some(root) = cache_root_real else {
+        return false;
+    };
+    std::fs::canonicalize(dir).is_ok_and(|real| real.starts_with(root))
+}
+
 /// Manifest install paths that existed before a prune and are gone after it.
 /// Empty is the post-condition `--prune --apply` asserts: whatever it removed,
 /// every pin the manifest names is still on disk (cameronsjo/cadence-hooks#904).
@@ -3103,17 +3133,22 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: Pru
         .iter()
         .filter_map(|p| std::fs::canonicalize(p).ok())
         .collect();
+    let cache_root_real = std::fs::canonicalize(&cache_root).ok();
     let dirs: Vec<PathBuf> = orphan_dirs(&pinned, &cache_root)
         .into_iter()
         .filter(|dir| {
-            let overlaps = overlaps_a_pin(dir, &pinned_real);
-            if overlaps {
-                eprintln!(
-                    "cadence-hooks doctor --prune: keeping {} — it resolves onto a pinned install",
-                    display_safe_path_flagged(dir)
-                );
-            }
-            !overlaps
+            let why = if overlaps_a_pin(dir, &pinned_real) {
+                "it resolves onto a pinned install"
+            } else if !resolves_inside(dir, cache_root_real.as_deref()) {
+                "it resolves outside the plugin cache root"
+            } else {
+                return true;
+            };
+            eprintln!(
+                "cadence-hooks doctor --prune: keeping {} — {why}",
+                display_safe_path_flagged(dir)
+            );
+            false
         })
         .collect();
     if dirs.is_empty() {
@@ -7666,6 +7701,61 @@ mod tests {
                 "{label} must make the bound unknown"
             );
         }
+    }
+
+    /// A registry that does not exist is empty; one that exists but cannot be
+    /// listed is not, since the readers would report it as holding no sessions.
+    #[test]
+    fn live_start_bound_is_unknown_on_an_unlistable_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            live_start_bound(Some(&tmp.path().join("missing")), None, 600),
+            LiveStart::None
+        );
+        let not_a_dir = tmp.path().join("registry-file");
+        fs::write(&not_a_dir, "").unwrap();
+        match live_start_bound(None, Some(&not_a_dir), 600) {
+            LiveStart::Unknown(names) => assert!(
+                names.iter().any(|n| n.starts_with("unreadable registry")),
+                "{names:?}"
+            ),
+            other => panic!("an unlistable registry must be unknown, got {other:?}"),
+        }
+    }
+
+    /// A vouched start in the future bounds nothing.
+    #[test]
+    fn live_start_bound_is_unknown_on_a_future_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let future = session_identity::now_epoch() + 3_600;
+        seed_record(tmp.path(), "skewed-session", future, true);
+        assert!(matches!(
+            live_start_bound(Some(tmp.path()), None, 600),
+            LiveStart::Unknown(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_inside_follows_symlinks_out_of_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(cache.join("mp/plugin/real-sha")).unwrap();
+        fs::create_dir_all(outside.join("victim-sha")).unwrap();
+        std::os::unix::fs::symlink(&outside, cache.join("mp/linked")).unwrap();
+        let root = fs::canonicalize(&cache).unwrap();
+
+        assert!(resolves_inside(
+            &cache.join("mp/plugin/real-sha"),
+            Some(&root)
+        ));
+        assert!(
+            !resolves_inside(&cache.join("mp/linked/victim-sha"), Some(&root)),
+            "lexically inside, really outside"
+        );
+        assert!(!resolves_inside(&cache.join("mp/missing"), Some(&root)));
+        assert!(!resolves_inside(&cache.join("mp/plugin/real-sha"), None));
     }
 
     const NOW: u64 = 2_000_000_000;
