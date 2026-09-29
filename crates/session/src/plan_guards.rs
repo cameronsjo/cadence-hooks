@@ -49,6 +49,7 @@
 
 use crate::plan_scan::{self, InFlightPlan};
 use cadence_hooks_core::markers;
+use cadence_hooks_core::shell::pr_flip_segments;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 
@@ -277,7 +278,7 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    if !is_pr_flip_command(command) {
+    if pr_flip_segments(command).is_empty() {
         return CheckResult::allow();
     }
     let Some(cwd) = input.cwd.as_deref() else {
@@ -309,52 +310,6 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     ))
 }
 
-/// The in-flight plan doc bound to the repo's current branch, if any. Binding
-/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
-/// is a silent no-fire (the guard must not guess), and shared-main repos
-/// match naturally because both sides read `main`. First match wins in
-/// `plan_scan`'s deterministic path order.
-/// Is `command` a `gh pr ready` / `gh pr merge` invocation? Token-window
-/// scan over the shell tokenizer's output rather than a substring (security
-/// review of this change): `echo "gh pr merge"` tokenizes the quoted text
-/// into ONE token, so prose about the command never matches, while flags
-/// after the verb (`gh pr merge 42 --squash`) don't disturb the window.
-///
-/// The scan runs PER SEGMENT. `tokenize` does no operator splitting, so a
-/// whole-command token stream runs straight through `&&`/`;`/`|` into later
-/// commands — and the `--undo` slice below would then read a *following*
-/// command's flag as this invocation's, suppressing the nudge on a real ship
-/// (`gh pr ready 42 && gh pr ready --undo`). [`command_segments`] cuts the
-/// line at those separators first, so each invocation only ever sees its own
-/// operands.
-///
-/// [`command_segments`]: cadence_hooks_core::shell::command_segments
-fn is_pr_flip_command(command: &str) -> bool {
-    cadence_hooks_core::shell::command_segments(command)
-        .into_iter()
-        .any(|segment| {
-            let tokens = cadence_hooks_core::shell::tokenize(&segment);
-            tokens.windows(3).enumerate().any(|(i, w)| {
-                if cadence_hooks_core::shell::basename(&w[0]) != "gh" || w[1] != "pr" {
-                    return false;
-                }
-                match w[2].as_str() {
-                    // `--undo` flips the PR back to DRAFT — it un-ships, the
-                    // retreat FROM the reconcile point this guard names, so
-                    // the unticked-box nudge is noise. Shared predicate with
-                    // the ship anchor (cadence-hooks#773/#774): it skips
-                    // redirect targets and here-string words, which the shell
-                    // eats before gh ever sees them.
-                    "ready" => !cadence_hooks_core::shell::carries_undo_flag(
-                        tokens.get(i + 3..).unwrap_or(&[]),
-                    ),
-                    "merge" => true,
-                    _ => false,
-                }
-            })
-        })
-}
-
 /// Atomically claim `path` with `create_new`: `true` means this invocation
 /// owns the claim; `AlreadyExists` means a sibling got there first; any other
 /// failure (unwritable marker dir) claims anyway — for an advisory nudge the
@@ -374,6 +329,11 @@ fn claim_marker(path: &Path) -> bool {
     }
 }
 
+/// The in-flight plan doc bound to the repo's current branch, if any. Binding
+/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
+/// is a silent no-fire (the guard must not guess), and shared-main repos
+/// match naturally because both sides read `main`. First match wins in
+/// `plan_scan`'s deterministic path order.
 fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
     let branch =
         cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)?;
@@ -927,6 +887,49 @@ mod tests {
             run_warn_plan_ready_flip(&prose).outcome,
             cadence_hooks_core::Outcome::Allow
         );
+    }
+
+    /// A repo on `main` with an in-flight plan and an `origin` of
+    /// `github.com/me/plans`.
+    fn repo_with_plan_and_origin() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-20-work.md",
+            "in-flight",
+            "main",
+            "# W\n\n- [ ] build\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        let ok = std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/me/plans.git"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        tmp
+    }
+
+    #[test]
+    fn ready_flip_sees_retargeted_and_prefixed_spellings() {
+        // cadence-hooks#778: the old matcher demanded `gh pr` adjacent, so a
+        // global `-R` or a keyword-led segment never nudged.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh -R me/plans pr ready 42",
+            "gh --repo=me/plans pr merge 42",
+            "env GH_TOKEN=x gh pr ready 42",
+            "if true; then gh pr ready 42; fi",
+        ] {
+            let input = bash_input("flip-778", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} is a ready flip of this checkout's PR"
+            );
+        }
     }
 
     #[test]

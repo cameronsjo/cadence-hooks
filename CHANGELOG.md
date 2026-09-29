@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The ready-flip guards see retargeted and prefixed flips.** `warn-unreviewed-ready-flip` and `warn-plan-ready-flip` share one matcher that reads the segment the way the ship anchor does, so `gh -R owner/repo pr ready 12`, `GH_REPO=o/r gh pr merge 5`, `env … gh pr merge 5`, and a keyword-led `then gh pr ready 12` are checked. A path-qualified `gh` still matches (cameronsjo/cadence-hooks#778)
 - **`warn-gh-merge-preflight` and `warn-pr-issue-link` see prefixed and keyword-wrapped `gh`.** `GH_TOKEN=x gh pr merge 5`, `env`, `time`, `command`, `nohup`, `exec`, and `for … do` / `if … then` segments now nudge. Quoted prose stays silent, and `bash -c '…'` and a path-qualified `gh` still nudge. `sudo`, `timeout`, `xargs`, `stdbuf`, and `eval` remain unseen (cameronsjo/cadence-hooks#545)
 - **`verify-pr-autoclose` reads a new PR in the repo `gh pr create` printed, not in `origin`.** A PR opened on an upstream from a fork checkout was looked up by number in the fork, so the check reported another PR's refs, and that repo's issue states, as this PR's. The create check now takes the repo from the PR URL, stays silent when there is no URL, when the URL names another host, or when the body is not JSON, and words an unreadable ref as "could not be read" rather than "not found" (cameronsjo/cadence-hooks#759)
 

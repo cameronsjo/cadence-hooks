@@ -33,8 +33,8 @@
 //! `GH_ENTERPRISE_TOKEN` when that is set.
 
 use cadence_hooks_core::shell::{
-    PrSelector, carries_undo_flag, command_segments, command_word, git_command,
-    host_and_repo_from_url, pr_selector, pr_url_parts, ship_target, strip_group_wrappers, tokenize,
+    PrSelector, git_command, host_and_repo_from_url, pr_flip_segments, pr_selector, pr_url_parts,
+    ship_target,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -133,41 +133,15 @@ impl GhRunner for RealGhRunner {
 }
 
 /// The tokens of the first `gh pr ready` / `gh pr merge` segment in
-/// `command`, or `None` when no segment is one. Segment- and token-based
-/// (mirrors `warn_gh_merge_preflight::is_gh_pr_merge`) so a hyphenated script
-/// name or quoted prose never matches, while flags after the verb don't
-/// disturb the window. Only that first flip segment is examined later; a
-/// second flip in the same compound command is not checked.
-///
-/// The global-flag spelling `gh -R o/r pr merge` does not match: the second
-/// token must be `pr` (cadence-hooks#778 tracks it). A prefixed `gh`
-/// (`GH_REPO=o/r gh pr merge 5`, `env … gh pr merge 5`) does not match
-/// either: the first token must be `gh`.
-///
-/// `gh pr ready --undo` is excluded: it flips the PR back to DRAFT, the exact
-/// retreat from the ship this guard's reviewed-signal nudge is about, so the
-/// nudge would be noise. The `--undo` scan is
-/// [`carries_undo_flag`][cadence_hooks_core::shell::carries_undo_flag] — the
-/// same predicate the ship anchor uses (cadence-hooks#773/#774), which skips
-/// redirect targets and here-string words because the shell eats them and gh
-/// never sees the flag.
+/// `command`, or `None` when no segment is one. The matcher is the shared
+/// [`pr_flip_segments`], so the retargeted and prefixed spellings the ship
+/// anchor already sees (`gh -R o/r pr merge 5`, `GH_REPO=o/r gh pr merge 5`,
+/// `env … gh pr merge 5`, a keyword-led `then gh pr merge 5`) are checked
+/// here too (cadence-hooks#778), and `gh pr ready --undo` is excluded there.
+/// Only that first flip segment is examined later; a second flip in the same
+/// compound command is not checked.
 fn flip_segment_tokens(command: &str) -> Option<Vec<String>> {
-    command_segments(command).into_iter().find_map(|segment| {
-        let tokens = tokenize(strip_group_wrappers(&segment));
-        let is_gh_pr = tokens
-            .first()
-            .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && tokens.get(1).map(String::as_str) == Some("pr");
-        if !is_gh_pr {
-            return None;
-        }
-        let is_flip = match tokens.get(2).map(String::as_str) {
-            Some("ready") => !carries_undo_flag(tokens.get(3..).unwrap_or(&[])),
-            Some("merge") => true,
-            _ => false,
-        };
-        is_flip.then_some(tokens)
-    })
+    pr_flip_segments(command).into_iter().next()
 }
 
 /// Which repo gh will query for the flipped PR.
@@ -1596,5 +1570,42 @@ mod tests {
         let gh = unreviewed_gh();
         assert_eq!(eval("gh pr merge --newflag x 5", &gh), None);
         assert_eq!(gh.call_count(), 0);
+    }
+
+    // --- retargeted and prefixed flips (cadence-hooks#778) ---
+
+    #[test]
+    fn retargeted_and_prefixed_flips_are_checked() {
+        // Each was silent before: the matcher demanded `gh` then `pr` as the
+        // first two tokens.
+        for command in [
+            "gh -R o/r pr merge 511",
+            "gh --repo o/r pr ready 511",
+            "gh --repo=o/r pr merge 511",
+            "GH_REPO=o/r gh pr merge 511",
+            "env GH_TOKEN=x gh -R o/r pr merge 511",
+            "if true; then gh -R o/r pr merge 511; fi",
+        ] {
+            let gh = unreviewed_gh();
+            assert!(eval(command, &gh).is_some(), "{command}");
+            let args = gh.graphql_args.borrow();
+            assert!(has(&args, "owner=o"), "{command}: {args:?}");
+            assert!(has(&args, "name=r"), "{command}: {args:?}");
+            assert!(has(&args, "number=511"), "{command}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn prefixed_flip_on_an_untrusted_host_makes_no_call() {
+        // Widening the matcher must not widen where the hook sends requests:
+        // an inline `GH_HOST=` is still vetted before any call.
+        let gh = unreviewed_gh();
+        assert_eq!(eval("GH_HOST=evil.example gh pr merge 5", &gh), None);
+        assert_eq!(gh.call_count(), 0);
+    }
+
+    #[test]
+    fn retargeted_undo_does_not_match() {
+        assert!(flip_segment_tokens("gh -R o/r pr ready 12 --undo").is_none());
     }
 }
