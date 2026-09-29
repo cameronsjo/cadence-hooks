@@ -1252,4 +1252,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn commented_continuation_floods_stay_fast() {
+        // `has_shell_fed_heredoc` reads `logical_lines` over the whole
+        // command, and a commented continuation on every line (`echo a #;\`
+        // ⏎ …) made that quadratic: 2 s at 200 KB, past the hook deadline,
+        // which fails open. The fallback only runs for a command no earlier
+        // arm blocked, so the timed rows end in a harmless `gh`; bash does not
+        // continue a comment, so a delete after the run is its own command
+        // and still blocks.
+        for unit in ["echo a #;\\\n", "echo a #;\\\r\n", "echo a #|\\\n"] {
+            let flood = unit.repeat(200_000 / unit.len());
+            for (tail, want) in [
+                ("gh pr list", cadence_hooks_core::Outcome::Allow),
+                (
+                    "gh repo delete x/y --yes",
+                    cadence_hooks_core::Outcome::Block,
+                ),
+            ] {
+                let command = format!("{flood}{tail}");
+                let start = std::time::Instant::now();
+                let result = GhDangerousGuard.run(&make_bash(&command));
+                assert_eq!(result.outcome, want, "{unit:?} {tail}");
+                assert!(
+                    start.elapsed() < nest_time_limit_1118(),
+                    "{unit:?} {tail}: {:?}",
+                    start.elapsed()
+                );
+            }
+        }
+    }
 }
