@@ -73,6 +73,10 @@ static NAME_PATTERN: LazyLock<Regex> =
 enum FileType {
     Skill,
     Command,
+    /// A plugin-distributed agent definition (`<plugin>/agents/*.md`).
+    Agent,
+    /// A living plan (`docs/plans/*.md`).
+    Plan,
     Other,
 }
 
@@ -259,9 +263,38 @@ fn classify_path(path: &str) -> FileType {
         FileType::Skill
     } else if is_markdown && is_definition_of("commands", prefix, &segments) {
         FileType::Command
+    } else if is_markdown && is_plugin_agent(prefix, &segments) {
+        FileType::Agent
+    } else if is_markdown && is_plan_path(&segments) {
+        FileType::Plan
     } else {
         FileType::Other
     }
+}
+
+/// Is this an agent definition inside a PLUGIN — an `agents/` directory whose
+/// parent carries a `.claude-plugin/` marker? `<repo>/.claude/agents/` is
+/// deliberately not matched: `hooks`, `mcpServers` and `permissionMode` are
+/// honoured there, so the silent-ignore warning would be false. Fails open on
+/// an absent marker, like [`is_definition_root`].
+fn is_plugin_agent(prefix: &str, segments: &[&str]) -> bool {
+    segments.iter().enumerate().any(|(i, segment)| {
+        i > 0
+            && i + 1 < segments.len()
+            && segment.eq_ignore_ascii_case("agents")
+            && std::path::Path::new(prefix)
+                .join(segments[..i].join("/"))
+                .join(".claude-plugin")
+                .is_dir()
+    })
+}
+
+/// `docs/plans/<name>.md` — a direct child only, so nested docs stay out.
+fn is_plan_path(segments: &[&str]) -> bool {
+    let n = segments.len();
+    n >= 3
+        && segments[n - 2].eq_ignore_ascii_case("plans")
+        && segments[n - 3].eq_ignore_ascii_case("docs")
 }
 
 fn extract_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
@@ -327,6 +360,211 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
+/// Hard cap on `description`, from the Agent Skills spec. The house target
+/// (250 chars) is advisory: 20 of 103 shipped skills exceed it, so blocking on
+/// it would lock edits to skills nobody is touching the description of.
+const DESCRIPTION_MAX_CHARS: usize = 1024;
+
+/// The Description Format Rules that are mechanically checkable (#613): a
+/// single YAML line, within the spec length cap, carrying a "Use when/after"
+/// trigger clause (in `description`, or in `when_to_use`, which the platform
+/// appends to it).
+///
+/// A block scalar (`>-`, `|`) or a continuation line silently fragments
+/// routing: the listing shows the indicator or the first line only.
+fn description_problems(content: &str, fields: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let Some((_, raw)) = fields.iter().find(|(k, _)| k == "description") else {
+        return problems; // missing-field error is reported elsewhere
+    };
+    let value = strip_inline_comment(raw);
+
+    let lines: Vec<&str> = content.lines().collect();
+    let end = lines
+        .iter()
+        .skip(1)
+        .position(|l| *l == "---")
+        .map_or(lines.len(), |p| p + 1);
+    let idx = lines[1..end.min(lines.len())]
+        .iter()
+        .position(|l| l.starts_with("description:"))
+        .map(|p| p + 1);
+    let continued = idx.is_some_and(|i| {
+        lines.get(i + 1).is_some_and(|next| {
+            i + 1 < end && next.starts_with(char::is_whitespace) && !next.trim().is_empty()
+        })
+    });
+
+    if value.starts_with('|') || value.starts_with('>') {
+        problems.push(
+            "description must be a single YAML line — a block scalar ('>-', '|') fragments skill routing".into(),
+        );
+        return problems;
+    }
+    if continued {
+        problems.push(
+            "description must be a single YAML line — an indented continuation line is not part of the routing text".into(),
+        );
+        return problems;
+    }
+
+    let unquoted = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value);
+    let len = unquoted.chars().count();
+    if len > DESCRIPTION_MAX_CHARS {
+        problems.push(format!(
+            "description is {len} characters — the spec cap is {DESCRIPTION_MAX_CHARS}"
+        ));
+    }
+
+    let has_trigger = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("use when") || lower.contains("use after")
+    };
+    let when_to_use = fields
+        .iter()
+        .find(|(k, _)| k == "when_to_use")
+        .map_or("", |(_, v)| v.as_str());
+    if !unquoted.is_empty() && !has_trigger(unquoted) && !has_trigger(when_to_use) {
+        problems.push(
+            "description has no trigger clause — say when to use the skill ('Use when …' / 'Use after …')".into(),
+        );
+    }
+    problems
+}
+
+/// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
+/// and bypasses conditional activation. Tokens inside fenced blocks or inline
+/// code spans are mentions, not references, and are skipped — the leniency
+/// that lets the rule be documented; the token must also start a word so
+/// `user@skills/x` does not match.
+fn force_load_refs(content: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut in_code = false;
+        let mut prev: Option<char> = None;
+        let mut rest = line;
+        while let Some(c) = rest.chars().next() {
+            if c == '`' {
+                in_code = !in_code;
+            } else if !in_code
+                && rest.starts_with("@skills/")
+                && prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '.' | '-')))
+            {
+                let token: String = rest.chars().take_while(|ch| !ch.is_whitespace()).collect();
+                refs.push(token);
+            }
+            prev = Some(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    refs
+}
+
+/// `@skills/` references the resulting document has that the on-disk one did
+/// not. A file already carrying one stays editable; only an introduction blocks.
+fn introduced_force_loads(path: &str, content: &str) -> Vec<String> {
+    let now = force_load_refs(content);
+    if now.is_empty() {
+        return Vec::new();
+    }
+    let before = std::fs::read_to_string(path)
+        .map(|old| force_load_refs(&old))
+        .unwrap_or_default();
+    now.into_iter()
+        .filter(|r| !before.contains(r))
+        .map(|r| {
+            format!(
+                "'{r}' force-loads a skill and bypasses conditional activation — name the skill (`plugin:skill`) instead of an @skills/ path"
+            )
+        })
+        .collect()
+}
+
+/// Agent files inside a plugin (#615): `hooks`, `mcpServers` and
+/// `permissionMode` are accepted and silently ignored there. A NUDGE, not a
+/// block: the file is otherwise valid, and the same agent copied to
+/// `.claude/agents/` honours all three. `skills`/`mcpServers` on teammate
+/// definitions are not checked — whether a definition is dispatched as a
+/// teammate is not visible from the file.
+fn check_agent(content: &str) -> CheckResult {
+    let Some(fields) = extract_frontmatter(content) else {
+        return CheckResult::allow();
+    };
+    let ignored: Vec<&str> = ["hooks", "mcpServers", "permissionMode"]
+        .into_iter()
+        .filter(|f| fields.iter().any(|(k, _)| k == f))
+        .collect();
+    if ignored.is_empty() {
+        return CheckResult::allow();
+    }
+    CheckResult::nudge(format!(
+        "Plugin-distributed agents silently ignore {} — the field is accepted but has no effect. Drop it, or ship the agent to .claude/agents/ where it is honoured.",
+        ignored.join(", ")
+    ))
+}
+
+/// Living-plan frontmatter shape (#607): producer tuple as FLAT keys in one
+/// frontmatter block above the title, never a nested `provenance:` block. A
+/// plan with no frontmatter at all predates the contract and is allowed — it
+/// cannot be told from a hand-written doc.
+fn check_plan(content: &str) -> CheckResult {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.first() != Some(&"---") {
+        return CheckResult::allow();
+    }
+    let Some(end) = lines[1..].iter().position(|l| *l == "---").map(|p| p + 1) else {
+        return CheckResult::allow();
+    };
+    let mut errors = Vec::new();
+    if lines[1..end]
+        .iter()
+        .any(|l| l.trim_end() == "provenance:" || l.starts_with("provenance:"))
+    {
+        errors.push("a 'provenance:' key in frontmatter — a plan carries the producer tuple as flat keys (date, session_id, model, harness, machine)");
+    }
+    if lines[end + 1..].iter().find(|l| !l.trim().is_empty()) == Some(&"---") {
+        errors.push("a second frontmatter block — a plan has exactly one, above the title");
+    }
+    let mut in_fence = false;
+    let mut first_in_fence = false;
+    for line in &lines[end + 1..] {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            first_in_fence = in_fence;
+            continue;
+        }
+        if in_fence && first_in_fence && !line.trim().is_empty() {
+            first_in_fence = false;
+            if line.trim_end() == "provenance:" {
+                errors.push(
+                    "a fenced nested 'provenance:' block — plans use flat frontmatter keys instead",
+                );
+            }
+        }
+    }
+    if errors.is_empty() {
+        CheckResult::allow()
+    } else {
+        CheckResult::block(format!(
+            "Living-plan frontmatter validation failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
 /// Validates YAML frontmatter in skill and command markdown files.
 pub struct ValidateSkillFrontmatter;
 
@@ -352,6 +590,12 @@ impl Check for ValidateSkillFrontmatter {
         let Some(content) = input.effective_content() else {
             return CheckResult::allow();
         };
+
+        match file_type {
+            FileType::Plan => return check_plan(&content),
+            FileType::Agent => return check_agent(&content),
+            _ => {}
+        }
 
         let Some(fields) = extract_frontmatter(&content) else {
             return CheckResult::block("Frontmatter validation failed: file missing YAML frontmatter (must start with ---)".to_string());
@@ -424,6 +668,8 @@ impl Check for ValidateSkillFrontmatter {
                         ));
                     }
                 }
+
+                errors.extend(description_problems(&content, &fields));
             }
             FileType::Command => {
                 if fields.iter().any(|(k, _)| k == "name") {
@@ -433,8 +679,12 @@ impl Check for ValidateSkillFrontmatter {
                     );
                 }
             }
-            FileType::Other => {}
+            FileType::Agent | FileType::Plan | FileType::Other => {}
         }
+
+        // `@skills/` force-load syntax (#614): skill and command bodies only,
+        // and only a reference this edit introduces.
+        errors.extend(introduced_force_loads(&path, &content));
 
         if errors.is_empty() {
             CheckResult::allow()
@@ -470,7 +720,7 @@ mod tests {
 
     #[test]
     fn valid_skill_passes() {
-        let content = "---\nname: my-skill\ndescription: A test skill\n---\n# Content";
+        let content = "---\nname: my-skill\ndescription: Use when testing\n---\n# Content";
         let fields = extract_frontmatter(content).unwrap();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].0, "name");
@@ -994,7 +1244,7 @@ mod tests {
     fn run_skill_invalid_name_format_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: My-Skill\ndescription: test\n---\n# Content",
+            "---\nname: My-Skill\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1005,7 +1255,7 @@ mod tests {
     fn run_skill_name_dir_mismatch_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: other-name\ndescription: test\n---\n# Content",
+            "---\nname: other-name\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1019,7 +1269,7 @@ mod tests {
         // 0.63.0 accepted, and the one that renders `/cadence:cadence:my-skill`.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
+            "---\nname: cadence:my-skill\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1032,7 +1282,7 @@ mod tests {
         // the format check AND `cadence:wrong` is not the directory `my-skill`.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
+            "---\nname: cadence:wrong\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1044,7 +1294,7 @@ mod tests {
         // The correct form as of Claude Code 2.1.216.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1054,7 +1304,7 @@ mod tests {
     fn run_valid_skill_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1064,7 +1314,7 @@ mod tests {
     fn run_command_with_name_field_blocks() {
         let input = make_write_input(
             "/repo/.claude/commands/my-cmd.md",
-            "---\nname: my-cmd\ndescription: test\n---\n# Content",
+            "---\nname: my-cmd\ndescription: Use when testing\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1085,7 +1335,7 @@ mod tests {
     fn run_unknown_field_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\nunknown-field: value\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nunknown-field: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1155,7 +1405,7 @@ mod tests {
 
     #[test]
     fn frontmatter_missing_end_delimiter() {
-        let content = "---\nname: my-skill\ndescription: test\n# No end delimiter";
+        let content = "---\nname: my-skill\ndescription: Use when testing\n# No end delimiter";
         assert!(extract_frontmatter(content).is_none());
     }
 
@@ -1163,7 +1413,7 @@ mod tests {
     fn frontmatter_nested_keys_excluded() {
         // Indented (nested) keys belong to a parent mapping — they are not
         // top-level fields and must not be validated against VALID_FIELDS.
-        let content = "---\nname: my-skill\n  nested: value\ndescription: test\n---\n";
+        let content = "---\nname: my-skill\n  nested: value\ndescription: Use when testing\n---\n";
         let fields = extract_frontmatter(content).unwrap();
         assert_eq!(fields.len(), 2);
         assert!(fields.iter().all(|(k, _)| k != "nested"));
@@ -1189,7 +1439,7 @@ mod tests {
     use cadence_hooks_core::test_builders::{make_edit, make_multi_edit};
 
     const VALID_SKILL: &str =
-        "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n\nBody text here.\n";
+        "---\nname: my-skill\ndescription: Use when testing\n---\n# My Skill\n\nBody text here.\n";
 
     /// Write a valid SKILL.md into a temp dir shaped like a REAL plugin skill
     /// tree — a plugin root carrying a `.claude-plugin/` marker, with the skill
@@ -1279,7 +1529,7 @@ mod tests {
         // unknown top-level fields.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\nmetadata:\n  author: cameron\n  version: 1.0.0\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nmetadata:\n  author: cameron\n  version: 1.0.0\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1289,7 +1539,7 @@ mod tests {
     fn valid_skill_with_optional_fields() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A skill\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1302,7 +1552,7 @@ mod tests {
         // It must not be rejected as an unknown frontmatter field.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\npaths: src/**/*.rs\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\npaths: src/**/*.rs\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1314,7 +1564,7 @@ mod tests {
     fn run_skill_with_background_true_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ncontext: fork\nbackground: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1324,7 +1574,7 @@ mod tests {
     fn run_skill_with_background_false_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: false\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ncontext: fork\nbackground: false\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1336,7 +1586,7 @@ mod tests {
         // 2.1.218; cadence house style stays strict true/false.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: yes\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ncontext: fork\nbackground: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1354,7 +1604,7 @@ mod tests {
         // same strictness as the new `background` field.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: yes\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nuser-invocable: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1370,7 +1620,7 @@ mod tests {
     fn run_skill_disable_model_invocation_numeric_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ndisable-model-invocation: 1\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ndisable-model-invocation: 1\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1386,7 +1636,7 @@ mod tests {
     fn run_skill_boolean_true_false_still_pass() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1398,7 +1648,7 @@ mod tests {
         // is the boolean true, not a malformed spelling.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1410,7 +1660,7 @@ mod tests {
         // Unquoted true/false is the one greppable form.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: \"true\"\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ncontext: fork\nbackground: \"true\"\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1459,7 +1709,7 @@ mod tests {
     #[test]
     fn frontmatter_line_without_colon() {
         // A line in frontmatter with no colon
-        let content = "---\nname: my-skill\nbroken line\ndescription: test\n---\n";
+        let content = "---\nname: my-skill\nbroken line\ndescription: Use when testing\n---\n";
         let fields = extract_frontmatter(content).unwrap();
         assert_eq!(fields.len(), 2); // broken line is skipped
     }
@@ -1470,7 +1720,7 @@ mod tests {
     fn run_skill_with_when_to_use_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\nwhen_to_use: Use when doing X\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nwhen_to_use: Use when doing X\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1480,7 +1730,7 @@ mod tests {
     fn run_skill_with_arguments_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\narguments: issue branch\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\narguments: issue branch\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1490,7 +1740,7 @@ mod tests {
     fn run_skill_with_disallowed_tools_passes() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\ndisallowed-tools: AskUserQuestion\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\ndisallowed-tools: AskUserQuestion\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -1499,8 +1749,9 @@ mod tests {
     #[test]
     fn run_skill_with_valid_effort_passes() {
         for level in ["low", "medium", "high", "xhigh", "max"] {
-            let content =
-                format!("---\nname: my-skill\ndescription: test\neffort: {level}\n---\n# Content");
+            let content = format!(
+                "---\nname: my-skill\ndescription: Use when testing\neffort: {level}\n---\n# Content"
+            );
             let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
@@ -1515,7 +1766,7 @@ mod tests {
     fn run_skill_with_invalid_effort_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\neffort: extreme\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\neffort: extreme\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1525,8 +1776,9 @@ mod tests {
     #[test]
     fn run_skill_with_valid_shell_passes() {
         for shell in ["bash", "powershell"] {
-            let content =
-                format!("---\nname: my-skill\ndescription: test\nshell: {shell}\n---\n# Content");
+            let content = format!(
+                "---\nname: my-skill\ndescription: Use when testing\nshell: {shell}\n---\n# Content"
+            );
             let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
@@ -1541,7 +1793,7 @@ mod tests {
     fn run_skill_with_invalid_shell_blocks() {
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\nshell: zsh\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\nshell: zsh\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1554,7 +1806,7 @@ mod tests {
         // key is still rejected.
         let input = make_write_input(
             "/repo/.claude/skills/my-skill/SKILL.md",
-            "---\nname: my-skill\ndescription: test\neffort: high\ntotally-made-up: value\n---\n# Content",
+            "---\nname: my-skill\ndescription: Use when testing\neffort: high\ntotally-made-up: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1564,5 +1816,203 @@ mod tests {
                 .unwrap()
                 .contains("Unknown frontmatter field: 'totally-made-up'")
         );
+    }
+
+    // ---- #613: Description Format Rules ----
+
+    const SKILL_PATH: &str = "/repo/.claude/skills/my-skill/SKILL.md";
+
+    fn skill_verdict(frontmatter_body: &str) -> (cadence_hooks_core::Outcome, String) {
+        let content = format!("---\nname: my-skill\n{frontmatter_body}\n---\n# Content");
+        let r = ValidateSkillFrontmatter.run(&make_write_input(SKILL_PATH, &content));
+        (r.outcome, r.message.unwrap_or_default())
+    }
+
+    #[test]
+    fn description_block_scalar_blocks() {
+        for indicator in [">-", "|", ">", "|-"] {
+            let (o, m) = skill_verdict(&format!(
+                "description: {indicator}\n  Use when testing things"
+            ));
+            assert_eq!(o, cadence_hooks_core::Outcome::Block, "{indicator}");
+            assert!(m.contains("single YAML line"), "{m}");
+        }
+    }
+
+    #[test]
+    fn description_continuation_line_blocks() {
+        let (o, m) = skill_verdict("description: Use when testing\n  and more text");
+        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+        assert!(m.contains("single YAML line"), "{m}");
+    }
+
+    #[test]
+    fn description_over_spec_cap_blocks_and_at_cap_passes() {
+        let at_cap = format!(
+            "Use when testing {}",
+            "x".repeat(DESCRIPTION_MAX_CHARS - 17)
+        );
+        assert_eq!(at_cap.chars().count(), DESCRIPTION_MAX_CHARS);
+        let (o, _) = skill_verdict(&format!("description: {at_cap}"));
+        assert_eq!(o, cadence_hooks_core::Outcome::Allow);
+        let (o, m) = skill_verdict(&format!("description: {at_cap}y"));
+        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+        assert!(m.contains("spec cap"), "{m}");
+    }
+
+    #[test]
+    fn description_without_trigger_clause_blocks() {
+        let (o, m) = skill_verdict("description: Liveness-gated reclaim of cruft");
+        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+        assert!(m.contains("no trigger clause"), "{m}");
+    }
+
+    #[test]
+    fn description_trigger_forms_pass() {
+        for fm in [
+            "description: Use when testing",
+            "description: Reclaims cruft. Use after a crash.",
+            "description: \"use WHEN quoted\"",
+            "description: Reclaims cruft\nwhen_to_use: Use when the lane dies",
+        ] {
+            assert_eq!(
+                skill_verdict(fm).0,
+                cadence_hooks_core::Outcome::Allow,
+                "{fm}"
+            );
+        }
+    }
+
+    #[test]
+    fn description_rules_do_not_apply_to_commands() {
+        let input = make_write_input(
+            "/repo/.claude/commands/my-cmd.md",
+            "---\ndescription: >-\n  a command\n---\n# Content",
+        );
+        assert_eq!(
+            ValidateSkillFrontmatter.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    // ---- #614: @skills/ force-load ----
+
+    #[test]
+    fn force_load_reference_in_prose_blocks() {
+        let content = "---\nname: my-skill\ndescription: Use when testing\n---\nSee @skills/other/SKILL.md for more.\n";
+        let r = ValidateSkillFrontmatter.run(&make_write_input(SKILL_PATH, content));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(r.message.unwrap().contains("@skills/other/SKILL.md"));
+    }
+
+    #[test]
+    fn force_load_in_code_span_fence_or_word_is_a_mention() {
+        for body in [
+            "Never write `@skills/x/SKILL.md` here.",
+            "```\n@skills/x/SKILL.md\n```",
+            "mail me at dev@skills/x",
+        ] {
+            let content =
+                format!("---\nname: my-skill\ndescription: Use when testing\n---\n{body}\n");
+            let r = ValidateSkillFrontmatter.run(&make_write_input(SKILL_PATH, &content));
+            assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow, "{body}");
+        }
+    }
+
+    #[test]
+    fn force_load_already_on_disk_stays_editable_but_a_new_one_blocks() {
+        let old =
+            "---\nname: my-skill\ndescription: Use when testing\n---\nSee @skills/a/SKILL.md\n";
+        let (_dir, path) = on_disk_skill(old);
+        let ok = ValidateSkillFrontmatter.run(&make_edit(&path, "See", "Look at"));
+        assert_eq!(ok.outcome, cadence_hooks_core::Outcome::Allow);
+        let bad = ValidateSkillFrontmatter.run(&make_edit(&path, "See", "@skills/b/SKILL.md and"));
+        assert_eq!(bad.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---- #615: plugin agents ----
+
+    fn plugin_agent() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("some-plugin");
+        std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(root.join("agents")).unwrap();
+        let path = as_hook_path(&root.join("agents/reviewer.md"));
+        (dir, path)
+    }
+
+    #[test]
+    fn plugin_agent_with_ignored_fields_nudges() {
+        let (_d, path) = plugin_agent();
+        assert_eq!(classify_path(&path), FileType::Agent);
+        let content =
+            "---\nname: r\ndescription: d\npermissionMode: plan\nhooks:\n  x: y\n---\nbody";
+        let r = ValidateSkillFrontmatter.run(&make_write_input(&path, content));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Nudge);
+        let m = r.message.unwrap();
+        assert!(m.contains("hooks") && m.contains("permissionMode"), "{m}");
+    }
+
+    #[test]
+    fn plugin_agent_without_ignored_fields_is_silent() {
+        let (_d, path) = plugin_agent();
+        let content = "---\nname: r\ndescription: d\nmodel: opus\nskills: a\n---\nbody";
+        let r = ValidateSkillFrontmatter.run(&make_write_input(&path, content));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn project_agent_dir_is_not_a_plugin_agent() {
+        // `.claude/agents/` honours all three fields — a warning would be false.
+        assert_eq!(classify_path("/repo/.claude/agents/r.md"), FileType::Other);
+    }
+
+    // ---- #607: living-plan frontmatter ----
+
+    fn plan_verdict(content: &str) -> (cadence_hooks_core::Outcome, String) {
+        let r = ValidateSkillFrontmatter.run(&make_write_input(
+            "/repo/docs/plans/2026-09-29-x.md",
+            content,
+        ));
+        (r.outcome, r.message.unwrap_or_default())
+    }
+
+    #[test]
+    fn plan_with_flat_keys_passes_and_frontmatterless_plan_passes() {
+        let ok = "---\nstatus: planned\nnext: go\ndate: 2026-09-29\nmodel: m\n---\n\n# Plan\n";
+        assert_eq!(plan_verdict(ok).0, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(
+            plan_verdict("# Old plan\n").0,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn plan_nested_provenance_in_frontmatter_blocks() {
+        let bad = "---\nstatus: planned\nprovenance:\n  date: 2026-09-29\n---\n# Plan\n";
+        let (o, m) = plan_verdict(bad);
+        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+        assert!(m.contains("provenance"), "{m}");
+    }
+
+    #[test]
+    fn plan_fenced_provenance_block_blocks_but_other_fences_pass() {
+        let bad = "---\nstatus: planned\n---\n# Plan\n\n```yaml\nprovenance:\n  date: x\n```\n";
+        assert_eq!(plan_verdict(bad).0, cadence_hooks_core::Outcome::Block);
+        let fine = "---\nstatus: planned\n---\n# Plan\n\n```yaml\nother: 1\n```\n";
+        assert_eq!(plan_verdict(fine).0, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn plan_second_frontmatter_block_blocks() {
+        let bad = "---\nstatus: planned\n---\n---\ndate: x\n---\n# Plan\n";
+        assert_eq!(plan_verdict(bad).0, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn only_direct_docs_plans_children_are_plans() {
+        assert_eq!(classify_path("/repo/docs/plans/x.md"), FileType::Plan);
+        assert_eq!(classify_path("/repo/docs/plans/sub/x.md"), FileType::Other);
+        assert_eq!(classify_path("/repo/plans/x.md"), FileType::Other);
     }
 }

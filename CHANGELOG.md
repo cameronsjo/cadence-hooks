@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`rules validate-frontmatter` now enforces the mechanical Description Format Rules on skills.** A `description` written as a block scalar (`>-`, `|`) or with an indented continuation line, longer than the spec cap of 1024 characters, or with no "Use when" / "Use after" trigger clause (in `description` or `when_to_use`) is blocked. The house 250-character target is not enforced: 20 of 103 shipped skills exceed it. Against the current cadence corpus this newly blocks edits to two skills with no trigger clause (`cadence:tend`, `cadence-discovery:usage-inventory`) until their descriptions gain one. (cameronsjo/cadence-hooks#613)
+- **`rules validate-frontmatter` rejects an introduced `@skills/` force-load reference in skill and command files.** The syntax bypasses conditional activation. A reference already in the file stays editable, and mentions inside inline code spans or fenced blocks, or glued to a preceding word, are allowed so the rule can be documented. (cameronsjo/cadence-hooks#614)
+- **`rules validate-frontmatter` blocks a nested `provenance:` in a living plan's frontmatter.** For a direct child of `docs/plans/` that opens with a frontmatter block, it also blocks a second frontmatter block above the title and a fenced `provenance:` block. A plan with no frontmatter is left alone. (cameronsjo/cadence-hooks#607)
+- **`rules validate-frontmatter` nudges when a plugin agent declares `hooks`, `mcpServers`, or `permissionMode`.** The platform accepts and silently ignores all three on plugin-distributed agents (a directory named `agents/` whose parent holds `.claude-plugin/`). It is a nudge, not a block, and `.claude/agents/` is not checked. `skills:`/`mcpServers:` on teammate-dispatched definitions are not checked, since the file does not show how it is dispatched. (cameronsjo/cadence-hooks#615)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed
