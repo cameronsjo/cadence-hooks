@@ -16933,6 +16933,88 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_scripts_reads_find_actions_and_command_line_git_aliases() {
+        // find execs its command with no shell, so each word comes back
+        // quoted; `{}` stays literal. git expands a `-c alias.*` before it
+        // runs anything. Each row measured under bash 5.2 with findutils 4.9
+        // and git 2.43 (canary files, a local bare repository).
+        for (command, want) in [
+            (
+                r"find . -exec sh -c 'cat .env' \;",
+                vec!["sh -c 'cat .env'"],
+            ),
+            (
+                r"find . -name x -exec git push --force origin main \;",
+                vec!["git push --force origin main"],
+            ),
+            ("find . -exec grep -l foo {} +", vec!["grep -l foo '{}'"]),
+            ("find . -execdir cat .env ';'", vec!["cat .env"]),
+            (r"find . -ok cat .env \;", vec!["cat .env"]),
+            (r"find . -okdir cat\ .env \;", vec!["'cat .env'"]),
+            // `+` closes only straight after `{}`; both actions are read.
+            (
+                r"find . -exec echo + x {} + -exec rm y \;",
+                vec!["echo + x '{}'", "rm y"],
+            ),
+            // No terminator: find refuses and runs nothing; surfaced anyway.
+            ("find . -exec cat .env", vec!["cat .env"]),
+            (r"sudo find / -exec cat .env \;", vec!["cat .env"]),
+            (r"find . -exec echo \'it\' \;", vec![r"echo ''\''it'\'''"]),
+            (
+                "git -c alias.p='push --force' p origin main",
+                vec!["git -c 'alias.p=push --force' push --force origin main"],
+            ),
+            ("git -c 'alias.x=!cat .env' x", vec!["cat .env"]),
+            ("git -c alias.X='!cat .env' x a", vec!["cat .env a"]),
+            (
+                "git -C d -c alias.p=push p",
+                vec!["git -C d -c alias.p=push push"],
+            ),
+            // Controls: nothing runs a command.
+            ("find . -name '*.rs' -print", vec![]),
+            ("find . -type f -delete", vec![]),
+            ("git -c alias.st=status log", vec![]),
+            ("git status", vec![]),
+            ("git -c alias.p=push status", vec![]),
+        ] {
+            assert_eq!(wrapped_scripts(&tokenize(command)), want, "{command:?}");
+        }
+        // Recursion: the script a find action or alias runs is walked in turn.
+        for (command, inner) in [
+            (r"find . -exec sh -c 'cat .env' \;", "cat .env"),
+            (
+                r"find . -exec bash -c 'git push --force origin main' \;",
+                "git push --force origin main",
+            ),
+            ("git -c alias.p=q -c 'alias.q=!cat .env' p", "cat .env"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment.trim() == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runs_in_found_directories_names_only_the_dir_actions() {
+        for (command, want) in [
+            (r"find . -execdir git push origin main \;", true),
+            (r"find . -okdir rm {} \;", true),
+            (r"nice find . -execdir wc -l {} +", true),
+            (r"find . -exec git push origin main \;", false),
+            ("find . -name x", false),
+            ("echo -execdir", false),
+        ] {
+            assert_eq!(
+                runs_in_found_directories(&tokenize(command)),
+                want,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn command_segments_leaves_a_wrapper_utility_s_data_alone() {
         // Shapes that run no inner script (measured): stdin is data under
         // `-c` or a script file; `flock -c` BEFORE the file is the lock path;
