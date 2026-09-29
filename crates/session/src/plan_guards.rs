@@ -336,8 +336,9 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
 /// position (`echo gh pr merge`) also matches, which costs at most a
 /// spurious nudge. The window is `gh pr <sub>` adjacent, so a global `-R`
 /// behind a non-transparent prefix (`sudo gh -R o/r pr ready 1`) is not seen
-/// here, and an inline `GH_REPO=` in front of such a prefix
-/// (`GH_REPO=o/r sudo gh pr ready 1`) is dropped with it.
+/// here. A window with an inline `GH_REPO=`/`GH_HOST=` anywhere before its
+/// `gh` (`env -u X GH_REPO=o/r gh pr ready 12`) is skipped: the slice would
+/// drop the retarget and read the flip as this checkout's.
 fn windowed_flips(command: &str) -> Vec<Vec<String>> {
     command_segments(command)
         .into_iter()
@@ -348,7 +349,12 @@ fn windowed_flips(command: &str) -> Vec<Vec<String>> {
             let tokens = tokenize(&segment);
             (0..tokens.len().saturating_sub(2))
                 .filter(|&i| {
-                    basename(&tokens[i]) == "gh"
+                    // An inline retarget ahead of `gh` would be dropped by the
+                    // slice below, so such a window is not read at all.
+                    !tokens[..i]
+                        .iter()
+                        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="))
+                        && basename(&tokens[i]) == "gh"
                         && tokens[i + 1] == "pr"
                         && match tokens[i + 2].as_str() {
                             "ready" => !carries_undo_flag(&tokens[i + 3..]),
@@ -1090,6 +1096,8 @@ mod tests {
         for cmd in [
             "sudo gh pr ready 12 -R other/repo",
             "timeout 60 gh pr ready --undo",
+            "env -u X GH_REPO=o/r gh pr ready 12",
+            "GH_HOST=x.example sudo gh pr ready 12",
         ] {
             let input = bash_input("flip-1070-i1-quiet", tmp.path(), cmd, "");
             assert_eq!(

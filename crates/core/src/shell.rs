@@ -1869,10 +1869,13 @@ pub fn pr_url_parts(value: &str) -> Option<(String, String, String, u64)> {
 /// The walk uses the same flag grammar as [`scan_ship_flags`]
 /// ([`flag_grammar`], [`read_flag_token`]), so a flag's value is never read
 /// as the selector: `-R o/r 5` and `-b 7 5` both select `5`. A `#` comment
-/// ends the walk, redirects are skipped, and after `--` the next token is the
-/// selector whatever it looks like. An unknown flag, or a lone `-`, makes the
+/// ends the walk, redirects are skipped, and after `--` every token is a
+/// positional whatever it looks like. An unknown flag, or a lone `-`, makes the
 /// selector [`PrSelector::Unreadable`], because which later token is a value
-/// can no longer be told.
+/// can no longer be told. So does a second positional: gh takes one, so a
+/// second means the walk misread some token, and the walk runs to the end of
+/// the segment to find it. An unknown flag after the selector therefore also
+/// reads as unreadable.
 ///
 /// This reads one segment. A caller that passes only the first flip segment
 /// of a compound command (`gh pr ready 1 && gh pr merge 2`) examines only
@@ -1883,26 +1886,37 @@ pub fn pr_selector(segment_tokens: &[String]) -> PrSelector {
     };
     let grammar = flag_grammar(invocation.subcommand);
     let operands = invocation.operands;
+    let mut selector: Option<&str> = None;
+    let mut after_double_dash = false;
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
         if token == "#" {
             break;
         }
-        if token == "--" {
-            return operands
-                .get(i + 1)
-                .map_or(PrSelector::None, |t| classify_pr_selector(t));
+        if token == "--" && !after_double_dash {
+            after_double_dash = true;
+            i += 1;
+            continue;
         }
         if let Some(next) = skip_redirect(operands, i) {
             i = next;
             continue;
         }
+        if after_double_dash || !token.starts_with('-') {
+            // gh takes one PR argument. A second positional means some
+            // token was not what this walk took it for (a flag value read as
+            // a flag, or `-- -R o/r`), so no token can be trusted as the PR
+            // (cadence-hooks#1070 delta review).
+            if selector.is_some() {
+                return PrSelector::Unreadable;
+            }
+            selector = Some(token);
+            i += 1;
+            continue;
+        }
         if token == "-" {
             return PrSelector::Unreadable;
-        }
-        if !token.starts_with('-') {
-            return classify_pr_selector(token);
         }
         let read = read_flag_token(grammar, token, operands.get(i + 1).map(String::as_str));
         if read.taints_rest {
@@ -1910,7 +1924,7 @@ pub fn pr_selector(segment_tokens: &[String]) -> PrSelector {
         }
         i += read.consumed;
     }
-    PrSelector::None
+    selector.map_or(PrSelector::None, classify_pr_selector)
 }
 
 /// Classify one positional token as a PR number, a PR URL, or anything else.
@@ -6915,6 +6929,38 @@ mod tests {
             "gh issue close 5",
         ] {
             assert!(pr_flip_segments(command).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn pr_selector_second_positional_is_unreadable() {
+        for command in [
+            "gh pr merge 5 --subject -R other/repo",
+            "gh pr merge 5 -b -R other/repo",
+            "gh pr merge 5 -A -R other/repo",
+            "gh pr merge 5 -F -R other/repo",
+            "gh pr merge 5 --body-file -R other/repo",
+            "gh pr merge 5 -- -R other/repo",
+            "gh pr merge 5 6",
+        ] {
+            let segments = pr_flip_segments(command);
+            assert_eq!(
+                pr_selector(&segments[0]),
+                PrSelector::Unreadable,
+                "{command}"
+            );
+        }
+        for (command, n) in [
+            ("gh pr merge 5 --squash", 5),
+            ("gh pr merge -- 5", 5),
+            ("gh pr merge -R o/r 5 --subject x", 5),
+        ] {
+            let segments = pr_flip_segments(command);
+            assert_eq!(
+                pr_selector(&segments[0]),
+                PrSelector::Number(n),
+                "{command}"
+            );
         }
     }
 

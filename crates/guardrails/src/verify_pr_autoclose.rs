@@ -158,7 +158,13 @@ pub fn merge_target(cmd: &str, origin_host: &str, origin_slug: &str) -> MergeTar
         [tokens] => tokens,
         _ => return MergeTarget::Unsure,
     };
-    if tokens.iter().any(|t| t == "--help" || t == "-h") {
+    // pflag prints help for `-h` anywhere in a short-flag cluster (`-dh`,
+    // `-sdh`), and merges nothing.
+    let asks_for_help = |t: &String| {
+        t == "--help"
+            || (t.starts_with('-') && !t.starts_with("--") && !t.contains('=') && t.contains('h'))
+    };
+    if tokens.iter().any(asks_for_help) {
         return MergeTarget::Unsure;
     }
     let names_origin = |value: &str, implied: Option<&str>| {
@@ -429,7 +435,11 @@ pub fn handle_merge(
             .get("mergedAt")
             .and_then(serde_json::Value::as_str)
             .and_then(rfc3339_unix_seconds)
-            .is_some_and(|at| clock.now_unix() - at <= MERGE_RECENCY_SECS);
+            // Symmetric, so a clock running behind cannot make an old merge
+            // look recent.
+            .is_some_and(|at| {
+                (-MERGE_RECENCY_SECS..=MERGE_RECENCY_SECS).contains(&(clock.now_unix() - at))
+            });
     if !merged {
         return None;
     }
@@ -738,6 +748,14 @@ mod tests {
             // review N1: help merges nothing.
             "gh pr merge 5 --help",
             "gh pr merge -h",
+            "gh pr merge 5 -dh",
+            "gh pr merge 5 -hd",
+            "gh pr merge 5 -sdh",
+            // Delta review: a second positional hides where gh points.
+            "gh pr merge 5 --subject -R other/repo",
+            "gh pr merge 5 -b -R other/repo",
+            "gh pr merge 5 --body-file -R other/repo",
+            "gh pr merge 5 -- -R other/repo",
         ] {
             assert_eq!(
                 merge_target(cmd, "github.com", "owner/repo"),
@@ -1211,6 +1229,17 @@ mod tests {
         );
         assert!(gh.close_calls.borrow().is_empty());
         assert!(clock.sleep_calls.borrow().is_empty());
+        // A clock running ten minutes and more behind the merge is not recent
+        // either.
+        let gh = FakeGh::new()
+            .with_issue(5, "OPEN")
+            .with_pr_body("Closes #5");
+        let clock = FakeClock::at("2026-09-24T23:49:00Z");
+        assert_eq!(
+            handle_merge("owner/repo", None, "gh pr merge 8", &gh, &clock, 10),
+            None
+        );
+        assert!(gh.close_calls.borrow().is_empty());
         // Ten minutes is still recent.
         let gh = FakeGh::new()
             .with_issue(5, "OPEN")
