@@ -816,6 +816,30 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_flood_before_a_decrypt_still_blocks_promptly() {
+        // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
+        // re-expanded as the guard re-tokenizes every segment, ran guards past
+        // their hook timeouts (a timeout fails open). The thread brace budget
+        // bounds the work; the dangerous tail must still block, promptly. The
+        // bound is generous for a debug build — release runs in tens of ms.
+        without_escape(|| {
+            let command = format!(
+                "{}sops -d s.yaml | grep x",
+                "echo {1..4096}; ".repeat(200 * 64)
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(outcome(&command), Outcome::Block);
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            // A heredoc body of minified JSON is data, not an overflow.
+            let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
+            assert_eq!(
+                outcome(&format!("cat > x.json <<'EOF'\n{json}\nEOF")),
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
     fn brace_words_that_build_no_decrypt_stay_allowed() {
         without_escape(|| {
             for command in [

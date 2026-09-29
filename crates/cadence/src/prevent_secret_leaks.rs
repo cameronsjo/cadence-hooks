@@ -3665,9 +3665,40 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_flood_before_a_dotenv_read_still_blocks_promptly() {
+        // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
+        // re-expanded as the guard re-tokenizes every segment, ran guards past
+        // their hook timeouts (a timeout fails open). The thread brace budget
+        // bounds the work; the dangerous tail must still block, promptly. The
+        // bound is generous for a debug build — release runs in tens of ms.
+        let command = format!("{}cat .env", "echo {1..4096}; ".repeat(200 * 64));
+        let started = std::time::Instant::now();
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn minified_json_in_a_heredoc_body_is_not_a_brace_overflow() {
+        // cadence-hooks#1096 review: a JSON line with more objects than the
+        // brace-group cap, in a heredoc body, read as an unmodelled expansion.
+        let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
+        for head in [
+            "cat > x.json <<'EOF'",
+            "cat > x.json <<EOF",
+            "gh api repos/o/r/issues --input - <<'EOF'",
+        ] {
+            let command = format!("{head}\n{json}\nEOF");
+            let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow, "{head}");
+        }
+    }
+
+    #[test]
     fn brace_words_that_read_no_dotenv_allowed() {
+        // A QUOTED `"{cat,.env}"` is left out on purpose: #1097's glob reading
+        // judges a quoted brace group as a glob too ("only adds blocks").
         for command in [
-            "\"{cat,.env}\"",
             "\\{cat,.env\\}",
             "echo {a,b}",
             "mkdir -p src/{a,b}",

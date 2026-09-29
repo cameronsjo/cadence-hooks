@@ -6792,6 +6792,25 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_flood_before_a_gh_write_still_blocks_promptly() {
+        // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
+        // re-expanded as the guard re-tokenizes every segment, ran guards past
+        // their hook timeouts (a timeout fails open). The thread brace budget
+        // bounds the work; the dangerous tail must still block, promptly. The
+        // bound is generous for a debug build — release runs in tens of ms.
+        with_env(&owners_env(), || {
+            let command = format!(
+                "{}gh pr create -R evil/x --title t",
+                "echo {1..4096}; ".repeat(200 * 64)
+            );
+            let started = std::time::Instant::now();
+            let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+            assert!(result.block_metadata.is_some(), "expected a block");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        });
+    }
+
+    #[test]
     fn unmodeled_gh_host_changes_resolve_to_an_unknown_host() {
         with_env(&owners_env(), || {
             for command in [

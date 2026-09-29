@@ -353,23 +353,26 @@ impl LeadRun {
 /// F25).
 pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
-    // One expansion budget for the whole call, so a command of many small
-    // exploding words cannot multiply the per-word bound into a stall that
-    // outlives the hook timeout (and fails open).
-    let mut budget = MAX_BRACE_BYTES;
-    walk_words(
-        command,
-        &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
-            push_expanded_token(
-                &mut tokens,
-                text,
-                flags,
-                unquoted_prefix_len,
-                expanding_prefix_len,
-                &mut budget,
-            );
-        },
-    );
+    // One expansion budget for the whole call, drawn from the thread's
+    // budget, so neither a command of many small exploding words nor a guard
+    // that re-tokenizes every segment can multiply the per-word bound into a
+    // stall that outlives the hook timeout and fails open (see
+    // [`BraceBudget`]).
+    with_brace_budget(|budget| {
+        walk_words(
+            command,
+            &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
+                push_expanded_token(
+                    &mut tokens,
+                    text,
+                    flags,
+                    unquoted_prefix_len,
+                    expanding_prefix_len,
+                    budget,
+                );
+            },
+        );
+    });
     tokens
 }
 
@@ -547,7 +550,7 @@ fn push_expanded_token(
     structural: &[bool],
     unquoted_prefix_len: usize,
     expanding_prefix_len: usize,
-    budget: &mut usize,
+    budget: &mut BraceBudget,
 ) {
     match brace_expand_word(&text, structural, budget) {
         BraceExpansion::Expanded(words) => {
@@ -574,12 +577,83 @@ fn push_expanded_token(
 /// (`{a,b}{a,b}…`) is adversarial by construction.
 const MAX_BRACE_WORDS: usize = 4096;
 
-/// Most bytes the expansions of every word in one tokenizer call may total.
-const MAX_BRACE_BYTES: usize = 1 << 20;
+/// Most bytes, and most words, the expansions in one tokenizer call may build.
+const MAX_BRACE_CALL_BYTES: usize = 1 << 20;
+const MAX_BRACE_CALL_WORDS: usize = 16 * 1024;
+
+/// Most bytes, and most words, every tokenizer call on one thread may build
+/// together. A hook is one process judging one command, so this bounds a
+/// guard's total expansion work however many times it re-tokenizes the
+/// segments of a command (cadence-hooks#1096 review: `echo {1..4096}` × N
+/// re-expanded per segment ran guards past their timeouts).
+const MAX_BRACE_THREAD_BYTES: usize = 8 << 20;
+const MAX_BRACE_THREAD_WORDS: usize = 256 * 1024;
 
 /// Most unquoted `{` one token may carry before expansion is not attempted —
-/// the bound on recursion depth and on rescans.
+/// the bound on recursion depth and on rescans. A `{` opening `${` does not
+/// count.
 const MAX_BRACE_GROUPS: usize = 64;
+
+/// What brace expansion may still build. Every charge that does not fit
+/// spends the whole budget, so once one check fails, every later word in the
+/// call reports [`BraceExpansion::Overflow`] without being expanded.
+#[derive(Debug, Clone, Copy)]
+struct BraceBudget {
+    bytes: usize,
+    words: usize,
+}
+
+impl BraceBudget {
+    fn charge(&mut self, words: usize, bytes: usize) -> Option<()> {
+        match (self.words.checked_sub(words), self.bytes.checked_sub(bytes)) {
+            (Some(w), Some(b)) => {
+                self.words = w;
+                self.bytes = b;
+                Some(())
+            }
+            _ => {
+                self.spend();
+                None
+            }
+        }
+    }
+
+    fn spend(&mut self) {
+        self.words = 0;
+        self.bytes = 0;
+    }
+
+    fn is_spent(&self) -> bool {
+        self.words == 0 || self.bytes == 0
+    }
+}
+
+thread_local! {
+    static THREAD_BRACE_BUDGET: std::cell::Cell<BraceBudget> =
+        const { std::cell::Cell::new(BraceBudget {
+            bytes: MAX_BRACE_THREAD_BYTES,
+            words: MAX_BRACE_THREAD_WORDS,
+        }) };
+}
+
+/// Run `f` with one call's brace budget — the per-call caps, or what is left of
+/// the thread's budget if less — and deduct what it spent from the thread.
+fn with_brace_budget<R>(f: impl FnOnce(&mut BraceBudget) -> R) -> R {
+    let thread = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+    let start = BraceBudget {
+        bytes: thread.bytes.min(MAX_BRACE_CALL_BYTES),
+        words: thread.words.min(MAX_BRACE_CALL_WORDS),
+    };
+    let mut budget = start;
+    let result = f(&mut budget);
+    THREAD_BRACE_BUDGET.with(|cell| {
+        cell.set(BraceBudget {
+            bytes: thread.bytes - (start.bytes - budget.bytes),
+            words: thread.words - (start.words - budget.words),
+        });
+    });
+    result
+}
 
 /// What bash's brace expansion does to one word.
 #[derive(Debug, PartialEq, Eq)]
@@ -588,8 +662,9 @@ enum BraceExpansion {
     Unchanged,
     /// The words bash produces, in bash's order, empty words dropped.
     Expanded(Vec<String>),
-    /// The word expands, but past [`MAX_BRACE_WORDS`], [`MAX_BRACE_BYTES`] or
-    /// [`MAX_BRACE_GROUPS`]. Not modelled; callers that decide safety refuse.
+    /// The word expands, but past [`MAX_BRACE_WORDS`], [`MAX_BRACE_GROUPS`] or
+    /// the call's [`BraceBudget`]. Not modelled; callers that decide safety
+    /// refuse.
     Overflow,
 }
 
@@ -604,25 +679,69 @@ enum BraceExpansion {
 /// `$(…)` and backtick spans are opaque; a word shaped as an assignment
 /// (`NAME=…`) is left alone, since bash does not expand an assignment
 /// statement and in command position that is what it is.
-fn brace_expand_word(text: &str, structural: &[bool], budget: &mut usize) -> BraceExpansion {
+fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) -> BraceExpansion {
+    let Some(word) = expanding_brace_word(text, structural) else {
+        return BraceExpansion::Unchanged;
+    };
+    if count_brace_opens(&word) > MAX_BRACE_GROUPS || budget.is_spent() {
+        return BraceExpansion::Overflow;
+    }
+    match expand_brace_chars(&word, budget) {
+        Some(words) => {
+            BraceExpansion::Expanded(words.into_iter().filter(|w| !w.is_empty()).collect())
+        }
+        None => {
+            budget.spend();
+            BraceExpansion::Overflow
+        }
+    }
+}
+
+/// `text` as `(char, structural)` pairs when bash would brace-expand it — some
+/// structural group has a top-level comma or a valid sequence, or the word
+/// carries more groups than [`MAX_BRACE_GROUPS`] — and `None` when it stands as
+/// written. Decided without expanding anything, so it costs no budget.
+fn expanding_brace_word(text: &str, structural: &[bool]) -> Option<Vec<(char, bool)>> {
+    if !text.contains('{') {
+        return None;
+    }
     let word: Vec<(char, bool)> = text
         .char_indices()
         .map(|(at, c)| (c, structural.get(at).copied().unwrap_or(false)))
         .collect();
-    let opens = word.iter().filter(|&&(c, s)| s && c == '{').count();
+    let opens = count_brace_opens(&word);
     if opens == 0 || is_assignment_shaped(&word) {
-        return BraceExpansion::Unchanged;
+        return None;
     }
-    if opens > MAX_BRACE_GROUPS {
-        return BraceExpansion::Overflow;
-    }
-    match expand_brace_chars(&word, budget) {
-        Some(words) if words.len() == 1 && words[0] == text => BraceExpansion::Unchanged,
-        Some(words) => {
-            BraceExpansion::Expanded(words.into_iter().filter(|w| !w.is_empty()).collect())
+    (opens > MAX_BRACE_GROUPS || has_expanding_group(&word)).then_some(word)
+}
+
+/// Structural `{` in `word` that could open a brace group — not the `{` of `${`.
+fn count_brace_opens(word: &[(char, bool)]) -> usize {
+    (0..word.len())
+        .filter(|&at| word[at] == ('{', true) && !(at > 0 && word[at - 1] == ('$', true)))
+        .count()
+}
+
+/// Does any structural `{` outside an opaque span open a group bash expands?
+fn has_expanding_group(word: &[(char, bool)]) -> bool {
+    let mut at = 0;
+    while at < word.len() {
+        if let Some(end) = opaque_span_end(word, at) {
+            at = end;
+            continue;
         }
-        None => BraceExpansion::Overflow,
+        if word[at] == ('{', true)
+            && let Some(close) = matching_brace(word, at)
+        {
+            let body = &word[at + 1..close];
+            if split_brace_body(body).len() > 1 || brace_sequence(body).is_some() {
+                return true;
+            }
+        }
+        at += 1;
     }
+    false
 }
 
 /// A leading `NAME=` in which every byte is unquoted syntax.
@@ -718,11 +837,20 @@ fn split_brace_body(body: &[(char, bool)]) -> Vec<&[(char, bool)]> {
     parts
 }
 
+/// A parsed sequence expression; [`BraceSequence::generate`] builds its words.
+struct BraceSequence {
+    start: i128,
+    end: i128,
+    step: u128,
+    letters: bool,
+    width: Option<usize>,
+    count: u128,
+}
+
 /// A group body as a sequence expression — `x..y` or `x..y..step`, integers or
-/// single ASCII letters — expanded, or `None` when it is not one (the braces
-/// are then literal). `Some(None)` is a sequence past [`MAX_BRACE_WORDS`].
-#[allow(clippy::option_option)]
-fn brace_sequence(body: &[(char, bool)]) -> Option<Option<Vec<String>>> {
+/// single ASCII letters — or `None` when it is not one (the braces are then
+/// literal). Parsing only: nothing is generated.
+fn brace_sequence(body: &[(char, bool)]) -> Option<BraceSequence> {
     if !body.iter().all(|&(_, s)| s) {
         return None;
     }
@@ -751,9 +879,6 @@ fn brace_sequence(body: &[(char, bool)]) -> Option<Option<Vec<String>>> {
         }
     };
     let count = start.abs_diff(end) / step + 1;
-    if count > MAX_BRACE_WORDS as u128 {
-        return Some(None);
-    }
     let pad = |s: &str| {
         let digits = s.trim_start_matches(['-', '+']);
         (digits.len() > 1 && digits.starts_with('0')).then_some(s.len())
@@ -765,27 +890,48 @@ fn brace_sequence(body: &[(char, bool)]) -> Option<Option<Vec<String>>> {
             .max(pad(to))
             .map(|w| w.max(from.len()).max(to.len()))
     };
-    let mut out = Vec::new();
-    let mut value = start;
-    // `count` is bounded above, so this ends.
-    for _ in 0..count {
-        out.push(if letters {
-            char::from(u8::try_from(value).unwrap_or(b'?')).to_string()
-        } else {
-            match width {
-                Some(width) if value < 0 => format!("-{:0>1$}", value.unsigned_abs(), width - 1),
-                Some(width) => format!("{value:0>width$}"),
-                None => value.to_string(),
-            }
-        });
-        let step = i128::try_from(step).unwrap_or(1);
-        value = if start <= end {
-            value + step
-        } else {
-            value - step
-        };
+    Some(BraceSequence {
+        start,
+        end,
+        step,
+        letters,
+        width,
+        count,
+    })
+}
+
+impl BraceSequence {
+    /// The sequence's words, or `None` — before allocating any — when it is
+    /// past [`MAX_BRACE_WORDS`] or does not fit `budget`.
+    fn generate(&self, budget: &mut BraceBudget) -> Option<Vec<String>> {
+        let count = usize::try_from(self.count)
+            .ok()
+            .filter(|&count| count <= MAX_BRACE_WORDS)?;
+        // Every word is at least `width` (or one) bytes long.
+        budget.charge(count, count.checked_mul(self.width.unwrap_or(1))?)?;
+        let step = i128::try_from(self.step).unwrap_or(1);
+        let mut out = Vec::with_capacity(count);
+        let mut value = self.start;
+        for _ in 0..count {
+            out.push(if self.letters {
+                char::from(u8::try_from(value).unwrap_or(b'?')).to_string()
+            } else {
+                match self.width {
+                    Some(width) if value < 0 => {
+                        format!("-{:0>1$}", value.unsigned_abs(), width - 1)
+                    }
+                    Some(width) => format!("{value:0>width$}"),
+                    None => value.to_string(),
+                }
+            });
+            value = if self.start <= self.end {
+                value + step
+            } else {
+                value - step
+            };
+        }
+        Some(out)
     }
-    Some(Some(out))
 }
 
 /// An optionally signed decimal integer of at most 18 digits.
@@ -798,14 +944,14 @@ fn parse_brace_int(s: &str) -> Option<i128> {
 }
 
 /// The expansions of `word`, left to right in bash's order, or `None` past the
-/// bounds. `bytes_left` is shared across the whole recursion.
-fn expand_brace_chars(word: &[(char, bool)], bytes_left: &mut usize) -> Option<Vec<String>> {
+/// bounds. `budget` is shared across the whole recursion.
+fn expand_brace_chars(word: &[(char, bool)], budget: &mut BraceBudget) -> Option<Vec<String>> {
     let mut partials = vec![String::new()];
     let mut at = 0;
     while at < word.len() {
         if let Some(end) = opaque_span_end(word, at) {
             let literal: String = word[at..end].iter().map(|&(c, _)| c).collect();
-            append_to_all(&mut partials, &[literal], bytes_left)?;
+            append_to_all(&mut partials, &[literal], budget)?;
             at = end;
             continue;
         }
@@ -817,7 +963,7 @@ fn expand_brace_chars(word: &[(char, bool)], bytes_left: &mut usize) -> Option<V
             let alternatives = if parts.len() > 1 {
                 let mut alternatives = Vec::new();
                 for part in parts {
-                    alternatives.extend(expand_brace_chars(part, bytes_left)?);
+                    alternatives.extend(expand_brace_chars(part, budget)?);
                     if alternatives.len() > MAX_BRACE_WORDS {
                         return None;
                     }
@@ -825,18 +971,17 @@ fn expand_brace_chars(word: &[(char, bool)], bytes_left: &mut usize) -> Option<V
                 Some(alternatives)
             } else {
                 match brace_sequence(body) {
-                    Some(Some(sequence)) => Some(sequence),
-                    Some(None) => return None,
+                    Some(sequence) => Some(sequence.generate(budget)?),
                     None => None,
                 }
             };
             if let Some(alternatives) = alternatives {
-                append_to_all(&mut partials, &alternatives, bytes_left)?;
+                append_to_all(&mut partials, &alternatives, budget)?;
                 at = close + 1;
                 continue;
             }
         }
-        append_to_all(&mut partials, &[word[at].0.to_string()], bytes_left)?;
+        append_to_all(&mut partials, &[word[at].0.to_string()], budget)?;
         at += 1;
     }
     Some(partials)
@@ -847,11 +992,11 @@ fn expand_brace_chars(word: &[(char, bool)], bytes_left: &mut usize) -> Option<V
 fn append_to_all(
     partials: &mut Vec<String>,
     suffixes: &[String],
-    bytes_left: &mut usize,
+    budget: &mut BraceBudget,
 ) -> Option<()> {
     if let [suffix] = suffixes {
         let grow = suffix.len().checked_mul(partials.len())?;
-        *bytes_left = bytes_left.checked_sub(grow)?;
+        budget.charge(0, grow)?;
         partials.iter_mut().for_each(|p| p.push_str(suffix));
         return Some(());
     }
@@ -859,12 +1004,17 @@ fn append_to_all(
     if count > MAX_BRACE_WORDS {
         return None;
     }
+    // Charge the words and their total length BEFORE building any of them.
+    let partial_bytes: usize = partials.iter().map(String::len).sum();
+    let suffix_bytes: usize = suffixes.iter().map(String::len).sum();
+    let bytes = partial_bytes
+        .checked_mul(suffixes.len())?
+        .checked_add(suffix_bytes.checked_mul(partials.len())?)?;
+    budget.charge(count, bytes)?;
     let mut next = Vec::with_capacity(count);
     for partial in partials.iter() {
         for suffix in suffixes {
-            let word = format!("{partial}{suffix}");
-            *bytes_left = bytes_left.checked_sub(word.len())?;
-            next.push(word);
+            next.push(format!("{partial}{suffix}"));
         }
     }
     *partials = next;
@@ -872,16 +1022,26 @@ fn append_to_all(
 }
 
 /// Does any word of `command` brace-expand past the bounds the tokenizer
-/// models ([`MAX_BRACE_WORDS`], [`MAX_BRACE_BYTES`], [`MAX_BRACE_GROUPS`])?
+/// models ([`MAX_BRACE_WORDS`], [`MAX_BRACE_GROUPS`], the call and thread
+/// [`BraceBudget`])?
 ///
 /// Such a word reaches every walk as written, unexpanded — so the command it
 /// names is invisible. A guard that decides safety refuses on this rather than
 /// judging a command it cannot see (cadence-hooks#1096). No real command line
 /// comes near the bounds.
+///
+/// Heredoc bodies are data, not words, and are left out: a minified JSON
+/// document in `cat > x.json <<'EOF'` carries more groups than the cap and is
+/// not a command. A body a shell runs as a script is the residual this skips.
 pub fn brace_expansion_overflows(command: &str) -> bool {
-    let mut budget = MAX_BRACE_BYTES;
-    raw_words(command).iter().any(|(text, flags)| {
-        brace_expand_word(text, flags, &mut budget) == BraceExpansion::Overflow
+    if !command.contains('{') {
+        return false;
+    }
+    let command = strip_heredoc_bodies(command);
+    with_brace_budget(|budget| {
+        raw_words(&command)
+            .iter()
+            .any(|(text, flags)| brace_expand_word(text, flags, budget) == BraceExpansion::Overflow)
     })
 }
 
@@ -1313,11 +1473,10 @@ fn opens_brace_expansion(text: &str) -> bool {
     if !text.starts_with('{') {
         return false;
     }
-    let mut budget = MAX_BRACE_BYTES;
     raw_words(text).first().is_some_and(|(word, flags)| {
         word.starts_with('{')
             && flags.first() == Some(&true)
-            && brace_expand_word(word, flags, &mut budget) != BraceExpansion::Unchanged
+            && expanding_brace_word(word, flags).is_some()
     })
 }
 
@@ -6518,6 +6677,60 @@ mod tests {
         let _ = tokenize(&many);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(brace_expansion_overflows(&many));
+    }
+
+    #[test]
+    fn brace_budget_bounds_the_work_of_every_call_on_a_thread() {
+        // cadence-hooks#1096 review: guards re-tokenize each segment, so a
+        // per-call budget alone let `echo {1..4096}` × N expand N times.
+        let spent_words =
+            || MAX_BRACE_THREAD_WORDS - THREAD_BRACE_BUDGET.with(std::cell::Cell::get).words;
+        let segment = "echo {1..4096}";
+        for _ in 0..1000 {
+            let _ = tokenize(segment);
+        }
+        // Once the thread budget is spent, a word is left whole without being
+        // expanded, and reports as an overflow — never as silently literal.
+        assert!(spent_words() <= MAX_BRACE_THREAD_WORDS);
+        assert!(THREAD_BRACE_BUDGET.with(std::cell::Cell::get).is_spent());
+        assert_eq!(words("{sops,-d,x}"), ["{sops,-d,x}"]);
+        assert!(brace_expansion_overflows("{sops,-d,x}"));
+        // A word with no expanding group is still read as it always was.
+        assert_eq!(words("HEAD@{1} {a}"), ["HEAD@{1}", "{a}"]);
+        assert!(!brace_expansion_overflows("echo {a} ${x}"));
+        assert_eq!(strip_group_wrappers("{ cat .env; }"), "cat .env");
+    }
+
+    #[test]
+    fn a_sequence_is_charged_before_it_is_built() {
+        let mut budget = BraceBudget {
+            bytes: 100,
+            words: 100,
+        };
+        let sequence = brace_sequence(&structural_chars("1..4096")).expect("a sequence");
+        assert!(sequence.generate(&mut budget).is_none());
+        // A refused charge spends the budget, so later words are not expanded.
+        assert!(budget.is_spent());
+        assert_eq!(
+            brace_expand_word("{a,b}", &[true; 5], &mut budget),
+            BraceExpansion::Overflow
+        );
+    }
+
+    #[test]
+    fn dollar_brace_does_not_count_toward_the_group_cap() {
+        let word = format!("{}{{x,y}}", "${a}".repeat(80));
+        assert!(!brace_expansion_overflows(&format!("echo {word}")));
+        assert_eq!(words(&format!("echo {word}")).len(), 3);
+        // Heredoc bodies are data: minified JSON past the cap is no overflow.
+        let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
+        assert!(!brace_expansion_overflows(&format!(
+            "cat > x.json <<'EOF'\n{json}\nEOF"
+        )));
+    }
+
+    fn structural_chars(text: &str) -> Vec<(char, bool)> {
+        text.chars().map(|c| (c, true)).collect()
     }
 
     #[test]
