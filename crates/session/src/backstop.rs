@@ -377,8 +377,8 @@ pub fn render_warning(marker: &LooseEndMarker) -> String {
     };
     format!(
         "⚠ Last session in this repo ended with loose ends: {summary}.{partial} \
-         Run /outro to account for them, or commit/push/file as needed. \
-         Intentional? Set CADENCE_NO_OUTRO_BACKSTOP."
+         Claude: tell the user, and offer /outro to account for them (or commit, push, \
+         or file each). If they are intentional, the user can set CADENCE_NO_OUTRO_BACKSTOP."
     )
 }
 
@@ -580,6 +580,21 @@ mod tests {
         assert!(
             !lower.contains("outro was skipped") && !lower.contains("you skipped"),
             "must not claim outro was skipped: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_names_the_actor_on_every_imperative() {
+        // cameronsjo/cadence-hooks#358: an actorless "Run /outro" reads as
+        // status. Claude offers the cleanup; the opt-out is the user's.
+        let msg = render_warning(&marker(1, 1, 1));
+        assert!(
+            msg.contains("Claude: tell the user, and offer /outro"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("the user can set CADENCE_NO_OUTRO_BACKSTOP"),
+            "{msg}"
         );
     }
 
