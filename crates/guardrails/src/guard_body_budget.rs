@@ -1705,6 +1705,20 @@ mod tests {
                 BodyArg::File("p.md".into()),
             ),
             ("gh pr create -Fp.md", BodyArg::File("p.md".into())),
+            // bash drops an unquoted backslash in a flag name, so each of these
+            // passes the flag itself (`printf '%s\n' --bo\dy` prints `--body`).
+            (r"gh pr create --bo\dy hi", BodyArg::Inline("hi".into())),
+            (r"gh pr create --bo\dy=hi", BodyArg::Inline("hi".into())),
+            (r"gh pr create -\bhi", BodyArg::Inline("hi".into())),
+            (
+                r"gh pr create --body-fi\le p.md",
+                BodyArg::File("p.md".into()),
+            ),
+            (r"gh pr create -\F p.md", BodyArg::File("p.md".into())),
+            (
+                r"gh pr create --body x --bo\dy last",
+                BodyArg::Inline("last".into()),
+            ),
         ] {
             assert_eq!(last_body_flag(cmd), Some(want), "{cmd:?}");
         }

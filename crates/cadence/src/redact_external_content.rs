@@ -3112,6 +3112,47 @@ term = "acmecorp"
     }
 
     #[test]
+    fn backslashed_flag_names_and_locale_quotes_reach_the_identity_block() {
+        // bash drops an unquoted backslash in a flag NAME too (`--bo\dy` is
+        // `--body`), and `$"…"` is a plain string in the C locale
+        // (`acme$""corp` is `acmecorp`). Every row's argv was checked with
+        // `bash -c "printf '%s\n' <words>"`; each posts the term and must block.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --bo\dy acmecorp",
+                r"gh pr comment 3 --bo\dy=acmecorp",
+                r"gh pr comment 3 --body\=acmecorp",
+                r"gh pr comment 3 -\b acmecorp",
+                r"gh pr comment 3 -\bacmecorp",
+                r"git commit -\m acmecorp",
+                r"git commit -\macmecorp",
+                r"git commit --mess\age acmecorp",
+                r"git commit -a\m acmecorp",
+                r"git commit -\a\macmecorp",
+                r"gh issue create --ti\tle acmecorp -b x",
+                r"gh issue create -\t acmecorp -b x",
+                r"gh release create v1 --no\tes acmecorp",
+                r"gh gist create --de\sc acmecorp f.txt",
+                r"gh api repos/o/r/issues -\f body=acmecorp",
+                r"gh api repos/o/r/issues --raw-fi\eld body=acmecorp",
+                r"gh api repos/o/r/issues --raw-fi\eld=body=acmecorp",
+                r#"gh pr comment 3 --body acme$""corp"#,
+                r#"gh pr comment 3 --body acme$"c"orp"#,
+                r#"gh pr comment 3 --body $"acme"corp"#,
+                r#"gh pr create --title acme$"corp" --body hi"#,
+                r#"git commit -m acme$""corp"#,
+                r#"gh api repos/o/r/issues -f body=acme$""corp"#,
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("[T1]"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    #[test]
     fn literal_backslashes_that_spell_no_term_stay_allowed() {
         // Prose carrying a real backslash, an escaped backslash bash keeps
         // (`acme\\corp` posts `acme\corp`), and a file or JSON payload whose
@@ -3132,6 +3173,10 @@ term = "acmecorp"
                 r"git commit -F bs.md",
                 r"gh api repos/o/r/issues -F body=@bs.md",
                 r"gh api repos/o/r/issues --input bs.json",
+                // `$$"x"` is the PID then `x`, not a locale string: nothing
+                // here spells the term.
+                r#"gh pr comment 3 --body acme$$"corp""#,
+                r#"gh pr comment 3 --body acme\$"corp""#,
             ] {
                 assert_eq!(
                     run_in(cmd, dir.path()).outcome,

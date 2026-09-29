@@ -467,6 +467,10 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     // The previous unquoted character was a backslash that itself was not
     // escaped, so this one is literal to bash (`\{a,b\}` does not expand).
     let mut escape_pending = false;
+    // The previous character was an unquoted, unescaped `$` that did not
+    // itself complete a `$$`, so a `$` here is the second half of the `$$`
+    // parameter, not the start of `$"…"` (`$$"x"` is the PID then `x`).
+    let mut dollar_pending = false;
     let mut chars = command.chars().peekable();
     // Iterations left before [`unquoted_substitution_len`] may scan again.
     // A failed scan read `n` characters; no opener among them is scanned
@@ -477,6 +481,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
 
     while let Some(c) = chars.next() {
         let escaped = std::mem::take(&mut escape_pending);
+        let after_dollar = std::mem::take(&mut dollar_pending);
         no_scan_for = no_scan_for.saturating_sub(1);
         // Backfill whatever the previous iteration pushed from a quoted arm —
         // at the TOP, because those arms `continue` past the bottom.
@@ -568,6 +573,20 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     unquoted_prefix.get_or_insert(current.len());
                     lead.boundary(current.len(), false);
                 }
+                // `$"` is bash's locale quoting: a double-quoted string whose
+                // text is looked up in the message catalog. With no catalog
+                // (the C/POSIX locale every hook runs in) it is the string
+                // itself, and the `$` is syntax, not text: `zorbl$"a"xcorp`
+                // passes `zorblaxcorp`. Keeping the `$` handed guards a word
+                // bash never builds. An escaped `\$` or the second `$` of
+                // `$$` is text, and the `"` after it opens a plain string.
+                '$' if chars.peek() == Some(&'"') && !escaped && !after_dollar => {
+                    chars.next();
+                    quote = Some(Quote::Double);
+                    in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), true);
+                }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
@@ -615,6 +634,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     current.push(c);
                     structural.resize(current.len(), !escaped);
                     escape_pending = c == '\\' && !escaped;
+                    dollar_pending = c == '$' && !escaped && !after_dollar;
                     in_token = true;
                 }
             },
@@ -12745,6 +12765,69 @@ mod tests {
             tokenize(r#"echo $HOME $(date) "$x""#),
             vec!["echo", "$HOME", "$(date)", "$x"]
         );
+    }
+
+    #[test]
+    fn tokenize_locale_quoting_drops_the_dollar_like_bash() {
+        // bash's `$"…"` is a double-quoted string translated through the
+        // message catalog; with none (the C/POSIX locale) it is the string
+        // itself and the `$` is syntax. Every row's expected text is what
+        // `printf '%s\n'` prints under bash 5.2, except that the tokenizer
+        // keeps an unquoted backslash (`\$`) for its callers, as it does
+        // everywhere else.
+        let cases: &[(&str, &[&str])] = &[
+            (r#"--body zorbl$""axcorp"#, &["--body", "zorblaxcorp"]),
+            (r#"--body zorbl$"a"xcorp"#, &["--body", "zorblaxcorp"]),
+            (r#"$"zorblaxcorp""#, &["zorblaxcorp"]),
+            (r#"$"x y" z"#, &["x y", "z"]),
+            (r#"echo $"""#, &["echo", ""]),
+            (r#"$"a\"b""#, &[r#"a"b"#]),
+            (r#"x$"'"y"#, &["x'y"]),
+            // `"$"` is a literal dollar inside a plain string.
+            (r#""$"x"#, &["$x"]),
+            // A substitution inside the string rides along whole.
+            (r#"a$"$(echo hi)"b"#, &["a$(echo hi)b"]),
+            // An escaped `$` is text, so the `"` opens a plain string.
+            (r#"\$"x""#, &[r"\$x"]),
+            // `$$` is the PID parameter; the quote after it is plain.
+            (r#"$$"x""#, &["$$x"]),
+            // `$$` then `$"x"`: the third `$` opens locale quoting.
+            (r#"$$$"x""#, &["$$x"]),
+            // A `$` before anything else stays ordinary text.
+            ("a$ b", &["a$", "b"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(tokenize(command), *want, "tokenize({command:?})");
+        }
+    }
+
+    #[test]
+    fn tokenize_marked_reads_locale_quoting_as_a_quote() {
+        // `>$"log"` is a redirect to `log` with an unquoted operator; `$"$HOME"`
+        // expands like `"$HOME"`.
+        let marked = tokenize_marked(r#">$"log""#);
+        assert_eq!(marked[0].text, ">log");
+        assert_eq!(marked[0].unquoted_prefix_len, 1);
+        let marked = tokenize_marked(r#"$"$HOME"/x"#);
+        assert_eq!(marked[0].text, "$HOME/x");
+        assert_eq!(marked[0].unquoted_prefix_len, 0);
+        assert_eq!(marked[0].expanding_prefix_len, 5);
+    }
+
+    #[test]
+    fn tokenize_locale_quote_flood_stays_linear() {
+        // 200 KB of `$""` (empty locale strings) and of unterminated `$"`
+        // openers must tokenize well inside the hook deadline.
+        for unit in [r#"$"""#, r#"a$"$"#, r#"$$""#] {
+            let command = format!("echo {}", unit.repeat(200_000 / unit.len()));
+            let started = std::time::Instant::now();
+            let _ = tokenize(&command);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit:?} flood took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

@@ -846,4 +846,152 @@ mod tests {
             assert_eq!(flag_values(&argv(cmd), "--desc", Some('d')), *want, "{cmd}");
         }
     }
+
+    // ---- flag names read the way the shell passes them ----
+    //
+    // bash drops an unquoted word's backslashes before the program parses its
+    // flags (`printf '%s\n' --bo\dy -\m --ti\tle` prints `--body -m --title`),
+    // so a backslash in a flag NAME must not hide the flag's value. Values stay
+    // raw: `--bo\dy=a\b` yields `a\b`, as the separate-token value `a\b` does.
+
+    #[test]
+    fn strip_flag_prefix_reads_the_name_as_the_shell_passes_it() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("--body=x", "--body=", Some("x")),
+            (r"--bo\dy=x", "--body=", Some("x")),
+            (r"--body\=x", "--body=", Some("x")),
+            (r"--bo\dy=a\b", "--body=", Some(r"a\b")),
+            (r"\-\-body=", "--body=", Some("")),
+            // `\\` is a literal backslash, not an escape of `d`.
+            (r"--bo\\dy=x", "--body=", None),
+            (r"--bo\", "--body=", None),
+            ("--bodyx", "--body=", None),
+        ];
+        for (tok, prefix, want) in cases {
+            assert_eq!(
+                strip_flag_prefix(tok, prefix),
+                *want,
+                "{tok:?} / {prefix:?}"
+            );
+        }
+        let glued: &[(&str, Option<&str>)] = &[
+            ("-mx", Some("x")),
+            (r"-\mx", Some("x")),
+            (r"-m\x", Some(r"\x")),
+            ("-m", None),
+            // A trailing lone backslash is dropped by the shell: bare `-m`.
+            (r"-m\", None),
+            (r"-\m", None),
+        ];
+        for (tok, want) in glued {
+            assert_eq!(glued_short_value(tok, "-m"), *want, "{tok:?}");
+        }
+        assert!(is_flag(r"--bo\dy", "--body"));
+        assert!(is_flag(r"-\m", "-m"));
+        assert!(!is_flag(r"--bo\\dy", "--body"));
+    }
+
+    #[test]
+    fn extract_bodies_matches_backslashed_flag_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "from file").unwrap();
+        let base = dir.path().to_str().unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            (r"gh pr comment 3 --bo\dy secret", &["secret"]),
+            (r"gh pr comment 3 --bo\dy=secret", &["secret"]),
+            (r"gh pr comment 3 --body\=secret", &["secret"]),
+            (r"gh pr comment 3 -\b secret", &["secret"]),
+            (r"gh pr comment 3 -\bsecret", &["secret"]),
+            (r"git commit -\m secret", &["secret"]),
+            (r"git commit -\msecret", &["secret"]),
+            (r"git commit --mess\age secret", &["secret"]),
+            (r"git commit --mess\age=secret", &["secret"]),
+            (r"gh pr comment 3 --body-fi\le b.md", &["from file"]),
+            (r"gh pr comment 3 --body-fi\le=b.md", &["from file"]),
+            (r"gh pr comment 3 -\F b.md", &["from file"]),
+            (r"gh pr comment 3 -\Fb.md", &["from file"]),
+            // The value keeps its own backslash for the caller to read.
+            (r"gh pr comment 3 --bo\dy=a\b", &[r"a\b"]),
+            // A literal backslash (`\\`) spells a different flag.
+            (r"gh pr comment 3 --bo\\dy secret", &[]),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(extract_bodies(cmd, base), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn extract_title_and_flag_values_match_backslashed_flag_names() {
+        let titles: &[(&str, Option<&str>)] = &[
+            (r"gh issue create --ti\tle secret -b x", Some("secret")),
+            (r"gh issue create --ti\tle=secret", Some("secret")),
+            (r"gh issue create -\t secret", Some("secret")),
+            (r"gh issue create -\tsecret", Some("secret")),
+            // An escaped value flag still swallows its value.
+            (r"gh issue create --bo\dy --title", None),
+        ];
+        for (cmd, want) in titles {
+            assert_eq!(extract_title(cmd).as_deref(), *want, "{cmd}");
+        }
+        let values: &[(&str, &[&str])] = &[
+            (r"gh gist create --de\sc a f", &["a"]),
+            (r"gh gist create --de\sc=a f", &["a"]),
+            (r"gh gist create -\d a f", &["a"]),
+            (r"gh gist create -\da f", &["a"]),
+            (r"gh gist create \-\- --desc a", &[]),
+        ];
+        for (cmd, want) in values {
+            assert_eq!(flag_values(&argv(cmd), "--desc", Some('d')), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_matches_backslashed_flag_names() {
+        use ApiField::*;
+        let cases: &[(&str, Option<ApiField>)] = &[
+            (
+                r"gh api repos/o/r/issues -\f body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues -\fbody=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-fi\eld body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-fi\eld=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues --raw-field\=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                r"gh api repos/o/r/issues -\F body=@b.md",
+                Some(File("b.md".into())),
+            ),
+            // gh reads the key the shell passes.
+            (
+                r"gh api repos/o/r/issues -f bo\dy=hi",
+                Some(Literal("hi".into())),
+            ),
+            // An escaped value flag still takes its value, not the endpoint.
+            (
+                r"gh api -\H x:y repos/o/r/issues -f body=hi",
+                Some(Literal("hi".into())),
+            ),
+        ];
+        for (cmd, want) in cases {
+            let req = parse_gh_api(&argv(cmd)).expect(cmd);
+            assert_eq!(&req.body, want, "{cmd}");
+            assert_eq!(req.endpoint, "repos/o/r/issues", "{cmd}");
+        }
+        let req =
+            parse_gh_api(&argv(r"gh api -\XPATCH repos/o/r/pulls/1 --in\put p.json")).unwrap();
+        assert_eq!(req.method.as_deref(), Some("PATCH"));
+        assert_eq!(req.input, Some(File("p.json".into())));
+    }
 }
