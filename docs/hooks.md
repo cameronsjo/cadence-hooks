@@ -110,7 +110,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` |
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
-| `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker) |
+| `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) |
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |

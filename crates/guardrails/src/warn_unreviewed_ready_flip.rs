@@ -6,8 +6,12 @@
 //! as a COMMENT review whose body's first line is a machine-readable marker
 //! —`<!-- cadence-review: <reviewer> head=<40-char SHA> crit=<n> imp=<n> -->` — and
 //! "reviewed" means that marker reads `crit=0 imp=0` on the current head, or
-//! a non-author human review is APPROVED on it
-//! (`cadence-forge:review-loop` § What "reviewed" means). This is the
+//! a non-author human review is APPROVED on it — and no reviewer's latest
+//! decisive review is `CHANGES_REQUESTED`
+//! (`cadence-forge:review-loop` § What "reviewed" means). An outstanding
+//! request is head-independent, so the nudge names the dismissal command for
+//! the operator rather than leaving a condition nobody can see how to clear
+//! (cadence-hooks#978). This is the
 //! deterministic backstop at the Ready-flip capture point, sibling to
 //! `warn-plan-ready-flip`'s reconcile check.
 //!
@@ -362,7 +366,14 @@ impl FlipTarget {
 /// A parsed review: the author's login and, for a formal review, its state
 /// and the commit SHA it was submitted against; for a cadence review, its
 /// body (the marker lives in the body's first line).
+///
+/// `id` is the review's REST id (`databaseId`), which the dismissal command
+/// names. `author_id` is the reviewer's numeric account id, the key
+/// [`outstanding_changes_requested`] groups on; either is `None` when the
+/// response carries no number for it.
 struct ParsedReview {
+    id: Option<u64>,
+    author_id: Option<u64>,
     login: String,
     state: String,
     commit_id: String,
@@ -374,16 +385,26 @@ struct ParsedReview {
 /// `last: 100`, not the REST reviews list: that list is oldest-first and
 /// returns 30 per page, so on a PR with more than 30 reviews the newest ones —
 /// the ones that can match the current head — were never fetched.
+///
+/// The reviewer's numeric id and the review's own id serve the
+/// `CHANGES_REQUESTED` half of the contract (cadence-hooks#978). The PR's
+/// issue comments are read only to recognise a marker posted in the wrong
+/// place (cadence-hooks#838); they never count as a reviewed signal.
 const PR_STATE_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
     repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
     headRefOid author { login } \
-    reviews(last: 100) { nodes { author { login } state commit { oid } body } } } } }";
+    reviews(last: 100) { nodes { databaseId \
+    author { login ... on User { databaseId } ... on Bot { databaseId } } \
+    state commit { oid } body } } \
+    comments(last: 100) { nodes { body } } } } }";
 
 /// The fields [`evaluate`] needs from [`PR_STATE_QUERY`]'s response.
 struct PrState {
     head: String,
     author: String,
     reviews: Vec<ParsedReview>,
+    /// Issue-comment bodies, oldest first. Empty when the response has none.
+    comments: Vec<String>,
 }
 
 /// Parse a [`PR_STATE_QUERY`] response. `None` on any parse failure or a
@@ -412,27 +433,89 @@ fn parse_pr_state(json: &str) -> Option<PrState> {
         .as_array()?
         .iter()
         .map(|r| ParsedReview {
+            id: r.get("databaseId").and_then(serde_json::Value::as_u64),
+            author_id: r
+                .get("author")
+                .and_then(|a| a.get("databaseId"))
+                .and_then(serde_json::Value::as_u64),
             login: str_at(r, &["author", "login"]),
             state: str_at(r, &["state"]),
             commit_id: str_at(r, &["commit", "oid"]),
             body: str_at(r, &["body"]),
         })
         .collect();
+    // Comments feed only the misplaced-marker hint, so a response without
+    // them reads as none rather than failing the whole verdict.
+    let comments = pr
+        .get("comments")
+        .and_then(|c| c.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+        .map(|nodes| nodes.iter().map(|c| str_at(c, &["body"])).collect())
+        .unwrap_or_default();
     Some(PrState {
         head,
         author: str_at(pr, &["author", "login"]),
         reviews,
+        comments,
     })
 }
 
-/// Does `reviews` carry a signal that counts as "reviewed" for `head`,
+/// Is the PR reviewed at `head`, per `cadence-forge:review-loop` § What
+/// "reviewed" means? Both halves of that contract must hold
+/// (cadence-hooks#978): an approval signal on `head`
+/// ([`has_approval_signal`]), and no outstanding `CHANGES_REQUESTED`
+/// ([`outstanding_changes_requested`]).
+fn is_reviewed(reviews: &[ParsedReview], head: &str, author: &str) -> bool {
+    has_approval_signal(reviews, head, author) && outstanding_changes_requested(reviews).is_empty()
+}
+
+/// The contract's second half, as `poll-prs.sh`'s
+/// `changes_requested_outstanding` computes it: group the reviews by
+/// reviewer, take each reviewer's most recent *decisive* review (`APPROVED`
+/// or `CHANGES_REQUESTED`), and return every one of those that requests
+/// changes. `COMMENTED` and `PENDING` carry no verdict, and a dismissed
+/// review's state becomes `DISMISSED`, so a dismissal clears it.
+///
+/// The key is the reviewer's numeric id, never the login, for the reason
+/// `poll-prs.sh` gives: two deleted accounts both read as an empty login, and
+/// grouping on it would let one's approval clear the other's block. A review
+/// with no id forms a group of one, so an unattributable block is never
+/// cleared.
+///
+/// The block is head-independent: a push does not clear it. That is the
+/// operator's ruling on cadence-hooks#978, option (a), and it is safe only
+/// because this guard nudges and never blocks. Only the newest 100 reviews
+/// are read ([`PR_STATE_QUERY`]), so a request older than that is not seen.
+fn outstanding_changes_requested(reviews: &[ParsedReview]) -> Vec<&ParsedReview> {
+    let mut latest: Vec<(Option<u64>, &ParsedReview)> = Vec::new();
+    for review in reviews {
+        if review.state != "APPROVED" && review.state != "CHANGES_REQUESTED" {
+            continue;
+        }
+        match review
+            .author_id
+            .and_then(|id| latest.iter_mut().find(|(key, _)| *key == Some(id)))
+        {
+            // Reviews arrive oldest first, so a later one replaces the earlier.
+            Some(slot) => slot.1 = review,
+            None => latest.push((review.author_id, review)),
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(_, review)| review)
+        .filter(|review| review.state == "CHANGES_REQUESTED")
+        .collect()
+}
+
+/// Does `reviews` carry a signal that counts as an approval for `head`,
 /// authored by anyone other than `author`?
 ///
 /// Two independent signals, either sufficient: a non-author human review
 /// APPROVED on `head`, or a cadence-review marker whose `head` matches and
 /// whose `crit`/`imp` are both zero. A marker or approval on a stale head
 /// (a push since the review) does not count.
-fn is_reviewed(reviews: &[ParsedReview], head: &str, author: &str) -> bool {
+fn has_approval_signal(reviews: &[ParsedReview], head: &str, author: &str) -> bool {
     reviews.iter().any(|r| {
         // The non-author restriction applies only to a formal human APPROVED
         // review (self-approval proves nothing) — the cadence-review marker
@@ -459,6 +542,164 @@ fn is_reviewed(reviews: &[ParsedReview], head: &str, author: &str) -> bool {
             .is_some_and(|c| &c["head"] == head && &c["crit"] == "0" && &c["imp"] == "0");
         formal_approved || marker_clean
     })
+}
+
+/// The opening every well-formed marker starts with, as [`MARKER_RE`] spells it.
+const MARKER_OPENING: &str = "<!-- cadence-review: ";
+
+/// Does `body` look like an attempt at a cadence-review marker? An HTML
+/// comment and the word `cadence-review` anywhere in it. Used only to word
+/// the nudge ([`marker_hint`]); it never decides a verdict.
+fn mentions_marker(body: &str) -> bool {
+    body.contains("<!--") && body.contains("cadence-review")
+}
+
+/// What is wrong with a marker line [`MARKER_RE`] rejected, as static field
+/// names (cadence-hooks#838). Every problem found is listed, since one marker
+/// can carry several. Nothing from the line itself is echoed except a
+/// character count: the body is PR text and the nudge reaches the session.
+fn marker_problems(first_line: &str) -> Vec<String> {
+    let Some(rest) = first_line.strip_prefix(MARKER_OPENING) else {
+        return vec![
+            "the review body's first line must be the marker, opening exactly \
+             `<!-- cadence-review: `"
+                .to_string(),
+        ];
+    };
+    let fields: Vec<&str> = rest.split(' ').collect();
+    let mut problems = Vec::new();
+    if fields.first().is_none_or(|f| f.contains('=')) {
+        problems.push("the `<reviewer>` field before `head=` is missing".to_string());
+    }
+    match fields.iter().find_map(|f| f.strip_prefix("head=")) {
+        None if fields.iter().any(|f| f.starts_with("sha=")) => {
+            problems.push("expected `head=<40-char SHA>`, found `sha=`".to_string());
+        }
+        None => problems.push("the `head=` field is missing".to_string()),
+        Some(sha) if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            problems.push(format!(
+                "`head=` must be the full 40-character SHA (found {} characters)",
+                sha.chars().count()
+            ));
+        }
+        Some(_) => {}
+    }
+    for field in ["crit=", "imp="] {
+        if !fields.iter().any(|f| f.starts_with(field)) {
+            problems.push(format!("the `{field}` field is missing"));
+        }
+    }
+    if problems.is_empty() {
+        problems.push(
+            "the fields are separated by something other than single spaces, a count is not \
+             ASCII digits, or the closing ` -->` is missing"
+                .to_string(),
+        );
+    }
+    problems
+}
+
+/// A sentence for the no-signal nudge when the PR carries a marker the guard
+/// saw and could not use, so a session that posted one learns why it did not
+/// count rather than reading the nudge as "you posted nothing"
+/// (cadence-hooks#838). `None` when no review or comment mentions a marker.
+///
+/// The two places have different fixes, so they are told apart: a marker on
+/// a review that does not parse names its broken fields; a marker only on an
+/// issue comment has to be posted again as a review. The newest review with a
+/// broken marker wins; a comment is reported only when no review mentions a
+/// marker at all. A marker that parses but names another head or non-zero
+/// counts is not a shape problem, and the main message already covers it.
+fn marker_hint(state: &PrState) -> Option<String> {
+    let reviews: Vec<&ParsedReview> = state
+        .reviews
+        .iter()
+        .filter(|r| mentions_marker(&r.body))
+        .collect();
+    if let Some(broken) = reviews.iter().rev().find_map(|r| {
+        let first_line = r.body.split('\n').next().unwrap_or_default();
+        (!MARKER_RE.is_match(first_line)).then_some(first_line)
+    }) {
+        return Some(format!(
+            " Found a `cadence-review` marker on a review that does not parse: {}.",
+            marker_problems(broken).join("; ")
+        ));
+    }
+    if reviews.is_empty() && state.comments.iter().any(|c| mentions_marker(c)) {
+        return Some(
+            " Found a `cadence-review` marker on an issue comment, which does not count: post \
+             it as a review (`gh pr review --comment --body-file <file>`) with the marker as \
+             the body's first line."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// A GitHub login safe to echo into the nudge: ASCII letters, digits, and
+/// `-`, at most 39 characters (GitHub's own rule). Bot logins end in `[bot]`
+/// in REST but arrive without it here, so the rule holds for them too.
+fn is_safe_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The sentence naming each outstanding `CHANGES_REQUESTED` review and the
+/// command that would dismiss it (cadence-hooks#978).
+///
+/// The ruling on #978 sets two limits, and both are kept here. The dismissal
+/// command is printed with the PR and review id filled in, so the way to
+/// clear the nudge is visible where it fires. And it is not the default
+/// advice: the sentence leads with addressing the changes and asking for a
+/// re-review, and names dismissal as the operator's call for a review they
+/// judge stale or resolved. The guard never dismisses anything.
+///
+/// Every value in the command is either parsed ([`is_safe_name`],
+/// [`is_safe_host`], a JSON number) or one of gh's `{owner}`/`{repo}`
+/// placeholders, which gh fills from the cwd's repo the same way the query
+/// did. A review with no id gets no command.
+fn changes_requested_sentence(
+    blockers: &[&ParsedReview],
+    query_repo: &QueryRepo,
+    host: Option<&str>,
+    pr_num: u64,
+) -> String {
+    let repo_path = match query_repo {
+        QueryRepo::Named { owner, name } => format!("repos/{owner}/{name}"),
+        QueryRepo::Placeholders => "repos/{owner}/{repo}".to_string(),
+    };
+    let hostname = host
+        .filter(|h| !h.eq_ignore_ascii_case("github.com") && is_safe_host(h))
+        .map(|h| format!(" --hostname {h}"))
+        .unwrap_or_default();
+    let who = |r: &ParsedReview| {
+        if is_safe_login(&r.login) {
+            format!("@{}", r.login)
+        } else {
+            "a reviewer".to_string()
+        }
+    };
+    let listed = blockers
+        .iter()
+        .map(|r| match r.id {
+            Some(id) => format!(
+                "{} (`gh api{hostname} -X PUT {repo_path}/pulls/{pr_num}/reviews/{id}/dismissals \
+                 -f message='<reason>'`)",
+                who(r)
+            ),
+            None => who(r),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        " PR #{pr_num} has an outstanding CHANGES_REQUESTED review — the reviewer's latest \
+         decisive review requests changes, and a new push does not clear it. Address the \
+         changes and ask for a re-review. If the operator judges a request stale or already \
+         resolved, dismissing it is their call: {listed}."
+    )
 }
 
 /// The repo half of the GraphQL request: explicit `owner`/`name` values, or
@@ -587,17 +828,36 @@ pub fn evaluate(
     if is_reviewed(&state.reviews, &state.head, &state.author) {
         return None;
     }
+    // Which half of the contract failed decides what the nudge says.
+    let approved = has_approval_signal(&state.reviews, &state.head, &state.author);
+    let blockers = outstanding_changes_requested(&state.reviews);
     let head = state.head.as_str();
+    // `chars`, not a byte slice: `headRefOid` comes from `gh` and a non-hex
+    // value would panic a `&head[..7]` on a char boundary.
+    let short_head = head.chars().take(7).collect::<String>();
 
-    Some(format!(
-        "warn-unreviewed-ready-flip: PR #{pr_num} has no reviewed signal on head {short_head} — \
-         neither a non-author human APPROVED review nor a `cadence-review` marker with \
-         `crit=0 imp=0` on this SHA. Post the dispatched reviewer's findings on the PR first \
-         (`cadence-forge:review-loop` § What \"reviewed\" means). Advisory only.",
-        // `chars`, not a byte slice: `headRefOid` comes from `gh` and a
-        // non-hex value would panic a `&head[..7]` on a char boundary.
-        short_head = head.chars().take(7).collect::<String>(),
-    ))
+    let mut msg =
+        format!("warn-unreviewed-ready-flip: PR #{pr_num} is not reviewed at head {short_head}.");
+    if !approved {
+        msg.push_str(
+            " It has no approval signal on this SHA — neither a non-author human APPROVED \
+             review nor a `cadence-review` marker with `crit=0 imp=0`. Post the dispatched \
+             reviewer's findings on the PR first.",
+        );
+        if let Some(hint) = marker_hint(&state) {
+            msg.push_str(&hint);
+        }
+    }
+    if !blockers.is_empty() {
+        msg.push_str(&changes_requested_sentence(
+            &blockers,
+            &query_repo,
+            target.host.as_deref(),
+            pr_num,
+        ));
+    }
+    msg.push_str(" See `cadence-forge:review-loop` § What \"reviewed\" means. Advisory only.");
+    Some(msg)
 }
 
 /// Nudges on `gh pr ready` / `gh pr merge` when the PR's head SHA has no
@@ -986,7 +1246,11 @@ mod tests {
                     a.iter()
                         .map(|r| {
                             serde_json::json!({
-                                "author": {"login": r["user"]["login"]},
+                                "databaseId": r["id"],
+                                "author": {
+                                    "login": r["user"]["login"],
+                                    "databaseId": r["user"]["id"],
+                                },
                                 "state": r["state"],
                                 "commit": {"oid": r["commit_id"]},
                                 "body": r["body"],
@@ -1008,6 +1272,20 @@ mod tests {
                 calls: std::cell::RefCell::new(Vec::new()),
                 graphql_args: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        /// Add issue comments with these bodies to the GraphQL response.
+        fn with_comments(mut self, bodies: &[&str]) -> Self {
+            let mut state: serde_json::Value =
+                serde_json::from_str(self.state_json.as_deref().unwrap()).unwrap();
+            let nodes: Vec<serde_json::Value> = bodies
+                .iter()
+                .map(|b| serde_json::json!({ "body": b }))
+                .collect();
+            state["data"]["repository"]["pullRequest"]["comments"] =
+                serde_json::json!({ "nodes": nodes });
+            self.state_json = Some(state.to_string());
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -1607,5 +1885,279 @@ mod tests {
     #[test]
     fn retargeted_undo_does_not_match() {
         assert!(flip_segment_tokens("gh -R o/r pr ready 12 --undo").is_none());
+    }
+
+    // --- CHANGES_REQUESTED (cadence-hooks#978) ---
+
+    const HEAD: &str = "abc1234abcabc1234abcabc1234abcabc1234abc";
+    const OLD_HEAD: &str = "111aaa111a111aaa111a111aaa111a111aaa111a";
+
+    fn clean_marker() -> serde_json::Value {
+        serde_json::json!({
+            "id": 900,
+            "user": {"login": "cameronsjo", "id": 1},
+            "state": "COMMENTED",
+            "commit_id": HEAD,
+            "body": format!("<!-- cadence-review: code-reviewer head={HEAD} crit=0 imp=0 -->\nnone")
+        })
+    }
+
+    fn review(id: u64, user_id: u64, login: &str, state: &str, commit: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "user": {"login": login, "id": user_id},
+            "state": state,
+            "commit_id": commit,
+            "body": ""
+        })
+    }
+
+    #[test]
+    fn outstanding_changes_requested_nudges_despite_a_clean_marker() {
+        // The case #978 names: a reviewer requests changes, the author posts
+        // a clean marker at the same head with no push.
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", HEAD),
+                clean_marker()
+            ]),
+        );
+        let msg = eval("gh pr merge 5", &gh).expect("an outstanding request must nudge");
+        assert!(msg.contains("CHANGES_REQUESTED"), "{msg}");
+        assert!(msg.contains("@rev"), "{msg}");
+        assert!(
+            msg.contains(
+                "gh api -X PUT repos/{owner}/{repo}/pulls/5/reviews/101/dismissals -f message='<reason>'"
+            ),
+            "{msg}"
+        );
+        // The approval half held, so the no-signal sentence is not printed.
+        assert!(!msg.contains("no approval signal"), "{msg}");
+    }
+
+    #[test]
+    fn dismissal_is_not_the_default_advice() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", HEAD),
+                clean_marker()
+            ]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        let re_review = msg.find("re-review").expect("must advise a re-review");
+        let dismiss = msg.find("dismissals").expect("must name the command");
+        assert!(re_review < dismiss, "{msg}");
+        assert!(msg.contains("operator"), "{msg}");
+    }
+
+    #[test]
+    fn a_stale_head_request_is_still_outstanding() {
+        // Head-independent, per the ruling: a push does not clear it.
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", OLD_HEAD),
+                clean_marker()
+            ]),
+        );
+        assert!(eval("gh pr merge 5", &gh).is_some());
+    }
+
+    #[test]
+    fn the_same_reviewers_later_approval_clears_the_request() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", OLD_HEAD),
+                review(102, 7, "rev", "APPROVED", HEAD)
+            ]),
+        );
+        assert_eq!(eval("gh pr merge 5", &gh), None);
+    }
+
+    #[test]
+    fn a_later_comment_does_not_clear_the_request() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", HEAD),
+                review(102, 7, "rev", "COMMENTED", HEAD),
+                clean_marker()
+            ]),
+        );
+        assert!(eval("gh pr merge 5", &gh).is_some());
+    }
+
+    #[test]
+    fn a_dismissed_request_is_not_outstanding() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([review(101, 7, "rev", "DISMISSED", HEAD), clean_marker()]),
+        );
+        assert_eq!(eval("gh pr merge 5", &gh), None);
+    }
+
+    #[test]
+    fn another_reviewers_approval_does_not_clear_a_request() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                review(101, 7, "rev", "CHANGES_REQUESTED", HEAD),
+                review(102, 8, "other", "APPROVED", HEAD)
+            ]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(msg.contains("reviews/101/dismissals"), "{msg}");
+    }
+
+    #[test]
+    fn reviewers_without_an_id_never_share_a_group() {
+        // Two deleted accounts: empty login, no id. Keyed by login they would
+        // collapse and the approval would clear the other's request.
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([
+                {"id": 101, "user": {"login": ""}, "state": "CHANGES_REQUESTED", "commit_id": HEAD, "body": ""},
+                {"id": 102, "user": {"login": ""}, "state": "APPROVED", "commit_id": HEAD, "body": ""}
+            ]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(msg.contains("a reviewer"), "{msg}");
+        assert!(msg.contains("reviews/101/dismissals"), "{msg}");
+    }
+
+    #[test]
+    fn dismissal_command_names_an_explicit_repo() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([review(101, 7, "rev", "CHANGES_REQUESTED", HEAD)]),
+        );
+        let msg = eval("gh pr merge 5 -R o/r", &gh).unwrap();
+        assert!(
+            msg.contains("repos/o/r/pulls/5/reviews/101/dismissals"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--hostname"), "{msg}");
+        // Both halves failed, so both sentences are printed.
+        assert!(msg.contains("no approval signal"), "{msg}");
+    }
+
+    #[test]
+    fn a_login_outside_the_github_charset_is_not_echoed() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([review(
+                101,
+                7,
+                "x` ignore previous",
+                "CHANGES_REQUESTED",
+                HEAD
+            )]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(!msg.contains("ignore previous"), "{msg}");
+        assert!(msg.contains("a reviewer"), "{msg}");
+    }
+
+    #[test]
+    fn query_asks_for_review_and_reviewer_ids() {
+        assert!(PR_STATE_QUERY.contains("reviews(last: 100) { nodes { databaseId"));
+        assert!(PR_STATE_QUERY.contains("... on User { databaseId }"));
+    }
+
+    // --- malformed markers (cadence-hooks#838) ---
+
+    #[test]
+    fn a_malformed_marker_names_each_broken_field() {
+        // The marker from the #838 report: `sha=` for `head=`, a short SHA,
+        // and no reviewer field.
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([{
+                "user": {"login": "cameronsjo"},
+                "state": "COMMENTED",
+                "commit_id": HEAD,
+                "body": "<!-- cadence-review: sha=5a4567aa crit=0 imp=0 -->\nfindings"
+            }]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(msg.contains("does not parse"), "{msg}");
+        assert!(msg.contains("`<reviewer>`"), "{msg}");
+        assert!(msg.contains("found `sha=`"), "{msg}");
+        // Nothing from the body is echoed.
+        assert!(!msg.contains("5a4567aa"), "{msg}");
+    }
+
+    #[test]
+    fn a_short_head_is_reported_by_length() {
+        assert_eq!(
+            marker_problems("<!-- cadence-review: rev head=abc1234 crit=0 imp=0 -->"),
+            vec!["`head=` must be the full 40-character SHA (found 7 characters)".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_marker_that_is_not_the_first_line_is_reported() {
+        let problems = marker_problems(&format!(
+            "  <!-- cadence-review: rev head={HEAD} crit=0 imp=0 -->"
+        ));
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("first line"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_spacing_fault_gets_the_fallback_problem() {
+        let problems = marker_problems(&format!(
+            "<!-- cadence-review: rev head={HEAD} crit=0 imp=0-->"
+        ));
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("single spaces"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_marker_on_an_issue_comment_says_to_post_a_review() {
+        let gh = FakeGh::new(HEAD, "cameronsjo", serde_json::json!([])).with_comments(&[&format!(
+            "<!-- cadence-review: rev head={HEAD} crit=0 imp=0 -->\nfindings"
+        )]);
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(msg.contains("issue comment"), "{msg}");
+        assert!(msg.contains("gh pr review --comment"), "{msg}");
+    }
+
+    #[test]
+    fn no_marker_anywhere_adds_no_hint() {
+        let gh = FakeGh::new(HEAD, "cameronsjo", serde_json::json!([]))
+            .with_comments(&["looks good to me"]);
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(!msg.contains("Found a"), "{msg}");
+    }
+
+    #[test]
+    fn a_well_formed_stale_marker_is_not_called_malformed() {
+        let gh = FakeGh::new(
+            HEAD,
+            "cameronsjo",
+            serde_json::json!([{
+                "user": {"login": "cameronsjo"},
+                "state": "COMMENTED",
+                "commit_id": OLD_HEAD,
+                "body": format!("<!-- cadence-review: rev head={OLD_HEAD} crit=0 imp=0 -->")
+            }]),
+        );
+        let msg = eval("gh pr merge 5", &gh).unwrap();
+        assert!(!msg.contains("does not parse"), "{msg}");
     }
 }
