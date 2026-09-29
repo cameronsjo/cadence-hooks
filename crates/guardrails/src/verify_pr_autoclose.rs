@@ -10,12 +10,14 @@
 //! otherwise it sleeps the rest of the wait and checks again.
 
 use cadence_hooks_core::shell::{
-    GH_DEFAULT_HOST, PrSelector, command_segments, command_word, forge_host, gh_pr_subcommand,
-    git_command, host_and_repo_from_url, pr_flip_segments, pr_selector, pr_url_parts,
-    repo_value_names_remote, ship_target, tokenize,
+    GH_DEFAULT_HOST, PrSelector, command_segments, command_word, forge_host, gh_pr_segments,
+    gh_pr_subcommand, git_command, host_and_repo_from_url, pr_flip_segments, pr_selector,
+    pr_url_parts, repo_value_names_remote, ship_target, tokenize,
 };
 use cadence_hooks_core::time::{now_unix_seconds, rfc3339_unix_seconds};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+use crate::bounded_tool::{DeadlineGhRunner, FLOW_CALL_CAP};
 
 /// How long after `mergedAt` the merge flow still acts. A `gh pr merge` on a
 /// PR merged longer ago than this is a re-run, not the merge itself.
@@ -211,41 +213,28 @@ pub trait Clock {
     fn sleep_secs(&self, secs: u64);
     /// The current time, in seconds since the Unix epoch.
     fn now_unix(&self) -> i64;
+    /// Time left before the flow's deadline ([`FLOW_BUDGET`] after the check
+    /// started). A sleep that would leave less than one bounded `gh` call
+    /// after it is skipped (cadence-hooks#986).
+    fn remaining(&self) -> std::time::Duration;
 }
 
 // ---------------------------------------------------------------------------
 // Real I/O implementations
 // ---------------------------------------------------------------------------
 
-/// Production `gh` runner: shells out to the system `gh` binary.
-///
-/// Carries the enterprise host (if any) and scopes `GH_HOST` to each spawned
-/// command — no process-global env mutation.
-pub struct RealGhRunner {
-    /// `GH_HOST` value for enterprise GitHub remotes; `None` targets github.com.
-    pub gh_host: Option<String>,
+/// Production clock: delegates to `std::thread::sleep`, and measures the time
+/// left against the flow deadline `until`.
+pub struct RealClock {
+    pub until: std::time::Instant,
 }
-
-impl GhRunner for RealGhRunner {
-    fn run(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = std::process::Command::new("gh");
-        if let Some(h) = &self.gh_host {
-            cmd.env("GH_HOST", h);
-        }
-        let output = cmd.args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        // Success with empty stdout is still success — `gh issue close` writes
-        // its confirmation to stderr, so an empty stdout must not read as failure.
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-}
-
-/// Production clock: delegates to `std::thread::sleep`.
-pub struct RealClock;
 
 impl Clock for RealClock {
+    fn remaining(&self) -> std::time::Duration {
+        self.until
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
     fn sleep_secs(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
@@ -398,12 +387,7 @@ pub fn handle_merge(
     let pr_num = match merge_target(cmd, &origin_host, &slug.to_ascii_lowercase()) {
         MergeTarget::NotAMerge | MergeTarget::Unsure => return None,
         MergeTarget::Number(n) => n,
-        MergeTarget::CurrentBranch => {
-            let raw = gh.run(&[
-                "pr", "view", "--json", "number", "-q", ".number", "-R", slug,
-            ]);
-            raw.and_then(|s| s.parse::<u64>().ok())?
-        }
+        MergeTarget::CurrentBranch => current_branch_pr(gh, &origin_host, slug)?,
     };
 
     // Fetch body + mergeCommit first — the merged PR's body doesn't change,
@@ -466,18 +450,27 @@ pub fn handle_merge(
     // Check early, and skip the rest of the wait only when every ref is
     // already CLOSED. `Missing` (which a `gh` failure also returns) never
     // counts as closed, so a failed read falls through to the full wait.
+    //
+    // Every sleep must leave room for at least one bounded `gh` call before
+    // the flow deadline, or the hook would sleep into the external hooks.json
+    // timeout and be killed silently. When it would not, the flow gives up
+    // here instead (cadence-hooks#986 review I1).
     let early = EARLY_CHECK_SECS.min(wait_secs);
     if early > 0 && early < wait_secs {
-        clock.sleep_secs(early);
+        if !sleep_within_flow(clock, early) {
+            return None;
+        }
         let all_closed = refs
             .iter()
             .all(|issue| fetch_issue_state(gh, *issue, slug) == IssueState::Closed);
         if all_closed {
             return None;
         }
-        clock.sleep_secs(wait_secs - early);
-    } else if wait_secs > 0 {
-        clock.sleep_secs(wait_secs);
+        if !sleep_within_flow(clock, wait_secs - early) {
+            return None;
+        }
+    } else if wait_secs > 0 && !sleep_within_flow(clock, wait_secs) {
+        return None;
     }
 
     let short_sha = if merge_sha.len() >= 7 {
@@ -527,9 +520,93 @@ pub fn handle_merge(
     }
 }
 
+/// The PR of the session cwd's branch, when gh reports one in origin's repo.
+///
+/// This used to pass `-R <slug>` with no selector, which gh refuses outright
+/// ("argument required when using the --repo flag", `pkg/cmd/pr/view/view.go`
+/// in cli/cli), so a bare `gh pr merge` never verified anything
+/// (cadence-hooks#1076). Now gh resolves the branch from the cwd — the runner
+/// spawns it there — and the `url` it reports must name origin's repo before
+/// its number is used, since gh's own base-repo choice (an `upstream` remote,
+/// `gh repo set-default`, an exported `GH_REPO`) can point elsewhere.
+///
+/// After `gh pr merge --delete-branch`, gh has already switched the checkout
+/// off the merged branch, so this finds no PR (or one that is not a recent
+/// merge, which `handle_merge` then ignores) and the flow stays silent.
+fn current_branch_pr(gh: &dyn GhRunner, origin_host: &str, slug: &str) -> Option<u64> {
+    let raw = gh.run(&["pr", "view", "--json", "number,url"])?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let number = value.get("number").and_then(serde_json::Value::as_u64)?;
+    let url = value.get("url").and_then(serde_json::Value::as_str)?;
+    let (host, owner, repo, url_number) = pr_url_parts(url)?;
+    let names_origin = repo_value_names_remote(
+        &format!("{host}/{owner}/{repo}"),
+        None,
+        origin_host,
+        &slug.to_ascii_lowercase(),
+    );
+    (names_origin && url_number == number).then_some(number)
+}
+
+/// Sleep `secs` when the flow deadline still leaves one bounded `gh` call
+/// ([`FLOW_CALL_CAP`]) after it; otherwise sleep nothing and return false.
+fn sleep_within_flow(clock: &dyn Clock, secs: u64) -> bool {
+    let needed = std::time::Duration::from_secs(secs) + FLOW_CALL_CAP;
+    if clock.remaining() < needed {
+        cadence_hooks_core::deadline::note_hit_by("gh");
+        return false;
+    }
+    clock.sleep_secs(secs);
+    true
+}
+
+/// The most `GH_AUTOCLOSE_WAIT_SECONDS` may ask for. A longer wait could not
+/// leave room for the checks after it inside [`FLOW_BUDGET`].
+const MAX_WAIT_SECS: u64 = 15;
+
+/// Read `GH_AUTOCLOSE_WAIT_SECONDS`: unset or unparseable is the 10 s
+/// default, and a larger value clamps to [`MAX_WAIT_SECS`].
+fn wait_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(10)
+        .min(MAX_WAIT_SECS)
+}
+
 // ---------------------------------------------------------------------------
 // Check implementation
 // ---------------------------------------------------------------------------
+
+/// Which flow a command runs, read from its parsed `gh pr` segments.
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    Create,
+    Merge,
+    Neither,
+}
+
+/// Pick the flow from the command's `gh pr <sub>` segments
+/// ([`gh_pr_segments`]) rather than a substring (cadence-hooks#1076).
+///
+/// The substring test missed `gh pr -R owner/repo merge 17` and
+/// `gh -R owner/repo pr merge 17`, which [`merge_target`] resolves, and
+/// matched `gh pr merge` inside an `echo` or a commit message. A command with
+/// both a create and a merge segment takes the create flow, as the substring
+/// order did.
+fn flow_for(cmd: &str) -> Flow {
+    let segments = gh_pr_segments(cmd);
+    let has = |sub: &str| segments.iter().any(|t| gh_pr_subcommand(t) == Some(sub));
+    if has("create") {
+        Flow::Create
+    } else if has("merge") {
+        Flow::Merge
+    } else {
+        Flow::Neither
+    }
+}
+
+/// How long the whole flow may run before its `gh` calls stop, safely under
+/// the hook's 30 s hooks.json timeout (cadence-hooks#986).
+const FLOW_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Advisory check for PR auto-close behaviour.
 ///
@@ -546,9 +623,14 @@ impl Check for VerifyPrAutoclose {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        let started = std::time::Instant::now();
         let Some(cmd) = input.command() else {
             return CheckResult::allow();
         };
+        let flow = flow_for(cmd);
+        if flow == Flow::Neither {
+            return CheckResult::allow();
+        }
 
         // Resolve working directory
         let cwd_fallback = std::env::current_dir()
@@ -567,22 +649,29 @@ impl Check for VerifyPrAutoclose {
         };
 
         // Enterprise GitHub: scope GH_HOST to the runner's spawned commands
-        // rather than mutating this process's environment.
-        let gh = RealGhRunner { gh_host: host };
-        let clock = RealClock;
-        let wait_secs: u64 = std::env::var("GH_AUTOCLOSE_WAIT_SECONDS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+        // rather than mutating this process's environment. Every call is
+        // bounded, and runs in the session cwd so a selector-less lookup
+        // resolves the checkout's branch.
+        let gh = DeadlineGhRunner {
+            cwd: std::path::PathBuf::from(cwd),
+            env: host
+                .iter()
+                .map(|h| ("GH_HOST".to_string(), h.clone()))
+                .collect(),
+            until: started + FLOW_BUDGET,
+        };
+        let clock = RealClock {
+            until: started + FLOW_BUDGET,
+        };
+        let wait_secs = wait_secs_from(std::env::var("GH_AUTOCLOSE_WAIT_SECONDS").ok().as_deref());
 
-        let message = if cmd.contains("gh pr create") {
-            let stdout = input.tool_response_stdout().unwrap_or("");
-            handle_create(gh.gh_host.as_deref(), stdout, &gh)
-        } else if cmd.contains("gh pr merge") {
-            handle_merge(&slug, gh.gh_host.as_deref(), cmd, &gh, &clock, wait_secs)
-        } else {
-            // Not a create or merge command — no handler invoked
-            None
+        let message = match flow {
+            Flow::Create => {
+                let stdout = input.tool_response_stdout().unwrap_or("");
+                handle_create(host.as_deref(), stdout, &gh)
+            }
+            Flow::Merge => handle_merge(&slug, host.as_deref(), cmd, &gh, &clock, wait_secs),
+            Flow::Neither => None,
         };
 
         match message {
@@ -785,8 +874,9 @@ mod tests {
         issue_state_seq: RefCell<HashMap<u64, VecDeque<Option<String>>>>,
         /// PR body to return for the merge-path `gh pr view <n>`
         pr_body: String,
-        /// PR number to return for bare `gh pr view --json number`
-        pr_number: Option<u64>,
+        /// JSON returned for the selector-less `gh pr view --json number,url`
+        /// (the cwd branch's PR); `None` simulates no PR for the branch.
+        current_pr: Option<String>,
         /// merge commit OID
         merge_commit_oid: String,
         /// `state` for the merge-path `gh pr view` ("MERGED" | "OPEN" | …)
@@ -807,7 +897,7 @@ mod tests {
                 issue_states: HashMap::new(),
                 issue_state_seq: RefCell::new(HashMap::new()),
                 pr_body: String::new(),
-                pr_number: None,
+                current_pr: None,
                 merge_commit_oid: "abc1234def".to_string(),
                 pr_state: "MERGED".to_string(),
                 merged_at: Some("2026-09-25T00:00:00Z".to_string()),
@@ -827,6 +917,11 @@ mod tests {
         fn with_issue_seq(self, num: u64, states: &[Option<&str>]) -> Self {
             let seq = states.iter().map(|s| s.map(str::to_string)).collect();
             self.issue_state_seq.borrow_mut().insert(num, seq);
+            self
+        }
+
+        fn with_current_pr(mut self, json: &str) -> Self {
+            self.current_pr = Some(json.to_string());
             self
         }
 
@@ -916,9 +1011,14 @@ mod tests {
                         }
                     }
                     Err(_) => {
-                        // Bare `gh pr view --json number -q .number` (no PR number in args)
-                        if args.contains(&"number") {
-                            return self.pr_number.map(|n| n.to_string());
+                        // No selector. gh refuses `-R` here ("argument
+                        // required when using the --repo flag"), and
+                        // otherwise answers for the cwd's branch.
+                        if args.contains(&"-R") {
+                            return None;
+                        }
+                        if args.contains(&"number,url") {
+                            return self.current_pr.clone();
                         }
                     }
                 }
@@ -932,6 +1032,8 @@ mod tests {
     struct FakeClock {
         sleep_calls: RefCell<Vec<u64>>,
         now: i64,
+        /// Time left in the flow; each sleep spends from it.
+        remaining: std::cell::Cell<std::time::Duration>,
     }
 
     impl FakeClock {
@@ -940,6 +1042,7 @@ mod tests {
             Self {
                 sleep_calls: RefCell::new(Vec::new()),
                 now: rfc3339_unix_seconds("2026-09-25T00:01:00Z").unwrap(),
+                remaining: std::cell::Cell::new(FLOW_BUDGET),
             }
         }
 
@@ -954,10 +1057,56 @@ mod tests {
     impl Clock for FakeClock {
         fn sleep_secs(&self, secs: u64) {
             self.sleep_calls.borrow_mut().push(secs);
+            let left = self.remaining.get();
+            self.remaining
+                .set(left.saturating_sub(std::time::Duration::from_secs(secs)));
         }
 
         fn now_unix(&self) -> i64 {
             self.now
+        }
+
+        fn remaining(&self) -> std::time::Duration {
+            self.remaining.get()
+        }
+    }
+
+    /// cadence-hooks#986 review I1: no sleep may run into the flow deadline.
+    /// (time left, sleeps taken, closes #5, why)
+    #[test]
+    fn merge_wait_never_sleeps_past_the_flow_deadline() {
+        let cases: &[(u64, &[u64], bool, &str)] = &[
+            (25, &[2, 8], true, "a full budget pays the whole wait"),
+            (
+                15,
+                &[2],
+                false,
+                "the rest of the wait would leave no room for a call",
+            ),
+            (9, &[], false, "not even the early check fits"),
+        ];
+        for (left, sleeps, closes, why) in cases {
+            let gh = FakeGh::new()
+                .with_pr_body("Closes #5")
+                .with_issue(5, "OPEN");
+            let clock = FakeClock::new();
+            clock.remaining.set(std::time::Duration::from_secs(*left));
+            let msg = handle_merge("owner/repo", None, "gh pr merge 8", &gh, &clock, 10);
+            assert_eq!(*clock.sleep_calls.borrow(), *sleeps, "{why}");
+            assert_eq!(msg.is_some(), *closes, "{why}");
+        }
+    }
+
+    #[test]
+    fn wait_seconds_default_and_clamp() {
+        for (raw, expected) in [
+            (None, 10),
+            (Some("3"), 3),
+            (Some("0"), 0),
+            (Some("junk"), 10),
+            (Some("600"), MAX_WAIT_SECS),
+        ] {
+            assert_eq!(wait_secs_from(raw), expected, "{raw:?}");
         }
     }
 
@@ -1303,7 +1452,7 @@ mod tests {
     // Case 17: merge, no PR number resolvable → return early, no sleep
     #[test]
     fn merge_no_pr_number_returns_early_no_sleep() {
-        let gh = FakeGh::new(); // pr_number is None by default
+        let gh = FakeGh::new(); // current_pr is None by default
 
         let clock = FakeClock::new();
         let msg = handle_merge(
@@ -1465,15 +1614,99 @@ mod tests {
         assert_eq!(gh.close_calls.borrow().len(), 1);
     }
 
+    /// cadence-hooks#1076: a bare `gh pr merge` resolves the cwd branch's PR
+    /// without `-R` (which gh refuses), and only a PR in origin's repo is used.
+    /// (current-branch answer, closes #5, why)
+    #[test]
+    fn merge_current_branch_resolves_only_a_pr_in_origin() {
+        let cases: &[(Option<&str>, bool, &str)] = &[
+            (
+                Some(r#"{"number":8,"url":"https://github.com/owner/repo/pull/8"}"#),
+                true,
+                "the branch's PR in origin is verified",
+            ),
+            (
+                Some(r#"{"number":8,"url":"https://github.com/Owner/Repo/pull/8"}"#),
+                true,
+                "the slug compares case-insensitively",
+            ),
+            (
+                Some(r#"{"number":8,"url":"https://github.com/upstream/repo/pull/8"}"#),
+                false,
+                "gh's base repo is another repo: stay silent",
+            ),
+            (
+                Some(r#"{"number":8,"url":"https://ghe.example.com/owner/repo/pull/8"}"#),
+                false,
+                "another host: stay silent",
+            ),
+            (
+                Some(r#"{"number":9,"url":"https://github.com/owner/repo/pull/8"}"#),
+                false,
+                "number and url disagree: stay silent",
+            ),
+            (Some("not json"), false, "an unreadable answer: stay silent"),
+            (None, false, "no PR for the branch: stay silent"),
+        ];
+        for (current, closes, why) in cases {
+            let mut gh = FakeGh::new()
+                .with_pr_body("Closes #5")
+                .with_issue(5, "OPEN");
+            if let Some(json) = current {
+                gh = gh.with_current_pr(json);
+            }
+            let clock = FakeClock::new();
+            let msg = handle_merge("owner/repo", None, "gh pr merge --squash", &gh, &clock, 0);
+            assert_eq!(msg.is_some(), *closes, "{why}: {msg:?}");
+            assert_eq!(gh.close_calls.borrow().len(), usize::from(*closes), "{why}");
+        }
+    }
+
+    /// cadence-hooks#1076: the flow is chosen from parsed `gh pr` segments.
+    #[test]
+    fn flow_is_read_from_parsed_gh_pr_segments() {
+        let cases: &[(&str, Flow)] = &[
+            ("gh pr merge 17 --squash", Flow::Merge),
+            ("gh pr -R owner/repo merge 17", Flow::Merge),
+            ("gh -R owner/repo pr merge 17", Flow::Merge),
+            ("/opt/homebrew/bin/gh pr merge 17", Flow::Merge),
+            ("gh pr create --fill", Flow::Create),
+            ("gh -R owner/repo pr create --fill", Flow::Create),
+            ("gh pr create --fill && gh pr merge 3", Flow::Create),
+            ("echo 'gh pr merge 17'", Flow::Neither),
+            ("git commit -m 'run gh pr merge later'", Flow::Neither),
+            ("gh pr view 17", Flow::Neither),
+            ("git status", Flow::Neither),
+        ];
+        for (cmd, expected) in cases {
+            assert_eq!(flow_for(cmd), *expected, "{cmd}");
+        }
+    }
+
+    /// The `-R`-between spellings the old substring dispatch never reached
+    /// are resolved by `merge_target` and now reach `handle_merge`.
+    #[test]
+    fn merge_with_repo_flag_before_the_subcommand_closes_stragglers() {
+        for cmd in ["gh pr -R owner/repo merge 8", "gh -R owner/repo pr merge 8"] {
+            let gh = FakeGh::new()
+                .with_pr_body("Closes #5")
+                .with_issue(5, "OPEN");
+            let clock = FakeClock::new();
+            let msg = handle_merge("owner/repo", None, cmd, &gh, &clock, 0);
+            assert!(msg.is_some_and(|m| m.contains("#5")), "{cmd}");
+        }
+    }
+
     // Case 18: cmd is neither create nor merge → Check::run allows, no handler invoked
     // (Tested via the Check trait — we verify allow() is returned for unrelated commands)
     #[test]
     fn unrelated_command_returns_allow() {
         let input = make_bash("git status");
         // We can't call VerifyPrAutoclose::run here because it hits git remote.
-        // Instead test the logic path: if cmd doesn't contain "gh pr create" or "gh pr merge",
-        // neither handler is invoked. We verify this via pr_number_from_create_stdout
-        // and merge_target reading no merge in unrelated commands.
+        // Instead test the logic path: a command with no `gh pr create` or
+        // `gh pr merge` segment invokes neither handler. We verify this via
+        // pr_from_create_stdout and merge_target reading no merge in
+        // unrelated commands.
         assert_eq!(pr_from_create_stdout("git status output"), None);
         assert_eq!(
             merge_target("git status", "github.com", "o/r"),

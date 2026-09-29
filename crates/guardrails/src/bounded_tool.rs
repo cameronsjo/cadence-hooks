@@ -52,6 +52,18 @@ pub fn run_tool(
     env: &[(String, String)],
 ) -> Option<String> {
     let timeout = next_timeout(program)?;
+    run_tool_for(program, args, cwd, env, timeout)
+}
+
+/// [`run_tool`] with the timeout supplied by the caller rather than read from
+/// the shared budget.
+fn run_tool_for(
+    program: &'static str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Option<String> {
     let mut cmd = Command::new(program);
     cmd.current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -88,9 +100,74 @@ impl GhRunner for BoundedGhRunner {
     }
 }
 
+/// The most one `gh` call in `verify-pr-autoclose`'s flow may take.
+pub const FLOW_CALL_CAP: Duration = Duration::from_secs(8);
+
+/// `gh` bounded by a flow deadline of its own instead of the shared per-hook
+/// budget (cadence-hooks#986).
+///
+/// `verify-pr-autoclose` deliberately sleeps for GitHub's auto-close
+/// (`GH_AUTOCLOSE_WAIT_SECONDS`, 10 s by default) under a 30 s hooks.json
+/// timeout, so the shared 3 s budget is spent before its first post-wait call
+/// and [`BoundedGhRunner`] would silence the whole merge flow. Each call here
+/// gets at most [`FLOW_CALL_CAP`], and never past `until`, which the caller
+/// sets safely under the external timeout. A call that times out is noted
+/// against `gh` on the shared deadline, so the dispatch layer writes its
+/// `deadline` row and stderr line the same way it does for any other probe.
+pub struct DeadlineGhRunner {
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub until: std::time::Instant,
+}
+
+impl DeadlineGhRunner {
+    /// The timeout for the next call, or `None` once `until` has passed.
+    fn next_timeout(&self) -> Option<Duration> {
+        let remaining = self
+            .until
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            deadline::note_hit_by("gh");
+            return None;
+        }
+        Some(remaining.min(FLOW_CALL_CAP))
+    }
+}
+
+impl crate::verify_pr_autoclose::GhRunner for DeadlineGhRunner {
+    fn run(&self, args: &[&str]) -> Option<String> {
+        let timeout = self.next_timeout()?;
+        run_tool_for("gh", args, &self.cwd, &self.env, timeout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cadence-hooks#986: a flow call gets the per-call cap, never past the
+    /// flow deadline, and nothing once the deadline has passed.
+    #[test]
+    fn deadline_runner_caps_each_call_at_the_flow_deadline() {
+        let now = std::time::Instant::now();
+        let runner = |until| DeadlineGhRunner {
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            until,
+        };
+        assert_eq!(
+            runner(now + Duration::from_secs(60)).next_timeout(),
+            Some(FLOW_CALL_CAP)
+        );
+        let near = runner(now + Duration::from_secs(3)).next_timeout();
+        assert!(near.is_some_and(|t| t <= Duration::from_secs(3) && t > Duration::ZERO));
+        assert_eq!(runner(now).next_timeout(), None);
+        // A spent deadline makes no call at all, so the answer is `None`.
+        assert_eq!(
+            crate::verify_pr_autoclose::GhRunner::run(&runner(now), &["--version"]),
+            None
+        );
+    }
 
     #[test]
     fn a_missing_program_is_none_not_a_panic() {
