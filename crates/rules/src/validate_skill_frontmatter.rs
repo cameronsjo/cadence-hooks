@@ -566,59 +566,80 @@ fn trigger_nudge(content: &str, fields: &[(String, String)]) -> Option<Problem> 
     })
 }
 
+/// The markdown body of a skill or command: everything after the closing `---`
+/// of its frontmatter, found the way [`extract_frontmatter`] finds it. Without
+/// a frontmatter block the whole document is the body. Frontmatter is YAML, not
+/// markdown: parsing it as markdown lets a block-scalar line (`   <!--`, a
+/// leading fence) swallow the real body.
+fn body_after_frontmatter(content: &str) -> &str {
+    let mut offset = 0;
+    let mut close = None;
+    for (i, line) in content.split_inclusive('\n').enumerate() {
+        let text = line.trim_end_matches(['\r', '\n']);
+        if i == 0 && text != "---" {
+            return content;
+        }
+        offset += line.len();
+        if i > 0 && text == "---" {
+            close = Some(offset);
+            break;
+        }
+    }
+    close.map_or(content, |o| &content[o..])
+}
+
 /// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
 /// and bypasses conditional activation.
 ///
-/// Markdown structure comes from a real CommonMark parser, not a hand-rolled
-/// scan: only text outside code blocks and inline code is read (so fences in
-/// list items, indented code, multi-line code spans and escaped backticks all
-/// follow the spec). Text inside links and emphasis is prose and is scanned.
-/// Backticks and fences remain the documented escape hatch; indentation alone
-/// is not one unless CommonMark makes it a code block. The token must start a
-/// word (`user@skills/x` does not match) and loses trailing `.,;:)` and backticks.
+/// A CommonMark parser is used ONLY to locate code: code blocks (fenced or
+/// indented, in lists or not) and inline code spans are blanked out of the raw
+/// body, keeping offsets, and the tokens are then scanned in the RAW text. So
+/// every construct that carries no text event — raw HTML, comments, link
+/// reference definitions, link destinations and titles — is still scanned,
+/// while `&#64;skills`, `\@skills` and `@skills/*x*` (not a path) are not
+/// references. The token must start a word (`user@skills/x` does not match)
+/// and loses trailing `.,;:)>` and backticks.
 fn force_load_refs(content: &str) -> Vec<String> {
-    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-    let mut refs = Vec::new();
-    let mut buf = String::new();
-    let mut in_code_block = false;
-    for event in Parser::new(content) {
-        match event {
-            Event::Text(t) if !in_code_block => buf.push_str(&t),
-            Event::SoftBreak | Event::HardBreak => buf.push(' '),
-            Event::Code(_) => buf.push(' '),
-            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. })
-            | Event::End(
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link,
-            ) => {}
-            Event::Start(Tag::CodeBlock(_)) => {
-                scan_tokens(&buf, &mut refs);
-                buf.clear();
-                in_code_block = true;
-            }
-            Event::End(TagEnd::CodeBlock) => in_code_block = false,
-            _ => {
-                scan_tokens(&buf, &mut refs);
-                buf.clear();
+    use pulldown_cmark::{Event, Parser, Tag};
+    let body = body_after_frontmatter(content);
+    let mut masked = body.as_bytes().to_vec();
+    let mut blank = |range: std::ops::Range<usize>| {
+        for b in &mut masked[range] {
+            if *b != b'\n' {
+                *b = b' ';
             }
         }
+    };
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) | Event::Code(_) => blank(range),
+            _ => {}
+        }
     }
-    scan_tokens(&buf, &mut refs);
+    let masked = String::from_utf8(masked).unwrap_or_default();
+    let mut refs = Vec::new();
+    scan_tokens(&masked, &mut refs);
     refs
 }
 
 fn scan_tokens(text: &str, refs: &mut Vec<String>) {
     for (pos, _) in text.match_indices("@skills/") {
         let prev = text[..pos].chars().next_back();
-        if prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '_' | '.' | '-')) {
+        if prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '_' | '.' | '-' | '\\')) {
+            continue;
+        }
+        // A path must follow: `@skills/*x*` and a bare `@skills/` are not references.
+        let next = text[pos + "@skills/".len()..].chars().next();
+        if !next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')) {
             continue;
         }
         let token: String = text[pos..]
             .chars()
-            .take_while(|c| !c.is_whitespace())
+            .take_while(|c| !c.is_whitespace() && !matches!(c, ']' | ')' | '<' | '>' | '"' | '\''))
             .collect();
         refs.push(
             token
-                .trim_end_matches(['.', ',', ';', ':', ')', '`'])
+                .trim_end_matches(['.', ',', ';', ':', ')', '`', '>', '*'])
                 .to_string(),
         );
     }
@@ -672,24 +693,23 @@ fn check_agent(content: &str) -> CheckResult {
     ))
 }
 
-/// Living-plan frontmatter shape (#607): producer tuple as FLAT keys in one
-/// frontmatter block above the title, never a nested `provenance:` block. A
-/// plan with no frontmatter at all predates the contract and is not checked.
-/// The fenced-block rule looks only at fences BEFORE the first heading, so a
-/// plan body can document the rule.
-/// Is the first non-blank line a `---` that opens a real second frontmatter
-/// block — a later closing `---` with at least one `key:` line between the
-/// markers? A bare thematic break right after the frontmatter is not one.
 /// Does a FENCED code block whose first non-blank line is `provenance:` appear
-/// before the first heading? Parsed as CommonMark, so a fence's extent and an
-/// indented code block follow the spec; a body below a heading may document it.
+/// before the first top-level heading? Parsed as CommonMark, so a fence's extent
+/// and an indented code block follow the spec; a body below a heading may
+/// document it. A heading inside a blockquote or list item is not a top-level
+/// heading and does not end the search.
 fn fenced_provenance_before_heading(body: &str) -> bool {
     use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
     let mut in_fence = false;
+    let mut depth = 0usize;
     let mut text = String::new();
     for event in Parser::new(body) {
         match event {
-            Event::Start(Tag::Heading { .. }) => return false,
+            Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Item) => depth += 1,
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item) => {
+                depth = depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Heading { .. }) if depth == 0 => return false,
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
                 in_fence = true;
                 text.clear();
@@ -708,6 +728,10 @@ fn fenced_provenance_before_heading(body: &str) -> bool {
     false
 }
 
+/// Is the first non-blank line a `---` that opens a real second frontmatter
+/// block? It must be followed by a closing `---`, and its first inner line must
+/// be a `key:` line, or `#` comment lines and then a `key:` line. A bare
+/// thematic break right after the frontmatter is not one.
 fn second_frontmatter_block(rest: &[&str]) -> bool {
     let Some(open) = rest.iter().position(|l| !l.trim().is_empty()) else {
         return false;
@@ -726,10 +750,17 @@ fn second_frontmatter_block(rest: &[&str]) -> bool {
                     .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
         })
     };
-    // A `key:` line directly after the opener and no blank line inside.
-    inner.first().is_some_and(|l| is_key(l)) && inner.iter().all(|l| !l.trim().is_empty())
+    inner
+        .iter()
+        .find(|l| !l.trim_start().starts_with('#'))
+        .is_some_and(|l| is_key(l))
 }
 
+/// Living-plan frontmatter shape (#607): producer tuple as FLAT keys in one
+/// frontmatter block above the title, never a nested `provenance:` block. A
+/// plan with no frontmatter at all predates the contract and is not checked.
+/// The fenced-block rule looks only at fences BEFORE the first heading, so a
+/// plan body can document the rule.
 fn plan_problems(content: &str) -> Vec<Problem> {
     let lines: Vec<&str> = content.lines().collect();
     let mut errors: Vec<Problem> = Vec::new();
@@ -2527,11 +2558,16 @@ mod tests {
     }
 
     #[test]
-    fn nb_second_frontmatter_needs_key_directly_after_opener_and_no_blanks() {
+    fn nb_second_frontmatter_needs_a_key_or_comment_then_key_first() {
+        // Blank line first: not a frontmatter block.
         let a = "---\nstatus: p\n---\n---\n\ndate: x\n---\n# Plan\n";
         assert_eq!(plan_verdict(a).0, cadence_hooks_core::Outcome::Allow);
+        // Key first, blank lines later: still a block (N2).
         let b = "---\nstatus: p\n---\n---\ndate: x\n\nmore: y\n---\n# Plan\n";
-        assert_eq!(plan_verdict(b).0, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(plan_verdict(b).0, cadence_hooks_core::Outcome::Block);
+        // Comment then key: a block (N2).
+        let c = "---\nstatus: p\n---\n---\n# note\ndate: x\n---\n# Plan\n";
+        assert_eq!(plan_verdict(c).0, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
@@ -2540,5 +2576,65 @@ mod tests {
         assert_eq!(o, cadence_hooks_core::Outcome::Allow);
         let (o, _) = skill_verdict("description: Use when x\n  # a comment\n  real continuation");
         assert_eq!(o, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---- third delta review: parser locates code, raw text is scanned ----
+
+    #[test]
+    fn i1_constructs_without_text_events_are_still_scanned() {
+        for doc in [
+            "<details>\n@skills/x/SKILL.md\n</details>",
+            "<!-- @skills/x/SKILL.md -->",
+            "<a href=\"@skills/x/SKILL.md\">t</a>",
+            "[ref]: @skills/x/SKILL.md",
+            "[^1]: @skills/x/SKILL.md",
+            "[a](  @skills/x/SKILL.md  )",
+            "[a](b \"@skills/x/SKILL.md\")",
+            "![img](b.png \"@skills/x/SKILL.md\")",
+        ] {
+            assert_eq!(force_load_refs(doc), vec!["@skills/x/SKILL.md"], "{doc:?}");
+        }
+    }
+
+    #[test]
+    fn n4_escaped_entity_and_non_path_forms_are_not_references() {
+        for doc in [
+            "&#64;skills/x/SKILL.md",
+            "\\@skills/x/SKILL.md",
+            "@skills/*x*/SKILL.md",
+            "@skills/",
+        ] {
+            assert!(force_load_refs(doc).is_empty(), "{doc:?}");
+        }
+    }
+
+    #[test]
+    fn i2_frontmatter_is_not_parsed_as_markdown() {
+        let block =
+            |fm: &str| format!("---\nname: s\ndescription: >-\n{fm}\n---\n@skills/x/SKILL.md\n");
+        for fm in ["   <!--", "   ```", "   plain"] {
+            assert_eq!(
+                force_load_refs(&block(fm)),
+                vec!["@skills/x/SKILL.md"],
+                "{fm:?}"
+            );
+        }
+        // The old on-disk document is read the same way.
+        assert_eq!(body_after_frontmatter("---\na: b\n---\nbody\n"), "body\n");
+        assert_eq!(
+            body_after_frontmatter("no frontmatter\n"),
+            "no frontmatter\n"
+        );
+    }
+
+    #[test]
+    fn n3_heading_inside_a_blockquote_is_not_the_first_heading() {
+        let doc = "---\nstatus: p\n---\n> # quoted\n\n```yaml\nprovenance:\n  d: 1\n```\n";
+        assert_eq!(plan_verdict(doc).0, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn n5_trailing_angle_bracket_is_trimmed() {
+        assert_eq!(force_load_refs("<@skills/x>"), vec!["@skills/x"]);
     }
 }
