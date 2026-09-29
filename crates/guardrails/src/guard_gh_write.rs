@@ -9,7 +9,7 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    COMMAND_RUNNERS, CommandWordVariables, GhRepoFlag, LOOP_PATTERN, TRANSPARENT,
+    COMMAND_RUNNERS, CommandWordVariables, ExpansionWork, GhRepoFlag, LOOP_PATTERN, TRANSPARENT,
     brace_expansion_overflows, carries_substitution, command_segments, command_segments_with_dirs,
     command_word, contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
@@ -3216,7 +3216,17 @@ impl Check for GhWriteGuard {
         // left whole, so the gh invocation it spells (`gh {pr,}{…}… create`)
         // is invisible to every reading below. Refuse rather than judge a
         // command this guard cannot see (cadence-hooks#1115).
-        if let Some(segment) = command_segments(command).into_iter().find(|segment| {
+        //
+        // The allowance is armed here for every reading below. `command_segments`
+        // re-splits the command and every script under it; a 200 KB flood of
+        // substitution heredocs cost seconds, and a hook past its deadline fails
+        // open, so a command this large to read is refused (cadence-hooks#1141).
+        let _work = ExpansionWork::arm(expansion_allowance(command.len()));
+        let readable = command_segments(command);
+        if ExpansionWork::spent() {
+            return too_large_to_read_block();
+        }
+        if let Some(segment) = readable.into_iter().find(|segment| {
             segment.contains('{')
                 && contains_ignoring_ascii_case(segment, "gh")
                 && brace_expansion_overflows(segment)
@@ -3411,9 +3421,13 @@ impl Check for GhWriteGuard {
         let mut judged = WriteJudgments::default();
         let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
         for reading in readings {
+            let segments = reading();
+            if ExpansionWork::spent() {
+                return too_large_to_read_block();
+            }
             if let Some(block) = judge_write_segments(
                 command,
-                reading(),
+                segments,
                 &work_dir,
                 &allowed_owners,
                 &allowed_repos,
@@ -3422,11 +3436,40 @@ impl Check for GhWriteGuard {
             ) {
                 return block;
             }
+            if ExpansionWork::spent() {
+                return too_large_to_read_block();
+            }
         }
 
         // No write segments, or every write segment targets an owned repo.
         CheckResult::allow()
     }
+}
+
+/// Bytes of script [`command_segments`] may read across every reading of one
+/// command: 24 passes' worth, plus room for short inputs, capped so no input
+/// can buy more time than the hook can spare. A GitHub body tops out at 64 KB,
+/// well inside it.
+fn expansion_allowance(len: usize) -> usize {
+    len.saturating_mul(24)
+        .saturating_add(64 * 1024)
+        .min(1024 * 1024)
+}
+
+/// The block for a command whose expansion ran out of allowance
+/// ([`ExpansionWork`]): part of it went unread, so it is not allowed.
+fn too_large_to_read_block() -> CheckResult {
+    CheckResult::block_structured(
+        "🚫 git-guardrails: command too large to read in full — cannot verify its gh targets\n   \
+         Fix: run each gh command on its own, with `-R owner/repo`"
+            .to_string(),
+        BlockMetadata {
+            rule_id: "gh-write-target-unresolvable".to_string(),
+            fix: "run each gh command on its own".to_string(),
+            allowed_owners: Vec::new(),
+            severity: "error",
+        },
+    )
 }
 
 /// Most distinct directories besides the whole-command one that
@@ -7954,6 +7997,68 @@ mod tests {
                 env.candidates(),
                 ["github.com", "evil.example.com", UNRESOLVED_GH_HOST]
             );
+        });
+    }
+
+    #[test]
+    fn expansion_allowance_blocks_adversarial_floods_quickly() {
+        // cadence-hooks#1141: a 200 KB flood of `"$(cat <<E` spans cost 1.3 s
+        // (release) in `command_segments` alone, past the hook deadline, which
+        // fails OPEN. The expansion allowance turns that into a block, fast.
+        let size = 200 * 1024;
+        let flood = |unit: &str| unit.repeat(size / unit.len());
+        with_env(&owners_env(), || {
+            for (name, body) in [
+                ("quoted-subst-heredoc", flood("\"$(cat <<E\nx\\\nE\n)\" ")),
+                ("gh-in-substitutions", flood("gh api $(gh pr view 1) ")),
+            ] {
+                for tail in ["", "\ngh pr create --title t --body b"] {
+                    let command = format!("{body}{tail}");
+                    let input = HookInput {
+                        tool_name: Some("Bash".into()),
+                        tool_input: Some(cadence_hooks_core::ToolInput {
+                            command: Some(command),
+                            ..Default::default()
+                        }),
+                        cwd: Some(env!("CARGO_MANIFEST_DIR").into()),
+                        ..Default::default()
+                    };
+                    let started = std::time::Instant::now();
+                    let result = GhWriteGuard.run(&input);
+                    let took = started.elapsed();
+                    assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block, "{name}");
+                    // Debug builds get headroom; release is the hook's budget.
+                    let limit = std::time::Duration::from_millis(if cfg!(debug_assertions) {
+                        6000
+                    } else {
+                        500
+                    });
+                    assert!(took < limit, "{name}: {took:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn expansion_allowance_leaves_a_large_ordinary_command_alone() {
+        // A 60 KB body (GitHub's cap is 64 KB) in a substitution heredoc is
+        // read in full: the allowance is for floods, not for big bodies.
+        let body = "line of PR body text\n".repeat(60 * 1024 / 21);
+        let command = format!(
+            "gh pr create -R cameronsjo/cadence --title t --body \"$(cat <<'EOF'\n{body}EOF\n)\""
+        );
+        with_env(&owners_env(), || {
+            let input = HookInput {
+                tool_name: Some("Bash".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    command: Some(command.clone()),
+                    ..Default::default()
+                }),
+                cwd: Some(env!("CARGO_MANIFEST_DIR").into()),
+                ..Default::default()
+            };
+            let result = GhWriteGuard.run(&input);
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
 

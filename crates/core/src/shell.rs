@@ -7800,6 +7800,66 @@ pub fn command_segments(command: &str) -> Vec<String> {
     out
 }
 
+thread_local! {
+    static EXPANSION_WORK_LEFT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static EXPANSION_WORK_SPENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// An optional allowance of bytes [`command_segments`] may hand to the
+/// splitter and the wrapper/substitution readers, shared by every call made
+/// while it is armed (cadence-hooks#1141).
+///
+/// Each call is linear, but the constant is large — a 200 KB flood of
+/// `"$(cat <<E` spans costs seconds — and a hook that runs past its deadline
+/// fails OPEN. A guard that arms it asks [`ExpansionWork::spent`] afterwards
+/// and REFUSES the command when it is set: once spent, the walk stops
+/// expanding (the segments already read are kept, nothing is dropped from
+/// them), so what remains unread is exactly what the guard must not allow.
+/// Unarmed, which is every other caller, nothing is charged.
+pub struct ExpansionWork;
+
+impl ExpansionWork {
+    /// Arm an allowance of `budget` bytes until the returned guard drops.
+    pub fn arm(budget: usize) -> ExpansionWorkGuard {
+        EXPANSION_WORK_LEFT.with(|left| left.set(Some(budget)));
+        EXPANSION_WORK_SPENT.with(|spent| spent.set(false));
+        ExpansionWorkGuard
+    }
+
+    fn charge(n: usize) -> bool {
+        EXPANSION_WORK_LEFT.with(|left| match left.get() {
+            None => true,
+            Some(have) => match have.checked_sub(n) {
+                Some(rest) => {
+                    left.set(Some(rest));
+                    true
+                }
+                None => {
+                    left.set(Some(0));
+                    EXPANSION_WORK_SPENT.with(|spent| spent.set(true));
+                    false
+                }
+            },
+        })
+    }
+
+    /// Whether an armed allowance ran out, leaving part of a command unread.
+    pub fn spent() -> bool {
+        EXPANSION_WORK_SPENT.with(std::cell::Cell::get)
+    }
+}
+
+/// Disarms [`ExpansionWork`] on drop.
+pub struct ExpansionWorkGuard;
+
+impl Drop for ExpansionWorkGuard {
+    fn drop(&mut self) {
+        EXPANSION_WORK_LEFT.with(|left| left.set(None));
+    }
+}
+
 /// Longest value [`AssignmentScope`] stores whole. `D=ab; D=$D$D; D=$D$D; …`
 /// doubles the value per segment, so forty segments asked for a terabyte and
 /// the guard hung past its deadline (cadence-hooks#1114). A longer value is
@@ -7971,6 +8031,9 @@ fn expand_segments(
     out: &mut Vec<String>,
     dedupe: bool,
 ) {
+    if !ExpansionWork::charge(command.len()) {
+        return;
+    }
     for segment in split_segments(command) {
         let mut defaults = Vec::new();
         let mut ambiguous = false;
@@ -8015,6 +8078,12 @@ fn emit_segment(
     out: &mut Vec<String>,
     dedupe: bool,
 ) {
+    if !ExpansionWork::charge(segment.len()) {
+        // Out of allowance: the segment itself is still surfaced, only its
+        // children go unread, and the caller sees [`ExpansionWork::spent`].
+        out.push(unmark(segment));
+        return;
+    }
     // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
     // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
     // substitution in the PARENT before it spawns bash at all, so a segment
