@@ -1822,6 +1822,77 @@ mod tests {
         });
     }
 
+    /// cadence-hooks#1144 review round 2: the substitution a child script runs
+    /// after its own `cd`/`export` is judged there, even when the parent
+    /// expands a textually identical one in another argument. A text-keyed
+    /// dedupe dropped the child's copy and judged only the parent's, in the
+    /// owned checkout. Every row runs from an owned checkout; `{other}` is an
+    /// unowned one.
+    #[test]
+    fn a_child_push_is_judged_where_the_child_runs_it() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let other = checkout_with_origin("https://github.com/evil/y.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                (
+                    "bash -c 'cd {other} && echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "bash -c 'export GIT_DIR={other}/.git; echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "sh -c 'cd {other} && echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "sudo bash -c 'cd {other} && echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "bash -c $'cd {other} && echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "bash -c 'cd {other} && echo `git push origin main`' \"`git push origin main`\"",
+                    Block,
+                ),
+                (
+                    "bash -c 'cd {other} && echo $(git push origin main)' _ \"$(git push origin main)\"",
+                    Block,
+                ),
+                (
+                    "bash -c 'cd {other} && echo $(git push --force origin main)' \"$(git push --force origin main)\"",
+                    Block,
+                ),
+                (
+                    "bash -c 'cd {other} && echo $(git push origin HEAD:main)' \"$(git push origin HEAD:main)\"",
+                    Block,
+                ),
+                (
+                    "eval \"cd {other}; '$(git push --force origin main)'\" '$(git push --force origin main)'",
+                    Block,
+                ),
+                (
+                    "watch 'cd {other} && echo $(git push origin main)' \"$(git push origin main)\"",
+                    Block,
+                ),
+                // Controls: the parent's own substitution, deduped by source,
+                // is still judged once where it runs.
+                ("bash -c \"$(git push origin feat)\"", Allow),
+                ("watch \"$(watch \"$(git push origin feat)\")\"", Allow),
+            ] {
+                let command = command.replace("{other}", &other).replace("{cwd}", &cwd);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
     /// cadence-hooks#1066: a URL the transport reads differently from a naive
     /// split is not owned.
     #[test]

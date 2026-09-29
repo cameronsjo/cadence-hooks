@@ -11,8 +11,8 @@ use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
     carries_substitution, command_segments, command_word, contains_ignoring_ascii_case,
-    gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word, parse_gh_repo_value,
-    parse_work_dir, requote_words, strip_quotes, tokenize,
+    gh_canonical_verb, gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word,
+    parse_gh_repo_value, parse_work_dir, requote_words, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -2176,7 +2176,9 @@ fn gh_repo_positional_target(segment: &str) -> Option<(String, Option<String>, S
     if argv.get(1).map(String::as_str) != Some("repo") {
         return None;
     }
-    let verb = argv.get(2)?;
+    // `gh repo new` is `gh repo create` (cadence-hooks#996).
+    let verb = gh_canonical_verb("repo", argv.get(2)?).to_string();
+    let verb = &verb;
     if !REPO_TARGET_VERBS.contains(&verb.as_str()) {
         return None;
     }
@@ -7448,6 +7450,19 @@ mod tests {
                 ("gh --repo=evil/x pr create --title x", true, true),
                 ("gh -Revil/x pr create --title x", true, true),
                 ("gh pr -R evil/x create --title x", true, true),
+                // #996: gh's cobra aliases write exactly as their verbs do.
+                ("gh pr new -R evil/x -t a -b b", true, true),
+                ("gh pr new -t a -b b", false, true),
+                ("gh pr new -R cameronsjo/x -t a -b b", true, false),
+                ("gh pr -R evil/x new -t a", true, true),
+                ("gh issue new -R evil/x -t a", true, true),
+                ("gh repo new evil/y --private", true, true),
+                ("gh repo new y --private", true, false),
+                ("gh release new v1 -R evil/x", true, true),
+                ("gh secret remove X -R evil/x", true, true),
+                ("gh variable remove X -R evil/x", true, true),
+                ("gh pr ls -R evil/x", true, false),
+                ("gh pr co 12 -R evil/x", true, false),
                 ("gh -R cameronsjo/y issue create --title x", true, false),
                 ("gh -R evil/x issue view 1", true, false),
                 // #1077 I3: a GH_HOST on the command that wraps gh.

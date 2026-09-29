@@ -21,9 +21,10 @@
 use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::{
-    ShipHead, ShipSegment, ShipTarget, git_command, merge_anchor_repo_targets, origin_triple,
-    parse_work_dir, polish_ship_segments_for_origin, remote_host_and_slug, repo_value_names_remote,
-    resolve_cd_target, split_segments_with_ops_joining_redirects, strip_group_wrappers, tokenize,
+    ShipHead, ShipSegment, ShipTarget, command_segments, git_command, merge_anchor_repo_targets_in,
+    origin_triple, parse_work_dir, polish_ship_segments_for_origin, polish_ship_segments_in,
+    remote_host_and_slug, repo_value_names_remote, resolve_cd_target,
+    split_segments_with_ops_joining_redirects, strip_group_wrappers, tokenize,
 };
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
@@ -451,17 +452,44 @@ pub fn located_ship_segments(command: &str, cwd: Option<&str>) -> Vec<LocatedShi
             .collect();
     };
     let whole_dir = parse_work_dir(command, cwd);
-    let whole_origin = merge_anchor_repo_targets(command).and_then(|_| origin_of(&whole_dir));
+    // Expanded once and shared: every question below re-expanded the whole
+    // command, and a single-segment command a second time per segment, which
+    // put a wrapper-nested 200 KB command past the hook deadline
+    // (cadence-hooks#1144 review).
+    let segments = WholeSegments {
+        command,
+        segments: command_segments(command),
+    };
+    let whole_origin =
+        merge_anchor_repo_targets_in(&segments.segments).and_then(|_| origin_of(&whole_dir));
     let mut origins = OriginCache::new(whole_dir.clone(), whole_origin.clone());
-    let whole: Vec<LocatedShip> = polish_ship_segments_for_origin(command, whole_origin.as_deref())
-        .into_iter()
-        .map(|segment| LocatedShip {
-            segment,
-            work_dir: Some(whole_dir.clone()),
-        })
-        .collect();
-    let per_segment = per_segment_ships(command, cwd, &mut origins);
+    let whole: Vec<LocatedShip> =
+        polish_ship_segments_in(&segments.segments, whole_origin.as_deref())
+            .into_iter()
+            .map(|segment| LocatedShip {
+                segment,
+                work_dir: Some(whole_dir.clone()),
+            })
+            .collect();
+    let per_segment = per_segment_ships(&segments, cwd, &mut origins);
     dedup_ships(merge_in_command_order(whole, per_segment))
+}
+
+/// One command and its [`command_segments`], so a text that IS the whole
+/// command (a single-segment command's only segment) is not expanded again.
+struct WholeSegments<'a> {
+    command: &'a str,
+    segments: Vec<String>,
+}
+
+impl WholeSegments<'_> {
+    fn of(&self, text: &str) -> std::borrow::Cow<'_, [String]> {
+        if text == self.command {
+            std::borrow::Cow::Borrowed(&self.segments)
+        } else {
+            std::borrow::Cow::Owned(command_segments(text))
+        }
+    }
 }
 
 /// Drop repeats of a (ship, directory) pair, keeping the first. Judging one
@@ -484,7 +512,12 @@ struct Group {
 }
 
 /// The per-segment reading of [`located_ship_segments`].
-fn per_segment_ships(command: &str, cwd: &str, origins: &mut OriginCache) -> Vec<LocatedShip> {
+fn per_segment_ships(
+    whole: &WholeSegments<'_>,
+    cwd: &str,
+    origins: &mut OriginCache,
+) -> Vec<LocatedShip> {
+    let command = whole.command;
     let mut located = Vec::new();
     let mut dir = cwd.to_string();
     let mut groups: Vec<Group> = Vec::new();
@@ -520,9 +553,9 @@ fn per_segment_ships(command: &str, cwd: &str, origins: &mut OriginCache) -> Vec
                 dir = resolve_cd_target(target, &dir);
             }
         }
-        let origin = origins.for_command(body, &dir);
+        let origin = origins.for_command(&whole.of(body), &dir);
         located.extend(
-            polish_ship_segments_for_origin(&raw, origin.as_deref())
+            polish_ship_segments_in(&whole.of(&raw), origin.as_deref())
                 .into_iter()
                 .map(|segment| LocatedShip {
                     segment,
@@ -687,8 +720,8 @@ impl OriginCache {
         }
     }
 
-    fn for_command(&mut self, command: &str, dir: &str) -> Option<String> {
-        merge_anchor_repo_targets(command)?;
+    fn for_command(&mut self, segments: &[String], dir: &str) -> Option<String> {
+        merge_anchor_repo_targets_in(segments)?;
         if let Some((_, origin)) = self.seen.iter().find(|(seen, _)| seen == dir) {
             return origin.clone();
         }
@@ -3408,7 +3441,11 @@ mod tests {
     /// `(anchor, work_dir)` from the per-segment reading alone.
     fn per_segment(command: &str) -> Vec<(&'static str, String)> {
         let mut origins = OriginCache::new("/cwd".to_string(), None);
-        per_segment_ships(command, "/cwd", &mut origins)
+        let whole = WholeSegments {
+            command,
+            segments: command_segments(command),
+        };
+        per_segment_ships(&whole, "/cwd", &mut origins)
             .into_iter()
             .map(|ship| (ship.segment.anchor, ship.work_dir.unwrap()))
             .collect()
@@ -3643,7 +3680,7 @@ mod tests {
         // Review M1: past the cap a segment used to get no origin at all, so
         // a retargeted merge stopped anchoring. The seed lookup is free.
         let mut origins = OriginCache::new("/w".to_string(), Some("github.com/own/repo".into()));
-        let merge = "gh pr merge -R own/repo";
+        let merge = &command_segments("gh pr merge -R own/repo");
         assert_eq!(
             origins.for_command(merge, "/w").as_deref(),
             Some("github.com/own/repo")
@@ -3659,7 +3696,10 @@ mod tests {
             Some("github.com/own/repo")
         );
         // A command with no retargeted merge never looks.
-        assert_eq!(origins.for_command("gh pr create", "/w"), None);
+        assert_eq!(
+            origins.for_command(&command_segments("gh pr create"), "/w"),
+            None
+        );
     }
 
     #[test]

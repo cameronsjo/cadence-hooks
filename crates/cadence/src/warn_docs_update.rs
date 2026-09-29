@@ -4,6 +4,7 @@
 //! whether code files changed without corresponding documentation updates.
 //! Warns with specific file suggestions.
 
+use cadence_hooks_core::shell::gh_canonical_verb;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::process::Command;
 
@@ -29,15 +30,19 @@ impl Check for WarnDocsUpdate {
             return CheckResult::allow();
         };
 
-        if !command.contains("gh") || !command.contains("pr") || !command.contains("create") {
+        if !command.contains("gh")
+            || !command.contains("pr")
+            || !(command.contains("create") || command.contains("new"))
+        {
             return CheckResult::allow();
         }
 
-        // Verify it's actually `gh pr create`
+        // Verify it's actually `gh pr create` (or its alias `gh pr new`,
+        // cadence-hooks#996)
         let tokens: Vec<&str> = command.split_whitespace().collect();
         let has_pr_create = tokens
             .windows(3)
-            .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "create");
+            .any(|w| w[0] == "gh" && w[1] == "pr" && gh_canonical_verb("pr", w[2]) == "create");
         if !has_pr_create {
             return CheckResult::allow();
         }

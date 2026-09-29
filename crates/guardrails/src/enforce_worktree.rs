@@ -4134,6 +4134,20 @@ fn inchain_dismissed_without_cd(
     env: CdEnv<'_>,
 ) -> HashMap<CommitTarget, Option<String>> {
     let mut dismissed: HashMap<CommitTarget, Option<String>> = HashMap::new();
+    let dismiss_argv = |raw: &str| {
+        let words = command_tokens(&tokenize_marked(strip_group_punctuation(raw)));
+        peel_heads(strip_compound_heads(&words), false).0.to_vec()
+    };
+    // Nothing is dismissed without a dismiss segment, so the directory and
+    // commit walks below — each a full pass over every child script — are
+    // skipped for the commands that carry none (cadence-hooks#1144 review).
+    let segments = split_segments_with_ops(command);
+    if !segments
+        .iter()
+        .any(|(raw, _)| is_dismiss_enforce_segment(&dismiss_argv(raw)))
+    {
+        return dismissed;
+    }
     let mut dirs = vec![cwd.to_string()];
     let mut unresolved = None;
     union_dirs(
@@ -4147,16 +4161,17 @@ fn inchain_dismissed_without_cd(
         return dismissed;
     }
     let mut active: HashMap<CommitTarget, Option<String>> = HashMap::new();
-    for (raw, next_op) in split_segments_with_ops(command) {
+    for (raw, next_op) in segments {
         let segment = strip_group_punctuation(&raw);
-        let words = command_tokens(&tokenize_marked(segment));
-        let argv = peel_heads(strip_compound_heads(&words), false).0;
+        let argv = dismiss_argv(&raw);
+        let argv = argv.as_slice();
         if is_dismiss_enforce_segment(argv) {
             active.insert(
                 dismiss_target_dir(argv, cwd),
                 crate::snooze_meta::normalize_reason(flag_value(argv, "--reason").as_deref()),
             );
-        } else {
+        } else if !active.is_empty() {
+            // Only a commit under an active dismissal is recorded.
             let mut found = Scan::default();
             union_commits(segment, 0, &dirs, (None, None), env, &mut found);
             for target in found.commits {

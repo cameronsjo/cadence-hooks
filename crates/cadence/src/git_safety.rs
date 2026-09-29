@@ -779,6 +779,49 @@ mod tests {
     }
 
     #[test]
+    fn force_push_through_a_wrapper_utility_blocked() {
+        // cadence-hooks#1144: each wrapper runs the push (measured with
+        // canaries); `su -c` was read by prevent-secret-leaks' own scan but
+        // never reached this guard.
+        for command in [
+            "env -S 'git push --force origin main'",
+            "env -S git\\ push\\ --force\\ origin\\ main",
+            "bash <<< 'git push --force origin main'",
+            "script -c 'git push --force origin main' /dev/null",
+            "flock /tmp/l -c 'git push --force origin main'",
+            "flock /tmp/l git push --force origin main",
+            "watch 'git push --force origin main'",
+            "tmux new-session -d 'git push --force origin main'",
+            "tmux send-keys 'git push --force origin main' Enter",
+            "su -c 'git push --force origin main'",
+            "su -c git\\ push\\ --force\\ origin\\ main",
+            "runuser -l me -c 'git push --force origin main'",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in [
+            "watch -n1 git status",
+            "flock /tmp/l make",
+            "script -q -c 'cargo test' /dev/null",
+            "tmux new-session -d 'npm run dev'",
+            "su -c 'git push origin feature-branch'",
+            "ssh host 'git push --force origin main'",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn a_brace_flood_before_a_reset_still_blocks_promptly() {
         // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
         // re-expanded as the guard re-tokenizes every segment, ran guards past
