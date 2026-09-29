@@ -600,10 +600,12 @@ fn has_glob_syntax(token: &str) -> bool {
 /// Three shapes carry no literal stem and still block: any glob directly inside
 /// one of the [`SECRET_STORE_DIRS`] (`~/.ssh/*`), an extglob group, whose
 /// literals this does not read (`@(.env)`), and a dotfile sweep — a
-/// component that opens with an explicit `.` and has no other literal run
-/// (`.*`, `.??*`, `.[e][n][v]`), which is how the dotenv files are reached
-/// without spelling them. Bash's rule that a wildcard never matches a leading
-/// `.` is honoured.
+/// component that opens with an explicit `.` plus at most one more literal
+/// character and has no other literal run of two or more (`.*`, `.??*`,
+/// `.[e][n][v]`, `.e*`, `.n*`), which is how the dotfiles are reached without
+/// spelling them (#1114). `.git*` and `.eslintrc*` open with a longer run and
+/// stay clean. Bash's rule that a wildcard never matches a leading `.` is
+/// honoured.
 fn glob_may_name_secret(token: &str, position: Filename) -> bool {
     let patterns: Vec<Vec<GlobElement>> = token.split('/').map(parse_glob).collect();
     let last = patterns.len() - 1;
@@ -615,7 +617,9 @@ fn glob_may_name_secret(token: &str, position: Filename) -> bool {
     let chunks = literal_chunks(target);
     let dot_sweep = target.first().is_some_and(GlobElement::matches_leading_dot)
         && chunks.iter().skip(1).all(|chunk| chunk.chars().count() < 2)
-        && chunks.first().is_some_and(|first| first == ".");
+        && chunks
+            .first()
+            .is_some_and(|first| first.starts_with('.') && first.chars().count() <= 2);
     // An extglob group's literals are not read, so it carries every stem.
     let opaque = target.contains(&GlobElement::Group);
     if families_at(position).iter().any(|family| {
@@ -1580,6 +1584,15 @@ mod tests {
             ("*credentials*", Unqualified),
             (".??*", Unqualified),
             (".[e][n][v]", Unqualified),
+            // #1114: a dot plus one literal is still a dotfile sweep.
+            (".e*", Unqualified),
+            (".e*", Known),
+            (".E*", Unqualified),
+            (".e?*", Unqualified),
+            ("dir/.e*", Unqualified),
+            (".n*", Known),
+            (".p*", Known),
+            (".g*", Known),
             // #1097 review M1: a negated POSIX class is any character.
             ("id[![:alpha:]]rsa", Unqualified),
             (".[![:upper:]]nv", Unqualified),
@@ -1630,6 +1643,12 @@ mod tests {
             (".*rc", Known),
             (".git*", Known),
             (".eslintrc*", Known),
+            (".git*", Unqualified),
+            (".gi*", Known),
+            // #1114: the dot plus one literal only sweeps a family whose
+            // name it can reach.
+            (".x*", Known),
+            (".c*", Known),
             ("gcloud-*.json", Known),
             ("open*", Known),
             ("{readme,changelog}.md", Known),
