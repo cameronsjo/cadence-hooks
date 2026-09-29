@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.115.0] - 2026-09-29
+
 ### Security
 
 - **`guard-gh-dangerous` reads a nested-substitution flood on an allowance and fails closed when it runs out.** `"$(x " * N + ")" * N` at ~250 KB cost about 0.65 s in release, and a hook past its deadline fails OPEN. The walk now arms `ExpansionWork`; once spent, the command is blocked only when it can spell `gh` and names `delete` (quotes and backslashes dropped, or a `$'…'` word), and allowed otherwise. A `delete` assembled from a substitution's output in a flood that size is not seen (cameronsjo/cadence-hooks#1141)
