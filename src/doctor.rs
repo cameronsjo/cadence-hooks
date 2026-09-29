@@ -600,6 +600,14 @@ fn scan_hooks_json(
                     find_line_number(raw, cmd),
                 ));
 
+                // Check 0b: a command that may block on empty stdin (#616).
+                findings.extend(stdin_hang_findings(
+                    cmd,
+                    plugin,
+                    path,
+                    find_line_number(raw, cmd),
+                ));
+
                 // Check 1: shell-expansion bug (Error).
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
                     findings.push(Finding {
@@ -649,6 +657,88 @@ fn scan_hooks_json(
     }
 
     findings
+}
+
+/// Command words that block reading standard input until it closes.
+const STDIN_READERS: &[&str] = &["cat", "read", "jq"];
+
+/// The first stdin-blocking command word in `command` that nothing feeds, as
+/// a static heuristic (cameronsjo/cadence-hooks#616, option a). NEVER runs the
+/// command. A segment is flagged when it heads its pipeline (no `|` before
+/// it), its command word is `cat`, `read` or `jq`, it carries no stdin
+/// redirect (`<`, `<<`, `<<<`, which includes `</dev/null`), and it names
+/// nothing to read instead: `cat` and `jq` with no file operand (`jq` counts
+/// its first non-option word as the filter, and `-n`/`--null-input` reads
+/// nothing), `read` without `-t` (a timeout), `-N` or `-u` (another fd). A hook is
+/// handed its payload on stdin, so a payload-reading hook is legitimate; the
+/// finding is advisory and names the shape only.
+fn stdin_hang_suspect(command: &str) -> Option<String> {
+    use cadence_hooks_core::shell::{command_word, split_segments_with_ops, tokenize};
+    let mut fed = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        let was_fed = fed;
+        fed = op == Some("|");
+        if was_fed {
+            continue;
+        }
+        let tokens = tokenize(&segment);
+        if tokens
+            .iter()
+            .any(|t| t.starts_with('<') || t.contains("</"))
+            || segment.contains('<')
+        {
+            continue;
+        }
+        let Some(head) = tokens.first() else {
+            continue;
+        };
+        let word = command_word(head);
+        if !STDIN_READERS.contains(&word.as_ref()) {
+            continue;
+        }
+        let args = &tokens[1..];
+        let operands = args.iter().filter(|a| !a.starts_with('-')).count();
+        let hangs = match word.as_ref() {
+            "cat" => operands == 0,
+            "jq" => !args.iter().any(|a| a == "-n" || a == "--null-input") && operands <= 1,
+            _ => !args
+                .iter()
+                .any(|a| a.starts_with("-t") || a == "-N" || a == "-u"),
+        };
+        if hangs {
+            return Some(segment);
+        }
+    }
+    None
+}
+
+/// The advisory for a command hook that may block on empty stdin (#616).
+fn stdin_hang_findings(
+    command: &str,
+    plugin: &str,
+    path: &Path,
+    line: Option<usize>,
+) -> Vec<Finding> {
+    stdin_hang_suspect(command)
+        .map(|segment| Finding {
+            severity: Severity::Warning,
+            blocker: Blocker::No,
+            plugin: plugin.to_string(),
+            file: path.to_path_buf(),
+            line,
+            snippet: segment,
+            diagnosis:
+                "a command hook reads standard input with no input file and no `</dev/null`; \
+                        if the harness ever delivers no stdin, or never closes it, the hook \
+                        hangs the session (static heuristic, nothing was run)"
+                    .to_string(),
+            remediation: "pass an input file or `</dev/null` where the payload is not needed; \
+                          for `read`, add `-t <seconds>`; a hook that consumes its stdin \
+                          payload on purpose can ignore this"
+                .to_string(),
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Claude Code's plugins directory.
@@ -8852,5 +8942,39 @@ mod tests {
         );
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("unavailable"));
+    }
+
+    #[test]
+    fn stdin_hang_heuristic_table() {
+        // (command, flagged) - #616. Static only; nothing is executed.
+        for (cmd, want) in [
+            ("cat", true),
+            ("jq .tool_name", true),
+            ("jq -r '.a'", true),
+            ("read line", true),
+            ("read -r line; echo $line", true),
+            ("cat </dev/null", false),
+            ("cat file.json", false),
+            ("jq .a file.json", false),
+            ("jq -n '{}'", false),
+            ("jq . </dev/null", false),
+            ("read -t 1 line", false),
+            ("read line <<< x", false),
+            ("echo x | jq .a", false),
+            ("echo x | cat", false),
+            ("cadence-hooks cadence guard-foo", false),
+        ] {
+            assert_eq!(stdin_hang_suspect(cmd).is_some(), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn stdin_hang_is_an_advisory_warning_never_a_blocker() {
+        let findings = stdin_hang_findings("cat", "p", Path::new("hooks.json"), Some(3));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].blocker, Blocker::No);
+        assert!(!is_session_start_blocker(&findings[0]));
+        assert!(stdin_hang_findings("cat x", "p", Path::new("h"), None).is_empty());
     }
 }
