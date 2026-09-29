@@ -6095,7 +6095,14 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
         let home = crate::paths::user_home_lossy_or_default();
         target.replacen('~', &home, 1)
     } else {
-        format!("{effective}/{target}")
+        // One exact allocation and two copies: `format!` grew the buffer in
+        // steps, which is most of what a flat scan over a `cd a; …` flood
+        // spent (each join copies the whole path so far).
+        let mut joined = String::with_capacity(effective.len() + 1 + target.len());
+        joined.push_str(effective);
+        joined.push('/');
+        joined.push_str(target);
+        joined
     }
 }
 
@@ -10590,8 +10597,153 @@ fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
+        Some(first) if command_word(first) == "find" => find_exec_scripts(&argv[1..]),
         _ => shell_c_argument_tokens(tokens).into_iter().collect(),
     }
+}
+
+/// `find`'s actions that run a command of their own: `-exec`/`-ok` in find's
+/// directory, `-execdir`/`-okdir` in each match's.
+const FIND_EXEC_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
+
+/// The commands `find … -exec CMD ARG… ;` (and `+`, `-execdir`, `-ok`,
+/// `-okdir`) runs, one script per action. find execs CMD directly, with no
+/// shell, so each word is written back quoted ([`shell_quoted_word`]) and the
+/// script re-reads as exactly those words: `-exec sh -c 'cat .env' \;`
+/// surfaces `sh -c 'cat .env'`, whose own script is surfaced in turn. `{}`
+/// stays the literal word find substitutes. The list ends at a `;` word, or at
+/// a `+` word straight after `{}` — find's only two terminators; an action
+/// with neither runs nothing (find refuses the command), and is surfaced
+/// anyway, which only adds a segment to inspect (cadence-hooks#1161 lane).
+///
+/// A `-execdir`/`-okdir` command runs in each match's directory rather than
+/// the segment's, so a walker that tracks the directory cannot vouch for where
+/// it runs — ask [`runs_in_found_directories`].
+fn find_exec_scripts(operands: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(raw) = operands.get(i) {
+        i += 1;
+        if !FIND_EXEC_ACTIONS.contains(&unescape_word(raw).as_ref()) {
+            continue;
+        }
+        let start = i;
+        let mut end = operands.len();
+        while let Some(word) = operands.get(i) {
+            let word = unescape_word(word);
+            let closes_plus =
+                word == "+" && i > start && unescape_word(&operands[i - 1]).as_ref() == "{}";
+            i += 1;
+            if word == ";" || closes_plus {
+                end = i - 1;
+                break;
+            }
+        }
+        if let Some(script) = quoted_script(&operands[start..end]) {
+            out.push(script);
+        }
+    }
+    out
+}
+
+/// Whether this token view is a `find` with a `-execdir`/`-okdir` action — a
+/// child script [`child_scripts`] returns that runs in each match's directory,
+/// not the segment's. See [`find_exec_scripts`].
+pub fn runs_in_found_directories(tokens: &[String]) -> bool {
+    let argv = peel_command_runners(strip_compound_heads(tokens));
+    argv.first()
+        .is_some_and(|first| command_word(first) == "find")
+        && argv[1..]
+            .iter()
+            .any(|word| matches!(unescape_word(word).as_ref(), "-execdir" | "-okdir"))
+}
+
+/// `word` written so a shell reads it back as that one word: bare when every
+/// character is inert, otherwise single-quoted.
+fn shell_quoted_word(word: &str) -> String {
+    let inert = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !word.is_empty() && word.chars().all(inert) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// Words the shell has already split, as a script that splits back into the
+/// same words: each is unescaped as the shell hands it over, then quoted.
+/// `None` when there are no words.
+fn quoted_script(words: &[String]) -> Option<String> {
+    (!words.is_empty()).then(|| {
+        words
+            .iter()
+            .map(|word| shell_quoted_word(&unescape_word(word)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+/// The command a `git -c alias.NAME=VALUE … NAME ARG…` runs, when the
+/// subcommand is an alias the same command line defines (cadence-hooks#1161).
+/// git expands it before running anything: a VALUE starting with `!` is a shell
+/// command run with ARG… appended; any other VALUE is split into git words
+/// that replace NAME. `git -c alias.p='push --force' p origin main` therefore
+/// runs `git push --force origin main`, which no verb gate saw.
+///
+/// The non-`!` answer keeps git's globals, the `-c alias.*` ones included, so
+/// an alias naming another alias is expanded again one level down (bounded by
+/// the caller's depth). git splits VALUE with its own quoting rules, which the
+/// shell tokenizer approximates; a misread only changes what is inspected.
+///
+/// **Only a `-c` alias is read.** An alias in the repository's or the user's
+/// config file needs a `git config` probe per repository, which this text walk
+/// never spawns — a named design call, not a claimed coverage. A
+/// `--config-env=alias.…` value lives in the environment and is not readable
+/// here either; `push::push_invocations` refuses it.
+fn git_alias_script(operands: &[String]) -> Option<String> {
+    let rest = skip_runner_flags("git", operands)?;
+    let globals = &operands[..operands.len() - rest.len()];
+    let (subcommand, args) = rest.split_first()?;
+    let name = unescape_word(subcommand).to_ascii_lowercase();
+    let value = git_command_line_aliases(globals)
+        .into_iter()
+        .rev()
+        .find_map(|(alias, value)| (alias == name).then_some(value))?;
+    let tail = quoted_script(args).unwrap_or_default();
+    let script = match value.strip_prefix('!') {
+        Some(shell) => format!("{shell} {tail}"),
+        None => {
+            let globals = quoted_script(globals).unwrap_or_default();
+            format!("git {globals} {value} {tail}")
+        }
+    };
+    let script = script.trim().to_string();
+    (!script.is_empty()).then_some(script)
+}
+
+/// Every `-c alias.NAME=VALUE` among git's global options, as
+/// `(lowercased NAME, VALUE)` in command-line order (the last one wins, as in
+/// git). Alias names are config variable names, which git compares
+/// case-insensitively.
+pub fn git_command_line_aliases(globals: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut words = globals.iter();
+    while let Some(word) = words.next() {
+        if unescape_word(word).as_ref() != "-c" {
+            continue;
+        }
+        let Some(setting) = words.next() else {
+            break;
+        };
+        let setting = unescape_word(setting);
+        let Some((key, value)) = setting.split_once('=') else {
+            continue;
+        };
+        let key = key.to_ascii_lowercase();
+        if let Some(name) = key.strip_prefix("alias.") {
+            out.push((name.to_string(), value.to_string()));
+        }
+    }
+    out
 }
 
 /// The command string a utility that is not a shell hands to one, or execs
@@ -10626,6 +10778,7 @@ fn wrapper_utility_script(verb: &str, operands: &[String]) -> Option<String> {
         "flock" => flock_command(operands),
         "watch" => watch_command(operands),
         "su" | "runuser" => su_script(verb, operands),
+        "git" => git_alias_script(operands),
         _ => None,
     }
 }
@@ -11911,6 +12064,22 @@ mod tests {
         // A relative target still joins normally — no regression on the
         // existing POSIX-relative behavior.
         assert_eq!(resolve_cd_target("sub", "/cwd"), "/cwd/sub");
+    }
+
+    #[test]
+    fn apply_cd_target_matches_resolve_cd_target() {
+        for (target, effective) in [
+            ("sub", "/cwd"),
+            ("../x", "/cwd/a"),
+            ("/abs", "/cwd"),
+            ("C:\\other", "C:\\primary"),
+            ("D:/other", "/cwd"),
+            ("~/x", "/cwd"),
+        ] {
+            let mut applied = effective.to_string();
+            apply_cd_target(&mut applied, target);
+            assert_eq!(applied, resolve_cd_target(target, effective), "{target}");
+        }
     }
 
     // --- run_bounded_with (the #271 bounded subprocess runner) ---
@@ -17568,7 +17737,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_cd_target_matches_resolve_cd_target() {
+    fn apply_cd_target_matches_resolve_cd_target_in_the_push_walk() {
         for (target, effective) in [
             ("sub", "/cwd"),
             ("../x", "/cwd/a"),
@@ -18372,6 +18541,88 @@ mod tests {
             segments.iter().any(|s| s.trim() == "cat .env"),
             "{segments:?}"
         );
+    }
+
+    #[test]
+    fn wrapped_scripts_reads_find_actions_and_command_line_git_aliases() {
+        // find execs its command with no shell, so each word comes back
+        // quoted; `{}` stays literal. git expands a `-c alias.*` before it
+        // runs anything. Each row measured under bash 5.2 with findutils 4.9
+        // and git 2.43 (canary files, a local bare repository).
+        for (command, want) in [
+            (
+                r"find . -exec sh -c 'cat .env' \;",
+                vec!["sh -c 'cat .env'"],
+            ),
+            (
+                r"find . -name x -exec git push --force origin main \;",
+                vec!["git push --force origin main"],
+            ),
+            ("find . -exec grep -l foo {} +", vec!["grep -l foo '{}'"]),
+            ("find . -execdir cat .env ';'", vec!["cat .env"]),
+            (r"find . -ok cat .env \;", vec!["cat .env"]),
+            (r"find . -okdir cat\ .env \;", vec!["'cat .env'"]),
+            // `+` closes only straight after `{}`; both actions are read.
+            (
+                r"find . -exec echo + x {} + -exec rm y \;",
+                vec!["echo + x '{}'", "rm y"],
+            ),
+            // No terminator: find refuses and runs nothing; surfaced anyway.
+            ("find . -exec cat .env", vec!["cat .env"]),
+            (r"sudo find / -exec cat .env \;", vec!["cat .env"]),
+            (r"find . -exec echo \'it\' \;", vec![r"echo ''\''it'\'''"]),
+            (
+                "git -c alias.p='push --force' p origin main",
+                vec!["git -c 'alias.p=push --force' push --force origin main"],
+            ),
+            ("git -c 'alias.x=!cat .env' x", vec!["cat .env"]),
+            ("git -c alias.X='!cat .env' x a", vec!["cat .env a"]),
+            (
+                "git -C d -c alias.p=push p",
+                vec!["git -C d -c alias.p=push push"],
+            ),
+            // Controls: nothing runs a command.
+            ("find . -name '*.rs' -print", vec![]),
+            ("find . -type f -delete", vec![]),
+            ("git -c alias.st=status log", vec![]),
+            ("git status", vec![]),
+            ("git -c alias.p=push status", vec![]),
+        ] {
+            assert_eq!(wrapped_scripts(&tokenize(command)), want, "{command:?}");
+        }
+        // Recursion: the script a find action or alias runs is walked in turn.
+        for (command, inner) in [
+            (r"find . -exec sh -c 'cat .env' \;", "cat .env"),
+            (
+                r"find . -exec bash -c 'git push --force origin main' \;",
+                "git push --force origin main",
+            ),
+            ("git -c alias.p=q -c 'alias.q=!cat .env' p", "cat .env"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment.trim() == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runs_in_found_directories_names_only_the_dir_actions() {
+        for (command, want) in [
+            (r"find . -execdir git push origin main \;", true),
+            (r"find . -okdir rm {} \;", true),
+            (r"nice find . -execdir wc -l {} +", true),
+            (r"find . -exec git push origin main \;", false),
+            ("find . -name x", false),
+            ("echo -execdir", false),
+        ] {
+            assert_eq!(
+                runs_in_found_directories(&tokenize(command)),
+                want,
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
