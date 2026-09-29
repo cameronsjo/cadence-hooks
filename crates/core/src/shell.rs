@@ -5123,20 +5123,26 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
         probe.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
     };
     let first = *i;
-    let mut last = first;
-    while last + 1 < lines.len() && continues(lines[last]) {
-        last += 1;
-    }
-    // Joined optimistically, with each line's byte offset recorded, so the
-    // comment check below can look at any prefix without rebuilding it.
+    // The run is discovered and joined LAZILY, only as far as the search below
+    // asks. Finding the whole run up front cost O(rest of the input) per
+    // logical line, so a flood where EVERY line is a commented continuation
+    // (`echo a #;\` ⏎ …, each ending its own logical line) was quadratic: 2 s
+    // at 200 KB in the guards that segment more than once.
     let mut joined = String::new();
-    let mut starts = Vec::with_capacity(last - first + 1);
-    for line in &lines[first..last] {
-        starts.push(joined.len());
-        let probe = line.strip_suffix('\r').unwrap_or(line);
-        joined.push_str(&probe[..probe.len() - 1]); // drop the continuing backslash (and any `\r`)
-    }
-    starts.push(joined.len());
+    let mut starts: Vec<usize> = Vec::new(); // byte offset of line `first + k` in `joined`
+    let mut open = true; // the run may reach further than `starts.len()`
+    let mut grow = |want: usize, joined: &mut String, starts: &mut Vec<usize>| {
+        while open && starts.len() <= want {
+            let k = first + starts.len();
+            if k + 1 < lines.len() && continues(lines[k]) {
+                starts.push(joined.len());
+                let probe = lines[k].strip_suffix('\r').unwrap_or(lines[k]);
+                joined.push_str(&probe[..probe.len() - 1]); // drop the continuing backslash (and any `\r`)
+            } else {
+                open = false;
+            }
+        }
+    };
     // **bash does not continue a comment line.** A comment runs to the
     // newline, so a trailing backslash sitting inside one is comment TEXT,
     // not a continuation — the next line starts a new command. Joining
@@ -5152,8 +5158,9 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
     // whole joined line once per continuation, and a 200 KB run of `<\`
     // lines took seconds — past the hook deadline, which fails open. Having a
     // comment only ever becomes true as the prefix grows, so the first such
-    // line is found by galloping then bisecting: O(n log n).
-    let has_comment = |k: usize| {
+    // line is found by galloping then bisecting: O(L log L) for a logical
+    // line of L physical lines, since the lazy join never runs past twice L.
+    let has_comment = |joined: &str, starts: &[usize], k: usize| {
         let line = lines[first + k];
         let probe = format!(
             "{}{}",
@@ -5162,31 +5169,34 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
         );
         !comment_spans(&probe).is_empty()
     };
-    let run = last - first; // lines that could continue: `0..run`
     let mut clean = 0; // every k below this is known comment-free
     let mut step = 1;
-    let mut ends_at = run;
-    while clean < run {
+    let ends_at = loop {
+        grow(clean + step - 1, &mut joined, &mut starts);
+        let run = starts.len(); // lines that could continue, as far as grown
+        if clean >= run {
+            break run;
+        }
         let probe = (clean + step - 1).min(run - 1);
-        if has_comment(probe) {
+        if has_comment(&joined, &starts, probe) {
             let (mut lo, mut hi) = (clean, probe);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if has_comment(mid) {
+                if has_comment(&joined, &starts, mid) {
                     hi = mid;
                 } else {
                     lo = mid + 1;
                 }
             }
-            ends_at = lo;
-            break;
+            break lo;
         }
         clean = probe + 1;
         step *= 2;
-    }
+    };
+    let run = starts.len();
     *i = first + ends_at + 1;
     if ends_at == run {
-        joined.push_str(lines[last]);
+        joined.push_str(lines[first + run]);
         joined
     } else {
         joined.truncate(starts[ends_at]);
@@ -12412,6 +12422,51 @@ mod tests {
         );
     }
 
+    /// The 200 KB continuation shapes: bare, spaced and commented runs, each
+    /// inside double quotes, a substitution and a heredoc body, and CRLF.
+    fn continuation_flood_shapes() -> Vec<String> {
+        let flood = |unit: &str| unit.repeat(200_000 / unit.len());
+        vec![
+            format!("{}cat .env", flood("a\\\n")),
+            format!("{}cat .env", flood("a \\\n")),
+            format!("{}cat .env", flood("echo a #;\\\n")),
+            format!("echo \"{}\" ; cat .env", flood("a\\\n")),
+            format!("echo $({}) ; cat .env", flood("a\\\n")),
+            format!("cat <<EOF\n{}EOF\ncat .env", flood("a\\\n")),
+            format!("{}cat .env", flood("a\\\r\n")),
+            format!("{}cat .env", flood("a \\\r\n")),
+            format!("{}cat .env", flood("echo a #;\\\r\n")),
+        ]
+    }
+
+    #[test]
+    fn commented_continuation_floods_stay_fast() {
+        // Every line of `echo a #;\` ⏎ … is its own logical line (bash does
+        // not continue a comment), but `take_logical_line` found and joined
+        // the WHOLE remaining continuation run before asking where the line
+        // ended — O(rest of input) per line, so 2 s at 200 KB in
+        // guard-gh-dangerous, which reads `logical_lines` over the whole
+        // command. The run is joined lazily now.
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
+        for input in continuation_flood_shapes() {
+            let started = std::time::Instant::now();
+            let lines = logical_lines(&input);
+            let segs = command_segments(&input);
+            let stripped = strip_heredoc_bodies(&input);
+            let took = started.elapsed();
+            assert!(!lines.is_empty() && !segs.is_empty() && !stripped.is_empty());
+            assert!(took < limit, "{:?}: {took:?}", &input[..12]);
+        }
+        // The commented shapes still end every logical line at its comment,
+        // so the command after the run is its own line.
+        for unit in ["echo a #;\\\n", "echo a #;\\\r\n"] {
+            let lines = logical_lines(&format!("{}cat .env", unit.repeat(18_000)));
+            assert_eq!(lines.len(), 18_001, "{unit:?}");
+            assert_eq!(lines.last().map(String::as_str), Some("cat .env"));
+        }
+    }
+
     #[test]
     fn take_logical_line_does_not_continue_a_comment() {
         // bash does not continue a COMMENT line: the trailing backslash is
@@ -12484,6 +12539,31 @@ mod tests {
                 let fast = take_logical_line(&lines, &mut i);
                 let slow = take_logical_line_rescanning(&lines, &mut j);
                 assert_eq!((fast, i), (slow, j), "{command:?}");
+            }
+        }
+        // Every run of up to five lines drawn from continuing, commented,
+        // quoted, escaped and CRLF pieces: the lazy join must end each
+        // logical line exactly where the reference does, wherever in the
+        // gallop the comment first appears.
+        let pieces = [
+            "a\\", "a #\\", "#;\\", "'\\", "\\\\", "x", "a\\\r", "#\\\r", "",
+        ];
+        let mut stack = vec![Vec::<&str>::new()];
+        while let Some(run) = stack.pop() {
+            let command = run.join("\n");
+            let lines: Vec<&str> = command.split('\n').collect();
+            let (mut i, mut j) = (0, 0);
+            while i < lines.len() {
+                let fast = take_logical_line(&lines, &mut i);
+                let slow = take_logical_line_rescanning(&lines, &mut j);
+                assert_eq!((fast, i), (slow, j), "{command:?}");
+            }
+            if run.len() < 5 {
+                for piece in pieces {
+                    let mut next = run.clone();
+                    next.push(piece);
+                    stack.push(next);
+                }
             }
         }
     }
