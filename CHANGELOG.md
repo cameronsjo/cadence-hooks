@@ -9,16 +9,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 
 - **`prevent-secret-writes` judges the file operands of an in-place `sed` or `perl` as write targets.** `sed -i d .env`, `sed -ni`, `sed --in-place=.bak`, `gsed -i "" d .env` and `perl -pi -e … .env` rewrote a secret file and were allowed; the script operand (first positional unless `-e`/`-f` supplies it) is skipped and each remaining operand is judged like a redirect target. (cameronsjo/cadence-hooks#1165)
+- **`GitState::resolve` fails closed on a forged `gitdir:` or `commondir:`.** Both are plain text under whoever controls the directory; the walk now returns unresolved unless each target is a directory holding a `HEAD` file, which guards already read as unknown. The metrics `repo` field uses the result as a display label only, and the docs now say so. (cameronsjo/cadence-hooks#670)
+- **`prevent-secret-leaks` documents that a repo's own `.git/config` can make read-only git commands run programs.** `diff.external`, textconv and `core.fsmonitor` are accepted, not fixed: a clone cannot ship `.git/config`, so exploiting it already needs local write access. No behavior change. (cameronsjo/cadence-hooks#1157)
 
 ### Changed
 
 - **The Bash block message for a `.envrc` write says a pure-loader `.envrc` can be written with the Write tool.** The Bash write keeps blocking, per the #248 ruling; the Write and Edit path already allows a pure-loader `.envrc` (#149), which is also what #533 asked for. (cameronsjo/cadence-hooks#248)
 - **The per-segment directory walk treats a `CDPATH`-searched `cd` as unresolvable.** A relative `cd sub` (or `pushd sub`) with `CDPATH` set lands in the first match on the path, not in `./sub`, so `guard-gh-write` judged `cd sub; gh pr create` in a directory the shell never entered. A relative target that is not `.`, `..`, `./…` or `../…` now adds an unresolvable directory, which `guard-gh-write` blocks on, when `CDPATH` is non-empty in the hook's environment or named anywhere in the command (`CDPATH=…`, `export CDPATH=…`); with it unset, nothing changes. `source FILE` / `. FILE` and shell aliases are deliberately not followed: activation scripts are common and benign. (cameronsjo/cadence-hooks#1171)
 - **`guard-gh-write` reads a variable command word as the `gh` the command assigned it.** `G=gh; $G pr create -t x`, `"$G"`, `${G}`, `export G=gh` and `G=/usr/bin/gh` ran a gh write the guard never recognized as one. When the same command assigns the variable a literal `gh`, the segment is now judged as `gh …`; a variable assigned something unreadable, or never assigned, is left as before (an accepted gap). (cameronsjo/cadence-hooks#1171)
+- **`warn-alias-parsing` no longer treats `find` as an aliased tool.** The usual replacement, `bfs`, is find-compatible, so the nudge only asked for rewrites of commands that already work. `cat`, `ls`, `du`, `df` and `top` are unchanged. (cameronsjo/cadence-hooks#1033)
+- **`log_timing` takes an optional namespace and omits the `plugin` field when it is absent.** This replaces the `"unknown"` and `"metrics"` sentinels in `hooks.jsonl`, which read as real plugin names. (cameronsjo/cadence-hooks#950)
+- **The session registry drops `SessionRecord.name` and the legacy `<name>.<short-id>.json` filename match.** Only `<session-id>.json` is recognised as a session's own file; records that still carry a `name` key keep parsing. Removal gate (no `<= 0.97.0` binary on any machine) is a machine check this change did not perform. (cameronsjo/cadence-hooks#899)
 
 ### Fixed
 
 - **`warn-going-public` now sees `gh repo rename`, `\gh`, `sudo`/`env -i`/`env -u` wrappers and `gh repo create -- <name>`.** A rename scans the new name for the same terms on any visibility (it makes no network call to learn whether the repo is public), the head is read through core's `command_word` and `peel_command_runners` (the local duplicate is removed), and the repo name is the first non-flag operand (value flags like `-d`/`-R` skip their value, an unknown flag skips alone, and the token after `--` is the name). `enforce-worktree` no longer reads `$$'` as an ANSI-C `$'` opener (bash: the PID, then a plain quote); commits to a primary checkout still block in those spellings. (cameronsjo/cadence-hooks#1171)
+
+### Added
+
+- **The SessionStart enforcement-status report names every armed allow-switch present in the environment.** `CADENCE_ALLOW_SENSITIVE_TERMS`, `CADENCE_ALLOW_MAIN`, `CADENCE_NO_ENFORCE_WORKTREE`, `CADENCE_BYPASS`, `CADENCE_DISABLE` (value shown only when it is a plain hook-name list), `CADENCE_MARKER_DIR` and `CADENCE_METRICS_DIR`, so a value a repo set in its settings is loud. A nudge line only; `CADENCE_BYPASS` keeps its semantics. (cameronsjo/cadence-hooks#963, cameronsjo/cadence-hooks#960)
+- **`guard-sops-decrypt` accepts an opt-in per-repo list of vouched consumer scripts.** A checked-in `.cadence/sops-consumers` lists repo-relative script paths, matched as exact strings and never globs; no file means no change. The block message now says the allowlist is exact-literal and points to the operator's own terminal for anything else. (cameronsjo/cadence-hooks#983)
+- **`lint-plan-shape` rejects a trivial `Panel: none` reason.** Empty, `n/a`, `na`, `none`, `-`, `.` and `tbd` (trimmed, case-insensitive) no longer settle the Panel line; any real reason still does. (cameronsjo/cadence-hooks#761)
+- **`inject-gh-write-context` nudges on a bare `#N` in a body posted with `-R <other-repo>`.** A bare ref resolves against the target repo, so it suggests `owner/repo#N`. Local only: no network, and silent when the origin remote cannot be read. (cameronsjo/cadence-hooks#150)
 
 ## [0.113.0] - 2026-09-29
 

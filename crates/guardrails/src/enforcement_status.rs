@@ -355,7 +355,12 @@ mod tests {
     /// cameronsjo/cadence-hooks#963/#960: every armed switch is named.
     #[test]
     fn armed_switches_are_named_and_only_present_ones() {
-        let table: &[(&[(&str, &str)], &[&str], &[&str])] = &[
+        type Case = (
+            &'static [(&'static str, &'static str)],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let table: &[Case] = &[
             (&[], &[], &["CADENCE_"]),
             (
                 &[("CADENCE_ALLOW_MAIN", "true")],
