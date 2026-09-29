@@ -1257,6 +1257,60 @@ fn telemetry_finding(
     })
 }
 
+/// Size at which a single `<metrics_dir>/*.jsonl` ledger earns a doctor
+/// warning (cadence-hooks#425). The ledgers are append-only with no cap or
+/// rotation; at a few hundred bytes a row this is hundreds of thousands of
+/// rows, far past what any reader of them needs in one file.
+const LEDGER_SIZE_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One `Warning` per `<metrics_dir>/*.jsonl` ledger at or above `threshold`
+/// bytes — the size half of #425. Nothing is deleted or rewritten: the
+/// remediation is a documented archive-and-restart (`mv` the file aside; the
+/// next append recreates it, owner-only). A rename is safe under concurrent
+/// writers, since each append opens the path fresh and an in-flight write
+/// lands in the archived file. Missing or unreadable dir: no findings
+/// (fail-open, like the other telemetry reads).
+fn ledger_size_findings(dir: &Path, threshold: u64) -> Vec<Finding> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut large: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let meta = entry.metadata().ok()?;
+            (name.ends_with(".jsonl") && meta.is_file() && meta.len() >= threshold)
+                .then_some((name, meta.len()))
+        })
+        .collect();
+    large.sort();
+    large
+        .into_iter()
+        .map(|(name, len)| {
+            let path = dir.join(&name);
+            let quoted = shell_single_quote(&path.display().to_string());
+            let archived = shell_single_quote(&format!("{}.archived", path.display()));
+            Finding {
+                severity: Severity::Warning,
+                blocker: Blocker::No,
+                plugin: "cadence-metrics".to_string(),
+                file: path,
+                line: None,
+                snippet: name,
+                diagnosis: format!(
+                    "metrics ledger is {} MiB; ledgers are append-only with no rotation",
+                    len / (1024 * 1024)
+                ),
+                remediation: format!(
+                    "archive it and let the next write start a fresh one: \
+                     `mv {quoted} {archived}` (delete or compress the archive \
+                     once nothing reads it)"
+                ),
+            }
+        })
+        .collect()
+}
+
 /// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one
 /// `reason`. Replaces the bare "inspect failopen.jsonl" guidance, which named a
 /// file but not a way to read it (cameronsjo/cadence-hooks#398).
@@ -3772,6 +3826,7 @@ pub fn run(
             window,
             now,
         ));
+        findings.extend(ledger_size_findings(&metrics_dir, LEDGER_SIZE_WARN_BYTES));
         // Names the CAUSE the deadline finding above can only tell the operator
         // to go looking for (#278). Gated with the other live-machine reads:
         // under `--root` these would report the dev machine's real dirs, not
@@ -4076,6 +4131,37 @@ mod tests {
             "remediation frames the compare-wiring fix: {}",
             f.remediation
         );
+    }
+
+    #[test]
+    fn ledger_size_findings_warns_only_on_large_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = fs::File::create(tmp.path().join("denials.jsonl")).unwrap();
+        big.set_len(2048).unwrap();
+        fs::write(tmp.path().join("hooks.jsonl"), "{}\n").unwrap();
+        // A non-ledger file over the threshold is not a ledger.
+        fs::File::create(tmp.path().join("notes.txt"))
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+
+        let findings = ledger_size_findings(tmp.path(), 1024);
+        assert_eq!(findings.len(), 1, "only the large ledger");
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.snippet, "denials.jsonl");
+        assert!(f.remediation.contains("mv '"), "{}", f.remediation);
+        assert!(
+            f.remediation.contains("denials.jsonl.archived"),
+            "{}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn ledger_size_findings_missing_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(ledger_size_findings(&tmp.path().join("absent"), 1).is_empty());
     }
 
     #[test]

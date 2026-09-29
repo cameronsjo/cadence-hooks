@@ -11,7 +11,10 @@
 //!   per session to tick the plan. cadence-rules § Plan Execution asks for
 //!   ticks "as work lands" — not on every commit — so the guard tolerates a
 //!   three-commit gap and fires at most once per session (friction canon:
-//!   spend friction only where it is load-bearing).
+//!   spend friction only where it is load-bearing). Because it lands after
+//!   the work commit, the copy names `git commit --amend` for an unpushed
+//!   commit, so the tick can join it rather than ride a follow-up
+//!   (cameronsjo/cadence-hooks#691).
 //! - **`warn-plan-ready-flip` (PreToolUse:Bash).** `gh pr ready` / `gh pr
 //!   merge` while the branch's plan still reads `status: in-flight` or
 //!   carries unticked checkboxes ⇒ warn. The PR-ready flip is one of the
@@ -272,8 +275,9 @@ pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
     CheckResult::nudge(format!(
         "living plan untouched: the last commits didn't tick {rel} — tick completed boxes and \
          bump its updated:/next: (the commit that lands work is the commit that touches the \
-         plan; cadence-rules § Plan Execution). Once per session; already-reconciled plans \
-         never see this."
+         plan; cadence-rules § Plan Execution). If the commit that just landed is unpushed, \
+         `git commit --amend` folds the tick into it instead of a follow-up commit. Once per \
+         session; already-reconciled plans never see this."
     ))
 }
 
@@ -712,6 +716,9 @@ mod tests {
         assert_eq!(r.outcome, cadence_hooks_core::Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("2026-08-11-guards.md"));
+        // cadence-hooks#691: the nudge lands after the work commit, so it
+        // names the escape that lets the tick join that commit.
+        assert!(msg.contains("`git commit --amend` folds the tick into it"));
 
         // Second qualifying commit in the same session: marker holds, silent.
         let r2 = run_nudge_plan_tick(&input);

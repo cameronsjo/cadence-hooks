@@ -29,9 +29,11 @@
 //! opened, and each file's read is capped to [`PLAN_SCAN_READ_CAP_BYTES`].
 //! The rendered SessionStart line is fixed-size by construction — a count
 //! and a command ([`render_pointer`]), never a list — so the disclosure's
-//! size no longer depends on the corpus at all. The uncapped per-plan list
+//! size no longer depends on the corpus at all. When the file cap cut the
+//! candidate list, the pointer says "at least N". The per-plan list
 //! ([`render_block`]) is reached only through `cadence-hooks session plans`,
-//! which an operator runs on purpose.
+//! which an operator runs on purpose, and that command scans every file with
+//! no cap on their number ([`plans_report`]).
 //!
 //! **Every interpolated field is sanitized at render time** — the frontmatter
 //! (`next`/`branch`/`pr`) and the filename-derived slug all originate from a
@@ -42,9 +44,14 @@
 //! before it reaches the disclosure string, so a crafted plan doc can't
 //! inject multi-line instruction blocks into a resuming session's context.
 //!
-//! Fails open throughout (ADR-0001): an unreadable directory, an unreadable
-//! file, or a malformed frontmatter block is skipped, never surfaced as an
-//! error — a bug here must not break `session start`.
+//! The hook-facing scans fail open (ADR-0001): an unreadable directory, an
+//! unreadable file, or a malformed frontmatter block is skipped, never
+//! surfaced as an error — a bug here must not break `session start`.
+//! [`plans_report`] is the exception, because a reader who asked for the full
+//! list must be told when it is not full (cameronsjo/cadence-hooks#968): it
+//! reports every listing, metadata and read failure alongside what it found.
+//! A malformed or absent frontmatter block is still a skip there, not an
+//! error — that is the opt-out, not a failed read.
 //!
 //! **Second responsibility — the plan-shape detectors.** This module also
 //! hosts the ONE implementation of the plan template's mandatory-stanza
@@ -311,7 +318,7 @@ fn orchestrator_driver_present(body: &str) -> bool {
 /// unreadable directory (fail-open).
 pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
     let plans_dir = repo_root.join("docs").join("plans");
-    let Some(paths) = list_markdown_files(&plans_dir) else {
+    let Some((paths, _capped)) = list_markdown_files(&plans_dir) else {
         return Vec::new();
     };
     paths
@@ -333,16 +340,15 @@ pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
         .collect()
 }
 
-/// Every matching plan as `(slug, facts)`, in `list_markdown_files` order —
-/// the one scan both tiers read, so the pointer's counts and the report's
-/// lines can never describe different corpora. Empty on a missing or
-/// unreadable directory (fail-open).
-fn matching_plans(repo_root: &Path) -> Vec<(String, PlanFacts)> {
+/// Every matching plan as `(slug, facts)` among the capped candidates, in
+/// `list_markdown_files` order, and whether the file cap dropped any
+/// candidate. Empty on a missing or unreadable directory (fail-open).
+fn matching_plans(repo_root: &Path) -> (Vec<(String, PlanFacts)>, bool) {
     let plans_dir = repo_root.join("docs").join("plans");
-    let Some(paths) = list_markdown_files(&plans_dir) else {
-        return Vec::new();
+    let Some((paths, capped)) = list_markdown_files(&plans_dir) else {
+        return (Vec::new(), false);
     };
-    paths
+    let matches = paths
         .iter()
         .filter_map(|path| {
             let slug = path.file_stem()?.to_str()?.to_string();
@@ -350,7 +356,119 @@ fn matching_plans(repo_root: &Path) -> Vec<(String, PlanFacts)> {
             let facts = parse_frontmatter_facts(&content)?;
             matches_in_flight_or_blocked(&facts.status).then_some((slug, facts))
         })
-        .collect()
+        .collect();
+    (matches, capped)
+}
+
+/// What the uncapped `session plans` scan found ([`plans_report`]).
+#[derive(Debug, Default)]
+pub struct PlansReport {
+    /// The tier-2 report, or `None` when no plan read is in flight or blocked.
+    pub report: Option<String>,
+    /// One line per entry the scan could not list, stat or read, each naming
+    /// the path (sanitized) and the error. Non-empty means `report` may be
+    /// missing plans. Empty when `docs/plans/` does not exist: an absent
+    /// directory is an answer, not a failure.
+    pub problems: Vec<String>,
+}
+
+/// Longest rendered path in a [`PlansReport::problems`] line.
+const PROBLEM_PATH_MAX_DISPLAY: usize = 240;
+
+fn problem(path: &Path, err: &dyn std::fmt::Display) -> String {
+    let path = identity::sanitize_field(&path.display().to_string(), PROBLEM_PATH_MAX_DISPLAY);
+    let err = identity::sanitize_field(&err.to_string(), identity::MAX_FIELD_DISPLAY);
+    format!("{path}: {err}")
+}
+
+/// The **tier-2** scan `cadence-hooks session plans` runs: every `.md` file
+/// directly in `<repo_root>/docs/plans/`, with no cap on how many, and every
+/// failure reported rather than skipped (cameronsjo/cadence-hooks#968). The
+/// SessionStart pointer keeps the capped, silent scan; a command a reader runs
+/// on purpose to get the whole list must not come back short without saying so.
+///
+/// Symlinked and non-regular `.md` entries are still skipped without a
+/// problem line: that is the scan's containment rule, not a failure. Each
+/// file's read is still capped at [`PLAN_SCAN_READ_CAP_BYTES`].
+///
+/// `pub` because `main.rs` dispatches the subcommand across the crate boundary.
+pub fn plans_report(repo_root: &Path) -> PlansReport {
+    plans_report_with(&repo_root.join("docs").join("plans"), &read_capped_strict)
+}
+
+/// [`plans_report`] over `plans_dir` with the file reader injected, so a read
+/// failure is testable when the suite runs as root (which reads a mode-000
+/// file without complaint).
+fn plans_report_with(
+    plans_dir: &Path,
+    read: &dyn Fn(&Path) -> std::io::Result<Option<String>>,
+) -> PlansReport {
+    let mut problems = Vec::new();
+    let entries = match fs::read_dir(plans_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PlansReport::default(),
+        Err(e) => {
+            return PlansReport {
+                report: None,
+                problems: vec![problem(plans_dir, &e)],
+            };
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                problems.push(problem(plans_dir, &e));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => continue,
+            Ok(_) => paths.push(path),
+            Err(e) => problems.push(problem(&path, &e)),
+        }
+    }
+    paths.sort();
+
+    let mut matches = Vec::new();
+    for path in paths {
+        let content = match read(&path) {
+            Ok(Some(content)) => content,
+            // Empty, or not UTF-8 from byte 0: no frontmatter to read.
+            Ok(None) => continue,
+            Err(e) => {
+                problems.push(problem(&path, &e));
+                continue;
+            }
+        };
+        let Some(facts) = parse_frontmatter_facts(&content) else {
+            continue;
+        };
+        if !matches_in_flight_or_blocked(&facts.status) {
+            continue;
+        }
+        // Lossy, not `to_str()?`: a non-UTF-8 name must not drop a plan
+        // from the list that claims to be complete.
+        let slug = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        matches.push((slug, facts));
+    }
+
+    let report = (!matches.is_empty()).then(|| {
+        let lines: Vec<String> = matches
+            .iter()
+            .map(|(slug, facts)| render_plan_line(slug, facts))
+            .collect();
+        render_block(&lines)
+    });
+    PlansReport { report, problems }
 }
 
 /// Scan `<repo_root>/docs/plans/*.md` and render the **tier-1** SessionStart
@@ -362,7 +480,7 @@ fn matching_plans(repo_root: &Path) -> Vec<(String, PlanFacts)> {
 /// ([`crate::start`], [`crate::plan_guards`]) — unlike the `Check`/`Logger`
 /// types `main.rs` dispatches across the crate boundary.
 pub(crate) fn scan_in_flight_plans(repo_root: &Path) -> Option<String> {
-    let matches = matching_plans(repo_root);
+    let (matches, capped) = matching_plans(repo_root);
     if matches.is_empty() {
         return None;
     }
@@ -370,32 +488,14 @@ pub(crate) fn scan_in_flight_plans(repo_root: &Path) -> Option<String> {
         .iter()
         .filter(|(_, facts)| facts.status == "blocked")
         .count();
-    Some(render_pointer(matches.len(), blocked))
-}
-
-/// The **tier-2** report `cadence-hooks session plans` prints: one line per
-/// in-flight or blocked plan, uncapped, with the same fields the SessionStart
-/// block carried before it became a pointer. `None` on the same "nothing in
-/// flight" answer [`scan_in_flight_plans`] goes silent for; the CLI turns that
-/// into its own sentence naming the scanned directory.
-///
-/// `pub` because `main.rs` dispatches the subcommand across the crate boundary.
-pub fn render_plans_report(repo_root: &Path) -> Option<String> {
-    let matches = matching_plans(repo_root);
-    if matches.is_empty() {
-        return None;
-    }
-    let lines: Vec<String> = matches
-        .iter()
-        .map(|(slug, facts)| render_plan_line(slug, facts))
-        .collect();
-    Some(render_block(&lines))
+    Some(render_pointer(matches.len(), blocked, capped))
 }
 
 /// `.md` files directly inside `dir`, bounded and ordered by
-/// [`select_candidates`]. `None` when `dir` doesn't exist or can't be listed
-/// — fails open rather than surfacing an I/O error.
-fn list_markdown_files(dir: &Path) -> Option<Vec<PathBuf>> {
+/// [`select_candidates`], and whether the bound dropped any. `None` when `dir`
+/// doesn't exist or can't be listed — fails open rather than surfacing an I/O
+/// error.
+fn list_markdown_files(dir: &Path) -> Option<(Vec<PathBuf>, bool)> {
     let entries = fs::read_dir(dir).ok()?;
     let candidates: Vec<(SystemTime, PathBuf)> = entries
         .filter_map(|e| e.ok())
@@ -417,7 +517,8 @@ fn list_markdown_files(dir: &Path) -> Option<Vec<PathBuf>> {
             Some((mtime, path))
         })
         .collect();
-    Some(select_candidates(candidates))
+    let capped = candidates.len() > PLAN_SCAN_MAX_FILES;
+    Some((select_candidates(candidates), capped))
 }
 
 /// Bound and order scan candidates: the newest [`PLAN_SCAN_MAX_FILES`] by
@@ -445,13 +546,17 @@ fn select_candidates(mut candidates: Vec<(SystemTime, PathBuf)>) -> Vec<PathBuf>
 /// body content. [`longest_utf8_prefix`] keeps everything up to the tear
 /// instead.
 fn read_capped(path: &Path) -> Option<String> {
+    read_capped_strict(path).ok().flatten()
+}
+
+/// [`read_capped`] with the I/O error kept: `Err` when the file could not be
+/// opened or read, `Ok(None)` when it read but holds no valid UTF-8 prefix.
+fn read_capped_strict(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read as _;
-    let file = fs::File::open(path).ok()?;
+    let file = fs::File::open(path)?;
     let mut buf = Vec::new();
-    file.take(PLAN_SCAN_READ_CAP_BYTES)
-        .read_to_end(&mut buf)
-        .ok()?;
-    longest_utf8_prefix(&buf)
+    file.take(PLAN_SCAN_READ_CAP_BYTES).read_to_end(&mut buf)?;
+    Ok(longest_utf8_prefix(&buf))
 }
 
 /// The longest valid-UTF-8 prefix of `buf`, or `None` when no valid prefix
@@ -624,15 +729,19 @@ fn render_block(lines: &[String]) -> String {
 /// `[blocked]` in a rendered line: a plan whose `next:` prose merely mentions
 /// the word would otherwise be counted as blocked, and the rendered text is
 /// the wrong place to re-derive a fact the scan already holds.
-fn render_pointer(total: usize, blocked: usize) -> String {
+///
+/// `capped` means the file cap dropped older candidates, so both counts are
+/// lower bounds and the line says "at least" (cameronsjo/cadence-hooks#968).
+fn render_pointer(total: usize, blocked: usize, capped: bool) -> String {
     let plural = if total == 1 { "" } else { "s" };
+    let at_least = if capped { "At least " } else { "" };
     let blocked_note = if blocked > 0 {
         format!(" ({blocked} blocked)")
     } else {
         String::new()
     };
     format!(
-        "{total} in-flight plan{plural} in docs/plans/{blocked_note}. Run \
+        "{at_least}{total} in-flight plan{plural} in docs/plans/{blocked_note}. Run \
          `cadence-hooks session plans` before your first edit in this repo; it lists each \
          plan's next step, branch, and PR. Tick the plan in the commit that lands the work."
     )
@@ -850,6 +959,150 @@ mod tests {
 
     fn write_plan(dir: &Path, name: &str, content: &str) {
         fs::write(dir.join(name), content).unwrap();
+    }
+
+    // --- plans_report: the uncapped, error-aware tier-2 scan (#968) ---
+
+    /// 60 plan files, the OLDEST by mtime `status: blocked`: past the hook's
+    /// newest-50 cap, so the capped scan cannot see it.
+    fn sixty_plans_oldest_blocked(tmp: &TempDir) {
+        let dir = plans_dir(tmp);
+        let now = SystemTime::now();
+        for i in 0..60u64 {
+            let (name, body) = if i == 59 {
+                (
+                    "2026-01-01-old-blocked.md".to_string(),
+                    "---\nstatus: blocked\nnext: \"unblock me\"\n---\n",
+                )
+            } else {
+                (
+                    format!("2026-09-01-plan-{i:02}.md"),
+                    "---\nstatus: in-flight\n---\n",
+                )
+            };
+            write_plan(&dir, &name, body);
+            let file = fs::File::options()
+                .write(true)
+                .open(dir.join(&name))
+                .unwrap();
+            file.set_modified(now - std::time::Duration::from_secs(60 * (i + 1)))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn plans_report_lists_a_blocked_plan_past_the_hook_file_cap() {
+        let tmp = TempDir::new().unwrap();
+        sixty_plans_oldest_blocked(&tmp);
+
+        // Control: the capped scan the hook uses cannot see it.
+        let (capped_matches, capped) = matching_plans(tmp.path());
+        assert!(capped, "60 files exceed the cap");
+        assert!(
+            !capped_matches
+                .iter()
+                .any(|(slug, _)| slug.contains("old-blocked")),
+            "the capped scan drops the oldest file"
+        );
+
+        let scan = plans_report(tmp.path());
+        assert!(scan.problems.is_empty(), "{:?}", scan.problems);
+        let report = scan.report.expect("plans in flight");
+        assert!(report.starts_with("60 in-flight plans"), "{report}");
+        assert!(
+            report.contains("2026-01-01-old-blocked") && report.contains("[blocked]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn capped_pointer_says_at_least() {
+        let tmp = TempDir::new().unwrap();
+        sixty_plans_oldest_blocked(&tmp);
+        let line = scan_in_flight_plans(tmp.path()).expect("pointer");
+        assert!(
+            line.starts_with(&format!("At least {PLAN_SCAN_MAX_FILES} in-flight plans")),
+            "{line}"
+        );
+        assert!(render_pointer(3, 0, true).starts_with("At least 3 in-flight plans"));
+        assert!(render_pointer(3, 0, false).starts_with("3 in-flight plans"));
+    }
+
+    #[test]
+    fn plans_report_names_a_file_it_could_not_read() {
+        let tmp = TempDir::new().unwrap();
+        let dir = plans_dir(&tmp);
+        write_plan(&dir, "2026-09-01-good.md", "---\nstatus: in-flight\n---\n");
+        write_plan(&dir, "2026-09-02-bad.md", "---\nstatus: blocked\n---\n");
+        let read = |path: &Path| {
+            if path.ends_with("2026-09-02-bad.md") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            } else {
+                read_capped_strict(path)
+            }
+        };
+        let scan = plans_report_with(&dir, &read);
+        assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
+        assert!(
+            scan.problems[0].contains("2026-09-02-bad.md"),
+            "{:?}",
+            scan.problems
+        );
+        assert!(scan.problems[0].contains("denied"), "{:?}", scan.problems);
+        let report = scan.report.expect("the readable plan still lists");
+        assert!(report.contains("2026-09-01-good"), "{report}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plans_report_names_a_mode_000_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = plans_dir(&tmp);
+        write_plan(&dir, "2026-09-02-locked.md", "---\nstatus: blocked\n---\n");
+        let locked = dir.join("2026-09-02-locked.md");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&locked).is_ok() {
+            // Running as root: the file is readable, so there is nothing to
+            // report. `plans_report_names_a_file_it_could_not_read` covers the
+            // reporting path with an injected reader.
+            return;
+        }
+        let scan = plans_report(tmp.path());
+        assert!(
+            scan.problems
+                .iter()
+                .any(|p| p.contains("2026-09-02-locked.md")),
+            "{:?}",
+            scan.problems
+        );
+    }
+
+    #[test]
+    fn plans_report_is_clean_when_the_directory_is_absent() {
+        let tmp = TempDir::new().unwrap();
+        let scan = plans_report(tmp.path());
+        assert!(scan.report.is_none());
+        assert!(
+            scan.problems.is_empty(),
+            "absent is an answer, not a failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plans_report_names_a_directory_it_could_not_list() {
+        let tmp = TempDir::new().unwrap();
+        // A regular file where the directory should be: `read_dir` fails with
+        // something other than NotFound, as root or not.
+        fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        fs::write(tmp.path().join("docs").join("plans"), "not a dir").unwrap();
+        let scan = plans_report(tmp.path());
+        assert_eq!(scan.problems.len(), 1, "{:?}", scan.problems);
+        assert!(scan.problems[0].contains("plans"), "{:?}", scan.problems);
     }
 
     // --- parse_frontmatter_facts: the opt-out proof (Design 3) ---
@@ -1100,7 +1353,7 @@ mod tests {
     #[test]
     fn render_pointer_names_the_counts_and_the_tier_two_command() {
         assert_eq!(
-            render_pointer(10, 2),
+            render_pointer(10, 2, false),
             "10 in-flight plans in docs/plans/ (2 blocked). Run `cadence-hooks session plans` \
              before your first edit in this repo; it lists each plan's next step, branch, and \
              PR. Tick the plan in the commit that lands the work."
@@ -1109,7 +1362,7 @@ mod tests {
 
     #[test]
     fn render_pointer_omits_the_blocked_parenthetical_at_zero() {
-        let line = render_pointer(1, 0);
+        let line = render_pointer(1, 0, false);
         assert!(
             line.starts_with("1 in-flight plan in docs/plans/. Run "),
             "{line}"
@@ -1121,7 +1374,7 @@ mod tests {
     fn render_pointer_is_one_line() {
         // It lands in SessionStart `additionalContext` beside other blocks; a
         // second line would read as a separate disclosure.
-        assert_eq!(render_pointer(10, 2).lines().count(), 1);
+        assert_eq!(render_pointer(10, 2, false).lines().count(), 1);
     }
 
     // --- longest_utf8_prefix / read_capped: torn-UTF-8 at the byte cap ---
@@ -1158,8 +1411,9 @@ mod tests {
             "fixture must exceed the read cap for this test to be meaningful"
         );
         write_plan(&dir, "2026-07-25-torn-utf8.md", &doc);
-        let report =
-            render_plans_report(tmp.path()).expect("plan still surfaces despite torn UTF-8");
+        let report = plans_report(tmp.path())
+            .report
+            .expect("plan still surfaces despite torn UTF-8");
         assert!(report.contains("2026-07-25-torn-utf8"));
         assert!(report.contains("still here"));
     }
@@ -1280,10 +1534,10 @@ mod tests {
         // Tier 1: a count and a command, no item list.
         assert_eq!(
             scan_in_flight_plans(tmp.path()).expect("one in-flight plan"),
-            render_pointer(1, 0)
+            render_pointer(1, 0, false)
         );
         // Tier 2: the detail, on demand.
-        let report = render_plans_report(tmp.path()).expect("one in-flight plan");
+        let report = plans_report(tmp.path()).report.expect("one in-flight plan");
         assert_eq!(
             report,
             "1 in-flight plan in docs/plans/:\n\
@@ -1332,7 +1586,7 @@ mod tests {
         );
         assert_eq!(
             scan_in_flight_plans(tmp.path()).unwrap(),
-            render_pointer(2, 1),
+            render_pointer(2, 1, false),
             "one blocked, not two"
         );
     }
@@ -1340,14 +1594,14 @@ mod tests {
     #[test]
     fn the_tier_two_report_is_silent_on_an_empty_corpus() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(render_plans_report(tmp.path()), None);
+        assert_eq!(plans_report(tmp.path()).report, None);
         let dir = plans_dir(&tmp);
         write_plan(
             &dir,
             "2026-07-01-done.md",
             "---\nstatus: done\n---\n\nbody\n",
         );
-        assert_eq!(render_plans_report(tmp.path()), None);
+        assert_eq!(plans_report(tmp.path()).report, None);
     }
 
     #[test]
@@ -1361,7 +1615,7 @@ mod tests {
                 "---\nstatus: in-flight\nnext: \"go\"\n---\n\nbody\n",
             );
         }
-        let report = render_plans_report(tmp.path()).unwrap();
+        let report = plans_report(tmp.path()).report.unwrap();
         assert!(report.starts_with("25 in-flight plans in docs/plans/:"));
         assert!(report.contains("plan-0"), "{report}");
         assert!(report.contains("plan-24"), "past the retired 20-line cap");
@@ -1381,7 +1635,7 @@ mod tests {
             "2026-07-02-good.md",
             "---\nstatus: in-flight\nnext: \"fine\"\n---\n\nbody\n",
         );
-        let report = render_plans_report(tmp.path()).unwrap();
+        let report = plans_report(tmp.path()).report.unwrap();
         assert!(report.contains("2026-07-02-good"));
         assert!(!report.contains("2026-07-01-malformed"));
     }
@@ -1400,7 +1654,7 @@ mod tests {
             "2026-07-01-first.md",
             "---\nstatus: in-flight\nnext: \"go\"\n---\n\nbody\n",
         );
-        let report = render_plans_report(tmp.path()).unwrap();
+        let report = plans_report(tmp.path()).report.unwrap();
         assert!(report.starts_with("2 in-flight plans in docs/plans/:"));
         let first_pos = report.find("2026-07-01-first").unwrap();
         let second_pos = report.find("2026-07-02-second").unwrap();
@@ -1408,7 +1662,7 @@ mod tests {
         assert!(report.contains("[blocked]"));
         assert_eq!(
             scan_in_flight_plans(tmp.path()).unwrap(),
-            render_pointer(2, 1)
+            render_pointer(2, 1, false)
         );
     }
 

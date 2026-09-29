@@ -832,4 +832,26 @@ mod tests {
             "init_repo makes exactly one commit"
         );
     }
+
+    /// Fixture `git` never signs (cameronsjo/cadence-hooks#1075). The pin lives
+    /// in the workspace `.cargo/config.toml` `[env]`, so it reaches every
+    /// hand-rolled helper, not only `git_in`. If this goes red, that file was
+    /// dropped or its value changed, and a broken signer will redden dozens of
+    /// unrelated fixture commits again.
+    #[test]
+    fn fixture_git_resolves_commit_and_tag_signing_off() {
+        let scratch = Scratch::new(&scratch_root(), "gpgsign-off");
+        for key in ["commit.gpgsign", "tag.gpgsign"] {
+            let out = std::process::Command::new("git")
+                .args(["config", "--bool", "--get", key])
+                .current_dir(scratch.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "false",
+                "{key} must resolve to false for every fixture git child"
+            );
+        }
+    }
 }

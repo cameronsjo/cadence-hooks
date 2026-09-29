@@ -186,6 +186,32 @@ mod tests {
     }
 
     #[test]
+    fn generated_table_prices_the_rows_the_hand_table_lacked() {
+        // #866: the first generated table picked these up from the published
+        // page. Opus 5.5 reads cache at 0.05x input and Mythos 5.1 at 0.025x,
+        // neither derivable from the usual 0.1x.
+        let prices = Prices::embedded();
+        let opus = prices
+            .get("claude-opus-5-5")
+            .expect("opus-5-5 must be priced");
+        assert_eq!(
+            (
+                opus.input_per_mtok,
+                opus.output_per_mtok,
+                opus.cache_read_per_mtok
+            ),
+            (4.0, 20.0, 0.2)
+        );
+        let mythos = prices
+            .get("claude-mythos-5-1")
+            .expect("mythos-5-1 must be priced");
+        assert_eq!(mythos.cache_read_per_mtok, 0.25);
+        // A dated id of the table's `Claude Opus 4` row resolves through the
+        // dated-suffix lookup.
+        assert!(prices.get("claude-opus-4-20250514").is_some());
+    }
+
+    #[test]
     fn fable_5_1_cache_read_is_not_a_tenth_of_input() {
         // The 0.025x exception: deriving fable-5-1's cache read from the usual
         // 0.1x multiplier yields $1.00 — wrong by 4x while looking plausible.

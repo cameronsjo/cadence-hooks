@@ -175,6 +175,13 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
 /// quoted parens that a raw count sees as balanced. An escaped `\(` outside
 /// quotes is likewise not grouping syntax and is not counted.
 pub fn has_unbalanced_groups(segment: &str) -> bool {
+    let (opens, closes, backticks) = unquoted_group_counts(segment);
+    opens != closes || backticks % 2 == 1
+}
+
+/// Unquoted `(`, `)` and backtick counts — the one scan behind
+/// [`has_unbalanced_groups`] and [`unquoted_paren_counts`].
+fn unquoted_group_counts(segment: &str) -> (usize, usize, usize) {
     let chars: Vec<char> = segment.chars().collect();
     let mut quote: Option<Quote> = None;
     let mut opens = 0usize;
@@ -196,7 +203,7 @@ pub fn has_unbalanced_groups(segment: &str) -> bool {
         }
         i += 1;
     }
-    opens != closes || backticks % 2 == 1
+    (opens, closes, backticks)
 }
 
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
@@ -1813,10 +1820,47 @@ fn skip_redirect(operands: &[String], i: usize) -> Option<usize> {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
-pub(crate) fn is_redirect_token(token: &str) -> bool {
+///
+/// A named-descriptor prefix (`{fd}>/dev/null`, bash's `{varname}` form) is
+/// stripped the same way as a digit one.
+pub fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
+    let rest = strip_named_fd(rest).unwrap_or(rest);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The byte length of `word`'s redirect OPERATOR — leading `&`s, a
+/// descriptor (digits or `{name}`), and the `>`/`<` run — and whether the
+/// operator is the whole word (its target is then the next word). `None` when
+/// `word` is not redirect-shaped ([`is_redirect_token`]).
+///
+/// A caller holding a [`MarkedToken`] must require the token's
+/// `unquoted_prefix_len` to reach this length: quote removal makes `2'>'x`
+/// (a literal file name) byte-identical to `2>x`, and only the operator's own
+/// quoting tells them apart (cadence-hooks#1058 review I-c).
+pub fn redirect_operator_span(word: &str) -> Option<(usize, bool)> {
+    if !is_redirect_token(word) {
+        return None;
+    }
+    let rest = word.trim_start_matches('&');
+    let rest = strip_named_fd(rest)
+        .unwrap_or_else(|| rest.trim_start_matches(|c: char| c.is_ascii_digit()));
+    let after = rest.trim_start_matches(['>', '<']);
+    Some((word.len() - after.len(), after.is_empty()))
+}
+
+/// `rest` after a leading `{ident}` descriptor name, or `None` when it has
+/// none.
+fn strip_named_fd(rest: &str) -> Option<&str> {
+    let inner = rest.strip_prefix('{')?;
+    let (name, after) = inner.split_once('}')?;
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(after)
 }
 
 /// The `gh pr <sub>` invocation in `tokens`, or `None`.
@@ -3773,6 +3817,33 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, false)
+}
+
+/// [`split_segments_with_ops`], except that an `&` belonging to a redirection
+/// operator — `>&`/`<&` (`2>&1`, `>&2`, `<&-`) or `&>`/`&>>` — stays inside
+/// its segment instead of cutting it as a background `&`.
+///
+/// The default splitter cuts `cd /wt 2>&1 & git commit` into `cd /wt 2>`,
+/// `1`, and `git commit`, so a caller cannot tell a real background `&` from
+/// half of a redirection. A walk that scopes a backgrounded `cd` to its
+/// subshell needs exactly that distinction (cadence-hooks#1058). Decided
+/// lexically, the way the shell does: `&` right after an unescaped `>`/`<`, or
+/// right before `>`, is part of the operator; `cd /wt & >/dev/null git commit`
+/// (space before `>`) still backgrounds the cd.
+///
+/// Opt-in rather than a change to [`split_segments_with_ops`], whose many
+/// callers were written against its current segments.
+pub fn split_segments_with_ops_joining_redirects(
+    command: &str,
+) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, true)
+}
+
+fn split_segments_impl(
+    command: &str,
+    join_redirect_amp: bool,
+) -> Vec<(String, Option<&'static str>)> {
     // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
     // with the body scan, because the shell reads one logical line and only
     // then begins a heredoc body on the line after it (#475).
@@ -3852,6 +3923,13 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
                 quote = Some(Quote::Double);
                 current.push(c);
             }
+            '&' if join_redirect_amp
+                && chars.peek() != Some(&'&')
+                && (ends_with_unescaped_redirect_op(current.as_str())
+                    || chars.peek() == Some(&'>')) =>
+            {
+                current.push(c);
+            }
             '&' => {
                 // `&&` and `&` are both separators; consume the second `&`.
                 let op = if chars.peek() == Some(&'&') {
@@ -3888,6 +3966,15 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
         segments.push((trimmed.to_string(), None));
     }
     segments
+}
+
+/// Whether `text` ends, with no space before the next character, in an
+/// unescaped `>` or `<` — the first half of a `>&`/`<&` operator.
+fn ends_with_unescaped_redirect_op(text: &str) -> bool {
+    let Some(before) = text.strip_suffix(['>', '<']) else {
+        return false;
+    };
+    before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
 }
 
 /// Whether `text` ends in a `>` that the shell reads as a redirect operator
@@ -10587,5 +10674,49 @@ mod tests {
         ] {
             assert_eq!(tokenize(word), [want], "{word:?}");
         }
+    }
+
+    #[test]
+    fn joining_splitter_keeps_redirection_ampersands_in_the_segment() {
+        let ops = |c: &str| split_segments_with_ops_joining_redirects(c);
+        assert_eq!(
+            ops("cd /wt 2>&1 & git x"),
+            vec![
+                ("cd /wt 2>&1".to_string(), Some("&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        assert_eq!(
+            ops("cd /wt &>/dev/null && git x"),
+            vec![
+                ("cd /wt &>/dev/null".to_string(), Some("&&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        // A space before `>` makes the `&` a real background operator.
+        assert_eq!(
+            ops("cd /wt & >/dev/null git x"),
+            vec![
+                ("cd /wt".to_string(), Some("&")),
+                (">/dev/null git x".to_string(), None)
+            ]
+        );
+        // The default splitter is unchanged.
+        assert_eq!(split_segments_with_ops("a 2>&1").len(), 2);
+    }
+
+    #[test]
+    fn a_redirect_operator_spans_its_descriptor_and_angle_brackets() {
+        assert_eq!(redirect_operator_span("2>x"), Some((2, false)));
+        assert_eq!(redirect_operator_span("2>"), Some((2, true)));
+        assert_eq!(redirect_operator_span("&>>log"), Some((3, false)));
+        assert_eq!(redirect_operator_span("{fd}>/dev/null"), Some((5, false)));
+        assert_eq!(redirect_operator_span("2>&1"), Some((2, false)));
+        assert_eq!(redirect_operator_span("x>y"), None);
+        // `2'>'x` tokenizes to `2>x` with only `2` unquoted: the operator is
+        // quoted, so it is a word, not a redirection.
+        let marked = tokenize_marked("2'>'x");
+        let (len, _) = redirect_operator_span(&marked[0].text).unwrap();
+        assert!(marked[0].unquoted_prefix_len < len);
     }
 }
