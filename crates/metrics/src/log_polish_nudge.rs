@@ -22,10 +22,8 @@
 //! Silent no-op on any failure — never blocks (it is a [`Logger`]).
 
 use crate::common;
-use cadence_hooks_core::markers::{polish_marker_present, resolve_ship_target};
-use cadence_hooks_core::shell::{
-    git_command, merge_anchor_repo_targets, origin_triple, parse_work_dir,
-    polish_ship_segments_for_origin,
+use cadence_hooks_core::markers::{
+    located_ship_segments, polish_marker_present, resolve_ship_target,
 };
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
@@ -47,29 +45,15 @@ impl Logger for LogPolishNudge {
             return;
         };
         // The denominator is defined as "every PR that fired the nudge", so the
-        // gate MUST be the same predicate the nudge uses — origin-aware, so a
-        // `gh pr merge -R` naming the cwd's own repo counts here exactly when
-        // it nudges (cadence-hooks#881). The `git remote get-url origin` spawn
-        // is paid only when `merge_anchor_repo_targets` says a merge segment
-        // could still anchor pending that origin match; every other shape
-        // (create, ready, a bare merge, an unrelated command) never pays for
-        // it. The anchor KIND rides along on the row: a draft-first branch now
-        // trips `ready` and again at `merge` (#325), and without the kind
-        // those two rows read as two separate ships of the same branch.
-        let origin = input
-            .cwd
-            .as_deref()
-            .filter(|_| merge_anchor_repo_targets(command).is_some())
-            .map(|cwd| parse_work_dir(command, cwd))
-            .and_then(|dir| git_command(&dir, &["remote", "get-url", "origin"]))
-            // The same host mapping the #995 resolver applies to every remote
-            // (an SSH alias, `ssh.github.com`), so both compare sites agree.
-            .and_then(|url| origin_triple(&url));
-        // One pass over the segments gives both the anchor kind (the first
-        // anchoring segment's, as `polish_ship_anchor_for_origin` reports it)
-        // and every segment's target.
-        let segments = polish_ship_segments_for_origin(command, origin.as_deref());
-        let Some(anchor) = segments.first().map(|segment| segment.anchor) else {
+        // gate MUST be the same walk the nudge uses — origin-aware, so a `gh pr
+        // merge -R` naming the cwd's own repo counts here exactly when it
+        // nudges (cadence-hooks#881), and directory-aware per segment, so each
+        // ship is looked up in the checkout it runs in (cadence-hooks#997).
+        // The anchor KIND rides along on the row: a draft-first branch trips
+        // `ready` and again at `merge` (#325), and without the kind those two
+        // rows read as two separate ships of the same branch.
+        let segments = located_ship_segments(command, input.cwd.as_deref());
+        let Some(anchor) = segments.first().map(|ship| ship.segment.anchor) else {
             return;
         };
         // Skip malformed payloads (mirrors the other loggers); session_id is
@@ -106,11 +90,10 @@ impl Logger for LogPolishNudge {
         // transcript scan) so scan-vs-marker drift is measurable. The target
         // kind rides along (cadence-hooks#995): a `cannot_check` row is a ship
         // the gate could not look up, which is not the same as a nudged skip.
-        let work_dir = input.cwd.as_deref().map(|cwd| parse_work_dir(command, cwd));
         let lookups: Vec<(&'static str, bool)> = segments
             .iter()
-            .map(|segment| {
-                let target = resolve_ship_target(&segment.target, work_dir.as_deref());
+            .map(|ship| {
+                let target = resolve_ship_target(&ship.segment.target, ship.work_dir.as_deref());
                 (target.kind(), polish_marker_present(&target))
             })
             .collect();
