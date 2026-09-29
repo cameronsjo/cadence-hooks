@@ -21,7 +21,9 @@
 use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::{
-    ShipHead, ShipTarget, git_command, remote_host_and_slug, repo_value_names_remote,
+    ShipHead, ShipSegment, ShipTarget, git_command, merge_anchor_repo_targets, origin_triple,
+    parse_work_dir, polish_ship_segments_for_origin, remote_host_and_slug, repo_value_names_remote,
+    split_segments_with_ops_joining_redirects, strip_group_wrappers,
 };
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
@@ -288,6 +290,156 @@ pub fn resolve_ship_target(target: &ShipTarget, cwd_dir: Option<&str>) -> Marker
         || git_remotes(cwd_dir),
         |branch| worktree_for_branch(cwd_dir, branch),
     )
+}
+
+/// One anchoring segment of a ship command and the directory it runs in
+/// (cadence-hooks#997).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedShip {
+    /// The anchor and the repo, host, and head the segment names.
+    pub segment: ShipSegment,
+    /// The `cd`-aware directory the segment runs in, or `None` without a cwd.
+    /// This is what [`resolve_ship_target`] takes as `cwd_dir`.
+    pub work_dir: Option<String>,
+}
+
+/// Most distinct directories [`located_ship_segments`] spawns `git remote
+/// get-url origin` in. Only a repo-retargeted `gh pr merge` needs the origin,
+/// and a command with more such merges in more directories than this is not
+/// one anybody types; past it the remaining merges get no origin, so they do
+/// not anchor (a nudge-only miss, never a block).
+const MAX_ORIGIN_LOOKUPS: usize = 8;
+
+/// Every ship-anchoring segment of `command`, each with the directory it
+/// runs in (cadence-hooks#997). Shared by `nudge-polish-before-pr` and
+/// `log-polish-nudge`, so the gate and its ledger judge each ship in the same
+/// checkout (#177).
+///
+/// The directory is resolved **per segment**, walking the top-level segments
+/// in order:
+///
+/// - a `cd` applies to the segments after it (every `cd` is assumed to
+///   succeed, as [`parse_work_dir`] assumes), so in `cd a && gh pr create ;
+///   cd b && gh pr create` the first ship runs in `a` and the second in `a/b`;
+/// - a `( … )` subshell gets its own directory, restored when it closes, so
+///   `(cd a && gh pr create) ; gh pr create` judges the second ship in the
+///   cwd;
+/// - a `{ …; }` group is stripped ([`strip_group_wrappers`]) but shares the
+///   parent's directory, as bash runs it in the current shell;
+/// - a `cd` in a pipeline stage or a backgrounded segment (`cd a | x`, `cd a
+///   &`) runs in its own process and moves nothing. The `&` of a redirection
+///   (`cd a 2>&1 && …`) is not a background `&`
+///   ([`split_segments_with_ops_joining_redirects`]).
+///
+/// Subshell nesting is counted from each segment's leading `(` and its
+/// unmatched trailing `)`; a backslash-escaped `)` is a word byte. Parentheses
+/// inside quotes are not told apart, so a segment ending in a quoted `)` can
+/// close a subshell early; that changes which checkout a later ship is judged
+/// in, and the check is advisory.
+///
+/// A ship that only the whole command reveals — a command word supplied by
+/// an earlier segment's assignment (`G=gh; $G pr create`) — is still judged,
+/// in the whole-command directory [`parse_work_dir`] gives, so this never
+/// reports fewer ships than [`polish_ship_segments_for_origin`] does.
+pub fn located_ship_segments(command: &str, cwd: Option<&str>) -> Vec<LocatedShip> {
+    let mut origins = OriginCache::default();
+    let Some(cwd) = cwd else {
+        return polish_ship_segments_for_origin(command, None)
+            .into_iter()
+            .map(|segment| LocatedShip {
+                segment,
+                work_dir: None,
+            })
+            .collect();
+    };
+    let mut located = Vec::new();
+    let mut dir = cwd.to_string();
+    let mut subshells: Vec<String> = Vec::new();
+    let mut previous_op: Option<&str> = None;
+    for (raw, op) in split_segments_with_ops_joining_redirects(command) {
+        let (opens, closes) = subshell_depth_change(&raw);
+        for _ in 0..opens {
+            subshells.push(dir.clone());
+        }
+        let body = strip_group_wrappers(&raw);
+        let own_process = matches!(op, Some("|" | "&")) || previous_op == Some("|");
+        if !own_process {
+            dir = parse_work_dir(body, &dir);
+        }
+        let origin = origins.for_command(body, &dir);
+        located.extend(
+            polish_ship_segments_for_origin(&raw, origin.as_deref())
+                .into_iter()
+                .map(|segment| LocatedShip {
+                    segment,
+                    work_dir: Some(dir.clone()),
+                }),
+        );
+        for _ in 0..closes {
+            if let Some(outer) = subshells.pop() {
+                dir = outer;
+            }
+        }
+        previous_op = op;
+    }
+    let whole_dir = parse_work_dir(command, cwd);
+    let whole_origin = origins.for_command(command, &whole_dir);
+    let whole = polish_ship_segments_for_origin(command, whole_origin.as_deref());
+    if whole.len() > located.len() {
+        located.extend(whole.into_iter().map(|segment| LocatedShip {
+            segment,
+            work_dir: Some(whole_dir.clone()),
+        }));
+    }
+    located
+}
+
+/// How many `( … )` subshells one top-level segment opens (its leading `(`)
+/// and closes (its trailing `)` run, less any `(` the segment itself left
+/// unmatched, as `echo $(pwd)` does).
+fn subshell_depth_change(segment: &str) -> (usize, usize) {
+    let trimmed = segment.trim();
+    let rest = trimmed.trim_start_matches(|c: char| c == '(' || c == '{' || c.is_whitespace());
+    let opens = trimmed[..trimmed.len() - rest.len()]
+        .chars()
+        .filter(|&c| c == '(')
+        .count();
+    let mut body = rest.trim_end_matches(|c: char| c == ')' || c == ';' || c.is_whitespace());
+    // `echo \)` ends in a literal `)`, not a closer.
+    if body.ends_with('\\') && rest[body.len()..].starts_with(')') {
+        body = &rest[..body.len() + 1];
+    }
+    let trailing = rest[body.len()..].chars().filter(|&c| c == ')').count();
+    let open_inside = body.chars().filter(|&c| c == '(').count();
+    let close_inside = body.chars().filter(|&c| c == ')').count();
+    (
+        opens,
+        trailing.saturating_sub(open_inside.saturating_sub(close_inside)),
+    )
+}
+
+/// `git remote get-url origin` per directory, spawned only for a command that
+/// carries a repo-retargeted `gh pr merge` ([`merge_anchor_repo_targets`]) and
+/// at most [`MAX_ORIGIN_LOOKUPS`] times per hook run.
+#[derive(Default)]
+struct OriginCache(Vec<(String, Option<String>)>);
+
+impl OriginCache {
+    fn for_command(&mut self, command: &str, dir: &str) -> Option<String> {
+        merge_anchor_repo_targets(command)?;
+        if let Some((_, origin)) = self.0.iter().find(|(seen, _)| seen == dir) {
+            return origin.clone();
+        }
+        if self.0.len() >= MAX_ORIGIN_LOOKUPS {
+            return None;
+        }
+        let origin = git_command(dir, &["remote", "get-url", "origin"])
+            // The same host mapping the #995 resolver applies to every
+            // remote (an SSH alias, `ssh.github.com`).
+            .and_then(|url| origin_triple(&url));
+        self.0.push((dir.to_string(), origin.clone()));
+        origin
+    }
 }
 
 /// The pure half of [`resolve_ship_target`]: every git read arrives as a
@@ -2981,5 +3133,144 @@ mod tests {
         with_marker_dir(tmp.path(), || {
             assert_ne!(daily_marker("gate-a"), daily_marker("gate-b"));
         });
+    }
+
+    // --- cadence-hooks#997: the directory each ship runs in ---
+
+    /// `(anchor, work_dir)` for every ship [`located_ship_segments`] finds.
+    fn located(command: &str) -> Vec<(&'static str, Option<String>)> {
+        located_ship_segments(command, Some("/cwd"))
+            .into_iter()
+            .map(|ship| (ship.segment.anchor, ship.work_dir))
+            .collect()
+    }
+
+    #[test]
+    fn each_ship_is_located_in_the_directory_it_runs_in() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("gh pr create -t a", &[("create", "/cwd")]),
+            ("cd /wt && gh pr create -t a", &[("create", "/wt")]),
+            // #997's three rows.
+            ("(cd ../u && gh pr create -t a)", &[("create", "/cwd/../u")]),
+            (
+                "( cd ../u && gh pr create -t a )",
+                &[("create", "/cwd/../u")],
+            ),
+            (
+                "{ cd ../u && gh pr create -t a; }",
+                &[("create", "/cwd/../u")],
+            ),
+            (
+                "cd ../u && gh pr create -t a ; cd ../p && gh pr create -t a",
+                &[("create", "/cwd/../u"), ("create", "/cwd/../u/../p")],
+            ),
+            // A subshell's `cd` ends with the subshell.
+            (
+                "(cd /u && gh pr create -t a) ; gh pr create -t a",
+                &[("create", "/u"), ("create", "/cwd")],
+            ),
+            ("(cd /u) && gh pr create -t a", &[("create", "/cwd")]),
+            ("((cd /u)) && gh pr create -t a", &[("create", "/cwd")]),
+            // A brace group shares the parent's directory.
+            ("{ cd /u; } && gh pr create -t a", &[("create", "/u")]),
+            // A pipeline stage or a backgrounded `cd` runs in its own process.
+            ("cd /u | true; gh pr create -t a", &[("create", "/cwd")]),
+            ("true | cd /u; gh pr create -t a", &[("create", "/cwd")]),
+            ("cd /u & gh pr create -t a", &[("create", "/cwd")]),
+            // A redirection's `&` does not background the `cd`.
+            ("cd /u 2>&1 && gh pr create -t a", &[("create", "/u")]),
+            (
+                "cd /u &>/dev/null && gh pr create -t a",
+                &[("create", "/u")],
+            ),
+            // An escaped `)` closes nothing.
+            (
+                "(cd /u && echo \\) && gh pr create -t a)",
+                &[("create", "/u")],
+            ),
+            // A substitution's `)` closes nothing.
+            (
+                "(cd /u && echo $(pwd) && gh pr create -t a)",
+                &[("create", "/u")],
+            ),
+            (
+                "echo $(pwd) ; cd /u && gh pr create -t a",
+                &[("create", "/u")],
+            ),
+            // A `cd` after the ship does not move it.
+            ("gh pr ready 3 && cd /u", &[("ready", "/cwd")]),
+            // Only the whole command reveals this ship; it keeps the
+            // whole-command directory.
+            ("cd /u; G=gh; $G pr create -t a", &[("create", "/u")]),
+            ("gh pr list && cd /u", &[]),
+        ];
+        for (command, want) in cases {
+            let want: Vec<(&str, Option<String>)> = want
+                .iter()
+                .map(|(anchor, dir)| (*anchor, Some((*dir).to_string())))
+                .collect();
+            assert_eq!(located(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn located_ships_without_a_cwd_have_no_directory() {
+        let ships = located_ship_segments("cd /u && gh pr create -t a", None);
+        assert_eq!(ships.len(), 1);
+        assert_eq!(ships[0].work_dir, None);
+    }
+
+    #[test]
+    fn located_ships_never_undercount_the_whole_command() {
+        for command in [
+            "gh pr create -t a && gh pr ready 3",
+            "sh -c 'gh pr create -t a' ; gh pr ready",
+            "gh pr create -t x -b \"$(gh pr create --head feat/pol)\"",
+            "G=gh; $G pr create -t a",
+            "(gh pr create -t a) && { gh pr ready; }",
+        ] {
+            assert!(
+                located_ship_segments(command, Some("/cwd")).len()
+                    >= polish_ship_segments_for_origin(command, None).len(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn subshell_depth_change_counts_group_parens_only() {
+        for (segment, want) in [
+            ("gh pr create", (0, 0)),
+            ("(cd x", (1, 0)),
+            ("( (cd x", (2, 0)),
+            ("gh pr create)", (0, 1)),
+            ("gh pr create) ", (0, 1)),
+            ("(cd x)", (1, 1)),
+            ("cd x))", (0, 2)),
+            ("echo $(pwd)", (0, 0)),
+            ("echo $(pwd))", (0, 1)),
+            ("{ (cd x", (1, 0)),
+            ("{ cd x", (0, 0)),
+            ("echo \\)", (0, 0)),
+            ("echo \\))", (0, 1)),
+        ] {
+            assert_eq!(subshell_depth_change(segment), want, "{segment}");
+        }
+    }
+
+    #[test]
+    fn a_flood_of_segments_stays_linear() {
+        let command = "(cd a && gh pr create -t a) ; ".repeat(7000);
+        assert!(command.len() > 200_000);
+        let started = std::time::Instant::now();
+        let ships = located_ship_segments(&command, Some("/cwd"));
+        assert_eq!(ships.len(), 7000);
+        assert!(
+            ships
+                .iter()
+                .all(|s| s.work_dir.as_deref() == Some("/cwd/a"))
+        );
+        // Debug build; the release bound is 0.5 s.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The polish gate asks for the security family when a record says the arm ran but not who ran it.** A marker with `security=ran` and no `--arm-model` attestation, on a branch whose diff touches code, now draws a nudge naming the re-record command (`--arm security=ran --arm-model security=opus`). It was silent through the attestation rollout; the polish skill has emitted `--arm-model` since 2026-08-26 and markers expire after 30 days, so an unattested record is now a hand record or an older tool. It ranks below every other polish nudge, and a docs-only branch stays silent. (cameronsjo/cadence-hooks#785)
+
+### Fixed
+
+- **The polish gate judges each ship in the directory its own segment runs in.** `(cd ../other && gh pr create)`, `{ cd ../other && gh pr create; }`, and `cd a && gh pr create ; cd b && gh pr create` were judged in the cwd or in the last `cd`'s directory, so a ship from an unpolished sibling worktree could pass silently. The gate and `log-polish-nudge` now share one walk (`markers::located_ship_segments`): a `cd` moves only the ships after it, a `( … )` subshell's `cd` ends with the subshell, a brace group shares its parent's directory, and a `cd` in a pipeline stage or a backgrounded segment moves nothing. (cameronsjo/cadence-hooks#997)
+- **`record-polish` and `nudge-polish-before-pr` are tested together through the built binary.** New `tests/polish_gate_e2e.rs` records and then gates in one fixture: an attached-HEAD record passes silently, a detached-HEAD record exits 1 and the gate nudges, a record for one branch does not cover another, a `--repo-root`/`--branch` record covers a ship from a subshell, and an unattested security record draws the attestation nudge. (cameronsjo/cadence-hooks#826)
+
 ## [0.110.0] - 2026-09-29
 
 ### Changed
