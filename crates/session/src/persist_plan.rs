@@ -129,9 +129,12 @@ const NUMERIC_SUFFIXES: std::ops::RangeInclusive<u32> = 2..=9;
 /// every write the hook never saw — a PR merge, a `gh api` contents write, an
 /// unwired checkout — left it certifying a body that no longer existed, and
 /// no reader could reproduce it). Nothing writes it any more; it survives as a
-/// READ-ONLY legacy idempotency tier (see [`file_matches_body`]) so documents
-/// already on disk stay recognized as re-fires, and it stays on
-/// [`HOOK_OWNED_KEYS`] so a plan-authored copy can never spoof that tier.
+/// READ-ONLY legacy idempotency tier (see [`file_matches`]) so documents
+/// already on disk stay recognized as re-fires. It stays on
+/// [`HOOK_OWNED_KEYS`], which covers only a plan-authored copy rendered by
+/// this hook: a file written by hand can carry any key, so the tier is
+/// believed only where the `plan-links.jsonl` ledger cannot contradict it
+/// (#1085 review).
 /// Parsed only from the LEADING frontmatter block
 /// ([`leading_frontmatter_block`]), never a whole-document scan: the body now
 /// grows by design (checkbox ticks, appended `## Deviations`/`## Learnings`
@@ -505,9 +508,15 @@ fn persist_plan_body(
     };
     let plans_dir = dest.plans_dir;
 
-    let body_hash = sha256_hex(body.as_bytes());
+    let recognizer = Recognizer::new(body, &dest.base, &dest.disposition);
+    let body_hash = recognizer.body_hash.clone();
     let slug = slugify(body);
     let stem = format!("{local_date}-{slug}");
+    let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
+    // The file this very tool call wrote, when it is a `Write` of this plan
+    // (#861, #1085 review). Decided before the ledger pre-check: a hand copy
+    // the session just saved is the answer, whatever the ledger says.
+    let own_write = adoptable_own_write(input, &plans_dir, body);
     // `claim_target`'s hash check only sees today's stem in this repo. A
     // resumed session after a reboot (marker wiped, same id, same injected
     // prompt, date rolled) or a plan moved since its first persist slips past
@@ -516,18 +525,21 @@ fn persist_plan_body(
     // other earlier copy gets a nudge naming it, so a deleted or moved plan
     // re-approved in the same session is never skipped silently.
     let user_plans_root = env.user_plans_dir.canonicalize().ok();
-    if let Some(earlier) =
-        session_already_persisted(&body_hash, session_id, user_plans_root.as_deref())
+    if own_write.is_none()
+        && let Some(earlier) =
+            session_already_persisted(&body_hash, session_id, user_plans_root.as_deref())
         && !numbered_candidates(&plans_dir, &stem)
             .into_iter()
             .chain(std::iter::once(fallback_path(
                 &plans_dir, &stem, session_id,
             )))
-            .any(|path| file_matches_body(&path, &body_hash))
+            .any(|path| recognizer.holds_this_plan(&path))
     {
-        return CheckResult::nudge(format!(
-            "This session already persisted this plan to {earlier}; no second copy written. \
-             If that copy was deleted on purpose, save the plan by hand."
+        return CheckResult::nudge(refire_nudge(
+            &earlier,
+            &dest.base,
+            approving == Some(session_id),
+            recommended_tier(body),
         ));
     }
 
@@ -544,7 +556,6 @@ fn persist_plan_body(
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
     let branch = dest.branch;
 
-    let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
     let fields = FrontmatterFields {
         updated: local_date,
         branch: branch.as_deref(),
@@ -555,28 +566,18 @@ fn persist_plan_body(
         approved_session_id: approving,
     };
     let document = render_document(&fields, body);
-    // The file this very tool call wrote, when it is a `Write` (#861): an
-    // approve-and-clear session that saves the plan by hand as its first tool
-    // call fires the injected arm on that Write, and the hand-written copy
-    // (its own frontmatter, a ticked step) no longer hashes to the approval.
-    // Without this the ladder reads it as a different plan and mints `-2.md`.
-    let own_write = (input.tool_name() == Some("Write"))
-        .then(|| input.file_path())
-        .flatten()
-        .and_then(|p| fs::canonicalize(p).ok());
 
     persist_and_nudge(
         &plans_dir,
         &stem,
         session_id,
-        &body_hash,
+        &recognizer,
         &document,
         own_write.as_deref(),
         utc_now,
         approving,
         session_id,
         &machine_digest,
-        &dest.base,
         // NOT "an earlier session (<id>)" — `approving` is this session's own
         // id on the same-session path, and naming that "earlier" tells a plan
         // approved in the turn you are reading that it came from a previous
@@ -1260,10 +1261,25 @@ fn read_capped_at_idempotency_limit(path: &Path) -> Option<String> {
 ///    compute it: strip leading frontmatter, strip the trailing harness
 ///    suffix lines and trim, hash.
 ///
+///    The recompute is compared against BOTH the approval hash and
+///    `past_frontmatter_hash`, the hash of the approval with its own leading
+///    frontmatter block removed: [`render_document`] folds that block into
+///    the hook's, so the hook's own output for a frontmatter-bearing plan
+///    recomputes to the second one (#1085 review).
+///
+/// `tier1_allowed` gates tier 1 (#1085 review): the caller passes `false`
+/// when the ledger knows this path but has no row for this hash, so a
+/// recorded key is only believed where the ledger cannot contradict it.
+///
 /// Only an equality returns `true`; every ambiguity (unreadable, over
 /// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
 /// suffix ladder run.
-fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+fn file_matches(
+    path: &Path,
+    body_hash: &str,
+    past_frontmatter_hash: &str,
+    tier1_allowed: bool,
+) -> bool {
     let Some(content) = read_capped_at_idempotency_limit(path) else {
         return false;
     };
@@ -1272,7 +1288,7 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
         fm.lines()
             .find_map(|l| l.strip_prefix(FRONTMATTER_HASH_KEY))
     }) {
-        return yaml_unquote(recorded.trim()) == body_hash;
+        return tier1_allowed && yaml_unquote(recorded.trim()) == body_hash;
     }
 
     if let Some(recorded) = content
@@ -1284,26 +1300,230 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
     }
 
     let body = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(&content));
-    sha256_hex(body.as_bytes()) == body_hash
+    let recomputed = sha256_hex(body.as_bytes());
+    recomputed == body_hash || recomputed == past_frontmatter_hash
+}
+
+/// [`file_matches`] for a plan with no frontmatter of its own and no ledger:
+/// the shape the tier tests pin.
+#[cfg(test)]
+fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+    file_matches(path, body_hash, body_hash, true)
+}
+
+/// The `plan-links.jsonl` rows, as (`body_sha256`, `plan_path`) pairs, read
+/// once per persist from the same bounded tail [`session_already_persisted`]
+/// reads. An unreadable ledger is empty, which falls back to the file checks.
+#[derive(Default)]
+struct PlanLedger {
+    rows: Vec<(String, String)>,
+}
+
+impl PlanLedger {
+    fn load() -> Self {
+        let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
+        let Some(tail) =
+            cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
+        else {
+            return Self::default();
+        };
+        let rows = tail
+            .lines()
+            .filter_map(|line| {
+                let row = serde_json::from_str::<Value>(line).ok()?;
+                Some((
+                    row.get("body_sha256")?.as_str()?.to_string(),
+                    row.get("plan_path")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Did this hook write `plan_path` for this exact body?
+    fn wrote(&self, body_hash: &str, plan_path: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|(h, p)| h == body_hash && p == plan_path)
+    }
+
+    /// Does any row name `plan_path`?
+    fn knows_path(&self, plan_path: &str) -> bool {
+        self.rows.iter().any(|(_, p)| p == plan_path)
+    }
+}
+
+/// Everything that decides whether a file already holds this approval: the
+/// approval's two hashes, the ledger, and how the ledger spells a path.
+struct Recognizer<'a> {
+    /// SHA-256 of the stripped approval text, the ledger key.
+    body_hash: String,
+    /// SHA-256 of the approval past its own leading frontmatter block (equal
+    /// to `body_hash` when it has none) — see [`file_matches`].
+    past_frontmatter_hash: String,
+    ledger: PlanLedger,
+    base: &'a Path,
+    disposition: &'a Disposition,
+}
+
+impl<'a> Recognizer<'a> {
+    fn new(body: &str, base: &'a Path, disposition: &'a Disposition) -> Self {
+        Self::with_ledger(body, base, disposition, PlanLedger::load())
+    }
+
+    fn with_ledger(
+        body: &str,
+        base: &'a Path,
+        disposition: &'a Disposition,
+        ledger: PlanLedger,
+    ) -> Self {
+        let body_hash = sha256_hex(body.as_bytes());
+        let past_frontmatter_hash = match frontmatter_extent(body) {
+            Some(_) => sha256_hex(
+                strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(body)).as_bytes(),
+            ),
+            None => body_hash.clone(),
+        };
+        Self {
+            body_hash,
+            past_frontmatter_hash,
+            ledger,
+            base,
+            disposition,
+        }
+    }
+
+    /// The `plan_path` a ledger row records for `path`. A user-scoped copy
+    /// has no repo to be relative to, so it records where it really is.
+    fn ledger_path(&self, path: &Path) -> String {
+        match self.disposition {
+            Disposition::UserScoped(_) => {
+                cadence_hooks_core::normalize_path(&path.to_string_lossy())
+            }
+            _ => repo_relative(path, self.base),
+        }
+    }
+
+    /// Does the file at `path` hold this approval? It must exist; then a
+    /// ledger row saying this hook wrote this path for this body answers yes
+    /// without reading it (a ticked plan re-approved by another session,
+    /// #1085 review), and otherwise [`file_matches`] decides.
+    fn holds_this_plan(&self, path: &Path) -> bool {
+        if fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        let plan_path = self.ledger_path(path);
+        if self.ledger.wrote(&self.body_hash, &plan_path) {
+            return true;
+        }
+        file_matches(
+            path,
+            &self.body_hash,
+            &self.past_frontmatter_hash,
+            !self.ledger.knows_path(&plan_path),
+        )
+    }
+}
+
+/// Normalize a plan text for the own-write affinity check: drop leading
+/// frontmatter and the harness suffix lines, untick checkboxes, and collapse
+/// blank runs, so a hand copy that only ticked a step or reflowed blank lines
+/// still compares equal to the approval.
+fn affinity_normal_form(text: &str) -> String {
+    let stripped = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(text));
+    let mut out: Vec<String> = Vec::new();
+    let mut previous_blank = false;
+    for line in stripped.lines() {
+        let line = line.trim_end();
+        let blank = line.is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        previous_blank = blank;
+        let indent = line.len() - line.trim_start().len();
+        let rest = &line[indent..];
+        let unticked = ["- [x]", "- [X]", "* [x]", "* [X]"]
+            .iter()
+            .find_map(|ticked| rest.strip_prefix(ticked))
+            .map(|tail| format!("{}- [ ]{tail}", &line[..indent]));
+        out.push(unticked.unwrap_or_else(|| line.to_string()));
+    }
+    out.join("\n")
+}
+
+/// Does `content` look like this approval (#1085 review)? Either it is the
+/// approval up to [`affinity_normal_form`], or it carries the approval's first
+/// ATX heading line verbatim.
+fn has_affinity(content: &str, body: &str) -> bool {
+    if affinity_normal_form(content) == affinity_normal_form(body) {
+        return true;
+    }
+    strip_leading_frontmatter(body)
+        .lines()
+        .find(|line| heading_text(line).is_some())
+        .map(str::trim)
+        .is_some_and(|heading| content.lines().any(|line| line.trim() == heading))
+}
+
+/// The plan file the triggering `Write` just saved, when the hook should adopt
+/// it as the persisted plan instead of writing its own copy
+/// (cameronsjo/cadence-hooks#861).
+///
+/// An approve-and-clear session that saves the plan by hand as its first tool
+/// call fires the injected arm on that Write, and the hand copy (its own
+/// frontmatter, a ticked step, often another filename) no longer hashes to the
+/// approval. Adoption needs every one of (#1085 review):
+///
+/// - the tool is `Write` and names a path; a relative path resolves against
+///   the payload `cwd`, and without an absolute `cwd` there is nothing to adopt;
+/// - the path is a regular `.md` file, not a symlink (`symlink_metadata`);
+/// - its parent is exactly the canonical `plans_dir`, so a Write anywhere else
+///   never counts;
+/// - the content has [`has_affinity`] with the approval, so a Write of some
+///   other document into the plans dir never certifies it.
+///
+/// The model supplies `file_path`, so the most it can do here is stop the hook
+/// writing its own copy of a plan it demonstrably just saved; it can never
+/// cause a write or a read outside `plans_dir`.
+fn adoptable_own_write(input: &HookInput, plans_dir: &Path, body: &str) -> Option<PathBuf> {
+    if input.tool_name() != Some("Write") {
+        return None;
+    }
+    let raw = PathBuf::from(input.file_path()?);
+    let path = if raw.is_absolute() {
+        raw
+    } else {
+        let cwd = PathBuf::from(input.cwd.as_deref()?);
+        if !cwd.is_absolute() {
+            return None;
+        }
+        cwd.join(raw)
+    };
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return None;
+    }
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    if path.parent()?.canonicalize().ok()? != plans_dir {
+        return None;
+    }
+    let adopted = plans_dir.join(path.file_name()?);
+    let content = read_capped_at_idempotency_limit(&adopted)?;
+    has_affinity(&content, body).then_some(adopted)
 }
 
 /// Try each candidate in order with `create_new` (O_EXCL): a fresh path wins
-/// outright; an occupied path is re-checked by
-/// [`file_matches_body`] — a match is a re-fire (idempotent skip), a mismatch
-/// tries the next candidate. Never overwrites anything.
-///
-/// `own_write` is the canonical path the triggering `Write` saved, if any. An
-/// occupied candidate that IS that file is the session's own copy of the plan
-/// (cameronsjo/cadence-hooks#861), adopted as persisted even when its body
-/// has drifted from the approval: it was written by the same tool call, so it
-/// cannot be some other plan that happens to share the stem.
+/// outright; an occupied path is re-checked by `holds_this_plan` (in
+/// production [`Recognizer::holds_this_plan`]) — a match is a re-fire
+/// (idempotent skip), a mismatch tries the next candidate. Never overwrites
+/// anything.
 fn claim_target(
     dir: &Path,
     stem: &str,
     session_id: &str,
-    body_hash: &str,
     document: &str,
-    own_write: Option<&Path>,
+    holds_this_plan: &dyn Fn(&Path) -> bool,
 ) -> Claim {
     let mut candidates = numbered_candidates(dir, stem);
     candidates.push(fallback_path(dir, stem, session_id));
@@ -1322,9 +1542,7 @@ fn claim_target(
                 return Claim::GiveUp;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if file_matches_body(&path, body_hash)
-                    || own_write.is_some_and(|w| fs::canonicalize(&path).is_ok_and(|c| c == w))
-                {
+                if holds_this_plan(&path) {
                     return Claim::AlreadyPersisted(path);
                 }
                 // Different plan at this path — try the next suffix.
@@ -1496,8 +1714,8 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
 /// longer emits them, but a plan that authors either would otherwise smuggle a
 /// forged session attribution into the persisted document, so they stay on the
 /// drop list. `body_sha256` joined them when the field was retired (#870): a
-/// plan-authored copy would otherwise satisfy [`file_matches_body`]'s legacy
-/// tier. The set is deliberately larger than the emitted set.
+/// plan-authored copy rendered by this hook would otherwise satisfy
+/// [`file_matches`]'s legacy tier. The set is deliberately larger than the emitted set.
 const HOOK_OWNED_KEYS: [&str; 8] = [
     "body_sha256",
     "session",
@@ -1626,37 +1844,37 @@ fn persist_and_nudge(
     plans_dir: &Path,
     stem: &str,
     session_id: &str,
-    body_hash: &str,
+    recognizer: &Recognizer,
     document: &str,
     own_write: Option<&Path>,
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
     machine_digest: &str,
-    repo_root: &Path,
     approved_label: &str,
     plan_body: &str,
     recommended_tier: Option<Tier>,
     disposition: &Disposition,
 ) -> CheckResult {
-    let path = match claim_target(plans_dir, stem, session_id, body_hash, document, own_write) {
-        Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
-        Claim::GiveUp => return CheckResult::allow(),
+    // A hand copy the triggering Write just saved is the plan (#861); it is
+    // adopted without touching the ladder, whatever its name.
+    let path = match own_write {
+        Some(adopted) => adopted.to_path_buf(),
+        None => match claim_target(plans_dir, stem, session_id, document, &|candidate| {
+            recognizer.holds_this_plan(candidate)
+        }) {
+            Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
+            Claim::GiveUp => return CheckResult::allow(),
+        },
     };
 
-    // A user-scoped copy has no repo to be relative to: record where it really
-    // is, so the ledger (and the re-fire nudge) can point back at it.
-    let plan_path_rel = match disposition {
-        Disposition::UserScoped(_) => cadence_hooks_core::normalize_path(&path.to_string_lossy()),
-        _ => repo_relative(&path, repo_root),
-    };
     append_plan_links_row(&plan_links_row(
         utc_now,
         parent_session_id,
         child_session_id,
         machine_digest,
-        &plan_path_rel,
-        body_hash,
+        &recognizer.ledger_path(&path),
+        &recognizer.body_hash,
         recommended_tier.map(Tier::as_str),
     ));
 
@@ -1778,8 +1996,60 @@ const PLAN_LINKS_SCAN_MAX_BYTES: u64 = 1024 * 1024;
 /// Longest ledger `plan_path` echoed back into the re-fire nudge.
 const MAX_ECHOED_PLAN_PATH_LEN: usize = 200;
 
+/// The re-fire nudge for a plan this session already persisted (#1085
+/// review): the wording says whether the earlier copy is still on disk, and a
+/// same-session re-approval still gets the #608 announcement reminder and the
+/// #823 model check, since it is an approval like any other.
+fn refire_nudge(
+    earlier: &EarlierCopy,
+    base: &Path,
+    same_session: bool,
+    tier: Option<Tier>,
+) -> String {
+    let label = &earlier.label;
+    let still_there = earlier.path.as_deref().map(|p| {
+        let p = Path::new(p);
+        if p.is_absolute() {
+            p.exists()
+        } else {
+            base.join(p).exists()
+        }
+    });
+    let mut nudge = match still_there {
+        Some(true) => format!(
+            "This session already persisted this plan to {label}, which is still there; no \
+             second copy written."
+        ),
+        Some(false) => format!(
+            "This session already persisted this plan to {label}, which is no longer there; \
+             no second copy written. If it was deleted on purpose, save the plan by hand."
+        ),
+        None => format!(
+            "This session already persisted this plan to {label}; no second copy written. If \
+             that copy was deleted on purpose, save the plan by hand."
+        ),
+    };
+    if same_session {
+        nudge.push(' ');
+        nudge.push_str(DRIVER_ANNOUNCE_REMINDER);
+        if let Some(tier) = tier {
+            nudge.push(' ');
+            nudge.push_str(&model_check_directive(tier));
+        }
+    }
+    nudge
+}
+
+/// An earlier persist found in the ledger: the label for the nudge, and the
+/// recorded path when it passed [`echoable_plan_path`]'s filter (only then is
+/// it stat-ed).
+struct EarlierCopy {
+    label: String,
+    path: Option<String>,
+}
+
 /// Has this session already persisted this exact plan body? Returns the
-/// earlier copy's label for the nudge when it has.
+/// earlier copy for the nudge when it has.
 ///
 /// Keyed on (`body_sha256`, `child_session_id`) in the durable ledger, which
 /// survives the reboot that wipes the injected arm's temp-dir marker. The
@@ -1792,7 +2062,7 @@ fn session_already_persisted(
     body_hash: &str,
     session_id: &str,
     user_plans_root: Option<&Path>,
-) -> Option<String> {
+) -> Option<EarlierCopy> {
     let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
     let tail = cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)?;
     tail.lines()
@@ -1802,10 +2072,12 @@ fn session_already_persisted(
             let matches = row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
                 && row.get("child_session_id").and_then(Value::as_str) == Some(session_id);
             matches.then(|| {
-                echoable_plan_path(
-                    row.get("plan_path").and_then(Value::as_str),
-                    user_plans_root,
-                )
+                let recorded = row.get("plan_path").and_then(Value::as_str);
+                let label = echoable_plan_path(recorded, user_plans_root);
+                let path = recorded
+                    .filter(|_| label.starts_with('`'))
+                    .map(str::to_string);
+                EarlierCopy { label, path }
             })
         })
 }
@@ -2056,14 +2328,9 @@ mod tests {
     #[test]
     fn claim_target_writes_fresh_file() {
         let tmp = TempDir::new().unwrap();
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "content-a",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-a", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         match claim {
             Claim::Wrote(path) => {
                 assert_eq!(path, tmp.path().join("2026-07-20-x.md"));
@@ -2079,14 +2346,9 @@ mod tests {
         let path = tmp.path().join("2026-07-20-x.md");
         fs::write(&path, doc_with_hash("hash-a")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "content-a",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-a", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         match claim {
             Claim::AlreadyPersisted(p) => assert_eq!(p, path),
             _ => panic!("expected an idempotent skip"),
@@ -2100,14 +2362,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("2026-07-20-x.md"), doc_with_hash("hash-a")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-b",
-            "content-b",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "content-b", &|p| {
+            file_matches_body(p, "hash-b")
+        });
         match claim {
             Claim::Wrote(path) => assert_eq!(path, tmp.path().join("2026-07-20-x-2.md")),
             _ => panic!("expected the -2 suffix to be claimed"),
@@ -2120,14 +2377,9 @@ mod tests {
         // time we get to it, but carries our OWN hash — same as a re-fire.
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("2026-07-20-x.md"), doc_with_hash("hash-a")).unwrap();
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "ignored",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         assert!(matches!(claim, Claim::AlreadyPersisted(_)));
     }
 
@@ -2141,9 +2393,8 @@ mod tests {
             tmp.path(),
             "2026-07-20-x",
             "sid12345",
-            "hash-new",
             "content-new",
-            None,
+            &|p| file_matches_body(p, "hash-new"),
         );
         match claim {
             Claim::Wrote(path) => {
@@ -2162,14 +2413,9 @@ mod tests {
         let fallback = fallback_path(tmp.path(), "2026-07-20-x", "sid12345");
         fs::write(&fallback, doc_with_hash("hash-new")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-new",
-            "ignored",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-new")
+        });
         match claim {
             Claim::AlreadyPersisted(path) => assert_eq!(path, fallback),
             _ => panic!("expected the fallback re-fire to be idempotent"),
@@ -2185,14 +2431,9 @@ mod tests {
         let fallback = fallback_path(tmp.path(), "2026-07-20-x", "sid12345");
         fs::write(&fallback, doc_with_hash("someone-elses-hash")).unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-new",
-            "ignored",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-new")
+        });
         assert!(
             matches!(claim, Claim::GiveUp),
             "no further ladder beyond the fallback — must give up, never overwrite"
@@ -2341,14 +2582,9 @@ mod tests {
         )
         .unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            &body_hash,
-            "ignored",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, &body_hash)
+        });
         match claim {
             Claim::AlreadyPersisted(path) => assert_eq!(path, base),
             _ => panic!("a backfilled doc holding this exact body is a re-fire, not a new plan"),
@@ -2374,14 +2610,9 @@ mod tests {
         )
         .unwrap();
 
-        let claim = claim_target(
-            tmp.path(),
-            "2026-07-20-x",
-            "sid12345",
-            "hash-a",
-            "ignored",
-            None,
-        );
+        let claim = claim_target(tmp.path(), "2026-07-20-x", "sid12345", "ignored", &|p| {
+            file_matches_body(p, "hash-a")
+        });
         assert!(
             matches!(claim, Claim::AlreadyPersisted(_)),
             "must anchor on the LAST hash line, not the decoy"
@@ -2963,14 +3194,18 @@ mod tests {
                 &plans_dir,
                 "2026-08-16-x",
                 "session-id",
-                "hash",
+                &Recognizer::with_ledger(
+                    body,
+                    tmp.path(),
+                    &Disposition::Repo,
+                    PlanLedger::default(),
+                ),
                 "document text",
                 None,
                 "2026-08-16T00:00:00Z",
                 None,
                 "session-id",
                 "digest",
-                tmp.path(),
                 "unknown",
                 body,
                 recommended_tier(body),
@@ -3008,14 +3243,18 @@ mod tests {
                     &plans_dir,
                     "2026-08-16-x",
                     "session-id",
-                    "hash",
+                    &Recognizer::with_ledger(
+                        body,
+                        tmp.path(),
+                        &Disposition::Repo,
+                        PlanLedger::default(),
+                    ),
                     "document text",
                     None,
                     "2026-08-16T00:00:00Z",
                     parent,
                     "session-id",
                     "digest",
-                    tmp.path(),
                     "unknown",
                     body,
                     recommended_tier(body),
@@ -3068,14 +3307,18 @@ mod tests {
                 &plans_dir,
                 "2026-08-16-x",
                 "session-id",
-                "hash",
+                &Recognizer::with_ledger(
+                    body,
+                    tmp.path(),
+                    &Disposition::Repo,
+                    PlanLedger::default(),
+                ),
                 "document text",
                 None,
                 "2026-08-16T00:00:00Z",
                 None,
                 "session-id",
                 "digest",
-                tmp.path(),
                 "unknown",
                 body,
                 recommended_tier(body),
@@ -3851,53 +4094,179 @@ mod tests {
         assert!(written.ends_with("---\n\n# Merge Me\n\n- [x] done\n"));
     }
 
-    #[test]
-    fn same_session_refire_of_a_frontmatter_plan_writes_no_sibling_without_a_body_hash() {
-        // cadence-hooks#870 retired the frontmatter `body_sha256:` that used to
-        // be the tier-1 re-fire anchor. A merged-frontmatter document no longer
-        // recomputes to the approval's hash (the plan's own block was folded
-        // into the hook's), so the ledger is what keeps a same-session re-fire
-        // from laddering into a `-2` copy.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        let cwd = tmp.path().to_string_lossy().into_owned();
-        let metrics_dir = TempDir::new().unwrap();
-        let transcript_path = tmp.path().join("refire-sid.jsonl");
+    /// One same-session `ExitPlanMode` approval of `plan` by `sid` in `repo`,
+    /// recording to `metrics`, on 2026-07-20.
+    fn approve_on(repo: &Path, metrics: &Path, sid: &str, plan: &str) -> CheckResult {
+        let transcript_path = repo.join(format!("{sid}.jsonl"));
         fs::write(&transcript_path, "{}").unwrap();
         let input = exit_plan_mode_post_tool_use(
-            "refire-sid",
-            "---\nstatus: in-flight\nbranch: main\n---\n\n# Refire Me\n\n- [ ] step",
-            &cwd,
+            sid,
+            plan,
+            &repo.to_string_lossy(),
             &transcript_path.to_string_lossy(),
             Some(false),
         );
-        let fire = || {
-            with_metrics_dir(metrics_dir.path(), || {
-                run_persist_plan_approval(
-                    &input,
-                    "2026-07-20T00:00:00Z",
-                    "2026-07-20",
-                    "test-host",
-                    &test_env(),
-                )
-            })
-        };
-        assert_eq!(fire().outcome, Outcome::Nudge);
-        let second = fire();
-        assert_eq!(second.outcome, Outcome::Nudge);
-        let plans = tmp.path().join("docs/plans");
-        assert!(plans.join("2026-07-20-refire-me.md").exists());
-        assert!(
-            !plans.join("2026-07-20-refire-me-2.md").exists(),
-            "a re-fire must not mint a sibling: {:?}",
-            second.message
-        );
-        assert!(
-            second
-                .message
+        with_metrics_dir(metrics, || {
+            run_persist_plan_approval(
+                &input,
+                "2026-07-20T00:00:00Z",
+                "2026-07-20",
+                "test-host",
+                &test_env(),
+            )
+        })
+    }
+
+    #[test]
+    fn same_session_refire_of_a_frontmatter_plan_writes_no_sibling_without_a_body_hash() {
+        // cadence-hooks#870 retired the frontmatter `body_sha256:` that used to
+        // be the tier-1 re-fire anchor; the hook must still recognize its own
+        // output for a plan that carries frontmatter.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let metrics_dir = TempDir::new().unwrap();
+        let plan = "---\nstatus: in-flight\nbranch: main\n---\n\n# Refire Me\n\n- [ ] step";
+        for _ in 0..2 {
+            let r = approve_on(tmp.path(), metrics_dir.path(), "refire-sid", plan);
+            assert_eq!(r.outcome, Outcome::Nudge);
+        }
+        assert_eq!(plan_names(tmp.path()), ["2026-07-20-refire-me.md"]);
+    }
+
+    /// #1085 review P7: another session approving a byte-identical plan that
+    /// carries frontmatter recognizes the hook's own output by the tier-3
+    /// recompute past the plan's frontmatter, with no ledger to lean on.
+    #[test]
+    fn cross_session_identical_frontmatter_plan_writes_no_sibling() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let plan = "---\nstatus: in-flight\nbranch: main\n---\n\n# Seven\n\n- [ ] step";
+        let first_metrics = TempDir::new().unwrap();
+        approve_on(tmp.path(), first_metrics.path(), "sid-a", plan);
+        let second_metrics = TempDir::new().unwrap();
+        let r = approve_on(tmp.path(), second_metrics.path(), "sid-b", plan);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(plan_names(tmp.path()), ["2026-07-20-seven.md"]);
+    }
+
+    /// #1085 review P8: a plain plan persisted, then ticked, then re-approved
+    /// by another session. The file no longer recomputes to the approval, but
+    /// the ledger proves the hook wrote that path for that body. With no
+    /// ledger row (a different metrics dir) the ladder still mints `-2`.
+    #[test]
+    fn ticked_plan_reapproved_by_another_session_is_recognized_through_the_ledger() {
+        let plan = "# Eight\n\n- [ ] one\n- [ ] two";
+        for shared_ledger in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            let first_metrics = TempDir::new().unwrap();
+            approve_on(tmp.path(), first_metrics.path(), "sid-a", plan);
+            let path = tmp.path().join("docs/plans/2026-07-20-eight.md");
+            let ticked = fs::read_to_string(&path)
                 .unwrap()
-                .contains("already persisted this plan"),
-            "the ledger names the earlier copy"
+                .replace("- [ ] one", "- [x] one");
+            fs::write(&path, &ticked).unwrap();
+            let other_metrics = TempDir::new().unwrap();
+            let metrics = if shared_ledger {
+                first_metrics.path()
+            } else {
+                other_metrics.path()
+            };
+            let r = approve_on(tmp.path(), metrics, "sid-b", plan);
+            assert_eq!(r.outcome, Outcome::Nudge);
+            let expected: &[&str] = if shared_ledger {
+                &["2026-07-20-eight.md"]
+            } else {
+                &["2026-07-20-eight-2.md", "2026-07-20-eight.md"]
+            };
+            assert_eq!(plan_names(tmp.path()), expected, "{:?}", r.message);
+            assert_eq!(fs::read_to_string(&path).unwrap(), ticked);
+        }
+    }
+
+    /// #1085 review N2: a legacy `body_sha256:` key is believed only where the
+    /// ledger cannot contradict it. A ledger that knows the path under a
+    /// different hash wins; a ledger that has never seen the path leaves the
+    /// read-only legacy tier in charge.
+    #[test]
+    fn legacy_frontmatter_hash_is_gated_by_the_ledger_when_it_knows_the_path() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let body = "# Legacy\n\nbody";
+        let hash = sha256_hex(body.as_bytes());
+        let path = base.join("docs/plans/2026-07-20-legacy.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The body drifted, so only tier 1 could match.
+        fs::write(
+            &path,
+            format!("---\nbody_sha256: \"{hash}\"\n---\n\n# Legacy\n\nedited body\n"),
+        )
+        .unwrap();
+        let disposition = Disposition::Repo;
+        let rel = "docs/plans/2026-07-20-legacy.md".to_string();
+        let silent = Recognizer::with_ledger(body, &base, &disposition, PlanLedger::default());
+        assert!(
+            silent.holds_this_plan(&path),
+            "no ledger entry: legacy tier"
+        );
+        let contradicting = Recognizer::with_ledger(
+            body,
+            &base,
+            &disposition,
+            PlanLedger {
+                rows: vec![("another-hash".into(), rel.clone())],
+            },
+        );
+        assert!(!contradicting.holds_this_plan(&path));
+        let confirming = Recognizer::with_ledger(
+            body,
+            &base,
+            &disposition,
+            PlanLedger {
+                rows: vec![(hash, rel)],
+            },
+        );
+        assert!(confirming.holds_this_plan(&path));
+        // The ledger fallback never answers for a file that is not there.
+        fs::remove_file(&path).unwrap();
+        assert!(!confirming.holds_this_plan(&path));
+    }
+
+    /// #1085 review N3: the re-fire wording says whether the earlier copy is
+    /// still on disk, and a same-session re-approval still carries the #608
+    /// reminder and the #823 directive.
+    #[test]
+    fn refire_nudge_names_whether_the_copy_survives_and_keeps_the_approval_lines() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("docs/plans")).unwrap();
+        fs::write(tmp.path().join("docs/plans/kept.md"), "x").unwrap();
+        let copy = |p: &str| EarlierCopy {
+            label: format!("`{p}`"),
+            path: Some(p.to_string()),
+        };
+        let kept = refire_nudge(&copy("docs/plans/kept.md"), tmp.path(), false, None);
+        assert!(kept.contains("which is still there"), "{kept}");
+        assert!(!kept.contains("save the plan by hand"), "{kept}");
+        let gone = refire_nudge(&copy("docs/plans/gone.md"), tmp.path(), false, None);
+        assert!(gone.contains("which is no longer there"), "{gone}");
+        assert!(gone.contains("save the plan by hand"), "{gone}");
+        let unknown = EarlierCopy {
+            label: "an earlier copy".into(),
+            path: None,
+        };
+        let unknown = refire_nudge(&unknown, tmp.path(), false, None);
+        assert!(!unknown.contains("still there") && !unknown.contains("no longer"));
+        assert!(!kept.contains(DRIVER_ANNOUNCE_REMINDER));
+        let same = refire_nudge(
+            &copy("docs/plans/kept.md"),
+            tmp.path(),
+            true,
+            Some(Tier::Opus),
+        );
+        assert!(same.contains(DRIVER_ANNOUNCE_REMINDER), "{same}");
+        assert!(
+            same.contains("This plan's recommended driver is opus"),
+            "{same}"
         );
     }
 
@@ -4171,6 +4540,55 @@ mod tests {
         assert_eq!(own[0]["parent_session_id"], parent_id, "file: {rows}");
     }
 
+    /// The hand copy an approve-and-clear session saves by hand: its own
+    /// frontmatter, the approval's heading, and a ticked step.
+    const HAND_COPY: &str = "---\nstatus: in-flight\napproved_session_id: \"x\"\n---\n\n\
+                             # Injected Plan\n\n- [x] Do the injected thing.\n";
+
+    /// Fire the injected arm once in a fresh repo on 2026-08-25. `setup` lays
+    /// out files under the repo root and returns the triggering `Write`'s
+    /// `file_path` (`None` for a Bash trigger).
+    fn injected_fire(setup: impl FnOnce(&Path) -> Option<String>) -> (TempDir, CheckResult) {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let parent_id = "11111111-2222-3333-4444-555555555561";
+        let transcript =
+            write_child_transcript(tmp.path(), &injected_prompt(tmp.path(), parent_id));
+        fs::create_dir_all(tmp.path().join("docs/plans")).unwrap();
+        let write_path = setup(tmp.path());
+        let mut input = injected_input(&cwd, &transcript, &unique_session_id("child-861"));
+        if let Some(file_path) = write_path {
+            input.tool_name = Some("Write".into());
+            input.tool_input = Some(ToolInput {
+                file_path: Some(file_path),
+                content: Some(HAND_COPY.into()),
+                ..Default::default()
+            });
+        }
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(
+                &input,
+                "2026-08-25T00:00:00Z",
+                "2026-08-25",
+                "test-host",
+                &test_env(),
+            )
+        });
+        (tmp, r)
+    }
+
+    /// Every `.md` name in the repo's plans dir, sorted.
+    fn plan_names(repo: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(repo.join("docs/plans"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// cadence-hooks#861: an approve-and-clear session whose FIRST tool call
     /// is a `Write` saving the plan by hand fires the injected arm on that
     /// Write. The hand copy carries its own frontmatter and a ticked step, so
@@ -4180,51 +4598,26 @@ mod tests {
     /// Write: adoption is keyed on the tool call, not on the stem.
     #[test]
     fn injected_arm_adopts_the_plan_file_its_own_write_just_saved() {
-        let hand_copy = "---\nstatus: in-flight\napproved_session_id: \"x\"\n---\n\n\
-                         # Injected Plan\n\n- [x] Do the injected thing.\n";
-        for (trigger_is_write, expect_sibling) in [(true, false), (false, true)] {
-            let tmp = TempDir::new().unwrap();
-            init_repo(tmp.path());
-            let cwd = tmp.path().to_string_lossy().into_owned();
-            let metrics_dir = TempDir::new().unwrap();
-            let parent_id = "11111111-2222-3333-4444-555555555561";
-            let transcript =
-                write_child_transcript(tmp.path(), &injected_prompt(tmp.path(), parent_id));
-            let plans = tmp.path().join("docs/plans");
-            fs::create_dir_all(&plans).unwrap();
-            let own = plans.join("2026-08-25-injected-plan.md");
-            fs::write(&own, hand_copy).unwrap();
-            let sid = unique_session_id("child-861");
-            let mut input = injected_input(&cwd, &transcript, &sid);
-            if trigger_is_write {
-                input.tool_name = Some("Write".into());
-                input.tool_input = Some(ToolInput {
-                    file_path: Some(own.to_string_lossy().into_owned()),
-                    content: Some(hand_copy.into()),
-                    ..Default::default()
-                });
-            }
-
-            let r = with_metrics_dir(metrics_dir.path(), || {
-                run_injected_plan_persist(
-                    &input,
-                    "2026-08-25T00:00:00Z",
-                    "2026-08-25",
-                    "test-host",
-                    &test_env(),
-                )
+        for trigger_is_write in [true, false] {
+            let (tmp, r) = injected_fire(|root| {
+                let own = root.join("docs/plans/2026-08-25-injected-plan.md");
+                fs::write(&own, HAND_COPY).unwrap();
+                trigger_is_write.then(|| own.to_string_lossy().into_owned())
             });
             assert_eq!(r.outcome, Outcome::Nudge);
-            let sibling = plans.join("2026-08-25-injected-plan-2.md");
+            let expected: &[&str] = if trigger_is_write {
+                &["2026-08-25-injected-plan.md"]
+            } else {
+                &[
+                    "2026-08-25-injected-plan-2.md",
+                    "2026-08-25-injected-plan.md",
+                ]
+            };
+            assert_eq!(plan_names(tmp.path()), expected, "{:?}", r.message);
             assert_eq!(
-                sibling.exists(),
-                expect_sibling,
-                "write trigger {trigger_is_write}: {:?}",
-                r.message
-            );
-            assert_eq!(
-                fs::read_to_string(&own).unwrap(),
-                hand_copy,
+                fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md"))
+                    .unwrap(),
+                HAND_COPY,
                 "the hand copy is never rewritten"
             );
             if trigger_is_write {
@@ -4235,6 +4628,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1085 review P1: a Write of unrelated content to the plan's own stem
+    /// must not certify it as the approved plan. The ladder runs and the
+    /// approval lands in `-2`.
+    #[test]
+    fn injected_arm_does_not_adopt_an_own_write_without_affinity() {
+        let garbage = "# Shopping list\n\n- milk\n";
+        let (tmp, r) = injected_fire(|root| {
+            let own = root.join("docs/plans/2026-08-25-injected-plan.md");
+            fs::write(&own, garbage).unwrap();
+            Some(own.to_string_lossy().into_owned())
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(
+            plan_names(tmp.path()),
+            [
+                "2026-08-25-injected-plan-2.md",
+                "2026-08-25-injected-plan.md"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md")).unwrap(),
+            garbage
+        );
+    }
+
+    /// #1085 review P3/P3b: a hand copy under another name in the plans dir
+    /// (another date, or the `-2` name with the base free) is adopted before
+    /// the ladder runs, so no second copy appears under the stem.
+    #[test]
+    fn injected_arm_adopts_a_hand_copy_under_another_name() {
+        for name in [
+            "2026-08-24-injected-plan.md",
+            "2026-08-25-injected-plan-2.md",
+        ] {
+            let (tmp, r) = injected_fire(|root| {
+                let own = root.join("docs/plans").join(name);
+                fs::write(&own, HAND_COPY).unwrap();
+                Some(own.to_string_lossy().into_owned())
+            });
+            assert_eq!(r.outcome, Outcome::Nudge);
+            assert_eq!(plan_names(tmp.path()), [name], "{:?}", r.message);
+            assert!(r.message.unwrap().contains(name));
+        }
+    }
+
+    /// #1085 review N4: a relative `file_path` resolves against the payload
+    /// `cwd`.
+    #[test]
+    fn injected_arm_resolves_a_relative_own_write_against_cwd() {
+        let (tmp, r) = injected_fire(|root| {
+            fs::write(
+                root.join("docs/plans/2026-08-24-injected-plan.md"),
+                HAND_COPY,
+            )
+            .unwrap();
+            Some("docs/plans/2026-08-24-injected-plan.md".into())
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert_eq!(plan_names(tmp.path()), ["2026-08-24-injected-plan.md"]);
+    }
+
+    /// #1085 review N6: a Write outside the plans dir, or to a symlink inside
+    /// it, is never adopted; the hook writes its own copy as usual.
+    #[test]
+    fn injected_arm_does_not_adopt_a_write_elsewhere_or_through_a_symlink() {
+        // Outside the plans dir, same content.
+        let (tmp, _) = injected_fire(|root| {
+            let notes = root.join("notes");
+            fs::create_dir_all(&notes).unwrap();
+            let own = notes.join("2026-08-24-injected-plan.md");
+            fs::write(&own, HAND_COPY).unwrap();
+            Some(own.to_string_lossy().into_owned())
+        });
+        assert_eq!(plan_names(tmp.path()), ["2026-08-25-injected-plan.md"]);
+
+        // A plans-dir symlink to a matching file elsewhere.
+        #[cfg(unix)]
+        {
+            let (tmp, r) = injected_fire(|root| {
+                let real = root.join("elsewhere.md");
+                fs::write(&real, HAND_COPY).unwrap();
+                let link = root.join("docs/plans/2026-08-24-injected-plan.md");
+                std::os::unix::fs::symlink(&real, &link).unwrap();
+                Some(link.to_string_lossy().into_owned())
+            });
+            assert_eq!(
+                plan_names(tmp.path()),
+                ["2026-08-24-injected-plan.md", "2026-08-25-injected-plan.md"],
+                "{:?}",
+                r.message
+            );
+        }
+    }
+
+    #[test]
+    fn own_write_without_an_absolute_cwd_is_not_adopted() {
+        let tmp = TempDir::new().unwrap();
+        let plans = tmp.path().canonicalize().unwrap();
+        fs::write(plans.join("p.md"), HAND_COPY).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some("p.md".into()),
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        let body = "# Injected Plan\n\nDo the injected thing.";
+        assert_eq!(adoptable_own_write(&input, &plans, body), None);
+        let absolute = HookInput {
+            tool_input: Some(ToolInput {
+                file_path: Some(plans.join("p.md").to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            ..input
+        };
+        assert_eq!(
+            adoptable_own_write(&absolute, &plans, body),
+            Some(plans.join("p.md"))
+        );
+    }
+
+    #[test]
+    fn affinity_accepts_ticks_and_blank_runs_or_the_heading_and_nothing_else() {
+        let body = "# Plan Title\n\n- [ ] one\n- [ ] two";
+        assert!(has_affinity(
+            "---\nstatus: x\n---\n\n# Plan Title\n\n\n\n- [x] one\n- [X] two\n",
+            body
+        ));
+        assert!(has_affinity("prose\n# Plan Title\nmore", body));
+        assert!(!has_affinity("# Other Title\n\n- [ ] one\n", body));
+        assert!(!has_affinity("mentions Plan Title inline", body));
+        // No heading: only the normalized-equality path.
+        assert!(has_affinity("- [x] a", "- [ ] a"));
+        assert!(!has_affinity("- [x] b", "- [ ] a"));
     }
 
     /// A reboot clears the marker temp dir, and a resumed session keeps its
