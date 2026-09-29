@@ -1077,4 +1077,77 @@ mod tests {
         assert_eq!(req.method.as_deref(), Some("PATCH"));
         assert_eq!(req.input, Some(File("p.json".into())));
     }
+
+    // --- cadence-hooks#1171: endpoint query strings and unread bodies
+
+    #[test]
+    fn percent_decode_forms() {
+        let cases: &[(&str, &str)] = &[
+            ("plain", "plain"),
+            ("a%20b", "a b"),
+            ("a+b", "a b"),
+            ("a%2Bb", "a+b"),
+            ("%41%62", "Ab"),
+            ("%e2%9c%93", "\u{2713}"),
+            ("100%", "100%"),
+            ("%zz", "%zz"),
+            ("%4", "%4"),
+            ("%ff", "\u{fffd}"),
+            ("", ""),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(percent_decode(raw), *want, "percent_decode({raw:?})");
+        }
+    }
+
+    #[test]
+    fn query_pairs_forms() {
+        let pairs = |endpoint: &str| {
+            ApiRequest {
+                endpoint: endpoint.to_string(),
+                ..Default::default()
+            }
+            .query_pairs()
+        };
+        let p = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert!(pairs("repos/o/r/issues").is_empty());
+        assert!(pairs("repos/o/r/issues?").is_empty());
+        assert_eq!(
+            pairs("x?title=a%20b&n=1"),
+            vec![p("title", "a b"), p("n", "1")]
+        );
+        assert_eq!(pairs("x?flag&k=v"), vec![p("flag", ""), p("k", "v")]);
+        assert_eq!(pairs("x?a=b=c"), vec![p("a", "b=c")]);
+        assert_eq!(pairs("x?a=1#frag=2"), vec![p("a", "1")]);
+        assert_eq!(pairs("x?a=1&&b=2"), vec![p("a", "1"), p("b", "2")]);
+        assert_eq!(
+            pairs("https://ghe.x/api/v3/repos/o/r?t%69tle=x"),
+            vec![p("title", "x")]
+        );
+    }
+
+    #[test]
+    fn extract_body_reads_reports_stdin_and_unread_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("ok.md"), "hello").unwrap();
+        let reads = |cmd: &str| extract_body_reads(cmd, base);
+        assert_eq!(
+            reads("gh pr create --body-file ok.md"),
+            vec![BodyRead::Text("hello".into(), BodySource::File)]
+        );
+        assert_eq!(reads("gh pr create --body-file -"), vec![BodyRead::Stdin]);
+        assert_eq!(reads("git commit -F -"), vec![BodyRead::Stdin]);
+        assert_eq!(reads("gh pr create --body-file=-"), vec![BodyRead::Stdin]);
+        assert_eq!(
+            reads("gh pr create --body-file nope.md"),
+            vec![BodyRead::Unread {
+                path: "nope.md".into(),
+                why: BodyFileError::Unreadable
+            }]
+        );
+        // The sourced view keeps its old contract: text only.
+        assert!(extract_bodies_sourced("gh pr create --body-file -", base).is_empty());
+        assert!(extract_bodies_sourced("gh pr create --body-file nope.md", base).is_empty());
+    }
 }

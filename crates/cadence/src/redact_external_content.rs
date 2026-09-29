@@ -384,10 +384,32 @@ fn posted_texts(segment: &str, base_dir: &str, stdin: &mut StdinResolver, sink: 
 /// input pays nothing, and a flood of identical segments is resolved once.
 struct StdinResolver<'a> {
     command: &'a str,
-    ops: Option<Vec<(String, Option<&'static str>)>>,
-    heredocs: Option<Vec<HeredocLine>>,
+    ops: Option<SegmentIndex>,
+    heredocs: Option<HeredocIndex>,
     cache: HashMap<String, Option<Vec<Posted>>>,
 }
+
+/// The top-level segments of the command with the operator after each, and
+/// where each distinct segment text first sits.
+struct SegmentIndex {
+    segments: Vec<(String, Option<&'static str>)>,
+    first: HashMap<String, usize>,
+}
+
+/// The heredoc lines, with the lines whose whole text is a given string, so
+/// the usual case — a segment that is its whole line — is a lookup.
+struct HeredocIndex {
+    lines: Vec<HeredocLine>,
+    by_text: HashMap<String, Vec<usize>>,
+    /// Bytes the substring fallback may still compare: a command with
+    /// thousands of heredocs and segments that are not whole lines would
+    /// otherwise cost a scan per segment. Past it the text is not found and
+    /// the segment gets the standard-input note.
+    budget: usize,
+}
+
+/// Bytes of heredoc-line text the substring fallback compares per command.
+const HEREDOC_SEARCH_BUDGET: usize = 2_000_000;
 
 /// A command line that introduces heredocs, with each body and the byte offset
 /// of the operator that owns it.
@@ -421,14 +443,19 @@ impl<'a> StdinResolver<'a> {
         if !own.is_empty() {
             return Some(own);
         }
-        let ops = self
-            .ops
-            .get_or_insert_with(|| split_segments_with_ops(self.command));
-        let idx = ops.iter().position(|(s, _)| s == segment)?;
-        if idx == 0 || !matches!(ops[idx - 1].1, Some("|" | "|&")) {
+        let index = self.ops.get_or_insert_with(|| {
+            let segments = split_segments_with_ops(self.command);
+            let mut first = HashMap::new();
+            for (i, (text, _)) in segments.iter().enumerate() {
+                first.entry(text.clone()).or_insert(i);
+            }
+            SegmentIndex { segments, first }
+        });
+        let idx = *index.first.get(segment)?;
+        if idx == 0 || !matches!(index.segments[idx - 1].1, Some("|" | "|&")) {
             return None;
         }
-        let stage = ops[idx - 1].0.clone();
+        let stage = index.segments[idx - 1].0.clone();
         self.piped(&stage)
     }
 
@@ -452,13 +479,41 @@ impl<'a> StdinResolver<'a> {
         if starts.is_empty() {
             return out;
         }
-        let heredocs = self
-            .heredocs
-            .get_or_insert_with(|| heredoc_lines(self.command));
-        for line in heredocs.iter() {
-            let Some(at) = line.text.find(segment) else {
-                continue;
-            };
+        let index = self.heredocs.get_or_insert_with(|| {
+            let lines = heredoc_lines(self.command);
+            let mut by_text: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, line) in lines.iter().enumerate() {
+                by_text
+                    .entry(line.text.trim().to_string())
+                    .or_default()
+                    .push(i);
+            }
+            HeredocIndex {
+                lines,
+                by_text,
+                budget: HEREDOC_SEARCH_BUDGET,
+            }
+        });
+        let mut owned: Vec<(&HeredocLine, usize)> = Vec::new();
+        if let Some(hits) = index.by_text.get(segment.trim()) {
+            for &i in hits {
+                let line = &index.lines[i];
+                if let Some(at) = line.text.find(segment) {
+                    owned.push((line, at));
+                }
+            }
+        } else {
+            for line in &index.lines {
+                if index.budget < line.text.len() {
+                    break;
+                }
+                index.budget -= line.text.len();
+                if let Some(at) = line.text.find(segment) {
+                    owned.push((line, at));
+                }
+            }
+        }
+        for (line, at) in owned {
             for (start, body) in &line.bodies {
                 if *start >= at && *start < at + segment.len() {
                     out.push((body.clone(), BodySource::File));
@@ -4037,6 +4092,332 @@ term = "acmecorp"
                     Outcome::Block
                 );
             },
+        );
+    }
+
+    // --- cadence-hooks#1171: the identity tier's remaining gaps -------------
+
+    /// The notes `gather_posted` reports for `cmd` (no env, no term source).
+    fn notes_for(cmd: &str) -> Vec<String> {
+        gather_posted(cmd, ".").1
+    }
+
+    #[test]
+    fn stdin_bodies_the_command_line_shows_reach_the_identity_block() {
+        // A body read from standard input is text the shell feeds in: a
+        // heredoc, a here-string, or an echo/printf literal piped into it.
+        // Every row posts the term.
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api repos/o/r/issues --input - <<'EOF'\n{\"body\":\"we run acmecorp\"}\nEOF",
+                "cat <<'EOF' | gh api repos/o/r/issues --input -\n{\"body\":\"acmecorp\"}\nEOF",
+                "gh api repos/o/r/issues -F body=@- <<< 'acmecorp'",
+                "gh api repos/o/r/issues -F body=@- <<<acmecorp",
+                "echo '{\"body\":\"acmecorp\"}' | gh api repos/o/r/issues --input -",
+                "echo 'acmecorp notes' | gh pr create --body-file -",
+                "echo -e 'acmecorp notes' | gh pr create --body-file -",
+                "printf '%s' 'acmecorp' | gh pr create -F -",
+                "printf 'acmecorp\\n' | gh issue comment 3 --body-file -",
+                "echo hi; echo acmecorp | gh issue comment 3 --body-file -",
+                "gh pr create --body-file - <<EOF\nacmecorp\nEOF",
+                "gh pr create --body-file - <<-EOF\n\tacmecorp\n\tEOF",
+                "gh pr create --body-file - <<EOF\nline one\nacmecorp\nEOF\necho done",
+                "git commit -F - <<EOF\nacmecorp\nEOF",
+                "cat <<EOF | git commit -F -\nacmecorp\nEOF",
+                "gh pr create --body-file=- <<EOF\nacmecorp\nEOF",
+                // The segment is only part of its line.
+                "cd sub && gh pr create --body-file - <<EOF\nacmecorp\nEOF",
+                "true; gh pr create --body-file - <<'EOF' --title t\nacmecorp\nEOF",
+                "gh gist create <<EOF\nacmecorp\nEOF",
+                "gh gist create - <<EOF\nacmecorp\nEOF",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Block, "must block: {cmd:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn stdin_bodies_that_are_clean_or_unseen_never_block() {
+        // Never block on stdin alone: clean visible text allows, and text the
+        // command line does not show is not scanned, not blocked.
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh pr create --body-file - <<EOF\nclean\nEOF",
+                "echo clean | gh pr create --body-file -",
+                "git log | gh pr create --body-file -",
+                "cat notes.md | gh pr create --body-file -",
+                "gh pr create --body-file - < notes.md",
+                "gh api repos/o/r/issues -F body=@-",
+                // The heredoc feeds `cat`, not the gh command after the `;`.
+                "cat <<EOF > /dev/null\nacmecorp\nEOF\ngh pr create --body-file -",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn stdin_that_is_not_visible_says_so_on_stderr_and_visible_stdin_does_not() {
+        for cmd in [
+            "git log | gh pr create --body-file -",
+            "gh api repos/o/r/issues -F body=@-",
+            "gh api repos/o/r/issues --input -",
+            "gh pr create --body-file - < notes.md",
+            "cat a b | gh pr create --body-file -",
+            "gh gist create",
+        ] {
+            let notes = notes_for(cmd);
+            assert_eq!(notes.len(), 1, "one note for: {cmd:?} got {notes:?}");
+            assert!(notes[0].contains("standard input"), "{cmd:?}: {notes:?}");
+        }
+        for cmd in [
+            "gh pr create --body-file - <<EOF\nx\nEOF",
+            "echo x | gh pr create --body-file -",
+            "gh api repos/o/r/issues -F body=@- <<< x",
+            "gh pr create --body-file notes-that-need-no-note.md --title t",
+            "gh pr create --body hello",
+        ] {
+            let notes = notes_for(cmd);
+            assert!(
+                notes.iter().all(|n| !n.contains("standard input")),
+                "no stdin note for: {cmd:?} got {notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_the_identity_scan_cannot_read_is_named_on_stderr_and_still_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("big.md"), vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        std::fs::write(dir.path().join("bin.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        std::fs::write(dir.path().join("ok.md"), "clean text").unwrap();
+        std::fs::create_dir(dir.path().join("adir")).unwrap();
+        let cases: &[(&str, &str)] = &[
+            (
+                "gh pr create --body-file missing.md",
+                "missing or unreadable",
+            ),
+            (
+                "gh pr create --body-file=missing.md",
+                "missing or unreadable",
+            ),
+            ("gh pr create -F missing.md", "missing or unreadable"),
+            ("gh pr create --body-file big.md", "over 1048576 bytes"),
+            ("gh pr create --body-file bin.md", "not valid UTF-8"),
+            ("gh pr create --body-file adir", "not a regular file"),
+            (
+                "gh api repos/o/r/issues -F body=@missing.md",
+                "missing or unreadable",
+            ),
+            (
+                "gh api repos/o/r/issues --input missing.json",
+                "missing or unreadable",
+            ),
+            (
+                "gh api repos/o/r/issues --input big.md",
+                "over 1048576 bytes",
+            ),
+            ("git commit -F missing.md", "missing or unreadable"),
+            (
+                "gh release create v1 --notes-file missing.md",
+                "missing or unreadable",
+            ),
+            ("gh gist create missing.md", "missing or unreadable"),
+            ("gh gist edit abc --add missing.md", "missing or unreadable"),
+        ];
+        for (cmd, why) in cases {
+            let (texts, notes) = gather_posted(cmd, base);
+            assert_eq!(notes.len(), 1, "{cmd:?}: {notes:?}");
+            assert!(
+                notes[0].starts_with("redact-external-content: identity scan could not read ")
+                    && notes[0].ends_with(why),
+                "{cmd:?}: {notes:?}"
+            );
+            assert!(texts.iter().all(|(t, _)| !t.contains("aaaa")), "{cmd:?}");
+            // The verdict is unchanged: the same command with the term armed
+            // still allows, because there is nothing to scan.
+            with_terms(FIXTURE, || {
+                let input = make_bash_with_cwd(cmd, base);
+                assert_eq!(
+                    RedactExternalContent.run(&input).outcome,
+                    Outcome::Allow,
+                    "{cmd:?}"
+                );
+            });
+        }
+        // The everyday flow stays silent.
+        for cmd in [
+            "gh pr create --body-file ok.md",
+            "git commit -F ok.md",
+            "gh gist create ok.md",
+            "gh pr create --title t --body hi",
+        ] {
+            let (_, notes) = gather_posted(cmd, base);
+            assert!(notes.is_empty(), "{cmd:?}: {notes:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_path_in_a_note_is_control_stripped() {
+        let notes = notes_for("gh pr create --body-file $'a\\x1b[31mb'");
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].contains('\x1b'), "{notes:?}");
+    }
+
+    #[test]
+    fn gist_file_contents_and_label_descriptions_reach_the_identity_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("leak.md"), "we run acmecorp").unwrap();
+        std::fs::write(dir.path().join("ok.md"), "fine").unwrap();
+        with_terms(FIXTURE, || {
+            let blocks = |cmd: &str| {
+                RedactExternalContent
+                    .run(&make_bash_with_cwd(cmd, base))
+                    .outcome
+                    == Outcome::Block
+            };
+            for cmd in [
+                "gh gist create leak.md",
+                "gh gist create ok.md leak.md",
+                "gh gist create -d desc -p leak.md",
+                "gh gist create --public --filename x leak.md",
+                "gh gist create leak.md > out.txt",
+                "gh gist edit abc123 leak.md",
+                "gh gist edit abc123 --add leak.md",
+                "gh gist edit abc123 --add=leak.md",
+                "gh gist edit abc123 -f old.txt leak.md",
+                "gh label create bug -d 'acmecorp bug'",
+                "gh label create bug --description 'acmecorp bug'",
+                "gh label create bug --description='acmecorp bug'",
+                "gh label edit bug -d acmecorp",
+                "gh label edit bug --description acmecorp",
+            ] {
+                assert!(blocks(cmd), "must block: {cmd:?}");
+            }
+            for cmd in [
+                "gh gist create ok.md",
+                "gh gist create ok.md -d fine",
+                "gh gist edit abc123 ok.md",
+                "gh gist edit leak.md",
+                "gh gist list leak.md",
+                "gh gist view abc123 --filename leak.md",
+                "gh label create bug -c ff0000",
+                "gh label create bug -d 'a clean description'",
+                "gh label list --search acmecorp",
+                "gh label delete acmecorp --yes",
+            ] {
+                assert!(!blocks(cmd), "must allow: {cmd:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_gist_stdin_operand_is_read_from_the_command_line() {
+        // `-`, and no operand at all, mean standard input for `gist create`.
+        assert!(
+            notes_for("gh gist create -")
+                .iter()
+                .any(|n| n.contains("standard input"))
+        );
+        assert!(
+            notes_for("gh gist create -d x")
+                .iter()
+                .any(|n| n.contains("standard input"))
+        );
+        assert!(
+            notes_for("gh gist create -f name -")
+                .iter()
+                .any(|n| n.contains("standard input"))
+        );
+        assert!(notes_for("gh gist edit abc123").is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_query_string_is_scanned_as_posted_text() {
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api -X POST 'repos/o/r/issues?title=acmecorp%20thing&x=1'",
+                "gh api -X POST 'repos/o/r/issues?x=1&title=acmecorp+thing'",
+                "gh api -X POST 'repos/o/r/issues?title=acme%63orp'",
+                "gh api -X POST 'repos/o/r/issues?ti%74le=x&body=acmecorp'",
+                "gh api --method PATCH 'repos/o/r/issues/1?title=acmecorp'",
+                "gh api -X POST repos/o/r/issues?title=acmecorp -f labels[]=bug",
+                "gh api -X POST 'repos/o/r/issues?acmecorp=1'",
+                "gh api -X PUT 'repos/o/r/topics?names=acmecorp'",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Block, "must block: {cmd:?}");
+            }
+            for cmd in [
+                // A GET sends nothing: the query only reads.
+                "gh api 'search/issues?q=acmecorp'",
+                "gh api -X GET 'repos/o/r/issues?title=acmecorp'",
+                "gh api 'repos/o/r/issues?title=acmecorp' -f x=1 -X GET",
+                // Nothing after a `#` is sent.
+                "gh api -X POST 'repos/o/r/issues?title=fine#acmecorp'",
+                "gh api -X POST 'repos/o/r/issues?title=fine&per_page=5'",
+                "gh api -X DELETE repos/o/r/issues/1/labels/bug",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn the_shaped_tiers_read_the_value_the_shell_passes() {
+        // `cadence\:attune` posts `cadence:attune`; the nudge must fire.
+        for cmd in [
+            "gh pr create --body 'see cadence\\:attune'",
+            "gh pr create --body see\\ cadence\\:attune",
+            "gh pr create --title cadence\\:attune",
+            "git commit -m 'ran cadence\\:attune'",
+            "gh pr create --body 'see /Users\\/cameron/x'",
+            "gh pr create --body 'see ~/.cla\\ude/settings.json'",
+        ] {
+            with_terms_cleared(|| {
+                assert_eq!(run(cmd).outcome, Outcome::Nudge, "must nudge: {cmd:?}");
+            });
+        }
+        // The same text spelled plainly already nudged: unchanged.
+        with_terms_cleared(|| {
+            assert_eq!(
+                run("gh pr create --body 'see cadence:attune'").outcome,
+                Outcome::Nudge
+            );
+            // A backslash elsewhere does not list the hit twice.
+            let msg = run("gh pr create --body 'a\\b cadence:attune'")
+                .message
+                .unwrap();
+            assert_eq!(msg.matches("cadence:attune").count(), 1, "{msg}");
+            // Clean text with a backslash stays silent.
+            assert_eq!(
+                run("gh pr create --body 'a\\b plain words'").outcome,
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn a_stdin_flood_stays_inside_the_deadline() {
+        // 200 KB of posting segments that each read standard input, and one
+        // large heredoc: resolved once per distinct segment, linear in size.
+        let flood = "gh pr create --body-file -; ".repeat(7_000);
+        let start = std::time::Instant::now();
+        let (_, notes) = gather_posted(&flood, ".");
+        assert_eq!(notes.len(), 1);
+        let heredoc = format!(
+            "gh pr create --body-file - <<EOF\n{}EOF",
+            "line of ordinary text\n".repeat(9_000)
+        );
+        let (texts, _) = gather_posted(&heredoc, ".");
+        assert_eq!(texts.len(), 1);
+        let lines = "echo a\n".repeat(30_000) + "gh pr create --body-file -";
+        let _ = gather_posted(&lines, ".");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
         );
     }
 }

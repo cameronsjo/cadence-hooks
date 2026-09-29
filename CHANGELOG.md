@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`redact-external-content` reads the bodies it could not see before, and says when it still cannot.** A body read from standard input (`--body-file -`, `-F -`, `-F x=@-`, `--input -`) is now scanned when the command line shows the text: a heredoc or here-string on the command, or the literals of an `echo`/`printf` (or a `cat` heredoc) piped into it; it blocks like any body and never blocks on standard input alone. A file it cannot read (missing, unreadable, not a regular file, not UTF-8, or over the 1 MiB cap) and standard input it cannot see now print one stderr line naming the cause; the verdict is unchanged (fail open), and a machine with no term source prints nothing. `gh gist create` and `gh gist edit` scan the contents of the files they name (`--add` included), `gh label create/edit -d/--description` joins the gate, and a non-GET `gh api` endpoint's percent-decoded query string is scanned as posted text. The shaped nudges (skill IDs, local paths) now read the value the shell passes as the identity tier does, so `cadence\:attune` no longer slips past them. (cameronsjo/cadence-hooks#1171)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security
