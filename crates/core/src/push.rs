@@ -31,11 +31,13 @@
 //! costs a false block on a harmless command, over-detecting it would let a real
 //! push through unscanned.
 
+use std::borrow::Cow;
+
 use crate::shell::{
-    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
-    executable_tokens_marked, git_command_line_aliases, git_output_detailed, installs_trap_action,
-    is_assignment_word, peel_command_runners, resolve_cd_target, runs_in_found_directories,
-    split_segments_with_ops, strip_group_wrappers, unescape_word,
+    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, apply_cd_target, child_scripts,
+    command_word, executable_tokens_marked, git_command_line_aliases, git_output_detailed,
+    installs_trap_action, is_assignment_word, peel_command_runners, resolve_cd_target,
+    runs_in_found_directories, split_segments_with_ops, strip_group_wrappers, unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -176,7 +178,8 @@ pub struct PushInvocation {
 /// push, and a scanner that only looked at top-level segments would miss it.
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    let walk = Walk::for_command(command, true);
+    let gh_hosts = GhHosts::for_command(command);
+    let walk = Walk::for_command(command, true, &gh_hosts);
     let mut writes = Vec::new();
     collect_push_invocations(
         command,
@@ -200,7 +203,8 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// publishes (cadence-hooks#1095).
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    let walk = Walk::for_command(command, false);
+    let gh_hosts = GhHosts::for_command(command);
+    let walk = Walk::for_command(command, false, &gh_hosts);
     let mut writes = Vec::new();
     collect_push_invocations(
         command,
@@ -275,22 +279,133 @@ struct Doubt {
 
 /// Settings for one whole walk, the same at every depth.
 #[derive(Debug, Clone, Copy)]
-struct Walk {
+struct Walk<'a> {
     /// Ask the repository how a bare push computes its refs.
     probe_config: bool,
     /// The command cannot have replaced `git` or `ssh-agent`, so a known
     /// substitution may be read by name — see
     /// [`may_redefine_known_commands`].
     trusts_known_commands: bool,
+    /// The hosts a `gh repo clone OWNER/REPO` may clone from.
+    gh_hosts: &'a GhHosts,
 }
 
-impl Walk {
-    fn for_command(command: &str, probe_config: bool) -> Self {
+impl<'a> Walk<'a> {
+    fn for_command(command: &str, probe_config: bool, gh_hosts: &'a GhHosts) -> Self {
         Self {
             probe_config,
             trusts_known_commands: !may_redefine_known_commands(command),
+            gh_hosts,
         }
     }
+}
+
+/// The hosts `gh` may resolve a bare `OWNER/REPO` against anywhere in one
+/// command: the inherited `GH_HOST` (else github.com), plus every literal
+/// `GH_HOST=<host>` the command writes. `gh repo clone OWNER/REPO` clones
+/// from `GH_HOST`, so mapping it to github.com always let
+/// `export GH_HOST=other.example; gh repo clone o/r && cd r && git push`
+/// through as a github.com push.
+///
+/// Read from the whole text, quotes and backslashes removed so that
+/// `GH_HO"ST"=x` still reads as the name the shell assembles, and without
+/// regard to order or scope: the set only grows, so an assignment after the
+/// clone, or in a subshell, can only add a host to judge. Any other mention —
+/// `$GH_HOST`, `${GH_HOST:=x}`, `read GH_HOST`, a value that is not a plain
+/// host — and any builtin that can assign a name the text does not spell
+/// (`export GH_HOS${X}T=…`, `eval`, `read`, `printf -v`) makes the host
+/// unreadable. This mirrors the candidate set guard-gh-write keeps for the
+/// same variable, more coarsely: coarseness here only costs a refusal.
+#[derive(Debug, Default)]
+struct GhHosts {
+    hosts: Vec<String>,
+    unreadable: bool,
+}
+
+impl GhHosts {
+    fn for_command(command: &str) -> Self {
+        let mut hosts = Self {
+            hosts: vec![crate::config::default_host()],
+            unreadable: false,
+        };
+        // Only a `gh repo clone` reads this; skip the scan for anything else.
+        if !command.contains("clone") {
+            return hosts;
+        }
+        let flat: String = command
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+            .collect();
+        hosts.observe(&flat);
+        hosts
+    }
+
+    fn observe(&mut self, flat: &str) {
+        static INDIRECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"\b(?:export|declare|typeset|readonly|local|eval|read|printf|mapfile|readarray|getopts)\b[^;&|\n]*[$`]",
+            )
+            .expect("pattern should compile")
+        });
+        if INDIRECT.is_match(flat) {
+            self.unreadable = true;
+        }
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        for (at, _) in flat.match_indices("GH_HOST") {
+            let before = flat[..at].chars().next_back();
+            let after = &flat[at + "GH_HOST".len()..];
+            // Another variable that merely contains the name.
+            if before.is_some_and(is_ident) || after.starts_with(is_ident) {
+                continue;
+            }
+            let head = flat[..at].trim_end();
+            let bare = after
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'));
+            // `unset GH_HOST` returns to the inherited host and `export
+            // GH_HOST` exports the value it has; both are candidates already.
+            if bare
+                && ["unset", "unset -v", "export"]
+                    .iter()
+                    .any(|v| head.ends_with(v))
+            {
+                continue;
+            }
+            // An assignment word starts a word: `${GH_HOST:=x}` and `$GH_HOST`
+            // do not.
+            let starts_word =
+                before.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '('));
+            let Some(value) = after.strip_prefix('=').filter(|_| starts_word) else {
+                self.unreadable = true;
+                continue;
+            };
+            let value = value
+                .split(|c: char| {
+                    c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '<' | '>')
+                })
+                .next()
+                .unwrap_or_default();
+            match plain_host(value) {
+                Some(host) => {
+                    if !self.hosts.contains(&host) {
+                        self.hosts.push(host);
+                    }
+                }
+                None => self.unreadable = true,
+            }
+        }
+    }
+}
+
+/// `value` lowercased when it is a plain host name (letters, digits, `.`,
+/// `-`, and a `:port`), else `None`.
+fn plain_host(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')))
+    .then(|| value.to_ascii_lowercase())
 }
 
 /// Could this command change what `git` or `ssh-agent` runs, before a
@@ -350,7 +465,7 @@ fn collect_push_invocations(
     cwd: &str,
     depth: usize,
     inherited: Doubt,
-    walk: Walk,
+    walk: Walk<'_>,
     writes: &mut Vec<ConfigRedirect>,
     out: &mut Vec<PushInvocation>,
 ) {
@@ -478,10 +593,16 @@ fn collect_push_invocations(
         let known_ok = walk.trusts_known_commands && substitutions_are_live(segment);
         // `env -C DIR`/`--chdir=DIR` runs this segment's command in DIR — and
         // any child script it starts — without moving the scope.
+        //
+        // Borrowed where it does not move: a copy per segment made a 200 KB
+        // `cd a; cd a; …` flood quadratic in the path it builds.
         let (segment_dir, segment_directory) = match env_chdir(prefix) {
-            EnvChdir::Stay => (effective_dir.clone(), scope_directory),
-            EnvChdir::To(dir) => (resolve_cd_target(dir, &effective_dir), scope_directory),
-            EnvChdir::Unreadable => (effective_dir.clone(), true),
+            EnvChdir::Stay => (Cow::Borrowed(effective_dir.as_str()), scope_directory),
+            EnvChdir::To(dir) => (
+                Cow::Owned(resolve_cd_target(dir, &effective_dir)),
+                scope_directory,
+            ),
+            EnvChdir::Unreadable => (Cow::Borrowed(effective_dir.as_str()), true),
         };
 
         // Children run with the directory in effect HERE — a substitution is
@@ -518,9 +639,13 @@ fn collect_push_invocations(
 
         match directory_verb(&tokens, known_ok) {
             Some(DirectoryVerb::Knowable(verb_tokens)) => {
-                match resolve_directory_verb(verb_tokens, &effective_dir, known_ok) {
-                    Some((moved, absolute)) => {
-                        effective_dir = moved;
+                match resolve_directory_verb(verb_tokens, known_ok) {
+                    Some((target, absolute)) => {
+                        // In place: a fresh join per `cd` copied the whole
+                        // path each time, quadratic under a `cd a; …` flood.
+                        if let Some(target) = target {
+                            apply_cd_target(&mut effective_dir, target);
+                        }
                         // A literal absolute target is where the shell is now,
                         // whatever came before it, so the directory doubt ends
                         // here. A which-repository doubt does not.
@@ -559,6 +684,7 @@ fn collect_push_invocations(
             &unquoted_prefix_lens,
             &segment_dir,
             known_ok,
+            walk.gh_hosts,
         ));
 
         if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &segment_dir, known_ok)
@@ -576,7 +702,7 @@ fn collect_push_invocations(
             out.push(invocation);
         } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &segment_dir) {
             out.push(PushInvocation {
-                work_dir: segment_dir.clone(),
+                work_dir: segment_dir.to_string(),
                 refspecs: Vec::new(),
                 all_or_mirror: false,
                 tags: false,
@@ -1260,13 +1386,10 @@ fn substitution_body(operands: &[&String]) -> Option<String> {
 ///
 /// `tokens` begins at the verb ([`directory_verb`] did the peel).
 ///
-/// Returns the new directory and whether it came from a literal absolute
+/// Returns the target to apply with [`apply_cd_target`] (`None` when the
+/// verb stays where it is), and whether it came from a literal absolute
 /// target, which ends any earlier directory doubt.
-fn resolve_directory_verb(
-    tokens: &[String],
-    effective_dir: &str,
-    known_ok: bool,
-) -> Option<(String, bool)> {
+fn resolve_directory_verb(tokens: &[String], known_ok: bool) -> Option<(Option<&str>, bool)> {
     let verb = tokens.first()?.as_str();
     if verb == "popd" {
         return None;
@@ -1294,7 +1417,7 @@ fn resolve_directory_verb(
     // ordinary, non-adversarial command refuse.
     let operands: Vec<&String> = strip_redirections(&tokens[idx..]);
     if known_ok && !stack_verb && names_the_current_toplevel(&operands) {
-        return Some((effective_dir.to_string(), false));
+        return Some((None, false));
     }
     if operands.len() != 1 {
         return None;
@@ -1313,7 +1436,7 @@ fn resolve_directory_verb(
                 && !(stack_verb && unescape_word(target).starts_with('+')) =>
         {
             Some((
-                resolve_cd_target(target, effective_dir),
+                Some(target.as_str()),
                 // A Windows drive path is as absolute as `/x`, the same test
                 // `resolve_cd_target` uses; `starts_with('/')` alone kept the
                 // doubt of an earlier `cd "$HOME"` alive past `cd C:\repo`.
@@ -1862,10 +1985,11 @@ fn humanish_directory(source: &str, bare: bool) -> Option<String> {
     })
 }
 
-/// The [`ConfigRedirect::Clone`] a clone of `source` into `directory` (or its
-/// default, `default_dir`) records, resolved against `dir`.
+/// The [`ConfigRedirect::Clone`] a clone of `sources` (each a place it may
+/// come from) into `directory` (or its default, `default_dir`) records,
+/// resolved against `dir`.
 fn clone_write(
-    source: ConfigRedirect,
+    sources: Vec<ConfigRedirect>,
     directory: Option<&String>,
     default_dir: Option<String>,
     mut redirects: Vec<ConfigRedirect>,
@@ -1878,7 +2002,7 @@ fn clone_write(
             .filter(|name| !name.contains(['$', '`']))
             .map(|name| resolve_cd_target(&name, dir)),
     };
-    redirects.insert(0, source);
+    redirects.splice(0..0, sources);
     ConfigRedirect::Clone { dest, redirects }
 }
 
@@ -1890,7 +2014,7 @@ fn git_clone_write(words: &[String], dir: &str) -> Option<ConfigRedirect> {
     let url = written_url(Some(source)).unwrap_or(ConfigRedirect::Unreadable);
     let default_dir = humanish_directory(source, bare);
     Some(clone_write(
-        url,
+        vec![url],
         positionals.get(1).copied(),
         default_dir,
         redirects,
@@ -1898,11 +2022,37 @@ fn git_clone_write(words: &[String], dir: &str) -> Option<ConfigRedirect> {
     ))
 }
 
+/// The `GH_HOST` an inline prefix (`GH_HOST=h gh …`, `env GH_HOST=h gh …`)
+/// hands one gh command: `None` when the prefix does not name it,
+/// `Some(Err(()))` when it names it in a way the text cannot read (an
+/// expansion in the value or the name, `env -u GH_HOST`).
+fn inline_gh_host(prefix: &[String]) -> Option<Result<Vec<String>, ()>> {
+    let mut found = None;
+    for word in prefix {
+        let word = unescape_word(word);
+        match word.split_once('=') {
+            Some(("GH_HOST", value)) => {
+                found = Some(plain_host(value).map(|host| vec![host]).ok_or(()));
+            }
+            Some((name, _)) if name.contains(['$', '`']) => found = Some(Err(())),
+            None if word.contains("GH_HOST") => found = Some(Err(())),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// The write a `gh repo clone REPO [DIR] [-- GITFLAGS…]` makes; `words` are
-/// the unescaped words after `clone`. `OWNER/REPO` is github.com's,
-/// `HOST/OWNER/REPO` that host's, and a URL is itself. A bare `REPO` is the
-/// signed-in user's, whom the text cannot name, so it is unreadable.
-fn gh_clone_write(words: &[String], dir: &str) -> Option<ConfigRedirect> {
+/// the unescaped words after `clone`. `OWNER/REPO` is on the `GH_HOST` gh
+/// runs with — each of `gh_hosts`, or unreadable when that is `None` —
+/// `HOST/OWNER/REPO` on that host, and a URL (gh reads any `:` as one) is
+/// itself. A bare `REPO` is the signed-in user's, whom the text cannot name,
+/// so it is unreadable.
+fn gh_clone_write(
+    words: &[String],
+    dir: &str,
+    gh_hosts: Option<&[String]>,
+) -> Option<ConfigRedirect> {
     let split = words.iter().position(|word| word == "--");
     let (own, git_flags) = match split {
         Some(at) => (&words[..at], &words[at + 1..]),
@@ -1920,24 +2070,30 @@ fn gh_clone_write(words: &[String], dir: &str) -> Option<ConfigRedirect> {
     }
     let (_, redirects, bare) = clone_words(git_flags);
     let repo = *positionals.first()?;
-    let url = if repo.contains("://") || repo.contains('@') {
-        written_url(Some(repo)).unwrap_or(ConfigRedirect::Unreadable)
+    let urls = if repo.contains([':', '@']) {
+        vec![written_url(Some(repo)).unwrap_or(ConfigRedirect::Unreadable)]
     } else {
         let parts: Vec<&str> = repo.split('/').collect();
         match parts.as_slice() {
-            _ if repo.contains(['$', '`']) => ConfigRedirect::Unreadable,
-            [owner, name] if !owner.is_empty() && !name.is_empty() => {
-                ConfigRedirect::Url(format!("https://github.com/{owner}/{name}"))
-            }
+            _ if repo.contains(['$', '`']) => vec![ConfigRedirect::Unreadable],
+            [owner, name] if !owner.is_empty() && !name.is_empty() => match gh_hosts {
+                Some(hosts) => hosts
+                    .iter()
+                    .map(|host| ConfigRedirect::Url(format!("https://{host}/{owner}/{name}")))
+                    .collect(),
+                None => vec![ConfigRedirect::Unreadable],
+            },
             [host, owner, name] if [host, owner, name].iter().all(|p| !p.is_empty()) => {
-                ConfigRedirect::Url(format!("https://{host}/{owner}/{name}"))
+                vec![ConfigRedirect::Url(format!(
+                    "https://{host}/{owner}/{name}"
+                ))]
             }
-            _ => ConfigRedirect::Unreadable,
+            _ => vec![ConfigRedirect::Unreadable],
         }
     };
     let default_dir = humanish_directory(repo, bare);
     Some(clone_write(
-        url,
+        urls,
         positionals.get(1).copied(),
         default_dir,
         redirects,
@@ -2046,6 +2202,7 @@ fn config_writes_of(
     unquoted_prefix_lens: &[usize],
     dir: &str,
     known_ok: bool,
+    gh_hosts: &GhHosts,
 ) -> Vec<ConfigRedirect> {
     let mut writes = Vec::new();
     // Every output redirection, glued (`x>>.git/config`) or not. One whose
@@ -2077,7 +2234,15 @@ fn config_writes_of(
         if words.first().is_some_and(|word| word == "repo")
             && words.get(1).is_some_and(|word| word == "clone")
         {
-            writes.extend(gh_clone_write(&words[2..], dir));
+            let prefix = &tokens[..tokens.len().saturating_sub(argv.len())];
+            let hosts = inline_gh_host(prefix).unwrap_or_else(|| {
+                if gh_hosts.unreadable {
+                    Err(())
+                } else {
+                    Ok(gh_hosts.hosts.clone())
+                }
+            });
+            writes.extend(gh_clone_write(&words[2..], dir, hosts.as_deref().ok()));
         }
         return writes;
     }

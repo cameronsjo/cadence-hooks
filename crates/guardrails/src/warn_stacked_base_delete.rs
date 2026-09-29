@@ -10,7 +10,7 @@
 //! Two delete paths are watched:
 //!
 //! - `git push <remote> --delete <branch>…` / `-d` / `:<branch>`, read by the
-//!   shared push walk ([`push_invocations`]). The remote is resolved from
+//!   shared push walk ([`push_locations`]). The remote is resolved from
 //!   local git config (`git remote get-url`), or read directly when it is a
 //!   URL. Either way its host must be `github.com` or `origin`'s host.
 //! - `gh pr merge --delete-branch` / `-d`: the PR is resolved exactly as the
@@ -26,8 +26,9 @@
 //! command names it or a non-origin remote's URL does, and every gh call is
 //! bounded ([`crate::bounded_tool`]).
 
+use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
-    gh_pr_segments, gh_pr_subcommand, git_command, host_and_repo_from_url, push_invocations,
+    gh_pr_segments, gh_pr_subcommand, git_command, host_and_repo_from_url,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::PathBuf;
@@ -212,6 +213,23 @@ impl WarnStackedBaseDelete {
 /// can record what (if anything) would be queried.
 type GhFactory<'a> = dyn Fn(PathBuf, Vec<(String, String)>) -> Box<dyn GhRunner> + 'a;
 
+/// The most deleted branches one command is checked for. Each costs a gh
+/// call, and each deleting push up to two `git remote get-url` spawns, so a
+/// flood of deletes would otherwise spend the whole hook budget and go
+/// silent. Past the cap the nudge fires without the check.
+const MAX_CHECKED_DELETES: usize = 8;
+
+/// The nudge for a command deleting more branches than the hook will check.
+fn unchecked_message(count: usize) -> String {
+    format!(
+        "warn-stacked-base-delete: this command deletes {count} branches, more \
+         than the {MAX_CHECKED_DELETES} checked for dependent PRs. Deleting a branch an open \
+         PR bases on CLOSES that PR — GitHub does not retarget it. Retarget any dependent \
+         first (`gh pr edit <n> --base <new-base>`), then delete. See \
+         `cadence-forge:using-github-cli` § stacked PRs. Advisory only."
+    )
+}
+
 /// The `git push --delete` path with an injectable gh runner.
 fn run_push_with(input: &HookInput, command: &str, make_gh: &GhFactory<'_>) -> Option<String> {
     let cwd_fallback = std::env::current_dir()
@@ -219,16 +237,27 @@ fn run_push_with(input: &HookInput, command: &str, make_gh: &GhFactory<'_>) -> O
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
     let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-    for push in push_invocations(command, cwd) {
-        let branches: Vec<String> = push
-            .refspecs
-            .iter()
-            .filter(|r| r.is_delete)
-            .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
-            .collect();
-        if branches.is_empty() || push.unresolved {
-            continue;
-        }
+    // `push_locations`, not `push_invocations`: the latter's config probe
+    // (two git spawns per push) runs only for pushes whose refspecs are all
+    // implicit, and an implicit refspec is never a delete, so it could only
+    // spend budget on pushes this hook skips anyway.
+    let deletes: Vec<_> = push_locations(command, cwd)
+        .into_iter()
+        .filter_map(|push| {
+            let branches: Vec<String> = push
+                .refspecs
+                .iter()
+                .filter(|r| r.is_delete)
+                .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
+                .collect();
+            (!branches.is_empty() && !push.unresolved).then_some((push, branches))
+        })
+        .collect();
+    let deleted: usize = deletes.iter().map(|(_, branches)| branches.len()).sum();
+    if deleted > MAX_CHECKED_DELETES {
+        return Some(unchecked_message(deleted));
+    }
+    for (push, branches) in deletes {
         let Some(repository) = push.repository.as_deref() else {
             continue;
         };
@@ -431,7 +460,7 @@ mod tests {
     #[test]
     fn push_delete_branch_extraction() {
         let branches = |cmd: &str| -> Vec<String> {
-            push_invocations(cmd, "/tmp")
+            push_locations(cmd, "/tmp")
                 .iter()
                 .flat_map(|p| p.refspecs.iter())
                 .filter(|r| r.is_delete)
@@ -445,7 +474,7 @@ mod tests {
         );
         assert_eq!(branches("git push origin :refs/heads/feat/a"), ["feat/a"]);
         assert!(branches("git push origin feat/a").is_empty());
-        let repos: Vec<Option<String>> = push_invocations("git push up --delete x", "/tmp")
+        let repos: Vec<Option<String>> = push_locations("git push up --delete x", "/tmp")
             .into_iter()
             .map(|p| p.repository)
             .collect();

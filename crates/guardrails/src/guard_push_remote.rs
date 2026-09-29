@@ -845,12 +845,9 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
 
     // Validate ownership of explicit remotes in loops
     if let LoopAnalysis::AllTargetsExplicit(cmds) = &loop_result {
-        let cwd_fallback_loop = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| ".".to_string());
-        let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
-        let work_dir_loop = parse_work_dir(command, cwd_loop);
+        // The same `parse_work_dir(command, cwd)` as above: recomputing it
+        // doubled the cost of a 200 KB `cd a; …` flood in front of a loop.
+        let work_dir_loop = &work_dir;
 
         // This loop is the one guard path that spawns a *command-controlled*
         // number of git probes (one per looped push), so it is the induced-
@@ -913,7 +910,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                      Fix: run pushes individually so each remote is validated.",
                 );
             }
-            match resolve_push_url(&work_dir_loop, Some(remote)) {
+            match resolve_push_url(work_dir_loop, Some(remote)) {
                 PushUrlResolution::Url(url) => {
                     if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
                         return CheckResult::block(format!(

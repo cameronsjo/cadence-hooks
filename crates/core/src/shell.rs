@@ -4924,6 +4924,18 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     effective
 }
 
+/// [`resolve_cd_target`] applied to `effective` in place. A relative target
+/// is appended rather than joined into a fresh string, so a walk that follows
+/// many `cd`s costs time linear in the path, not quadratic.
+pub fn apply_cd_target(effective: &mut String, target: &str) {
+    if looks_absolute(target) || target.starts_with('~') {
+        *effective = resolve_cd_target(target, effective);
+    } else {
+        effective.push('/');
+        effective.push_str(target);
+    }
+}
+
 /// Resolve a single cd target against the current effective directory.
 pub fn resolve_cd_target(target: &str, effective: &str) -> String {
     if looks_absolute(target) {
