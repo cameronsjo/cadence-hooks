@@ -1099,15 +1099,28 @@ fn audit_subjects() -> Vec<AuditSubject> {
 /// (cameronsjo/cadence-hooks#629). Measuring the position and printing it
 /// with the failure turns "go check whether the sibling is current" into an
 /// answer the reader already has.
+///
+/// `GIT_DIR`/`GIT_WORK_TREE` are cleared (a test run started from a git hook
+/// inherits them and would measure the wrong repository), and the counts are
+/// trusted only when git's top level IS `checkout`. A missing checkout inside
+/// some enclosing repo would otherwise report that repo's position.
 fn sibling_position(checkout: &Path) -> Option<(usize, usize)> {
-    let output = Command::new("git")
-        .args(["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .current_dir(checkout)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(checkout)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let toplevel = git(&["rev-parse", "--show-toplevel"])?;
+    let toplevel = PathBuf::from(String::from_utf8(toplevel.stdout).ok()?.trim());
+    if toplevel.canonicalize().ok()? != checkout.canonicalize().ok()? {
         return None;
     }
+    let output = git(&["rev-list", "--left-right", "--count", "origin/main...HEAD"])?;
     let text = String::from_utf8(output.stdout).ok()?;
     let mut counts = text.split_whitespace().map(str::parse::<usize>);
     Some((counts.next()?.ok()?, counts.next()?.ok()?))
@@ -1185,6 +1198,11 @@ fn sibling_position_counts_a_checkout_behind_origin_main() {
     assert_eq!(sibling_position(&checkout), Some((1, 0)));
 
     assert_eq!(sibling_position(&tmp.path().join("absent")), None);
+    // A subdirectory is not the checkout: its enclosing repo's position must
+    // not be reported as the sibling's.
+    let nested = checkout.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(sibling_position(&nested), None);
 }
 
 /// The fixture leg. It must always resolve completely: the fixture ships in
