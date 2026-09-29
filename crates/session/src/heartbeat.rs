@@ -190,7 +190,6 @@ mod tests {
         // (#70).
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -227,7 +226,6 @@ mod tests {
         // commit on that branch is not falsely flagged as drift.
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -261,7 +259,6 @@ mod tests {
         // flagged as drift (code-review C1).
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -294,7 +291,6 @@ mod tests {
         // absorbed and drift vanishes at commit. `git` is not leading here.
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -333,7 +329,6 @@ mod tests {
         // suppress drift. The baseline must stay put.
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -397,7 +392,6 @@ mod tests {
 
         // A peer registers, then ages past the (zero-second) threshold.
         let dead = SessionRecord {
-            name: "dead-peer".into(),
             session_id: "dead-sess".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -408,7 +402,6 @@ mod tests {
 
         // A second peer registers fresh (age 0) right before our heartbeat.
         let live = SessionRecord {
-            name: "live-peer".into(),
             session_id: "live-sess".into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
@@ -445,9 +438,8 @@ mod tests {
         // the first (sweep_stale loops with no early return; this pins it).
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        for (name, sid) in [("dead-a", "sess-a"), ("dead-b", "sess-b")] {
+        for (_name, sid) in [("dead-a", "sess-a"), ("dead-b", "sess-b")] {
             let rec = SessionRecord {
-                name: name.into(),
                 session_id: sid.into(),
                 branch: Some("main".into()),
                 declared_branch: Some("main".into()),
@@ -481,7 +473,6 @@ mod tests {
     fn heartbeat_makes_stale_record_live_again() {
         let tmp = TempDir::new().unwrap();
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "self-session".into(),
             ..Default::default()
         };

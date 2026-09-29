@@ -208,7 +208,6 @@ pub fn run_start(
             existing
         }
         None => SessionRecord {
-            name: identity::short_id(sid).to_string(),
             session_id: sid.to_string(),
             branch: branch.clone(),
             declared_branch: branch,
@@ -604,7 +603,6 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Allow, "no peers → no disclosure");
         let own = registry::read_own(tmp.path(), "solo-session").unwrap();
         assert_eq!(own.branch.as_deref(), Some("main"));
-        assert!(!own.name.is_empty());
     }
 
     /// Only a `startup` registration vouches for its start time: the prune
@@ -1216,7 +1214,6 @@ mod tests {
     ) -> Peer {
         Peer {
             record: SessionRecord {
-                name: name.into(),
                 session_id: format!("{name}-id"),
                 branch: branch.map(String::from),
                 intent: intent.map(String::from),

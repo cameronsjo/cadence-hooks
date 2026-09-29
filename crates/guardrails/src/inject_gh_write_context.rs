@@ -21,6 +21,11 @@
 //! matters most. Nudges are exit 0, so the cost of a repeat is a line of
 //! context, never a blocked command.
 //!
+//! It also carries one retargeted-write nudge (cameronsjo/cadence-hooks#150): a
+//! body posted with `-R other/repo` that holds a bare `#N` (see
+//! [`crate::issue_refs::cross_repo_bare_ref_nudge`]). No new wiring: this hook
+//! already sees every gh write.
+//!
 //! Enforcement still lives in [`guard_gh_write`](super::guard_gh_write); this
 //! check only advises, and reuses that guard's write-detection and
 //! target-detection so the nudge and the block cannot drift apart.
@@ -30,6 +35,7 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 use crate::gh_context::render_from_env;
 use crate::guard_gh_write::{is_write_command, segment_invokes_gh, segment_lacks_explicit_target};
+use crate::issue_refs::{cross_repo_bare_ref_nudge, origin_slug_of};
 
 /// Re-inject the gh allowlist + `-R` rule just before an untargeted gh write.
 pub struct InjectGhWriteContext;
@@ -50,11 +56,17 @@ impl Check for InjectGhWriteContext {
                 && segment_lacks_explicit_target(&segment)
         });
 
-        if !needs_context {
-            return CheckResult::allow();
-        }
+        // The retargeted twin (cameronsjo/cadence-hooks#150): a write that DOES
+        // name `-R other/repo` whose body carries a bare `#N`. Local only.
+        let base_dir = input.cwd.as_deref().unwrap_or(".");
+        let bare_ref = cross_repo_bare_ref_nudge(command, base_dir, &|| origin_slug_of(base_dir));
 
-        CheckResult::nudge(render_from_env())
+        match (needs_context, bare_ref) {
+            (false, None) => CheckResult::allow(),
+            (true, None) => CheckResult::nudge(render_from_env()),
+            (false, Some(msg)) => CheckResult::nudge(msg),
+            (true, Some(msg)) => CheckResult::nudge(format!("{}\n{msg}", render_from_env())),
+        }
     }
 }
 
@@ -239,5 +251,119 @@ mod tests {
     #[test]
     fn check_name_matches_subcommand() {
         assert_eq!(InjectGhWriteContext.name(), "inject-gh-write-context");
+    }
+
+    // --- retargeted body with a bare #N (#150) ---
+
+    /// A checkout whose `origin` is `cameronsjo/cadence-hooks`.
+    fn checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cameronsjo/cadence-hooks.git",
+        ]);
+        dir
+    }
+
+    fn in_checkout(command: &str, dir: &std::path::Path) -> CheckResult {
+        InjectGhWriteContext.run(&cadence_hooks_core::test_builders::make_bash_with_cwd(
+            command,
+            dir.to_str().unwrap(),
+        ))
+    }
+
+    #[test]
+    fn retargeted_body_with_a_bare_ref_nudges_and_the_rest_stay_silent() {
+        let repo = checkout();
+        // (command, nudges)
+        let table = [
+            (
+                "gh issue create -R cameronsjo/cadence --title t --body 'see #42'",
+                true,
+            ),
+            (
+                "gh issue comment 5 -R cameronsjo/cadence --body 'dup of #7 and #9'",
+                true,
+            ),
+            (
+                "gh pr create --repo cameronsjo/cadence -t t -b 'Closes #12'",
+                true,
+            ),
+            // Qualified refs are fine.
+            (
+                "gh issue create -R cameronsjo/cadence -t t -b 'see cameronsjo/cadence-hooks#42'",
+                false,
+            ),
+            // No bare ref at all, or only inside code, or a hex colour / entity.
+            (
+                "gh issue create -R cameronsjo/cadence -t t -b 'no refs'",
+                false,
+            ),
+            (
+                "gh issue create -R cameronsjo/cadence -t t -b 'run `make #42`'",
+                false,
+            ),
+            (
+                "gh issue create -R cameronsjo/cadence -t t -b 'colour #123456 and &#39;'",
+                false,
+            ),
+            // -R names the checkout's own repo (any case): bare #N resolves right.
+            (
+                "gh issue create -R cameronsjo/cadence-hooks -t t -b 'see #42'",
+                false,
+            ),
+            (
+                "gh issue create -R CameronSjo/Cadence-Hooks -t t -b 'see #42'",
+                false,
+            ),
+            // Reads never fire.
+            ("gh issue view 5 -R cameronsjo/cadence", false),
+            ("gh pr list -R cameronsjo/cadence --search '#42'", false),
+        ];
+        for (command, nudges) in table {
+            let r = in_checkout(command, repo.path());
+            assert_eq!(r.outcome == Outcome::Nudge, nudges, "{command}");
+            if nudges {
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("owner/repo#N"), "{msg}");
+                assert!(msg.contains("cameronsjo/cadence"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_origin_keeps_the_retargeted_nudge_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = in_checkout(
+            "gh issue create -R cameronsjo/cadence -t t -b 'see #42'",
+            dir.path(),
+        );
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn bare_refs_reads_prose_only() {
+        use crate::issue_refs::bare_refs;
+        for (body, want) in [
+            ("see #5 and #3, again #5", vec![3, 5]),
+            ("a/b#7 and a-b#8 and x#9", vec![]),
+            ("```\n#4\n```\nafter #6", vec![6]),
+            ("# Heading\n#123456 colour", vec![]),
+            ("(#12) [#13]", vec![12, 13]),
+        ] {
+            assert_eq!(bare_refs(body), want, "{body:?}");
+        }
     }
 }

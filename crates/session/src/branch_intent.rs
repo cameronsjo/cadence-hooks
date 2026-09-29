@@ -309,7 +309,6 @@ mod tests {
         started_epoch: u64,
     ) {
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: session_id.into(),
             branch: Some(branch.into()),
             declared_branch: Some(branch.into()),

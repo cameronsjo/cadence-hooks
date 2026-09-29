@@ -7553,11 +7553,10 @@ mod tests {
     // ── prune_liveness_gate (#305) ──────────────────────────────────────────
 
     /// Write a fresh peer record and return its sessions dir.
-    fn seed_session(name: &str, session_id: &str) -> tempfile::TempDir {
+    fn seed_session(_name: &str, session_id: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".claude").join("sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: name.into(),
             session_id: session_id.into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -7720,7 +7719,6 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: "distant-anvil".into(),
             session_id: "other-checkout-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -7766,7 +7764,6 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: "forge-anvil".into(),
             session_id: "peer-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -7805,7 +7802,6 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: "distant-anvil".into(),
             session_id: "some-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -7829,7 +7825,6 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: "distant-anvil".into(),
             session_id: "blocking-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -7861,12 +7856,10 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            // Hostile content goes in `repo`, not `name`: the record FILENAME
-            // derives from the name, and Windows rejects control characters in
-            // filenames, so a hostile name makes the fixture unwritable there
-            // rather than testing the renderer. The name exercises the length
-            // cap instead — the other half of the same sanitize call.
-            name: "x".repeat(200),
+            // Hostile content goes in `repo`, not `session_id`: the record
+            // FILENAME derives from the id, and Windows rejects control
+            // characters in filenames, so a hostile id makes the fixture
+            // unwritable there rather than testing the renderer.
             session_id: "hostile-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
@@ -8047,7 +8040,6 @@ mod tests {
     /// Write a live record into `dir` with the given start and vouch.
     fn seed_record(dir: &Path, session_id: &str, started_epoch: u64, start_verified: bool) {
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: session_identity::short_id(session_id).into(),
             session_id: session_id.into(),
             started_epoch,
             start_verified,
