@@ -241,6 +241,9 @@ fn unquoted_group_counts(segment: &str) -> (usize, usize, usize) {
 /// both letting `guard_gh_write` clear a write that lands somewhere else
 /// (cameronsjo/cadence-hooks#463 review).
 ///
+/// A backslash before a blank (space or tab) keeps the blank in the word, as
+/// bash does: `p\ repo` is one token, `p\ repo`.
+///
 /// A backslash anywhere else stays a literal character. `\gh` keeps its
 /// backslash for the callers that strip it themselves, and a Windows path
 /// (`C:\Users\x`) survives intact — consuming those would corrupt the very
@@ -568,6 +571,18 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
                     lead.boundary(current.len(), true);
+                }
+                // An escaped blank is part of the word to bash: `p\ repo` is
+                // ONE argv word. Splitting it handed every guard two words,
+                // so `git -C /p\ repo commit` read `repo` as the subcommand
+                // and no commit at all (PR #1140 review). The backslash stays
+                // in the text, as every other unquoted backslash does. A
+                // newline is excluded: `\<newline>` is a line continuation.
+                ' ' | '\t' if escaped => {
+                    lead.unquoted();
+                    current.push(c);
+                    structural.resize(current.len(), false);
+                    in_token = true;
                 }
                 // Only bash's blanks end a word: space, tab, and the newline
                 // that separates commands. VT, FF, CR and Unicode spaces are
@@ -8284,9 +8299,14 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
                 .get(i + 1)
                 .is_some_and(|t| unescape_word(t).as_ref() == "--")
             {
-                return tokens.get(i + 2).cloned();
+                return tokens.get(i + 2).map(|s| unescape_word(s).into_owned());
             }
-            return tokens.get(i + 1).cloned();
+            // The script is the word the shell hands the wrapper, escapes
+            // removed: `bash -c cat\ .env` runs `cat .env`. Read raw, the
+            // escaped blank kept it one word and no guard saw an operand.
+            // As with `eval_script`, over-unescaping a single-quoted script
+            // can only add a block.
+            return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
         // (e.g. `sh script.sh`) — no inline script to expand.
@@ -11208,6 +11228,22 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_keeps_an_escaped_blank_in_its_word() {
+        // bash: `p\ repo` is one word (PR #1140 review).
+        assert_eq!(
+            tokenize("git -C /p\\ repo commit"),
+            vec!["git", "-C", "/p\\ repo", "commit"]
+        );
+        assert_eq!(tokenize("a\\\tb c"), vec!["a\\\tb", "c"]);
+        // `\\ ` is an escaped backslash, then a real blank.
+        assert_eq!(tokenize("a\\\\ b"), vec!["a\\\\", "b"]);
+        // A continuation is not an escaped blank.
+        assert_eq!(tokenize("a\\\nb"), vec!["a\\", "b"]);
+        let marked = tokenize_marked("/p\\ q");
+        assert_eq!(marked[0].unquoted_prefix_len, marked[0].text.len());
+    }
+
+    #[test]
     fn tokenize_handles_empty_and_whitespace_input() {
         assert_eq!(tokenize(""), Vec::<String>::new());
         assert_eq!(tokenize("   "), Vec::<String>::new());
@@ -13260,6 +13296,27 @@ mod tests {
         assert_eq!(
             shell_c_argument("bash -c -- -- echo"),
             Some("--".to_string())
+        );
+    }
+
+    #[test]
+    fn command_segments_unescapes_an_escaped_shell_c_script() {
+        // `bash -c cat\ .env` hands bash the script `cat .env`. With an
+        // escaped blank kept in its word, the raw script was one token and
+        // no guard saw an operand (PR #1140 review).
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "bash -c cat\\ .env",
+            "sh -c cat\\ .env",
+            "bash -lc cat\\ .env",
+            "bash -c -- cat\\ .env",
+            "sudo sh -c cat\\ .env",
+        ] {
+            assert!(command_segments(cmd).contains(&inner), "{cmd:?}");
+        }
+        assert_eq!(
+            shell_c_argument("bash -c git\\ push\\ --force\\ origin\\ main"),
+            Some("git push --force origin main".to_string())
         );
     }
 

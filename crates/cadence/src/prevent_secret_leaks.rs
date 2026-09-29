@@ -17,7 +17,7 @@ use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_word,
     executable_tokens, is_assignment_word, skip_git_global_options, split_segments,
-    strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked,
+    strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -715,10 +715,18 @@ fn substituted_word_reads(
         // .env handling"`), which the whitespace firewall already judges. An
         // unbalanced word is re-read whole unless every substitution in the
         // segment is quoted.
-        // Quote characters are dropped before the split: `$(printf 'cat
-        // .env')` prints two words its own quotes kept together.
-        let blank =
-            |text: &str| tokenize(&text.replace(['\'', '"'], "").replace(['(', ')', '`'], " "));
+        // Quote characters and the backslash of an escaped blank are dropped
+        // before the split: `$(printf 'cat .env')` and `$(echo cat\ .env)`
+        // print two words their own quoting kept together.
+        let blank = |text: &str| {
+            tokenize(
+                &text
+                    .replace(['\'', '"'], "")
+                    .replace("\\ ", " ")
+                    .replace("\\\t", "\t")
+                    .replace(['(', ')', '`'], " "),
+            )
+        };
         let words: Option<Vec<String>> = if !carries_substitution(token) {
             None
         } else {
@@ -793,8 +801,12 @@ fn nested_command_strings(tokens: &[String]) -> Vec<String> {
     let mut scripts = Vec::new();
     let mut push = |value: &str| {
         let value = value.strip_prefix('!').unwrap_or(value);
-        if !value.is_empty() && seen.insert(value.to_string()) {
-            scripts.push(value.to_string());
+        // Both spellings: the raw value, and the word the shell hands the
+        // wrapper (`su -c cat\ .env` runs `cat .env`).
+        for value in [value.to_string(), unescape_word(value).into_owned()] {
+            if !value.is_empty() && seen.insert(value.clone()) {
+                scripts.push(value);
+            }
         }
     };
     let mut git_sub: Option<&str> = None;
@@ -6431,6 +6443,11 @@ mod tests {
             "\"cat\"$(echo \" \" .env)".to_string(),
             // The substitution's own quotes hid the words it prints.
             "$(printf 'cat .env')".to_string(),
+            // An escaped blank the substitution's `echo` removes, or the
+            // shell does before handing `-c` its script (PR #1140).
+            "$(echo cat\\ .env)".to_string(),
+            "bash -c cat\\ .env".to_string(),
+            "su -c cat\\ .env".to_string(),
             "eval \"$(printf 'cat .env')\"".to_string(),
             // Accepted over-block: bash hands the output to `x` as arguments
             // and reads nothing, but an argument position is judged under the
@@ -9654,6 +9671,11 @@ mod tests {
                 "sudo -D /x bash -o posix -c 'cat .env'",
                 "su -lc 'cat .env' root",
                 "su -c'cat .env' root",
+                // An escaped blank instead of quotes (PR #1140 review).
+                "bash -c cat\\ .env",
+                "bash -c -- cat\\ .env",
+                "nice bash -c cat\\ .env",
+                "su -c cat\\ .env",
                 // I-e: untracked content in the stash.
                 "git -c stash.showIncludeUntracked=true stash show -p",
                 "git config stash.showIncludeUntracked true; git stash show -p",
