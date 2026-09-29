@@ -1226,10 +1226,12 @@ fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
 }
 
 /// Could core's heredoc reading disagree with bash's here? Core's
-/// `heredoc_introducers` does not model escapes (cadence-hooks#1084), so an
-/// escaped `\<`, or an escaped quote anywhere near a `<<`, can make it read a
+/// `heredoc_introducers` did not model escapes (cadence-hooks#1084), so an
+/// escaped `\<`, or an escaped quote anywhere near a `<<`, could make it read a
 /// heredoc (or a delimiter) bash does not see — and strip, as body, lines bash
-/// runs. Also suspect:
+/// runs. It reads them with the shared quote model now (#813, #1116); the
+/// escape shapes stay suspect here as a second, independent reading. Also
+/// suspect:
 /// `plain_carve`'s own heredoc count differing from core's on the same text.
 /// A suspect command is never plain, and the union path also reads it line by
 /// line with no heredoc stripping at all ([`scan_prepared`]).
@@ -1983,6 +1985,12 @@ fn heredoc_body_len(text: &str, heredoc: &Heredoc) -> Option<usize> {
             bare
         };
         if bare == heredoc.delim {
+            // A delimiter line that a continuation joins onto the line before
+            // it is not a delimiter: bash reads `x\` ⏎ `EOF` as `xEOF` and the
+            // body runs on (cameronsjo/cadence-hooks#1122).
+            if !heredoc.quoted && joins.joins_text() {
+                return None;
+            }
             return Some(offset);
         }
         if !heredoc.quoted
@@ -2011,6 +2019,19 @@ struct ContinuationJoin {
 }
 
 impl ContinuationJoin {
+    /// A continuation from the previous physical line is still joining, so
+    /// the next line is not a line of its own.
+    fn joining(&self) -> bool {
+        self.pending.is_some() || self.overlong
+    }
+
+    /// A continuation is joining TEXT onto the next line, so a next line that
+    /// reads as the delimiter is not one to bash: `x\` ⏎ `EOF` is `xEOF`. A
+    /// bare `\` ⏎ `EOF` joins nothing, and that line still ends the body.
+    fn joins_text(&self) -> bool {
+        self.overlong || self.pending.as_deref().is_some_and(|p| !p.is_empty())
+    }
+
     /// Feed one physical body line: true when it completes a logical line
     /// that spans a continuation and equals `delim`.
     fn splits(&mut self, bare: &str, delim: &str) -> bool {
@@ -2020,7 +2041,7 @@ impl ContinuationJoin {
         } else {
             bare
         };
-        let joining = self.pending.is_some() || self.overlong;
+        let joining = self.joining();
         if !joining && !continued {
             return false;
         }
@@ -2066,6 +2087,13 @@ fn continuation_splits_a_delimiter(command: &str) -> bool {
                     next
                 };
                 if bare == heredoc.delim {
+                    // The reverse of a split delimiter: a continuation joins
+                    // this delimiter line onto the one before (`x\` ⏎ `EOF`
+                    // is `xEOF`), so bash's body runs on past where a line
+                    // reading ends it (cameronsjo/cadence-hooks#1122).
+                    if !heredoc.quoted && joins.joins_text() {
+                        return true;
+                    }
                     break;
                 }
                 if !heredoc.quoted && joins.splits(bare, &heredoc.delim) {
@@ -10570,6 +10598,11 @@ mod tests {
             // #1113 item 5: a backslash-newline splits the delimiter.
             format!("cat <<EOF >/dev/null\nEO\\\nF\n{body}\nEOF"),
             format!("cat <<EOF\nEO\\\nF\n{body}\nEOF"),
+            // #1122: a continuation that destroys a delimiter. Bash reads
+            // `xEOF`, so the body runs on to the second `EOF` and the commit
+            // after it runs, behind a heredoc opener that is really body text.
+            format!("cat <<EOF\nx\\\nEOF\n: <<EOG\nEOF\n{body}\nEOG"),
+            format!("cat <<EOF\nx\\\nEOF\ncat <<'EOG'\nEOF\n{body}\nEOG"),
         ];
         for cmd in &from_w {
             assert_eq!(outcome_from(&wt, cmd), Outcome::Block, "{cmd:?}");
@@ -10685,6 +10718,10 @@ mod tests {
             ("aEO\\\nF\n", false),
             ("EOF\\\nx\n", false),
             ("foo \\\nbar\n", false),
+            // #1122, the reverse: the continuation joins text onto a line that
+            // reads as the delimiter, so bash's body runs on.
+            ("x\\\nEOF\n", true),
+            ("foo \\\nx\\\nEOF\n", true),
         ] {
             let cmd = format!("cat <<EOF\n{body}git commit -m x\nEOF");
             assert_eq!(continuation_splits_a_delimiter(&cmd), splits, "{body:?}");
