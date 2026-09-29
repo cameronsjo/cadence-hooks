@@ -216,10 +216,10 @@ impl Check for NudgePolishBeforePr {
         // Every anchoring segment is judged, not only the first (security
         // review, #995 I1): `gh pr create --head polished && gh pr create
         // --head unpolished` ships twice, and a polished first ship must not
-        // vouch for the second. Each segment resolves its own target in the
-        // directory IT runs in (cadence-hooks#997) — a `cd` inside `( … )` or
-        // between two ships moves only the ships after it — and the sharpest
-        // verdict wins. The `git remote get-url origin` spawn is paid only for
+        // vouch for the second. Each ship is judged both in the directory its
+        // own segment runs in and in the whole-command directory
+        // (cadence-hooks#997), so a `cd` inside `( … )` or between two ships
+        // can add a nudge but never clear one; the sharpest verdict wins. The `git remote get-url origin` spawn is paid only for
         // a repo-retargeted `gh pr merge` (cadence-hooks#881), so the common
         // `create`/`ready` paths never pay for it.
         located_ship_segments(command, input.cwd.as_deref())
@@ -2996,7 +2996,6 @@ mod tests {
             // stays in the polished cwd.
             for command in [
                 "(cd ../unpol) && gh pr create -t a",
-                "cd ../unpol | true; gh pr create -t a",
                 "(cd ../unpol && gh pr list) ; gh pr create -t a",
             ] {
                 let result = run_at(command, &pol);
@@ -3007,15 +3006,74 @@ mod tests {
                     result.message
                 );
             }
-            // And a subshell into the polished worktree from the unpolished
-            // one allows only its own ship.
-            let both = run_at(
+            // Every ship is also judged in the whole-command directory (the
+            // pre-#997 reading), so a subshell into the polished worktree
+            // does not clear a ship from the unpolished cwd.
+            for command in [
                 "(cd ../pol && gh pr create -t a) ; gh pr create -t a",
-                &unpol,
-            );
-            assert_no_polish_nudge(&both);
-            let alone = run_at("(cd ../pol && gh pr create -t a)", &unpol);
-            assert_eq!(alone.outcome, Outcome::Allow, "{:?}", alone.message);
+                "(cd ../pol && gh pr create -t a)",
+            ] {
+                assert_no_polish_nudge(&run_at(command, &unpol));
+            }
+        });
+    }
+
+    #[test]
+    fn a_leaked_subshell_cd_never_clears_an_unpolished_ship() {
+        // #997 review I2/I3: each of these ran the ship in the unpolished cwd
+        // while the walker judged it in the polished worktree. origin/main
+        // nudges on every one.
+        with_sibling_worktrees(|_primary, parent| {
+            let unpol = format!("{parent}/unpol");
+            for command in [
+                // I2: parens inside quotes.
+                "(cd ../pol && grep -c \"fn main(\" src/lib.rs) ; gh pr create -t a -b b",
+                "(cd ../pol && echo \":(\") ; gh pr create -t a -b b",
+                "(cd ../pol && echo ')') ; gh pr create -t a -b b",
+                // I3: a piped or backgrounded brace group, and a `cd` in a
+                // substitution.
+                "{ cd ../pol; } | true; gh pr create -t a -b b",
+                "{ cd ../pol; } & gh pr create -t a -b b",
+                // Pre-#997 reading kept: a piped `cd` still nudges.
+                "cd ../pol | true; gh pr create -t a -b b",
+            ] {
+                assert_no_polish_nudge(&run_at(command, &unpol));
+            }
+            // The whole-command reading takes `../pol)` for this `cd`'s
+            // target, a directory that does not exist, so its verdict is the
+            // cannot-check advisory, which outranks the absent marker. Never
+            // silent either way.
+            let substitution = run_at("echo $(true; cd ../pol); gh pr create -t a -b b", &unpol);
+            assert_eq!(substitution.outcome, Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn a_whole_command_only_ship_is_judged_beside_a_located_merge() {
+        // #997 review I1: a merge the per-segment reading anchors (its
+        // subshell's origin matches `-R`) and a ship only the whole command
+        // reveals (`$G`) tied the old count comparison, and the unpolished
+        // `$G` ship was dropped. Both readings are judged now.
+        let (other, other_root) = init_repo_with_real_origin_remote(
+            "feat/merged",
+            "https://github.com/other/repo.git",
+            &["src/lib.rs"],
+        );
+        let (cwd, _) = init_repo_with_real_origin_remote("feat/unpol", OWN_URL, &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&other_root, "feat/merged"), RAN).unwrap();
+            let other = other.path().to_str().unwrap();
+            let cwd = cwd.path().to_str().unwrap();
+            // Control: the merge alone anchors in its own repo and allows.
+            let control = run_at(&format!("(cd {other} && gh pr merge -R other/repo)"), other);
+            assert_eq!(control.outcome, Outcome::Allow, "{:?}", control.message);
+            assert_no_polish_nudge(&run_at(
+                &format!(
+                    "(cd {other} && gh pr merge -R other/repo) ; G=gh; $G pr create -t a -b b"
+                ),
+                cwd,
+            ));
         });
     }
 

@@ -171,10 +171,25 @@ fn an_explicit_branch_record_covers_a_ship_from_a_subshell() {
     );
     assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
 
+    let gated = gate(
+        &markers,
+        &repo,
+        &format!("(cd {} && gh pr create -t a -b b)", repo.display()),
+    );
+    assert_eq!(gated.status.code(), Some(0));
+    assert_eq!(stdout(&gated), "", "{}", stdout(&gated));
+
+    // From outside the checkout the whole-command reading judges the ship
+    // where the session stands, which is no checkout: the advisory, never
+    // silence (the #997 review ruling keeps that reading).
     let parent = repo.parent().unwrap();
     let gated = gate(&markers, parent, "(cd repo && gh pr create -t a -b b)");
     assert_eq!(gated.status.code(), Some(0));
-    assert_eq!(stdout(&gated), "", "{}", stdout(&gated));
+    assert!(
+        stdout(&gated).contains("Can't check polish"),
+        "{}",
+        stdout(&gated)
+    );
 }
 
 #[test]
