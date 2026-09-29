@@ -14,8 +14,8 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, is_assignment_word, skip_git_global_options,
-    split_segments, strip_heredoc_bodies, tokenize,
+    brace_expansion_overflows, command_segments, command_word, executable_tokens,
+    is_assignment_word, skip_git_global_options, split_segments, strip_heredoc_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -3011,11 +3011,32 @@ fn bash_leaks_secrets_within(
         )));
     }
 
+    // cadence-hooks#1096: a brace word the tokenizer cannot expand within its
+    // bounds reaches every walk as written, so whatever command or operand it
+    // builds is invisible. No real command comes near the bounds; refuse
+    // rather than judge a command this guard cannot see.
+    if !oversized && command.contains('{') && brace_expansion_overflows(command) {
+        return Some(CheckResult::block(
+            "🚫 BLOCKED: prevent-secret-leaks: command has a brace expansion too large to scan\n\
+             Found: a `{…,…}` or `{x..y}` word expanding past the modelled bound, which can \
+             hide the command it runs or the file it reads\n\
+             Fix: spell the words out, or use `seq` for a long numeric range.",
+        ));
+    }
+
     // Block: a dangerous deny-set operand (the `.env` family plus the non-`.env`
     // credential stores) handed to any command that is not metadata-safe
     // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
     // is still seen.
-    if !oversized && command_may_reference_secret(&lower) {
+    //
+    // The raw-text pre-filter also reads the brace-EXPANDED words
+    // (cadence-hooks#1096): `cat .{env,x}` and `cat .e{n,}v` read `.env`, and
+    // neither raw text contains it.
+    if !oversized
+        && (command_may_reference_secret(&lower)
+            || (lower.contains('{')
+                && command_may_reference_secret(&tokenize(command).join(" ").to_lowercase())))
+    {
         // #308: computed once per command — an in-command cd/pushd/popd
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
@@ -3358,6 +3379,51 @@ mod tests {
     fn bash_cat_env_blocked() {
         let result = SecretLeaksGuard::default().run(&make_bash_input("cat .env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn brace_expansion_that_reads_a_dotenv_blocked() {
+        // cadence-hooks#1096: bash brace-expands before running, so each row
+        // reads `.env` (checked under bash); all were Allow at the parent commit.
+        for command in [
+            "{cat,.env}",
+            "sudo {cat,.env}",
+            "{c,}at .env",
+            "cat .{env,x}",
+            "cat .e{n,}v",
+            "{cat,'.env'}",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        // Past the expansion bound the words are unseen, so it refuses.
+        let product = "{a,b}".repeat(13);
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&format!("echo {product}")));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn brace_words_that_read_no_dotenv_allowed() {
+        for command in [
+            "\"{cat,.env}\"",
+            "\\{cat,.env\\}",
+            "echo {a,b}",
+            "mkdir -p src/{a,b}",
+            "cp x.{ts,js} out/",
+            "cat .{env.example,gitignore}",
+            "for i in {1..4096}; do :; done",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
     }
 
     #[test]

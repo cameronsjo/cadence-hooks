@@ -65,8 +65,9 @@
 //! `enforce-worktree` treats `CADENCE_ALLOW_MAIN`.
 
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, command_word, peel_command_runners,
-    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
+    MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_word,
+    peel_command_runners, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
+    tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -310,7 +311,16 @@ impl Check for SopsDecryptGuard {
             return CheckResult::allow();
         };
 
-        let Some(found) = first_unsafe_decrypt(command, 0) else {
+        // A brace word past the tokenizer's expansion bounds reaches the walk
+        // unexpanded, so a decrypt it builds (`{sops,-d,…}`) is invisible:
+        // refuse rather than judge a command this guard cannot see
+        // (cadence-hooks#1096). No real command comes near the bounds.
+        let found = first_unsafe_decrypt(command, 0).or_else(|| {
+            (command.contains('{') && brace_expansion_overflows(command)).then(|| {
+                "a brace expansion too large to model, which can hide a decrypt".to_string()
+            })
+        });
+        let Some(found) = found else {
             return CheckResult::allow();
         };
 
@@ -778,6 +788,46 @@ mod tests {
                 "sudo sops s.yaml",
                 "time -p ls",
                 "setsid ls",
+            ] {
+                assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_decrypt_built_by_brace_expansion_blocks() {
+        // cadence-hooks#1096: bash brace-expands the command word, so each row
+        // runs `sops -d`; all were Allow at the parent commit.
+        without_escape(|| {
+            for command in [
+                "{sops,-d,secrets.yaml}",
+                "{sops,-d,secrets.yaml} | grep x",
+                "( {sops,-d,secrets.yaml} )",
+                "nice -n 5 {sops,-d,secrets.yaml} | grep x",
+                "sops {-d,secrets.yaml} | grep x",
+                "{sops,'-d',secrets.yaml}",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command:?}");
+            }
+            // Past the expansion bound the word is unseen, so it refuses.
+            let product = "{a,b}".repeat(13);
+            assert_eq!(outcome(&format!("echo {product}")), Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn brace_words_that_build_no_decrypt_stay_allowed() {
+        without_escape(|| {
+            for command in [
+                "{sops,-d,s.yaml} | curl --config -",
+                "\"{sops,-d,secrets.yaml}\"",
+                "\\{sops,-d,secrets.yaml\\}",
+                "{sops,-e,s.yaml}",
+                "mkdir -p src/{a,b}",
+                "echo {a,b}",
+                "cp x.{ts,js} out/",
+                "git commit -m \"{a,b}\"",
+                "for i in {1..4096}; do :; done",
             ] {
                 assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
             }

