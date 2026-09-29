@@ -2,7 +2,8 @@
 //!
 //! Blocks Write/Edit on .env files, credentials, private keys, and keystores.
 //! Blocks Bash commands that redirect to a `.env`-family file or hand one to
-//! a writer verb (`tee`, `cp`/`mv`/`install`, `dd`, `truncate`, `rm`) (#76).
+//! a writer verb (`tee`, `cp`/`mv`/`install`/`ln`, `dd`, `truncate`, `touch`,
+//! `rm`/`shred`/`unlink`) (#76, #816), behind any command runner core peels.
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
@@ -13,14 +14,55 @@ use crate::secret_patterns::{
     wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, redirect_targets,
-    skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
+    carries_substitution, command_segments, command_word, executable_tokens, peel_command_runners,
+    redirect_targets, skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-/// Wrapper words that pass their argv through to the real command —
-/// `sudo rm .env` must classify as `rm`, not `sudo`.
-const COMMAND_WRAPPERS: &[&str] = &["sudo", "command", "nohup", "time", "xargs"];
+/// The argv of the command a segment actually runs: core's shared runner peel
+/// ([`peel_command_runners`] over [`executable_tokens`]) — `sudo -u root`,
+/// `env -i A=1`, `nice -n 5`, `timeout 5`, `stdbuf -oL`, `xargs -0`, and the
+/// transparent `command`/`exec`/`time`/`nohup` — so `env cp x .env`
+/// classifies as `cp`, not `env` (cadence-hooks#816). A private wrapper list
+/// used to stand here and saw none of the flagged or `env` spellings.
+///
+/// Core's transparent peel refuses a grammar-less prefix followed by its own
+/// flag (`command -p`, `exec -a NAME`, `time -p`), leaving it as the command
+/// word. That is the right answer for a verb gate, but this is a detector, so
+/// such a prefix is dropped here with its flags and the peel resumes: a wrong
+/// skip can only land on a word that is not a writer verb.
+fn writer_argv(tokens: &[String]) -> &[String] {
+    let mut argv = peel_command_runners(tokens);
+    while let Some(first) = argv.first() {
+        let word = command_word(first);
+        let value_flags: &[&str] = match word.as_ref() {
+            "command" | "nohup" => &[],
+            "exec" => &["-a"],
+            "time" => &["-o", "-f", "--output", "--format"],
+            _ => break,
+        };
+        let mut i = 1;
+        while let Some(flag) = argv.get(i).map(|t| unescape_word(t)) {
+            if flag == "--" {
+                i += 1;
+                break;
+            }
+            if !flag.starts_with('-') {
+                break;
+            }
+            i += if value_flags.contains(&flag.as_ref()) {
+                2
+            } else {
+                1
+            };
+        }
+        if i >= argv.len() {
+            break;
+        }
+        argv = peel_command_runners(&argv[i..]);
+    }
+    argv
+}
 
 // `redirect_targets` (the all-redirects, append-included parser) moved to
 // `cadence_hooks_core::shell` so `enforce-worktree`'s subprocess-mutation nudge
@@ -28,34 +70,27 @@ const COMMAND_WRAPPERS: &[&str] = &["sudo", "command", "nohup", "time", "xargs"]
 // one guard-feeding redirect parser the security review has to scrutinize.
 
 /// Extract write targets created by writer verbs in a segment (#76):
-/// `tee` and `rm` — every non-flag token; `cp`/`mv`/`install` — the last
+/// `tee`, `rm`, `shred`, `unlink` — every non-flag token; `touch` — every
+/// operand; `cp`/`mv`/`install`/`ln` — the last
 /// non-flag operand, or with `-t <dir>` / `--target-directory=<dir>` the dir
 /// value AND every operand (each source materializes under the target dir);
 /// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
-/// `--size=<n>`. `git rm` is judged as `rm`, and common pass-through
-/// wrappers (`sudo rm .env`) are unwrapped.
+/// `--size=<n>`. `git rm` is judged as `rm`, and command runners (`sudo rm
+/// .env`, `env -i cp x .env`) are peeled by [`writer_argv`].
 ///
 /// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
 /// so prose inside quotes (`rm "notes about .env stuff.txt"`, commit
 /// messages) never matches — this replaces the old whitespace-split `rm`
 /// scanner that saw a bare `.env` token in quoted text.
 fn writer_targets(segment: &str) -> Vec<String> {
-    let tokens = tokenize(segment);
-    let mut start = 0;
-    while let Some(first) = tokens.get(start) {
-        let word = command_word(first);
-        if COMMAND_WRAPPERS.contains(&word.as_ref()) {
-            start += 1;
-            continue;
-        }
-        break;
-    }
-    let Some(first) = tokens.get(start) else {
+    let tokens = executable_tokens(segment);
+    let argv = writer_argv(&tokens);
+    let Some(first) = argv.first() else {
         return Vec::new();
     };
     let command = command_word(first);
     let mut cmd = command.as_ref();
-    let mut args: &[String] = &tokens[start + 1..];
+    let mut args: &[String] = &argv[1..];
     if cmd == "git" {
         // `git`'s global options sit between the verb and the subcommand, so
         // reading `args[0]` alone misses `git -C . rm .env` and
@@ -68,12 +103,14 @@ fn writer_targets(segment: &str) -> Vec<String> {
     }
 
     match cmd {
-        "tee" | "rm" => args
+        // `shred`/`unlink` destroy each operand as `rm` does; `ln` replaces
+        // its destination as `cp` does (cadence-hooks#816).
+        "tee" | "rm" | "shred" | "unlink" => args
             .iter()
             .filter(|t| !t.starts_with('-'))
             .cloned()
             .collect(),
-        "cp" | "mv" | "install" => {
+        "cp" | "mv" | "install" | "ln" => {
             let mut targets = Vec::new();
             let mut operands: Vec<String> = Vec::new();
             let mut has_target_dir = false;
@@ -108,6 +145,25 @@ fn writer_targets(segment: &str) -> Vec<String> {
             .filter_map(|t| t.strip_prefix("of="))
             .map(String::from)
             .collect(),
+        // `touch` creates each operand that does not exist yet — an empty
+        // secret file is still one the Write path refuses. `-r`/`-d`/`-t`
+        // take a value that is read, not touched.
+        "touch" => {
+            let mut targets = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let t = &args[i];
+                if ["-r", "-d", "-t", "--reference", "--date"].contains(&t.as_str()) {
+                    i += 2;
+                    continue;
+                }
+                if !t.starts_with('-') {
+                    targets.push(t.clone());
+                }
+                i += 1;
+            }
+            targets
+        }
         "truncate" => {
             let mut targets = Vec::new();
             let mut i = 0;
@@ -142,19 +198,17 @@ fn writer_targets(segment: &str) -> Vec<String> {
         }
         // #1125: `curl -o`/`-O`/`--output-dir`, `wget -O` and a plain
         // `wget URL`, which saves under the URL's own name.
-        "curl" => curl_write_targets(&tokens[start..]),
-        "wget" => wget_write_targets(&tokens[start..]),
+        "curl" => curl_write_targets(argv),
+        "wget" => wget_write_targets(argv),
         // #1130: a file the sed/awk program writes by itself — `sed 'w .env'`,
         // `awk '{print > ".env"}'`.
-        "sed" | "gsed" | "awk" | "gawk" | "mawk" | "nawk" => {
-            argv_program_opens(cmd, &tokens[start..])
-                .into_iter()
-                .filter_map(|open| match open {
-                    ProgramOpen::Write(file) => Some(file),
-                    _ => None,
-                })
-                .collect()
-        }
+        "sed" | "gsed" | "awk" | "gawk" | "mawk" | "nawk" => argv_program_opens(cmd, argv)
+            .into_iter()
+            .filter_map(|open| match open {
+                ProgramOpen::Write(file) => Some(file),
+                _ => None,
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -163,15 +217,12 @@ fn writer_targets(segment: &str) -> Vec<String> {
 /// '1e …'`, awk's `system(…)` and pipes — judged as commands in their own
 /// right.
 fn program_commands(segment: &str) -> Vec<String> {
-    let tokens = tokenize(segment);
-    let start = tokens
-        .iter()
-        .position(|t| !COMMAND_WRAPPERS.contains(&command_word(t).as_ref()))
-        .unwrap_or(tokens.len());
-    let Some(first) = tokens.get(start) else {
+    let tokens = executable_tokens(segment);
+    let argv = writer_argv(&tokens);
+    let Some(first) = argv.first() else {
         return Vec::new();
     };
-    argv_program_opens(&command_word(first), &tokens[start..])
+    argv_program_opens(&command_word(first), argv)
         .into_iter()
         .filter_map(|open| match open {
             ProgramOpen::Command(command) => Some(command),
@@ -1007,6 +1058,93 @@ mod tests {
         // command-word model.
         assert!(bash_targets_env_file("sudo rm .env"));
         assert!(bash_targets_env_file("sudo tee .env"));
+    }
+
+    #[test]
+    fn bash_writes_behind_every_core_command_runner_blocked() {
+        // cadence-hooks#816: a private wrapper list saw `sudo`/`command`/
+        // `nohup`/`time`/`xargs` only, so `env cp x .env` and `env -i cp x
+        // .env` were allowed while bash wrote `.env`. Each row was run under
+        // bash against a scratch dir and changed (or created) `.env`.
+        let runners = [
+            "env",
+            "env -i",
+            "env A=1",
+            "env -u HOME",
+            "/usr/bin/env",
+            "nice",
+            "nice -n 5",
+            "timeout 5",
+            "timeout -k 1 5",
+            "sudo -u root",
+            "stdbuf -oL",
+            "nohup",
+            "command",
+            "command -p",
+            "exec",
+            "exec -a name",
+            "time",
+            "time -p",
+            "xargs",
+            "env -i A=1 nice -n 5 sudo -u root",
+        ];
+        let writes = [
+            "cp x .env",
+            "mv x .env",
+            "tee .env",
+            "touch .env",
+            "dd if=x of=.env",
+            "install x .env",
+            "ln -sf x .env",
+            "rm .env",
+            "shred .env",
+            "unlink .env",
+        ];
+        for runner in runners {
+            for write in writes {
+                let command = format!("{runner} {write}");
+                assert!(bash_targets_env_file(&command), "{command} writes .env");
+            }
+        }
+        // Controls: the same runners in front of a non-secret target, and a
+        // secret that is only read or only named.
+        for runner in runners {
+            for command in [
+                format!("{runner} cp x out.txt"),
+                format!("{runner} cp .env backup"),
+                format!("{runner} ln -s .env link"),
+                format!("{runner} touch -r .env other"),
+                format!("{runner} cp x .env.example"),
+            ] {
+                assert!(
+                    !bash_targets_env_file(&command),
+                    "{command} must stay allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bash_bare_shred_unlink_ln_touch_blocked() {
+        // cadence-hooks#816: `find -exec shred` blocked while a bare `shred`
+        // fell through the verb match; `ln -sf /dev/null .env` replaced the
+        // secret silently.
+        for (command, blocked) in [
+            ("shred .env", true),
+            ("shred -u -n 3 .env", true),
+            ("unlink .env", true),
+            ("ln -sf /dev/null .env", true),
+            ("ln -t . /elsewhere/.env", true),
+            ("ln /elsewhere/.env", true),
+            ("touch .env", true),
+            ("touch -d yesterday .env", true),
+            ("ln -s .env link", false),
+            ("touch -r .env stamp", false),
+            ("shred notes.txt", false),
+            ("unlink .env.example", false),
+        ] {
+            assert_eq!(bash_targets_env_file(command), blocked, "{command}");
+        }
     }
 
     // --- #86: component-matched targets, quote-aware rm ---

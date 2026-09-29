@@ -60,7 +60,7 @@ const METADATA_SAFE_COMMANDS: &[&str] = &[
 /// **Before copying a prefix set from anywhere, ask whether the copy feeds a
 /// DETECTOR or an EXEMPTION.** The distinction decides the safety direction and
 /// is invisible at the call site, because the code shape is identical.
-/// `prevent_secret_writes::COMMAND_WRAPPERS` peels in order to *find* a writer
+/// `prevent_secret_writes::writer_argv` peels (through core's shared runner peel) to *find* a writer
 /// verb, so peeling there can only ever ADD blocks — looking deeper finds more
 /// danger. This set feeds [`METADATA_SAFE_COMMANDS`], an *exemption* lookup, so
 /// peeling here can only ever SUBTRACT blocks. A detector may be over-eager
