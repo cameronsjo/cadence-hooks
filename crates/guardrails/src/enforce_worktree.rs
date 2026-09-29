@@ -172,10 +172,10 @@ use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
-    heredoc_introducers, is_assignment_word, is_transparent_prefix_word, looks_absolute,
-    redirect_operator_span, redirect_targets, resolve_cd_target, skip_transparent_prefixes,
-    split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
-    strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    heredoc_introducers, installs_trap_action, is_assignment_word, is_transparent_prefix_word,
+    looks_absolute, redirect_operator_span, redirect_targets, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, split_segments_with_ops_joining_redirects,
+    strip_compound_heads, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -186,6 +186,7 @@ use cadence_hooks_core::worktree::{
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// Environment inputs resolved once per invocation, injected into the
@@ -463,17 +464,42 @@ fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
 /// git committed into the primary. [`commit_targets_of`] resolves these against
 /// the same post-`-C` base the explicit flags use, which also keeps both call
 /// sites in sync by construction (security review, #378).
+///
+/// The walk continues through an `env` with options, as
+/// [`peel_with_chdirs`] does: `env -i` drops both values inherited from
+/// before it, `env -u GIT_DIR` drops that one, and an assignment after the
+/// options (`env -i GIT_DIR=<p>/.git git commit`) is read (cadence-hooks#1100).
 fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
     let (mut work_tree, mut git_dir) = (None, None);
     let mut idx = 0;
-    while idx + 1 < tokens.len() && is_prefix_word(tokens, idx) {
-        let tok = tokens[idx].as_str();
-        if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
-            work_tree = Some(v);
-        } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
-            git_dir = Some(v);
+    while idx + 1 < tokens.len() {
+        if is_prefix_word(tokens, idx) {
+            let tok = tokens[idx].as_str();
+            if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
+                work_tree = Some(v);
+            } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
+                git_dir = Some(v);
+            }
+            idx += 1;
+            continue;
         }
-        idx += 1;
+        if !is_env_with_options(&tokens[idx..]) {
+            break;
+        }
+        let Some(flags) = parse_env_flags(&tokens[idx + 1..]) else {
+            break;
+        };
+        if flags.clears {
+            (work_tree, git_dir) = (None, None);
+        }
+        for name in &flags.unsets {
+            match name.as_str() {
+                "GIT_WORK_TREE" => work_tree = None,
+                "GIT_DIR" => git_dir = None,
+                _ => {}
+            }
+        }
+        idx += 1 + flags.consumed;
     }
     (work_tree, git_dir)
 }
@@ -675,6 +701,20 @@ fn scan_targets(command: &str, cwd: &str, on_disk: bool) -> Scan {
 /// computes it once for both this and the in-chain dismiss scan, since the
 /// segmenter's cost grows with the command's line continuations.
 fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>) -> Scan {
+    let mut out = scan_either_path(command, cwd, env, plain);
+    // A commit whose checkout cannot be read may land anywhere, the session
+    // cwd included: judge it there too, as an unreadable `cd` is judged.
+    if out.unreadable.is_some() {
+        let here = normalize_target(cwd);
+        if !out.commits.contains(&here) {
+            out.commits.push(here);
+        }
+    }
+    out
+}
+
+/// [`scan_prepared`]'s two paths.
+fn scan_either_path(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>) -> Scan {
     if let Some(plain) = plain {
         let mut out = Scan::default();
         let walked = walk_plain(plain, cwd, env, |seg| {
@@ -684,8 +724,14 @@ fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>
             let (argv, work_tree, git_dir) = plain_command(&seg.words);
             for dir in seg.dirs {
                 detect_mutations(argv, seg.segment, &dir.pwd, &mut out.mutations);
-                out.commits
-                    .extend(commit_targets_of(argv, &dir.pwd, work_tree, git_dir));
+                out.commits.extend(commit_targets_of(
+                    argv,
+                    &dir.pwd,
+                    work_tree,
+                    git_dir,
+                    env,
+                    &mut out.unreadable,
+                ));
             }
         });
         if walked.is_some() {
@@ -704,11 +750,25 @@ fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>
     }
     if command_heredocs_suspect(command) {
         // Core may have stripped lines bash runs as heredoc body: read every
-        // line as code too, with no heredoc stripping (#1084).
+        // line as code too, with no heredoc stripping (#1084) — except the
+        // lines of a body whose delimiter was read plainly, which bash reads
+        // as data (cadence-hooks#1101).
         let delims = substitution_heredoc_delims(command);
+        let bodies = plain_carve_bodies(command)
+            .map(|carve| carve.confident_bodies())
+            .unwrap_or_default();
+        let mut at = 0;
         let lines = command
             .split('\n')
-            .map(|line| split_early_heredoc_end(line, delims.as_deref().unwrap_or(&[])))
+            .map(|line| {
+                let start = at;
+                at += line.len() + 1;
+                if bodies.iter().any(|body| body.contains(&start)) {
+                    Cow::Borrowed("")
+                } else {
+                    split_early_heredoc_end(line, delims.as_deref().unwrap_or(&[]))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ; ");
         merge_scan(&mut out, union_scan(&lines, cwd, env));
@@ -749,6 +809,7 @@ fn merge_scan(out: &mut Scan, extra: Scan) {
     }
     out.unresolved_cd = out.unresolved_cd.take().or(extra.unresolved_cd);
     out.unresolved_commit = out.unresolved_commit.take().or(extra.unresolved_commit);
+    out.unreadable = out.unreadable.take().or(extra.unreadable);
     out.union_cd_dirs.extend(extra.union_cd_dirs);
 }
 
@@ -924,6 +985,11 @@ struct Scan {
     unresolved_cd: Option<String>,
     /// The first commit segment whose shape a substitution decides.
     unresolved_commit: Option<String>,
+    /// The block message for the first commit whose checkout cannot be read
+    /// for another reason: a directory value [`chdir_landing`] cannot read,
+    /// a commit in a `trap` action, or one behind an `env` whose options
+    /// cannot be read. The session cwd is judged too ([`scan_prepared`]).
+    unreadable: Option<String>,
     union_cd_dirs: Vec<String>,
 }
 
@@ -974,6 +1040,9 @@ struct CdEnv<'a> {
     /// The command may switch cd to physical resolution (`set -P`, `set -o
     /// physical`): a lexical `..` is then unreadable on the union path.
     physical: bool,
+    /// Where a path really is, symlinks followed, or `None` when it does not
+    /// exist: the directory `git -C` and `env -C` actually `chdir` into.
+    canonical: CanonicalProbe,
 }
 
 impl<'a> CdEnv<'a> {
@@ -985,11 +1054,17 @@ impl<'a> CdEnv<'a> {
         } else {
             (assume_exists, assume_exists)
         };
+        let canonical: CanonicalProbe = if on_disk {
+            canonical_on_disk
+        } else {
+            assume_canonical
+        };
         CdEnv {
             home,
             dir_exists,
             file_exists,
             physical: false,
+            canonical,
         }
     }
 }
@@ -1003,6 +1078,22 @@ fn is_dir_on_disk(path: &str) -> bool {
 /// Does `path` exist at all (an input redirection's file)?
 fn is_path_on_disk(path: &str) -> bool {
     Path::new(path).exists()
+}
+
+/// Resolves a path the way a `chdir` does: every symlink followed.
+type CanonicalProbe = fn(&str) -> Option<String>;
+
+/// The real path of `path`, or `None` when it does not exist.
+fn canonical_on_disk(path: &str) -> Option<String> {
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Test stand-in for [`canonical_on_disk`]: no symlinks, so every path is its
+/// lexical normalization.
+fn assume_canonical(path: &str) -> Option<String> {
+    Some(lexical_normalize(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,11 +1166,11 @@ struct Plain {
 
 /// The command as a [`Plain`] when its shape is plain, else `None`.
 fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
-    let (text, heredocs) = plain_carve(command)?;
-    if heredoc_reading_suspect(command, &text, heredocs) {
+    let carve = plain_carve_bodies(command)?;
+    if heredoc_reading_suspect(command, &carve) {
         return None;
     }
-    let segments = split_segments_with_ops_joining_redirects(&text);
+    let segments = split_segments_with_ops_joining_redirects(&carve.text);
     plain_segments_ok(&segments, cwd, env).then_some(Plain { segments })
 }
 
@@ -1091,18 +1182,51 @@ fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
 /// `plain_carve`'s own heredoc count differing from core's on the same text.
 /// A suspect command is never plain, and the union path also reads it line by
 /// line with no heredoc stripping at all ([`scan_prepared`]).
-fn heredoc_reading_suspect(command: &str, carved: &str, carve_heredocs: usize) -> bool {
-    if escapes_hide_a_heredoc(command) {
+///
+/// Escapes are looked for outside the bodies [`plain_carve`] read with a
+/// plainly spelled delimiter: body text is data to bash, and core, which
+/// matches a body's end line by line, never reads a quote in one
+/// (cadence-hooks#1101). A delimiter with an escape or an inner quote in it
+/// is not plainly spelled, so its body still counts.
+fn heredoc_reading_suspect(command: &str, carve: &Carve) -> bool {
+    if escapes_hide_a_heredoc(&outside_ranges(command, &carve.confident_bodies())) {
         return true;
     }
+    let carved = carve.text.as_str();
     if !carved.contains("<<") {
-        return carve_heredocs != 0;
+        return carve.heredocs != 0;
     }
     let core_heredocs: usize = strip_heredoc_bodies(carved)
         .split('\n')
         .map(|line| heredoc_introducers(line).len())
         .sum();
-    core_heredocs != carve_heredocs
+    core_heredocs != carve.heredocs
+}
+
+impl Carve {
+    /// Every body read with a plainly spelled delimiter, in command order.
+    fn confident_bodies(&self) -> Vec<Range<usize>> {
+        let mut all: Vec<Range<usize>> = self
+            .message_bodies
+            .iter()
+            .chain(&self.heredoc_bodies)
+            .cloned()
+            .collect();
+        all.sort_by_key(|r| r.start);
+        all
+    }
+}
+
+/// `text` with the (sorted, disjoint) byte `ranges` removed.
+fn outside_ranges(text: &str, ranges: &[Range<usize>]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for range in ranges {
+        out.push_str(&text[from..range.start]);
+        from = range.end;
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 /// An escaped `<` anywhere, or an escaped quote anywhere in a command with a
@@ -1121,8 +1245,8 @@ fn command_heredocs_suspect(command: &str) -> bool {
     if substitution_heredoc_ends_early(command) {
         return true;
     }
-    match plain_carve(command) {
-        Some((text, heredocs)) => heredoc_reading_suspect(command, &text, heredocs),
+    match plain_carve_bodies(command) {
+        Some(carve) => heredoc_reading_suspect(command, &carve),
         None => escapes_hide_a_heredoc(command),
     }
 }
@@ -1251,7 +1375,13 @@ fn plain_segments_ok(
         if is_cd[i] && cd_is_physical(&marked) {
             return false;
         }
-        let argv = peel_command_prefixes(&words);
+        let (argv, chdirs) = peel_with_chdirs(&words);
+        // `env -C <dir>` moves only the command it runs, and an `env` whose
+        // options cannot be read may run anything anywhere: the union path
+        // judges both (cadence-hooks#1100).
+        if !chdirs.is_empty() || is_env_with_options(argv) {
+            return false;
+        }
         let Some(head) = argv.first().map(|h| unescape_word(h)) else {
             continue;
         };
@@ -1271,15 +1401,25 @@ fn plain_segments_ok(
 /// `builtin [--]` — the same peel [`cd_word`] applies, so a head behind them
 /// (`command -p eval …`, `builtin -- source …`) is checked as the head it is.
 fn peel_command_prefixes(words: &[String]) -> &[String] {
+    peel_with_chdirs(words).0
+}
+
+/// [`peel_command_prefixes`], plus the `-C`/`--chdir` values of every `env`
+/// peeled on the way, in order. An `env` with options is peeled too
+/// ([`parse_env_flags`]): `env -i git commit` and `env -C <dir> git commit`
+/// hid the commit behind a head of `env` (cadence-hooks#1100). One whose
+/// options cannot be read stays the head ([`is_env_with_options`]).
+fn peel_with_chdirs(words: &[String]) -> (&[String], Vec<String>) {
     let mut argv = skip_transparent_prefixes(words);
+    let mut chdirs = Vec::new();
     loop {
         let Some(head) = argv.first() else {
-            return argv;
+            return (argv, chdirs);
         };
         match unescape_word(head).as_ref() {
             "command" => {
                 let Some(rest) = command_runs(&argv[1..]) else {
-                    return argv;
+                    return (argv, chdirs);
                 };
                 argv = rest;
             }
@@ -1289,7 +1429,14 @@ fn peel_command_prefixes(words: &[String]) -> &[String] {
                     argv = &argv[1..];
                 }
             }
-            _ => return argv,
+            _ if is_env_with_options(argv) => {
+                let Some(flags) = parse_env_flags(&argv[1..]) else {
+                    return (argv, chdirs);
+                };
+                argv = &argv[1 + flags.consumed..];
+                chdirs.extend(flags.chdirs);
+            }
+            _ => return (argv, chdirs),
         }
         argv = skip_transparent_prefixes(argv);
     }
@@ -1519,7 +1666,7 @@ fn redirects_are_plain(marked: &[MarkedToken], cwd: &str, env: CdEnv<'_>) -> boo
 /// One left-to-right scan that tracks what bash tracks — single and double
 /// quotes, backslash escapes, `#` comments, and heredoc bodies — so a
 /// substitution is only recognized where bash would run it. A `$(` in live
-/// context must be exactly a carve-out ([`heredoc_substitution_len`]), else
+/// context must be exactly a carve-out ([`heredoc_substitution_body`]), else
 /// the command is not plain and the scan stops there. Text in single quotes,
 /// in a comment or in a heredoc body is never matched as an opener: matching
 /// the opener as bare text let a carve-out swallow commands bash runs
@@ -1538,7 +1685,25 @@ fn redirects_are_plain(marked: &[MarkedToken], cwd: &str, env: CdEnv<'_>) -> boo
 /// Linear in the command: each carve-out is measured once and skipped, and
 /// the first opener that is not one ends the scan.
 fn plain_carve(command: &str) -> Option<(String, usize)> {
+    plain_carve_bodies(command).map(|carve| (carve.text, carve.heredocs))
+}
+
+/// [`plain_carve`]'s reading, with where its heredoc bodies are.
+struct Carve {
+    text: String,
+    heredocs: usize,
+    /// The byte ranges, in the original command, of each carve-out's body.
+    message_bodies: Vec<Range<usize>>,
+    /// The same for each other heredoc whose delimiter word is plainly
+    /// spelled ([`Heredoc::confident`]).
+    heredoc_bodies: Vec<Range<usize>>,
+}
+
+/// [`plain_carve`], recording its body ranges ([`Carve`]).
+fn plain_carve_bodies(command: &str) -> Option<Carve> {
     let bytes = command.as_bytes();
+    let mut message_bodies = Vec::new();
+    let mut heredoc_bodies = Vec::new();
     let mut out = String::with_capacity(command.len());
     let mut i = 0;
     let mut single = false;
@@ -1588,9 +1753,11 @@ fn plain_carve(command: &str) -> Option<(String, usize)> {
             }
             '$' if next == Some(b'(') => {
                 const OPEN: &str = "$(cat <<";
-                let len = command[i..]
+                let (len, body) = command[i..]
                     .strip_prefix(OPEN)
-                    .and_then(heredoc_substitution_len)?;
+                    .and_then(heredoc_substitution_body)?;
+                let at = i + OPEN.len();
+                message_bodies.push(at + body.start..at + body.end);
                 out.push_str(CARVED);
                 i += OPEN.len() + len;
                 word_start = false;
@@ -1622,6 +1789,9 @@ fn plain_carve(command: &str) -> Option<(String, usize)> {
                 i += 1;
                 for heredoc in std::mem::take(&mut pending) {
                     let body_len = heredoc_body_len(&command[i..], &heredoc)?;
+                    if heredoc.confident {
+                        heredoc_bodies.push(i..i + body_len);
+                    }
                     out.push_str(&command[i..i + body_len]);
                     i += body_len;
                 }
@@ -1634,7 +1804,12 @@ fn plain_carve(command: &str) -> Option<(String, usize)> {
         word_start = !double && matches!(c, ' ' | '\t' | ';' | '&' | '|');
         i += width;
     }
-    (!single && !double).then_some((out, heredocs))
+    (!single && !double).then_some(Carve {
+        text: out,
+        heredocs,
+        message_bodies,
+        heredoc_bodies,
+    })
 }
 
 /// A character bash does not treat as the tokenizer does: a control character
@@ -1650,6 +1825,11 @@ struct Heredoc {
     delim: String,
     strip_tabs: bool,
     quoted: bool,
+    /// The delimiter word is a plain name, bare or in one pair of quotes
+    /// (`EOF`, `'EOF'`, `"EOF"`): no escape or inner quote can make bash read
+    /// a different delimiter than this parse does (`<<"E\"F"` ends at `E"F`,
+    /// cadence-hooks#1101).
+    confident: bool,
 }
 
 /// Parse the heredoc operator at the start of `text` (`<<` or `<<-`, blanks,
@@ -1671,6 +1851,14 @@ fn parse_heredoc_operator(text: &str) -> Option<(Heredoc, usize)> {
         return None;
     }
     let quoted = word.contains(['\'', '"', '\\']);
+    let inner = [('\'', '\''), ('"', '"')]
+        .iter()
+        .find_map(|(open, close)| word.strip_prefix(*open)?.strip_suffix(*close))
+        .unwrap_or(word);
+    let confident = !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
     let delim: String = word
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -1683,6 +1871,7 @@ fn parse_heredoc_operator(text: &str) -> Option<(Heredoc, usize)> {
             delim,
             strip_tabs,
             quoted,
+            confident,
         },
         at + end,
     ))
@@ -1724,7 +1913,15 @@ fn heredoc_body_len(text: &str, heredoc: &Heredoc) -> Option<usize> {
 /// line like `DELIMX` with no `)` is ordinary body text. The
 /// delimiter line is matched exactly — a trailing `\r` is not trimmed, and is
 /// refused anyway by [`plain_carve`].
+#[cfg(test)]
 fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
+    heredoc_substitution_body(after_open).map(|(len, _)| len)
+}
+
+/// [`heredoc_substitution_len`], with the byte range of the body in
+/// `after_open`: from the line after the delimiter word through the closing
+/// delimiter line.
+fn heredoc_substitution_body(after_open: &str) -> Option<(usize, Range<usize>)> {
     let mut at = 0;
     let dash = after_open.starts_with('-');
     if dash {
@@ -1759,7 +1956,11 @@ fn heredoc_substitution_len(after_open: &str) -> Option<usize> {
             if !tail[blanks..].starts_with(')') {
                 return None;
             }
-            return Some(at + close + 1 + newline + 1 + offset + blanks + 1);
+            let body_start = at + close + 1 + newline + 1;
+            return Some((
+                body_start + offset + blanks + 1,
+                body_start..body_start + offset,
+            ));
         }
         if ends_a_substitution_heredoc(bare, delim) {
             return None;
@@ -1990,7 +2191,7 @@ fn union_scan(command: &str, cwd: &str, env: CdEnv<'_>) -> Scan {
         union_cd_dirs: dirs[1..].to_vec(),
         ..Scan::default()
     };
-    union_commits(command, 0, &dirs, (None, None), &mut out);
+    union_commits(command, 0, &dirs, (None, None), env, &mut out);
     out
 }
 
@@ -2040,11 +2241,39 @@ fn union_dirs(
     };
     for (segment, marked) in union_segments(script) {
         let words = command_tokens(&marked);
-        let argv = union_argv(&words);
+        let (argv, chdirs) = peel_with_chdirs(strip_compound_heads(&words));
         if let Some(head) = argv.first()
             && matches!(unescape_word(head).as_ref(), "eval" | "source" | ".")
         {
             note(head.clone(), unresolved);
+        }
+        // `env -C <dir>` runs its command in `<dir>` (cadence-hooks#1100):
+        // collect it as a `cd` names a directory, from every one known.
+        if chdirs.len() > MAX_UNION_DIRS {
+            // Each hop joins onto the last, so a long chain is quadratic.
+            note("… (too many `env -C` directories)".to_string(), unresolved);
+        } else if !chdirs.is_empty() && unresolved.is_none() {
+            for base in dirs.clone() {
+                let landed = chdirs.iter().try_fold(base, |here, value| {
+                    chdir_landing(value, &here, env).map(|d| lexical_normalize(&d))
+                });
+                match landed {
+                    Some(dir) if dirs.len() < MAX_UNION_DIRS => {
+                        let dir = normalize_target(&dir);
+                        if !dirs.contains(&dir) {
+                            dirs.push(dir);
+                        }
+                    }
+                    Some(_) => {
+                        note("… (too many directories)".to_string(), unresolved);
+                        break;
+                    }
+                    None => {
+                        note(format!("(env -C) {}", chdirs.join(" ")), unresolved);
+                        break;
+                    }
+                }
+            }
         }
         for (i, t) in marked.iter().enumerate() {
             let word = unescape_word(&t.text);
@@ -2124,11 +2353,20 @@ fn union_dirs(
 /// Every commit in `script` (and its child scripts), judged from each of
 /// `dirs`. `inherited_env` carries a `GIT_WORK_TREE=`/`GIT_DIR=` prefix into a
 /// wrapper's child, as the shell exports it (#378).
+///
+/// A commit in a `trap` action is judged from every directory and reported
+/// as unreadable: the action runs when the signal fires, in whatever
+/// directory the shell has reached by then, so a `cd` inside it resolves from
+/// a directory this walk has not collected yet (`trap 'cd <p> && git commit'
+/// EXIT; cd ..` from a worktree beside `<p>`) — the same refusal core's push
+/// walk makes (cadence-hooks#1091). So is a commit behind an `env` whose
+/// options cannot be read.
 fn union_commits(
     script: &str,
     depth: usize,
     dirs: &[String],
     inherited_env: (Option<&str>, Option<&str>),
+    env: CdEnv<'_>,
     out: &mut Scan,
 ) {
     for (segment, marked) in union_segments(script) {
@@ -2139,17 +2377,58 @@ fn union_commits(
         let work_tree = work_tree.or(inherited_env.0);
         let git_dir = git_dir.or(inherited_env.1);
         if depth < MAX_WRAPPER_DEPTH {
+            let deferred = installs_trap_action(&words);
+            let child_env = CdEnv { home: None, ..env };
             for child in child_scripts(argv, &segment) {
-                union_commits(&child, depth + 1, dirs, (work_tree, git_dir), out);
+                if !deferred {
+                    union_commits(
+                        &child,
+                        depth + 1,
+                        dirs,
+                        (work_tree, git_dir),
+                        child_env,
+                        out,
+                    );
+                    continue;
+                }
+                let mut trapped = Scan::default();
+                union_commits(
+                    &child,
+                    depth + 1,
+                    dirs,
+                    (work_tree, git_dir),
+                    child_env,
+                    &mut trapped,
+                );
+                if !trapped.commits.is_empty() && out.unreadable.is_none() {
+                    out.unreadable = Some(unreadable_commit_message(
+                        &segment,
+                        "commits in a `trap` action, which runs in whatever directory the \
+                         shell has reached when the signal fires",
+                    ));
+                    out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
+                }
+                merge_scan(out, trapped);
             }
         }
         if cd_word(&marked).is_some() {
             continue;
         }
+        if is_env_with_options(argv)
+            && argv.iter().any(|w| w.contains("commit"))
+            && out.unreadable.is_none()
+        {
+            out.unreadable = Some(unreadable_commit_message(
+                &segment,
+                "may run a git commit behind `env` options the guard cannot read",
+            ));
+            out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
+        }
         let mut found = false;
         for dir in dirs {
             detect_mutations(argv, &segment, dir, &mut out.mutations);
-            let targets = commit_targets_of(argv, dir, work_tree, git_dir);
+            let targets =
+                commit_targets_of(argv, dir, work_tree, git_dir, env, &mut out.unreadable);
             found |= !targets.is_empty();
             out.commits.extend(targets);
         }
@@ -2513,6 +2792,164 @@ fn resolve_git_path(path: &str, base: &str) -> String {
     }
 }
 
+/// Where a directory value that git or `env` `chdir`s into — a `git -C`,
+/// `--work-tree`, `--git-dir` or `GIT_DIR=`/`GIT_WORK_TREE=` value, or an
+/// `env -C` — lands from `base`, or `None` when the guard cannot read it.
+///
+/// Unreadable (cadence-hooks#1056, #1100):
+///
+/// - a shell expansion the guard does not perform: any `$` other than a
+///   leading `$HOME`/`${HOME}` expanded against [`CdEnv::home`] (only set for
+///   a command shown to leave HOME alone, see [`dollar_home`]), a backtick, a
+///   substitution placeholder, a glob, a brace or a paren. Joining `$VAR`
+///   onto `base` named a directory that holds no repo, so the commit behind it
+///   was allowed wherever `$VAR` pointed;
+/// - a `~user`/`~+`/`~-` tilde form, which the plain HOME substitution would
+///   mangle into a path naming no repo;
+/// - a path with a `..` whose real location differs from its lexical folding.
+///   A `chdir` resolves each symlink before the `..` after it, so
+///   `git -C link/../x` with `link -> <p>/sub` runs in `<p>/x` while the
+///   lexical reading says `<base>/x`. A value naming no existing directory is
+///   not unreadable: git and `env` fail on it, and nothing runs.
+///
+/// A value that is not a `$HOME` path is judged as the raw text, even where
+/// bash would not expand it (`'$V'`): that can only block.
+fn chdir_landing(value: &str, base: &str, env: CdEnv<'_>) -> Option<String> {
+    let home_rest = value
+        .strip_prefix("${HOME}")
+        .or_else(|| value.strip_prefix("$HOME"))
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+    let expanded = match (home_rest, env.home) {
+        (Some(rest), Some(home)) => Cow::Owned(format!("{home}{rest}")),
+        _ => Cow::Borrowed(value),
+    };
+    if expanded.contains(['$', '`', '*', '?', '[', '{', '(', ')']) || expanded.contains(CARVED) {
+        return None;
+    }
+    if let Some(after_tilde) = expanded.strip_prefix('~')
+        && !(after_tilde.is_empty() || after_tilde.starts_with('/'))
+    {
+        return None;
+    }
+    let joined = resolve_git_path(&expanded, base);
+    if joined.split(['/', '\\']).any(|c| c == "..")
+        && let Some(physical) = (env.canonical)(&joined)
+        && (env.canonical)(&lexical_normalize(&joined)).as_deref() != Some(physical.as_str())
+    {
+        return None;
+    }
+    Some(joined)
+}
+
+/// What an `env` invocation's own options do before it runs its command.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EnvFlags {
+    /// The option words, `--` included.
+    consumed: usize,
+    /// `-C`/`--chdir` values, in order, raw.
+    chdirs: Vec<String>,
+    /// `-i`, `-` or `--ignore-environment`: the command inherits no variables.
+    clears: bool,
+    /// `-u`/`--unset` names.
+    unsets: Vec<String>,
+}
+
+/// Parse the options after an `env` word — GNU's and BSD's shared set (see
+/// core's `ENV_VALUE_SHORT_FLAGS`), plus `-` for `-i`. `None` for an option
+/// it does not model (`-S`, `--argv0`, a signal option), or when no command
+/// follows the options.
+fn parse_env_flags(after: &[String]) -> Option<EnvFlags> {
+    let mut flags = EnvFlags::default();
+    let mut i = 0;
+    loop {
+        let tok = unescape_word(after.get(i)?);
+        if !tok.starts_with('-') {
+            break;
+        }
+        i += 1;
+        match tok.as_ref() {
+            "--" => break,
+            "-" | "--ignore-environment" => flags.clears = true,
+            "--null" | "--debug" => {}
+            long if long.starts_with("--") => {
+                let (name, glued) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value.to_string())),
+                    None => (long, None),
+                };
+                let value = match glued {
+                    Some(value) => value,
+                    None => {
+                        i += 1;
+                        after.get(i - 1)?.clone()
+                    }
+                };
+                match name {
+                    "--chdir" => flags.chdirs.push(value),
+                    "--unset" => flags.unsets.push(value),
+                    _ => return None,
+                }
+            }
+            short => {
+                for (pos, c) in short[1..].char_indices() {
+                    match c {
+                        'i' => flags.clears = true,
+                        '0' | 'v' => {}
+                        'u' | 'C' | 'P' => {
+                            let glued = &short[1 + pos + 1..];
+                            let value = if glued.is_empty() {
+                                i += 1;
+                                after.get(i - 1)?.clone()
+                            } else {
+                                glued.to_string()
+                            };
+                            match c {
+                                'C' => flags.chdirs.push(value),
+                                'u' => flags.unsets.push(value),
+                                _ => {}
+                            }
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    after.get(i)?;
+    flags.consumed = i;
+    Some(flags)
+}
+
+/// Is `word` an `env` command word?
+fn is_env_word(word: &str) -> bool {
+    command_word(word) == "env"
+}
+
+/// An `env` followed by an option. Left at the head after
+/// [`peel_with_chdirs`], it is one whose options [`parse_env_flags`] cannot
+/// read: the command behind it, and where it runs, are unknown.
+fn is_env_with_options(argv: &[String]) -> bool {
+    argv.first().is_some_and(|w| is_env_word(w))
+        && argv
+            .get(1)
+            .is_some_and(|w| unescape_word(w).starts_with('-'))
+}
+
+/// The block message for a commit whose checkout the guard cannot read for a
+/// reason other than a `cd` or a substitution (see [`Scan::unreadable`]).
+fn unreadable_commit_message(what: &str, why: &str) -> String {
+    let what = sanitize_field(&what.replace(CARVED, "$(…)"), MAX_PATH_DISPLAY);
+    format!(
+        "Blocked: `{what}` {why}, so enforce-worktree cannot tell which checkout this commit \
+         lands in — it may be a primary checkout.\nName the path literally, e.g. \
+         `git -C <path> commit`."
+    )
+}
+
+/// The most `git -C` hops [`commit_targets_of`] reads; past it the target is
+/// unreadable.
+const MAX_DASH_C_HOPS: usize = 16;
+
 /// If `argv` (already prefix-/assignment-stripped) is a `git … commit …`
 /// invocation, return every directory the commit lands in — the `effective_dir`,
 /// or the trees named by `--work-tree`, `--git-dir`, and a `-C <path>` redirect
@@ -2561,11 +2998,19 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// [`file_mutation_targets`], which had the same gap — the normalization lives
 /// in exactly one place so a new verb gate cannot silently reopen the bypass by
 /// forgetting a step.
+///
+/// Every directory value goes through [`chdir_landing`]. One it cannot read —
+/// a `$VAR`, a glob, a `..` through a symlink — is still emitted as its
+/// lexical reading, and the first is described in `unreadable`, which
+/// [`run_enforce`] blocks from a linked worktree and [`scan_prepared`] answers
+/// by judging the session cwd too (cadence-hooks#1056, #1100).
 fn commit_targets_of(
     argv: &[String],
     effective_dir: &str,
     env_work_tree: Option<&str>,
     env_git_dir: Option<&str>,
+    env: CdEnv<'_>,
+    unreadable: &mut Option<String>,
 ) -> Vec<CommitTarget> {
     let Some(verb) = argv.first() else {
         return Vec::new();
@@ -2586,6 +3031,8 @@ fn commit_targets_of(
     let mut redirect: Option<String> = None;
     let mut work_tree: Option<Cow<'_, str>> = None;
     let mut git_dir: Option<Cow<'_, str>> = None;
+    let mut unread: Option<String> = None;
+    let mut hops = 0;
     let mut idx = 1;
     while let Some(t) = argv.get(idx).map(String::as_str) {
         // The FLAG is read the way git receives it, after the shell's escape
@@ -2609,7 +3056,30 @@ fn commit_targets_of(
                     // `-C` compounds: resolve this hop against the previous one.
                     "-C" => {
                         let base = redirect.as_deref().unwrap_or(effective_dir);
-                        redirect = Some(resolve_git_path(value, base));
+                        // Folded once read: each hop joins onto a short path,
+                        // and a readable hop's folding IS where git lands.
+                        // Once one hop is unreadable the target is anyway;
+                        // skip the stats that could only find another. Past
+                        // MAX_DASH_C_HOPS the chain is unreadable too: each
+                        // hop reads the path the last one built.
+                        hops += 1;
+                        if unread.is_some() {
+                            // The target is already unreadable; this hop
+                            // cannot make it readable again.
+                            idx += 2;
+                            continue;
+                        }
+                        let landed = if hops > MAX_DASH_C_HOPS {
+                            unread = Some(format!("-C … ({hops} directories)"));
+                            None
+                        } else {
+                            chdir_landing(value, base, env)
+                        };
+                        let hop = landed.unwrap_or_else(|| {
+                            unread.get_or_insert_with(|| format!("-C {value}"));
+                            resolve_git_path(value, base)
+                        });
+                        redirect = Some(lexical_normalize(&hop));
                     }
                     "--work-tree" => work_tree = Some(Cow::Borrowed(value)),
                     "--git-dir" => git_dir = Some(Cow::Borrowed(value)),
@@ -2640,14 +3110,29 @@ fn commit_targets_of(
     // Per-flag precedence: each explicit flag overrides only its OWN env var,
     // exactly as git does, so `--git-dir=X` with `GIT_WORK_TREE=Y` still reads
     // its tree from Y.
+    let mut resolve = |p: &str, name: &str| {
+        chdir_landing(p, base, env).unwrap_or_else(|| {
+            unread.get_or_insert_with(|| format!("{name} {p}"));
+            resolve_git_path(p, base)
+        })
+    };
     let resolved_work_tree = work_tree
         .as_deref()
         .or(env_work_tree)
-        .map(|p| resolve_git_path(p, base));
+        .map(|p| resolve(p, "--work-tree"));
     let resolved_git_dir = git_dir
         .as_deref()
         .or(env_git_dir)
-        .map(|p| resolve_git_path(p, base));
+        .map(|p| resolve(p, "--git-dir"));
+    if let Some(what) = unread
+        && unreadable.is_none()
+    {
+        *unreadable = Some(unreadable_commit_message(
+            &format!("git {what} commit"),
+            "names a directory the guard cannot resolve (a shell variable, a glob, or a `..` \
+             through a symlink)",
+        ));
+    }
 
     // BOTH are emitted, because they name two different things git mutates and
     // either one landing in a primary checkout is the harm this guard exists to
@@ -2770,7 +3255,8 @@ fn inchain_dismissed_prepared(
             }
         } else {
             for dir in seg.dirs {
-                for target in commit_targets_of(argv, &dir.pwd, work_tree, git_dir) {
+                for target in commit_targets_of(argv, &dir.pwd, work_tree, git_dir, env, &mut None)
+                {
                     if let Some(reason) = active.get(&target) {
                         dismissed.entry(target).or_insert_with(|| reason.clone());
                     }
@@ -2828,7 +3314,7 @@ fn inchain_dismissed_without_cd(
             );
         } else {
             let mut found = Scan::default();
-            union_commits(segment, 0, &dirs, (None, None), &mut found);
+            union_commits(segment, 0, &dirs, (None, None), env, &mut found);
             for target in found.commits {
                 if let Some(reason) = active.get(&target) {
                     dismissed.entry(target).or_insert_with(|| reason.clone());
@@ -3394,6 +3880,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 mutations: mutation_targets,
                 unresolved_cd,
                 unresolved_commit,
+                unreadable,
                 union_cd_dirs,
             } = scan_prepared(command, cwd, env, plain.as_ref());
             // A leading `&&`-chained `dismiss-enforce-worktree` for the SAME
@@ -3451,7 +3938,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             let unreadable = match (unresolved_cd.as_deref(), unresolved_commit.as_deref()) {
                 (Some(target), _) => Some(unresolved_cd_block_message(target)),
                 (None, Some(segment)) => Some(substituted_commit_block_message(segment)),
-                (None, None) => None,
+                (None, None) => unreadable,
             };
             if has_commit
                 && let Some(message) = unreadable
@@ -4252,10 +4739,20 @@ mod tests {
     }
 
     #[test]
-    fn env_with_option_flag_is_a_miss_not_a_misparse() {
-        // `env -i git commit` — we don't parse env's own flags; documented
-        // miss (empty), never a wrong target. Mirrors `nice -n 10`.
-        assert!(git_commit_targets("env -i git commit -m x", "/cwd").is_empty());
+    fn env_with_options_commit_detected() {
+        // cadence-hooks#1100: env's own options are parsed now, so the commit
+        // behind them is found. `env -C <dir>` is a directory change, which
+        // the union path collects.
+        for cmd in [
+            "env -i git commit -m x",
+            "env -u FOO git commit -m x",
+            "env -0v -- git commit -m x",
+            "env - git commit -m x",
+            "env --ignore-environment --unset=FOO git commit -m x",
+            "/usr/bin/env -i GIT_AUTHOR_NAME=x git commit -m x",
+        ] {
+            assert_eq!(git_commit_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
     }
 
     #[test]
@@ -8903,6 +9400,350 @@ mod tests {
                 Outcome::Allow,
                 "{cmd:?}"
             );
+        }
+    }
+
+    /// Run `cmd` from `cwd` through the whole Bash arm.
+    fn outcome_from(cwd: &Path, cmd: &str) -> Outcome {
+        let mut input = make_bash(cmd);
+        input.cwd = Some(cwd.to_string_lossy().into_owned());
+        run_enforce(&input, &cfg(false, false)).outcome
+    }
+
+    #[test]
+    fn a_cd_into_a_missing_directory_leaves_the_commit_in_the_primary() {
+        // cadence-hooks#1102: bash's `cd` fails on a missing target and the
+        // shell stays put, so a commit reached through `;`, a newline or `||`
+        // runs in the primary. Behind `&&` it never runs.
+        let scratch = scratch("missing-cd-1102");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy().into_owned();
+        for cmd in [
+            "cd nonexist; git commit -m x".to_string(),
+            "cd \"}\"; git commit -m x".to_string(),
+            "cd \\}; git commit -m x".to_string(),
+            "cd }; git commit -m x".to_string(),
+            "cd nonexist\ngit commit -m x".to_string(),
+            "cd nonexist || true; git commit -m x".to_string(),
+            "cd nonexist || git commit -m x".to_string(),
+            format!("cd {p}/nonexist; git commit -m x"),
+        ] {
+            assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
+        }
+        assert_eq!(
+            outcome_from(&primary, "cd nonexist && git commit -m x"),
+            Outcome::Allow
+        );
+        // From the worktree, into the primary and then a failed cd.
+        for cmd in [
+            format!("cd {p} && cd nonexist; git commit -m x"),
+            format!("cd {p}; cd nonexist\ngit commit -m x"),
+        ] {
+            assert_eq!(outcome_from(&wt, &cmd), Outcome::Block, "{cmd:?}");
+        }
+        assert_eq!(
+            outcome_from(&wt, "cd nonexist; git commit -m x"),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn env_options_parse_like_env() {
+        let words = |s: &str| tokenize(s);
+        let parsed = |s: &str| parse_env_flags(&words(s));
+        let flags = parsed("-iC /p -u GIT_DIR --chdir=/q --unset X git commit").unwrap();
+        assert_eq!(flags.consumed, 7);
+        assert_eq!(flags.chdirs, vec!["/p", "/q"]);
+        assert!(flags.clears);
+        assert_eq!(flags.unsets, vec!["GIT_DIR", "X"]);
+        assert_eq!(parsed("-C/p git").unwrap().chdirs, vec!["/p"]);
+        assert_eq!(parsed("--chdir /p git").unwrap().chdirs, vec!["/p"]);
+        assert_eq!(parsed("-- git").unwrap().consumed, 1);
+        assert!(parsed("- git").unwrap().clears);
+        // Unmodelled options, or no command after the options: unreadable.
+        for rest in ["-S 'git commit'", "--argv0 x git", "-x git", "-i", "-C /p"] {
+            assert_eq!(parsed(rest), None, "{rest}");
+        }
+        // Every option core's runner peel accepts is read to the same word.
+        for rest in [
+            "-i git",
+            "-u X git",
+            "-uX git",
+            "-C /p git",
+            "-0v git",
+            "-P /b git",
+        ] {
+            let w = words(rest);
+            let core = cadence_hooks_core::shell::skip_runner_flags("env", &w).unwrap();
+            assert_eq!(parse_env_flags(&w).unwrap().consumed, w.len() - core.len());
+        }
+    }
+
+    #[test]
+    fn env_chdir_is_a_directory_change() {
+        // cadence-hooks#1100: `env -C <dir>` runs its command in `<dir>`.
+        let env = CdEnv::new(None, false);
+        for cmd in [
+            "env -C /p git commit -m x",
+            "env --chdir=/p git commit -m x",
+            "env --chdir /p git commit -m x",
+            "env -C/p git commit -m x",
+            "env -iC /p git commit -m x",
+            "env -C / env -C p git commit -m x",
+            "env -C /p sh -c 'git commit -m x'",
+        ] {
+            assert!(!is_plain_shape(cmd, "/w", env), "{cmd}");
+            assert!(
+                sorted_targets(cmd, "/w").contains(&"/p".to_string()),
+                "{cmd}: {:?}",
+                sorted_targets(cmd, "/w")
+            );
+        }
+        // `env -C .. git -C p commit` lands in `/p` from `/w`.
+        assert!(sorted_targets("env -C .. git -C p commit", "/w").contains(&"/p".to_string()));
+        // An unreadable chdir is an unreadable cd.
+        let scan = scan_targets("env -C \"$D\" git commit -m x", "/w", false);
+        assert!(scan.unresolved_cd.is_some());
+        // An env whose options cannot be read hides nothing.
+        let scan = scan_targets("env -S 'git commit -m x'", "/w", false);
+        assert!(scan.unreadable.is_some());
+        assert!(scan.commits.contains(&"/w".to_string()));
+    }
+
+    #[test]
+    fn env_clears_and_unsets_drop_inherited_git_overrides() {
+        let targets = |cmd: &str| sorted_targets(cmd, "/w");
+        assert_eq!(
+            targets("GIT_DIR=/p/.git env -i git commit -m x"),
+            vec!["/w"]
+        );
+        assert_eq!(
+            targets("GIT_DIR=/p/.git env -u GIT_DIR git commit"),
+            vec!["/w"]
+        );
+        assert_eq!(targets("GIT_DIR=/p/.git env -u FOO git commit"), vec!["/p"]);
+        assert_eq!(
+            targets("env -i GIT_DIR=/p/.git git commit -m x"),
+            vec!["/p"]
+        );
+        assert_eq!(
+            targets("env -u X GIT_WORK_TREE=/p git commit -m x"),
+            vec!["/p"]
+        );
+    }
+
+    #[test]
+    fn chdir_landing_reads_only_what_it_can() {
+        let env = CdEnv::new(Some("/h"), false);
+        let land = |v: &str| chdir_landing(v, "/w", env);
+        assert_eq!(land("$HOME/x").as_deref(), Some("/h/x"));
+        assert_eq!(land("${HOME}/x").as_deref(), Some("/h/x"));
+        assert_eq!(land("$HOME").as_deref(), Some("/h"));
+        assert_eq!(land("sub").as_deref(), Some("/w/sub"));
+        assert_eq!(land("/p").as_deref(), Some("/p"));
+        for value in [
+            "$VAR", "$VAR/x", "$HOMEX/x", "a$B", "`pwd`", "x*", "x?", "[ab]", "{a,b}", "~u/x",
+            "~+", "~-",
+        ] {
+            assert_eq!(land(value), None, "{value}");
+        }
+        // No home to expand against: unreadable.
+        let env = CdEnv::new(None, false);
+        assert_eq!(chdir_landing("$HOME/x", "/w", env), None);
+    }
+
+    #[test]
+    fn an_unreadable_git_directory_value_is_unreadable() {
+        // cadence-hooks#1056: the value was joined onto the cwd as a literal
+        // `$VAR`, naming no repo, and the commit was allowed.
+        for cmd in [
+            "git -C \"$V\" commit -m x",
+            "git -C $V/sub commit -m x",
+            "git --work-tree=\"$V\" commit -m x",
+            "git --git-dir $V commit -m x",
+            "GIT_DIR=$V git commit -m x",
+            "git -C 'x*' commit -m x",
+            "git -C ~nobody/x commit -m x",
+            "cd /a && git -C \"$V\" commit -m x",
+        ] {
+            let scan = scan_targets(cmd, "/w", false);
+            assert!(scan.unreadable.is_some(), "{cmd}");
+            assert!(scan.commits.contains(&"/w".to_string()), "{cmd}");
+        }
+        // A readable value, or no commit, is not.
+        for cmd in [
+            "git -C sub commit -m x",
+            "git -C \"$V\" log",
+            "git -C ~/x commit",
+        ] {
+            assert!(scan_targets(cmd, "/w", false).unreadable.is_none(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_commit_in_a_trap_action_is_unreadable() {
+        // cadence-hooks#1091: a trap runs where the shell is when the signal
+        // fires, so a `cd` in it resolves from a directory the walk has not
+        // collected yet.
+        for cmd in [
+            "trap 'git commit -m x' EXIT",
+            "trap 'cd p && git commit -m x' EXIT; cd ..",
+            "trap -- 'git -C p commit' INT; cd /a",
+            "sh -c \"trap 'git commit -m x' EXIT\"",
+        ] {
+            let scan = scan_targets(cmd, "/w", false);
+            assert!(scan.unreadable.is_some(), "{cmd}");
+            assert!(scan.commits.contains(&"/w".to_string()), "{cmd}");
+        }
+        for cmd in ["trap 'echo hi' EXIT; git commit -m x", "trap - EXIT"] {
+            assert!(scan_targets(cmd, "/w", false).unreadable.is_none(), "{cmd}");
+        }
+        // An eval'd cd is already an unreadable cd.
+        let scan = scan_targets("eval 'cd /p'; git commit -m x", "/w", false);
+        assert!(scan.unresolved_cd.is_some());
+    }
+
+    #[test]
+    fn a_plainly_delimited_heredoc_body_is_not_read_as_code() {
+        // cadence-hooks#1101: an escaped quote in a commit-message body made
+        // the whole command suspect, and prose mentioning `cd` then read as
+        // a `cd`.
+        let env = CdEnv::new(None, false);
+        for body in [
+            "fix: handle \\\"quoted\\\" names\n\nthen cd .. and retry",
+            "fix: say \\\"hi\\\"\n\nRun cd $HOME/foo first, or `cd -`.",
+            "a \\'b\\' c\ncd /p",
+        ] {
+            let cmd = format!("git commit -m \"$(cat <<'EOF'\n{body}\nEOF\n)\"");
+            assert!(!command_heredocs_suspect(&cmd), "{cmd:?}");
+            assert!(is_plain_shape(&cmd, "/w", env), "{cmd:?}");
+            assert_eq!(sorted_targets(&cmd, "/w"), vec!["/w"], "{cmd:?}");
+            let scan = scan_targets(&cmd, "/w", false);
+            assert!(scan.unresolved_cd.is_none(), "{cmd:?}");
+        }
+        // An escape outside the body keeps the command suspect, but the
+        // line-by-line reads skip a plainly delimited body.
+        for cmd in [
+            "echo \\\"x\\\" && git commit -m \"$(cat <<'EOF'\nthen cd .. and retry\nEOF\n)\"",
+            "echo \\\"x\\\"; git commit -F - <<'EOF'\nthen cd .. and retry\nEOF",
+            "git commit -F - <<\"EOF\"\nfix \\\"x\\\"\nthen cd .. and retry\nEOF",
+        ] {
+            let scan = scan_targets(cmd, "/w", false);
+            assert!(scan.unresolved_cd.is_none(), "{cmd:?}");
+            assert_eq!(sorted_targets(cmd, "/w"), vec!["/w"], "{cmd:?}");
+        }
+        // A delimiter with an escape or an inner quote is not plainly read.
+        for word in ["\"E\\\"F\"", "'E\\'F'", "E\\F", "'E'F'"] {
+            let (heredoc, _) = parse_heredoc_operator(&format!("<<{word}\n")).unwrap();
+            assert!(!heredoc.confident, "{word}");
+        }
+        for word in ["EOF", "'EOF'", "\"EOF\"", "END_MSG", "e-o.f"] {
+            let (heredoc, _) = parse_heredoc_operator(&format!("<<{word}\n")).unwrap();
+            assert!(heredoc.confident, "{word}");
+        }
+    }
+
+    #[test]
+    fn a_long_git_dash_c_chain_keeps_the_redirect_bounded() {
+        // Each hop reads the path the last one built; past MAX_DASH_C_HOPS
+        // the chain is unreadable instead of quadratic.
+        for unit in ["-C sub -C .. ", "-C sub ", "-C link/.. "] {
+            let cmd = format!("git {}commit -m x", unit.repeat(200 * 1024 / unit.len()));
+            let started = std::time::Instant::now();
+            let scan = scan_targets(&cmd, "/w", false);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit}"
+            );
+            assert!(scan.unreadable.is_some(), "{unit}");
+            assert!(scan.commits.contains(&"/w".to_string()), "{unit}");
+        }
+        let short = format!("git {}commit -m x", "-C sub -C .. ".repeat(8));
+        assert_eq!(sorted_targets(&short, "/w"), vec!["/w"]);
+        assert!(scan_targets(&short, "/w", false).unreadable.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ew_followup_repros_block_end_to_end() {
+        let scratch = scratch("ew-followups-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir(primary.join("sub")).unwrap();
+        std::fs::create_dir(primary.join("sub2")).unwrap();
+        std::fs::create_dir(wt.join("sub")).unwrap();
+        std::os::unix::fs::symlink(primary.join("sub"), wt.join("link")).unwrap();
+        let p = primary.to_string_lossy().into_owned();
+        let from_w = [
+            // #1100 (a): git's chdir is physical.
+            "git -C link/../sub2 commit -m x".to_string(),
+            "git -C link/.. commit -m x".to_string(),
+            "git -C link/../sub commit -m x".to_string(),
+            "GIT_DIR=link/../.git git commit -m x".to_string(),
+            "git --git-dir=link/../.git commit -m x".to_string(),
+            // #1100 (b)
+            format!("env -C {p} git commit -m x"),
+            format!("env --chdir={p} git commit -m x"),
+            format!("env --chdir {p} git commit -m x"),
+            format!("env -iC {p} git commit -m x"),
+            format!("env -C {p} sh -c 'git commit -m x'"),
+            "env -C .. git -C repo commit -m x".to_string(),
+            format!("GIT_DIR={p}/.git env -u FOO git commit -m x"),
+            // #1091
+            "trap 'cd repo && git commit -m x' EXIT; cd ..".to_string(),
+            format!("trap 'git commit -m x' EXIT; cd {p}"),
+            format!("eval 'cd {p}'; git commit -m x"),
+            "eval 'cd ..'; git -C repo commit -m x".to_string(),
+            // #1056
+            "git -C \"$V\" commit -m x".to_string(),
+            "git --work-tree=\"$V\" commit -m x".to_string(),
+            "GIT_DIR=$V git commit -m x".to_string(),
+            // #1101: the B3 repro still blocks.
+            format!("cat <<\"E\\\"F\"\nE\"F\ncd {p}\nEF\ngit commit -m x"),
+        ];
+        for cmd in &from_w {
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Block, "{cmd:?}");
+        }
+        for cmd in ["git -C \"$V\" commit -m x", "env -i git commit -m x"] {
+            assert_eq!(outcome_from(&primary, cmd), Outcome::Block, "{cmd:?}");
+        }
+        let allowed_from_w = [
+            "git -C sub/.. commit -m x",
+            "env -i git commit -m x",
+            "GIT_DIR=link/../.git env -i git commit -m x",
+            "trap 'echo done' EXIT; git commit -m x",
+            "git commit -m \"$(cat <<'EOF'\nfix: handle \\\"quoted\\\" names\n\nthen cd .. and retry\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nfix: say \\\"hi\\\"\n\nRun cd $HOME/foo first, or `cd -`.\nEOF\n)\"",
+            "git commit -F - <<'EOF'\nfix \\\"x\\\"\nthen cd .. and retry\nEOF",
+        ];
+        for cmd in allowed_from_w {
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Allow, "{cmd:?}");
+        }
+        let w = wt.to_string_lossy().into_owned();
+        let from_p = format!("cd {w} && git commit -m \"$(cat <<'EOF'\nfix: a \\\"b\\\"\nEOF\n)\"");
+        assert_eq!(outcome_from(&primary, &from_p), Outcome::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_six_common_flows_still_pass() {
+        let scratch = scratch("six-flows");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir(wt.join("sub")).unwrap();
+        let w = wt.to_string_lossy().into_owned();
+        let msg = "\"$(cat <<'EOF'\nfix: x\n\nbody\nEOF\n)\"";
+        for (cwd, cmd) in [
+            (
+                &primary,
+                "git worktree add .claude/worktrees/x -b x && cd .claude/worktrees/x && git commit -m x"
+                    .to_string(),
+            ),
+            (&primary, format!("cd {w} && git commit -m {msg}")),
+            (&wt, "cd sub && git commit -m x".to_string()),
+            (&wt, "npm test 2>&1 | tail -3 && git commit -m x".to_string()),
+            (&wt, "(cd sub && make) && git commit -m x".to_string()),
+            (&primary, format!("git -C {w} commit -m x")),
+        ] {
+            assert_eq!(outcome_from(cwd, &cmd), Outcome::Allow, "{cmd:?}");
         }
     }
 }
