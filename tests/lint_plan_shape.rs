@@ -20,6 +20,8 @@
 //! | no inline plan, `planFilePath` inside the plan store | read through the bounded reader; judged |
 //! | no inline plan, `planFilePath` OUTSIDE the plan store | exit 0, silent (never read) |
 
+mod support;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -31,7 +33,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");

@@ -66,6 +66,20 @@ pub struct SessionRecord {
     /// still parse and simply carry no repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// True only when `started_epoch` bounds the moment this session's process
+    /// loaded its plugins: the record was created by a `SessionStart` whose
+    /// `source` is `startup`, a fresh process.
+    ///
+    /// `started_epoch` alone is not that bound. `/clear` and `/compact` mint a
+    /// new session id inside a process that loaded its plugins long before, and
+    /// a heartbeat recreates a swept record with `started_epoch` set to now.
+    /// `doctor --prune --keep-newest`/`--older-than` delete a version dir only
+    /// when it was orphaned before every live session started
+    /// (cameronsjo/cadence-hooks#904), so a record that cannot vouch for its
+    /// start time keeps every dir. Serde-defaulted to `false`: a record from an
+    /// older binary cannot vouch either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_verified: bool,
 }
 
 /// The short id a session is displayed by: the first 8 characters of the
@@ -292,6 +306,7 @@ mod tests {
             started: "2026-06-02T01:26:05Z".into(),
             started_epoch: 1_780_000_000,
             repo: Some("/Users/x/Projects/cadence-hooks".into()),
+            start_verified: true,
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: SessionRecord = serde_json::from_str(&json).unwrap();

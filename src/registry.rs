@@ -305,7 +305,7 @@ pub const HOOKS: &[HookEntry] = &[
     // rules
     HookEntry {
         name: "validate-frontmatter",
-        description: "Validate SKILL.md and command frontmatter",
+        description: "Validate SKILL.md, command, living-plan, and plugin-agent frontmatter",
         namespace: "rules",
         event: Some(HookEvent::PreToolUse),
     },

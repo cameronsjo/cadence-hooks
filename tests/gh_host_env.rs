@@ -5,8 +5,10 @@
 //! Setting it inside that test binary flipped their bare-owner verdicts
 //! whenever the two overlapped. A child's environment touches nothing else.
 
+mod support;
+
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn guard(command: &str, gh_host: &str) -> i32 {
     let scratch = tempfile::tempdir().expect("temp metrics dir");
@@ -17,7 +19,7 @@ fn guard(command: &str, gh_host: &str) -> i32 {
         "cwd": "/tmp",
     })
     .to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut child = support::cadence_hooks()
         .args(["guardrails", "guard-gh-write"])
         // Ambient switches would exempt the guard and fake a pass.
         .env_remove("CADENCE_BYPASS")

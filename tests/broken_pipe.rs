@@ -13,10 +13,46 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::io::Read;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+/// `pipe(2)` with both ends close-on-exec.
+///
+/// The tests in this file run in parallel threads of one process and each
+/// spawns children. A plain `pipe()` leaves the read end inheritable for the
+/// instant before the test closes it, so a sibling test's `fork`/`exec` in that
+/// window carries a live reader into *its* child. The pipe then never counts
+/// as closed: a write that must hit `EPIPE` succeeds, and the process exits 0
+/// instead of dying by SIGPIPE (an intermittent red about 1 run in 400 under
+/// load). Close-on-exec removes the leak; the write end reaches the intended
+/// child through `Stdio`, whose `dup2` onto fd 1 clears the flag.
+///
+/// # Safety
+///
+/// `fds` must be a valid two-element array, the only thing written through.
+unsafe fn cloexec_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: the caller guarantees `fds` is a valid two-element array.
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: as above; `fcntl` only touches the two fds just created.
+        unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0 {
+                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            rc
+        }
+    }
+}
 
 /// Run `cadence-hooks <args>` with stdout wired to a pipe whose read end is
 /// **already closed**, and return `(status, stderr, failopen_rows)`.
@@ -44,7 +80,7 @@ fn run_with_closed_stdout_env(
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid two-element array of `c_int`, the only thing
     // `pipe(2)` writes through this pointer.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let rc = unsafe { cloexec_pipe(&mut fds) };
     assert_eq!(rc, 0, "pipe(2) failed");
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
@@ -55,7 +91,7 @@ fn run_with_closed_stdout_env(
     // below, and never wrapped in an owning type.
     unsafe { libc::close(read_fd) };
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut command = support::cadence_hooks();
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
@@ -152,10 +188,21 @@ fn closed_stdout_covers_doctor() {
         !stderr.contains("internal error (panic)"),
         "doctor reported an internal error on a closed stdout:\n{stderr}"
     );
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGPIPE),
-        "expected death by SIGPIPE; got status {status:?} with stderr:\n{stderr}"
+    // Two legitimate outcomes, and which one happens is scheduling, not logic
+    // (#1061): `doctor` in an empty temp home has no plugin manifest, so it
+    // either reaches a stdout write first and dies by SIGPIPE, or finishes its
+    // checks and exits 2 on the missing-manifest finding before writing
+    // anything. Neither is a defect. What must never happen is a panic, a
+    // `Broken pipe` complaint, or any other exit code (101 is a Rust panic).
+    let sigpipe = status.signal() == Some(libc::SIGPIPE);
+    let clean_finding_exit = status.signal().is_none() && status.code() == Some(2);
+    assert!(
+        sigpipe || clean_finding_exit,
+        "expected death by SIGPIPE or a clean exit 2 finding; got status {status:?} with stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "doctor must not complain about a closed stdout:\n{stderr}"
     );
     assert!(
         failopen.is_empty(),
@@ -197,7 +244,7 @@ fn a_genuine_panic_is_still_loud_with_stdout_closed() {
 
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid two-element array of `c_int`.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let rc = unsafe { cloexec_pipe(&mut fds) };
     assert_eq!(rc, 0, "pipe(2) failed");
     // SAFETY: fresh fds from `pipe(2)`; `Stdio` takes ownership of the write end
     // and the read end is closed here and never used.
@@ -205,7 +252,7 @@ fn a_genuine_panic_is_still_loud_with_stdout_closed() {
     // SAFETY: as above.
     unsafe { libc::close(fds[0]) };
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut child = support::cadence_hooks()
         .args(["cadence", "terminology"])
         .env("CADENCE_METRICS_DIR", tmp.path())
         .env("CADENCE_TEST_PANIC", "1")
@@ -271,7 +318,7 @@ fn try_survives_a_hook_that_closes_its_stdin() {
 
     // `CADENCE_BYPASS=1` exits the *child* immediately (`try` itself is exempt),
     // which is the early-close case without any timing dependence.
-    let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let output = support::cadence_hooks()
         .args(["try", "cadence", "terminology"])
         .arg("--payload")
         .arg(&payload)

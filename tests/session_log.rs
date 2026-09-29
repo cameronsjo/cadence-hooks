@@ -5,11 +5,13 @@
 //! at a per-test tempdir, so the write lands nowhere real and the env override
 //! is isolated (never touches the test runner's process-global env).
 
+mod support;
+
 use std::io::Write;
 use std::process::Command;
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // Don't inherit env that would bypass, disable, or re-price the logger.
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");

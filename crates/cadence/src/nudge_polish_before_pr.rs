@@ -43,8 +43,10 @@
 //!   definition → a distinct **security nudge** (cadence-hooks#467). An absent
 //!   roster is *unknown, never skipped* — it draws the unknown-roster nudge
 //!   below, not this one;
-//! - no marker for this branch (or the repo/branch can't be resolved) → **nudge**
-//!   (ADR-0001 fail-open; CP1 never blocks on our own missing data);
+//! - no marker for this branch (or no cwd, or a detached HEAD) → **nudge**
+//!   (ADR-0001 fail-open; CP1 never blocks on our own missing data). A cwd
+//!   outside any repo is the **cannot-check advisory** instead
+//!   (cadence-hooks#453): there is no checkout to look the marker up in;
 //! - a marker older than
 //!   [`cadence_hooks_core::markers::POLISH_MARKER_TTL_DAYS`] → treated as
 //!   absent → **nudge**, naming the expiry so it doesn't read as a false
@@ -146,7 +148,7 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 /// dispatches the security arm) can escalate to the security nudge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerState {
-    /// No polish marker for this branch (or repo/branch/cwd unresolved).
+    /// No polish marker for this branch (or no cwd, or a detached HEAD).
     Absent,
     /// The command names a repo or head this checkout cannot resolve
     /// (cadence-hooks#995), so no marker can be looked up. Distinct from
@@ -376,7 +378,7 @@ fn recorded_digest(record: Option<&cadence_hooks_core::markers::PolishRecord>) -
 ///
 /// - non-ship-anchor (incl. a `--draft` create, and a `gh pr merge` that names
 ///   a PR or overrides the repo) → allow.
-/// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
+/// - ship anchor + no marker (or no cwd, or a detached HEAD) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
 /// - ship anchor + a repo or head this checkout cannot resolve → the
 ///   cannot-check advisory (#995).
@@ -1050,6 +1052,28 @@ mod tests {
             let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
             assert_eq!(result.outcome, Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn run_outside_a_repo_is_the_cannot_check_advisory() {
+        // cadence-hooks#453: a session rooted outside any repo (`~/.claude`)
+        // that ships into one has no checkout to look the marker up in. The
+        // advisory says so; the no-marker nudge would claim polish never ran.
+        let plain = tempfile::tempdir().unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            for command in [
+                "gh pr create -R own/b --head feat/x -t a -b b",
+                "gh pr ready 6 --repo own/b",
+            ] {
+                let input = make_bash_with_cwd(command, plain.path().to_str().unwrap());
+                let result = NudgePolishBeforePr.run(&input);
+                assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+                let msg = result.message.unwrap_or_default();
+                assert!(msg.starts_with("Can't check polish"), "{command}: {msg}");
+                assert!(msg.contains("outside a git checkout"), "{command}: {msg}");
+            }
         });
     }
 
@@ -2496,11 +2520,16 @@ mod tests {
     }
 
     #[test]
-    fn issue_995_non_git_cwd_keeps_the_no_polish_nudge() {
+    fn issue_995_non_git_cwd_is_the_cannot_check_advisory() {
+        // Was the no-polish nudge until cadence-hooks#453: a cwd outside any
+        // repo has no checkout to look the marker up in.
         let tmp = tempfile::tempdir().unwrap();
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            assert_no_polish_nudge(&run_at(ISSUE_995_COMMAND, tmp.path().to_str().unwrap()));
+            let result = run_at(ISSUE_995_COMMAND, tmp.path().to_str().unwrap());
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap_or_default();
+            assert!(msg.starts_with("Can't check polish"), "{msg}");
         });
     }
 
