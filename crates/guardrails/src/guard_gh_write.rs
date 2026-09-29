@@ -1693,6 +1693,48 @@ fn repoless_api_root(segment: &str) -> Option<&'static str> {
         .find(|root| *root == first)
 }
 
+/// The endpoint path of a `gh api` segment when it addresses the authenticated
+/// user's own account (`user/…`), with gh's first-class command for that
+/// resource when one exists. Relative endpoints only, like
+/// [`repoless_api_root`].
+///
+/// Account resources have no `repos/<owner>/<repo>` form, so the generic fix
+/// dead-ended there (#756). The block itself stands — no owner is in the path —
+/// but the hint names what does work. `gh ssh-key` and `gh gpg-key` are
+/// account-level and deliberately outside this guard's write patterns (see
+/// [`WRITE_ACTIONS_EXTRA`]); only the two resources whose commands are known to
+/// cover the same keys are mapped, and every other `user/…` path gets the plain
+/// "ask the user" branch.
+fn account_scoped_api(segment: &str) -> Option<Option<&'static str>> {
+    let endpoint = gh_api_endpoint(segment)?;
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    if path.contains("://") {
+        return None;
+    }
+    let mut parts = path.trim_start_matches('/').split('/');
+    if parts.next() != Some("user") {
+        return None;
+    }
+    Some(match parts.next() {
+        Some("keys") => Some("`gh ssh-key add` / `gh ssh-key delete <id>`"),
+        Some("gpg_keys") => Some("`gh gpg-key add` / `gh gpg-key delete <key-id>`"),
+        _ => None,
+    })
+}
+
+/// The fix line for an account-scoped `gh api` write — see [`account_scoped_api`].
+fn account_scoped_fix(alternative: Option<&str>) -> String {
+    match alternative {
+        Some(cmd) => format!(
+            "account resources have no repos/<owner>/<repo> form; use gh's own command for this \
+             resource ({cmd}), or ask the user"
+        ),
+        None => "account resources have no repos/<owner>/<repo> form; ask the user to run the \
+                 command themselves"
+            .to_string(),
+    }
+}
+
 /// Build the block message for a `gh api` write whose target owner can't be
 /// verified (graphql, `orgs/…`, `user/…`, anything that isn't
 /// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
@@ -1714,6 +1756,15 @@ fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String
              Command: {segment}\n   \
              Fix: `/{root}` has no `repos/<owner>/<repo>` form, so this guard cannot clear it. \
              Do the work locally, or ask the user to run the command themselves.{note}"
+        );
+    }
+    if let Some(alternative) = account_scoped_api(segment) {
+        return format!(
+            "🚫 git-guardrails: gh api write to an account-scoped `user/…` endpoint — no owner in \
+             its path, so ownership can't be checked\n   \
+             Command: {segment}\n   \
+             Fix: {}{note}",
+            account_scoped_fix(alternative)
         );
     }
     let fix = if is_graphql {
@@ -1746,6 +1797,8 @@ fn api_unverifiable_block(
         format!(
             "/{root} has no owner or repo in its path, so no repos/<owner>/<repo> form exists; do the work locally or ask the user to run it"
         )
+    } else if let Some(alternative) = account_scoped_api(segment) {
+        account_scoped_fix(alternative)
     } else if segment_is_graphql(segment) {
         "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
     } else {
@@ -5777,5 +5830,69 @@ mod tests {
             ),
             None
         );
+    }
+
+    // --- #756: account-scoped `gh api` writes name a form that works ---
+
+    fn block_in_tmp(command: &str) -> (String, BlockMetadata) {
+        let mut out = None;
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "expected BLOCK: {command}"
+            );
+            let meta = result
+                .block_metadata
+                .unwrap_or_else(|| panic!("expected a structured block: {command}"));
+            out = Some((result.message.unwrap_or_default(), meta));
+        });
+        out.expect("closure ran")
+    }
+
+    #[test]
+    fn account_scoped_api_write_names_the_first_class_command() {
+        for (command, expected) in [
+            ("gh api -X DELETE user/keys/147472709", "gh ssh-key delete"),
+            ("gh api -X DELETE /user/gpg_keys/12", "gh gpg-key delete"),
+        ] {
+            let (message, meta) = block_in_tmp(command);
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable", "{command}");
+            assert!(meta.fix.contains(expected), "fix: {}", meta.fix);
+            assert!(message.contains(expected), "message: {message}");
+            // The dead-end advice must be gone: no repos form exists here.
+            assert!(
+                !message.contains("use `gh api repos/"),
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_account_scoped_api_write_asks_the_user() {
+        let (message, meta) = block_in_tmp("gh api -X POST user/emails -f email=a@b.c");
+        assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        assert!(meta.fix.contains("ask the user"), "fix: {}", meta.fix);
+        assert!(!message.contains("gh ssh-key"), "message: {message}");
+        assert!(
+            !message.contains("use `gh api repos/"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn non_user_unverifiable_api_write_keeps_the_repos_hint() {
+        // `users/<name>` and `orgs/…` are not the caller's account; the
+        // generic wording stands for them.
+        for command in [
+            "gh api -X POST orgs/evil/repos -f name=x",
+            "gh api -X PUT users/someone/following",
+        ] {
+            let (message, _) = block_in_tmp(command);
+            assert!(
+                message.contains("use `gh api repos/"),
+                "{command}: {message}"
+            );
+        }
     }
 }

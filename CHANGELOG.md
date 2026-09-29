@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` names a working fix for an account-scoped `gh api` write.** A `user/…` endpoint has no owner in its path, so the write still blocks, but the hint no longer points at a `repos/<owner>/<repo>` form that does not exist for it: `user/keys` names `gh ssh-key`, `user/gpg_keys` names `gh gpg-key`, and any other `user/…` path says to ask the user (cameronsjo/cadence-hooks#756)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed
