@@ -4784,86 +4784,80 @@ fn budgeted_spans(body: &str, work: &mut WorkBudget) -> Vec<String> {
 }
 
 fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudget) -> String {
-    let lines: Vec<&str> = command.split('\n').collect();
+    let chars: Vec<char> = command.chars().collect();
+    let byte_of: Vec<usize> = command
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(command.len()))
+        .collect();
+    let mut lex = HeredocLex::default();
     let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        // Assemble the LOGICAL line first: the shell joins backslash-newline
-        // continuations before it interprets anything, and a heredoc body
-        // begins on the line after the logical line that introduces it. Doing
-        // this per line — rather than as a pre-pass over the whole command —
-        // is what keeps body lines out of it: a body is read raw below, so a
-        // stray apostrophe in prose can never desynchronize a quote tracker
-        // and suppress a later continuation (#475).
-        let mut line = take_logical_line(&lines, &mut i);
-        // A commented-out introducer introduces nothing. `echo hi # cat <<EOF`
-        // is one `echo` to bash: the `<<EOF` is inside a comment, so the lines
-        // after it are ordinary commands, not a body. Detecting the delimiter
-        // there consumed them as a body and dropped them — including a
-        // `rm -rf ~` that bash runs. Only the delimiter SCAN uses the trimmed
-        // view; `line` itself is emitted whole, and the comment pass in
-        // [`split_segments_with_ops`] removes the text later.
-        let scan = match comment_spans(&line).first() {
-            Some(&(start, _)) => &line[..start],
-            None => line.as_str(),
+    let mut pos = 0;
+    loop {
+        // One COMMAND line, read the way bash reads it: it ends at the first
+        // newline that is not quoted, not escaped, and not inside a `"$( … )"`
+        // span — which is where a heredoc body begins. A quote opened on the
+        // introducing line carries the command line past its physical end
+        // (`<<EOF;echo 'q` ⏎ `it's` ⏎ …), and starting the body one line early
+        // put every later line in the wrong quote state
+        // (cameronsjo/cadence-hooks#1117). The scan is the one
+        // [`heredoc_introducers`] runs, so the introducers found here are read
+        // with the shared quote model rather than a private one (#813).
+        let scan = scan_command_line(&chars, pos, &mut lex, true);
+        // Emitted as LOGICAL lines — backslash-newline continuations joined —
+        // which is the shape every consumer of this function has always seen.
+        //
+        // Except a line that carries a heredoc inside a `"$( … )"` or
+        // `` "`…`" `` span this scan skipped: its body is still in the text,
+        // and joining there rewrote it. `x\` ⏎ `EOF` became `xEOF` inside a
+        // quoted-delimiter body bash never joins, the body then ran past
+        // bash's terminator, and the command after it was read as body
+        // (a `\` before a CR likewise, which bash does not join either).
+        // Such a line joins only the continuations this scan read outside
+        // the skipped spans; the spans reach the substitution scanner — which
+        // applies each delimiter's own rule — as bash wrote them.
+        let text = &command[byte_of[pos]..byte_of[scan.end]];
+        let mut line = if scan.skipped_heredoc {
+            let mut joined = String::with_capacity(text.len());
+            let mut from = pos;
+            for &(at, len) in &scan.joins {
+                joined.push_str(&command[byte_of[from]..byte_of[at]]);
+                from = at + len;
+            }
+            joined.push_str(&command[byte_of[from]..byte_of[scan.end]]);
+            joined
+        } else {
+            logical_lines(text).join("\n")
         };
-        let delims = heredoc_introducers(scan);
-        for HeredocIntroducer { word, expands, .. } in delims {
+        if scan.end >= chars.len() {
+            // Input ends on this command line, possibly inside a quote opened
+            // on it: no body follows, so nothing is dropped.
+            out.push(line);
+            break;
+        }
+        let mut next = scan.end + 1;
+        let mut at_eof = false;
+        let count = scan.introducers.len();
+        for (n, intro) in scan.introducers.iter().enumerate() {
+            let mut heredoc = PendingHeredoc::from(&intro.delimiter);
+            // `` `cat <<\EOF` `` ⏎ `EO\` ⏎ `F`: bash removes the continuation
+            // from the backtick text first, so even a quoted delimiter's body
+            // ends at the joined `EOF`.
+            heredoc.joins |= intro.in_backticks;
             // Scan ahead for the terminator without committing the drop. Only
             // if it is found do we replace the body with the carried-forward
             // substitution lines; otherwise the lines are restored untouched.
-            let body_start = i;
-            let mut body_lines: Vec<&str> = Vec::new();
-            let mut found = false;
-            while i < lines.len() {
-                let body = lines[i];
-                if body.trim() == word {
-                    i += 1; // consume the terminator line
-                    found = true;
-                    break;
-                }
-                body_lines.push(body);
-                i += 1;
-            }
-            if found {
-                if expands {
-                    // Carry the substitution SPANS, never the prose around
-                    // them. A heredoc body is data: its apostrophes are
-                    // ordinary characters, but everything downstream reads a
-                    // segment as shell syntax, so splicing a whole body line in
-                    // let a contraction ("it's here $(cat .env)") open a quote
-                    // state that suppressed the very substitution the
-                    // carry-forward exists to surface (#475).
-                    //
-                    // Extracted over the WHOLE body at once, not line by line.
-                    // A substitution's boundary is its closing delimiter, not a
-                    // newline — `` `cmd ⏎ cmd` `` is one substitution running
-                    // two commands — so a per-line extractor found no closer,
-                    // emitted nothing, and (having replaced the old
-                    // carry-the-whole-line behavior) left NOTHING for the
-                    // splitter to see. Same lesson as [`take_logical_line`]:
-                    // the unit is the construct, never the physical line.
-                    //
-                    // Each span is appended behind a NEWLINE, never a space.
-                    // The introducing line can carry a trailing comment, and a
-                    // space glued the span into it — `cat <<EOF # note` plus a
-                    // body span became `cat <<EOF # note $(rm -rf ~)`, which
-                    // the comment rule in [`split_segments_with_ops`] then
-                    // discarded whole, manufacturing a fresh miss out of a fix
-                    // (#490/#499). A newline keeps the span a segment of its
-                    // own, out of the comment's reach; this function already
-                    // joins its output on `\n`, so the span still reaches
-                    // `substitution_bodies` and `child_scripts` unchanged.
-                    for span in budgeted_spans(&body_lines.join("\n"), work) {
-                        line.push('\n');
-                        line.push_str(&carried_span(&span, depth, work));
-                    }
-                }
-            } else {
+            // A body that ends mid-line (bash 5.2's `EOF)` form inside a
+            // substitution) with another body still pending leaves no line for
+            // that body to start on that this reading can locate: kept.
+            let end = heredoc_body_end(&chars, next, &heredoc, intro.in_subst)
+                .filter(|end| end.at_line_start || n + 1 == count);
+            let Some(end) = end else {
                 // Terminator never matched — keep every consumed line as-is so
                 // a command bash would execute is never silently dropped.
                 out.push(line);
-                out.extend(lines[body_start..].iter().map(|l| l.to_string()));
+                let rest = &command[byte_of[next]..];
+                out.push(rest.to_string());
                 // Verbatim is necessary but no longer sufficient. These lines
                 // are heredoc BODY — data, where a `#` is an ordinary
                 // character — yet they are handed on as shell syntax, so the
@@ -4880,12 +4874,52 @@ fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudg
                 // the input once per nesting level — the multiplicative cost
                 // the review of #1093 measured. Only the outermost spans are
                 // carried, and only once.
-                let rest = lines[body_start..].join("\n");
-                out.extend(budgeted_spans(&rest, work));
+                out.extend(budgeted_spans(rest, work));
                 return out.join("\n");
+            };
+            if heredoc.expands {
+                // Carry the substitution SPANS, never the prose around
+                // them. A heredoc body is data: its apostrophes are
+                // ordinary characters, but everything downstream reads a
+                // segment as shell syntax, so splicing a whole body line in
+                // let a contraction ("it's here $(cat .env)") open a quote
+                // state that suppressed the very substitution the
+                // carry-forward exists to surface (#475).
+                //
+                // Extracted over the WHOLE body at once, not line by line.
+                // A substitution's boundary is its closing delimiter, not a
+                // newline — `` `cmd ⏎ cmd` `` is one substitution running
+                // two commands — so a per-line extractor found no closer,
+                // emitted nothing, and (having replaced the old
+                // carry-the-whole-line behavior) left NOTHING for the
+                // splitter to see. Same lesson as [`take_logical_line`]:
+                // the unit is the construct, never the physical line.
+                //
+                // Each span is appended behind a NEWLINE, never a space.
+                // The introducing line can carry a trailing comment, and a
+                // space glued the span into it — `cat <<EOF # note` plus a
+                // body span became `cat <<EOF # note $(rm -rf ~)`, which
+                // the comment rule in [`split_segments_with_ops`] then
+                // discarded whole, manufacturing a fresh miss out of a fix
+                // (#490/#499). A newline keeps the span a segment of its
+                // own, out of the comment's reach; this function already
+                // joins its output on `\n`, so the span still reaches
+                // `substitution_bodies` and `child_scripts` unchanged.
+                let body: String = chars[next..end.body_end].iter().collect();
+                let body = body.strip_suffix('\n').unwrap_or(&body);
+                for span in budgeted_spans(body, work) {
+                    line.push('\n');
+                    line.push_str(&carried_span(&span, depth, work));
+                }
             }
+            next = end.resume;
+            at_eof = end.at_eof;
         }
         out.push(line);
+        if at_eof {
+            break;
+        }
+        pos = next;
     }
     out.join("\n")
 }
@@ -4935,31 +4969,83 @@ pub fn logical_lines(command: &str) -> Vec<String> {
 /// Joining unconditionally can only merge text INSIDE a quoted value, which
 /// makes a scan see more, never less.
 fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
-    let mut line = lines[*i].to_string();
-    *i += 1;
-    while *i < lines.len() {
-        let probe = line.strip_suffix('\r').unwrap_or(&line);
-        // **bash does not continue a comment line.** A comment runs to the
-        // newline, so a trailing backslash sitting inside one is comment TEXT,
-        // not a continuation — the next line starts a new command. Joining
-        // anyway pulled that command up into the comment, where the strip pass
-        // then deleted the whole thing: `echo a #;\` + `rm -rf ~` collapsed to
-        // `echo a` and the deletion reached no guard, while bash ran it. The
-        // spellings that carry a separator inside the comment body (`#;\`,
-        // `#|\`) are the sharp ones, because those are exactly the ones a
-        // comment-blind splitter used to survive by splitting on the separator.
-        if !comment_spans(probe).is_empty() {
-            break;
-        }
-        let trailing = probe.chars().rev().take_while(|&c| c == '\\').count();
-        if trailing % 2 == 0 {
-            break;
-        }
-        line.truncate(probe.len() - 1); // drop the continuing backslash (and any `\r`)
-        line.push_str(lines[*i]);
-        *i += 1;
+    // The continuation run: every line up to the first one that does not end
+    // in an odd count of backslashes, which is as far as the join can reach.
+    let continues = |line: &str| {
+        let probe = line.strip_suffix('\r').unwrap_or(line);
+        probe.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+    };
+    let first = *i;
+    let mut last = first;
+    while last + 1 < lines.len() && continues(lines[last]) {
+        last += 1;
     }
-    line
+    // Joined optimistically, with each line's byte offset recorded, so the
+    // comment check below can look at any prefix without rebuilding it.
+    let mut joined = String::new();
+    let mut starts = Vec::with_capacity(last - first + 1);
+    for line in &lines[first..last] {
+        starts.push(joined.len());
+        let probe = line.strip_suffix('\r').unwrap_or(line);
+        joined.push_str(&probe[..probe.len() - 1]); // drop the continuing backslash (and any `\r`)
+    }
+    starts.push(joined.len());
+    // **bash does not continue a comment line.** A comment runs to the
+    // newline, so a trailing backslash sitting inside one is comment TEXT,
+    // not a continuation — the next line starts a new command. Joining
+    // anyway pulled that command up into the comment, where the strip pass
+    // then deleted the whole thing: `echo a #;\` + `rm -rf ~` collapsed to
+    // `echo a` and the deletion reached no guard, while bash ran it. The
+    // spellings that carry a separator inside the comment body (`#;\`,
+    // `#|\`) are the sharp ones, because those are exactly the ones a
+    // comment-blind splitter used to survive by splitting on the separator.
+    //
+    // The line ends at the first line of the run whose logical prefix already
+    // holds a comment. Asking that of every prefix in turn re-scanned the
+    // whole joined line once per continuation, and a 200 KB run of `<\`
+    // lines took seconds — past the hook deadline, which fails open. Having a
+    // comment only ever becomes true as the prefix grows, so the first such
+    // line is found by galloping then bisecting: O(n log n).
+    let has_comment = |k: usize| {
+        let line = lines[first + k];
+        let probe = format!(
+            "{}{}",
+            &joined[..starts[k]],
+            line.strip_suffix('\r').unwrap_or(line)
+        );
+        !comment_spans(&probe).is_empty()
+    };
+    let run = last - first; // lines that could continue: `0..run`
+    let mut clean = 0; // every k below this is known comment-free
+    let mut step = 1;
+    let mut ends_at = run;
+    while clean < run {
+        let probe = (clean + step - 1).min(run - 1);
+        if has_comment(probe) {
+            let (mut lo, mut hi) = (clean, probe);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if has_comment(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            ends_at = lo;
+            break;
+        }
+        clean = probe + 1;
+        step *= 2;
+    }
+    *i = first + ends_at + 1;
+    if ends_at == run {
+        joined.push_str(lines[last]);
+        joined
+    } else {
+        joined.truncate(starts[ends_at]);
+        joined.push_str(lines[first + ends_at]);
+        joined
+    }
 }
 
 /// Command-substitution spans in an expanding heredoc's body, returned with
@@ -5121,15 +5207,27 @@ pub struct HeredocIntroducer {
     pub expands: bool,
 }
 
-/// Find heredoc introducers on a single logical line, outside quotes.
-/// `<<<` (here-string) is skipped. A `<<` inside a `'…'` or `"…"` string on
-/// this line is literal text and ignored; cross-line quote state is backstopped
-/// by the terminator-not-found rule in [`strip_heredoc_bodies`].
+/// Find heredoc introducers in `line`, outside quotes and comments. `<<<`
+/// (here-string) is skipped, and so is a `<<` inside `$(( … ))` arithmetic or
+/// directly inside `${ … }`, where it is not a redirection.
 ///
-/// Pair with [`logical_lines`] — an introducer split across a
-/// backslash-newline (`bash <\` ⏎ `<EOF`) is `<<` to the shell, which removes
-/// both characters of the pair, and only reads as one construct once the line
-/// has been joined.
+/// **One quote model, shared with every other scanner in this file.** This
+/// used to track quoting with two private toggles, with no backslash handling
+/// and no `$'…'` mode, so the escaped quote in `echo "a\"b <<EOF"` read as the
+/// closer and the `<<EOF` behind it registered as an introducer bash never
+/// sees. [`strip_heredoc_bodies`] then dropped every line up to a matching
+/// `EOF` — lines bash runs (cameronsjo/cadence-hooks#813). The walk is now
+/// [`scan_command_line`], which reads quotes through [`scan_quote_syntax`],
+/// skips a `"$( … )"` span whole the way [`split_segments_with_ops`] does, and
+/// recognises comments by the [`comment_spans`] rule.
+///
+/// **The delimiter is parsed by [`heredoc_delimiter`]**, the same parser the
+/// substitution scanner uses, so `<<"E\"F"` ends at a line `E"F` in both
+/// (cameronsjo/cadence-hooks#1116), `<<$'E'` at `E`, and `<<E'F'G` at `EFG`.
+///
+/// A backslash-newline inside the operator or the word is removed the way the
+/// shell removes it (`bash <\` ⏎ `<EOF` is `<<EOF`), so a raw line works as
+/// well as a [`logical_lines`] one.
 pub fn heredoc_introducers(line: &str) -> Vec<HeredocIntroducer> {
     let chars: Vec<char> = line.chars().collect();
     // Char index → byte offset, so a range can be handed back for slicing.
@@ -5138,75 +5236,207 @@ pub fn heredoc_introducers(line: &str) -> Vec<HeredocIntroducer> {
         .map(|(b, _)| b)
         .chain(std::iter::once(line.len()))
         .collect();
-    let mut delims = Vec::new();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-            i += 1;
-            continue;
-        }
-        if c == '"' && !in_single {
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
-        if in_single || in_double {
-            i += 1;
-            continue;
-        }
-        if c == '<' && chars.get(i + 1) == Some(&'<') {
-            // `<<<` is a here-string, not a heredoc.
-            if chars.get(i + 2) == Some(&'<') {
-                i += 3;
+    scan_command_line(&chars, 0, &mut HeredocLex::default(), false)
+        .introducers
+        .into_iter()
+        .map(|found| HeredocIntroducer {
+            start: byte_of[found.start],
+            end: byte_of[found.delimiter.end.min(chars.len())],
+            expands: !found.delimiter.quoted,
+            word: found.delimiter.word,
+        })
+        .collect()
+}
+
+/// Lexer state [`scan_command_line`] carries from one command line to the
+/// next: the expansions still open and whether a backtick span is, exactly as
+/// [`comment_spans`] carries them across newlines.
+#[derive(Default)]
+struct HeredocLex {
+    open: Vec<Opener>,
+    backticks: bool,
+    /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
+    /// be bounded, stop trying, so an opener flood stays linear.
+    exhausted: bool,
+}
+
+/// A heredoc operator [`scan_command_line`] found, by char index.
+struct FoundIntroducer {
+    /// Char index of the leading `<`.
+    start: usize,
+    delimiter: HeredocDelimiter,
+    /// Inside an unquoted `$( … )`, where bash 5.2 also ends a body at a line
+    /// that starts with the delimiter and carries a `)`.
+    in_subst: bool,
+    /// Inside a `` `…` `` span, whose text bash reads with every
+    /// backslash-newline removed before it parses the heredoc.
+    in_backticks: bool,
+}
+
+/// One command line: where it ends and the heredocs it opens.
+struct CommandLine {
+    /// Char index of the newline that ends the command line, or the input
+    /// length when none does.
+    end: usize,
+    introducers: Vec<FoundIntroducer>,
+    /// A `"$( … )"` or `` "`…`" `` span skipped whole carries a `<<`.
+    skipped_heredoc: bool,
+    /// The continuations this scan read as bash does — outside every quote
+    /// but `"…"` and outside every skipped span — as (char index, length).
+    joins: Vec<(usize, usize)>,
+}
+
+/// Read one command line of `chars` from `start` the way bash reads it, and
+/// collect the heredoc operators on it.
+///
+/// With `stop_at_newline`, the line ends at the first newline that is not
+/// quoted, not a backslash-newline continuation, and not inside a `"$( … )"` or
+/// `` "`…`" `` span — the newline after which bash starts reading heredoc
+/// bodies. A newline inside a quoted run does not end it: in
+/// `echo $(cat <<EOF;echo 'q` ⏎ `it's` ⏎ `EOF` the body starts after `it's`,
+/// not after the first line (cameronsjo/cadence-hooks#1117). Without it, the
+/// whole input is read as one line.
+///
+/// Quoting is [`scan_quote_syntax`]; a substitution inside `"…"` is skipped
+/// through [`quoted_substitution_end`] as [`split_segments_with_ops`] and
+/// [`comment_spans`] skip it; a `#` opens a comment by exactly the
+/// [`comment_spans`] rule, so this never recognises a comment that function
+/// does not. Every one of those is a shared model on purpose: this scanner
+/// decides which lines are heredoc DATA, and a disagreement with the splitter
+/// about where a quoted run ends is a line one of them reads as code and the
+/// other drops.
+fn scan_command_line(
+    chars: &[char],
+    start: usize,
+    lex: &mut HeredocLex,
+    stop_at_newline: bool,
+) -> CommandLine {
+    let mut quote: Option<Quote> = None;
+    let mut boundary = true;
+    let mut introducers = Vec::new();
+    let mut skipped_heredoc = false;
+    let mut joins = Vec::new();
+    let mut j = start;
+    while j < chars.len() {
+        let c = chars[j];
+        if quote == Some(Quote::Double) {
+            // bash removes a backslash-newline inside `"…"` as well.
+            if c == '\\' && chars.get(j + 1) == Some(&'\n') {
+                joins.push((j, 2));
+                j += 2;
                 continue;
             }
-            let mut j = i + 2;
-            if chars.get(j) == Some(&'-') {
-                j += 1;
+            if c == '\\' && matches!(chars.get(j + 1), Some('$' | '`')) {
+                j += 2;
+                continue;
             }
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            // Optional quote around the delimiter word suppresses expansion.
-            // A quoted word reads until its MATCHING quote, so an inner other
-            // quote is part of the word (`<<'EOF"'` → terminator `EOF"`); an
-            // unquoted word stops at the first non-word char.
-            let quote_char = chars.get(j).copied().filter(|c| *c == '\'' || *c == '"');
-            if quote_char.is_some() {
-                j += 1;
-            }
-            let mut word = String::new();
-            while j < chars.len() {
-                let wc = chars[j];
-                if let Some(q) = quote_char {
-                    if wc == q {
-                        j += 1;
-                        break;
-                    }
-                } else if !(wc.is_alphanumeric() || wc == '_') {
-                    break;
+            if !lex.exhausted && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'('))) {
+                if let Some(end) = quoted_substitution_end(chars, j) {
+                    skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
+                    j = end;
+                    continue;
                 }
-                word.push(wc);
-                j += 1;
+                lex.exhausted = true;
             }
-            if !word.is_empty() {
-                delims.push(HeredocIntroducer {
-                    start: byte_of[i],
-                    end: byte_of[j.min(chars.len())],
-                    expands: quote_char.is_none(),
-                    word,
-                });
-            }
-            i = j;
+        }
+        // `\` before a CRLF continues the line the way [`take_logical_line`]
+        // joins it, so a `\r\n` source reads as one command line there and
+        // here alike.
+        if quote.is_none()
+            && c == '\\'
+            && chars.get(j + 1) == Some(&'\r')
+            && chars.get(j + 2) == Some(&'\n')
+        {
+            joins.push((j, 3));
+            j += 3;
             continue;
         }
-        i += 1;
+        if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
+            j = next;
+            boundary = false;
+            continue;
+        }
+        let innermost = lex.open.last().copied();
+        match c {
+            // A continuation: both characters vanish, so it neither ends the
+            // line nor a word.
+            '\\' => {
+                if chars.get(j + 1) == Some(&'\n') {
+                    joins.push((j, 2));
+                }
+                j += 2;
+                continue;
+            }
+            '$' if matches!(chars.get(j + 1), Some('{' | '(')) => {
+                let arithmetic = chars[j + 1] == '(' && chars.get(j + 2) == Some(&'(');
+                lex.open.push(match chars[j + 1] {
+                    '{' => Opener::Brace,
+                    _ if arithmetic => Opener::Paren,
+                    _ => Opener::Subst,
+                });
+                boundary = lex.open.last() == Some(&Opener::Subst);
+                j += 2;
+                continue;
+            }
+            '`' => lex.backticks = !lex.backticks,
+            '(' if !lex.open.is_empty() => lex.open.push(Opener::Paren),
+            '{' if !lex.open.is_empty() => lex.open.push(Opener::Brace),
+            ')' if matches!(innermost, Some(Opener::Paren | Opener::Subst)) => {
+                lex.open.pop();
+            }
+            '}' if innermost == Some(Opener::Brace) => {
+                lex.open.pop();
+            }
+            '#' if boundary
+                && matches!(innermost, None | Some(Opener::Subst))
+                && !lex.backticks =>
+            {
+                j = chars[j..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |off| j + off);
+                continue;
+            }
+            '<' if matches!(innermost, None | Some(Opener::Subst)) => {
+                match heredoc_operator(chars, j) {
+                    HeredocOperator::HereString(end) => {
+                        j = end;
+                        boundary = false;
+                        continue;
+                    }
+                    HeredocOperator::Heredoc(delimiter) => {
+                        introducers.push(FoundIntroducer {
+                            start: j,
+                            in_subst: lex.open.contains(&Opener::Subst),
+                            in_backticks: lex.backticks,
+                            delimiter,
+                        });
+                        j = introducers.last().expect("just pushed").delimiter.end;
+                        boundary = false;
+                        continue;
+                    }
+                    HeredocOperator::None => {}
+                }
+            }
+            '\n' if stop_at_newline => {
+                return CommandLine {
+                    end: j,
+                    introducers,
+                    skipped_heredoc,
+                    joins,
+                };
+            }
+            _ => {}
+        }
+        boundary = matches!(c, '\n' | ';' | '&' | '|') || c.is_whitespace();
+        j += 1;
     }
-    delims
+    CommandLine {
+        end: chars.len(),
+        introducers,
+        skipped_heredoc,
+        joins,
+    }
 }
 
 /// Split a shell command into top-level command segments.
@@ -6347,6 +6577,39 @@ impl ScanStop {
     }
 }
 
+/// Where a `case` statement's parse stands, for [`scan_substitution_body`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaseState {
+    /// After `case`, before `in`: the subject word.
+    Subject,
+    /// Reading patterns up to the `)` that closes them. `fresh` until the
+    /// first pattern word, so an optional leading `(` and a closing `esac`
+    /// are recognised; `parens` counts extglob groups inside the patterns.
+    Pattern { fresh: bool, parens: usize },
+    /// A clause's commands, up to `;;`, `;&`, `;;&` or `esac`.
+    Body,
+}
+
+impl CaseState {
+    fn pattern() -> Self {
+        CaseState::Pattern {
+            fresh: true,
+            parens: 0,
+        }
+    }
+}
+
+/// Reserved words after which a command word can still begin, so a `case`
+/// behind one is the keyword (`if case …`, `do case …`).
+const COMMAND_LEADING_RESERVED_WORDS: &[&str] = &[
+    "!", "{", "if", "then", "else", "elif", "do", "while", "until", "time",
+];
+
+/// A character that ends a shell word: a blank or a metacharacter.
+fn is_word_break(c: char) -> bool {
+    c.is_whitespace() || ";&|()<>".contains(c)
+}
+
 /// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
 /// body text and the index just past its `)`.
 ///
@@ -6389,9 +6652,75 @@ fn scan_substitution_body_bounded(
     // `<<` heredoc exists there (`$(( 1 << 2 ))` is a shift).
     let arithmetic = chars.get(start) == Some(&'(');
     // Heredocs introduced on the current line, in order, waiting for the
-    // newline that starts their bodies: (delimiter word, `<<-` tab strip).
-    let mut pending: Vec<(Vec<char>, bool)> = Vec::new();
+    // newline that starts their bodies.
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
+    // Where a command word could begin: the body's start, after a separator,
+    // or after a reserved word that leads a command (`then`, `do`, `!`, …).
+    // Only there is `case` the keyword (cameronsjo/cadence-hooks#1094).
+    let mut command_position = true;
+    // The `case` statements open at this level, innermost last.
+    let mut cases: Vec<CaseState> = Vec::new();
     while j < chars.len() {
+        // A `case` statement's pattern list closes each pattern with a
+        // bare `)`, which this scanner counted as the terminator:
+        // `$(case a in a) cat .env;; esac)` ended at `a)`, and inside a
+        // heredoc body the span dropped the read bash runs
+        // (cameronsjo/cadence-hooks#1094). So `case … esac` is modelled:
+        // the keyword where a command can start opens one, `in` starts its
+        // patterns, a pattern's `)` opens a clause without closing any
+        // level, `;;`/`;&`/`;;&` return to the patterns, and `esac` closes
+        // it. A statement still open at end of input is this scanner's own
+        // lexing, so it widens like the other lexed constructs.
+        //
+        // The quote-blind reading runs this too. It exists for a quote this
+        // scanner may have misread, which a case pattern's `)` is not; ending
+        // it at that `)` handed callers a second, spurious body at every
+        // nesting level, and a 200 KB `$(case a in a) ` flood cost 4x main.
+        if quote.is_none()
+            && !arithmetic
+            && boundary
+            && !is_word_break(chars[j])
+            && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'\n'))
+        {
+            let top = cases.last().copied();
+            if command_position
+                || matches!(top, Some(CaseState::Subject | CaseState::Pattern { .. }))
+            {
+                let word_end = chars[j..]
+                    .iter()
+                    .position(|&c| is_word_break(c))
+                    .map_or(chars.len(), |off| j + off);
+                let word = &chars[j..word_end];
+                let is = |keyword: &str| word.iter().copied().eq(keyword.chars());
+                match top {
+                    Some(CaseState::Subject) => {
+                        if is("in") {
+                            *cases.last_mut().expect("top") = CaseState::pattern();
+                        }
+                    }
+                    Some(CaseState::Pattern { fresh: true, .. }) if is("esac") => {
+                        cases.pop();
+                    }
+                    Some(CaseState::Pattern { parens, .. }) => {
+                        *cases.last_mut().expect("top") = CaseState::Pattern {
+                            fresh: false,
+                            parens,
+                        };
+                    }
+                    Some(CaseState::Body) if command_position && is("esac") => {
+                        cases.pop();
+                    }
+                    _ if is("case") => {
+                        cases.push(CaseState::Subject);
+                        lexed = true;
+                    }
+                    _ => {}
+                }
+                command_position = COMMAND_LEADING_RESERVED_WORDS
+                    .iter()
+                    .any(|reserved| is(reserved));
+            }
+        }
         if quote_aware {
             // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
             // `Quote::Double::escapes_next` only covers `"` and `\`, so without
@@ -6430,22 +6759,30 @@ fn scan_substitution_body_bounded(
                     None => return Err(ScanStop::LexUnresolved),
                 }
                 boundary = true;
+                command_position = true;
                 continue;
             }
-            if quote.is_none()
-                && !arithmetic
-                && chars[j] == '<'
-                && chars.get(j + 1) == Some(&'<')
-                && chars.get(j + 2) != Some(&'<')
-                && (j == 0 || chars[j - 1] != '<')
-                && let Some((word, strip_tabs, end)) = heredoc_delimiter(chars, j + 2)
+            if quote.is_none() && !arithmetic && chars[j] == '<' && (j == 0 || chars[j - 1] != '<')
             {
-                body.extend(&chars[j..end]);
-                j = end;
-                pending.push((word.chars().collect(), strip_tabs));
-                lexed = true;
-                boundary = false;
-                continue;
+                match heredoc_operator(chars, j) {
+                    // Past the whole operator, so its second and third `<`
+                    // cannot be re-read as a heredoc.
+                    HeredocOperator::HereString(end) => {
+                        body.extend(&chars[j..end]);
+                        j = end;
+                        boundary = true;
+                        continue;
+                    }
+                    HeredocOperator::Heredoc(delimiter) => {
+                        body.extend(&chars[j..delimiter.end]);
+                        j = delimiter.end;
+                        pending.push(PendingHeredoc::from(&delimiter));
+                        lexed = true;
+                        boundary = false;
+                        continue;
+                    }
+                    HeredocOperator::None => {}
+                }
             }
             // A `` `…` `` span, unquoted or inside `"…"`, is opaque to this
             // level: bash re-parses it on its own and ends it at the first
@@ -6540,6 +6877,51 @@ fn scan_substitution_body_bounded(
                 continue;
             }
         }
+        // Inside a `case` pattern list a paren belongs to the patterns — an
+        // optional leading `(`, an extglob group, the `)` that ends them —
+        // and never to this level's depth.
+        if let Some(CaseState::Pattern { fresh, parens }) = cases.last().copied()
+            && matches!(chars[j], '(' | ')')
+        {
+            let top = cases.last_mut().expect("top");
+            *top = match (chars[j], parens) {
+                ('(', _) if fresh => CaseState::Pattern {
+                    fresh: false,
+                    parens,
+                },
+                ('(', _) => CaseState::Pattern {
+                    fresh: false,
+                    parens: parens + 1,
+                },
+                (_, 0) => CaseState::Body,
+                (_, _) => CaseState::Pattern {
+                    fresh: false,
+                    parens: parens - 1,
+                },
+            };
+            command_position = *top == CaseState::Body;
+            body.push(chars[j]);
+            boundary = true;
+            j += 1;
+            continue;
+        }
+        // `;;`, `;&` and `;;&` end a clause and return to the patterns.
+        if cases.last() == Some(&CaseState::Body)
+            && chars[j] == ';'
+            && matches!(chars.get(j + 1), Some(';' | '&'))
+        {
+            let len = if chars.get(j + 1) == Some(&';') && chars.get(j + 2) == Some(&'&') {
+                3
+            } else {
+                2
+            };
+            body.extend(&chars[j..j + len]);
+            j += len;
+            *cases.last_mut().expect("top") = CaseState::pattern();
+            boundary = true;
+            command_position = false;
+            continue;
+        }
         match chars[j] {
             '(' => {
                 depth += 1;
@@ -6560,6 +6942,9 @@ fn scan_substitution_body_bounded(
             chars[j],
             ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
         );
+        if matches!(chars[j], ';' | '&' | '|' | '(' | '\n') {
+            command_position = true;
+        }
         j += 1;
     }
     // Running out of input inside a quote this scanner opened is not the shell
@@ -6584,40 +6969,121 @@ fn scan_substitution_body_bounded(
     Err(ScanStop::Unterminated)
 }
 
+/// A heredoc operator's delimiter word, read the way bash reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocDelimiter {
+    /// The terminator, quote removal applied.
+    word: String,
+    /// `<<-`: leading tabs are stripped from body lines and the terminator.
+    strip_tabs: bool,
+    /// Any part of the word was quoted or escaped, which makes the body inert
+    /// (no expansion, no line continuation).
+    quoted: bool,
+    /// Char index just past the word.
+    end: usize,
+}
+
+/// What sits at a `<` in unquoted shell code.
+enum HeredocOperator {
+    /// `<<<`: a here-string, not a heredoc. Index just past the operator.
+    HereString(usize),
+    Heredoc(HeredocDelimiter),
+    /// Anything else, including a `<<` with no word after it.
+    None,
+}
+
+/// Skip any backslash-newline continuations at `chars[k]`: the shell removes
+/// both characters before it tokenizes, so `<\` ⏎ `<EOF` is `<<EOF`.
+fn skip_continuations(chars: &[char], mut k: usize) -> usize {
+    while chars.get(k) == Some(&'\\') && chars.get(k + 1) == Some(&'\n') {
+        k += 2;
+    }
+    k
+}
+
+/// Read the heredoc operator, if any, whose first `<` is `chars[j]`. The
+/// caller has already ruled out a `<` that continues an earlier one.
+fn heredoc_operator(chars: &[char], j: usize) -> HeredocOperator {
+    let second = skip_continuations(chars, j + 1);
+    if chars.get(second) != Some(&'<') {
+        return HeredocOperator::None;
+    }
+    let third = skip_continuations(chars, second + 1);
+    if chars.get(third) == Some(&'<') {
+        return HeredocOperator::HereString(third + 1);
+    }
+    heredoc_delimiter(chars, third).map_or(HeredocOperator::None, HeredocOperator::Heredoc)
+}
+
 /// Parse the delimiter of a `<<`/`<<-` heredoc whose operator ends just before
-/// `k`: returns the delimiter word with quoting removed, whether `<<-` strips
-/// leading tabs, and the index just past the word. `None` when no word
-/// follows (bash rejects that, so the caller reads the text as ordinary).
-fn heredoc_delimiter(chars: &[char], mut k: usize) -> Option<(String, bool, usize)> {
+/// `k`. `None` when no word follows (bash rejects that, so the caller reads
+/// the text as ordinary).
+///
+/// **The one delimiter parser.** [`heredoc_introducers`] (and through it
+/// [`strip_heredoc_bodies`]) and the substitution scanner both read the word
+/// here. They used to disagree: the top-level reader stopped a quoted word at
+/// the first matching quote, so `<<"E\"F"` ended at `E\` there and at `E"F`
+/// here and in bash. The body was never found, its lines stayed in the text
+/// as shell syntax, and the stray `"` in `E"F` opened a phantom quote that
+/// swallowed the command after the substitution
+/// (cameronsjo/cadence-hooks#1116).
+///
+/// Quote removal follows bash, measured on 5.2: inside `"…"` a backslash
+/// escapes only `$`, `` ` ``, `"` and `\` (`<<"E\xF"` ends at `E\xF`); `$'…'`
+/// is decoded (`<<$'E'` ends at `E`); `$"…"` reads as `"…"`; quoted parts
+/// concatenate (`<<E'F'G` ends at `EFG`); a backslash-newline vanishes.
+fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
+    let mut k = skip_continuations(chars, k);
     let strip_tabs = chars.get(k) == Some(&'-');
     if strip_tabs {
-        k += 1;
+        k = skip_continuations(chars, k + 1);
     }
     while matches!(chars.get(k), Some(' ' | '\t')) {
-        k += 1;
+        k = skip_continuations(chars, k + 1);
     }
     let mut word = String::new();
     let mut quoted = false;
     while let Some(&c) = chars.get(k) {
         match c {
+            '\\' if chars.get(k + 1) == Some(&'\n') => k += 2,
             c if c.is_whitespace() || ";&|()<>".contains(c) => break,
-            '\'' | '"' => {
+            '$' if chars.get(k + 1) == Some(&'\'') => {
+                quoted = true;
+                let start = k + 2;
+                let mut e = start;
+                while e < chars.len() && chars[e] != '\'' {
+                    e += if chars[e] == '\\' { 2 } else { 1 };
+                }
+                let e = e.min(chars.len());
+                decode_ansi_c_run(&chars[start..e].iter().collect::<String>(), &mut word);
+                k = (e + 1).min(chars.len());
+            }
+            '$' if chars.get(k + 1) == Some(&'"') => k += 1,
+            '\'' => {
                 quoted = true;
                 k += 1;
                 while let Some(&q) = chars.get(k) {
                     k += 1;
-                    if q == c {
+                    if q == '\'' {
                         break;
                     }
-                    if c == '"'
-                        && q == '\\'
-                        && let Some(&n) = chars.get(k)
-                    {
-                        word.push(n);
-                        k += 1;
-                        continue;
-                    }
                     word.push(q);
+                }
+            }
+            '"' => {
+                quoted = true;
+                k += 1;
+                while let Some(&q) = chars.get(k) {
+                    k += 1;
+                    match q {
+                        '"' => break,
+                        '\\' if chars.get(k) == Some(&'\n') => k += 1,
+                        '\\' if matches!(chars.get(k), Some('$' | '`' | '"' | '\\')) => {
+                            word.push(chars[k]);
+                            k += 1;
+                        }
+                        q => word.push(q),
+                    }
                 }
             }
             '\\' => {
@@ -6633,55 +7099,167 @@ fn heredoc_delimiter(chars: &[char], mut k: usize) -> Option<(String, bool, usiz
             }
         }
     }
-    (!word.is_empty() || quoted).then_some((word, strip_tabs, k.min(chars.len())))
+    (!word.is_empty() || quoted).then_some(HeredocDelimiter {
+        word,
+        strip_tabs,
+        quoted,
+        end: k.min(chars.len()),
+    })
+}
+
+/// A heredoc whose body is still to be read.
+struct PendingHeredoc {
+    word: Vec<char>,
+    strip_tabs: bool,
+    /// Unquoted delimiter: the body expands.
+    expands: bool,
+    /// A backslash-newline in the body joins two lines before bash compares
+    /// the result with the delimiter: in an expanding body, and in ANY body
+    /// inside a `` `…` `` span, whose text bash reads with backslash-newlines
+    /// already removed.
+    joins: bool,
+}
+
+impl From<&HeredocDelimiter> for PendingHeredoc {
+    fn from(delimiter: &HeredocDelimiter) -> Self {
+        Self {
+            word: delimiter.word.chars().collect(),
+            strip_tabs: delimiter.strip_tabs,
+            expands: !delimiter.quoted,
+            joins: !delimiter.quoted,
+        }
+    }
+}
+
+/// Where a heredoc body ended.
+struct HeredocEnd {
+    /// Char index where the terminator line starts: the body is everything
+    /// before it.
+    body_end: usize,
+    /// Char index where shell code resumes.
+    resume: usize,
+    /// `resume` is the start of a line (false for the `EOF)` form).
+    at_line_start: bool,
+    /// The terminator was the last line and no newline followed it.
+    at_eof: bool,
+}
+
+/// Find the end of the heredoc body that starts at `chars[j]` — the character
+/// after the newline that ends the introducing command line. `None` when no
+/// terminator is found, or when one is found in a shape whose resume point
+/// this reading cannot place: the caller must then keep the text.
+///
+/// **The one terminator model**, shared by [`strip_heredoc_bodies`] and the
+/// substitution scanner, measured against bash 5.2:
+///
+/// - The terminator line equals the delimiter EXACTLY, after leading tabs are
+///   removed for `<<-`. Surrounding blanks or a trailing `\r` make it an
+///   ordinary body line. The top-level reader used to `trim()` the line, so
+///   `  EOF` ended the body early and a later `<<EOG` read as an introducer
+///   that swallowed lines bash runs.
+/// - In an unquoted-delimiter body a line ending in an unescaped backslash is
+///   joined to the next BEFORE the comparison, and tabs are stripped from the
+///   start of the joined line only. So `EO\` ⏎ `F` ends the body, and `x\` ⏎
+///   `EOF` does not: bash reads `xEOF` and the body continues
+///   (cameronsjo/cadence-hooks#1122). A quoted-delimiter body joins nothing.
+/// - `in_subst` (the heredoc was opened inside `$( … )`): bash also ends the
+///   body at a line that starts with the delimiter and carries a `)` —
+///   `EOF)`, `EOF )`, `EOF ; echo "a)"` all measured — and parses the rest of
+///   that line as code, so scanning resumes right after the delimiter there.
+///   A line merely starting with the delimiter (`EOFx`, `EOF ; x`) does not
+///   end it. Missing that form would let a later exact delimiter line end the
+///   body too LATE, swallowing commands bash runs. After a continuation the
+///   same form refuses, since its resume point would sit inside a joined
+///   line.
+fn heredoc_body_end(
+    chars: &[char],
+    mut j: usize,
+    heredoc: &PendingHeredoc,
+    in_subst: bool,
+) -> Option<HeredocEnd> {
+    let word = heredoc.word.as_slice();
+    let mut line_start = j;
+    // The logical line so far, while a continuation is joining lines.
+    let mut joined: Option<Vec<char>> = None;
+    while j < chars.len() {
+        let eol = chars[j..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |off| j + off);
+        let mut from = j;
+        if heredoc.strip_tabs && joined.is_none() {
+            while from < eol && chars[from] == '\t' {
+                from += 1;
+            }
+        }
+        let trailing = chars[from..eol]
+            .iter()
+            .rev()
+            .take_while(|&&c| c == '\\')
+            .count();
+        let continued = heredoc.joins && trailing % 2 == 1;
+        // Compared in place: one allocation per body line made a long heredoc
+        // cost an allocator round-trip per line on every rescan.
+        let piece = &chars[from..if continued { eol - 1 } else { eol }];
+        let resume = (eol + 1).min(chars.len());
+        let ends = |at_eof| HeredocEnd {
+            body_end: line_start,
+            resume,
+            at_line_start: true,
+            at_eof,
+        };
+        if continued {
+            joined.get_or_insert_with(Vec::new).extend_from_slice(piece);
+        } else if let Some(mut logical) = joined.take() {
+            logical.extend_from_slice(piece);
+            if logical == word {
+                return Some(ends(eol == chars.len()));
+            }
+            if in_subst && logical.starts_with(word) && logical.contains(&')') {
+                return None;
+            }
+        } else {
+            if piece == word {
+                return Some(ends(eol == chars.len()));
+            }
+            if in_subst && piece.starts_with(word) && piece.contains(&')') {
+                return Some(HeredocEnd {
+                    body_end: line_start,
+                    resume: from + word.len(),
+                    at_line_start: false,
+                    at_eof: false,
+                });
+            }
+        }
+        if eol == chars.len() {
+            break;
+        }
+        j = eol + 1;
+        if joined.is_none() {
+            line_start = j;
+        }
+    }
+    None
 }
 
 /// Skip the bodies of every heredoc in `pending` (in order), starting at `j`,
 /// the first character after the newline that ends the introducing line.
-/// Returns where scanning resumes, or `None` when a body never ends.
-///
-/// A body ends at a line equal to its delimiter (leading tabs removed for
-/// `<<-`), and scanning resumes on the next line. Inside a command
-/// substitution bash 5.2 ALSO ends it at a line that starts with the delimiter
-/// and contains a `)` — `EOF)`, `EOF )`, `EOF ; echo "a)"` all measured, each
-/// with a "delimited by end-of-file" warning — and parses the rest of that
-/// line as code, so scanning resumes right after the delimiter there. A line
-/// merely starting with the delimiter (`EOFx`, `EOF ; x`) does not end it.
-/// Missing that second form would let a later exact delimiter line end the
-/// body too LATE, swallowing commands bash runs, so both are modelled.
+/// Returns where scanning resumes, or `None` when a body never ends — or ends
+/// in the mid-line `EOF)` form with another body still waiting, which leaves
+/// no line this reading can start that body on. Every body is read by
+/// [`heredoc_body_end`], the terminator model [`strip_heredoc_bodies`] uses.
 fn skip_heredoc_bodies(
     chars: &[char],
     mut j: usize,
-    pending: &mut Vec<(Vec<char>, bool)>,
+    pending: &mut Vec<PendingHeredoc>,
 ) -> Option<usize> {
-    for (word, strip_tabs) in pending.drain(..) {
-        loop {
-            if j >= chars.len() {
-                return None;
-            }
-            let eol = chars[j..]
-                .iter()
-                .position(|&c| c == '\n')
-                .map_or(chars.len(), |off| j + off);
-            let mut from = j;
-            if strip_tabs {
-                while from < eol && chars[from] == '\t' {
-                    from += 1;
-                }
-            }
-            // Compared in place: one allocation per body line made a long
-            // heredoc cost an allocator round-trip per line on every rescan.
-            let line = &chars[from..eol];
-            if line == word.as_slice() {
-                j = (eol + 1).min(chars.len());
-                break;
-            }
-            if line.starts_with(&word) && line.contains(&')') {
-                j = from + word.len();
-                break;
-            }
-            j = (eol + 1).min(chars.len());
+    let count = pending.len();
+    for (n, heredoc) in pending.drain(..).enumerate() {
+        let end = heredoc_body_end(chars, j, &heredoc, true)?;
+        if !end.at_line_start && n + 1 < count {
+            return None;
         }
+        j = end.resume;
     }
     Some(j)
 }
@@ -11302,6 +11880,321 @@ mod tests {
         // A here-string is not a heredoc, and a `<<` inside quotes is text.
         assert!(heredoc_introducers("bash <<< 'x'").is_empty());
         assert!(heredoc_introducers("echo '<<EOF'").is_empty());
+    }
+
+    #[test]
+    fn heredoc_introducers_read_quotes_with_the_shared_model() {
+        // cameronsjo/cadence-hooks#813: two private quote toggles with no
+        // backslash handling read the escaped quote in `"a\"b <<EOF"` as the
+        // closer, so the `<<EOF` behind it registered as an introducer bash
+        // never sees. Every row below is checked against bash 5.2: the count
+        // is how many heredocs bash opens on the line.
+        for (line, count) in [
+            ("echo \"a\\\"b <<EOF\"", 0),
+            ("echo $'a\\'b <<EOF'", 0),
+            ("echo \\<<EOF", 0),
+            ("echo 'x' <<EOF", 1),
+            ("echo \"x\" <<EOF", 1),
+            // Comments, arithmetic and `${…}` are not redirections.
+            ("echo hi # cat <<EOF", 0),
+            ("echo $(( 1 << 2 ))", 0),
+            ("echo ${x:-<<EOF}", 0),
+            // A `"$( … )"` span is skipped whole, as the splitter skips it.
+            ("git commit -m \"$(cat <<'EOF'", 0),
+            // A continuation inside the operator is removed first.
+            ("cat <\\\n<EOF", 1),
+            ("cat <<A <<'B'", 2),
+        ] {
+            assert_eq!(heredoc_introducers(line).len(), count, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn heredoc_delimiters_read_the_way_bash_reads_them() {
+        // One parser for the top-level reader and the substitution scanner
+        // (cameronsjo/cadence-hooks#1116). Each word is bash 5.2's terminator.
+        for (line, word, expands) in [
+            ("cat <<\"E\\\"F\"", "E\"F", false),
+            ("cat <<\"E\\xF\"", "E\\xF", false),
+            ("cat <<\"E\\$F\"", "E$F", false),
+            ("cat <<$'E'", "E", false),
+            ("cat <<$\"E\"", "E", false),
+            ("cat <<E'F'G", "EFG", false),
+            ("cat <<\\EOF", "EOF", false),
+            ("cat <<''", "", false),
+            ("cat <<EO\\\nF", "EOF", true),
+            ("cat <<EOF.x", "EOF.x", true),
+        ] {
+            let found = heredoc_introducers(line);
+            assert_eq!(found.len(), 1, "{line:?}");
+            assert_eq!(found[0].word, word, "{line:?}");
+            assert_eq!(found[0].expands, expands, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn heredoc_body_end_matches_bash_terminators() {
+        // The one terminator model, row by row against bash 5.2: `Some(n)`
+        // means the body is the first `n` lines and the next line ends it.
+        let body_lines = |body: &str, delim: &str, quoted: bool, dash: bool, in_subst: bool| {
+            let heredoc = PendingHeredoc {
+                word: delim.chars().collect(),
+                strip_tabs: dash,
+                expands: !quoted,
+                joins: !quoted,
+            };
+            let chars: Vec<char> = body.chars().collect();
+            heredoc_body_end(&chars, 0, &heredoc, in_subst)
+                .map(|end| chars[..end.body_end].iter().filter(|&&c| c == '\n').count())
+        };
+        for (body, quoted, dash, in_subst, want) in [
+            ("x\nEOF\nrest", false, false, false, Some(1)),
+            // Exact match only: blanks and a CR make an ordinary body line.
+            ("  EOF\nEOF\n", false, false, false, Some(1)),
+            ("EOF \nEOF\n", false, false, false, Some(1)),
+            ("EOF\r\nEOF\n", false, false, false, Some(1)),
+            // `<<-` strips leading tabs, and only tabs.
+            ("\t\tEOF\n", false, true, false, Some(0)),
+            (" EOF\nEOF\n", false, true, false, Some(1)),
+            // #1122: a continuation joins BEFORE the comparison.
+            ("x\\\nEOF\nEOF\n", false, false, false, Some(2)),
+            ("EO\\\nF\nx\nEOF\n", false, false, false, Some(0)),
+            ("\\\nEOF\n", false, false, false, Some(0)),
+            ("x\\\\\nEOF\n", false, false, false, Some(1)),
+            // Tabs go from the start of the joined line only.
+            ("\tEO\\\n\tF\nEOF\n", false, true, false, Some(2)),
+            // A quoted delimiter joins nothing.
+            ("x\\\nEOF\n", true, false, false, Some(1)),
+            // Inside `$( … )`, `EOF)` ends the body too; outside it does not.
+            ("x\nEOF)\n", false, false, true, Some(1)),
+            ("x\nEOF)\nEOF\n", false, false, false, Some(2)),
+            ("x\nEOFx\nEOF ; x\n", false, false, true, None),
+            // No terminator at all.
+            ("x\ny", false, false, false, None),
+        ] {
+            assert_eq!(
+                body_lines(body, "EOF", quoted, dash, in_subst),
+                want,
+                "{body:?} quoted={quoted} dash={dash} in_subst={in_subst}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_bodies_end_where_bash_ends_them() {
+        // End to end through the segmenter: every row is a live miss on main
+        // (bash runs `cat .env`, checked with a harmless canary), and every
+        // one comes from the top-level heredoc reader disagreeing with bash.
+        for input in [
+            // #813: a fake introducer behind an escaped quote.
+            "echo \"a\\\"b <<EOF\"\ncat .env\nEOF",
+            "echo $'a\\'b <<EOF'\ncat .env\nEOF",
+            // #1116: an escaped quote inside the delimiter's own quoting.
+            "echo $(cat <<\"E\\\"F\"\nx\nE\"F\n) ; cat .env",
+            // #1117: a quote open on the introducing line moves the body.
+            "echo $(cat <<EOF;echo 'q\nit's\nEOF\n) ; cat .env",
+            "cat <<EOF; echo 'q\nx'\nit's body\nEOF\ncat .env",
+            // #1122: a continuation that destroys the terminator.
+            "cat <<EOF\nx\\\nEOF\n: <<EOG\nEOF\ncat .env\nEOG",
+            // A continuation that builds it.
+            "cat <<EOF\nEO\\\nF\ncat .env\nEOF",
+            // Blanks or a CR around a terminator: not a terminator.
+            "cat <<EOF\n  EOF\n: <<EOG\nEOF\ncat .env\nEOG",
+            "cat <<EOF\nEOF\r\n: <<EOG\nEOF\ncat .env\nEOG",
+            // A `<<` bash reads inside a multi-line quoted string.
+            "echo 'it\n<<EOF'\ncat .env\nEOF",
+            // An arithmetic shift is not a heredoc.
+            "echo $(( 1 << 2 ))\ncat .env\n2",
+            // bash 5.2 ends a body inside `$( … )` at `EOF)`.
+            "x=$(cat <<EOF\nit's\nEOF)\ncat .env",
+            // A quoted-delimiter body inside a `"$( … )"` span joins nothing:
+            // `x\` ⏎ `EOF` ends it, and so does a `\` before a CR. Joining
+            // the skipped span's lines rewrote the body so it ran past bash's
+            // terminator, in every quoted spelling of the delimiter.
+            "echo \"$(cat <<'EOF'\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "echo \"$(cat <<\\EOF\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "x=\"$(cat <<$'E\\x4fF'\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<E'O'F\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "echo \"$(cat <<'EOF'\nx\\\r\nEOF\ncat .env\nEOF\n)\"",
+            // Backtick text loses its backslash-newlines BEFORE the heredoc is
+            // read, so even a quoted delimiter's body ends at a joined `EOF`.
+            "x=`cat <<\\EOF\nEO\\\nF\ncat .env\nEOF\n`",
+            "x=`cat <<'EOF'\nEO\\\nF\ncat .env\nEOF\n`",
+            "echo \"`cat <<\\EOF\nEO\\\nF\ncat .env\nEOF\n`\"",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                out.iter().any(|s| s == "cat .env"),
+                "{input:?}: the read reached no segment: {out:?}"
+            );
+        }
+        // The substitution scanner places the #1116/#1117 bodies where bash
+        // does, and resumes on the code after the substitution.
+        for body in [
+            "cat <<\"E\\\"F\"\nx\nE\"F\n) ; cat .env",
+            "cat <<EOF;echo 'q\nit's\nEOF\n) ; cat .env",
+        ] {
+            let chars: Vec<char> = body.chars().collect();
+            let (_, end) = scan_substitution_body(&chars, 0, true).expect(body);
+            assert_eq!(
+                chars[end..].iter().collect::<String>(),
+                " ; cat .env",
+                "{body:?}"
+            );
+        }
+        // Controls: bash reads each `cat .env` here as heredoc DATA.
+        for input in [
+            "cat <<'EOF'\ncat .env\nEOF",
+            "cat <<EOF\nEOF\r\ncat .env\nEOF",
+            "cat <<EOF\nx\\\nEOF\ncat .env\nEOF",
+            "cat <<-EOF\n\tEO\\\n\tF\ncat .env\nEOF",
+            // In backticks `x\` ⏎ `EOF` joins to `xEOF`, whatever the quoting.
+            "x=`cat <<\\EOF\nx\\\nEOF\ncat .env\nEOF\n`",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                !out.iter().any(|s| s == "cat .env"),
+                "{input:?}: body data became a command: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_stripping_keeps_the_common_commit_and_pr_shapes() {
+        // The shapes Claude sends every day: a message body is data, however
+        // many apostrophes, parens, `#`s and backticks it carries, and the
+        // command after it is still a command.
+        for (input, last) in [
+            (
+                "git commit -m \"$(cat <<'EOF'\nfix(core): it's done (really) # `x`\n\nCo-Authored-By: X <x@y.z>\nEOF\n)\"\ngit status",
+                "git status",
+            ),
+            (
+                "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n- it's (fine) #1 `c` \"q\n\nEOF\n)\" && git status",
+                "git status",
+            ),
+            (
+                "cat > notes.md <<'EOF'\nit's # (x) `y`\nEOF\ngit status",
+                "git status",
+            ),
+            (
+                "git commit -F - <<'EOF'\nmsg: it's (x)\nEOF\ngit status",
+                "git status",
+            ),
+        ] {
+            let out = command_segments(input);
+            assert_eq!(
+                out.last().map(String::as_str),
+                Some(last),
+                "{input:?}: {out:?}"
+            );
+            assert!(
+                !out.iter()
+                    .any(|s| ["fix(", "- it's", "it's", "msg:", "## ", "Co-Authored"]
+                        .iter()
+                        .any(|prose| s.starts_with(prose))),
+                "{input:?}: body prose became a segment: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_case_statement_does_not_end_the_substitution_at_a_pattern() {
+        // cameronsjo/cadence-hooks#1094: a `case` pattern's `)` read as the
+        // terminator, so inside a heredoc body `cat .env` fell outside the
+        // span. Each row's terminator is where bash 5.2 ends the substitution;
+        // the text after it is what the scan must hand back.
+        for body in [
+            "case a in a) cat .env;; esac) ; rest",
+            "case a in (a) cat .env;; esac) ; rest",
+            "case a in a|b) x;; c) y;& d) z;;& esac) ; rest",
+            "case a in a) x; esac) ; rest",
+            "case a in\n  a)\n    x\n    ;;\nesac\n) ; rest",
+            "if true; then case a in a) x;; esac; fi) ; rest",
+            "echo; case a in a) (x); esac) ; rest",
+            "! case a in @(a|b)) x;; esac) ; rest",
+            "case a in a) case b in b) x;; esac;; esac) ; rest",
+            "case $(echo a) in a) x;; esac) ; rest",
+            // `case` as an ordinary word, or quoted, is not the keyword.
+            "echo case in point) ; rest",
+            "'case' a) ; rest",
+        ] {
+            let chars: Vec<char> = body.chars().collect();
+            let (_, end) = scan_substitution_body(&chars, 0, true).expect(body);
+            assert_eq!(
+                chars[end..].iter().collect::<String>(),
+                " ; rest",
+                "{body:?}"
+            );
+        }
+        // A statement still open at end of input is the scanner's own lexing:
+        // the caller widens.
+        let chars: Vec<char> = "case a in a) x;; ".chars().collect();
+        assert_eq!(
+            scan_substitution_body(&chars, 0, true),
+            Err(ScanStop::LexUnresolved)
+        );
+        for input in [
+            "cat <<EOF\n$(case a in a) cat .env;; esac)\nEOF",
+            "cat <<EOF\n$(if true; then case a in a) cat .env;; esac; fi)\nEOF",
+            "echo \"$(case a in a) echo;; esac)\" ; cat .env",
+            // Failing the scan on `case` latched the splitter's `"$( … )"`
+            // reading off for the rest of the input, and the odd `"` in this
+            // commit body then hid the read after it.
+            "x=\"$(case a in a) echo;; esac)\"\ngit commit -m \"$(cat <<'EOF'\nsay \"hi\nEOF\n)\"\ncat .env",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                out.iter().any(|s| s.contains("cat .env")),
+                "{input:?}: the read reached no segment: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_opener_floods_stay_fast() {
+        // A 200 KB `$(case a in a) ` flood: the quote-blind reading ended at
+        // each pattern's `)` while the quote-aware one could not, so every
+        // nesting level surfaced two near-whole bodies and the wrapper
+        // recursion re-read both (1.4 s in enforce-worktree, 4x main). The
+        // blind reading models `case` too now, and surfaces one.
+        for unit in ["$(case a in a) ", "\"$(case a in a) "] {
+            let input = format!("echo {} ; cat .env", unit.repeat(200_000 / unit.len()));
+            let chars: Vec<char> = input.chars().collect();
+            assert!(scan_substitution_body(&chars, 7, false).is_err(), "{unit}");
+            let started = std::time::Instant::now();
+            let segs = command_segments(&input);
+            let took = started.elapsed();
+            assert!(segs.iter().any(|s| s.contains("cat .env")), "{unit}");
+            assert!(took < std::time::Duration::from_secs(5), "{unit}: {took:?}");
+        }
+    }
+
+    #[test]
+    fn continuation_floods_stay_fast() {
+        // `take_logical_line` re-ran the comment scan over the whole joined
+        // line once per continuation, so a 200 KB run of `<\` lines spent
+        // seconds in every segmenting guard (22 s in enforce-worktree) — past
+        // the hook deadline, which fails open. A heredoc body of `x\` lines
+        // that never terminates is kept verbatim and reaches the same path.
+        for input in [
+            format!("cat {}<EOF\nEOF\ncat .env", "<\\\n".repeat(66_000)),
+            format!("cat <<EOF\n{}EOF\ncat .env", "x\\\n".repeat(66_000)),
+            format!("echo '#{}' ; cat .env", "\\\n".repeat(100_000)),
+        ] {
+            let started = std::time::Instant::now();
+            let lines = logical_lines(&input);
+            let segs = command_segments(&input);
+            let took = started.elapsed();
+            assert!(!lines.is_empty() && !segs.is_empty());
+            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        }
+        // The join still stops at a comment line, found by bisection now.
+        let input = format!("echo {}a #;\\\ncat .env", "x\\\n".repeat(1000));
+        assert_eq!(
+            logical_lines(&input).last().map(String::as_str),
+            Some("cat .env")
+        );
     }
 
     #[test]
