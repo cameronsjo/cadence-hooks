@@ -114,9 +114,10 @@ fn is_bash_overshare_trigger(command: &str) -> bool {
     }
 
     use cadence_hooks_core::shell::command_segments;
-    command_segments(command)
-        .iter()
-        .any(|seg| crate::redact_external_content::is_external_post(seg))
+    command_segments(command).iter().any(|seg| {
+        crate::redact_external_content::is_external_post(seg)
+            && !crate::redact_external_content::api_posts_no_prose(seg)
+    })
 }
 
 /// True when `path` is under the Obsidian vault.
@@ -288,7 +289,66 @@ mod tests {
             ("gh repo create o/r -d text --public", Outcome::Nudge),
             ("gh pr merge 3 --subject s", Outcome::Nudge),
             ("gh api repos/o/r", Outcome::Allow),
-            ("gh api -X GET repos/o/r/issues -f q=x", Outcome::Allow),
+            // Render-only and state-only requests post no prose
+            // (cadence-hooks#1172); a prose field, wherever it sits, does.
+            ("gh api /markdown -f text=x", Outcome::Allow),
+            ("gh api markdown -f text=x -f mode=gfm", Outcome::Allow),
+            ("gh api /markdown/raw -f text=x", Outcome::Allow),
+            (
+                "gh api -X PATCH repos/o/r/issues/2 -f state=closed",
+                Outcome::Allow,
+            ),
+            (
+                "gh api -X PATCH repos/o/r/pulls/2 -f state=closed -f base=main",
+                Outcome::Allow,
+            ),
+            (
+                "gh api -X PUT repos/o/r/issues/2/labels -f 'labels[]=bug'",
+                Outcome::Allow,
+            ),
+            (
+                "gh api -X PATCH repos/o/r/issues/2 -f state=closed -f body=x",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api repos/o/r/issues/2/comments -f body=x",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X PATCH repos/o/r/pulls/2 -f state=closed -F body=@f.md",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X PATCH repos/o/r/gists/1 -f description=x",
+                Outcome::Nudge,
+            ),
+            ("gh api -X POST repos/o/r/issues -f title=x", Outcome::Nudge),
+            (
+                "gh api -X PUT repos/o/r/contents/f.md -f message=x -f content=Zm9v",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X PUT 'repos/o/r/contents/f.md' -f 'commit[message]=x'",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X PATCH 'repos/o/r/issues/2?title=x'",
+                Outcome::Nudge,
+            ),
+            ("gh api repos/o/r/issues --input req.json", Outcome::Nudge),
+            ("gh api -X POST markdown/other -f text=x", Outcome::Nudge),
+            (
+                "gh api -X POST repos/o/r/markdown -f text=x",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X PATCH repos/o/r/issues/2 -f state=closed; gh pr create -t x",
+                Outcome::Nudge,
+            ),
+            (
+                "gh api -X POST graphql -f query='mutation { x }'",
+                Outcome::Nudge,
+            ),
             ("gh api graphql -f query='query { x }'", Outcome::Allow),
         ];
         for (cmd, want) in cases {

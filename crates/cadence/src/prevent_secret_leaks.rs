@@ -502,6 +502,19 @@ fn strip_quoted_heredoc_bodies(text: &str) -> Cow<'_, str> {
     Cow::Owned(out.join("\n"))
 }
 
+/// Does `text` (quotes already removed) write a `git` command word followed,
+/// in the same command, by a verb that reads `<rev>:<path>` objects — `show`,
+/// `cat-file`, `log` or `diff`? Global options (`git -C /r show`) sit between.
+fn names_an_object_reader(text: &str) -> bool {
+    static READER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?:^|[\s;&|(`$/])git\s+(?:[^\s;&|]+\s+)*?(?:show|cat-file|log|diff)(?:$|[\s;&|)`])",
+        )
+        .expect("pattern should compile")
+    });
+    READER.is_match(text)
+}
+
 /// A secret-file name in `text` once quoting is REMOVED, not split on — the
 /// fail-closed judgment for input the structured scan does not finish
 /// (#832/#815 delta review I2/I4). `".e"'nv'` and `.e\nv` normalize to
@@ -527,17 +540,17 @@ fn normalized_secret_name(text: &str) -> Option<String> {
                     Filename::Known,
                 ))
     };
+    // git's `<rev>:<path>` names a committed file (`HEAD:.env`), and past the
+    // cap no grammar says which words are object spellings — so a `:` splits
+    // only where a `git` that reads objects is written. Elsewhere it is
+    // prose: `key: value`, `id_rsa:` and `.env:` in a long YAML body
+    // (cadence-hooks#1172).
+    let splits_colon = names_an_object_reader(&normalized);
     normalized
         .split(|c: char| {
             c.is_whitespace()
-                || matches!(
-                    c,
-                    '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '='
-                        // git's `<rev>:<path>` names a committed file
-                        // (`HEAD:.env`), and past the cap no grammar says
-                        // which words are object spellings.
-                        | ':'
-                )
+                || matches!(c, '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '=')
+                || (splits_colon && c == ':')
         })
         .find_map(|piece| {
             // 4096 is `secret_patterns`' glob-token cap, past which the
@@ -11593,6 +11606,43 @@ mod tests {
             Allow,
             "no family in the literal part: judged as the `*` spelling is",
         );
+    }
+
+    /// Past the size cap a `:` splits a word only where a `git` that reads
+    /// `<rev>:<path>` objects is written (cadence-hooks#1172): YAML prose
+    /// stays allowed, and every spelling of the object read still blocks.
+    #[test]
+    fn oversized_commands_split_a_colon_only_for_a_git_object_reader() {
+        let pad = "x ".repeat(STRUCTURED_SCAN_LIMIT);
+        for (tail, blocks) in [
+            ("key: value", false),
+            ("id_rsa:", false),
+            (".env:", false),
+            ("- name: value", false),
+            // A bare `.env` word blocks past the cap however it is punctuated.
+            ("- name: .env", true),
+            ("echo show HEAD:.env", false),
+            ("git status; echo HEAD:.env", false),
+            ("git show HEAD:README.md", false),
+            ("git show HEAD:.env", true),
+            ("git -C /r show HEAD:.env", true),
+            ("git cat-file -p HEAD:.env", true),
+            ("git cat-file blob HEAD:id_rsa", true),
+            ("git log -p HEAD:.env", true),
+            ("git diff HEAD:.env HEAD~1:.env", true),
+            ("git 'show' 'HEAD:.env'", true),
+            ("git \"show\" HEAD:.env", true),
+            ("/usr/bin/git show HEAD:.env", true),
+            ("cd r && git show HEAD:.env", true),
+            ("key: value; git show HEAD:.env", true),
+            ("echo $(git show HEAD:.env)", true),
+            ("x=`git show HEAD:.env`", true),
+            ("git\tshow HEAD:.env", true),
+            ("git show\nHEAD:.env", true),
+        ] {
+            let command = format!("{pad}{tail}");
+            assert_eq!(normalized_secret_name(&command).is_some(), blocks, "{tail}");
+        }
     }
 
     #[test]

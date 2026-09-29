@@ -4959,6 +4959,8 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
     let mut previous_op: Option<&str> = None;
+    let mut root_lookups = 0;
+    let mut trusted = None;
     for (segment, op) in split_segments_with_ops(command) {
         let after_chain = matches!(previous_op, None | Some("&&" | ";" | "||"));
         previous_op = op;
@@ -4969,10 +4971,58 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
         if words.first().map(String::as_str) == Some("cd")
             && let Some(target) = words.get(1)
         {
-            apply_cd_target(&mut effective, target);
+            // `cd "$(git rev-parse --show-toplevel)"` lands on the root of
+            // the checkout it runs in, not in a directory of that name.
+            let root = (words.len() >= 2)
+                .then(|| toplevel_substitution(&words[1..].join(" ")))
+                .flatten()
+                .filter(|_| toplevel_segment_is_live(&segment))
+                .filter(|_| *trusted.get_or_insert_with(|| known_commands_are_trusted(command)))
+                .filter(|_| {
+                    root_lookups += 1;
+                    root_lookups <= MAX_ROOT_LOOKUPS
+                })
+                .and_then(|git_dir| repo_root_of(&effective, git_dir.as_deref()));
+            match root {
+                Some(root) => effective = root,
+                None => apply_cd_target(&mut effective, target),
+            }
         }
     }
     effective
+}
+
+/// The root of the checkout `dir` is in (after an optional `git -C <dir>`),
+/// or `None` when it is not absolute, not inside one, or unreadable.
+fn repo_root_of(dir: &str, git_dir: Option<&str>) -> Option<String> {
+    let mut at = dir.to_string();
+    if let Some(git_dir) = git_dir {
+        move_dir(&mut at, git_dir, looks_absolute(git_dir));
+    }
+    if at == UNRESOLVABLE_DIR || !looks_absolute(&at) {
+        return None;
+    }
+    crate::gitstate::GitState::resolve(std::path::Path::new(&at))
+        .map(|state| state.repo_root.to_string_lossy().into_owned())
+}
+
+/// May `cd "$(git rev-parse --show-toplevel)"` in this segment be read as the
+/// checkout root? Not when the substitution is single-quoted or escaped (a
+/// directory's name then).
+fn toplevel_segment_is_live(segment: &str) -> bool {
+    !segment.contains(['\'', '\\'])
+}
+
+/// Can the tools a command names by name be trusted to be what they are named?
+/// Not when the command or its environment may point git elsewhere (`GIT_DIR`,
+/// `GIT_WORK_TREE`), or may have replaced `git`, `ssh-agent` or another
+/// known tool ([`crate::push::may_redefine_known_commands`]). Scans the whole
+/// command, so a walk asks once ([`DirWalk::known_commands_trusted`]).
+fn known_commands_are_trusted(command: &str) -> bool {
+    !command.contains("GIT_")
+        && std::env::var_os("GIT_DIR").is_none()
+        && std::env::var_os("GIT_WORK_TREE").is_none()
+        && !crate::push::may_redefine_known_commands(command)
 }
 
 /// One top-level segment of a command and the directory it runs in
@@ -5040,8 +5090,23 @@ pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std:
 struct Group {
     subshell: bool,
     saved: Vec<String>,
+    /// The `pushd` stack to go back to: a subshell's pushes and pops end
+    /// with it.
+    stack: DirStack,
     after_pipe: bool,
 }
+
+/// The `pushd` stack, as the directory sets the shell was in before each
+/// `pushd` this walk read. `poisoned` once anything the walk cannot follow
+/// touched it: a later `popd` then stays unreadable.
+#[derive(Clone, Default)]
+struct DirStack {
+    entries: Vec<Vec<String>>,
+    poisoned: bool,
+}
+
+/// Most `pushd`s remembered before the stack is given up as unreadable.
+const MAX_DIR_STACK: usize = 16;
 
 /// A compound command [`segment_work_dirs`] is inside. Its body runs in the
 /// PARENT shell, so a `cd` there moves the parent — but only if the branch
@@ -5072,6 +5137,7 @@ const MAX_REPLAYED_SEGMENTS: usize = 4096;
 struct DirSet {
     dirs: Vec<String>,
     shared: Option<Vec<std::rc::Rc<str>>>,
+    stack: DirStack,
 }
 
 impl DirSet {
@@ -5079,7 +5145,31 @@ impl DirSet {
         Self {
             dirs: vec![cwd.to_string()],
             shared: None,
+            stack: DirStack::default(),
         }
+    }
+
+    /// Leave a group: back to its directories and its `pushd` stack.
+    fn restore(&mut self, dirs: Vec<String>, stack: DirStack) {
+        self.replace(dirs);
+        self.stack = stack;
+    }
+
+    /// Apply `cd "$(git rev-parse --show-toplevel)"` (with an optional `-C
+    /// <dir>`): each directory becomes the root of the checkout it is in. A
+    /// directory that is not inside one, that is not absolute, or that is
+    /// already unresolvable stays [`UNRESOLVABLE_DIR`].
+    fn move_to_repo_root(&mut self, git_dir: Option<&str>, keep: bool, lookups: &mut usize) {
+        let mut next = if keep { self.dirs.clone() } else { Vec::new() };
+        for dir in &self.dirs {
+            // Each lookup reads the disk: a flood of them is refused, not run.
+            *lookups += 1;
+            let root = (*lookups <= MAX_ROOT_LOOKUPS)
+                .then(|| repo_root_of(dir, git_dir))
+                .flatten();
+            next.push(root.unwrap_or_else(|| UNRESOLVABLE_DIR.to_string()));
+        }
+        self.set(next);
     }
 
     /// The directories, shared by every segment that runs there.
@@ -5193,7 +5283,17 @@ struct DirWalk {
     /// walk does not record (`f() if …; fi`).
     functions: std::collections::HashMap<String, Option<Script>>,
     replayed: usize,
+    /// `git rev-parse --show-toplevel` lookups made so far, against
+    /// [`MAX_ROOT_LOOKUPS`].
+    root_lookups: usize,
+    /// [`known_commands_are_trusted`] for the whole command, asked at the first
+    /// segment that needs it: each ask scans the command.
+    known_commands: std::cell::OnceCell<bool>,
 }
+
+/// Most checkout-root lookups one walk makes (each reads the disk); past it a
+/// `cd "$(git rev-parse --show-toplevel)"` is unresolvable.
+const MAX_ROOT_LOOKUPS: usize = 64;
 
 /// What a command sets one variable to ([`literal_values_of`]).
 #[derive(Clone)]
@@ -5580,9 +5680,87 @@ fn split_glued_redirection(words: &mut Vec<MarkedToken>, index: usize) {
 enum VerbTarget {
     /// A literal target.
     To(String),
-    /// A target this walk cannot read: `popd`, `cd -`, `cd "$D"`, a flagged
+    /// `$(git rev-parse --show-toplevel)`, with the `-C <dir>` it named:
+    /// the root of the checkout the shell is in.
+    RepoRoot(Option<String>),
+    /// A bare `popd`: back to where the matching `pushd` left.
+    Pop,
+    /// A target this walk cannot read: `popd -n`, `cd -`, `cd "$D"`, a flagged
     /// `pushd`, more than one operand.
     Unreadable,
+}
+
+/// Is this `eval`'s whole operand one of the tool-initialisation substitutions
+/// — `$(ssh-agent -s)`, `$(direnv hook bash)`, `$(brew shellenv)`, `$(pyenv
+/// init -)`, `$(rbenv init -)`, `$(starship init bash)`, `$(zoxide init
+/// bash)`, `$(fnm env)`, `$(mise activate bash)`? Each prints a fixed set of
+/// exports, functions and prompt hooks: none changes directory, and none
+/// redefines a command this walk follows (cameronsjo/cadence-hooks#1172).
+///
+/// The head is matched exactly — the tool by name (or an absolute path to it),
+/// its subcommand, then plain words only — so `$(direnv export bash)` (which
+/// prints whatever the `.envrc` exports), `$(cat x)`, a second command, and a
+/// glued word all stay unknowable. The caller must first rule out that the
+/// command replaced the tool ([`crate::push::may_redefine_known_commands`]).
+pub fn eval_is_tool_init(operands: &[&String]) -> bool {
+    if crate::push::evals_only_an_agent_environment(operands) {
+        return true;
+    }
+    let Some(body) = crate::push::substitution_body(operands) else {
+        return false;
+    };
+    let mut words = body.split([' ', '\t']).filter(|word| !word.is_empty());
+    let Some(head) = words.next() else {
+        return false;
+    };
+    let name = match head.rsplit_once('/') {
+        Some(("", _)) => return false,
+        Some((dir, name)) if dir.starts_with('/') => name,
+        Some(_) => return false,
+        None => head,
+    };
+    let subcommand = match name {
+        "direnv" => "hook",
+        "brew" => "shellenv",
+        "pyenv" | "rbenv" | "starship" | "zoxide" => "init",
+        "fnm" => "env",
+        "mise" => "activate",
+        _ => return false,
+    };
+    if words.next() != Some(subcommand) {
+        return false;
+    }
+    words.all(|word| {
+        // `zoxide init --cmd cd` defines a `cd` of its own.
+        word != "--cmd"
+            && !word.starts_with("--cmd=")
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./:@,=+%-".contains(c))
+    })
+}
+
+/// The `git -C <dir>` of a whole-operand `$(git rev-parse --show-toplevel)`
+/// (or its backtick spelling): `Some(None)` without one. Exact words only, so
+/// a `--git-dir`, a suffix (`…)/..`) or a second command is not it.
+fn toplevel_substitution(operand: &str) -> Option<Option<String>> {
+    let body = operand.trim();
+    let body = match body.strip_prefix("$(") {
+        Some(rest) => rest.strip_suffix(')').unwrap_or(rest),
+        None => body.strip_prefix('`')?.strip_suffix('`')?,
+    };
+    let words: Vec<&str> = body.split([' ', '\t']).filter(|w| !w.is_empty()).collect();
+    match words.as_slice() {
+        ["git", "rev-parse", "--show-toplevel"] => Some(None),
+        ["git", "-C", dir, "rev-parse", "--show-toplevel"]
+            if !dir.is_empty()
+                && !dir.starts_with('-')
+                && !dir.contains(|c: char| "$`\\'\"*?[]{}~!#&|;<>()".contains(c)) =>
+        {
+            Some(Some((*dir).to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Read a `cd`/`pushd`/`popd`'s target from its words (the verb first).
@@ -5590,12 +5768,10 @@ enum VerbTarget {
 fn verb_target(words: &[MarkedToken]) -> VerbTarget {
     let verb = words[0].text.as_str();
     let verb = unescape_word(verb);
-    if verb == "popd" {
-        return VerbTarget::Unreadable;
-    }
+    let pop = verb == "popd";
     let stack_verb = verb == "pushd";
     let mut idx = 1;
-    while let Some(word) = words.get(idx) {
+    while let Some(word) = words.get(idx).filter(|_| !pop) {
         let text = unescape_word(&word.text);
         if text == "--" {
             idx += 1;
@@ -5623,6 +5799,20 @@ fn verb_target(words: &[MarkedToken]) -> VerbTarget {
             continue;
         }
         operands.push(word.text.as_str());
+    }
+    if pop {
+        // Any option or operand (`popd -n`, `popd +1`) is not read here.
+        return if operands.is_empty() {
+            VerbTarget::Pop
+        } else {
+            VerbTarget::Unreadable
+        };
+    }
+    // An unquoted substitution arrives split on its spaces.
+    if let Some(git_dir) =
+        toplevel_substitution(&operands.join(" ")).filter(|_| !operands.is_empty())
+    {
+        return VerbTarget::RepoRoot(git_dir);
     }
     match operands.as_slice() {
         [] if !stack_verb => VerbTarget::To("~".to_string()),
@@ -5703,7 +5893,7 @@ impl DirWalk {
                     let forked =
                         group.subshell || group.after_pipe || matches!(op, Some("|" | "&"));
                     if forked {
-                        dirs.replace(group.saved);
+                        dirs.restore(group.saved, group.stack);
                     }
                 }
             }
@@ -5711,6 +5901,7 @@ impl DirWalk {
                 groups.push(Group {
                     subshell,
                     saved: dirs.dirs.clone(),
+                    stack: dirs.stack.clone(),
                     after_pipe: previous_op == Some("|"),
                 });
             }
@@ -5762,7 +5953,7 @@ impl DirWalk {
                 // A `)` closes the innermost subshell, and any brace group
                 // opened inside it with it.
                 while let Some(group) = groups.pop() {
-                    dirs.replace(group.saved);
+                    dirs.restore(group.saved, group.stack);
                     if group.subshell {
                         break;
                     }
@@ -5774,6 +5965,7 @@ impl DirWalk {
                 groups.push(Group {
                     subshell: true,
                     saved: dirs.dirs.clone(),
+                    stack: dirs.stack.clone(),
                     after_pipe: false,
                 });
             }
@@ -5896,6 +6088,12 @@ impl DirWalk {
             .contains_key("CDPATH")
     }
 
+    fn known_commands_trusted(&self) -> bool {
+        *self
+            .known_commands
+            .get_or_init(|| known_commands_are_trusted(&self.command))
+    }
+
     fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
         for dir in dirs.snapshot() {
             self.located.push(LocatedSegment {
@@ -5933,7 +6131,7 @@ impl DirWalk {
             || plain
                 && !matches!(
                     first_word,
-                    "builtin" | "command" | "eval" | "trap" | "cd" | "pushd" | "popd"
+                    "builtin" | "command" | "eval" | "trap" | "cd" | "pushd" | "popd" | "dirs"
                 )
                 && !self.functions.contains_key(first_word)
         {
@@ -6031,6 +6229,18 @@ impl DirWalk {
                     .map(|word| word.text.as_str())
                     .skip_while(|word| *word == "--")
                     .collect();
+                let operands: Vec<&String> = words[1..]
+                    .iter()
+                    .map(|word| &word.text)
+                    .skip_while(|word| word.as_str() == "--")
+                    .collect();
+                if !body.contains(['\'', '\\'])
+                    && eval_is_tool_init(&operands)
+                    && self.known_commands_trusted()
+                {
+                    // Prints exports and hooks; it changes no directory.
+                    return;
+                }
                 if script.iter().any(|word| word.contains(['$', '`', '\\'])) {
                     if !own_process {
                         dirs.add_unresolvable();
@@ -6046,25 +6256,88 @@ impl DirWalk {
                     dirs.add_unresolvable();
                 }
             }
-            "cd" | "pushd" | "popd" if !own_process => match verb_target(words) {
-                VerbTarget::To(target) if self.cdpath_may_redirect(&target) => {
-                    dirs.add_unresolvable();
+            "cd" | "pushd" | "popd" if !own_process => {
+                let maybe = context.conditional || ambiguous || command_prefixed;
+                let pushes = name == "pushd";
+                let mut target = verb_target(words);
+                // Only a live double-quoted or bare substitution is one: in
+                // single quotes or escaped it is a directory's name, and a
+                // `git` the command may have replaced names anything.
+                if matches!(target, VerbTarget::RepoRoot(_))
+                    && (!toplevel_segment_is_live(body)
+                        || !self.known_commands_trusted()
+                        || self.functions.contains_key("git"))
+                {
+                    target = VerbTarget::Unreadable;
                 }
-                VerbTarget::To(target) => {
-                    let absolute = looks_absolute(&target) || target.starts_with('~');
-                    // `command cd` does not move zsh; `\cd` moves where `'\cd'`
-                    // does not. Either way, judge both.
-                    dirs.move_to(
-                        &target,
-                        context.conditional || ambiguous || command_prefixed,
-                    );
-                    if context.looped && !absolute {
-                        // Round a loop N times, a relative `cd` lands N deep.
+                let remembers = pushes
+                    && !maybe
+                    && !context.looped
+                    && !dirs.stack.poisoned
+                    && dirs.stack.entries.len() < MAX_DIR_STACK;
+                if pushes && !remembers {
+                    dirs.stack.poisoned = true;
+                }
+                match target {
+                    VerbTarget::To(target) if self.cdpath_may_redirect(&target) => {
+                        dirs.stack.poisoned |= pushes;
+                        dirs.add_unresolvable();
+                    }
+                    VerbTarget::To(target) => {
+                        let absolute = looks_absolute(&target) || target.starts_with('~');
+                        if remembers {
+                            dirs.stack.entries.push(dirs.dirs.clone());
+                        }
+                        // `command cd` does not move zsh; `\cd` moves where `'\cd'`
+                        // does not. Either way, judge both.
+                        dirs.move_to(&target, maybe);
+                        if context.looped && !absolute {
+                            // Round a loop N times, a relative `cd` lands N deep.
+                            dirs.add_unresolvable();
+                        }
+                    }
+                    VerbTarget::RepoRoot(git_dir) => {
+                        if remembers {
+                            dirs.stack.entries.push(dirs.dirs.clone());
+                        }
+                        dirs.move_to_repo_root(git_dir.as_deref(), maybe, &mut self.root_lookups);
+                        if context.looped {
+                            dirs.add_unresolvable();
+                        }
+                    }
+                    VerbTarget::Pop => {
+                        let top = dirs
+                            .stack
+                            .entries
+                            .last()
+                            .cloned()
+                            .filter(|_| !dirs.stack.poisoned && !context.looped);
+                        match top {
+                            Some(top) if !maybe => {
+                                dirs.stack.entries.pop();
+                                dirs.set(top);
+                            }
+                            Some(top) => {
+                                // Maybe popped: both places, and the stack is
+                                // no longer known.
+                                dirs.stack.poisoned = true;
+                                let mut both = dirs.dirs.clone();
+                                both.extend(top);
+                                dirs.set(both);
+                            }
+                            None => {
+                                dirs.stack.poisoned = true;
+                                dirs.add_unresolvable();
+                            }
+                        }
+                    }
+                    VerbTarget::Unreadable => {
+                        dirs.stack.poisoned |= pushes;
                         dirs.add_unresolvable();
                     }
                 }
-                VerbTarget::Unreadable => dirs.add_unresolvable(),
-            },
+            }
+            "dirs" if !own_process => dirs.stack.poisoned = true,
             _ => {}
         }
     }
@@ -6100,6 +6373,17 @@ impl DirWalk {
             self.walk(&body, dirs, depth + 1, context);
         }
     }
+}
+
+/// The subshells one top-level segment opens and closes: leading `(` openers
+/// plus a `$(…)` the splitter cut open, and unpaired `)`s. The push walk keeps
+/// a subshell's `cd` from moving its parent with them.
+pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let shape = segment_shape(peeled.command.unwrap_or(""));
+    let opens = peeled.opens.iter().filter(|&&paren| paren).count() + shape.inner_open;
+    (opens, shape.paren_closes)
 }
 
 /// How far a segment opens (positive) or closes (negative) groups — the
@@ -18644,6 +18928,180 @@ mod tests {
         ] {
             assert_eq!(segment_shape(segment), want, "{segment}");
         }
+    }
+
+    /// `popd` returns to the directory before the `pushd` it matches, when that
+    /// `pushd` was read in the same command (cameronsjo/cadence-hooks#1172).
+    /// Everything the walk cannot pair keeps the unresolvable verdict.
+    #[test]
+    fn segment_work_dirs_pairs_popd_with_its_pushd() {
+        const X: &str = UNRESOLVABLE_DIR;
+        for (command, want) in [
+            ("pushd sub && make && popd && gh pr create", &["/cwd"][..]),
+            ("pushd /u; popd; gh pr create", &["/cwd"]),
+            ("pushd /u; cd v; popd; gh pr create", &["/cwd"]),
+            ("cd a; pushd /u; popd; gh pr create", &["/cwd/a"]),
+            ("pushd /u; pushd /v; popd; gh pr create", &["/u"]),
+            ("pushd /u; pushd /v; popd; popd; gh pr create", &["/cwd"]),
+            (
+                "pushd /u >/dev/null; popd >/dev/null; gh pr create",
+                &["/cwd"],
+            ),
+            ("builtin pushd /u; builtin popd; gh pr create", &["/cwd"]),
+            // A pipeline stage or a subshell has a stack of its own.
+            ("pushd /u; (popd); gh pr create", &["/u"]),
+            ("pushd /u; (pushd /v; popd); popd; gh pr create", &["/cwd"]),
+            ("(pushd /u; popd); gh pr create", &["/cwd"]),
+            // Unmatched, unreadable or maybe-run: unresolvable, as before.
+            ("popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; popd; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; popd -n; gh pr create", &["/u", X]),
+            ("pushd /u; popd +1; gh pr create", &["/u", X]),
+            ("pushd /u; pushd; popd; gh pr create", &["/u", X]),
+            ("pushd -n /u; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; dirs -c; popd; gh pr create", &["/u", X]),
+            ("command pushd /u; popd; gh pr create", &["/cwd", "/u", X]),
+            ("pushd /u | cat; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u & popd; gh pr create", &["/cwd", X]),
+            (
+                "if x; then pushd /u; fi; popd; gh pr create",
+                &["/cwd", "/u", X],
+            ),
+            (
+                "pushd /u; if x; then popd; fi; gh pr create",
+                &["/cwd", "/u"],
+            ),
+            (
+                "for d in a b; do pushd $d; popd; done; gh pr create",
+                &["/cwd", X],
+            ),
+            ("f() { pushd /u; }; f; popd; gh pr create", &["/cwd"]),
+        ] {
+            let got = last_dirs(command);
+            let mut want: Vec<String> = want.iter().map(|d| (*d).to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{command}");
+        }
+    }
+
+    /// A flood of `pushd`, `popd` and checkout-root `cd`s is bounded: each
+    /// lookup past the budget is unresolvable rather than a disk read.
+    #[test]
+    fn a_flood_of_stack_and_toplevel_moves_is_bounded() {
+        let started = std::time::Instant::now();
+        for unit in [
+            "pushd /u; ",
+            "pushd a; popd; ",
+            "popd; ",
+            "cd \"$(git rev-parse --show-toplevel)\"; ",
+            "eval \"$(ssh-agent -s)\"; ",
+            "eval \"$(direnv hook bash)\"; ",
+        ] {
+            let command = format!("{}gh pr create", unit.repeat(200_000 / unit.len()));
+            let located = segment_work_dirs_with_cdpath(&command, "/nonexistent-cwd", false);
+            assert!(located.last().is_some(), "{unit}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// `cd "$(git rev-parse --show-toplevel)"` lands on the root of the
+    /// checkout it runs in, and only that exact substitution
+    /// (cameronsjo/cadence-hooks#1172).
+    #[test]
+    fn segment_work_dirs_resolves_the_toplevel_substitution() {
+        const X: &str = UNRESOLVABLE_DIR;
+        let repo = tempfile::tempdir().expect("create repo");
+        crate::git_fixtures::init_repo(repo.path());
+        let sub = repo.path().join("a/b");
+        std::fs::create_dir_all(&sub).expect("create subdirectory");
+        let root = std::fs::canonicalize(repo.path())
+            .expect("canonicalize repo")
+            .to_string_lossy()
+            .into_owned();
+        let sub = sub.to_string_lossy().into_owned();
+        for (command, want) in [
+            (
+                "cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd $(git rev-parse --show-toplevel); gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd `git rev-parse --show-toplevel`; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd -P \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd \"$(git -C /nonexistent rev-parse --show-toplevel)\"; gh pr create",
+                vec![X],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)/x\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd \"$(git rev-parse --git-dir)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd '$(git rev-parse --show-toplevel)'; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)\" x; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "git() { :; }; cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "PATH=/x:$PATH; cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "(cd \"$(git rev-parse --show-toplevel)\"); gh pr create",
+                vec![sub.as_str()],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)\" || true; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "true && cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+        ] {
+            let located = segment_work_dirs_with_cdpath(command, &sub, false);
+            let last = located.last().map(|segment| segment.raw.clone());
+            let mut got: Vec<String> = located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect();
+            got.sort();
+            got.dedup();
+            let mut want: Vec<String> = want.iter().map(|d| (*d).to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{command}");
+        }
+        // The whole-command reading agrees.
+        assert_eq!(
+            parse_work_dir(
+                "cd \"$(git rev-parse --show-toplevel)\" && gh pr create",
+                &sub
+            ),
+            root
+        );
+        assert_eq!(
+            parse_work_dir("cd \"$(git rev-parse --show-toplevel)/x\"", &sub),
+            format!("{sub}/$(git rev-parse --show-toplevel)/x")
+        );
     }
 
     /// A relative `cd`/`pushd` target searches `CDPATH` (bash: `cd sub` with

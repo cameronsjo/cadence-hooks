@@ -842,6 +842,9 @@ struct GhHostEnv {
     /// The whole command, raw — heredoc bodies included, which the segment
     /// list strips. Read only for a `source`/`.` fed by a heredoc.
     raw_command: String,
+    /// Whether nothing in [`Self::raw_command`] can have replaced a known
+    /// tool, asked at the first tool-init `eval` (each ask scans the command).
+    tools_trusted: std::cell::OnceCell<bool>,
 }
 
 impl GhHostEnv {
@@ -864,6 +867,7 @@ impl GhHostEnv {
             allexport: false,
             inherited,
             raw_command: String::new(),
+            tools_trusted: std::cell::OnceCell::new(),
         }
     }
 
@@ -1100,7 +1104,22 @@ impl GhHostEnv {
         // Past the nesting cap its words go unread, so the host is unknown
         // (#1073 review I-d).
         if command == Some("eval") {
-            self.observe_nested(&rest[1..].join(" "), depth);
+            // A tool-init substitution (`$(ssh-agent -s)`, `$(brew shellenv)`)
+            // prints exports and hooks but never a `GH_HOST` or `GH_REPO`
+            // (cameronsjo/cadence-hooks#1172); its exact head only, and only
+            // when nothing in the command could have replaced the tool.
+            let operands: Vec<&String> = rest[1..]
+                .iter()
+                .skip_while(|word| word.as_str() == "--")
+                .collect();
+            let plain_tool_init = !segment.contains(['\'', '\\'])
+                && cadence_hooks_core::shell::eval_is_tool_init(&operands)
+                && *self.tools_trusted.get_or_init(|| {
+                    !cadence_hooks_core::push::may_redefine_known_commands(&self.raw_command)
+                });
+            if !plain_tool_init {
+                self.observe_nested(&rest[1..].join(" "), depth);
+            }
         }
         // A `trap` action runs later in this shell, so it is read like an
         // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
@@ -8633,6 +8652,261 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// Over-blocks the operator ruled FIX (cameronsjo/cadence-hooks#1172):
+    /// `cd "$(git rev-parse --show-toplevel)"`, a tool-init `eval`, and a
+    /// `pushd`/`popd` pair. Every row is `(command, run from the owned
+    /// checkout?, blocks?)`; each allow has a twin that really runs in the
+    /// unowned checkout (or reads something else) and still blocks.
+    #[test]
+    fn known_shapes_that_stay_in_the_checkout_are_not_unresolvable() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        std::fs::create_dir(owned.path().join("sub")).unwrap();
+        std::fs::create_dir(unowned.path().join("sub")).unwrap();
+        let osub = format!("{o}/sub");
+        let usub = format!("{u}/sub");
+        with_env(&owners_env(), || {
+            for (command, cwd, blocks) in [
+                // 1. The repo root of the directory it runs in.
+                (
+                    "cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                (
+                    "cd $(git rev-parse --show-toplevel) && gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                (
+                    "cd \"$(git -C {O} rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &usub,
+                    false,
+                ),
+                (
+                    "pushd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                // Twins: the root of the unowned checkout, a suffix, another
+                // query, a literal directory name, a replaced `git`.
+                (
+                    "cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &usub,
+                    true,
+                ),
+                (
+                    "cd \"$(git -C {U} rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "cd \"$(git rev-parse --show-toplevel)/../{UB}\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "cd \"$(git rev-parse --git-dir)\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "cd '$(git rev-parse --show-toplevel)' && gh pr create -t x",
+                    &usub,
+                    true,
+                ),
+                (
+                    "git() { echo {U}; }; cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "PATH=/x:$PATH; cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "GIT_DIR={U}/.git cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
+                    &"/nonexistent-dir".to_string(),
+                    true,
+                ),
+                // 2. Tool-init evals run nothing that moves.
+                ("eval \"$(ssh-agent -s)\"; gh pr create -t x", &osub, false),
+                (
+                    "eval \"$(direnv hook bash)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                ("eval \"$(brew shellenv)\"; gh pr create -t x", &osub, false),
+                (
+                    "eval \"$(/opt/homebrew/bin/brew shellenv)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                ("eval \"$(pyenv init -)\"; gh pr create -t x", &osub, false),
+                ("eval \"$(rbenv init -)\"; gh pr create -t x", &osub, false),
+                (
+                    "eval \"$(starship init bash)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                (
+                    "eval \"$(zoxide init bash)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                (
+                    "eval \"$(fnm env --use-on-cd)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                (
+                    "eval \"$(mise activate bash)\"; gh pr create -t x",
+                    &osub,
+                    false,
+                ),
+                ("eval $(ssh-agent -s) && gh pr create -t x", &osub, false),
+                // Twins: another eval, a second command, a redefined tool, a
+                // `cd`-defining flag, a direnv export, an unowned cwd.
+                ("eval \"$(cat x)\"; gh pr create -t x", &osub, true),
+                (
+                    "eval \"$(direnv export bash)\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "eval \"$(ssh-agent -s; cd {U})\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "eval \"$(zoxide init bash --cmd cd)\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "eval \"$(mise activate bash; cd {U})\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "eval \"$(brew shellenv)\" cd {U}; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "brew() { echo cd {U}; }; eval \"$(brew shellenv)\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "starship() { echo cd {U}; }; eval \"$(starship init bash)\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                (
+                    "PATH=/x:$PATH; eval \"$(fnm env)\"; gh pr create -t x",
+                    &osub,
+                    true,
+                ),
+                ("eval '$(ssh-agent -s)'; gh pr create -t x", &osub, true),
+                ("eval \"$(ssh-agent -s)\"; gh pr create -t x", &usub, true),
+                // 4. `popd` returns to where the matching `pushd` left.
+                (
+                    "pushd sub && make && popd && gh pr create -t x",
+                    &o.to_string(),
+                    false,
+                ),
+                (
+                    "pushd {U} && make && popd && gh pr create -t x",
+                    &o.to_string(),
+                    false,
+                ),
+                (
+                    "pushd {U} >/dev/null; popd >/dev/null; gh pr create -t x",
+                    &o.to_string(),
+                    false,
+                ),
+                (
+                    "pushd {U}; pushd {O}; popd; popd; gh pr create -t x",
+                    &o.to_string(),
+                    false,
+                ),
+                // Twins: still inside, an unmatched or unreadable `popd`, a
+                // `popd` that only ran in a subshell, a maybe-run `pushd`, a
+                // cleared stack, a rotated stack.
+                ("pushd {U} && gh pr create -t x", &o.to_string(), true),
+                (
+                    "pushd {U}; pushd {O}; popd; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                ("popd && gh pr create -t x", &o.to_string(), true),
+                (
+                    "pushd sub && popd && popd && gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                ("pushd {U}; (popd); gh pr create -t x", &o.to_string(), true),
+                (
+                    "pushd {U}; popd -n; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                (
+                    "pushd {U}; popd +1; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                (
+                    "pushd {U}; dirs -c; popd; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                (
+                    "pushd {U}; pushd; popd; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                (
+                    "if true; then pushd {U}; fi; popd; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                ("(pushd {U}); popd; gh pr create -t x", &o.to_string(), true),
+                (
+                    "pushd {U} | cat; popd; gh pr create -t x",
+                    &o.to_string(),
+                    true,
+                ),
+                (
+                    "pushd sub && make && popd && gh pr create -t x",
+                    &u.to_string(),
+                    true,
+                ),
+            ] {
+                let command = command
+                    .replace("{O}", o)
+                    .replace("{U}", u)
+                    .replace("{UB}", u.rsplit('/').next().unwrap());
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
     }
 
     /// The fast paths decline only segments the full reading declines too.
