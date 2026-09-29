@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.112.0] - 2026-09-29
+
 ### Security
 
 - **The shared working-directory resolver counts a `cd` only where bash runs it.** `parse_work_dir` was a raw-text regex, so a `cd` inside a quoted string, a `#` comment, or behind an escaped separator re-pointed every guard that resolves through it: from an unowned checkout, `echo "; cd <owned>" && gh pr create` was judged in the owned repo and `guard-gh-write` allowed it. It now walks the quote-, escape-, comment- and heredoc-aware top-level segments, and applies a segment whose first word is `cd` at exactly the positions the regex recognized (start, `&&`, `;`, `||`), so every real unquoted `cd` resolves to the same target as before. Callers: `guard-gh-write`, `guard-push-remote`, `git-safety`, `guard-held-close`, `warn-issue-tracker`, `warn-changelog-entry`, and the polish-ship locator. (cameronsjo/cadence-hooks#1137)
