@@ -4339,15 +4339,15 @@ const MAX_SUBSTITUTION_DEPTH: usize = 16;
 
 /// Why a substitution scan stopped without locating a terminator.
 ///
-/// The split is load-bearing, not bookkeeping. Three variants say **this
+/// The split is load-bearing, not bookkeeping. Four variants say **this
 /// scanner gave up on text the shell may well run**, and a caller must never
 /// answer those by deleting a construct (ADR-0001: a guard's own limit must not
 /// hide a command the shell runs). `Unterminated` is the lone exception, and it
 /// says something much narrower than it looks: the scan ran off the end of the
 /// input **at this level, with no quote left open and nothing nested having
 /// failed**. It is the residue left once the known scanner limits have been
-/// named, not a positive finding that the shell agrees — see its own doc for a
-/// route that still reaches it on a line both shells run.
+/// named, not a positive finding that the shell agrees — see its own doc for
+/// how narrow it now is.
 ///
 /// Every qualifier in that sentence was bought. Three review passes found three
 /// different ways to arrive at "no terminator" on a line the shell runs, and
@@ -4375,16 +4375,22 @@ enum ScanStop {
     ///
     /// The residue — what is left once the known scanner limits below have been
     /// named — and NOT a positive finding that the shell also sees no
-    /// terminator. A fourth route is known and open: the same missing `#` and
-    /// backtick handling that produced [`ScanStop::QuoteUnresolved`] also
-    /// over-counts OPENING parens, so a `(` inside a comment, inside a backtick
-    /// span, or inside `${x:-(}` — text to both shells — ends the scan with
-    /// `depth > 0`, no quote open, and nothing nested failed, on a line the
-    /// shells run. That is cadence-hooks#831's other face; it is unchanged by
-    /// the work that added these variants and still costs a heredoc span. A
-    /// `depth > 1` at end of input is the obvious discriminator for routing it
-    /// to a widening stop without building real comment parsing.
+    /// terminator. It is now narrowed to exactly ONE paren level left open,
+    /// and only when the scan never leaned on its own comment, backtick or
+    /// brace lexing: anything else is [`ScanStop::LexUnresolved`].
     Unterminated,
+    /// Input ran out with MORE than one paren level open, or after the scan
+    /// skipped a `#` comment, a `` `…` `` span or a `${…}` expansion it lexed
+    /// itself — or one of those three never closed.
+    ///
+    /// cadence-hooks#831's other face. A `(` the scanner counts and the shells
+    /// do not — any shape this scanner has no arm for — ends the scan with
+    /// more levels open than closed, on a line both shells may run, so
+    /// `depth > 1` at end of input widens instead of deleting. The comment,
+    /// backtick and brace arms are this scanner's own model of bash's lexer;
+    /// when one of them was used and no terminator followed, the model may be
+    /// what is wrong, so that widens too.
+    LexUnresolved,
     /// Input ran out inside a quoted run this scanner opened. The shell often
     /// disagrees that a quote was open at all — a `#` comment's apostrophe is
     /// the common case — so this says nothing about whether it runs the line.
@@ -4413,9 +4419,10 @@ impl ScanStop {
     /// how both `NestedUnresolved` and `QuoteUnresolved` came to be needed.
     fn is_scanner_limit(self) -> bool {
         match self {
-            ScanStop::QuoteUnresolved | ScanStop::NestedUnresolved | ScanStop::DepthExceeded => {
-                true
-            }
+            ScanStop::QuoteUnresolved
+            | ScanStop::NestedUnresolved
+            | ScanStop::DepthExceeded
+            | ScanStop::LexUnresolved => true,
             ScanStop::Unterminated => false,
         }
     }
@@ -4454,6 +4461,11 @@ fn scan_substitution_body_bounded(
     let mut j = start;
     let mut body = String::new();
     let mut quote: Option<Quote> = None;
+    // Where a new word could begin — the only place bash starts a `#` comment.
+    let mut boundary = true;
+    // Whether the scan leaned on its own comment/backtick/brace lexing, so running
+    // off the end afterwards is reported as the scanner limit it may be.
+    let mut lexed = false;
     while j < chars.len() {
         if quote_aware {
             // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
@@ -4466,6 +4478,68 @@ fn scan_substitution_body_bounded(
             {
                 body.extend(&chars[j..j + 2]);
                 j += 2;
+                continue;
+            }
+            // A backslash-newline outside quotes is a line continuation: both
+            // characters vanish, so it neither ends a word nor starts one. A
+            // `#` right after it is mid-word, not a comment.
+            if quote.is_none() && chars[j] == '\\' && chars.get(j + 1) == Some(&'\n') {
+                body.extend(&chars[j..j + 2]);
+                j += 2;
+                continue;
+            }
+            // A `` `…` `` span, unquoted or inside `"…"`, is opaque to this
+            // level: bash re-parses it on its own and ends it at the first
+            // unescaped backtick, so nothing inside — a `)`, a `(`, a `"` — is
+            // a terminator, a nesting level, or a quote of THIS body. Reading
+            // it as plain data let its `)` end the substitution early, or its
+            // `"` close the enclosing double-quoted run, and the text bash runs
+            // after it fell outside the span (cameronsjo/cadence-hooks#831,
+            // #836). An unclosed span is a scanner limit, never a deletion.
+            if matches!(quote, None | Some(Quote::Double)) && chars[j] == '`' {
+                let Some(end) = backtick_span_end(chars, j) else {
+                    return Err(ScanStop::LexUnresolved);
+                };
+                body.extend(&chars[j..end]);
+                j = end;
+                lexed = true;
+                boundary = false;
+                continue;
+            }
+            // A `${…}` parameter expansion is data to this level's paren
+            // count: `$(echo ${x:-(} ; cat .env)` runs both commands in bash,
+            // but counting the `(` left the scan one level deep at the real
+            // terminator, the heredoc span was dropped, and the read reached
+            // no guard (cameronsjo/cadence-hooks#831). An unclosed expansion
+            // is a scanner limit, never a deletion.
+            if matches!(quote, None | Some(Quote::Double))
+                && chars[j] == '$'
+                && chars.get(j + 1) == Some(&'{')
+            {
+                let Some(end) = brace_expansion_end(chars, j, budget) else {
+                    return Err(ScanStop::LexUnresolved);
+                };
+                body.extend(&chars[j..end]);
+                j = end;
+                lexed = true;
+                boundary = false;
+                continue;
+            }
+            // A `#` where a word could begin, outside any quote, is a comment
+            // to bash and runs to the newline — so a `)` inside it is not the
+            // terminator and a `(` inside it opens nothing. Without this arm
+            // `$(echo hi # )⏎cat .env)` ended at the commented `)` and the
+            // second command fell outside the span (cameronsjo/cadence-hooks#831).
+            // The comment text is kept in the body verbatim; the comment pass
+            // downstream removes it when the body is re-split.
+            if quote.is_none() && boundary && chars[j] == '#' {
+                let end = chars[j..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |off| j + off);
+                body.extend(&chars[j..end]);
+                j = end;
+                lexed = true;
                 continue;
             }
             // A nested `$(` runs a substitution in exactly the two states where
@@ -4497,11 +4571,13 @@ fn scan_substitution_body_bounded(
                 };
                 body.extend(&chars[j..nested_end]);
                 j = nested_end;
+                boundary = false;
                 continue;
             }
             if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
                 body.extend(&chars[j..next]);
                 j = next;
+                boundary = false;
                 continue;
             }
         }
@@ -4519,6 +4595,12 @@ fn scan_substitution_body_bounded(
             }
             other => body.push(other),
         }
+        // bash's metacharacters end a word, so a `#` after any of them starts a
+        // comment (`$(echo a;#c ⏎ …)`, `$( (#c ⏎ …)`, `>#x` all measured).
+        boundary = matches!(
+            chars[j],
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+        );
         j += 1;
     }
     // Running out of input inside a quote this scanner opened is not the shell
@@ -4528,10 +4610,17 @@ fn scan_substitution_body_bounded(
     // and the scan runs off the end. Reported as the scanner limit it is, so
     // `substitution_spans` widens instead of deleting the construct — measured
     // as a live miss on both the read and the write guard inside a heredoc.
-    // The underlying divergence (no `#` arm) is cadence-hooks#831 and is not
-    // fixed here; what is fixed is it costing the guards the whole span.
+    // The comment arm above now reads that shape the way bash does; this stop
+    // remains the backstop for any quote this scanner opens and bash does not.
     if quote.is_some() {
         return Err(ScanStop::QuoteUnresolved);
+    }
+    // More than one level still open means the scan opened parens it never
+    // closed — some `(` shape with no arm here — on a line the shells may run.
+    // And a comment, backtick or brace span this scanner lexed itself may be
+    // where it went wrong. Both widen (cadence-hooks#831).
+    if depth > 1 || lexed {
+        return Err(ScanStop::LexUnresolved);
     }
     Err(ScanStop::Unterminated)
 }
@@ -4550,6 +4639,46 @@ fn backtick_span_end(chars: &[char], i: usize) -> Option<usize> {
             '`' => return Some(j + 1),
             _ => j += 1,
         }
+    }
+    None
+}
+
+/// Index just past the `}` closing the `${…}` expansion that opens at
+/// `chars[i]` (the `$`), or `None` when none can be located.
+///
+/// Nested `{`/`}` pairs are counted the way bash counts them (`${x:-{}}` is
+/// one expansion), a quoted run or escaped character inside is data, and a
+/// nested substitution is skipped whole — within the caller's remaining
+/// nesting `budget`, so this cannot recurse past [`MAX_SUBSTITUTION_DEPTH`].
+fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote: Option<Quote> = None;
+    let mut j = i + 2;
+    while j < chars.len() {
+        if quote.is_none() && chars[j] == '$' && chars.get(j + 1) == Some(&'(') {
+            let (_, end) = scan_substitution_body_bounded(chars, j + 2, true, budget).ok()?;
+            j = end;
+            continue;
+        }
+        if quote.is_none() && chars[j] == '`' {
+            j = backtick_span_end(chars, j)?;
+            continue;
+        }
+        if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
+            j = next;
+            continue;
+        }
+        match chars[j] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
     }
     None
 }
@@ -8964,6 +9093,102 @@ mod tests {
             split_segments("echo $(echo a ; cat .env)"),
             vec!["echo $(echo a".to_string(), "cat .env)".to_string()],
         );
+    }
+
+    #[test]
+    fn substitution_scan_terminator_agrees_with_bash_on_comments_backticks_and_braces() {
+        // cadence-hooks#831 / #836: each row is a substitution whose terminator
+        // bash places somewhere other than the first `)` a paren counter sees —
+        // behind a `#` comment, inside a backtick span, inside a `${…}`, or
+        // behind a backtick whose own `"` used to close the enclosing run.
+        // Every expected body was checked against `bash -c` with a harmless
+        // twin (`echo two` for the payload).
+        let rows: &[(&str, &str)] = &[
+            // #831 face 2: a `)` inside a comment is not the terminator.
+            ("echo \"$(echo hi # )\ncat .env)\"", "echo hi # )\ncat .env"),
+            // #831 face 3: an unquoted backtick's `)` is not the terminator.
+            (
+                "echo $(echo `echo )` ; cat .env)",
+                "echo `echo )` ; cat .env",
+            ),
+            // #836: a backtick inside `"…"` inside the body.
+            (
+                r#"echo "$(echo "`echo ")"`" ; cat .env)""#,
+                r#"echo "`echo ")"`" ; cat .env"#,
+            ),
+            // The comment's over-counted-opener face: `(` in `${…}` / a
+            // backtick / a comment opens no level.
+            ("echo $(echo ${x:-(} ; cat .env)", "echo ${x:-(} ; cat .env"),
+            (
+                "echo $(echo `echo (` ; cat .env)",
+                "echo `echo (` ; cat .env",
+            ),
+            ("echo $(cat .env # note (\n)", "cat .env # note (\n"),
+            // A `)` or quoted `}` inside `${…}` is data (bash 5 runs these).
+            ("echo $(echo ${x:-)} ; cat .env)", "echo ${x:-)} ; cat .env"),
+            (
+                r#"echo $(echo ${x:-"}"} ; cat .env)"#,
+                r#"echo ${x:-"}"} ; cat .env"#,
+            ),
+            // Comment boundaries bash recognizes after metacharacters.
+            ("echo $(echo a;#c )\ncat .env)", "echo a;#c )\ncat .env"),
+            ("echo $(#c )\ncat .env)", "#c )\ncat .env"),
+            // Controls: a `#` mid-word, after an escaped space, or after a
+            // backslash-newline continuation is NOT a comment to bash, so the
+            // first `)` still terminates.
+            ("echo $(echo a#b ) ; x", "echo a#b "),
+            (r"echo $(echo a\ #b ) ; x", r"echo a\ #b "),
+            ("echo $(echo a\\\n#b ) ; x", "echo a\\\n#b "),
+            ("echo $(echo {#b ) ; x", "echo {#b "),
+        ];
+        for (input, body) in rows {
+            let bodies = substitution_bodies(input);
+            assert_eq!(bodies.first().map(String::as_str), Some(*body), "{input:?}");
+        }
+
+        // The same shapes inside an expanding heredoc, where a wrong terminator
+        // used to cost the whole span. Every row was a measured ALLOW under
+        // `prevent-secret-leaks` before the fix.
+        for input in [
+            "cat <<EOF\n$(echo `echo )` ; cat .env)\nEOF",
+            "cat <<EOF\n$(cat .env # note (\n)\nEOF",
+            "cat <<EOF\n$(echo ${x:-(} ; cat .env)\nEOF",
+            "cat <<EOF\n$(echo `echo (` ; cat .env)\nEOF",
+            "cat <<EOF\n$(echo \"`echo \")\"`\" ; cat .env)\nEOF",
+            "cat <<EOF\n$(echo ${x:-)} ; cat .env)\nEOF",
+            // #831 face 4: the top-level comment pass read a `#` inside a
+            // nested double-quoted run as a comment.
+            r#"echo "$(echo "a # )" ; cat .env)""#,
+            "echo \"$(echo hi # )\ncat .env)\"",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                out.iter().any(|s| s.trim_end_matches(')') == "cat .env"),
+                "{input:?}: the payload reached no segment: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_spans_widen_when_the_scanners_own_lexing_finds_no_terminator() {
+        // An unclosed backtick or `${` inside a substitution, or a comment the
+        // scan skipped before running off the end, is `ScanStop::LexUnresolved`
+        // — the scanner's lexing may be what is wrong, so the span widens
+        // rather than being dropped.
+        for input in [
+            "$(echo `x ; cat .env",
+            "$(echo ${x ; cat .env",
+            "$(echo hi # note\ncat .env",
+        ] {
+            let spans = substitution_spans(input);
+            assert!(
+                spans.iter().any(|s| s.contains("cat .env")),
+                "{input:?} was dropped: {spans:?}"
+            );
+        }
+        // Control: a plain unterminated `$(` with none of that is still the
+        // narrow non-widening case (#475's prose-splicing cost).
+        assert!(substitution_spans("prose $(cat .env").is_empty());
     }
 
     #[test]
