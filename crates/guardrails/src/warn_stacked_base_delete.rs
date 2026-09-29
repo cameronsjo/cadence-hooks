@@ -523,6 +523,63 @@ mod tests {
     }
 
     #[test]
+    fn clone_floods_allow_before_the_deadline() {
+        // A 200 KB flood of clones and bare pushes took ~3.1 s in release:
+        // every bare push spent two git config probes in its own directory,
+        // none of which a delete check reads. Nothing here deletes a branch.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cwd = repo.path().to_str().unwrap();
+        for unit in [
+            "git clone https://github.com/cameronsjo/x d && cd d && git push; cd ..; ",
+            "gh repo clone cameronsjo/x && cd x && git push; cd ..; ",
+        ] {
+            let flood = unit.repeat(200_000 / unit.len());
+            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&flood, cwd);
+            let started = std::time::Instant::now();
+            let result = WarnStackedBaseDelete.run(&input);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{unit}: took {:?}",
+                started.elapsed()
+            );
+            assert_eq!(result.outcome, Outcome::Allow, "{unit}");
+        }
+    }
+
+    #[test]
+    fn a_delete_flood_nudges_without_checking() {
+        use cadence_hooks_core::git_fixtures::{git_in, init_repo};
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        // Past the cap: nudged, and nothing is queried.
+        for command in [
+            "cd d && git push origin --delete x; cd ..; ".repeat(4500),
+            format!(
+                "git push origin --delete {}",
+                (0..30_000)
+                    .map(|i| format!("b{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            "git push origin --delete a b c d e f g h i".to_string(),
+        ] {
+            let started = std::time::Instant::now();
+            let (msg, calls) = push_calls(repo.path(), &command);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(calls, 0);
+            assert!(msg.is_some_and(|m| m.contains("more than the 8 checked")));
+        }
+        // At the cap, each branch is still checked.
+        let (msg, calls) = push_calls(repo.path(), "git push origin --delete a b c d e f g h");
+        assert_eq!(calls, 1, "the first branch with dependents answers");
+        assert!(msg.is_some_and(|m| m.contains("bases on `a`")));
+    }
+
+    #[test]
     fn unrelated_commands_allow_without_any_call() {
         for cmd in [
             "git status",

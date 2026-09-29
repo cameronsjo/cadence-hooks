@@ -733,8 +733,11 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // Structural safety checks first — these don't need the owner list
     // and must block even when unconfigured.
 
+    // One parse for both the chain and the loop analysis.
+    let (chain_result, loop_result) = loop_analysis::analyze_push_chain_and_loops(command);
+
     // Chain analysis: multiple pushes in && / ; chains
-    match loop_analysis::analyze_push_chain(command) {
+    match chain_result {
         ChainAnalysis::SameRemote(_) => {
             // All chained pushes target the same remote — safe to proceed
         }
@@ -784,7 +787,6 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     }
 
     // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
-    let loop_result = loop_analysis::analyze_push_loops(command);
     match &loop_result {
         LoopAnalysis::MissingTargets(cmds) => {
             let bare_pushes: Vec<String> = cmds
@@ -2407,6 +2409,125 @@ mod tests {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
             }
+        });
+    }
+
+    /// `gh repo clone OWNER/REPO` clones from `GH_HOST`, not always
+    /// github.com, so a push in the clone is judged against that host, the
+    /// way guard-gh-write judges a gh write. Each Block row was ALLOW before.
+    #[test]
+    fn a_gh_repo_clone_is_judged_on_the_gh_host() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // An inline, `env`, or earlier exported host.
+                (
+                    "GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "env GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HOST=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HO\"ST\"=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // A host the text cannot read.
+                (
+                    "export GH_HOST=\"$H\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "export GH_HOS${T}=x; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    ": ${GH_HOST:=other.example}; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "GH_HOST=$H gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // A URL or `HOST/OWNER/REPO` names its own host.
+                (
+                    "gh repo clone https://other.example/cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "gh repo clone other.example:cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "gh repo clone other.example/cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                // Controls.
+                ("gh repo clone cameronsjo/z && cd z && git push", Allow),
+                (
+                    "GH_HOST=github.com gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "export GH_HOST=github.com; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "unset GH_HOST; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "gh repo clone https://github.com/cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "GH_HOST=other.example gh repo clone cameronsjo/z && git push origin main",
+                    Allow,
+                ),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+        // A host the operator trusts is judged like any other push there.
+        let mut trusted = owners_only();
+        trusted.retain(|(name, _)| *name != "CADENCE_EXTRA_HOSTS");
+        trusted.push(("CADENCE_EXTRA_HOSTS", Some("other.example")));
+        with_env(&trusted, || {
+            let command = "GH_HOST=other.example gh repo clone cameronsjo/z && cd z && git push";
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+            assert_eq!(result.outcome, Allow, "{:?}", result.message);
+        });
+    }
+
+    #[test]
+    fn a_cd_flood_before_a_push_is_judged_before_the_deadline() {
+        // 200 KB of `cd a; ` before one push: each `cd` copied the whole
+        // path the walk had built, so the walk was quadratic and took ~0.5 s
+        // in release — at the hook deadline, which fails open. Now ~0.3 s in
+        // release; the bound is loose because `parse_work_dir`'s own flat
+        // scan still joins a fresh path per `cd`, which a debug build pays
+        // several times over.
+        with_env(&owners_only(), || {
+            let repo = crate::github_origin_repo();
+            let cwd = repo.path().to_string_lossy();
+            let command = format!("{}git push", "cd a; ".repeat(40_000));
+            let started = std::time::Instant::now();
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "took {:?}",
+                started.elapsed()
+            );
+            // Not a repository: git fails the push itself.
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
 

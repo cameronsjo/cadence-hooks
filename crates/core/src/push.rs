@@ -2853,6 +2853,83 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn gh_hosts_read_every_literal_assignment_and_refuse_the_rest() {
+        // (command, unreadable, hosts added beyond the inherited one)
+        for (command, unreadable, added) in [
+            ("gh repo clone o/r", false, &[][..]),
+            (
+                "export GH_HOST=Other.Example; gh repo clone o/r",
+                false,
+                &["other.example"][..],
+            ),
+            (
+                "GH_HOST=a.example gh repo clone o/r",
+                false,
+                &["a.example"][..],
+            ),
+            (
+                "export GH_HO\"ST\"=b.example; gh repo clone o/r",
+                false,
+                &["b.example"][..],
+            ),
+            ("unset GH_HOST; gh repo clone o/r", false, &[][..]),
+            ("export GH_HOST; gh repo clone o/r", false, &[][..]),
+            (
+                "MY_GH_HOST=x GH_HOSTNAME=y gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            ("export GH_HOST=$H; gh repo clone o/r", true, &[][..]),
+            ("export GH_HOST=a/b; gh repo clone o/r", true, &[][..]),
+            (": ${GH_HOST:=x}; gh repo clone o/r", true, &[][..]),
+            ("echo $GH_HOST; gh repo clone o/r", true, &[][..]),
+            ("read GH_HOST; gh repo clone o/r", true, &[][..]),
+            ("export GH_HOS${T}=x; gh repo clone o/r", true, &[][..]),
+            ("GH_HOST+=x gh repo clone o/r", true, &[][..]),
+        ] {
+            let hosts = GhHosts::for_command(command);
+            assert_eq!(hosts.unreadable, unreadable, "{command}");
+            assert_eq!(&hosts.hosts[1..], added, "{command}");
+        }
+    }
+
+    #[test]
+    fn inline_gh_host_reads_the_prefix() {
+        let words =
+            |text: &str| -> Vec<String> { text.split_whitespace().map(String::from).collect() };
+        assert_eq!(inline_gh_host(&words("")), None);
+        assert_eq!(inline_gh_host(&words("FOO=1")), None);
+        assert_eq!(
+            inline_gh_host(&words("GH_HOST=X.example")),
+            Some(Ok(vec!["x.example".to_string()]))
+        );
+        assert_eq!(
+            inline_gh_host(&words("env GH_HOST=x.example")),
+            Some(Ok(vec!["x.example".to_string()]))
+        );
+        assert_eq!(inline_gh_host(&words("GH_HOST=$H")), Some(Err(())));
+        assert_eq!(inline_gh_host(&words("GH_HOST=")), Some(Err(())));
+        assert_eq!(inline_gh_host(&words("env -u GH_HOST")), Some(Err(())));
+        assert_eq!(inline_gh_host(&words("GH_HOS$T=x")), Some(Err(())));
+    }
+
+    #[test]
+    fn a_cd_flood_walks_in_linear_time() {
+        // Each `cd a` used to copy the whole path built so far: quadratic in
+        // a 200 KB flood.
+        let command = format!("{}git push origin main", "cd a; ".repeat(40_000));
+        let started = std::time::Instant::now();
+        let pushes = push_locations(&command, "/repo");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].work_dir.len(), "/repo".len() + 2 * 40_000);
+    }
+
     fn only(command: &str, cwd: &str) -> PushInvocation {
         let mut found = push_invocations(command, cwd);
         assert_eq!(found.len(), 1, "expected exactly one push in {command:?}");

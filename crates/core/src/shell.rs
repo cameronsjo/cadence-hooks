@@ -4955,7 +4955,14 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
         let home = crate::paths::user_home_lossy_or_default();
         target.replacen('~', &home, 1)
     } else {
-        format!("{effective}/{target}")
+        // One exact allocation and two copies: `format!` grew the buffer in
+        // steps, which is most of what a flat scan over a `cd a; …` flood
+        // spent (each join copies the whole path so far).
+        let mut joined = String::with_capacity(effective.len() + 1 + target.len());
+        joined.push_str(effective);
+        joined.push('/');
+        joined.push_str(target);
+        joined
     }
 }
 
@@ -10917,6 +10924,22 @@ mod tests {
         // A relative target still joins normally — no regression on the
         // existing POSIX-relative behavior.
         assert_eq!(resolve_cd_target("sub", "/cwd"), "/cwd/sub");
+    }
+
+    #[test]
+    fn apply_cd_target_matches_resolve_cd_target() {
+        for (target, effective) in [
+            ("sub", "/cwd"),
+            ("../x", "/cwd/a"),
+            ("/abs", "/cwd"),
+            ("C:\\other", "C:\\primary"),
+            ("D:/other", "/cwd"),
+            ("~/x", "/cwd"),
+        ] {
+            let mut applied = effective.to_string();
+            apply_cd_target(&mut applied, target);
+            assert_eq!(applied, resolve_cd_target(target, effective), "{target}");
+        }
     }
 
     // --- run_bounded_with (the #271 bounded subprocess runner) ---
