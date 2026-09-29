@@ -175,12 +175,11 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, child_scripts_within, command_word,
-    expand_leading_home, heredoc_introducers, installs_trap_action, is_assignment_word,
-    is_transparent_prefix_word, looks_absolute, redirect_operator_span, redirect_targets,
-    resolve_cd_target, skip_runner_flags, skip_transparent_prefixes, split_segments_with_ops,
-    split_segments_with_ops_joining_redirects, strip_compound_heads, strip_heredoc_bodies,
-    tokenize, tokenize_marked, unescape_word,
+    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
+    heredoc_introducers, installs_trap_action, is_assignment_word, is_transparent_prefix_word,
+    looks_absolute, redirect_operator_span, redirect_targets, resolve_cd_target, skip_runner_flags,
+    skip_transparent_prefixes, split_segments_with_ops, split_segments_with_ops_joining_redirects,
+    strip_compound_heads, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -2705,7 +2704,7 @@ fn git_exports(command: &str) -> GitExports {
     fn is_git_var(name: &str) -> bool {
         matches!(name, "GIT_DIR" | "GIT_WORK_TREE")
     }
-    fn walk(script: &str, depth: usize, seen: &mut Seen, inherited: &mut Vec<String>) {
+    fn walk(script: &str, depth: usize, seen: &mut Seen) {
         for (segment, marked) in union_segments(script) {
             let words = command_tokens(&marked);
             let heads = strip_compound_heads(&words);
@@ -2768,8 +2767,8 @@ fn git_exports(command: &str) -> GitExports {
                 seen.unreadable = Some(segment.clone());
             }
             if depth < MAX_WRAPPER_DEPTH {
-                for mut child in child_scripts_within(argv, &segment, inherited) {
-                    walk(&child.script, depth + 1, seen, &mut child.inherited);
+                for child in child_scripts(argv, &segment) {
+                    walk(&child, depth + 1, seen);
                 }
             }
         }
@@ -2788,7 +2787,7 @@ fn git_exports(command: &str) -> GitExports {
         return GitExports::default();
     }
     let mut seen = Seen::default();
-    walk(command, 0, &mut seen, &mut Vec::new());
+    walk(command, 0, &mut seen);
     let mut out = GitExports {
         unreadable: seen.unreadable,
         ..GitExports::default()
@@ -2882,19 +2881,6 @@ fn union_dirs(
     env: CdEnv<'_>,
     dirs: &mut Vec<String>,
     unresolved: &mut Option<String>,
-) {
-    union_dirs_within(script, depth, env, dirs, unresolved, &mut Vec::new());
-}
-
-/// [`union_dirs`] for a child script, skipping the substitutions its parent
-/// segment already walked ([`child_scripts_within`]).
-fn union_dirs_within(
-    script: &str,
-    depth: usize,
-    env: CdEnv<'_>,
-    dirs: &mut Vec<String>,
-    unresolved: &mut Option<String>,
-    inherited: &mut Vec<String>,
 ) {
     let note = |what: String, unresolved: &mut Option<String>| {
         if unresolved.is_none() {
@@ -2999,14 +2985,13 @@ fn union_dirs_within(
             }
         }
         if depth < MAX_WRAPPER_DEPTH {
-            for mut child in child_scripts_within(argv, &segment, inherited) {
-                union_dirs_within(
-                    &child.script,
+            for child in child_scripts(argv, &segment) {
+                union_dirs(
+                    &child,
                     depth + 1,
                     CdEnv { home: None, ..env },
                     dirs,
                     unresolved,
-                    &mut child.inherited,
                 );
             }
         }
@@ -3032,28 +3017,6 @@ fn union_commits(
     env: CdEnv<'_>,
     out: &mut Scan,
 ) {
-    union_commits_within(
-        script,
-        depth,
-        dirs,
-        inherited_env,
-        env,
-        out,
-        &mut Vec::new(),
-    );
-}
-
-/// [`union_commits`] for a child script, skipping the substitutions its
-/// parent segment already walked ([`child_scripts_within`]).
-fn union_commits_within(
-    script: &str,
-    depth: usize,
-    dirs: &[String],
-    inherited_env: (Option<&str>, Option<&str>),
-    env: CdEnv<'_>,
-    out: &mut Scan,
-    inherited: &mut Vec<String>,
-) {
     for (segment, marked) in union_segments(script) {
         let words = command_tokens(&marked);
         let heads = strip_compound_heads(&words);
@@ -3064,28 +3027,26 @@ fn union_commits_within(
         if depth < MAX_WRAPPER_DEPTH {
             let deferred = installs_trap_action(&words);
             let child_env = CdEnv { home: None, ..env };
-            for mut child in child_scripts_within(argv, &segment, inherited) {
+            for child in child_scripts(argv, &segment) {
                 if !deferred {
-                    union_commits_within(
-                        &child.script,
+                    union_commits(
+                        &child,
                         depth + 1,
                         dirs,
                         (work_tree, git_dir),
                         child_env,
                         out,
-                        &mut child.inherited,
                     );
                     continue;
                 }
                 let mut trapped = Scan::default();
-                union_commits_within(
-                    &child.script,
+                union_commits(
+                    &child,
                     depth + 1,
                     dirs,
                     (work_tree, git_dir),
                     child_env,
                     &mut trapped,
-                    &mut child.inherited,
                 );
                 if !trapped.commits.is_empty() && out.unreadable.is_none() {
                     out.unreadable = Some(unreadable_commit_message(

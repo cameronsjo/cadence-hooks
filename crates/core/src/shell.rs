@@ -6331,7 +6331,10 @@ pub fn command_segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let spent = std::cell::Cell::new(0);
     let mut assignments = AssignmentScope::root(&spent);
-    expand_segments(command, &mut assignments, 0, &mut out, &mut Vec::new());
+    // A command that already carries the mark cannot be told apart from one
+    // this walk wrote, so it is expanded without the dedupe at all.
+    let dedupe = !command.contains(EXPANDED_MARK);
+    expand_segments(command, &mut assignments, 0, &mut out, dedupe);
     out
 }
 
@@ -6497,15 +6500,14 @@ impl<'a> AssignmentScope<'a> {
 /// execution order as segments are walked, so each segment only ever sees the
 /// assignments that precede it.
 ///
-/// `parent_bodies` holds the substitution bodies the PARENT segment already
-/// expanded, when `command` is a script that segment's wrapper runs; see
+/// `dedupe` enables the [`EXPANDED_MARK`] identity skip; see
 /// [`emit_segment`].
 fn expand_segments(
     command: &str,
     assignments: &mut AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
-    parent_bodies: &mut Vec<String>,
+    dedupe: bool,
 ) {
     for segment in split_segments(command) {
         let mut defaults = Vec::new();
@@ -6517,7 +6519,7 @@ fn expand_segments(
         // erases the assignment, and a guard tracking one by its spelling
         // (`guard-gh-write`'s `${GH_HOST:=…}`) must still see it.
         if !defaults.is_empty() && expanded != segment {
-            out.push(segment.clone());
+            out.push(unmark(segment.clone()));
         }
         // A `${D:-word}` choice that turned on `D` being set is emitted both
         // ways (see [`apply_assignments`]): `C=echo; C=; ${C:-cat} .env` runs
@@ -6526,7 +6528,7 @@ fn expand_segments(
             let alternate =
                 apply_assignments(&segment, assignments, &mut Vec::new(), true, &mut false);
             if alternate != expanded {
-                emit_segment(alternate, assignments, depth, out, parent_bodies);
+                emit_segment(alternate, assignments, depth, out, dedupe);
             }
         }
         for (name, value) in defaults {
@@ -6538,7 +6540,7 @@ fn expand_segments(
         for assignment in segment_assignments(&expanded) {
             assignments.assign(assignment);
         }
-        emit_segment(expanded, assignments, depth, out, parent_bodies);
+        emit_segment(expanded, assignments, depth, out, dedupe);
     }
 }
 
@@ -6549,7 +6551,7 @@ fn emit_segment(
     assignments: &AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
-    parent_bodies: &mut Vec<String>,
+    dedupe: bool,
 ) {
     // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
     // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
@@ -6569,62 +6571,111 @@ fn emit_segment(
     // appears as a substring of the pushed segment, and three levels is
     // already generous.
     //
-    // **A body is expanded once, by the shallowest segment that carries it.**
-    // A wrapper's script is built from the segment's own words, so a
+    // **A substitution is expanded once, by the segment the shell expands it
+    // in.** A wrapper's script is built from the segment's own words, so a
     // substitution in one of them (`watch "$(watch "$(…)")"`) is a body of
     // this segment AND, textually, of the script's segment one level down.
     // Expanding it at both levels doubled the work per nesting level, ~2^depth
     // up to [`MAX_WRAPPER_DEPTH`], which put 200 KB inputs past the hook
-    // deadline (cadence-hooks#1144 review). So the bodies expanded here are
-    // handed to the script's walk, which skips each one once.
+    // deadline (cadence-hooks#1144 review).
     //
-    // The copy skipped is always the script's, never this one. The real shell
-    // runs the substitution HERE, in the parent, and hands the wrapper its
-    // OUTPUT — the script never holds that `$(…)` at all, so its copy is an
-    // artefact of reading the script from the segment's words. It is also the
-    // worse copy: the word it came from lost its quotes to [`tokenize`]
-    // (`"$(a "b c")"` reaches the script as `$(a b c)`), and it sits one level
-    // deeper, with less depth budget. The match is therefore by
-    // [`quote_blind`] text, which is what survives that quote removal (a copy
-    // that differs by an unescaped backslash is kept — see there); a
-    // script that carries the same substitution twice keeps the second copy.
-    // [`child_scripts_within`] is the same rule for the walkers.
-    let mut bodies = Vec::new();
+    // The script's copy is identified by SOURCE, never by text: before the
+    // script is read from this segment's words, every substitution this
+    // segment expands is tagged with [`EXPANDED_MARK`] at its own opener
+    // ([`mark_expanded_substitutions`]), and a body that arrives carrying the
+    // tag is skipped. A text match was a miss: in `bash -c 'cd evil && echo
+    // $(git push origin main)' "$(git push origin main)"` the two pushes are
+    // separate commands — the second runs here, the first in the child after
+    // its `cd` — and matching by text dropped the child's. Only a
+    // substitution this shell expands (unquoted or in `"…"`) carries the
+    // tag; one in `'…'` or `$'…'` text is the child's to run, and is always
+    // expanded there. The tagged copy is also the worse one: the word it
+    // came from lost its quotes to [`tokenize`], and it sits one level deeper
+    // with less depth budget.
     if depth < MAX_WRAPPER_DEPTH {
-        bodies = unseen_substitution_bodies(&segment, parent_bodies);
-        for body in &bodies {
+        for body in substitution_bodies(&segment) {
+            if dedupe && body.starts_with(EXPANDED_MARK) {
+                continue;
+            }
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
-            expand_segments(body, &mut scope, depth + 1, out, &mut Vec::new());
+            expand_segments(&body, &mut scope, depth + 1, out, dedupe);
         }
     }
     let scripts = if depth < MAX_WRAPPER_DEPTH {
-        wrapped_scripts(&executable_tokens(&segment))
+        let marked = dedupe.then(|| mark_expanded_substitutions(&segment));
+        wrapped_scripts(&executable_tokens(marked.as_deref().unwrap_or(&segment)))
     } else {
         Vec::new()
     };
-    out.push(segment);
-    let seen: Vec<String> = bodies.iter().map(|body| quote_blind(body)).collect();
+    out.push(unmark(segment));
     for inner in scripts {
         // A child shell inherits what is set so far, but its own
         // assignments die with the subshell — recurse on a snapshot so
         // they cannot reach the parent's later segments.
         let mut scope = assignments.child();
-        expand_segments(&inner, &mut scope, depth + 1, out, &mut seen.clone());
+        expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
     }
 }
 
-/// `text` without quote characters — what a substitution's text keeps after
-/// [`tokenize`]'s quote removal carried it from a segment's word into a
-/// wrapper's script. See [`emit_segment`].
+/// Tags a substitution [`emit_segment`] has already expanded, inside the
+/// text a wrapper's script is read from. A private-use character: it never
+/// reaches a caller ([`unmark`] strips it from every segment pushed), and a
+/// command that carries one itself turns the dedupe off.
+const EXPANDED_MARK: char = '\u{E000}';
+
+/// `segment` with [`EXPANDED_MARK`] inserted at the start of every body
+/// [`scan_substitution_bodies`] bounds confidently — exactly the
+/// substitutions this segment's shell expands, at their own position, so the
+/// tag follows that one substitution into whatever script is read from its
+/// word. A substitution the scan cannot bound is left untagged (ambiguity
+/// keeps both copies).
 ///
-/// Backslashes are deliberately kept. [`unescape_word`] also removes them on
-/// the way into the script, and that copy reads differently: in
-/// `bash -c "$(echo echo x \> .env)"` the script's copy of the body is
-/// `echo echo x > .env`, which carries the redirect the executed output
-/// performs, so it must stay a copy of its own.
-fn quote_blind(text: &str) -> String {
-    text.chars().filter(|c| !matches!(c, '\'' | '"')).collect()
+/// A body holding a backslash is not tagged. The script reads it with the
+/// shell's backslash removal applied, which is a different reading, not a
+/// copy: in `bash -c "$(echo echo x \> .env)"` the script's copy is
+/// `echo echo x > .env`, carrying the redirect the executed output performs.
+fn mark_expanded_substitutions(segment: &str) -> String {
+    let mut starts = Vec::new();
+    scan_substitution_bodies(segment, &mut starts);
+    if starts.is_empty() {
+        return segment.to_string();
+    }
+    let mut out = String::with_capacity(segment.len() + 3 * starts.len());
+    let mut starts = starts.into_iter().peekable();
+    for (i, c) in segment.chars().enumerate() {
+        if starts.next_if_eq(&i).is_some() && c != EXPANDED_MARK {
+            out.push(EXPANDED_MARK);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `text` without any [`EXPANDED_MARK`].
+fn unmark(text: String) -> String {
+    if text.contains(EXPANDED_MARK) {
+        text.replace(EXPANDED_MARK, "")
+    } else {
+        text
+    }
+}
+
+/// Whether `script` is nothing but one tagged substitution
+/// ([`mark_expanded_substitutions`]) — `watch "$(cmd)"`'s script. The child
+/// runs cmd's OUTPUT, which no walker can read, while cmd itself is already
+/// a body of the segment.
+fn is_only_an_expanded_substitution(script: &str) -> bool {
+    let chars: Vec<char> = script.trim().chars().collect();
+    match chars.as_slice() {
+        ['$', '(', EXPANDED_MARK, ..] => {
+            matches!(scan_substitution_body(&chars, 2, true), Ok((_, end)) if end == chars.len())
+        }
+        ['`', EXPANDED_MARK, rest @ ..] => {
+            rest.last() == Some(&'`') && !rest[..rest.len() - 1].contains(&'`')
+        }
+        _ => false,
+    }
 }
 
 /// Scripts a single segment will itself execute in a child shell context: a
@@ -6647,93 +6698,32 @@ fn quote_blind(text: &str) -> String {
 /// a flat view splices `$(cd /x)`'s `cd` into the parent stream and moves the
 /// tracked directory for segments the real shell still runs in the parent's
 /// cwd (issue #228).
+///
+/// A wrapper's script that is nothing but a substitution this segment expands
+/// (`watch "$(cmd)"`, `bash -c "$(cmd)"`) is left out: the child runs cmd's
+/// output, cmd is returned as a body, and walking the script as well re-walked
+/// cmd once per nesting level (cadence-hooks#1144 review). It is identified by
+/// source, as in [`emit_segment`], and only when the tagged reading of
+/// `segment` yields the same scripts as `argv`; otherwise every script is
+/// kept.
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
-    child_scripts_within(argv, segment, &mut Vec::new())
-        .into_iter()
-        .map(|child| child.script)
-        .collect()
-}
-
-/// One script [`child_scripts_within`] surfaces, with what to hand the walk
-/// of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildScript {
-    /// The script the child runs.
-    pub script: String,
-    /// The substitution bodies this segment already surfaced, to pass as
-    /// `inherited` to every `child_scripts_within` call the walk of
-    /// [`ChildScript::script`] makes. Empty for a substitution body.
-    pub inherited: Vec<String>,
-}
-
-/// [`child_scripts`] for a walker that recurses into each script, without the
-/// doubling [`emit_segment`] describes: a wrapper's script repeats the
-/// segment's own substitutions, so walking both re-walked each substitution
-/// once per nesting level — ~2^depth, past the hook deadline at 200 KB
-/// (cadence-hooks#1144 review). `inherited` is the [`ChildScript::inherited`]
-/// of the script being walked (empty at the top level); each body in it is
-/// skipped once, across that script's segments, and the copy skipped is the
-/// script's, never the parent's, for the reasons [`emit_segment`] gives.
-pub fn child_scripts_within(
-    argv: &[String],
-    segment: &str,
-    inherited: &mut Vec<String>,
-) -> Vec<ChildScript> {
-    let bodies = unseen_substitution_bodies(segment, inherited);
-    let seen: Vec<String> = bodies.iter().map(|body| quote_blind(body)).collect();
-    let mut out: Vec<ChildScript> = wrapped_scripts(argv)
-        .into_iter()
-        // A script that is nothing but one of those substitutions
-        // (`watch "$(cmd)"`) runs cmd's OUTPUT, which no walker can read, and
-        // cmd itself is walked as a body already — so the script is not
-        // walked a second time.
-        .filter(|script| !is_only_a_seen_substitution(script, &seen))
-        .map(|script| ChildScript {
-            script,
-            inherited: seen.clone(),
-        })
-        .collect();
-    out.extend(bodies.into_iter().map(|script| ChildScript {
-        script,
-        inherited: Vec::new(),
-    }));
-    out
-}
-
-/// Whether `script`, quote-blind, is exactly `$(BODY)` or `` `BODY` `` for
-/// one of the `seen` bodies (already [`quote_blind`]).
-fn is_only_a_seen_substitution(script: &str, seen: &[String]) -> bool {
-    let blind = quote_blind(script);
-    let blind = blind.trim();
-    let inner = blind
-        .strip_prefix("$(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .or_else(|| {
-            blind
-                .strip_prefix('`')
-                .and_then(|rest| rest.strip_suffix('`'))
-        });
-    inner.is_some_and(|inner| seen.iter().any(|body| body == inner))
-}
-
-/// `segment`'s substitution bodies, less each one whose [`quote_blind`] text
-/// is in `inherited` — consumed as it matches, so a body carried twice is
-/// skipped once.
-fn unseen_substitution_bodies(segment: &str, inherited: &mut Vec<String>) -> Vec<String> {
-    let mut bodies = substitution_bodies(segment);
-    if !inherited.is_empty() {
-        bodies.retain(|body| {
-            let blind = quote_blind(body);
-            match inherited.iter().position(|seen| *seen == blind) {
-                Some(at) => {
-                    inherited.swap_remove(at);
-                    false
-                }
-                None => true,
-            }
-        });
+    let mut out = wrapped_scripts(argv);
+    if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
+        let marked = wrapped_scripts(&executable_tokens(&mark_expanded_substitutions(segment)));
+        let aligned = marked.len() == out.len()
+            && marked
+                .iter()
+                .zip(&out)
+                .all(|(tagged, script)| unmark(tagged.clone()) == *script);
+        if aligned {
+            let mut keep = marked
+                .iter()
+                .map(|tagged| !is_only_an_expanded_substitution(tagged));
+            out.retain(|_| keep.next().unwrap_or(true));
+        }
     }
-    bodies
+    out.extend(substitution_bodies(segment));
+    out
 }
 
 /// Push `text` onto `out` when it carries anything but whitespace.
@@ -7677,6 +7667,16 @@ fn quoted_substitution_end(chars: &[char], i: usize) -> Option<usize> {
 /// it into its own segment — the backtick arm below surfaces that tail as an
 /// extra body so it still reaches the guards (cameronsjo/cadence-hooks#653).
 fn substitution_bodies(segment: &str) -> Vec<String> {
+    scan_substitution_bodies(segment, &mut Vec::new())
+}
+
+/// [`substitution_bodies`], also recording in `starts` the char index where
+/// each CONFIDENTLY bounded body begins — a terminated `$(…)`, or a closed
+/// backtick span whose own quoting resolved — when the body holds no
+/// backslash (see [`mark_expanded_substitutions`]). The widening arms (an
+/// unterminated or depth-capped substitution) record nothing, so a caller
+/// keyed on `starts` treats every one of them as unknown.
+fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut bodies = Vec::new();
     let mut i = 0;
@@ -7715,6 +7715,9 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
         if c == '$' && chars.get(i + 1) == Some(&'(') {
             if let Ok((body, end)) = scan_substitution_body(&chars, i + 2, true) {
                 if !body.trim().is_empty() {
+                    if !body.contains('\\') {
+                        starts.push(i + 2);
+                    }
                     bodies.push(body);
                 }
                 i = end;
@@ -7763,7 +7766,15 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
                 body.push(chars[j]);
                 j += 1;
             }
+            let quoting_unterminated =
+                j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]);
+            let confident = j < chars.len() && !quoting_unterminated;
             if !body.trim().is_empty() {
+                // The span as written: the loop above drops an escape pair
+                // from `body`, so `body` cannot show one.
+                if confident && !chars[i + 1..j].contains(&'\\') {
+                    starts.push(i + 1);
+                }
                 bodies.push(body);
             }
             // The closing backtick was found (j < chars.len()), but the span's
@@ -7778,7 +7789,7 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             // any substitution inside it surfaces when that body is itself
             // re-scanned, and continuing the outer loop here would re-walk —
             // and could double-emit — the same text char by char.
-            if j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]) {
+            if quoting_unterminated {
                 push_nonblank(&mut bodies, &chars[j + 1..]);
                 break;
             }
@@ -16587,59 +16598,106 @@ mod tests {
     }
 
     /// The walker form of the test above: recursing into every
-    /// [`child_scripts_within`] result, the way the push and enforce-worktree
-    /// walks do, visits each substitution body once.
+    /// [`child_scripts`] result, the way the push and enforce-worktree walks
+    /// do, stays linear, because a script that is only a substitution the
+    /// segment expands is not walked twice.
     #[test]
-    fn child_scripts_within_walks_a_substitution_once() {
-        fn walk(script: &str, depth: usize, inherited: &mut Vec<String>, walked: &mut usize) {
+    fn child_scripts_walks_a_nested_substitution_once() {
+        fn walk(script: &str, depth: usize, walked: &mut usize) {
             *walked += script.len();
             for segment in split_segments(script) {
                 if depth >= MAX_WRAPPER_DEPTH {
                     continue;
                 }
-                let tokens = executable_tokens(&segment);
-                for mut child in child_scripts_within(&tokens, &segment, inherited) {
-                    walk(&child.script, depth + 1, &mut child.inherited, walked);
+                for child in child_scripts(&executable_tokens(&segment), &segment) {
+                    walk(&child, depth + 1, walked);
                 }
             }
         }
         for wrapper in ["watch", "env -S", "tmux new", "su -c", "bash -c", "eval"] {
             let command = nested_substitution_flood(wrapper, 4, " x");
             let mut walked = 0;
-            walk(&command, 0, &mut Vec::new(), &mut walked);
+            walk(&command, 0, &mut walked);
             assert!(
                 walked <= 5 * command.len(),
                 "{wrapper:?}: walked {walked} bytes of {}",
                 command.len()
             );
         }
-        // Still surfaced: the body a substitution runs, and a script that
-        // carries more than the substitution.
-        let tokens = executable_tokens("watch \"$(cat .env)\"");
-        let children = child_scripts_within(&tokens, "watch \"$(cat .env)\"", &mut Vec::new());
+        let children = |segment: &str| child_scripts(&executable_tokens(segment), segment);
+        // Only the body: the script is nothing but that substitution.
+        assert_eq!(children("watch \"$(cat .env)\""), ["cat .env"]);
+        // Kept: a script that carries more than the substitution, and one
+        // whose substitution the CHILD runs (single-quoted here).
         assert_eq!(
-            children
-                .iter()
-                .map(|c| c.script.as_str())
-                .collect::<Vec<_>>(),
-            ["cat .env"]
-        );
-        let segment = "bash -c \"cat $(echo .env)\"";
-        let children = child_scripts_within(&executable_tokens(segment), segment, &mut Vec::new());
-        assert_eq!(
-            children
-                .iter()
-                .map(|c| c.script.as_str())
-                .collect::<Vec<_>>(),
+            children("bash -c \"cat $(echo .env)\""),
             ["cat $(echo .env)", "echo .env"]
         );
-        // A backslash difference keeps the script's copy: it reads as the
-        // redirect the executed output performs.
-        let segments = command_segments("bash -c \"$(echo echo x \\> .env)\"");
-        assert!(
-            segments.iter().any(|s| s == "echo echo x > .env"),
-            "{segments:?}"
+        assert_eq!(children("bash -c '$(cat .env)'"), ["$(cat .env)"]);
+        assert_eq!(
+            children("bash -c '$(git push)' \"$(git push)\""),
+            ["$(git push)", "git push"]
         );
+        // A command carrying the mark itself turns the identification off.
+        let marked = format!("watch \"$({EXPANDED_MARK}cat .env)\"");
+        assert_eq!(children(&marked).len(), 2);
+    }
+
+    /// cadence-hooks#1144 review round 2: a substitution the CHILD runs is
+    /// never mistaken for one the parent expanded because the text matches.
+    /// Each row's inner push runs after the child's `cd`/`export`; the one in
+    /// `$0` runs in the parent. Both must surface.
+    #[test]
+    fn a_child_substitution_is_never_deduped_against_a_parent_one_by_text() {
+        let push = "git push origin main";
+        for command in [
+            "bash -c 'cd /evil && echo $(git push origin main)' \"$(git push origin main)\"",
+            "bash -c 'export GIT_DIR=/o/.git; echo $(git push origin main)' \"$(git push origin main)\"",
+            "sh -c 'cd /evil && echo $(git push origin main)' \"$(git push origin main)\"",
+            "sudo bash -c 'cd /evil && echo $(git push origin main)' \"$(git push origin main)\"",
+            "bash -c $'cd /evil && echo $(git push origin main)' \"$(git push origin main)\"",
+            "bash -c 'cd /evil && echo `git push origin main`' \"`git push origin main`\"",
+            "bash -c 'cd /evil && echo $(git push origin main)' _ \"$(git push origin main)\"",
+            "watch 'cd /evil && echo $(git push origin main)' \"$(git push origin main)\"",
+        ] {
+            let segments = command_segments(command);
+            let after_cd = segments
+                .iter()
+                .position(|s| s.starts_with("cd /evil") || s.starts_with("export GIT_DIR"))
+                .unwrap_or_else(|| panic!("{command:?}: no cd/export in {segments:?}"));
+            assert!(
+                segments[after_cd..].iter().any(|s| s == push),
+                "{command:?}: the child's push after its cd is gone: {segments:?}"
+            );
+            assert!(
+                segments[..after_cd].iter().any(|s| s == push),
+                "{command:?}: the parent's push is gone: {segments:?}"
+            );
+        }
+        for (command, inner) in [
+            (
+                "bash -c 'cd /evil && echo $(git push --force origin main)' \"$(git push --force origin main)\"",
+                "git push --force origin main",
+            ),
+            (
+                "bash -c 'cd /evil && echo $(git push origin HEAD:main)' \"$(git push origin HEAD:main)\"",
+                "git push origin HEAD:main",
+            ),
+            (
+                "eval \"cd /evil; '$(git push --force origin main)'\" '$(git push --force origin main)'",
+                "git push --force origin main",
+            ),
+        ] {
+            let segments = command_segments(command);
+            let after_cd = segments
+                .iter()
+                .position(|s| s.starts_with("cd /evil"))
+                .unwrap_or_else(|| panic!("{command:?}: {segments:?}"));
+            assert!(
+                segments[after_cd..].iter().any(|s| s == inner),
+                "{command:?}: {segments:?}"
+            );
+        }
     }
 
     #[test]
