@@ -416,6 +416,12 @@ pub const HOOKS: &[HookEntry] = &[
         namespace: "obsidian",
         events: &[HookEvent::PreToolUse],
     },
+    HookEntry {
+        name: "trash-guard-liveness",
+        description: "Report at SessionStart when a configured vault's trash-guard routes no longer judge as contracted",
+        namespace: "obsidian",
+        events: &[HookEvent::SessionStart],
+    },
     // metrics
     HookEntry {
         name: "snapshot",

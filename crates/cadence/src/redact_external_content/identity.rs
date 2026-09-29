@@ -53,13 +53,27 @@ pub(crate) enum Mode {
 ///
 /// `path` matches when the scanned content's file path contains it (a Write/Edit
 /// surface only — a commit message has no path). `pattern` matches against the
-/// surrounding text. Either alone is sufficient; both empty is inert.
+/// surrounding text. Either alone is sufficient; both empty is inert — unless
+/// `destinations` is set (below).
+///
+/// `destinations` (cameronsjo/cadence-hooks#630) scopes the entry along the axis
+/// `path` cannot express: WHERE the content is going. Each element is an
+/// `owner/repo` or an `owner/*` glob, matched case-insensitively against the
+/// repo a post targets (`-R`, else the checkout's origin). With it set the
+/// entry applies only to a post whose target resolves and matches, and it is
+/// ANDed with `path`/`pattern` when those are also set. With `destinations` as
+/// the only clause, the destination match alone excuses the term. A surface
+/// with no resolvable destination (a Write/Edit, a commit whose origin cannot
+/// be read, a command posting to several repos) never satisfies a
+/// destination-scoped entry: unknown means the term stays blocked.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct AllowEntry {
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub pattern: Option<String>,
+    #[serde(default)]
+    pub destinations: Vec<String>,
 }
 
 /// One deny-list term with its explicit, stable id.
@@ -91,14 +105,131 @@ pub(crate) struct IdentityList {
     /// Global allows, applied to every term.
     #[serde(default)]
     pub allow: Vec<AllowEntry>,
+    /// Oldest cadence-hooks release that understands this file, when the
+    /// author states one (`min_version = "0.110.0"`). Read by
+    /// [`IdentityList::too_new_note`] only; scanning never depends on it.
+    #[serde(default)]
+    pub min_version: Option<String>,
+    /// Regexes compiled once, on first scan, beside the parsed terms
+    /// (cameronsjo/cadence-hooks#580).
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<Compiled>,
+}
+
+/// The highest term-source `version` this binary understands.
+pub(crate) const SUPPORTED_VERSION: u32 = 1;
+
+/// Match regexes built from a list, index-aligned with its terms and allows.
+#[derive(Debug, Clone, Default)]
+struct Compiled {
+    terms: Vec<Option<Regex>>,
+    term_allows: Vec<Vec<Option<Regex>>>,
+    global_allows: Vec<Option<Regex>>,
+}
+
+fn compile_allows(allows: &[AllowEntry]) -> Vec<Option<Regex>> {
+    allows
+        .iter()
+        .map(|a| {
+            a.pattern
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .and_then(cached_regex)
+        })
+        .collect()
 }
 
 impl IdentityList {
+    fn compiled(&self) -> &Compiled {
+        self.compiled.get_or_init(|| Compiled {
+            terms: self.terms.iter().map(|t| term_regex(&t.term)).collect(),
+            term_allows: self
+                .terms
+                .iter()
+                .map(|t| compile_allows(&t.allow))
+                .collect(),
+            global_allows: compile_allows(&self.allow),
+        })
+    }
+
+    /// Does any allow entry carry a `destinations` scope? Lets the hook skip
+    /// resolving a post's target (a `git` spawn) when nothing could use it.
+    pub fn uses_destinations(&self) -> bool {
+        self.allow
+            .iter()
+            .chain(self.terms.iter().flat_map(|t| t.allow.iter()))
+            .any(|a| !a.destinations.is_empty())
+    }
+
+    /// Why this binary cannot fully read the file, when the file says it needs
+    /// something newer: a `version` above [`SUPPORTED_VERSION`], or a
+    /// `min_version` above this release. `None` for a file this binary reads.
+    /// The scan still runs on such a file (fail-open direction is unchanged);
+    /// this is the line an operator needs to know to upgrade.
+    pub fn too_new_note(&self) -> Option<String> {
+        let running = env!("CARGO_PKG_VERSION");
+        if let Some(min) = self.min_version.as_deref()
+            && version_newer(min, running)
+        {
+            return Some(format!(
+                "term source requires cadence-hooks >= {min} (this binary is {running}); \
+                 run: brew update && brew upgrade cadence-hooks"
+            ));
+        }
+        match self.version {
+            Some(v) if v > SUPPORTED_VERSION => Some(format!(
+                "term source is format version {v}, newer than the {SUPPORTED_VERSION} this \
+                 binary ({running}) reads; upgrade cadence-hooks — the file's `min_version` \
+                 names the minimum release when it states one"
+            )),
+            _ => None,
+        }
+    }
+
     /// Is the tier armed? An empty term list is treated exactly like an absent
     /// file — inert, and surfaced by [`status`]. A file that parses but carries
     /// no terms is the silent-disarm shape, not a configuration choice.
     pub fn is_armed(&self) -> bool {
         !self.terms.is_empty()
+    }
+
+    /// Number of terms — what `--status` reports as `term_count`.
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// A fingerprint of the enforced content, not of the file: the first 12 hex
+    /// characters of the SHA-256 over the term values, each trimmed, sorted
+    /// bytewise and joined by `\n`. Comments, ordering, ids, allow entries and
+    /// formatting do not move it; adding, removing or substituting a term does
+    /// (cameronsjo/cadence-hooks#589). Case is preserved on purpose — the
+    /// provisioning script recomputes it in a different language.
+    pub fn term_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut values: Vec<&str> = self.terms.iter().map(|t| t.term.trim()).collect();
+        values.sort_unstable();
+        let hex: String = Sha256::digest(values.join("\n").as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        hex[..12].to_string()
+    }
+}
+
+/// Is dotted version `a` strictly newer than `b`? Non-numeric or missing
+/// components read as 0, and an unparseable `a` is never newer (a typo in
+/// `min_version` must not claim the binary is too old).
+fn version_newer(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Option<[u64; 3]> {
+        let mut out = [0u64; 3];
+        for (slot, part) in out.iter_mut().zip(v.trim().split('.')) {
+            *slot = part.parse().ok()?;
+        }
+        Some(out)
+    }
+    match (parts(a), parts(b)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
     }
 }
 
@@ -266,6 +397,61 @@ pub(crate) fn load_from(path: &std::path::Path) -> (IdentityList, Status) {
     }
 }
 
+/// Structural problems the runtime swallows, named for
+/// `redact-scan --validate-config`: a term with no text (never matches), an
+/// allow `pattern` that is not a regex (never excuses), a `destinations` entry
+/// that is neither `owner/repo` nor `owner/*` (never matches), an unreadable
+/// `min_version`. Each is inert at runtime, which is exactly why it is worth
+/// saying out loud once.
+pub(crate) fn validate(list: &IdentityList) -> Vec<String> {
+    let mut errors = Vec::new();
+    let check_allows = |errors: &mut Vec<String>, owner: &str, allows: &[AllowEntry]| {
+        for (i, a) in allows.iter().enumerate() {
+            if let Some(pat) = a.pattern.as_deref().filter(|p| !p.is_empty())
+                && let Err(e) = Regex::new(pat)
+            {
+                let first = e.to_string().lines().last().unwrap_or("").to_string();
+                errors.push(format!(
+                    "{owner} allow[{i}].pattern is not a valid regex: {first}"
+                ));
+            }
+            for d in &a.destinations {
+                let ok = match d.trim().strip_suffix("/*") {
+                    Some(o) => !o.is_empty() && !o.contains('/') && !o.contains('*'),
+                    None => {
+                        let mut it = d.trim().split('/');
+                        matches!(
+                            (it.next(), it.next(), it.next()),
+                            (Some(o), Some(r), None)
+                                if !o.is_empty() && !r.is_empty() && !d.contains('*')
+                        )
+                    }
+                };
+                if !ok {
+                    errors.push(format!(
+                        "{owner} allow[{i}].destinations entry {d:?} must be `owner/repo` or `owner/*`"
+                    ));
+                }
+            }
+        }
+    };
+    for t in &list.terms {
+        if t.term.trim().is_empty() {
+            errors.push(format!("term {:?} has an empty `term`", t.id));
+        }
+        check_allows(&mut errors, &format!("term {:?}", t.id), &t.allow);
+    }
+    check_allows(&mut errors, "global", &list.allow);
+    if let Some(min) = list.min_version.as_deref()
+        && !min.trim().split('.').all(|p| p.parse::<u64>().is_ok())
+    {
+        errors.push(format!(
+            "min_version {min:?} is not a dotted numeric version"
+        ));
+    }
+    errors
+}
+
 /// Build the match regex for one term: case-insensitive, and word-boundary
 /// anchored only on the sides where the term's own edge is a word character
 /// (an unconditional `\b` around a term starting with `.` or `/` would never
@@ -318,52 +504,93 @@ pub(super) fn cached_regex(pattern: &str) -> Option<Regex> {
     })
 }
 
+/// Does a destination scope admit this post target? Empty scope admits every
+/// target (it is no restriction). A non-empty scope admits only a resolved
+/// `destination` (`owner/repo`, lowercase) equal to an `owner/repo` element or
+/// covered by an `owner/*` one.
+fn destination_admits(scope: &[String], destination: Option<&str>) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    let Some(dest) = destination else {
+        return false;
+    };
+    let dest = dest.to_ascii_lowercase();
+    scope.iter().any(|pat| {
+        let pat = pat.trim().to_ascii_lowercase();
+        match pat.strip_suffix("/*") {
+            Some(owner) => {
+                !owner.is_empty()
+                    && !owner.contains('/')
+                    && dest.split_once('/').is_some_and(|(o, _)| o == owner)
+            }
+            None => pat == dest,
+        }
+    })
+}
+
 /// Does an allow entry excuse this match?
 ///
 /// `path` is a containment test against the scanned surface's file path (absent
 /// for a commit message, so a path-only allow never fires there). `pattern` is
 /// a regex against the full scanned text — the form that expresses "this term,
-/// in this sentence, is the English word."
-fn is_allowed(entry: &AllowEntry, text: &str, file_path: Option<&str>) -> bool {
-    if let Some(p) = entry.path.as_deref().filter(|p| !p.is_empty())
+/// in this sentence, is the English word." `destinations` limits either (or
+/// stands alone) to posts targeting the named repos; see [`AllowEntry`].
+fn is_allowed(
+    entry: &AllowEntry,
+    pattern: Option<&Regex>,
+    text: &str,
+    file_path: Option<&str>,
+    destination: Option<&str>,
+) -> bool {
+    if !destination_admits(&entry.destinations, destination) {
+        return false;
+    }
+    let path = entry.path.as_deref().filter(|p| !p.is_empty());
+    let has_pattern = entry.pattern.as_deref().is_some_and(|p| !p.is_empty());
+    if path.is_none() && !has_pattern {
+        // Only a destination scope can make a clause-less entry live.
+        return !entry.destinations.is_empty();
+    }
+    if let Some(p) = path
         && file_path.is_some_and(|fp| fp.contains(p))
     {
         return true;
     }
-    if let Some(pat) = entry.pattern.as_deref().filter(|p| !p.is_empty())
-        && cached_regex(pat).is_some_and(|re| re.is_match(text))
-    {
-        return true;
-    }
-    false
+    pattern.is_some_and(|re| re.is_match(text))
 }
 
 /// Scan `text` for identity terms.
 ///
 /// **Config-blind by signature.** There is no `RedactionConfig` parameter, no
-/// destination tier, no repo allowlist — so no committed file can reach this
+/// audience tier, no repo allowlist — so no committed file can reach this
 /// function's behavior even by future accident. That is the type-level half of
 /// the same property [`super::ConfigScope::SourceFileOnly`] enforces for the
-/// shaped-tier call sites.
+/// shaped-tier call sites. `destination` is the resolved `owner/repo` of the
+/// post (a fact about the command, never read from a repo file); it only ever
+/// lets the term source's own `destinations`-scoped allows apply.
 pub(crate) fn scan_identity(
     text: &str,
     list: &IdentityList,
     file_path: Option<&str>,
+    destination: Option<&str>,
 ) -> Vec<IdentityHit> {
     if !list.is_armed() {
         return Vec::new();
     }
+    let compiled = list.compiled();
     let mut hits: Vec<IdentityHit> = Vec::new();
-    for term in &list.terms {
-        let Some(re) = term_regex(&term.term) else {
+    for (i, term) in list.terms.iter().enumerate() {
+        let Some(re) = compiled.terms[i].as_ref() else {
             continue;
         };
         // A term-level or global allow excusing this context skips the term.
         let excused = term
             .allow
             .iter()
-            .chain(list.allow.iter())
-            .any(|a| is_allowed(a, text, file_path));
+            .zip(&compiled.term_allows[i])
+            .chain(list.allow.iter().zip(&compiled.global_allows))
+            .any(|(a, pat)| is_allowed(a, pat.as_ref(), text, file_path, destination));
         if excused {
             continue;
         }
@@ -397,21 +624,25 @@ mod tests {
                 })
                 .collect(),
             allow: Vec::new(),
+            ..Default::default()
         }
     }
 
     #[test]
     fn matches_case_insensitively() {
         let l = list_of(&[("T1", "acmecorp")]);
-        assert_eq!(scan_identity("We use AcmeCorp here", &l, None).len(), 1);
+        assert_eq!(
+            scan_identity("We use AcmeCorp here", &l, None, None).len(),
+            1
+        );
     }
 
     #[test]
     fn respects_word_boundaries() {
         let l = list_of(&[("T1", "acme")]);
         // `acmecorp` must not match the shorter standalone term.
-        assert!(scan_identity("acmecorp tooling", &l, None).is_empty());
-        assert_eq!(scan_identity("the acme tool", &l, None).len(), 1);
+        assert!(scan_identity("acmecorp tooling", &l, None, None).is_empty());
+        assert_eq!(scan_identity("the acme tool", &l, None, None).len(), 1);
     }
 
     #[test]
@@ -419,7 +650,7 @@ mod tests {
         let l = list_of(&[("T9", "acme widget")]);
         for spelling in ["acme widget", "acme-widget", "acme_widget", "Acme Widget"] {
             assert_eq!(
-                scan_identity(spelling, &l, None).len(),
+                scan_identity(spelling, &l, None, None).len(),
                 1,
                 "should match: {spelling}"
             );
@@ -430,7 +661,7 @@ mod tests {
     fn hostname_with_dots_matches() {
         let l = list_of(&[("T5", "ghe.example.com")]);
         assert_eq!(
-            scan_identity("push to ghe.example.com/org/repo", &l, None).len(),
+            scan_identity("push to ghe.example.com/org/repo", &l, None, None).len(),
             1
         );
     }
@@ -439,7 +670,7 @@ mod tests {
     fn empty_list_is_inert() {
         let l = IdentityList::default();
         assert!(!l.is_armed());
-        assert!(scan_identity("acmecorp", &l, None).is_empty());
+        assert!(scan_identity("acmecorp", &l, None, None).is_empty());
     }
 
     #[test]
@@ -461,9 +692,13 @@ mod tests {
         l.terms[0].allow.push(AllowEntry {
             path: None,
             pattern: Some(r"(?i)clarion\s+(call|bell)".to_string()),
+            ..Default::default()
         });
-        assert!(scan_identity("a clarion call to arms", &l, None).is_empty());
-        assert_eq!(scan_identity("the clarion platform", &l, None).len(), 1);
+        assert!(scan_identity("a clarion call to arms", &l, None, None).is_empty());
+        assert_eq!(
+            scan_identity("the clarion platform", &l, None, None).len(),
+            1
+        );
     }
 
     #[test]
@@ -472,10 +707,11 @@ mod tests {
         l.terms[0].allow.push(AllowEntry {
             path: Some("test_fixtures.py".to_string()),
             pattern: None,
+            ..Default::default()
         });
-        assert!(scan_identity("clarion", &l, Some("a/test_fixtures.py")).is_empty());
+        assert!(scan_identity("clarion", &l, Some("a/test_fixtures.py"), None).is_empty());
         // A commit message has no path — the allow cannot fire there.
-        assert_eq!(scan_identity("clarion", &l, None).len(), 1);
+        assert_eq!(scan_identity("clarion", &l, None, None).len(), 1);
     }
 
     #[test]
@@ -484,12 +720,14 @@ mod tests {
         l.allow.push(AllowEntry {
             path: Some("docs/redaction-tests/".to_string()),
             pattern: None,
+            ..Default::default()
         });
         assert!(
             scan_identity(
                 "acmecorp and widgetco",
                 &l,
-                Some("docs/redaction-tests/fixtures.md")
+                Some("docs/redaction-tests/fixtures.md"),
+                None
             )
             .is_empty()
         );
@@ -529,12 +767,151 @@ mod tests {
         // divergence is the identity pass ignoring config, not the term simply
         // never matching anything.
         let l = list_of(&[("T1", "tool_input")]);
-        let hits = scan_identity("the tool_input field", &l, None);
+        let hits = scan_identity("the tool_input field", &l, None, None);
         assert_eq!(
             hits.len(),
             1,
             "identity must flag a term that repo config allowlists for shaped categories"
         );
         assert_eq!(hits[0].id, "T1");
+    }
+
+    fn with_allow(entry: AllowEntry) -> IdentityList {
+        let mut l = list_of(&[("T1", "acmecorp")]);
+        l.terms[0].allow.push(entry);
+        l
+    }
+
+    #[test]
+    fn destination_scope_table() {
+        // (scope, destination, excused?)
+        let table: &[(&[&str], Option<&str>, bool)] = &[
+            (&["me/tool"], Some("me/tool"), true),
+            (&["Me/Tool"], Some("me/TOOL"), true),
+            (&["me/*"], Some("me/anything"), true),
+            (&["me/*"], Some("other/anything"), false),
+            (&["me/*"], Some("menace/x"), false),
+            (&["me/tool"], Some("me/other"), false),
+            (&["a/b", "c/*"], Some("c/d"), true),
+            // Unknown destination never satisfies a scope.
+            (&["me/*"], None, false),
+            // Malformed scope entries match nothing.
+            (&["*"], Some("me/tool"), false),
+            (&["*/*"], Some("me/tool"), false),
+            (&["me"], Some("me/tool"), false),
+            (&["/*"], Some("me/tool"), false),
+            (&["a/b/*"], Some("a/b/c"), false),
+        ];
+        for (scope, dest, want) in table {
+            let l = with_allow(AllowEntry {
+                destinations: scope.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            });
+            let hits = scan_identity("acmecorp", &l, None, *dest);
+            assert_eq!(hits.is_empty(), *want, "scope {scope:?} dest {dest:?}");
+        }
+    }
+
+    #[test]
+    fn destination_scope_is_anded_with_path_and_pattern() {
+        let l = with_allow(AllowEntry {
+            pattern: Some("acme".into()),
+            destinations: vec!["me/*".into()],
+            ..Default::default()
+        });
+        // Both must hold: pattern matches, destination in scope.
+        assert!(scan_identity("acmecorp", &l, None, Some("me/x")).is_empty());
+        assert_eq!(scan_identity("acmecorp", &l, None, Some("out/x")).len(), 1);
+        assert_eq!(scan_identity("acmecorp", &l, None, None).len(), 1);
+        let l = with_allow(AllowEntry {
+            pattern: Some("no-such-text".into()),
+            destinations: vec!["me/*".into()],
+            ..Default::default()
+        });
+        assert_eq!(scan_identity("acmecorp", &l, None, Some("me/x")).len(), 1);
+    }
+
+    #[test]
+    fn an_entry_with_no_clause_at_all_stays_inert() {
+        let l = with_allow(AllowEntry::default());
+        assert_eq!(scan_identity("acmecorp", &l, None, Some("me/x")).len(), 1);
+    }
+
+    #[test]
+    fn global_destination_scoped_allow_applies_to_every_term() {
+        let mut l = list_of(&[("T1", "acmecorp"), ("T2", "widgetco")]);
+        l.allow.push(AllowEntry {
+            destinations: vec!["me/*".into()],
+            ..Default::default()
+        });
+        assert!(scan_identity("acmecorp widgetco", &l, None, Some("me/x")).is_empty());
+        assert_eq!(scan_identity("acmecorp widgetco", &l, None, None).len(), 2);
+    }
+
+    #[test]
+    fn regexes_compile_once_and_scans_agree() {
+        let mut l = list_of(&[("T1", "acmecorp")]);
+        l.terms[0].allow.push(AllowEntry {
+            pattern: Some("(?i)acmecorp\\s+holiday".into()),
+            ..Default::default()
+        });
+        assert!(std::ptr::eq(l.compiled(), l.compiled()));
+        for _ in 0..3 {
+            assert_eq!(scan_identity("acmecorp here", &l, None, None).len(), 1);
+            assert!(scan_identity("acmecorp holiday", &l, None, None).is_empty());
+        }
+    }
+
+    #[test]
+    fn term_digest_tracks_content_not_formatting() {
+        let digest = |src: &str| toml::from_str::<IdentityList>(src).unwrap().term_digest();
+        let base =
+            digest("[[terms]]\nid=\"T1\"\nterm=\"alpha\"\n[[terms]]\nid=\"T2\"\nterm=\"beta\"\n");
+        // Order, ids, comments, allow entries and whitespace do not move it.
+        assert_eq!(
+            base,
+            digest(
+                "# note\n[[terms]]\nid=\"Z9\"\nterm=\" beta \"\n[[terms]]\nid=\"T1\"\nterm=\"alpha\"\n[[terms.allow]]\npath=\"x\"\n"
+            )
+        );
+        // A substitution with the count unchanged moves it — the 19-vs-18 class.
+        assert_ne!(
+            base,
+            digest("[[terms]]\nid=\"T1\"\nterm=\"alpha\"\n[[terms]]\nid=\"T2\"\nterm=\"gamma\"\n")
+        );
+        // So does a dropped term.
+        assert_ne!(base, digest("[[terms]]\nid=\"T1\"\nterm=\"alpha\"\n"));
+        assert_eq!(base.len(), 12);
+        // Pinned value: scripts/replicate-redaction-terms.sh recomputes this in
+        // Python, so the algorithm is a contract. sha256("alpha\nbeta")[..12].
+        assert_eq!(base, "bbfb79e82216");
+    }
+
+    #[test]
+    fn version_newer_table() {
+        let table: &[(&str, &str, bool)] = &[
+            ("0.114.0", "0.113.0", true),
+            ("0.113.0", "0.113.0", false),
+            ("0.9.0", "0.113.0", false),
+            ("1.0.0", "0.999.9", true),
+            ("1", "0.5.0", true),
+            ("", "0.1.0", false),
+            ("soon", "0.1.0", false),
+            ("1.x.0", "0.1.0", false),
+        ];
+        for (a, b, want) in table {
+            assert_eq!(version_newer(a, b), *want, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn validate_names_each_swallowed_problem() {
+        let l: IdentityList = toml::from_str(
+            "min_version = \"x\"\n[[terms]]\nid=\"T1\"\nterm=\"\"\n[[terms.allow]]\npattern=\"(\"\ndestinations=[\"bad\"]\n",
+        )
+        .unwrap();
+        let errs = validate(&l);
+        assert_eq!(errs.len(), 4, "{errs:?}");
+        assert!(validate(&list_of(&[("T1", "x")])).is_empty());
     }
 }

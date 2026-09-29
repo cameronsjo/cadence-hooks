@@ -25,13 +25,13 @@ const DEFAULT_THRESHOLD_MS: u128 = 1000;
 /// Record a hook's wall-clock time at the dispatch seam — but only when it
 /// exceeds the threshold.
 ///
-/// `hook` is the canonical registry name threaded from the binary, `namespace` its
+/// `hook` is the canonical registry name threaded from the binary, `namespace` (`None` when unknown; the `plugin` field is then omitted) its
 /// namespace, `event` the rendered event string (e.g. `PreToolUse`, `logger`),
 /// and `elapsed_ms` the measured duration. `session_id` is recorded when present
 /// and null otherwise. Fully fail-open: any error along the way is a no-op.
 pub fn log_timing(
     hook: &str,
-    namespace: &str,
+    namespace: Option<&str>,
     event: &str,
     elapsed_ms: u128,
     session_id: Option<&str>,
@@ -76,23 +76,28 @@ fn over_threshold(elapsed_ms: u128, threshold: u128) -> bool {
 }
 
 /// Build the `hooks.jsonl` record. Pure — no I/O beyond [`common::utc_timestamp`].
-/// camelCase keys: `ts`, `hook`, `plugin`, `event`, `elapsedMs` (numeric),
+/// camelCase keys: `ts`, `hook`, `plugin` (omitted when the namespace is unknown), `event`, `elapsedMs` (numeric),
 /// `sessionId` (null when `None`).
 fn build_timing_record(
     hook: &str,
-    namespace: &str,
+    namespace: Option<&str>,
     event: &str,
     elapsed_ms: u128,
     session_id: Option<&str>,
 ) -> Value {
-    json!({
+    let mut record = json!({
         "ts": common::utc_timestamp(),
         "hook": hook,
-        "plugin": namespace,
         "event": event,
         "elapsedMs": elapsed_ms,
         "sessionId": session_id,
-    })
+    });
+    // Absent namespace omits the field rather than writing a sentinel
+    // (`"unknown"`, `"metrics"`) that reads as a real plugin name.
+    if let Some(ns) = namespace {
+        record["plugin"] = json!(ns);
+    }
+    record
 }
 
 #[cfg(test)]
@@ -166,7 +171,13 @@ mod tests {
 
     #[test]
     fn record_has_expected_camelcase_fields() {
-        let rec = build_timing_record("terminology", "cadence", "PreToolUse", 1500, Some("sess-1"));
+        let rec = build_timing_record(
+            "terminology",
+            Some("cadence"),
+            "PreToolUse",
+            1500,
+            Some("sess-1"),
+        );
         assert_eq!(rec["hook"], "terminology");
         assert_eq!(rec["plugin"], "cadence");
         assert_eq!(rec["event"], "PreToolUse");
@@ -179,8 +190,22 @@ mod tests {
 
     #[test]
     fn record_session_id_null_when_none() {
-        let rec = build_timing_record("git-safety", "cadence", "PreToolUse", 2000, None);
+        let rec = build_timing_record("git-safety", Some("cadence"), "PreToolUse", 2000, None);
         assert!(rec["sessionId"].is_null());
+    }
+
+    /// cameronsjo/cadence-hooks#950: an absent namespace omits `plugin` — no
+    /// sentinel string reads as a real plugin name.
+    #[test]
+    fn record_plugin_field_follows_namespace_presence() {
+        for (ns, want) in [(Some("cadence"), Some("cadence")), (None, None)] {
+            let rec = build_timing_record("h", ns, "PreToolUse", 2000, None);
+            assert_eq!(rec.get("plugin").and_then(|v| v.as_str()), want, "{ns:?}");
+            assert_eq!(
+                rec.as_object().unwrap().contains_key("plugin"),
+                want.is_some()
+            );
+        }
     }
 
     // --- log_timing end-to-end (tempdir, default threshold) ---
@@ -217,7 +242,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
             // Elapsed injected as a u128 — no Instant, no sleep.
-            log_timing("terminology", "cadence", "PreToolUse", 1500, Some("sess-1"));
+            log_timing(
+                "terminology",
+                Some("cadence"),
+                "PreToolUse",
+                1500,
+                Some("sess-1"),
+            );
         });
         let rows = read_lines(tmp.path());
         assert_eq!(rows.len(), 1);
@@ -230,7 +261,13 @@ mod tests {
     fn fast_hook_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
-            log_timing("terminology", "cadence", "PreToolUse", 500, Some("sess-1"));
+            log_timing(
+                "terminology",
+                Some("cadence"),
+                "PreToolUse",
+                500,
+                Some("sess-1"),
+            );
         });
         assert!(
             read_lines(tmp.path()).is_empty(),

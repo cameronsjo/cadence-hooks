@@ -4,3 +4,6 @@
 
 /// Block `rm` inside an Obsidian vault — files should be moved to `.trash/` instead.
 pub mod trash_guard;
+
+/// SessionStart liveness check for [`trash_guard`]: probes each of its routes.
+pub mod trash_guard_liveness;

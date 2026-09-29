@@ -320,6 +320,11 @@ enum CadenceCommands {
         /// to announce itself once per session. Exit 0 armed / 1 unarmed.
         #[arg(long)]
         status: bool,
+        /// Parse the term source and check what the runtime swallows (bad
+        /// allow regexes, malformed `destinations`, an empty term, a file that
+        /// needs a newer binary). Exit 0 valid / 2 with each problem on stderr.
+        #[arg(long)]
+        validate_config: bool,
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     /// Exit: 0 recorded, 1 nothing recorded (detached HEAD, not a repo, write failed),
@@ -366,6 +371,15 @@ enum CadenceCommands {
         /// audit can tell a cleared roster from a legacy one (cadence-hooks#775)
         #[arg(long)]
         fresh: bool,
+        /// Record a dispositioned SKIP instead of a polish run, with the reason
+        /// — e.g. `--skip "dnsmasq address= line change only"`. The pre-PR gate
+        /// then treats the branch as dispositioned and echoes the reason.
+        /// Required non-trivial (not empty, `n/a`, `none`, `-`, `.`), at most
+        /// 120 bytes of `[A-Za-z0-9 .,:;()/_'#=+-]`; anything else is a usage
+        /// error (exit 2). Cannot be combined with `--scope`, `--arm*`, or
+        /// `--fresh` (cadence-hooks#787)
+        #[arg(long, value_name = "REASON", allow_hyphen_values = true)]
+        skip: Option<String>,
     },
 }
 
@@ -487,6 +501,8 @@ enum RulesCommands {
 enum ObsidianCommands {
     /// Block rm in Obsidian vault (use .trash/ instead)
     TrashGuard,
+    /// Report at SessionStart when a trash-guard route no longer judges as contracted
+    TrashGuardLiveness,
 }
 
 #[derive(Subcommand)]
@@ -669,6 +685,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         }),
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
+            ObsidianCommands::TrashGuardLiveness => "trash-guard-liveness",
         }),
         Commands::Metrics(m) => Some(match m {
             MetricsCommands::Snapshot => "snapshot",
@@ -985,6 +1002,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ObsidianCommands::TrashGuard => CheckPlan::new(
                 Box::new(cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard),
                 pre,
+            ),
+            ObsidianCommands::TrashGuardLiveness => CheckPlan::new(
+                Box::new(cadence_hooks_obsidian::trash_guard_liveness::TrashGuardLiveness),
+                session,
             ),
         },
         // warn-stale is a SessionStart *check*, not a logger — it reads the
@@ -1540,6 +1561,7 @@ fn main() {
                 arm_model,
                 arm_report,
                 fresh,
+                skip,
             } => {
                 // Exit only on a nonzero code; the success path keeps falling
                 // through to main's own exit. `run_record` returns 0 when a
@@ -1549,7 +1571,7 @@ fn main() {
                 // (`--scope`, `--branch` — cadence-hooks#775, #801). This is a
                 // CLI action, not a hook, so a nonzero exit gates no tool call.
                 let code = cadence_hooks_cadence::record_polish::run_record(
-                    repo_root, branch, scope, arm, arm_model, arm_report, fresh,
+                    repo_root, branch, scope, arm, arm_model, arm_report, fresh, skip,
                 );
                 if code != 0 {
                     process::exit(code.into());
@@ -1560,7 +1582,14 @@ fn main() {
                 audience,
                 init,
                 status,
+                validate_config,
             } => {
+                if validate_config {
+                    process::exit(
+                        cadence_hooks_cadence::redact_external_content::run_validate_config()
+                            .into(),
+                    );
+                }
                 if status {
                     process::exit(
                         cadence_hooks_cadence::redact_external_content::run_status().into(),

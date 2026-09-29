@@ -1,8 +1,9 @@
 //! Warn when piping output from shell-aliased tools into parsers.
 //!
-//! Modern CLI replacements (`cat`→`bat`, `find`→`fd`, `ls`→`eza`, `du`→`dust`,
-//! `df`→`duf`, `top`→`btm`) change output format — and `find`→`fd` changes
-//! syntax entirely. Piping their output into grep/awk/xargs parses the
+//! Modern CLI replacements (`cat`→`bat`, `ls`→`eza`, `du`→`dust`, `df`→`duf`,
+//! `top`→`btm`) change output format. `find` is deliberately absent: the usual
+//! replacement (`bfs`) is find-compatible, so a nudge would only ask for
+//! rewrites of commands that already work (cadence-hooks#1033). Piping their output into grep/awk/xargs parses the
 //! replacement's format, not the original's. The fix is `command <tool>` or an
 //! absolute path.
 //!
@@ -21,7 +22,6 @@ use std::sync::LazyLock;
 /// Tools that are commonly aliased to modern replacements with different output.
 const ALIASED_TOOLS: &[(&str, &str)] = &[
     ("cat", "bat"),
-    ("find", "fd"),
     ("ls", "eza"),
     ("du", "dust"),
     ("df", "duf"),
@@ -245,10 +245,17 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Nudge);
     }
 
+    /// cameronsjo/cadence-hooks#1033: `find` is not an aliased set member.
     #[test]
-    fn find_piped_to_xargs_nudges() {
-        let result = WarnAliasParsing.run(&make_bash("find . -name '*.rs' | xargs wc -l"));
-        assert_eq!(result.outcome, Outcome::Nudge);
+    fn find_pipelines_do_not_nudge() {
+        for command in [
+            "find . -name '*.rs' | xargs wc -l",
+            "find . -type f | head -5",
+            "cd /tmp && find . -name x | sort",
+        ] {
+            let result = WarnAliasParsing.run(&make_bash(command));
+            assert_eq!(result.outcome, Outcome::Allow, "{command:?}");
+        }
     }
 
     #[test]
@@ -287,13 +294,6 @@ mod tests {
             msg.contains("command ls"),
             "nudge should give the fix: {msg}"
         );
-    }
-
-    #[test]
-    fn nudge_message_names_find_fd() {
-        let result = WarnAliasParsing.run(&make_bash("find . -type f | head -5"));
-        let msg = result.message.unwrap_or_default();
-        assert!(msg.contains("fd"), "nudge should name the fd alias: {msg}");
     }
 
     // --- edge cases ---
