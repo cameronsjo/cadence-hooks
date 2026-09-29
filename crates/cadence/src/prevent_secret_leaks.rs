@@ -316,26 +316,39 @@ const RESCAN_NODES: usize = 256;
 /// and a timed-out hook does not block, so the stall WAS the bypass. When the
 /// allowance runs out, the scan stops and the caller fails closed on the raw
 /// command ([`rough_secret`]).
+///
+/// It also carries the scan's wall-clock DEADLINE (#832 delta review I-2):
+/// the Bash arm runs inside a hook group that fails a member OPEN after
+/// 4000 ms, so the structured scan gives up well before that and the caller
+/// falls back to [`normalized_secret_name`].
 struct RescanBudget {
     bytes: usize,
     nodes: usize,
+    deadline: std::time::Instant,
     exhausted: bool,
 }
 
-impl Default for RescanBudget {
-    fn default() -> Self {
+impl RescanBudget {
+    fn new(deadline: std::time::Instant) -> Self {
         Self {
             bytes: RESCAN_BYTES,
             nodes: RESCAN_NODES,
+            deadline,
             exhausted: false,
         }
     }
-}
 
-impl RescanBudget {
+    /// Past the deadline? Marks the budget exhausted when it is.
+    fn out_of_time(&mut self) -> bool {
+        if std::time::Instant::now() >= self.deadline {
+            self.exhausted = true;
+        }
+        self.exhausted
+    }
+
     /// Spend on `script`, or mark the budget exhausted and refuse.
     fn spend(&mut self, script: &str) -> bool {
-        if self.exhausted || self.nodes == 0 || script.len() > self.bytes {
+        if self.out_of_time() || self.nodes == 0 || script.len() > self.bytes {
             self.exhausted = true;
             return false;
         }
@@ -508,11 +521,40 @@ fn normalized_secret_name(text: &str) -> Option<String> {
 }
 
 /// Commands longer than this skip the structured scan: the shared segmenter
-/// and runner peel are super-linear on adversarial input (`su ` × N crossed
-/// the 5 s hook timeout near 180 KB), and a timed-out hook does not block.
-/// Over the cap, [`normalized_secret_name`] decides alone (#832 delta review
-/// I2).
-const STRUCTURED_SCAN_LIMIT: usize = 64 * 1024;
+/// and runner peel are super-linear on adversarial input, and a hook that runs
+/// past its group's 4000 ms limit fails OPEN. At 64 KiB a nested `su` repro
+/// still took 3.9 s on a release build, so the cap is 16 KiB (#832 delta
+/// review I-2). Over the cap, [`normalized_secret_name`] decides alone.
+const STRUCTURED_SCAN_LIMIT: usize = 16 * 1024;
+
+/// Wall-clock allowance for the structured scan of one command. Past it, the
+/// scan is abandoned and [`normalized_secret_name`] decides, as over the size
+/// cap. Well under the hook group's 4000 ms fail-open limit.
+const STRUCTURED_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The untracked-content check for a command too long for the structured
+/// scan: its tokens, read without segmenting. Fails closed — any mention of
+/// the untracked-stash or ignored-file-grep shape anywhere blocks.
+fn untracked_content_by_tokens(command: &str, lower: &str) -> bool {
+    if !(lower.contains("stash") || lower.contains("untracked")) {
+        return false;
+    }
+    let tokens = tokenize(command);
+    let has = |f: &dyn Fn(&str) -> bool| tokens.iter().any(|t| f(t));
+    let short_has = |t: &str, c: char| t.starts_with('-') && !t.starts_with("--") && t.contains(c);
+    let stash_patch = has(&|t| t == "stash")
+        && has(&|t| t == "show")
+        && has(&|t| t.starts_with("--patch") || short_has(t, 'p'));
+    let untracked = lower.contains("showincludeuntracked")
+        || has(&|t| {
+            t.starts_with("--include-untracked")
+                || t.starts_with("--only-untracked")
+                || short_has(t, 'u')
+        });
+    (stash_patch && untracked)
+        || has(&|t| t.contains("stash") && t.contains("^3"))
+        || (has(&|t| t == "--untracked") && has(&|t| t == "--no-exclude-standard"))
+}
 
 /// [`segment_env_reads`] at a nesting depth: the segment's own operands, plus
 /// every command string it hands to something that runs it
@@ -2907,31 +2949,40 @@ fn bash_leaks_secrets(
     cwd: Option<&str>,
     detect: fn() -> bool,
 ) -> Option<CheckResult> {
-    if command.len() > STRUCTURED_SCAN_LIMIT {
-        return normalized_secret_name(command).map(|name| {
-            CheckResult::block(format!(
-                "🚫 BLOCKED: prevent-secret-leaks: command is too long to scan and names a \
-                 secret file\n\
-                 Found: `{name}`\n\
-                 Fix: run the command directly, or split it into shorter commands."
-            ))
-        });
-    }
+    bash_leaks_secrets_within(command, cwd, detect, STRUCTURED_SCAN_DEADLINE)
+}
+
+/// [`bash_leaks_secrets`] with the structured scan's time allowance passed in,
+/// so a test can exercise the deadline fallback without a slow input.
+fn bash_leaks_secrets_within(
+    command: &str,
+    cwd: Option<&str>,
+    detect: fn() -> bool,
+    time_limit: std::time::Duration,
+) -> Option<CheckResult> {
+    let deadline = std::time::Instant::now() + time_limit;
     let lower = command.to_lowercase();
+    let oversized = command.len() > STRUCTURED_SCAN_LIMIT;
 
     // #850 delta review I7: `git stash show -p` with untracked files prints
     // every untracked file a `git stash -u` swept up — a `.env` is the
     // typical one, and the command need not name it. Judged before the
-    // raw-text pre-filter for exactly that reason.
+    // raw-text pre-filter AND before the size cap (#1071 review I-1: the cap
+    // returning first turned a padded `git stash show -p -u` into an allow).
+    // Over the cap it reads tokens only, never the segmenter.
     let untracked_config = lower.contains("showincludeuntracked");
-    if (lower.contains("stash") || lower.contains("untracked"))
-        && command_segments(command).iter().any(|segment| {
-            let tokens = tokenize(segment);
-            resolve_command(&tokens).is_some_and(|(word, argv)| {
-                word == "git" && git_prints_untracked_content(&argv[1..], untracked_config)
+    let prints_untracked = if oversized {
+        untracked_content_by_tokens(command, &lower)
+    } else {
+        (lower.contains("stash") || lower.contains("untracked"))
+            && command_segments(command).iter().any(|segment| {
+                let tokens = tokenize(segment);
+                resolve_command(&tokens).is_some_and(|(word, argv)| {
+                    word == "git" && git_prints_untracked_content(&argv[1..], untracked_config)
+                })
             })
-        })
-    {
+    };
+    if prints_untracked {
         return Some(CheckResult::block(
             "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
              Found: a `git` command printing UNTRACKED or ignored file content (a stash's \
@@ -2942,11 +2993,23 @@ fn bash_leaks_secrets(
         ));
     }
 
+    // Over the size cap the structured scan is skipped: block when the
+    // normalized raw text names a secret anywhere — prose included — and
+    // otherwise fall through to the nudges below.
+    if oversized && let Some(name) = normalized_secret_name(command) {
+        return Some(CheckResult::block(format!(
+            "🚫 BLOCKED: prevent-secret-leaks: command is too long to scan and names a \
+             secret file\n\
+             Found: `{name}`\n\
+             Fix: run the command directly, or split it into shorter commands."
+        )));
+    }
+
     // Block: a dangerous deny-set operand (the `.env` family plus the non-`.env`
     // credential stores) handed to any command that is not metadata-safe
     // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
     // is still seen.
-    if command_may_reference_secret(&lower) {
+    if !oversized && command_may_reference_secret(&lower) {
         // #308: computed once per command — an in-command cd/pushd/popd
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
@@ -2986,8 +3049,11 @@ fn bash_leaks_secrets(
                 .any(|t| is_assignment_word(t) && t.starts_with("GIT_")),
         };
         let segments = command_segments(command);
-        let mut budget = RescanBudget::default();
+        let mut budget = RescanBudget::new(deadline);
         for segment in &segments {
+            if budget.out_of_time() {
+                break;
+            }
             // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
             // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
             // proven pure-loader `.envrc`; any other dangerous operand in the
@@ -3026,7 +3092,7 @@ fn bash_leaks_secrets(
         if budget.exhausted && normalized_secret_name(command).is_some() {
             return Some(CheckResult::block(
                 "🚫 BLOCKED: prevent-secret-leaks: command nests too many command strings to \
-                 scan, and names a secret file\n\
+                 scan (or took too long to scan), and names a secret file\n\
                  Fix: run the command directly, without nested `su`/`sh -c` wrappers.",
             ));
         }
@@ -7580,7 +7646,8 @@ mod tests {
     #[test]
     fn many_unterminated_quoted_heredocs_stay_linear() {
         // #815 delta review I1: each introducer rescanned every later line.
-        let n = 8000;
+        // Sized to stay under the structured-scan cap, so the stripper runs.
+        let n = 2000;
         let command = format!(
             "echo \"$(cat {}\n{})\"; cat .env",
             "<<'X' ".repeat(n),
@@ -7712,5 +7779,68 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "heredoc bodies are data",
         );
+    }
+
+    #[test]
+    fn untracked_stash_check_runs_before_the_size_cap() {
+        // #1071 review I-1: padding past the cap skipped this check.
+        let padded = format!("git stash show -p -u; {}", "true; ".repeat(11_000));
+        assert!(padded.len() > STRUCTURED_SCAN_LIMIT);
+        assert_fast_block(&padded, 1000);
+        let grep = format!(
+            "git grep --untracked --no-exclude-standard KEY; {}",
+            "true; ".repeat(11_000)
+        );
+        assert_fast_block(&grep, 1000);
+        let stash3 = format!("git show stash@{{0}}^3; {}", "true; ".repeat(11_000));
+        assert_fast_block(&stash3, 1000);
+        let benign = format!("git stash show --stat; {}", "true; ".repeat(11_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn nudges_still_fire_over_the_size_cap() {
+        let dump = format!("{}printenv", "true; ".repeat(4_000));
+        assert!(dump.len() > STRUCTURED_SCAN_LIMIT);
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&dump));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+        let echo = format!("{}echo $API_SECRET", "true; ".repeat(4_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&echo));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn nested_substitution_su_flood_blocks_fast() {
+        // #1071 review I-2: under the old 64 KiB cap this took 3.9 s on a
+        // release build, inside a hook group that fails open at 4000 ms.
+        let command = format!(
+            "echo {}{}-c true{}; cat .env",
+            "$(".repeat(20),
+            "su ".repeat(21_800),
+            ")".repeat(20)
+        );
+        assert_fast_block(&command, 500);
+    }
+
+    #[test]
+    fn structured_scan_deadline_fails_closed() {
+        // #1071 review I-2: past the deadline the structured scan is
+        // abandoned and the normalized raw text decides.
+        let run = |command: &str| {
+            bash_leaks_secrets_within(command, None, || false, std::time::Duration::ZERO)
+        };
+        let blocked = run("true; su -c 'cat .env'").expect("secret named");
+        assert_eq!(blocked.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            blocked
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("took too long"),
+            "{:?}",
+            blocked.message
+        );
+        assert!(run("true; su -c 'ls'").is_none());
     }
 }
