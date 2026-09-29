@@ -878,7 +878,10 @@ fn check_destructive_in_vault_at(
     // backtick substitution is also seen — the sibling secret-writes guard
     // uses the same wrapper-unwrapping splitter for the same reason.
     for segment in command_segments(command) {
-        for target in clobber_redirect_targets(&segment) {
+        for target in clobber_redirect_targets(&segment)
+            .into_iter()
+            .flat_map(|target| with_brace_expansion(&target))
+        {
             if let Some(resolved) = resolve_in_vault(&target, &cwd, &vault, &vault_prefix)
                 && meta.exists(&resolved)
             {
@@ -895,6 +898,24 @@ fn check_destructive_in_vault_at(
     }
 
     CheckResult::allow()
+}
+
+/// A redirect target plus the names bash brace-expands it into. The target
+/// comes back from the redirect parser as one unexpanded word, but bash
+/// expands `>note.m{d..d}` to `note.md` before opening it. The written name is
+/// judged as well as each expansion, so a quoted `"a{b,c}"` (never expanded by
+/// bash) is still judged as written; an extra candidate can only add a block
+/// on a file that exists in the vault (cameronsjo/cadence-hooks#1115).
+fn with_brace_expansion(target: &str) -> Vec<String> {
+    let mut names = vec![target.to_string()];
+    if target.contains('{') {
+        for word in tokenize(target) {
+            if !names.contains(&word) {
+                names.push(word);
+            }
+        }
+    }
+    names
 }
 
 /// Judge a harness deletion primitive that named a path directly — a normalized
@@ -2757,6 +2778,27 @@ mod tests {
         let fs = FakeFs::with(&["/vault/notes/note.md"]);
         let result = check_destructive_in_vault("echo hi > note.md", "/vault/notes", "/vault", &fs);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn brace_expanded_redirect_target_is_judged_as_the_expanded_name() {
+        // cameronsjo/cadence-hooks#1115: bash writes `note.md` for
+        // `>note.m{d..d}` — a single-character sequence, not `{md..md}`.
+        let fs = FakeFs::with(&["/vault/notes/note.md"]);
+        for (command, want) in [
+            ("echo x >note.m{d..d}", cadence_hooks_core::Outcome::Block),
+            ("echo x > note.m{d..d}", cadence_hooks_core::Outcome::Block),
+            ("echo x > note.{md,}", cadence_hooks_core::Outcome::Block),
+            // Controls: an expansion that names no existing file, and a
+            // sequence bash leaves literal.
+            ("echo x > other.m{d..d}", cadence_hooks_core::Outcome::Allow),
+            ("echo x > note.{md..md}", cadence_hooks_core::Outcome::Allow),
+            // Append never truncates.
+            ("echo x >> note.m{d..d}", cadence_hooks_core::Outcome::Allow),
+        ] {
+            let result = check_destructive_in_vault(command, "/vault/notes", "/vault", &fs);
+            assert_eq!(result.outcome, want, "{command}");
+        }
     }
 
     #[test]
