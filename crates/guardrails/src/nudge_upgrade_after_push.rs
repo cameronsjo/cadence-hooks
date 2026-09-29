@@ -5,40 +5,60 @@
 //! main branch. If so, emits a nudge telling Claude to schedule a deferred
 //! `brew upgrade` via CronCreate (one-shot, ~4 minutes out) to allow CI
 //! time to build and publish the new beta release.
+//!
+//! The pushes come from [`push_invocations`], the shell walk the push guards
+//! share, not from a substring search. A substring search fired on any command
+//! whose TEXT said `git push … main`: a heredoc body, an `echo`, a commit
+//! message (cameronsjo/cadence-hooks#893). This is a nudge, so every ambiguity
+//! resolves toward silence.
 
 use cadence_hooks_core::gitstate::GitState;
-use cadence_hooks_core::shell::{git_command, host_and_repo_from_url, parse_work_dir};
+use cadence_hooks_core::push::{PushInvocation, push_invocations};
+use cadence_hooks_core::shell::{git_command, host_and_repo_from_url};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 
 const TARGET_REPO: &str = "cameronsjo/cadence-hooks";
 
-/// Check if the push targets the main branch.
-///
-/// Looks for an explicit refspec first (`git push origin main`),
-/// then falls back to the current branch for bare `git push`.
-fn is_push_to_main(command: &str, work_dir: &str) -> bool {
-    // Explicit refspec: `git push origin main`, `git push origin main:main`
-    if let Some(after_push) = command.split("git push").nth(1) {
-        let segment = after_push.split(&['&', ';', '|'][..]).next().unwrap_or("");
-        let args: Vec<&str> = segment
-            .split_whitespace()
-            .filter(|w| !w.starts_with('-'))
-            .collect();
-        // args[0] = remote, args[1] = refspec
-        if let Some(refspec) = args.get(1) {
-            let src = refspec.split(':').next().unwrap_or(refspec);
-            return src == "main" || src == "master";
-        }
-    }
+fn is_main(name: &str) -> bool {
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    name == "main" || name == "master"
+}
 
-    // Bare `git push` — check the current branch via the shared GitState
-    // (pure-filesystem HEAD read, not a `git branch --show-current` spawn;
-    // cadence-hooks#164). A detached HEAD resolves to `None` → not main.
-    GitState::resolve(Path::new(work_dir))
-        .and_then(|s| s.branch)
-        .map(|b| b == "main" || b == "master")
-        .unwrap_or(false)
+/// Whether this push publishes to the main branch.
+///
+/// A named refspec is judged by the branch it writes on the remote: its
+/// destination, or its source when it names none (`git push origin main`).
+/// A bare `git push` publishes the current branch, read from `work_dir`
+/// (pure-filesystem HEAD read, cadence-hooks#164; a detached HEAD is not main).
+/// A dry run and a delete publish nothing.
+fn is_push_to_main(push: &PushInvocation) -> bool {
+    if push.dry_run {
+        return false;
+    }
+    push.refspecs.iter().filter(|r| !r.is_delete).any(|r| {
+        if r.implicit {
+            return GitState::resolve(Path::new(&push.work_dir))
+                .and_then(|s| s.branch)
+                .is_some_and(|b| is_main(&b));
+        }
+        r.destination
+            .as_deref()
+            .or(r.source.as_deref())
+            .is_some_and(is_main)
+    })
+}
+
+/// Whether `work_dir`'s `origin` is the cadence-hooks repo.
+fn is_cadence_hooks_checkout(work_dir: &str) -> bool {
+    let Some(remote_url) = git_command(work_dir, &["remote", "get-url", "origin"]) else {
+        return false;
+    };
+    let Some((_host, repo_path)) = host_and_repo_from_url(&remote_url) else {
+        return false;
+    };
+    // Normalize: strip .git suffix, compare case-insensitively
+    repo_path.trim_end_matches(".git").to_lowercase() == TARGET_REPO
 }
 
 /// Nudge Claude to schedule a deferred brew upgrade after pushing cadence-hooks.
@@ -54,33 +74,21 @@ impl Check for NudgeUpgradeAfterPush {
             return CheckResult::allow();
         };
 
-        if !command.contains("git push") {
+        // Cheap prefilter before the shell walk.
+        if !command.contains("push") {
             return CheckResult::allow();
         }
 
-        // Resolve working directory (handles `cd /foo && git push`)
         let cwd_fallback = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| ".".to_string());
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-        let work_dir = parse_work_dir(command, cwd);
 
-        // Check if this is the cadence-hooks repo
-        let Some(remote_url) = git_command(&work_dir, &["remote", "get-url", "origin"]) else {
-            return CheckResult::allow();
-        };
-        let Some((_host, repo_path)) = host_and_repo_from_url(&remote_url) else {
-            return CheckResult::allow();
-        };
-        // Normalize: strip .git suffix, compare case-insensitively
-        let normalized = repo_path.trim_end_matches(".git").to_lowercase();
-        if normalized != TARGET_REPO {
-            return CheckResult::allow();
-        }
-
-        // Check if pushing to main
-        if !is_push_to_main(command, &work_dir) {
+        let pushed_main = push_invocations(command, cwd)
+            .iter()
+            .any(|push| is_push_to_main(push) && is_cadence_hooks_checkout(&push.work_dir));
+        if !pushed_main {
             return CheckResult::allow();
         }
 
@@ -145,44 +153,85 @@ mod tests {
 
     // --- is_push_to_main tests ---
 
+    /// Does `command`, run in `cwd`, push to main? Any push counts.
+    fn pushes_main(command: &str, cwd: &str) -> bool {
+        push_invocations(command, cwd).iter().any(is_push_to_main)
+    }
+
     #[test]
     fn is_push_to_main_explicit_refspec() {
-        assert!(is_push_to_main("git push origin main", "/tmp"));
-        assert!(is_push_to_main("git push origin main:main", "/tmp"));
+        assert!(pushes_main("git push origin main", "/tmp"));
+        assert!(pushes_main("git push origin main:main", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_master_branch() {
-        assert!(is_push_to_main("git push origin master", "/tmp"));
-        assert!(is_push_to_main("git push origin master:master", "/tmp"));
+        assert!(pushes_main("git push origin master", "/tmp"));
+        assert!(pushes_main("git push origin master:master", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_feature_branch() {
-        assert!(!is_push_to_main("git push origin feature/foo", "/tmp"));
+        assert!(!pushes_main("git push origin feature/foo", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_tag_push() {
-        assert!(!is_push_to_main("git push origin v1.0.0", "/tmp"));
+        assert!(!pushes_main("git push origin v1.0.0", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_with_flags() {
-        assert!(is_push_to_main("git push --force origin main", "/tmp"));
-        assert!(is_push_to_main("git push -u origin main", "/tmp"));
+        assert!(pushes_main("git push --force origin main", "/tmp"));
+        assert!(pushes_main("git push -u origin main", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_chained_command() {
-        // Only checks segment before & or ;
-        assert!(is_push_to_main("git push origin main && echo done", "/tmp"));
+        assert!(pushes_main("git push origin main && echo done", "/tmp"));
     }
 
     #[test]
     fn is_push_to_main_bare_push_nonexistent_dir() {
-        // Bare push to nonexistent dir — git_command returns None, falls to false
-        assert!(!is_push_to_main("git push origin", "/tmp/nonexistent"));
+        // Bare push in a dir with no HEAD to read — not main.
+        assert!(!pushes_main("git push origin", "/tmp/nonexistent"));
+    }
+
+    #[test]
+    fn is_push_to_main_judges_the_remote_side() {
+        // `feat:main` writes main on the remote; `main:feat` does not.
+        assert!(pushes_main("git push origin feat:main", "/tmp"));
+        assert!(pushes_main("git push origin HEAD:refs/heads/main", "/tmp"));
+        assert!(!pushes_main("git push origin main:feat", "/tmp"));
+    }
+
+    #[test]
+    fn is_push_to_main_ignores_dry_runs_and_deletes() {
+        assert!(!pushes_main("git push --dry-run origin main", "/tmp"));
+        assert!(!pushes_main("git push origin --delete main", "/tmp"));
+    }
+
+    #[test]
+    fn is_push_to_main_follows_dash_c() {
+        assert!(pushes_main("git -C /elsewhere push origin main", "/tmp"));
+    }
+
+    /// cameronsjo/cadence-hooks#893: the words `git push origin main` in text
+    /// that no shell runs as a push are not a push.
+    #[test]
+    fn push_words_in_prose_are_not_a_push() {
+        for command in [
+            "python3 - <<'EOF'\n# later: git push origin main\nEOF",
+            "cat > notes.md <<EOF\nthen git push origin main\nEOF",
+            "echo 'git push origin main'",
+            "printf '%s\\n' \"git push origin main\"",
+            "git commit -m 'docs: explain git push origin main'",
+        ] {
+            assert!(
+                !pushes_main(command, "/tmp"),
+                "no push to main runs here: {command:?}"
+            );
+        }
     }
 
     // --- Check::run() integration: repo detection ---
@@ -246,6 +295,25 @@ mod tests {
             result.outcome,
             Outcome::Nudge,
             "cd + push should detect cadence-hooks repo via parse_work_dir"
+        );
+    }
+
+    /// The #893 shape end to end: a heredoc whose body reads like a push to
+    /// main, run from the cadence-hooks repo while it sits on main, is silent.
+    #[test]
+    fn heredoc_mentioning_a_push_to_main_allows() {
+        let repo = crate::github_origin_repo();
+        let cwd = repo.path().to_string_lossy();
+        // Control: a real push from the same checkout nudges.
+        let control = make_bash_with_cwd("git push origin main", &cwd);
+        assert_eq!(NudgeUpgradeAfterPush.run(&control).outcome, Outcome::Nudge);
+
+        let cmd = "python3 - <<'EOF'\nimport pathlib\n# after review: git push origin main\nEOF";
+        let input = make_bash_with_cwd(cmd, &cwd);
+        assert_eq!(
+            NudgeUpgradeAfterPush.run(&input).outcome,
+            Outcome::Allow,
+            "a heredoc body is text, not a push"
         );
     }
 }
