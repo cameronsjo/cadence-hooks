@@ -439,352 +439,391 @@ impl Check for PushRemoteGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(command) = input.command() else {
-            return CheckResult::allow();
-        };
-
-        // Every downstream parser historically expected literal `git push`.
-        // Normalize the verb once so the fast path, loop analysis, target
-        // extraction, and work-dir resolution all judge the same command.
-        let command = GIT_PUSH_VERB.replace_all(command, "git push");
-        let command = command.as_ref();
-        if !mentions_push(command) {
-            return CheckResult::allow();
+        let verdict = judge_push(input);
+        if verdict.outcome != cadence_hooks_core::Outcome::Allow || verdict.bypass.is_some() {
+            return verdict;
         }
-        // The structural gate. A tokenized push in command position is the
-        // definitive answer; the literal substring stays as a floor so a shape
-        // the tokenizer cannot reach — a push inside an `eval` string, a verb
-        // behind a substitution — keeps the coverage it had before this became
-        // a parse. Union, never replacement: the parse must only ever ADD
-        // commands to judge.
-        let push_segments = git_push_segments(command);
-        if push_segments.is_empty() && !command.contains("git push") {
-            return CheckResult::allow();
+        unverified_directory_nudge(input).unwrap_or(verdict)
+    }
+}
+
+/// A nudge for an allowed push that runs after a directory change the push walk
+/// could not follow — `cd "$VAR"`, `cd -`, `cd $(…)`, `popd`, a bare `cd` —
+/// with no `eval`, `trap` or git redirect in play (those block in
+/// [`check_pushes_elsewhere`]). Ruled a nudge, not a block (cadence-hooks#1095):
+/// nothing in the command names another repository, and scripts hold their
+/// checkout in a variable often enough that blocking would spend friction on
+/// correct work. The walk reads text only, so this costs no subprocess.
+fn unverified_directory_nudge(input: &HookInput) -> Option<CheckResult> {
+    let command = input.command()?;
+    let command = GIT_PUSH_VERB.replace_all(command, "git push");
+    if !mentions_push(&command) {
+        return None;
+    }
+    let cwd_fallback = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+    let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+    let push = push_locations(&command, cwd)
+        .into_iter()
+        .find(|push| push.directory_unverified && !push.repository_unresolved)?;
+    Some(CheckResult::nudge(format!(
+        "⚠️  git-guardrails: Push directory could not be verified\n   \
+         A directory change before the push (`cd \"$VAR\"`, `cd -`, `cd $(…)`, \
+         `popd`, a bare `cd`) is resolved by the shell, so the push may run \
+         outside the checked repository.\n   \
+         Checked instead: {}\n   \
+         Verify: cd /path/to/repo && git push origin <branch>",
+        push.work_dir
+    )))
+}
+
+/// The ownership verdict for one Bash command, before the
+/// [`unverified_directory_nudge`] pass.
+fn judge_push(input: &HookInput) -> CheckResult {
+    let Some(command) = input.command() else {
+        return CheckResult::allow();
+    };
+
+    // Every downstream parser historically expected literal `git push`.
+    // Normalize the verb once so the fast path, loop analysis, target
+    // extraction, and work-dir resolution all judge the same command.
+    let command = GIT_PUSH_VERB.replace_all(command, "git push");
+    let command = command.as_ref();
+    if !mentions_push(command) {
+        return CheckResult::allow();
+    }
+    // The structural gate. A tokenized push in command position is the
+    // definitive answer; the literal substring stays as a floor so a shape
+    // the tokenizer cannot reach — a push inside an `eval` string, a verb
+    // behind a substitution — keeps the coverage it had before this became
+    // a parse. Union, never replacement: the parse must only ever ADD
+    // commands to judge.
+    let push_segments = git_push_segments(command);
+    if push_segments.is_empty() && !command.contains("git push") {
+        return CheckResult::allow();
+    }
+
+    // Structural safety checks first — these don't need the owner list
+    // and must block even when unconfigured.
+
+    // Chain analysis: multiple pushes in && / ; chains
+    match loop_analysis::analyze_push_chain(command) {
+        ChainAnalysis::SameRemote(_) => {
+            // All chained pushes target the same remote — safe to proceed
         }
-
-        // Structural safety checks first — these don't need the owner list
-        // and must block even when unconfigured.
-
-        // Chain analysis: multiple pushes in && / ; chains
-        match loop_analysis::analyze_push_chain(command) {
-            ChainAnalysis::SameRemote(_) => {
-                // All chained pushes target the same remote — safe to proceed
-            }
-            ChainAnalysis::DifferentRemotes(cmds) => {
-                let remotes: Vec<String> = cmds
-                    .iter()
-                    .filter_map(|c| c.explicit_repo.as_ref())
-                    .map(|r| format!("`{r}`"))
-                    .collect();
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: chained git push to different remotes\n   \
-                     Found: remotes {}\n   \
-                     Fix: run each push individually, e.g. `git push origin main`",
-                    remotes.join(", "),
-                ));
-            }
-            ChainAnalysis::MissingRemotes(cmds) => {
-                let bare: Vec<String> = cmds
-                    .iter()
-                    .filter(|c| c.explicit_repo.is_none())
-                    .map(|c| format!("`git {}`", c.args.join(" ")))
-                    .collect();
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                     Found: {}\n   \
-                     Fix: add explicit remote, e.g. `git push origin main`",
-                    bare.join(", "),
-                ));
-            }
-            ChainAnalysis::ParseFailed => {
-                // Fall back to counting. The substring count alone misses a
-                // push carrying a git global (`git -C . push …`), which is
-                // exactly the shape #554 was about — so take the larger of the
-                // two counts rather than trusting either on its own.
-                let push_count = strip_quotes(command)
-                    .matches("git push")
-                    .count()
-                    .max(push_segments.len());
-                if push_count > 1 {
-                    return CheckResult::block(
-                        "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
-                         Fix: run each push separately, e.g. `git push origin main && git push origin dev`",
-                    );
-                }
-            }
-            ChainAnalysis::SingleOrNone => {}
+        ChainAnalysis::DifferentRemotes(cmds) => {
+            let remotes: Vec<String> = cmds
+                .iter()
+                .filter_map(|c| c.explicit_repo.as_ref())
+                .map(|r| format!("`{r}`"))
+                .collect();
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: chained git push to different remotes\n   \
+                 Found: remotes {}\n   \
+                 Fix: run each push individually, e.g. `git push origin main`",
+                remotes.join(", "),
+            ));
         }
-
-        // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
-        let loop_result = loop_analysis::analyze_push_loops(command);
-        match &loop_result {
-            LoopAnalysis::MissingTargets(cmds) => {
-                let bare_pushes: Vec<String> = cmds
-                    .iter()
-                    .filter(|c| c.explicit_repo.is_none())
-                    .map(|c| format!("git {}", c.args.join(" ")))
-                    .collect();
-                let example = bare_pushes.first().cloned().unwrap_or_default();
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: git push in loop without explicit remote\n   \
-                     Found: `{example}`\n   \
-                     Fix: add the remote, e.g. `git push origin` or `git push origin main`",
-                ));
-            }
-            LoopAnalysis::ParseFailed => {
-                let stripped = strip_quotes(command);
-                if LOOP_PATTERN.is_match(&stripped) {
-                    return CheckResult::block(
-                        "🚫 git-guardrails: git push in loop — cannot verify targets\n   \
-                         Fix: run each push individually with explicit remote, e.g. `git push origin main`",
-                    );
-                }
-            }
-            LoopAnalysis::AllTargetsExplicit(_) | LoopAnalysis::NoLoops => {}
+        ChainAnalysis::MissingRemotes(cmds) => {
+            let bare: Vec<String> = cmds
+                .iter()
+                .filter(|c| c.explicit_repo.is_none())
+                .map(|c| format!("`git {}`", c.args.join(" ")))
+                .collect();
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: chained git push without explicit remotes\n   \
+                 Found: {}\n   \
+                 Fix: add explicit remote, e.g. `git push origin main`",
+                bare.join(", "),
+            ));
         }
-
-        // Owner-based checks require configuration
-        let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
-        let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
-        let extra_hosts = env_extra_hosts();
-
-        if allowed_owners.is_empty() {
-            return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
+        ChainAnalysis::ParseFailed => {
+            // Fall back to counting. The substring count alone misses a
+            // push carrying a git global (`git -C . push …`), which is
+            // exactly the shape #554 was about — so take the larger of the
+            // two counts rather than trusting either on its own.
+            let push_count = strip_quotes(command)
+                .matches("git push")
+                .count()
+                .max(push_segments.len());
+            if push_count > 1 {
+                return CheckResult::block(
+                    "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
+                     Fix: run each push separately, e.g. `git push origin main && git push origin dev`",
+                );
+            }
         }
+        ChainAnalysis::SingleOrNone => {}
+    }
 
-        // Resolve working directory
-        let cwd_fallback = std::env::current_dir()
+    // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
+    let loop_result = loop_analysis::analyze_push_loops(command);
+    match &loop_result {
+        LoopAnalysis::MissingTargets(cmds) => {
+            let bare_pushes: Vec<String> = cmds
+                .iter()
+                .filter(|c| c.explicit_repo.is_none())
+                .map(|c| format!("git {}", c.args.join(" ")))
+                .collect();
+            let example = bare_pushes.first().cloned().unwrap_or_default();
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: git push in loop without explicit remote\n   \
+                 Found: `{example}`\n   \
+                 Fix: add the remote, e.g. `git push origin` or `git push origin main`",
+            ));
+        }
+        LoopAnalysis::ParseFailed => {
+            let stripped = strip_quotes(command);
+            if LOOP_PATTERN.is_match(&stripped) {
+                return CheckResult::block(
+                    "🚫 git-guardrails: git push in loop — cannot verify targets\n   \
+                     Fix: run each push individually with explicit remote, e.g. `git push origin main`",
+                );
+            }
+        }
+        LoopAnalysis::AllTargetsExplicit(_) | LoopAnalysis::NoLoops => {}
+    }
+
+    // Owner-based checks require configuration
+    let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+    let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
+    let extra_hosts = env_extra_hosts();
+
+    if allowed_owners.is_empty() {
+        return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
+    }
+
+    // Resolve working directory
+    let cwd_fallback = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+    let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+    let work_dir = parse_work_dir(command, cwd);
+
+    // Where each push really runs (cadence-hooks#1095). `parse_work_dir`
+    // is a flat scan for `cd`, so an `eval`'d or trapped `cd`, a `pushd`,
+    // `builtin cd`, `git -C <dir>` and a `GIT_DIR=` prefix all left it on
+    // the session's owned checkout while the push ran elsewhere. The
+    // non-flat push walk follows each of those or says it cannot.
+    if let Some(block) = check_pushes_elsewhere(
+        command,
+        cwd,
+        &work_dir,
+        &allowed_owners,
+        &allowed_repos,
+        &extra_hosts,
+    ) {
+        return block;
+    }
+
+    // Validate ownership of explicit remotes in loops
+    if let LoopAnalysis::AllTargetsExplicit(cmds) = &loop_result {
+        let cwd_fallback_loop = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| ".".to_string());
-        let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-        let work_dir = parse_work_dir(command, cwd);
+        let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
+        let work_dir_loop = parse_work_dir(command, cwd_loop);
 
-        // Where each push really runs (cadence-hooks#1095). `parse_work_dir`
-        // is a flat scan for `cd`, so an `eval`'d or trapped `cd`, a `pushd`,
-        // `builtin cd`, `git -C <dir>` and a `GIT_DIR=` prefix all left it on
-        // the session's owned checkout while the push ran elsewhere. The
-        // non-flat push walk follows each of those or says it cannot.
-        if let Some(block) = check_pushes_elsewhere(
-            command,
-            cwd,
-            &work_dir,
-            &allowed_owners,
-            &allowed_repos,
-            &extra_hosts,
-        ) {
-            return block;
-        }
+        // This loop is the one guard path that spawns a *command-controlled*
+        // number of git probes (one per looped push), so it is the induced-
+        // budget-exhaustion vector (#271 security follow-up): a flood of
+        // bogus-remote pushes drains the shared deadline, then the real
+        // ownership-deciding probe times out. A push loop is rare and
+        // batchable, so the safe answer to *any* resolution timeout here is
+        // to fail CLOSED — "run pushes individually so each remote is
+        // validated" (a single push has budget for its one resolution). This
+        // is deliberately stricter than the single-command arm below (which
+        // fails open on a slow host, the common path that must not
+        // false-block): failing open in the loop would let an unvalidated,
+        // possibly-unowned push through, and no timing/count heuristic can
+        // separate that flood from a slow host — a slow host inflates each
+        // probe, keeping any completion-count discriminator under its bar.
+        for cmd in cmds {
+            let Some(remote) = &cmd.explicit_repo else {
+                continue;
+            };
 
-        // Validate ownership of explicit remotes in loops
-        if let LoopAnalysis::AllTargetsExplicit(cmds) = &loop_result {
-            let cwd_fallback_loop = std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| ".".to_string());
-            let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
-            let work_dir_loop = parse_work_dir(command, cwd_loop);
+            // An explicit URL is validated DIRECTLY, never looked up as a
+            // remote name. `git remote get-url --push <url>` always fails,
+            // and the `Failed` arm below fails open by design (its rationale
+            // was written for a typo'd remote *name*) — so a URL in a loop
+            // body reached no ownership check at all:
+            // `for b in a b; do git push https://evil.example/x.git $b; done`
+            // was skipped silently. Answered without a subprocess, which
+            // matters because this loop is the command-controlled spawn path
+            // the shared #271 deadline has to survive.
+            if host_and_repo_from_url(remote).is_some() {
+                if !check_owner(remote, &allowed_owners, &allowed_repos, &extra_hosts) {
+                    return CheckResult::block(format!(
+                        "🚫 git-guardrails: Push loop targets a remote you don't own\n   \
+                         Found: {remote}\n   \
+                         Fix: push to an owned remote instead, or run each push \
+                         individually"
+                    ));
+                }
+                continue;
+            }
 
-            // This loop is the one guard path that spawns a *command-controlled*
-            // number of git probes (one per looped push), so it is the induced-
-            // budget-exhaustion vector (#271 security follow-up): a flood of
-            // bogus-remote pushes drains the shared deadline, then the real
-            // ownership-deciding probe times out. A push loop is rare and
-            // batchable, so the safe answer to *any* resolution timeout here is
-            // to fail CLOSED — "run pushes individually so each remote is
-            // validated" (a single push has budget for its one resolution). This
-            // is deliberately stricter than the single-command arm below (which
-            // fails open on a slow host, the common path that must not
-            // false-block): failing open in the loop would let an unvalidated,
-            // possibly-unowned push through, and no timing/count heuristic can
-            // separate that flood from a slow host — a slow host inflates each
-            // probe, keeping any completion-count discriminator under its bar.
-            for cmd in cmds {
-                let Some(remote) = &cmd.explicit_repo else {
-                    continue;
-                };
-
-                // An explicit URL is validated DIRECTLY, never looked up as a
-                // remote name. `git remote get-url --push <url>` always fails,
-                // and the `Failed` arm below fails open by design (its rationale
-                // was written for a typo'd remote *name*) — so a URL in a loop
-                // body reached no ownership check at all:
-                // `for b in a b; do git push https://evil.example/x.git $b; done`
-                // was skipped silently. Answered without a subprocess, which
-                // matters because this loop is the command-controlled spawn path
-                // the shared #271 deadline has to survive.
-                if host_and_repo_from_url(remote).is_some() {
-                    if !check_owner(remote, &allowed_owners, &allowed_repos, &extra_hosts) {
+            match resolve_push_url(&work_dir_loop, Some(remote)) {
+                PushUrlResolution::Url(url) => {
+                    if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
                         return CheckResult::block(format!(
-                            "🚫 git-guardrails: Push loop targets a remote you don't own\n   \
-                             Found: {remote}\n   \
+                            "🚫 git-guardrails: Push loop targets remote you don't own\n   \
+                             Found: remote `{remote}` → {url}\n   \
                              Fix: push to an owned remote instead, or run each push \
                              individually"
                         ));
                     }
-                    continue;
                 }
-
-                match resolve_push_url(&work_dir_loop, Some(remote)) {
-                    PushUrlResolution::Url(url) => {
-                        if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
-                            return CheckResult::block(format!(
-                                "🚫 git-guardrails: Push loop targets remote you don't own\n   \
-                                 Found: remote `{remote}` → {url}\n   \
-                                 Fix: push to an owned remote instead, or run each push \
-                                 individually"
-                            ));
-                        }
-                    }
-                    PushUrlResolution::TimedOut => {
-                        return CheckResult::block(
-                            "🚫 git-guardrails: Push-loop ownership check timed out\n   \
-                             The git-probe deadline expired before a looped push's remote \
-                             could be ownership-validated — failing closed so an unowned \
-                             remote can't slip through.\n   \
-                             Fix: run pushes individually so each remote is validated.",
-                        );
-                    }
-                    // Failed (git answered, remote unresolvable): unchanged
-                    // fail-open skip — an unresolvable remote was fail-open
-                    // pre-#271, and the trailing single-command arm still runs.
-                    PushUrlResolution::Failed => {}
+                PushUrlResolution::TimedOut => {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: Push-loop ownership check timed out\n   \
+                         The git-probe deadline expired before a looped push's remote \
+                         could be ownership-validated — failing closed so an unowned \
+                         remote can't slip through.\n   \
+                         Fix: run pushes individually so each remote is validated.",
+                    );
                 }
+                // Failed (git answered, remote unresolvable): unchanged
+                // fail-open skip — an unresolvable remote was fail-open
+                // pre-#271, and the trailing single-command arm still runs.
+                PushUrlResolution::Failed => {}
             }
         }
+    }
 
-        // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
-        // on this single-command path is the accepted common-path degradation:
-        // a normal `git push` on a slow host must not false-block (ADR-0001), so
-        // fail open and record the suppressed fail-closed block (the sharp
-        // telemetry reason) rather than the soft `deadline` the runner logs on
-        // its own. (Unlike the loop arm above, there is no command-controlled
-        // spawn count here to inflate — the probe count is fixed.)
-        match cadence_hooks_core::shell::git_command_detailed(
-            &work_dir,
-            &["rev-parse", "--git-dir"],
-        ) {
-            cadence_hooks_core::shell::GitQuery::Value(_) => {}
-            cadence_hooks_core::shell::GitQuery::TimedOut => {
+    // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
+    // on this single-command path is the accepted common-path degradation:
+    // a normal `git push` on a slow host must not false-block (ADR-0001), so
+    // fail open and record the suppressed fail-closed block (the sharp
+    // telemetry reason) rather than the soft `deadline` the runner logs on
+    // its own. (Unlike the loop arm above, there is no command-controlled
+    // spawn count here to inflate — the probe count is fixed.)
+    match cadence_hooks_core::shell::git_command_detailed(&work_dir, &["rev-parse", "--git-dir"]) {
+        cadence_hooks_core::shell::GitQuery::Value(_) => {}
+        cadence_hooks_core::shell::GitQuery::TimedOut => {
+            cadence_hooks_core::deadline::note_suppressed_block();
+            return CheckResult::allow();
+        }
+        cadence_hooks_core::shell::GitQuery::Failed => return CheckResult::allow(),
+    }
+
+    // Classify the push target. An explicit URL is validated directly —
+    // closing the bypass where a URL silently fell back to validating
+    // `origin`. A named remote or bare push resolves through git's
+    // tracking remote, exactly as before.
+    let targets = extract_push_targets(command, &push_segments, &work_dir);
+
+    // Validate EVERY explicitly-named destination. git prefers the
+    // positional over `--repo`, but checking only git's preferred one is
+    // what regressed the first cut of this fix — an unmodelled option's
+    // value posed as a positional and discarded a recorded evil `--repo`
+    // URL. Blocking if *either* is unowned is stricter than git's own
+    // precedence and costs only a nonsense command.
+    let mut named_remotes: Vec<String> = Vec::new();
+    let mut owned_url_validated = false;
+    let mut unresolvable: Option<String> = None;
+    for target in &targets {
+        match target {
+            PushTarget::Url(url) => {
+                if !check_owner(url, &allowed_owners, &allowed_repos, &extra_hosts) {
+                    return CheckResult::block(unowned_message(
+                        url,
+                        &work_dir,
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
+                    ));
+                }
+                owned_url_validated = true;
+            }
+            PushTarget::UnownableUrl(url) => {
+                return CheckResult::block(format!(
+                    "🚫 git-guardrails: Push target's owner cannot be determined\n   \
+                     Would push to: {url}\n   \
+                     Directory:     {work_dir}\n   \
+                     This is a URL git will push to, but it carries no \
+                     `owner/repo` to check against the allowlist — and an owner \
+                     that cannot be determined cannot be allowed.\n\n   \
+                     Push explicit: git push origin main"
+                ));
+            }
+            PushTarget::Named(remote) => {
+                // Deduplicate: this loop drives one git probe per entry,
+                // and the shared #271 deadline is a budget a repeated
+                // remote should not spend twice.
+                if !named_remotes.iter().any(|r| r == remote) {
+                    named_remotes.push(remote.clone());
+                }
+            }
+            PushTarget::Unresolvable(token) => unresolvable = Some(token.clone()),
+            PushTarget::None => {}
+        }
+    }
+
+    // Every explicit destination was an owned URL and none needs git
+    // resolution — nothing left to check. An unresolvable token is
+    // deliberately excluded: it still takes the tracking-remote fallback
+    // below, and the nudge rides that path's allow.
+    if named_remotes.is_empty() && owned_url_validated && unresolvable.is_none() {
+        return CheckResult::allow();
+    }
+
+    // Resolve and validate EVERY named remote, not only the last one seen.
+    // With no named remote at all, the single `None` probe is the
+    // tracking-remote fallback — the bare-`git push` path, unchanged.
+    let probes: Vec<Option<&str>> = if named_remotes.is_empty() {
+        vec![None]
+    } else {
+        named_remotes.iter().map(|r| Some(r.as_str())).collect()
+    };
+
+    let mut url = String::new();
+    for probe in probes {
+        url = match resolve_push_url(&work_dir, probe) {
+            PushUrlResolution::Url(url) => url,
+            // The probe hit the #271 subprocess deadline: the guard's own
+            // infrastructure failed, which never blocks (ADR-0001). Record
+            // the suppressed fail-closed block so telemetry can distinguish
+            // "slow git" from "an ownership block was bypassed".
+            PushUrlResolution::TimedOut => {
                 cadence_hooks_core::deadline::note_suppressed_block();
                 return CheckResult::allow();
             }
-            cadence_hooks_core::shell::GitQuery::Failed => return CheckResult::allow(),
-        }
-
-        // Classify the push target. An explicit URL is validated directly —
-        // closing the bypass where a URL silently fell back to validating
-        // `origin`. A named remote or bare push resolves through git's
-        // tracking remote, exactly as before.
-        let targets = extract_push_targets(command, &push_segments, &work_dir);
-
-        // Validate EVERY explicitly-named destination. git prefers the
-        // positional over `--repo`, but checking only git's preferred one is
-        // what regressed the first cut of this fix — an unmodelled option's
-        // value posed as a positional and discarded a recorded evil `--repo`
-        // URL. Blocking if *either* is unowned is stricter than git's own
-        // precedence and costs only a nonsense command.
-        let mut named_remotes: Vec<String> = Vec::new();
-        let mut owned_url_validated = false;
-        let mut unresolvable: Option<String> = None;
-        for target in &targets {
-            match target {
-                PushTarget::Url(url) => {
-                    if !check_owner(url, &allowed_owners, &allowed_repos, &extra_hosts) {
-                        return CheckResult::block(unowned_message(
-                            url,
-                            &work_dir,
-                            &allowed_owners,
-                            &allowed_repos,
-                            &extra_hosts,
-                        ));
-                    }
-                    owned_url_validated = true;
-                }
-                PushTarget::UnownableUrl(url) => {
-                    return CheckResult::block(format!(
-                        "🚫 git-guardrails: Push target's owner cannot be determined\n   \
-                         Would push to: {url}\n   \
-                         Directory:     {work_dir}\n   \
-                         This is a URL git will push to, but it carries no \
-                         `owner/repo` to check against the allowlist — and an owner \
-                         that cannot be determined cannot be allowed.\n\n   \
-                         Push explicit: git push origin main"
-                    ));
-                }
-                PushTarget::Named(remote) => {
-                    // Deduplicate: this loop drives one git probe per entry,
-                    // and the shared #271 deadline is a budget a repeated
-                    // remote should not spend twice.
-                    if !named_remotes.iter().any(|r| r == remote) {
-                        named_remotes.push(remote.clone());
-                    }
-                }
-                PushTarget::Unresolvable(token) => unresolvable = Some(token.clone()),
-                PushTarget::None => {}
-            }
-        }
-
-        // Every explicit destination was an owned URL and none needs git
-        // resolution — nothing left to check. An unresolvable token is
-        // deliberately excluded: it still takes the tracking-remote fallback
-        // below, and the nudge rides that path's allow.
-        if named_remotes.is_empty() && owned_url_validated && unresolvable.is_none() {
-            return CheckResult::allow();
-        }
-
-        // Resolve and validate EVERY named remote, not only the last one seen.
-        // With no named remote at all, the single `None` probe is the
-        // tracking-remote fallback — the bare-`git push` path, unchanged.
-        let probes: Vec<Option<&str>> = if named_remotes.is_empty() {
-            vec![None]
-        } else {
-            named_remotes.iter().map(|r| Some(r.as_str())).collect()
+            PushUrlResolution::Failed => return cannot_resolve(&work_dir),
         };
 
-        let mut url = String::new();
-        for probe in probes {
-            url = match resolve_push_url(&work_dir, probe) {
-                PushUrlResolution::Url(url) => url,
-                // The probe hit the #271 subprocess deadline: the guard's own
-                // infrastructure failed, which never blocks (ADR-0001). Record
-                // the suppressed fail-closed block so telemetry can distinguish
-                // "slow git" from "an ownership block was bypassed".
-                PushUrlResolution::TimedOut => {
-                    cadence_hooks_core::deadline::note_suppressed_block();
-                    return CheckResult::allow();
-                }
-                PushUrlResolution::Failed => return cannot_resolve(&work_dir),
-            };
-
-            if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
-                return CheckResult::block(unowned_message(
-                    &url,
-                    &work_dir,
-                    &allowed_owners,
-                    &allowed_repos,
-                    &extra_hosts,
-                ));
-            }
-        }
-
-        // The tracking remote is owned — but the command named a destination
-        // built at run time, so the URL just validated is not necessarily the
-        // one git contacts. Ruled a nudge rather than a block (2026-08-08): the
-        // target is unseeable until the shell runs, so no verdict here can be
-        // evidence, and blocking would spend friction on scripts that hold a
-        // legitimate remote in a variable.
-        if let Some(token) = unresolvable {
-            return CheckResult::nudge(format!(
-                "⚠️  git-guardrails: Push target `{token}` is resolved by the shell\n   \
-                 Checked instead: {url}\n   \
-                 That is the tracking remote, which may not be where this pushes.\n   \
-                 Verify: git push <explicit-remote> <branch>"
+        if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
+            return CheckResult::block(unowned_message(
+                &url,
+                &work_dir,
+                &allowed_owners,
+                &allowed_repos,
+                &extra_hosts,
             ));
         }
-
-        CheckResult::allow()
     }
+
+    // The tracking remote is owned — but the command named a destination
+    // built at run time, so the URL just validated is not necessarily the
+    // one git contacts. Ruled a nudge rather than a block (2026-08-08): the
+    // target is unseeable until the shell runs, so no verdict here can be
+    // evidence, and blocking would spend friction on scripts that hold a
+    // legitimate remote in a variable.
+    if let Some(token) = unresolvable {
+        return CheckResult::nudge(format!(
+            "⚠️  git-guardrails: Push target `{token}` is resolved by the shell\n   \
+             Checked instead: {url}\n   \
+             That is the tracking remote, which may not be where this pushes.\n   \
+             Verify: git push <explicit-remote> <branch>"
+        ));
+    }
+
+    CheckResult::allow()
 }
 
 #[cfg(test)]
@@ -1506,7 +1545,7 @@ mod tests {
     /// `(command, outcome)`.
     #[test]
     fn push_moved_to_another_repository_is_judged_there() {
-        use cadence_hooks_core::Outcome::{Allow, Block};
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
         let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
         let other = checkout_with_origin("https://github.com/evil/y.git");
         std::fs::create_dir(owned.path().join("sub")).expect("create sub");
@@ -1516,8 +1555,33 @@ mod tests {
             for (command, outcome) in [
                 // The issue's two shapes: the directory cannot be followed.
                 ("eval 'cd {other}'; git push origin main", Block),
+                ("eval 'cd /other' ; git push", Block),
                 ("trap 'cd {other}; git push origin main' EXIT", Block),
-                ("cd \"$DIR\" && git push origin main", Block),
+                // An unreadable `cd` target with nothing naming another
+                // repository nudges (ruling on #1095).
+                ("cd \"$DIR\" && git push origin main", Nudge),
+                ("cd \"$VAR\" && git push", Nudge),
+                ("cd - && git push origin feat", Nudge),
+                ("cd $(other) && git push origin feat", Nudge),
+                // ...but not when it names the repository already checked.
+                (
+                    "cd $(git rev-parse --show-toplevel) && git push -u origin feat",
+                    Allow,
+                ),
+                (
+                    "cd \"$(git rev-parse --show-toplevel)\" && git push origin feat",
+                    Allow,
+                ),
+                (
+                    "cd sub && cd \"$(git rev-parse --show-toplevel)\" && git push",
+                    Allow,
+                ),
+                ("eval \"$(ssh-agent -s)\"; git push origin feat", Allow),
+                (
+                    "eval \"$(ssh-agent -s)\" && cd \"$D\" && git push origin feat",
+                    Nudge,
+                ),
+                ("eval \"$(cat env.sh)\"; git push origin feat", Block),
                 ("GIT_DIR={other}/.git git push origin main", Block),
                 ("git --git-dir={other}/.git push origin main", Block),
                 // Followed, and judged in the directory the push runs in.
