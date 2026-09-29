@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`enforce-worktree` judges a Write or Edit to a very deep path inside the hook deadline.** Resolving a not-yet-created file's directory stat-ed every ancestor, and each stat copies the whole path, so a `file_path` of 100,000 components took about a second in release: past the deadline, where the hook fails open. An ancestor longer than the OS path limit cannot exist, so it is now skipped without a stat, and the same path resolves in milliseconds with the same verdict. (cameronsjo/cadence-hooks#1171)
+
 ## [0.112.0] - 2026-09-29
 
 ### Security
