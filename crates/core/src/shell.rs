@@ -6949,7 +6949,7 @@ struct CommandLine {
 /// whole input is read as one line.
 ///
 /// Quoting is [`scan_quote_syntax`]; a substitution inside `"…"` is skipped
-/// through [`quoted_substitution_end`] as [`split_segments_with_ops`] and
+/// through [`quoted_substitution_bound`] as [`split_segments_with_ops`] and
 /// [`comment_spans`] skip it; a `#` opens a comment by exactly the
 /// [`comment_spans`] rule, so this never recognises a comment that function
 /// does not. Every one of those is a shared model on purpose: this scanner
@@ -6982,12 +6982,13 @@ fn scan_command_line(
                 continue;
             }
             if !lex.exhausted && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'('))) {
-                if let Some(end) = quoted_substitution_end(chars, j) {
+                let bound = quoted_substitution_bound(chars, j);
+                if let SubstBound::Bounded(end) = bound {
                     skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
                     j = end;
                     continue;
                 }
-                lex.exhausted = true;
+                lex.exhausted = bound.latches();
             }
         }
         // `\` before a CRLF continues the line the way [`take_logical_line`]
@@ -7207,15 +7208,15 @@ fn split_segments_impl(
             && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
         {
             let i = all.len() - chars.len() - 1;
-            match quoted_substitution_end(&all, i) {
-                Some(end) => {
+            match quoted_substitution_bound(&all, i) {
+                SubstBound::Bounded(end) => {
                     current.extend(&all[i..end]);
                     for _ in i + 1..end {
                         chars.next();
                     }
                     continue;
                 }
-                None => scan_exhausted = true,
+                other => scan_exhausted = other.latches(),
             }
         }
         if let Some(q) = quote {
@@ -7465,7 +7466,8 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     (all, byte_of)
                 });
                 let at = byte_of.binary_search(&i).expect("char boundary");
-                if let Some(end) = quoted_substitution_end(all, at) {
+                let bound = quoted_substitution_bound(all, at);
+                if let SubstBound::Bounded(end) = bound {
                     let end_byte = byte_of[end];
                     while chars.peek().is_some_and(|&(j, _)| j < end_byte) {
                         chars.next();
@@ -7473,7 +7475,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     boundary = false;
                     continue;
                 }
-                scan_exhausted = true;
+                scan_exhausted = bound.latches();
             }
         }
         if let Some(q) = quote {
@@ -8335,6 +8337,11 @@ enum ScanStop {
     /// A nested `$( )` scan failed, for any reason. Says nothing about whether
     /// the shell runs the outer construct — usually it does.
     NestedUnresolved,
+    /// A nested scan hit [`MAX_SUBSTITUTION_DEPTH`]. [`ScanStop::NestedUnresolved`]
+    /// for a caller that widens, but it says the scan stopped at the cap's
+    /// openers rather than at the end of the input, which is what lets a
+    /// caller's latch stay local to the span (cameronsjo/cadence-hooks#1137).
+    NestedTooDeep,
     /// Nesting exceeded [`MAX_SUBSTITUTION_DEPTH`].
     ///
     /// Internal to the recursion: the nested arm relabels every nested failure
@@ -8358,6 +8365,7 @@ impl ScanStop {
         match self {
             ScanStop::QuoteUnresolved
             | ScanStop::NestedUnresolved
+            | ScanStop::NestedTooDeep
             | ScanStop::DepthExceeded
             | ScanStop::LexUnresolved => true,
             ScanStop::Unterminated => false,
@@ -8648,11 +8656,17 @@ fn scan_substitution_body_bounded(
                 // on that reading. Measured cost: a `#` comment inside the
                 // nested body flipped a heredoc secret read from blocked to
                 // allowed (see [`ScanStop`]).
-                let Ok((_, nested_end)) =
-                    scan_substitution_body_bounded(chars, j + 2, true, budget)
-                else {
-                    return Err(ScanStop::NestedUnresolved);
-                };
+                let (_, nested_end) =
+                    match scan_substitution_body_bounded(chars, j + 2, true, budget) {
+                        Ok(found) => found,
+                        // Depth is remembered through the relabelling: a
+                        // depth failure read only as far as the cap's
+                        // openers, unlike one that ran to the end of input.
+                        Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => {
+                            return Err(ScanStop::NestedTooDeep);
+                        }
+                        Err(_) => return Err(ScanStop::NestedUnresolved),
+                    };
                 body.extend(&chars[j..nested_end]);
                 j = nested_end;
                 boundary = false;
@@ -9169,6 +9183,33 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
     None
 }
 
+/// How far a `"$( … )"` / `` "`…`" `` span reaches, and WHY when it does not.
+///
+/// The latch each splitter keeps ("stop scanning after one span that cannot
+/// be bounded") is only sound for [`SubstBound::Unbounded`]: that scan ran to
+/// the end of the input, so every later one would too. [`SubstBound::TooDeep`]
+/// gave up at a nesting cap after reading only as far as the cap's openers —
+/// local to that span, so it must not switch off span handling for the rest
+/// of the pass (cameronsjo/cadence-hooks#1137, #1143): 17 levels of `"$(`
+/// early in a command read every later span character by character, and a
+/// commit body with an odd `"` then hid a later `cat .env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubstBound {
+    Bounded(usize),
+    /// Nesting past [`MAX_SUBSTITUTION_DEPTH`]: cheap, and local.
+    TooDeep,
+    /// No closer found: the scan read to the end of the input.
+    Unbounded,
+}
+
+impl SubstBound {
+    /// Whether a caller's latch should trip: the failure cost a scan to the
+    /// end of the input.
+    fn latches(self) -> bool {
+        self == Self::Unbounded
+    }
+}
+
 /// Index just past the command substitution — `$(…)` or `` `…` `` — opening at
 /// `chars[i]`, when one opens there AND its terminator can be located.
 ///
@@ -9177,16 +9218,18 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
 /// outer run nor opens a new one. A walker that reads the body as plain
 /// quoted data lets that inner `"` close its `Quote::Double`, and the rest of
 /// the command — separators included — is then misread as quoted text
-/// (cameronsjo/cadence-hooks#830). `None` means "no substitution here, or
+/// (cameronsjo/cadence-hooks#830). `Unbounded`/`TooDeep` mean "no substitution here, or
 /// none this scanner can bound": the caller keeps its old character-by-
 /// character reading, which is the status quo rather than a new deletion.
-fn quoted_substitution_end(chars: &[char], i: usize) -> Option<usize> {
+fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
     match chars[i] {
-        '$' if chars.get(i + 1) == Some(&'(') => scan_substitution_body(chars, i + 2, true)
-            .ok()
-            .map(|(_, end)| end),
-        '`' => backtick_span_end(chars, i),
-        _ => None,
+        '$' if chars.get(i + 1) == Some(&'(') => match scan_substitution_body(chars, i + 2, true) {
+            Ok((_, end)) => SubstBound::Bounded(end),
+            Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => SubstBound::TooDeep,
+            Err(_) => SubstBound::Unbounded,
+        },
+        '`' => backtick_span_end(chars, i).map_or(SubstBound::Unbounded, SubstBound::Bounded),
+        _ => SubstBound::Unbounded,
     }
 }
 
@@ -16342,6 +16385,31 @@ mod tests {
             !substitution_bodies(&"$(".repeat(levels)).is_empty(),
             "deep nesting must still emit the ambiguous readings"
         );
+    }
+
+    #[test]
+    fn deep_quoted_substitution_nesting_does_not_latch_later_spans() {
+        // cadence-hooks#1137/#1143: 17+ levels of `"$(` early in a command
+        // latched the splitter into character-by-character reading for the
+        // rest of the pass, so a later commit heredoc holding an odd `"`
+        // opened a phantom quote over `cat .env`. The depth failure is local
+        // to its span: the later span is still bounded, and `cat .env` is a
+        // segment of its own at every depth.
+        for n in [1usize, 15, 16, 17, 18, 20, 40] {
+            let cmd = format!(
+                "{}; git commit -m \"$(cat <<'EOF'\nit\"s\nEOF\n)\"; cat .env",
+                "echo \"$(".repeat(n) + &"echo x".to_string() + &")\"".repeat(n),
+            );
+            for (name, segs) in [
+                ("split_segments", split_segments(&cmd)),
+                ("command_segments", command_segments(&cmd)),
+            ] {
+                assert!(
+                    segs.iter().any(|s| s.trim() == "cat .env"),
+                    "{name} n={n}: {segs:?}"
+                );
+            }
+        }
     }
 
     #[test]
