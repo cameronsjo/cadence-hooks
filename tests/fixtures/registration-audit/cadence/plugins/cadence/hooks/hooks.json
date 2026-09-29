@@ -81,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/memory-guard cadence/terminology cadence/orphaned-todos cadence/prevent-secret-writes cadence/env-vars cadence/line-endings cadence/warn-overshare cadence/redact-external-content",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/memory-guard cadence/terminology cadence/orphaned-todos cadence/prevent-secret-writes cadence/env-vars cadence/line-endings cadence/warn-overshare cadence/redact-external-content cadence/warn-instruction-narrative cadence/warn-plugin-root-cruft",
             "timeout": 10
           },
           {
@@ -202,6 +202,12 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session warn-commit-provenance",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-held-close --ledger \"${CLAUDE_PLUGIN_ROOT}/config/held-issues.txt\"",
             "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
             "timeout": 5
           }
