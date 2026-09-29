@@ -116,6 +116,46 @@ pub enum BodySource {
 /// removed) needs to know which bodies are words, since doing the same to a
 /// file's contents would scan text nobody posts.
 pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, BodySource)> {
+    extract_body_reads(segment, base_dir)
+        .into_iter()
+        .filter_map(|read| match read {
+            BodyRead::Text(text, source) => Some((text, source)),
+            BodyRead::Stdin | BodyRead::Unread { .. } => None,
+        })
+        .collect()
+}
+
+/// One body flag's outcome: the text, or the reason there is none. What
+/// [`extract_bodies_sourced`] drops silently, a caller that must say so can
+/// read here (cadence-hooks#1171).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyRead {
+    /// The body text, tagged by where it came from.
+    Text(String, BodySource),
+    /// `--body-file -` / `-F -`: the body is standard input, which the flag
+    /// itself does not carry.
+    Stdin,
+    /// A file-body flag whose file yielded no text.
+    Unread { path: String, why: BodyFileError },
+}
+
+/// Read one file-body flag's value: standard input for `-`, else the file.
+pub fn read_body_flag(path: &str, base_dir: &str) -> BodyRead {
+    if path == "-" {
+        return BodyRead::Stdin;
+    }
+    match read_body_file(path, base_dir) {
+        Ok(text) => BodyRead::Text(text, BodySource::File),
+        Err(why) => BodyRead::Unread {
+            path: path.to_string(),
+            why,
+        },
+    }
+}
+
+/// [`extract_bodies_sourced`] that also reports the flags that named standard
+/// input or a file it could not read.
+pub fn extract_body_reads(segment: &str, base_dir: &str) -> Vec<BodyRead> {
     let tokens = tokenize(segment);
     let mut bodies = Vec::new();
     let mut i = 0;
@@ -126,7 +166,7 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
         if matches!(name.as_ref(), "--body" | "-b" | "-m" | "--message")
             && let Some(v) = tokens.get(i + 1)
         {
-            bodies.push((v.clone(), BodySource::Word));
+            bodies.push(BodyRead::Text(v.clone(), BodySource::Word));
             i += 2;
             continue;
         }
@@ -136,9 +176,7 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
         if matches!(name.as_ref(), "--body-file" | "-F")
             && let Some(p) = tokens.get(i + 1)
         {
-            if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push((content, BodySource::File));
-            }
+            bodies.push(read_body_flag(p, base_dir));
             i += 2;
             continue;
         }
@@ -146,27 +184,23 @@ pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, Bod
         if let Some(v) =
             strip_flag_prefix(tok, "--body=").or_else(|| strip_flag_prefix(tok, "--message="))
         {
-            bodies.push((v.to_string(), BodySource::Word));
+            bodies.push(BodyRead::Text(v.to_string(), BodySource::Word));
             i += 1;
             continue;
         }
         if let Some(p) = strip_flag_prefix(tok, "--body-file=") {
-            if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push((content, BodySource::File));
-            }
+            bodies.push(read_body_flag(p, base_dir));
             i += 1;
             continue;
         }
         // Glued short forms: `-mMSG`, `-bBODY` (literal), `-FPATH` (file).
         if let Some(v) = glued_short_value(tok, "-m").or_else(|| glued_short_value(tok, "-b")) {
-            bodies.push((v.to_string(), BodySource::Word));
+            bodies.push(BodyRead::Text(v.to_string(), BodySource::Word));
             i += 1;
             continue;
         }
         if let Some(p) = glued_short_value(tok, "-F") {
-            if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push((content, BodySource::File));
-            }
+            bodies.push(read_body_flag(p, base_dir));
             i += 1;
             continue;
         }
@@ -353,6 +387,55 @@ impl ApiRequest {
         e = e.strip_prefix("api/v3/").unwrap_or(e);
         e.split(['?', '#']).next().unwrap_or(e)
     }
+
+    /// The endpoint's query string as percent-decoded (key, value) pairs:
+    /// `repos/o/r/issues?title=a%20b&x` → `[("title", "a b"), ("x", "")]`.
+    /// Whatever follows a `#` is not sent. A non-GET request posts these as
+    /// part of the request, so a scanner reads them as posted text
+    /// (cadence-hooks#1171).
+    pub fn query_pairs(&self) -> Vec<(String, String)> {
+        let Some((_, query)) = self.endpoint.split_once('?') else {
+            return Vec::new();
+        };
+        let query = query.split('#').next().unwrap_or(query);
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                (percent_decode(k), percent_decode(v))
+            })
+            .collect()
+    }
+}
+
+/// Decode a URL query component: `%XX` bytes and `+` as a space. A `%` not
+/// followed by two hex digits stays literal; invalid UTF-8 is replaced, so the
+/// result is always text a scanner can read.
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hex = |b: u8| (b as char).to_digit(16);
+                if let (Some(h), Some(l)) = (
+                    bytes.get(i + 1).copied().and_then(hex),
+                    bytes.get(i + 2).copied().and_then(hex),
+                ) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `gh api` flags whose value is the following token (or `=`-joined, or glued

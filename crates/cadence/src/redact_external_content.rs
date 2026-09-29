@@ -57,12 +57,13 @@
 //! nudge mode, silent failure beats false positives.
 
 use cadence_hooks_core::gh_bodies::{
-    ApiField, ApiRequest, BodySource, extract_bodies_sourced, flag_values, parse_gh_api,
-    read_body_file, strip_flag_prefix,
+    ApiField, ApiRequest, BodyFileError, BodyRead, BodySource, extract_body_reads, flag_values,
+    parse_gh_api, read_body_flag, strip_flag_prefix,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
-    skip_git_global_options, strip_quotes, unescape_word,
+    command_segments, command_word, executable_tokens, gh_command_path, heredoc_introducers,
+    peel_command_runners, redirect_operator_span, skip_git_global_options, split_segments_with_ops,
+    strip_quotes, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 mod identity;
@@ -180,7 +181,12 @@ const GH_POST_GROUPS: &[&str] = &["pr", "issue", "release", "gist", "discussion"
 const GH_POST_VERBS: &[&str] = &["create", "comment", "edit", "review", "reopen"];
 /// Posting `gh` commands outside the group × verb grid above: a merge commit's
 /// subject and body, and a repository's description.
-const GH_EXTRA_POSTS: &[(&str, &[&str])] = &[("pr", &["merge"]), ("repo", &["create", "edit"])];
+/// A label's description is posted text too (cadence-hooks#1171).
+const GH_EXTRA_POSTS: &[(&str, &[&str])] = &[
+    ("pr", &["merge"]),
+    ("repo", &["create", "edit"]),
+    ("label", &["create", "edit"]),
+];
 const TEA_POST_GROUPS: &[&str] = &["pr", "issue"];
 const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
 
@@ -248,7 +254,11 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
 /// allowed; a mutation — or a query the hook cannot see (`-F query=@file`,
 /// stdin) — publishes.
 fn api_posts(req: &ApiRequest) -> bool {
-    if !req.sends_payload() || (!req.has_fields && req.input.is_none()) {
+    // An endpoint query string is sent with a non-GET request, so it carries
+    // text as a field does (cadence-hooks#1171).
+    if !req.sends_payload()
+        || (!req.has_fields && req.input.is_none() && req.query_pairs().is_empty())
+    {
         return false;
     }
     if req.endpoint_path() != "graphql" || req.input.is_some() {
@@ -269,22 +279,261 @@ static GRAPHQL_MUTATION: LazyLock<Regex> =
 /// One text a segment publishes, tagged with where it came from.
 type Posted = (String, BodySource);
 
+/// Everything a gate-passing segment yields while its texts are collected: the
+/// texts, the reasons some text could not be read, and whether the command
+/// reads a body from standard input.
+#[derive(Default)]
+struct Sink {
+    texts: Vec<Posted>,
+    /// One stderr line per text the identity scan could not read
+    /// (cadence-hooks#1171). Never a verdict: the scan still fails open.
+    notes: Vec<String>,
+    /// Set while collecting one segment: a flag names standard input.
+    stdin: bool,
+}
+
+impl Sink {
+    fn word(&mut self, text: String) {
+        self.texts.push((text, BodySource::Word));
+    }
+
+    /// Fold one body flag's outcome in: text kept, standard input flagged,
+    /// an unread file reported.
+    fn read(&mut self, read: BodyRead) {
+        match read {
+            BodyRead::Text(text, source) => self.texts.push((text, source)),
+            BodyRead::Stdin => self.stdin = true,
+            BodyRead::Unread { path, why } => self.notes.push(unread_note(&path, why)),
+        }
+    }
+
+    /// A file-valued flag's contents (`-` is standard input).
+    fn file(&mut self, path: &str, base_dir: &str) {
+        self.read(read_body_flag(path, base_dir));
+    }
+}
+
+/// The stderr line for a file the identity scan could not read. The path is
+/// the operator's own text, so it goes through [`stderr_safe`] like every
+/// other value this guard prints.
+fn unread_note(path: &str, why: BodyFileError) -> String {
+    let why = match why {
+        BodyFileError::Unreadable => "missing or unreadable".to_string(),
+        BodyFileError::NotRegular => "not a regular file".to_string(),
+        BodyFileError::NotUtf8 => "not valid UTF-8".to_string(),
+        BodyFileError::OverCap => format!(
+            "over {} bytes",
+            cadence_hooks_core::paths::MAX_UNTRUSTED_CONFIG_BYTES
+        ),
+    };
+    format!(
+        "redact-external-content: identity scan could not read {}: {why}",
+        stderr_safe(path)
+    )
+}
+
+const STDIN_NOTE: &str = "redact-external-content: identity scan could not see the text this \
+     command reads from standard input (only a heredoc, a here-string or an echo/printf \
+     literal piped into it is visible)";
+
+/// Every text the gate-passing segments of `command` publish, and the notes
+/// for what could not be read. Callers gate first (#424) — file-valued flags
+/// are read here.
+fn gather_posted(command: &str, base_dir: &str) -> (Vec<Posted>, Vec<String>) {
+    let mut sink = Sink::default();
+    let mut stdin = StdinResolver::new(command);
+    for segment in command_segments(command) {
+        if is_external_post(&segment) {
+            posted_texts(&segment, base_dir, &mut stdin, &mut sink);
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    sink.notes.retain(|n| seen.insert(n.clone()));
+    (sink.texts, sink.notes)
+}
+
 /// Every text ONE gate-passing segment publishes: body flags, titles and
-/// descriptions, or a `gh api` request's fields. Callers gate first (#424) —
-/// file-valued flags are read here.
-fn posted_texts(segment: &str, base_dir: &str) -> Vec<Posted> {
+/// descriptions, or a `gh api` request's fields.
+fn posted_texts(segment: &str, base_dir: &str, stdin: &mut StdinResolver, sink: &mut Sink) {
     let tokens = executable_tokens(segment);
     let argv = peel_command_runners(&tokens);
+    sink.stdin = false;
     if let Some(req) = parse_gh_api(argv) {
-        return api_texts(&req, base_dir);
+        api_texts(&req, base_dir, sink);
+    } else {
+        for read in extract_body_reads(segment, base_dir) {
+            sink.read(read);
+        }
+        headline_texts(argv, base_dir, sink);
     }
-    let mut texts = extract_bodies_sourced(segment, base_dir);
-    texts.extend(headline_texts(argv, base_dir));
-    texts
+    if sink.stdin {
+        match stdin.resolve(segment) {
+            Some(texts) => sink.texts.extend(texts),
+            None => sink.notes.push(STDIN_NOTE.to_string()),
+        }
+    }
+}
+
+/// The text the shell feeds a segment's standard input, where the command
+/// line shows it (cadence-hooks#1171): a heredoc or here-string on the segment
+/// itself, or — for a segment that follows a `|` — a heredoc or here-string on
+/// `cat`, or the literals of `echo`/`printf`, in the stage before it. `None`
+/// where it is not visible (a file, another command's output, an expansion).
+///
+/// Built once per command and lazily, so a command that never reads standard
+/// input pays nothing, and a flood of identical segments is resolved once.
+struct StdinResolver<'a> {
+    command: &'a str,
+    ops: Option<Vec<(String, Option<&'static str>)>>,
+    heredocs: Option<Vec<HeredocLine>>,
+    cache: HashMap<String, Option<Vec<Posted>>>,
+}
+
+/// A command line that introduces heredocs, with each body and the byte offset
+/// of the operator that owns it.
+struct HeredocLine {
+    text: String,
+    bodies: Vec<(usize, String)>,
+}
+
+impl<'a> StdinResolver<'a> {
+    fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            ops: None,
+            heredocs: None,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, segment: &str) -> Option<Vec<Posted>> {
+        if let Some(hit) = self.cache.get(segment) {
+            return hit.clone();
+        }
+        let resolved = self.resolve_uncached(segment);
+        self.cache.insert(segment.to_string(), resolved.clone());
+        resolved
+    }
+
+    fn resolve_uncached(&mut self, segment: &str) -> Option<Vec<Posted>> {
+        // A redirect on the segment beats a pipe into it.
+        let own = self.redirected(segment);
+        if !own.is_empty() {
+            return Some(own);
+        }
+        let ops = self
+            .ops
+            .get_or_insert_with(|| split_segments_with_ops(self.command));
+        let idx = ops.iter().position(|(s, _)| s == segment)?;
+        if idx == 0 || !matches!(ops[idx - 1].1, Some("|" | "|&")) {
+            return None;
+        }
+        let stage = ops[idx - 1].0.clone();
+        self.piped(&stage)
+    }
+
+    /// The heredoc bodies and here-string words `segment` itself redirects in.
+    fn redirected(&mut self, segment: &str) -> Vec<Posted> {
+        let mut out: Vec<Posted> = Vec::new();
+        let tokens = executable_tokens(segment);
+        for (i, tok) in tokens.iter().enumerate() {
+            if tok == "<<<" {
+                if let Some(word) = tokens.get(i + 1) {
+                    out.push((word.clone(), BodySource::Word));
+                }
+            } else if let Some(word) = tok.strip_prefix("<<<") {
+                out.push((word.to_string(), BodySource::Word));
+            }
+        }
+        let starts: Vec<usize> = heredoc_introducers(segment)
+            .iter()
+            .map(|i| i.start)
+            .collect();
+        if starts.is_empty() {
+            return out;
+        }
+        let heredocs = self
+            .heredocs
+            .get_or_insert_with(|| heredoc_lines(self.command));
+        for line in heredocs.iter() {
+            let Some(at) = line.text.find(segment) else {
+                continue;
+            };
+            for (start, body) in &line.bodies {
+                if *start >= at && *start < at + segment.len() {
+                    out.push((body.clone(), BodySource::File));
+                }
+            }
+        }
+        out
+    }
+
+    /// What the stage before a `|` writes, when its literals show it.
+    fn piped(&mut self, stage: &str) -> Option<Vec<Posted>> {
+        let tokens = executable_tokens(stage);
+        let argv = peel_command_runners(&tokens);
+        let head = command_word(argv.first()?).into_owned();
+        match head.as_str() {
+            "echo" | "printf" => {
+                let mut args = &argv[1..];
+                if head == "echo" {
+                    while let Some(flag) = args.first()
+                        && flag.len() > 1
+                        && flag.starts_with('-')
+                        && flag[1..].chars().all(|c| "neE".contains(c))
+                    {
+                        args = &args[1..];
+                    }
+                }
+                Some(vec![(args.join(" "), BodySource::Word)])
+            }
+            // `cat` only relays what a redirect gave it; `cat FILE` is a file
+            // the hook does not read here.
+            "cat" => {
+                let fed = self.redirected(stage);
+                (!fed.is_empty()).then_some(fed)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Every command line of `command` that introduces heredocs, with each body
+/// read to its terminator line (to the end of the text when none is found, the
+/// see-more direction).
+fn heredoc_lines(command: &str) -> Vec<HeredocLine> {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut next = i + 1;
+        let mut bodies = Vec::new();
+        for intro in heredoc_introducers(lines[i]) {
+            let mut body = String::new();
+            while next < lines.len() {
+                let line = lines[next];
+                next += 1;
+                if line == intro.word || line.trim_start_matches('\t') == intro.word {
+                    break;
+                }
+                body.push_str(line);
+                body.push('\n');
+            }
+            bodies.push((intro.start, body));
+        }
+        if !bodies.is_empty() {
+            out.push(HeredocLine {
+                text: lines[i].to_string(),
+                bodies,
+            });
+        }
+        i = next;
+    }
+    out
 }
 
 /// The value the shell passes for one posted text, when it differs from the
-/// text as extracted — the second spelling the identity tier scans.
+/// text as extracted — the second spelling every tier scans.
 ///
 /// A file's bytes are posted as they are. A command-line word arrives from the
 /// tokenizer with its quotes removed and any `$'…'` escapes decoded, but with
@@ -306,12 +555,12 @@ fn shell_passed_value((text, source): &Posted) -> Option<String> {
 }
 
 /// Literal- and file-valued flags a posting command publishes beyond the body
-/// flags [`extract_bodies`] reads. Keyed by command,
+/// flags [`extract_body_reads`] reads. Keyed by command,
 /// because a letter means different things per command: `gh repo create -t`
 /// is a team and `git commit -t` a template file, neither of them text.
-fn headline_texts(argv: &[String], base_dir: &str) -> Vec<Posted> {
+fn headline_texts(argv: &[String], base_dir: &str, sink: &mut Sink) {
     let Some(head) = argv.first() else {
-        return Vec::new();
+        return;
     };
     let rest = &argv[1..];
     let mut literal: Vec<(&str, Option<char>)> = Vec::new();
@@ -326,8 +575,15 @@ fn headline_texts(argv: &[String], base_dir: &str) -> Vec<Posted> {
                     file.push(("--notes-file", None));
                 }
             }
-            Some(g) if g == "gist" => literal.push(("--desc", Some('d'))),
-            Some(g) if g == "repo" => literal.push(("--description", Some('d'))),
+            Some(g) if g == "gist" => {
+                literal.push(("--desc", Some('d')));
+                for path in gist_file_operands(argv) {
+                    sink.file(&path, base_dir);
+                }
+            }
+            Some(g) if g == "repo" || g == "label" => {
+                literal.push(("--description", Some('d')));
+            }
             _ => {}
         },
         "tea" => {
@@ -336,46 +592,113 @@ fn headline_texts(argv: &[String], base_dir: &str) -> Vec<Posted> {
         }
         "git" => {
             file.push(("--file", None));
-            return git_commit_texts(rest, base_dir, &file);
+            git_commit_texts(rest, base_dir, &file, sink);
+            return;
         }
         _ => {}
     }
-    let mut texts: Vec<Posted> = Vec::new();
     for (long, short) in literal {
-        texts.extend(words(flag_values(rest, long, short)));
+        for v in flag_values(rest, long, short) {
+            sink.word(v);
+        }
     }
     for (long, short) in file {
         for path in flag_values(rest, long, short) {
-            texts.extend(read_file_text(&path, base_dir));
+            sink.file(&path, base_dir);
         }
     }
-    texts
 }
 
-/// Command-line values, tagged as words.
-fn words(values: Vec<String>) -> impl Iterator<Item = Posted> {
-    values.into_iter().map(|v| (v, BodySource::Word))
-}
-
-/// A file-valued flag's contents, tagged as a file; nothing when unreadable.
-fn read_file_text(path: &str, base_dir: &str) -> Option<Posted> {
-    read_body_file(path, base_dir)
-        .ok()
-        .map(|t| (t, BodySource::File))
+/// The local files `gh gist create` or `gh gist edit` publishes: every file
+/// operand of `create` (`-`, and no operand at all, is standard input); the
+/// operands after the gist id of `edit`, and its `--add` file. Each is read as
+/// a `--body-file` is (cadence-hooks#1171).
+fn gist_file_operands(argv: &[String]) -> Vec<String> {
+    let mut words = argv[1..].iter().map(String::as_str).enumerate();
+    // The verb follows the `gist` group word; global flags may sit between.
+    let mut verb: Option<(usize, String)> = None;
+    let mut seen_group = false;
+    for (i, w) in words.by_ref() {
+        let name = unescape_word(w);
+        if !seen_group {
+            seen_group = name == "gist";
+        } else if !name.starts_with('-') {
+            verb = Some((i, name.into_owned()));
+            break;
+        }
+    }
+    let Some((at, verb)) = verb else {
+        return Vec::new();
+    };
+    if verb != "create" && verb != "edit" {
+        return Vec::new();
+    }
+    let operands = &argv[1 + at + 1..];
+    let mut positional: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < operands.len() {
+        let tok = operands[i].as_str();
+        let name = unescape_word(tok);
+        // A redirection (`<<EOF`, `2>&1`, `> out`) is not an operand, nor is
+        // the target word of a bare operator.
+        if let Some((_, bare)) = redirect_operator_span(tok) {
+            i += if bare { 2 } else { 1 };
+            continue;
+        }
+        if name == "--" {
+            positional.extend(operands[i + 1..].iter().cloned());
+            break;
+        }
+        if matches!(
+            name.as_ref(),
+            "--desc" | "-d" | "--filename" | "-f" | "--remove" | "-r"
+        ) {
+            i += 2;
+            continue;
+        }
+        if matches!(name.as_ref(), "--add" | "-a") {
+            added.extend(operands.get(i + 1).cloned());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = strip_flag_prefix(tok, "--add=") {
+            added.push(v.to_string());
+        } else if name.len() > 1 && name.starts_with('-') {
+            // A boolean or `=`-joined flag: no operand.
+        } else {
+            positional.push(tok.to_string());
+        }
+        i += 1;
+    }
+    if verb == "create" {
+        if positional.is_empty() {
+            positional.push("-".to_string());
+        }
+    } else {
+        // The first operand of `edit` is the gist id or URL.
+        positional.drain(..positional.len().min(1));
+    }
+    positional.extend(added);
+    positional
 }
 
 /// `git commit`'s messages beyond `-m`/`-F`: `--file`, and `-m`/`-F` bundled
 /// behind git's boolean short flags (`-am msg`, `-vmmsg`, `-aF path`), which
-/// git parses as the flags one by one and [`extract_bodies`] reads as a word
-/// that is neither.
-fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>)]) -> Vec<Posted> {
+/// git parses as the flags one by one and [`extract_body_reads`] reads as a
+/// word that is neither.
+fn git_commit_texts(
+    rest: &[String],
+    base_dir: &str,
+    file: &[(&str, Option<char>)],
+    sink: &mut Sink,
+) {
     /// git commit's short flags that take no value, so a bundle can continue
     /// past them.
     const BOOLEAN_SHORTS: &str = "aeinopqsvz";
-    let mut texts: Vec<Posted> = Vec::new();
     for (long, short) in file {
         for path in flag_values(rest, long, *short) {
-            texts.extend(read_file_text(&path, base_dir));
+            sink.file(&path, base_dir);
         }
     }
     for (i, tok) in rest.iter().enumerate() {
@@ -391,7 +714,7 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
         let Some(at) = bundle.find(['m', 'F']) else {
             continue;
         };
-        // A bare `-m`/`-F` or a glued `-mMSG` is extract_bodies' to read.
+        // A bare `-m`/`-F` or a glued `-mMSG` is extract_body_reads' to read.
         if at == 0 || !bundle[..at].chars().all(|c| BOOLEAN_SHORTS.contains(c)) {
             continue;
         }
@@ -407,42 +730,48 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
             Some(glued)
         };
         match (value, &bundle[at..=at]) {
-            (Some(v), "m") => texts.push((v.to_string(), BodySource::Word)),
-            (Some(p), _) => texts.extend(read_file_text(p, base_dir)),
+            (Some(v), "m") => sink.word(v.to_string()),
+            (Some(p), _) => sink.file(p, base_dir),
             (None, _) => {}
         }
     }
-    texts
 }
 
 /// Every text a publishing `gh api` request carries: each field's key and
-/// value (a `-F key=@path` value read from its file), and the `--input` file —
-/// its JSON strings, keys included, or its raw text when it is not JSON, since
-/// gh sends the bytes as they are. `@-` and `--input -` are standard input,
-/// which the hook cannot see.
-fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<Posted> {
-    let mut texts: Vec<Posted> = Vec::new();
+/// value (a `-F key=@path` value read from its file), the percent-decoded
+/// query string of the endpoint, and the `--input` file — its JSON strings,
+/// keys included, or its raw text when it is not JSON, since gh sends the
+/// bytes as they are. `@-` and `--input -` are standard input, which the
+/// caller resolves where the command line shows it.
+fn api_texts(req: &ApiRequest, base_dir: &str, sink: &mut Sink) {
     for (key, field) in &req.fields {
-        texts.push((key.clone(), BodySource::Word));
+        sink.word(key.clone());
         match field {
-            ApiField::Literal(v) => texts.push((v.clone(), BodySource::Word)),
-            ApiField::File(p) => texts.extend(read_file_text(p, base_dir)),
-            ApiField::Stdin => {}
+            ApiField::Literal(v) => sink.word(v.clone()),
+            ApiField::File(p) => sink.file(p, base_dir),
+            ApiField::Stdin => sink.stdin = true,
         }
     }
-    if let Some(ApiField::File(p)) = &req.input
-        && let Ok(raw) = read_body_file(p, base_dir)
-    {
-        match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(value) => {
-                let mut strings = Vec::new();
-                json_strings(&value, &mut strings);
-                texts.extend(strings.into_iter().map(|t| (t, BodySource::File)));
-            }
-            Err(_) => texts.push((raw, BodySource::File)),
-        }
+    for (key, value) in req.query_pairs() {
+        sink.word(key);
+        sink.word(value);
     }
-    texts
+    match &req.input {
+        Some(ApiField::File(p)) => match read_body_flag(p, base_dir) {
+            BodyRead::Text(raw, _) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(value) => {
+                    let mut strings = Vec::new();
+                    json_strings(&value, &mut strings);
+                    sink.texts
+                        .extend(strings.into_iter().map(|t| (t, BodySource::File)));
+                }
+                Err(_) => sink.texts.push((raw, BodySource::File)),
+            },
+            other => sink.read(other),
+        },
+        Some(ApiField::Stdin) => sink.stdin = true,
+        _ => {}
+    }
 }
 
 /// Collect every string in a JSON document, object keys included. Decoding
@@ -668,10 +997,13 @@ impl Check for RedactExternalContent {
         // Quote-strip each segment first so a body merely mentioning `gh pr
         // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
-        let mut bodies: Vec<Posted> = Vec::new();
-        for segment in command_segments(command) {
-            if is_external_post(&segment) {
-                bodies.extend(posted_texts(&segment, &base_dir));
+        let (bodies, notes) = gather_posted(command, &base_dir);
+        // A text the identity scan could not read is said once on stderr, and
+        // only where the tier is armed — a machine with no term source has
+        // nothing the scan failed to do. The verdict is unchanged: fail open.
+        if identity_list.is_armed() {
+            for note in &notes {
+                eprintln!("{note}");
             }
         }
         if bodies.is_empty() {
@@ -705,16 +1037,32 @@ impl Check for RedactExternalContent {
             let body = posted.0.as_str();
             // Config-blind by signature — no config, no tier, no allowlist.
             // The value the shell actually passes is scanned too, when it
-            // differs; the shaped tiers read the text as written only, since
-            // they list every occurrence and a second spelling would repeat
-            // them.
-            for text in std::iter::once(body.to_string()).chain(shell_passed_value(posted)) {
+            // differs.
+            let passed = shell_passed_value(posted);
+            for text in std::iter::once(body.to_string()).chain(passed.clone()) {
                 if !identity_seen.contains(&text) {
                     identity_hits.extend(identity::scan_identity(&text, &identity_list, None));
                     identity_seen.insert(text);
                 }
             }
-            hits.extend(scan_body(body, &config, d));
+            // The shaped tiers read both spellings too (`cadence\:attune`
+            // posts `cadence:attune`), but list every occurrence, so a hit
+            // the as-written text already produced is not listed a second
+            // time: only the surplus the shell's reading adds.
+            let mut written = scan_body(body, &config, d);
+            let mut seen: HashMap<(&'static str, String), usize> = HashMap::new();
+            for hit in &written {
+                *seen.entry((hit.category, hit.snippet.clone())).or_default() += 1;
+            }
+            if let Some(passed) = &passed {
+                for hit in scan_body(passed, &config, d) {
+                    match seen.get_mut(&(hit.category, hit.snippet.clone())) {
+                        Some(n) if *n > 0 => *n -= 1,
+                        _ => written.push(hit),
+                    }
+                }
+            }
+            hits.extend(written);
         }
 
         // Config warnings ride the nudge channel (exit 0 / stdout → lands in
