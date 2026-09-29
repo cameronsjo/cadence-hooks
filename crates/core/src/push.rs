@@ -154,7 +154,8 @@ pub struct PushInvocation {
 /// push, and a scanner that only looked at top-level segments would miss it.
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    collect_push_invocations(command, cwd, 0, Doubt::default(), true, &mut out);
+    let walk = Walk::for_command(command, true);
+    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
     out
 }
 
@@ -167,8 +168,77 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// publishes (cadence-hooks#1095).
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    collect_push_invocations(command, cwd, 0, Doubt::default(), false, &mut out);
+    let walk = Walk::for_command(command, false);
+    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
     out
+}
+
+/// What a scope cannot vouch for, carried into the scripts it spawns.
+#[derive(Debug, Clone, Copy, Default)]
+struct Doubt {
+    /// A which-repository cause: see [`PushInvocation::repository_unresolved`].
+    repository: bool,
+    /// An unfollowable directory change: see
+    /// [`PushInvocation::directory_unverified`].
+    directory: bool,
+}
+
+/// Settings for one whole walk, the same at every depth.
+#[derive(Debug, Clone, Copy)]
+struct Walk {
+    /// Ask the repository how a bare push computes its refs.
+    probe_config: bool,
+    /// The command cannot have replaced `git` or `ssh-agent`, so a known
+    /// substitution may be read by name — see
+    /// [`may_redefine_known_commands`].
+    trusts_known_commands: bool,
+}
+
+impl Walk {
+    fn for_command(command: &str, probe_config: bool) -> Self {
+        Self {
+            probe_config,
+            trusts_known_commands: !may_redefine_known_commands(command),
+        }
+    }
+}
+
+/// Could this command change what `git` or `ssh-agent` runs, before a
+/// substitution of either is read by name (cadence-hooks#1095 review)?
+///
+/// The two allows — `cd "$(git rev-parse --show-toplevel)"` and
+/// `eval "$(ssh-agent -s)"` — trust the command NAMES. A function or alias
+/// named either (`ssh-agent(){ echo "cd /x"; }`), a `PATH` assignment or export,
+/// `hash`, `enable`, a sourced file, or a `BASH_ENV=`/`ENV=` start-up file can
+/// each make the name run something else. Matched on the raw text, quotes and
+/// all, so a mention inside a message also disables the allows: that only
+/// costs a nudge or a block, and never an allow the command did not earn. Any
+/// `alias` at all counts, since `shopt -s expand_aliases` can arrive by the
+/// same routes.
+fn may_redefine_known_commands(command: &str) -> bool {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?:git|ssh-agent)[ \t]*\([ \t]*\)",
+            r"|\bfunction[ \t]+\\?(?:git|ssh-agent)\b",
+            r"|\balias\b|\bhash\b|\benable\b|\bsource\b",
+            r"|(?:^|[;&|(\n])[ \t]*\.[ \t]",
+            r"|\bPATH\+?=",
+            r"|\b(?:export|declare|typeset|readonly|local)\b[^;&|\n]*\bPATH\b",
+            r"|\b(?:BASH_ENV|ENV)=",
+        ))
+        .expect("pattern should compile")
+    });
+    PATTERN.is_match(command)
+}
+
+/// Is every `$(…)` and backtick in this segment one the shell will expand?
+/// Deliberately coarse: a segment with any single quote or backslash is
+/// answered `false`, so `cd '$(git rev-parse --show-toplevel)'` — a literal
+/// directory name after quote removal, which the tokens no longer show — cannot
+/// pass for the substitution it spells (cadence-hooks#1095 review). Double
+/// quotes do not stop expansion and are allowed.
+fn substitutions_are_live(segment: &str) -> bool {
+    !segment.contains(['\'', '\\'])
 }
 
 /// Recursive worker for [`push_invocations`], mirroring
@@ -185,22 +255,12 @@ pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// `inherited_env` to close, reopened here until this parameter landed. It
 /// carries an unfollowable directory change for the same reason: a child starts
 /// in the parent's cwd, so a cwd the parent lost is lost for the child too.
-/// What a scope cannot vouch for, carried into the scripts it spawns.
-#[derive(Debug, Clone, Copy, Default)]
-struct Doubt {
-    /// A which-repository cause: see [`PushInvocation::repository_unresolved`].
-    repository: bool,
-    /// An unfollowable directory change: see
-    /// [`PushInvocation::directory_unverified`].
-    directory: bool,
-}
-
 fn collect_push_invocations(
     script: &str,
     cwd: &str,
     depth: usize,
     inherited: Doubt,
-    probe_config: bool,
+    walk: Walk,
     out: &mut Vec<PushInvocation>,
 ) {
     let mut effective_dir = cwd.to_string();
@@ -316,6 +376,17 @@ fn collect_push_invocations(
             scope_unresolved = true;
         }
         let segment_unresolved = scope_unresolved || prefix_redirect;
+        // Known substitutions are read by name only when nothing in the
+        // command can have redefined the name and the segment has no quoting
+        // that could make the text a literal (cadence-hooks#1095 review).
+        let known_ok = walk.trusts_known_commands && substitutions_are_live(segment);
+        // `env -C DIR`/`--chdir=DIR` runs this segment's command in DIR — and
+        // any child script it starts — without moving the scope.
+        let (segment_dir, segment_directory) = match env_chdir(prefix) {
+            EnvChdir::Stay => (effective_dir.clone(), scope_directory),
+            EnvChdir::To(dir) => (resolve_cd_target(dir, &effective_dir), scope_directory),
+            EnvChdir::Unreadable => (effective_dir.clone(), true),
+        };
 
         // Children run with the directory in effect HERE — a substitution is
         // evaluated before its own segment runs — and in their OWN scope, so
@@ -330,24 +401,25 @@ fn collect_push_invocations(
         if depth < MAX_WRAPPER_DEPTH {
             let child_doubt = Doubt {
                 repository: segment_unresolved || installs_trap_action(argv),
-                directory: scope_directory,
+                directory: segment_directory,
             };
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(
-                    &child,
-                    &effective_dir,
-                    depth + 1,
-                    child_doubt,
-                    probe_config,
-                    out,
-                );
+                collect_push_invocations(&child, &segment_dir, depth + 1, child_doubt, walk, out);
             }
         }
 
-        match directory_verb(&tokens) {
+        match directory_verb(&tokens, known_ok) {
             Some(DirectoryVerb::Knowable(verb_tokens)) => {
-                match resolve_directory_verb(verb_tokens, &effective_dir) {
-                    Some(moved) => effective_dir = moved,
+                match resolve_directory_verb(verb_tokens, &effective_dir, known_ok) {
+                    Some((moved, absolute)) => {
+                        effective_dir = moved;
+                        // A literal absolute target is where the shell is now,
+                        // whatever came before it, so the directory doubt ends
+                        // here. A which-repository doubt does not.
+                        if absolute {
+                            scope_directory = false;
+                        }
+                    }
                     // The target could not be read. Keeping the pre-`cd`
                     // directory and saying nothing is the trap — see
                     // [`resolve_directory_verb`].
@@ -368,31 +440,104 @@ fn collect_push_invocations(
             None => {}
         }
 
-        if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &effective_dir) {
-            invocation.unresolved |= segment_unresolved || scope_directory;
+        if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &segment_dir, known_ok)
+        {
+            invocation.unresolved |= segment_unresolved || segment_directory;
             invocation.repository_unresolved |= segment_unresolved;
-            invocation.directory_unverified |= scope_directory;
+            invocation.directory_unverified |= segment_directory;
             // Only an implicit refspec stands on the `push.default`
             // computation; a named one replaces it, so the config question does
             // not arise and no git call is made.
-            if probe_config && invocation.refspecs.iter().all(|refspec| refspec.implicit) {
+            if walk.probe_config && invocation.refspecs.iter().all(|refspec| refspec.implicit) {
                 invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
             }
             out.push(invocation);
-        } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &effective_dir)
-        {
+        } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &segment_dir) {
             out.push(PushInvocation {
-                work_dir: effective_dir.clone(),
+                work_dir: segment_dir.clone(),
                 refspecs: Vec::new(),
                 all_or_mirror: false,
                 tags: false,
                 dry_run: false,
                 unresolved: true,
                 repository_unresolved: true,
-                directory_unverified: scope_directory,
+                directory_unverified: segment_directory,
                 repository: None,
             });
         }
+    }
+}
+
+/// Where an `env` in a segment's prefix words runs its command.
+enum EnvChdir<'a> {
+    /// No `-C`/`--chdir`.
+    Stay,
+    /// A literal directory, resolved against the scope's directory.
+    To(&'a str),
+    /// A target carrying `$` or a backtick.
+    Unreadable,
+}
+
+/// Read `env -C DIR` / `--chdir DIR` / `--chdir=DIR` (and `-C` inside a short
+/// cluster, `-iC DIR`) out of the prefix words the runner peel removed. The
+/// peel steps over `-C` as a value flag and so never looked at the directory:
+/// `env -C /other git push origin main` pushed from `/other` while the walk
+/// reported the scope's own directory (cadence-hooks#1095 review). The last
+/// `-C` wins, and an `env` whose options this cannot read yields `Stay`: the
+/// peel then refuses at that `env` too, so no push is resolved past it.
+fn env_chdir(prefix: &[String]) -> EnvChdir<'_> {
+    let mut found: Option<&str> = None;
+    let mut in_env = false;
+    let mut idx = 0;
+    while let Some(raw) = prefix.get(idx) {
+        idx += 1;
+        if command_word(raw) == "env" {
+            in_env = true;
+            continue;
+        }
+        if !in_env {
+            continue;
+        }
+        let word = unescape_word(raw);
+        if !word.starts_with('-') || word.as_ref() == "-" || word.as_ref() == "--" {
+            // An assignment operand keeps `env` reading; anything else is the
+            // next runner in the prefix.
+            in_env = word.contains('=') || word.as_ref() == "--";
+            continue;
+        }
+        if let Some(value) = raw.strip_prefix("--chdir=") {
+            found = Some(value);
+        } else if word.as_ref() == "--chdir" {
+            found = prefix.get(idx).map(String::as_str);
+            idx += 1;
+        } else if word.as_ref() == "--unset" {
+            idx += 1;
+        } else if !word.starts_with("--") {
+            let cluster = &raw[raw.find('-').map_or(0, |at| at + 1)..];
+            for (pos, c) in cluster.char_indices() {
+                let glued = &cluster[pos + c.len_utf8()..];
+                if c == 'C' {
+                    if glued.is_empty() {
+                        found = prefix.get(idx).map(String::as_str);
+                        idx += 1;
+                    } else {
+                        found = Some(glued);
+                    }
+                    break;
+                }
+                if matches!(c, 'u' | 'P') {
+                    if glued.is_empty() {
+                        idx += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    match found {
+        None => EnvChdir::Stay,
+        Some(dir) if dir.contains(['$', '`']) => EnvChdir::Unreadable,
+        Some(dir) => EnvChdir::To(dir),
     }
 }
 
@@ -485,7 +630,7 @@ fn names_a_push(tokens: &[String], unquoted_prefix_lens: &[usize], effective_dir
     stripped.iter().enumerate().any(|(index, word)| {
         command_word(word) == "git"
             && stripped.get(index + 1..).is_some_and(|after_verb| {
-                git_globals(after_verb, effective_dir)
+                git_globals(after_verb, effective_dir, false)
                     .rest
                     .first()
                     .is_some_and(|subcommand| unescape_word(subcommand).as_ref() == "push")
@@ -709,7 +854,7 @@ enum DirectoryVerb<'a> {
 /// merely *could* unescape to a directory verb refuses. That over-refuses the
 /// unquoted `\cd`, which really does move — an explainable refusal, traded
 /// against a silently wrong answer.
-fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
+fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>> {
     fn names_directory_verb(word: &str) -> bool {
         matches!(word, "cd" | "pushd" | "popd")
     }
@@ -796,7 +941,8 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
     // and an `eval`'d `cd` moves the PARENT, so this refusal is still what
     // keeps the later segments honest (cadence-hooks#237 security review, F20).
     if unescape_word(candidate).as_ref() == "eval" {
-        if evals_only_an_agent_environment(&rest[1..]) {
+        // Redirections are not operands: `eval "$(ssh-agent -s)" >/dev/null`.
+        if known_ok && evals_only_an_agent_environment(&strip_redirections(&rest[1..])) {
             return None;
         }
         return Some(DirectoryVerb::Unknowable);
@@ -833,14 +979,53 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
 /// directory. Matched exactly: a single operand that is a substitution of
 /// `ssh-agent` with option words only, so `eval "$(ssh-agent -s)"; cd …` is
 /// still a separate segment and `eval "$(cat x)"` still refuses.
-fn evals_only_an_agent_environment(operands: &[String]) -> bool {
+fn evals_only_an_agent_environment(operands: &[&String]) -> bool {
     let Some(body) = substitution_body(operands) else {
         return false;
     };
     let mut words = body.split([' ', '\t']).filter(|word| !word.is_empty());
-    words.next() == Some("ssh-agent")
-        && words
-            .all(|word| word.starts_with('-') && word[1..].chars().all(|c| c.is_ascii_alphabetic()))
+    if words.next() != Some("ssh-agent") {
+        return false;
+    }
+    // ssh-agent's options, and nothing else: a trailing word is a COMMAND
+    // ssh-agent would run, whose output is what `eval` reads. `-a SOCK`,
+    // `-t LIFE`, `-E HASH`, `-P ALLOW` and `-O OPT` take a value, glued or as
+    // the next word, and the value must be plain text.
+    let plain = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./:@,=+-%".contains(c))
+    };
+    let mut expects_value = false;
+    for word in words {
+        if expects_value {
+            if !plain(word) {
+                return false;
+            }
+            expects_value = false;
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            return false;
+        };
+        for (pos, c) in cluster.char_indices() {
+            match c {
+                'c' | 's' | 'd' | 'D' | 'k' => {}
+                'a' | 't' | 'E' | 'P' | 'O' => {
+                    let glued = &cluster[pos + 1..];
+                    if glued.is_empty() {
+                        expects_value = true;
+                    } else if !plain(glued) {
+                        return false;
+                    }
+                    break;
+                }
+                _ => return false,
+            }
+        }
+    }
+    !expects_value
 }
 
 /// The one unreadable `cd` target this walk can still name:
@@ -849,8 +1034,7 @@ fn evals_only_an_agent_environment(operands: &[String]) -> bool {
 /// (cadence-hooks#1095 ruling). Reported as the current directory, which names
 /// the same repository; an exact match only.
 fn names_the_current_toplevel(operands: &[&String]) -> bool {
-    let operands: Vec<String> = operands.iter().map(|word| word.to_string()).collect();
-    let body = substitution_body(&operands);
+    let body = substitution_body(operands);
     body.is_some_and(|body| {
         body.split([' ', '\t']).filter(|word| !word.is_empty()).eq([
             "git",
@@ -867,8 +1051,12 @@ fn names_the_current_toplevel(operands: &[&String]) -> bool {
 /// trailing `)`. Rejoining quoted pieces (`cd '$(git' …`) yields the same text,
 /// which is harmless here: the shell then refuses the extra operands and
 /// stays where it is, which is where this walk reports it.
-fn substitution_body(operands: &[String]) -> Option<String> {
-    let joined = operands.join(" ");
+fn substitution_body(operands: &[&String]) -> Option<String> {
+    let joined = operands
+        .iter()
+        .map(|word| word.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     let joined = joined.trim();
     if let Some(rest) = joined.strip_prefix("$(") {
         return Some(rest.strip_suffix(')').unwrap_or(rest).to_string());
@@ -902,10 +1090,9 @@ fn substitution_body(operands: &[String]) -> Option<String> {
 /// published a commit from another repository. The caller now gets
 /// `unresolved` and can refuse.
 ///
-/// Note the asymmetry that made this the one bad arm: `git -C $D push` resolves
-/// to `<cwd>/$D`, a path that does not exist, so `rev-list` fails and the
-/// composed posture blocks. Only the `cd` arm degraded to a *plausible wrong
-/// answer*.
+/// `git -C $D push` used to resolve to `<cwd>/$D`, a path that does not exist,
+/// so `rev-list` failed there; it is now marked the same way as this arm
+/// (`directory_unverified`, cadence-hooks#1095 review).
 ///
 /// Unreadable: `popd`; ANY flagged `pushd`; a bare verb; `-` (`$OLDPWD`); a
 /// target carrying an unexpanded `$` or a backtick; and more than one operand.
@@ -928,7 +1115,14 @@ fn substitution_body(operands: &[String]) -> Option<String> {
 /// and `cd /a/$B` are equally unknowable.
 ///
 /// `tokens` begins at the verb ([`directory_verb`] did the peel).
-fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
+///
+/// Returns the new directory and whether it came from a literal absolute
+/// target, which ends any earlier directory doubt.
+fn resolve_directory_verb(
+    tokens: &[String],
+    effective_dir: &str,
+    known_ok: bool,
+) -> Option<(String, bool)> {
     let verb = tokens.first()?.as_str();
     if verb == "popd" {
         return None;
@@ -955,8 +1149,8 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
     // idiom is normally written, and counting the redirect words made that
     // ordinary, non-adversarial command refuse.
     let operands: Vec<&String> = strip_redirections(&tokens[idx..]);
-    if !stack_verb && names_the_current_toplevel(&operands) {
-        return Some(effective_dir.to_string());
+    if known_ok && !stack_verb && names_the_current_toplevel(&operands) {
+        return Some((effective_dir.to_string(), false));
     }
     if operands.len() != 1 {
         return None;
@@ -974,7 +1168,10 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
                 && !target.contains('`')
                 && !(stack_verb && unescape_word(target).starts_with('+')) =>
         {
-            Some(resolve_cd_target(target, effective_dir))
+            Some((
+                resolve_cd_target(target, effective_dir),
+                target.starts_with('/'),
+            ))
         }
         _ => None,
     }
@@ -1135,6 +1332,10 @@ struct GitGlobals<'a> {
     /// `--git-dir`/`--work-tree` was seen — the push points at a repository
     /// this walk cannot name correctly.
     foreign_redirect: bool,
+    /// A `-C` value carrying `$` or a backtick — the `git -C "$D"` twin of an
+    /// unreadable `cd` target, and treated the same way
+    /// ([`PushInvocation::directory_unverified`]).
+    unreadable_dir: bool,
     /// A `-c`/`--config-env` global carried a key that replaces the bare-push
     /// ref computation (`push.default`, or a `remote.<name>.push` refspec).
     push_config_override: bool,
@@ -1164,9 +1365,10 @@ struct GitGlobals<'a> {
 /// a push git performs under `matching`. Only the key is examined, and any
 /// value marks the invocation unresolved, because reading the value would mean
 /// re-implementing git's config parsing to decide a safety question.
-fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
+fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> GitGlobals<'a> {
     let mut redirect: Option<String> = None;
     let mut foreign_redirect = false;
+    let mut unreadable_dir = false;
     let mut push_config_override = false;
     let mut idx = 0;
 
@@ -1203,7 +1405,15 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
                 "-C" => {
                     if let Some(value) = argv.get(idx + 1) {
                         let base = redirect.as_deref().unwrap_or(effective_dir);
-                        redirect = Some(resolve_cd_target(value, base));
+                        if known_ok && names_the_current_toplevel(&[value]) {
+                            // The top of the repository already in effect.
+                            redirect = Some(base.to_string());
+                        } else if value.contains(['$', '`']) {
+                            unreadable_dir = true;
+                            redirect = Some(base.to_string());
+                        } else {
+                            redirect = Some(resolve_cd_target(value, base));
+                        }
                     }
                 }
                 "--work-tree" | "--git-dir" => foreign_redirect = true,
@@ -1237,6 +1447,7 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
     GitGlobals {
         work_dir: redirect.unwrap_or_else(|| effective_dir.to_string()),
         foreign_redirect,
+        unreadable_dir,
         push_config_override,
         rest: &argv[idx..],
     }
@@ -1280,6 +1491,7 @@ fn push_invocation_of(
     argv: &[String],
     argv_quoted: &[usize],
     effective_dir: &str,
+    known_ok: bool,
 ) -> Option<PushInvocation> {
     // **Redirections come out FIRST — before the verb, the globals and the
     // subcommand are read.** A redirection is legal anywhere in a simple
@@ -1307,7 +1519,7 @@ fn push_invocation_of(
     if command_word(argv.first()?) != "git" {
         return None;
     }
-    let globals = git_globals(&argv[1..], effective_dir);
+    let globals = git_globals(&argv[1..], effective_dir, known_ok);
     let (subcommand, words) = globals.rest.split_first()?;
     // `push` stays case-SENSITIVE — a git subcommand is — but it takes the same
     // backslash removal the verb does: `git pu\sh origin main` really pushes
@@ -1350,9 +1562,11 @@ fn push_invocation_of(
         all_or_mirror: scan.all_or_mirror,
         tags: scan.tags,
         dry_run: scan.dry_run,
-        unresolved: globals.foreign_redirect || (implicit && globals.push_config_override),
+        unresolved: globals.foreign_redirect
+            || globals.unreadable_dir
+            || (implicit && globals.push_config_override),
         repository_unresolved: globals.foreign_redirect,
-        directory_unverified: false,
+        directory_unverified: globals.unreadable_dir,
         repository: {
             let named = crate::shell::push_repository_argument(words);
             named.positional.or(named.repo_flag)
@@ -1997,6 +2211,14 @@ mod tests {
                 "cd /other && cd \"$(git rev-parse --show-toplevel)\" && git push",
                 "/other",
             ),
+            (
+                "git -C \"$(git rev-parse --show-toplevel)\" push origin main",
+                "/repo",
+            ),
+            (
+                "git -C /other -C \"$(git rev-parse --show-toplevel)\" push",
+                "/other",
+            ),
         ] {
             let invocation = only(command, "/repo");
             assert_eq!(invocation.work_dir, want_dir, "{command}");
@@ -2006,12 +2228,77 @@ mod tests {
     }
 
     #[test]
+    fn a_toplevel_cd_is_not_trusted_when_git_may_be_something_else() {
+        // Review of #1132: a quoted literal, or a command that can redefine
+        // `git`, falls back to an unreadable target.
+        for command in [
+            "cd '$(git rev-parse --show-toplevel)' && git push origin main",
+            "git(){ command git -C /x \"$@\"; }; cd \"$(git rev-parse --show-toplevel)\" && git push",
+            "function git { :; }; cd \"$(git rev-parse --show-toplevel)\" && git push",
+            "export PATH=/evil:$PATH && cd \"$(git rev-parse --show-toplevel)\" && git push",
+            "declare -x PATH; cd \"$(git rev-parse --show-toplevel)\" && git push",
+            ". ./env.sh; cd \"$(git rev-parse --show-toplevel)\" && git push",
+            "hash -p /evil/git git; git -C \"$(git rev-parse --show-toplevel)\" push",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.directory_unverified, "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_targets_the_walk_cannot_read_are_unverified() {
+        // Review of #1132: `-C` and `env -C` follow the `cd` rules.
+        for (command, want_dir, unverified) in [
+            ("git -C \"$D\" push origin main", "/repo", true),
+            ("D=/other; git -C $D push origin main", "/repo", true),
+            ("env -C \"$D\" git push origin main", "/repo", true),
+            ("env -C /other git push origin main", "/other", false),
+            ("env --chdir=/other git push origin main", "/other", false),
+            ("env --chdir /other git push origin main", "/other", false),
+            ("env -iC /other git push origin main", "/other", false),
+            ("env -i -C sub git push origin main", "/repo/sub", false),
+            (
+                "env -C /other sh -c 'git push origin main'",
+                "/other",
+                false,
+            ),
+            // A literal absolute `cd` ends an earlier directory doubt.
+            (
+                "cd \"$HOME\" && cd /abs/own && git push origin main",
+                "/abs/own",
+                false,
+            ),
+            (
+                "cd \"$HOME\" && cd rel && git push origin main",
+                "/repo/rel",
+                true,
+            ),
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, want_dir, "{command}");
+            assert_eq!(invocation.directory_unverified, unverified, "{command}");
+            assert!(!invocation.repository_unresolved, "{command}");
+        }
+        // An absolute `cd` does not clear a which-repository doubt.
+        assert!(
+            only("eval 'cd /x'; cd /abs && git push origin main", "/repo").repository_unresolved
+        );
+    }
+
+    #[test]
     fn an_ssh_agent_eval_moves_nothing() {
         // cadence-hooks#1095 ruling: ssh-agent's output only sets variables.
         for command in [
             "eval \"$(ssh-agent -s)\"; git push origin main",
             "eval $(ssh-agent) && git push origin main",
             "eval `ssh-agent -s` && git push origin main",
+            // Redirections are not operands (review of #1132).
+            "eval \"$(ssh-agent -s)\" > /dev/null && git push origin main",
+            "eval \"$(ssh-agent -s)\" 2>/dev/null; git push origin main",
+            // ssh-agent's value-taking options, glued or separate.
+            "eval \"$(ssh-agent -s -t 3600)\"; git push origin main",
+            "eval \"$(ssh-agent -a /tmp/agent.sock -t1h -E sha256 -P /usr/lib/x)\"; git push",
+            "eval \"$(ssh-agent -O no-restrict-websafe)\"; git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert!(!invocation.unresolved, "{command}");
@@ -2021,6 +2308,17 @@ mod tests {
             "eval \"$(cat env.sh)\"; git push origin main",
             "eval \"$(ssh-agent -s)\" cd /other; git push origin main",
             "eval \"$(ssh-agent -s; cd /other)\"; git push origin main",
+            // A trailing word is a command ssh-agent runs; its output is eval'd.
+            "eval \"$(ssh-agent -s mycmd)\"; git push origin main",
+            "eval \"$(ssh-agent -t)\"; git push origin main",
+            "eval \"$(ssh-agent -a $(pwd))\"; git push origin main",
+            // A single-quoted operand is text, not a substitution.
+            "eval '$(ssh-agent -s)'; git push origin main",
+            // The name may not be ssh-agent any more.
+            "ssh-agent(){ echo 'cd /x'; }; eval \"$(ssh-agent -s)\"; git push",
+            "shopt -s expand_aliases; alias ssh-agent=f; eval \"$(ssh-agent -s)\"; git push",
+            "PATH=/evil:$PATH; eval \"$(ssh-agent -s)\"; git push origin main",
+            "source ./env.sh; eval \"$(ssh-agent -s)\"; git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert!(invocation.repository_unresolved, "{command}");

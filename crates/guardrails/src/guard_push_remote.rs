@@ -317,15 +317,15 @@ const MAX_PUSH_DIRECTORIES: usize = 4;
 /// directory the rest of the guard judges — or refuse one whose directory
 /// cannot be known (cadence-hooks#1095). `None` when nothing blocks.
 ///
-/// **An unknowable directory blocks.** The push walk marks it for an `eval`
+/// **An unknowable repository blocks.** The push walk marks it for an `eval`
 /// (whose script can `cd` the parent shell), a `trap` action (which runs
-/// wherever the shell has reached when the signal fires), a `cd`/`pushd`
-/// target it cannot read (`$VAR`, `-`, `popd`), a `--git-dir`/`--work-tree`
-/// or `GIT_DIR=`/`GIT_WORK_TREE=`/`GIT_CONFIG*` redirect, and a push hidden
-/// behind a prefix it cannot peel. Each of those can move the push to a
-/// repository whose remote was never read, and the only directory left to
+/// wherever the shell has reached when the signal fires), a `--git-dir`/
+/// `--work-tree` or `GIT_DIR=`/`GIT_WORK_TREE=`/`GIT_CONFIG*` redirect, and a
+/// push hidden behind a prefix it cannot peel. Each of those can move the push
+/// to a repository whose remote was never read, and the only directory left to
 /// judge is the session's own owned checkout — a plausible wrong answer, not a
-/// safe default.
+/// safe default. An unreadable `cd`/`-C` target alone is not one of these: it
+/// nudges ([`unverified_directory_nudge`]).
 ///
 /// **A knowable other directory is validated there**, exactly as the main path
 /// validates `work_dir`: its explicit target or its tracking remote. A directory
@@ -346,9 +346,10 @@ fn check_pushes_elsewhere(
     if pushes.iter().any(|push| push.repository_unresolved) {
         return Some(CheckResult::block(
             "🚫 git-guardrails: Cannot tell which repository this push runs in\n   \
-             A directory change or repository redirect before the push (an `eval`, \
-             a `trap` action, `cd $VAR`, `cd -`, `popd`, `GIT_DIR=`, `--git-dir`) \
-             moves it somewhere its remote cannot be checked.\n   \
+             Something before the push can move it to another repository whose \
+             remote cannot be checked: an `eval`, a `trap` action, a `GIT_DIR=`/\
+             `GIT_WORK_TREE=` or `--git-dir`/`--work-tree` redirect, or a prefix \
+             this guard cannot read past.\n   \
              Fix: run the push from a literal directory, e.g. \
              `cd /path/to/repo && git push origin main`",
         ));
@@ -471,7 +472,7 @@ fn unverified_directory_nudge(input: &HookInput) -> Option<CheckResult> {
     Some(CheckResult::nudge(format!(
         "⚠️  git-guardrails: Push directory could not be verified\n   \
          A directory change before the push (`cd \"$VAR\"`, `cd -`, `cd $(…)`, \
-         `popd`, a bare `cd`) is resolved by the shell, so the push may run \
+         `popd`, a bare `cd`, `git -C \"$D\"`, `env -C \"$D\"`) is resolved by the shell, so the push may run \
          outside the checked repository.\n   \
          Checked instead: {}\n   \
          Verify: cd /path/to/repo && git push origin <branch>",
@@ -1582,6 +1583,71 @@ mod tests {
                     Nudge,
                 ),
                 ("eval \"$(cat env.sh)\"; git push origin feat", Block),
+                // Review of #1132.
+                (
+                    "eval \"$(ssh-agent -s)\" > /dev/null && git push origin feat",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -s)\" 2>/dev/null; git push origin feat",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -s -t 3600)\"; git push origin feat",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -a /tmp/s -t1h -E sha256)\"; git push origin feat",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -s mycmd)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "ssh-agent(){ echo 'cd {other}'; }; eval \"$(ssh-agent -s)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "shopt -s expand_aliases; alias ssh-agent='echo cd {other}'; eval \"$(ssh-agent -s)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "PATH=/evil:$PATH; eval \"$(ssh-agent -s)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "git(){ command git -C {other} \"$@\"; }; cd \"$(git rev-parse --show-toplevel)\" && git push origin feat",
+                    Nudge,
+                ),
+                (
+                    "export PATH=/evil:$PATH && cd \"$(git rev-parse --show-toplevel)\" && git push origin feat",
+                    Nudge,
+                ),
+                (
+                    "source ./x.sh; cd \"$(git rev-parse --show-toplevel)\" && git push origin feat",
+                    Nudge,
+                ),
+                (
+                    "cd '$(git rev-parse --show-toplevel)' && git push origin feat",
+                    Nudge,
+                ),
+                ("eval '$(ssh-agent -s)'; git push origin feat", Block),
+                (
+                    "git -C \"$(git rev-parse --show-toplevel)\" push origin feat",
+                    Allow,
+                ),
+                ("cd \"$HOME\" && cd {cwd} && git push origin feat", Allow),
+                ("cd \"$HOME\" && cd {other} && git push origin feat", Block),
+                ("git -C \"$D\" push origin feat", Nudge),
+                ("D={other}; git -C $D push origin feat", Nudge),
+                ("eval 'D={other}'; git -C $D push origin feat", Block),
+                ("env -C {other} git push origin main", Block),
+                ("env --chdir={other} git push origin main", Block),
+                ("env --chdir {other} git push origin main", Block),
+                ("env -iC {other} git push origin main", Block),
+                ("env -C \"$D\" git push origin main", Nudge),
+                ("env -C sub git push origin feat", Allow),
                 ("GIT_DIR={other}/.git git push origin main", Block),
                 ("git --git-dir={other}/.git push origin main", Block),
                 // Followed, and judged in the directory the push runs in.
