@@ -701,6 +701,33 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
+    /// cadence-hooks#1144 item 3: a write inside a `case` clause, where the
+    /// pattern's `)` sits glued to the command word. Blocks on main at
+    /// 0.111.0; pinned here because no test held it. `(command, outcome)`.
+    #[test]
+    fn writes_inside_a_case_clause_are_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("case a in a) cp x .env;; esac", Block),
+            ("echo $(case a in a) cp x .env;; esac)", Block),
+            ("x=$(case a in a) cp x .env;; esac)", Block),
+            ("case a in (a) cp x .env;; esac", Block),
+            ("case a in a|b) cp x .env;; esac", Block),
+            ("case a in *) tee .env </dev/null;; esac", Block),
+            ("case a in a) echo hi > .env;; esac", Block),
+            ("case a in a) true;& b) mv x .env;; esac", Block),
+            ("case a in a) : ;; b) touch .env;; esac", Block),
+            ("case a in\n a) rm .env\n ;;\nesac", Block),
+            // Ordinary `case` scripts stay allowed.
+            ("case a in a) echo ok;; esac", Allow),
+            ("case a in a) cp x y;; esac", Allow),
+            ("case $x in a) cp x y;; b) echo done;; esac", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
+
     #[test]
     fn service_account_json_blocked() {
         assert!(is_blocked(

