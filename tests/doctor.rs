@@ -1213,7 +1213,7 @@ fn doctor_still_flags_missing_cache_dir_for_non_directory_source() {
     );
 }
 
-// ── doctor --prune gate window (#902) ───────────────────────────────────────
+// ── doctor --prune --keep-newest / --older-than (#904), gate window (#902) ──
 
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
@@ -1242,6 +1242,139 @@ fn orphan(parent: &std::path::Path, sha: &str, at: Option<u64>) -> std::path::Pa
         set_mtime(&marker, at);
     }
     dir
+}
+
+fn prune_with_root(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    cadence_hooks()
+        .args(["doctor", "--prune"])
+        .args(extra)
+        .arg("--root")
+        .arg(root)
+        .output()
+        .expect("failed to execute")
+}
+
+#[test]
+fn doctor_prune_keep_newest_keeps_unstamped_and_newest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let oldest = orphan(&parent, "oldest-sha", Some(now - 3 * DAY));
+    let older = orphan(&parent, "older-sha", Some(now - 2 * DAY));
+    let newest = orphan(&parent, "newest-sha", Some(now - DAY));
+    let unstamped = orphan(&parent, "unstamped-sha", None);
+
+    let dry = prune_with_root(tmp.path(), &["--keep-newest", "2"]);
+    assert_eq!(dry.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(stdout.contains("keep: unstamped"), "{stdout}");
+    assert!(stdout.contains("keep: among the newest"), "{stdout}");
+    assert!(stdout.contains("2 orphaned version dir(s)"), "{stdout}");
+    assert!(
+        oldest.exists() && older.exists(),
+        "a dry run deletes nothing"
+    );
+
+    let out = prune_with_root(tmp.path(), &["--keep-newest", "2", "--apply"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !oldest.exists() && !older.exists(),
+        "past N, stamped: removed"
+    );
+    assert!(
+        newest.exists(),
+        "the unstamped dir takes one slot, this the other"
+    );
+    assert!(unstamped.exists(), "unstamped counts as newest");
+    assert!(pinned.exists());
+}
+
+#[test]
+fn doctor_prune_older_than_removes_only_dirs_orphaned_that_long_ago() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let old = orphan(&parent, "old-sha", Some(now - 3 * DAY));
+    let recent = orphan(&parent, "recent-sha", Some(now - 3_600));
+    let unstamped = orphan(&parent, "unstamped-sha", None);
+
+    let out = prune_with_root(tmp.path(), &["--older-than", "2d", "--apply"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed 1 orphaned version dir(s)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2 kept"), "{stdout}");
+    assert!(!old.exists());
+    assert!(recent.exists() && unstamped.exists() && pinned.exists());
+}
+
+#[test]
+fn doctor_prune_limits_are_usage_errors_without_prune_or_with_a_bad_age() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["doctor", "--keep-newest", "3"],
+        vec!["doctor", "--older-than", "7d"],
+        vec!["doctor", "--prune", "--older-than", "7"],
+        vec!["doctor", "--prune", "--older-than", "0d"],
+        vec!["doctor", "--prune", "--keep-newest", "many"],
+    ] {
+        let out = cadence_hooks()
+            .args(&args)
+            .arg("--root")
+            .arg(tmp.path())
+            .output()
+            .expect("failed to execute");
+        assert_eq!(out.status.code(), Some(2), "{args:?} is a usage error");
+    }
+}
+
+/// A pin whose `installPath` is a symlink to a sibling makes that sibling look
+/// orphaned by name. Removing it would leave the pin dangling, so it is kept.
+#[cfg(unix)]
+#[test]
+fn doctor_prune_apply_keeps_the_dir_a_symlinked_pin_resolves_onto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("workbench/my-plugin");
+    let real = orphan(&parent, "real-sha", Some(1));
+    let other = orphan(&parent, "other-sha", Some(1));
+    let pinned = parent.join("pinned-sha");
+    std::os::unix::fs::symlink(&real, &pinned).unwrap();
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned);
+
+    for extra in [vec!["--apply"], vec!["--keep-newest", "0", "--apply"]] {
+        let out = prune_with_root(tmp.path(), &extra);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{extra:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("resolves onto a pinned install"),
+            "{extra:?}"
+        );
+        assert!(
+            real.exists() && pinned.exists(),
+            "{extra:?}: the pin must survive"
+        );
+    }
+    assert!(!other.exists(), "a real orphan beside it is still removed");
 }
 
 /// A Claude config dir with a pinned install and two stamped orphans: one
@@ -1315,5 +1448,57 @@ fn doctor_prune_apply_refuses_a_peer_between_beats_under_a_short_stale_override(
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
     assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}
+
+/// A session that started two days ago cannot be reading a dir orphaned three
+/// days ago, but may be reading one orphaned a day ago.
+#[test]
+fn doctor_prune_older_than_removes_only_dirs_orphaned_before_every_live_start() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+
+    let out = live_prune(home.path(), &config, &metrics, &["--older-than", "12h"])
+        .output()
+        .expect("failed to execute");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !three_days.exists(),
+        "orphaned before the session started: removed"
+    );
+    assert!(one_day.exists(), "orphaned after it started: kept");
+    assert!(
+        stdout.contains("keep: a live session may be reading it"),
+        "{stdout}"
+    );
+    assert!(pinned.exists());
+}
+
+/// A session registered by `/clear` (or recreated by a heartbeat, or written by
+/// an older binary) cannot say when it loaded its plugins, so nothing goes.
+#[test]
+fn doctor_prune_limits_keep_every_dir_when_a_live_session_cannot_vouch() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+    seed_live_session(&config, "cleared0-0000", now - 60, false, now);
+
+    let out = live_prune(home.path(), &config, &metrics, &["--keep-newest", "0"])
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot say when they loaded their plugins"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cleared0"), "names the session: {stderr}");
     assert!(three_days.exists() && one_day.exists() && pinned.exists());
 }

@@ -2789,6 +2789,253 @@ fn prune_gate_window_secs(stale_minutes: u64) -> u64 {
         .max(session_registry::default_stale_secs())
 }
 
+/// How long before a session's recorded start a dir must have been orphaned
+/// for that session to be ruled out as its reader. A fresh process loads its
+/// plugins a little before `SessionStart` registers it; the margin covers that
+/// gap many times over, and a wider one only keeps a few more dirs.
+const PRUNE_START_MARGIN_SECS: u64 = 600;
+
+/// Bounds on `doctor --prune` for a machine that is never quiet
+/// (cameronsjo/cadence-hooks#904). With either set, the all-or-nothing liveness
+/// refusal gives way to a per-dir decision in [`select_prunable`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneLimits {
+    /// `--keep-newest N`: keep the N most recently orphaned dirs.
+    pub keep_newest: Option<usize>,
+    /// `--older-than <duration>`, in seconds: delete only dirs orphaned at
+    /// least this long ago.
+    pub older_than_secs: Option<u64>,
+}
+
+impl PruneLimits {
+    fn is_active(&self) -> bool {
+        self.keep_newest.is_some() || self.older_than_secs.is_some()
+    }
+}
+
+/// Parse an `--older-than` value: a whole number followed by `s`, `m`, `h`,
+/// `d` or `w` (`90m`, `12h`, `7d`). A bare number, a zero, or any other suffix
+/// is rejected, so a typo is a usage error rather than a surprise window.
+pub fn parse_age(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("`{value}` needs a unit: s, m, h, d or w (e.g. 7d)"))?;
+    let (digits, unit) = value.split_at(split);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{value}` must start with a whole number (e.g. 7d)"))?;
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return Err(format!("`{value}`: unit must be s, m, h, d or w")),
+    };
+    match n.checked_mul(scale) {
+        Some(0) => Err("--older-than must be longer than zero".to_string()),
+        Some(secs) => Ok(secs),
+        None => Err(format!("`{value}` is too large")),
+    }
+}
+
+/// When a version dir was orphaned, from the `.orphaned_at` marker Claude
+/// Code's loader writes: the LATER of the marker's own mtime and a timestamp
+/// in its contents (epoch seconds or milliseconds), since later is the
+/// direction that keeps the dir under every rule that reads it.
+///
+/// `None` (unstamped) when the marker is absent, a symlink, or not a regular
+/// file: a dir with no trustworthy stamp is treated as the newest there is.
+fn orphaned_at(dir: &Path) -> Option<u64> {
+    let marker = dir.join(".orphaned_at");
+    let meta = std::fs::symlink_metadata(&marker).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let stamped = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        // Epoch seconds pass 1e11 in the year 5138; anything above is millis.
+        .map(|n| if n > 100_000_000_000 { n / 1000 } else { n });
+    Some(stamped.map_or(mtime, |s| s.max(mtime)))
+}
+
+/// What the live sessions say about which orphaned dirs they could be reading.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveStart {
+    /// No live session and no unreadable record: nothing to protect.
+    None,
+    /// Every live session vouches for its start; the earliest is this epoch.
+    Earliest(u64),
+    /// At least one live session (or unreadable record) cannot say when it
+    /// loaded its plugins, so no orphaned dir can be ruled out. Carries
+    /// sanitized names for the notice.
+    Unknown(Vec<String>),
+}
+
+/// The live-session start bound for [`select_prunable`], over both registries
+/// like [`prune_liveness_gate`].
+///
+/// Fails closed on everything it cannot vouch for: an unreadable record, a
+/// record without `start_verified` (a `/clear`, `/compact`, resume or fork
+/// registration, a heartbeat-recreated record, or one from an older binary), and
+/// a zero `started_epoch` all make the answer [`LiveStart::Unknown`]. A session
+/// in both registries is read in both, so a disagreement between its copies
+/// resolves to the more cautious one.
+fn live_start_bound(
+    sessions_dir: Option<&Path>,
+    global_dir: Option<&Path>,
+    stale_secs: u64,
+) -> LiveStart {
+    let mut unknown: Vec<String> = Vec::new();
+    let mut earliest: Option<u64> = None;
+    for dir in sessions_dir.into_iter().chain(global_dir) {
+        for name in session_registry::unreadable_records(dir) {
+            let name = format!("unreadable record {name}");
+            if !unknown.contains(&name) {
+                unknown.push(name);
+            }
+        }
+        for peer in session_registry::live_peers(dir, "", stale_secs) {
+            let rec = &peer.record;
+            if !rec.start_verified || rec.started_epoch == 0 {
+                let name = session_identity::sanitize_field(
+                    session_identity::short_id(&rec.session_id),
+                    8,
+                );
+                if !unknown.contains(&name) {
+                    unknown.push(name);
+                }
+                continue;
+            }
+            earliest = Some(earliest.map_or(rec.started_epoch, |e| e.min(rec.started_epoch)));
+        }
+    }
+    if !unknown.is_empty() {
+        return LiveStart::Unknown(unknown);
+    }
+    earliest.map_or(LiveStart::None, LiveStart::Earliest)
+}
+
+/// Why [`select_prunable`] kept a dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepReason {
+    /// No `.orphaned_at` stamp: its age is unknown, so it counts as newest.
+    Unstamped,
+    /// Among the `--keep-newest` N.
+    Newest,
+    /// Orphaned more recently than `--older-than`.
+    TooRecent,
+    /// A live session started before it was orphaned (or cannot say when it
+    /// started), so it may still be reading it.
+    LiveSession,
+}
+
+impl KeepReason {
+    fn label(self) -> &'static str {
+        match self {
+            KeepReason::Unstamped => "unstamped",
+            KeepReason::Newest => "among the newest",
+            KeepReason::TooRecent => "orphaned too recently",
+            KeepReason::LiveSession => "a live session may be reading it",
+        }
+    }
+}
+
+/// Decide each orphaned dir under `--keep-newest` / `--older-than`.
+///
+/// A dir is deleted only when EVERY rule allows it: it is stamped, it is not
+/// among the `keep_newest` newest (unstamped dirs rank newest and take those
+/// slots first), it was orphaned at least `older_than_secs` before `now`, and
+/// it was orphaned more than [`PRUNE_START_MARGIN_SECS`] before the earliest
+/// live session started. That last rule is #474's hazard scoped to where it
+/// applies: a session that started after a dir was orphaned loaded the pin the
+/// manifest named then, never that dir. A session that started earlier may be
+/// reading it, and one that cannot say when it started may be too.
+///
+/// Pure over its inputs. Returns `(dir, None)` to delete and
+/// `(dir, Some(reason))` to keep, in input order.
+fn select_prunable(
+    stamped: &[(PathBuf, Option<u64>)],
+    limits: PruneLimits,
+    now: u64,
+    live: &LiveStart,
+) -> Vec<(PathBuf, Option<KeepReason>)> {
+    // Rank newest first: unstamped (unknown age) ahead of every stamp, then by
+    // stamp descending, ties broken by path so the cut is deterministic.
+    let mut ranked: Vec<usize> = (0..stamped.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        let key = |i: usize| std::cmp::Reverse(stamped[i].1.unwrap_or(u64::MAX));
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| stamped[a].0.cmp(&stamped[b].0))
+    });
+    let mut newest = vec![false; stamped.len()];
+    for &i in ranked.iter().take(limits.keep_newest.unwrap_or(0)) {
+        newest[i] = true;
+    }
+
+    stamped
+        .iter()
+        .enumerate()
+        .map(|(i, (dir, at))| {
+            let reason = match *at {
+                None => Some(KeepReason::Unstamped),
+                Some(_) if newest[i] => Some(KeepReason::Newest),
+                Some(at)
+                    if limits
+                        .older_than_secs
+                        .is_some_and(|min_age| now.saturating_sub(at) < min_age) =>
+                {
+                    Some(KeepReason::TooRecent)
+                }
+                Some(at) => match live {
+                    LiveStart::None => None,
+                    LiveStart::Earliest(start)
+                        if at.saturating_add(PRUNE_START_MARGIN_SECS) < *start =>
+                    {
+                        None
+                    }
+                    LiveStart::Earliest(_) | LiveStart::Unknown(_) => Some(KeepReason::LiveSession),
+                },
+            };
+            (dir.clone(), reason)
+        })
+        .collect()
+}
+
+/// Whether `dir` is a pinned install, or contains or sits inside one, once
+/// symlinks are resolved. [`orphan_dirs`] compares basenames under each pin's
+/// parent, so a pin whose `installPath` is a symlink to a sibling would
+/// nominate the real dir it names as an orphan. A dir that cannot be resolved
+/// is treated as pinned.
+fn overlaps_a_pin(dir: &Path, pinned_real: &[PathBuf]) -> bool {
+    let Ok(real) = std::fs::canonicalize(dir) else {
+        return true;
+    };
+    pinned_real
+        .iter()
+        .any(|pin| pin.starts_with(&real) || real.starts_with(pin))
+}
+
+/// Manifest install paths that existed before a prune and are gone after it.
+/// Empty is the post-condition `--prune --apply` asserts: whatever it removed,
+/// every pin the manifest names is still on disk (cameronsjo/cadence-hooks#904).
+fn pins_lost(present_before: &[PathBuf]) -> Vec<PathBuf> {
+    present_before
+        .iter()
+        .filter(|p| !p.exists())
+        .cloned()
+        .collect()
+}
+
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
 /// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
 /// must be paired with `prune` at the call site (`run` enforces this before
@@ -2805,7 +3052,12 @@ fn prune_gate_window_secs(stale_minutes: u64) -> u64 {
 /// `<root>/<marketplace>/<plugin>/<sha>` directly, matching how the manifest
 /// path above is resolved), or the live `~/.claude/plugins/cache` otherwise —
 /// the same anchor `run`'s cache-walk fallback uses.
-fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
+///
+/// With `limits` set (`--keep-newest`, `--older-than`), the all-or-nothing
+/// liveness refusal gives way to a per-dir decision ([`select_prunable`]), and
+/// the dry run previews it. Either way, a candidate that resolves onto a pin
+/// is dropped, and `--apply` exits 2 if any pin present before is gone after.
+fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool, limits: PruneLimits) -> u8 {
     let (manifest, cache_root) = match root_override {
         Some(root) => {
             if !root.exists() {
@@ -2839,7 +3091,31 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         return 0;
     };
 
-    let dirs = orphan_dirs(&pinned, &cache_root);
+    // Pins as they stand before anything is removed: the post-condition below
+    // compares against these, and the canonical forms drop any candidate that
+    // resolves onto a pin (a symlinked `installPath` names a sibling's real dir).
+    let pinned_present: Vec<PathBuf> = pinned
+        .iter()
+        .map(|(_, p)| p.clone())
+        .filter(|p| p.exists())
+        .collect();
+    let pinned_real: Vec<PathBuf> = pinned_present
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    let dirs: Vec<PathBuf> = orphan_dirs(&pinned, &cache_root)
+        .into_iter()
+        .filter(|dir| {
+            let overlaps = overlaps_a_pin(dir, &pinned_real);
+            if overlaps {
+                eprintln!(
+                    "cadence-hooks doctor --prune: keeping {} — it resolves onto a pinned install",
+                    display_safe_path_flagged(dir)
+                );
+            }
+            !overlaps
+        })
+        .collect();
     if dirs.is_empty() {
         if !quiet {
             println!("cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found");
@@ -2847,71 +3123,149 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         return 0;
     }
 
-    if !quiet {
-        for dir in &dirs {
-            let size = dir_size_bytes(dir);
-            // `.orphaned_at` is written externally by Claude Code's own
-            // plugin loader when it retires a version dir, not by anything
-            // in this repo — surfacing it here is advisory ("this one was
-            // already flagged upstream"), not a marker this codebase creates.
-            println!(
-                "{}",
-                render_orphan_dir_line(dir, size, dir.join(".orphaned_at").exists())
-            );
-        }
-    }
-
-    // Refuse to delete while live peer sessions may be pinned to these dirs.
-    // Only under default mode (not `--root`), mirroring the legacy-config gating
-    // below — `--root` fixtures must stay hermetic and never read live sessions.
-    // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
-    if root_override.is_none() && apply {
-        let stale_secs = prune_gate_window_secs(session_registry::stale_minutes());
-        let force = matches!(
-            std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        let sessions_dir = std::env::current_dir()
+    // The liveness gate reads live sessions only under default mode (not
+    // `--root`), mirroring the legacy-config gating below — `--root` fixtures
+    // must stay hermetic and never read live sessions.
+    let gate_on = root_override.is_none();
+    let force = matches!(
+        std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let stale_secs = prune_gate_window_secs(session_registry::stale_minutes());
+    let sessions_dir = || {
+        std::env::current_dir()
             .ok()
-            .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
-        let global_dir = session_registry::global_sessions_dir();
-        if let PruneGate::Blocked(names) = prune_liveness_gate(
-            sessions_dir.as_deref(),
-            Some(global_dir.as_path()),
-            stale_secs,
-            force,
-        ) {
-            eprintln!(
-                "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
-                 The gate blocks while any session is REGISTERED, including this one, so /reload-plugins does not clear it: \
-                 end those sessions, or wait out the staleness window, then re-run. \
-                 Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
-                names.len(),
-                names.join(", ")
-            );
-            return 0;
-        }
-    }
+            .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()))
+    };
+    let global_dir = session_registry::global_sessions_dir();
 
-    let (removed, freed_bytes) = prune_orphans(&dirs, apply, &cache_root);
+    let (to_remove, kept) = if limits.is_active() {
+        // Per-dir decision (cameronsjo/cadence-hooks#904). Read in dry-run too,
+        // so the preview shows what `--apply` would keep.
+        let live = if gate_on && !force {
+            live_start_bound(
+                sessions_dir().as_deref(),
+                Some(global_dir.as_path()),
+                stale_secs,
+            )
+        } else {
+            LiveStart::None
+        };
+        if let LiveStart::Unknown(names) = &live {
+            let shown: Vec<String> = names.iter().take(MAX_NAMED_PEERS).cloned().collect();
+            let more = names.len().saturating_sub(shown.len());
+            eprintln!(
+                "cadence-hooks doctor --prune: {} live session(s) cannot say when they loaded their plugins: {}{}. \
+                 Keeping every dir a live session could be reading. A session vouches for its start only when \
+                 it registered at a fresh startup; /clear, /compact, resume, fork, a heartbeat-recreated record, \
+                 or an older cadence-hooks cannot. End those sessions, or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1.",
+                names.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        let stamped: Vec<(PathBuf, Option<u64>)> =
+            dirs.iter().map(|d| (d.clone(), orphaned_at(d))).collect();
+        let decisions = select_prunable(&stamped, limits, session_identity::now_epoch(), &live);
+        let mut to_remove = Vec::new();
+        let mut kept = 0usize;
+        for (dir, reason) in decisions {
+            if !quiet {
+                let line =
+                    render_orphan_dir_line(&dir, dir_size_bytes(&dir), orphaned_at(&dir).is_some());
+                match reason {
+                    Some(r) => println!("{line} — keep: {}", r.label()),
+                    None => println!("{line}"),
+                }
+            }
+            match reason {
+                Some(_) => kept += 1,
+                None => to_remove.push(dir),
+            }
+        }
+        (to_remove, kept)
+    } else {
+        if !quiet {
+            for dir in &dirs {
+                let size = dir_size_bytes(dir);
+                // `.orphaned_at` is written externally by Claude Code's own
+                // plugin loader when it retires a version dir, not by anything
+                // in this repo — surfacing it here is advisory ("this one was
+                // already flagged upstream"), not a marker this codebase creates.
+                println!(
+                    "{}",
+                    render_orphan_dir_line(dir, size, dir.join(".orphaned_at").exists())
+                );
+            }
+        }
+
+        // Refuse to delete while live peer sessions may be pinned to these dirs.
+        // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
+        if gate_on && apply {
+            let gate = prune_liveness_gate(
+                sessions_dir().as_deref(),
+                Some(global_dir.as_path()),
+                stale_secs,
+                force,
+            );
+            if let PruneGate::Blocked(names) = gate {
+                eprintln!(
+                    "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
+                     The gate blocks while any session is REGISTERED, including this one, so /reload-plugins does not clear it: \
+                     end those sessions, or wait out the staleness window, then re-run. \
+                     Or bound the prune with --keep-newest N or --older-than <age>, which keep only the dirs a live session could be reading. \
+                     Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
+                    names.len(),
+                    names.join(", ")
+                );
+                return 0;
+            }
+        }
+        (dirs, 0)
+    };
+
+    let (removed, freed_bytes) = prune_orphans(&to_remove, apply, &cache_root);
     let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
 
+    // The post-condition is the pins, not the count: whatever was removed,
+    // every install the manifest named before must still be there.
+    let lost = if apply {
+        pins_lost(&pinned_present)
+    } else {
+        Vec::new()
+    };
+    for pin in &lost {
+        eprintln!(
+            "cadence-hooks doctor --prune --apply: ERROR: pinned install {} is gone after the prune — reinstall that plugin",
+            display_safe_path_flagged(pin)
+        );
+    }
+
     if !quiet {
+        let kept_note = if kept > 0 {
+            format!(", {kept} kept")
+        } else {
+            String::new()
+        };
         if apply {
             println!(
-                "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB"
+                "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB{kept_note}"
             );
             println!(
                 "  If any Claude Code session is currently running, run /reload-plugins in it now."
             );
         } else {
             println!(
-                "cadence-hooks doctor --prune: {removed} orphaned version dir(s) (~{freed_mib:.1} MiB) would be removed — dry-run, nothing deleted. Re-run with --apply to remove them."
+                "cadence-hooks doctor --prune: {removed} orphaned version dir(s) (~{freed_mib:.1} MiB) would be removed{kept_note} — dry-run, nothing deleted. Re-run with --apply to remove them."
             );
         }
     }
 
-    0
+    if lost.is_empty() { 0 } else { 2 }
 }
 
 /// One `(marketplace, install_location, declared_repo)` from
@@ -3171,7 +3525,13 @@ fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
 /// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
 /// (decision D4); `apply` actually removes and requires `prune` (a usage
 /// error, exit 2, otherwise).
-pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) -> u8 {
+pub fn run(
+    root_override: Option<&Path>,
+    quiet: bool,
+    prune: bool,
+    apply: bool,
+    limits: PruneLimits,
+) -> u8 {
     if apply && !prune {
         eprintln!(
             "cadence-hooks doctor: --apply requires --prune (dry-run first with --prune, then --prune --apply)"
@@ -3179,8 +3539,13 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         return 2;
     }
 
+    if limits.is_active() && !prune {
+        eprintln!("cadence-hooks doctor: --keep-newest and --older-than require --prune");
+        return 2;
+    }
+
     if prune {
-        return run_prune(root_override, quiet, apply);
+        return run_prune(root_override, quiet, apply, limits);
     }
 
     // Ahead of every scan, and outside the `root_override.is_none()` gate the
@@ -6452,7 +6817,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false, false, false), 0);
+        assert_eq!(run(Some(root.path()), false, false, false, NO_LIMITS), 0);
     }
 
     #[test]
@@ -6460,7 +6825,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
         ]);
-        assert_eq!(run(Some(root.path()), false, false, false), 1);
+        assert_eq!(run(Some(root.path()), false, false, false, NO_LIMITS), 1);
     }
 
     #[test]
@@ -6468,7 +6833,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false, false, false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false, NO_LIMITS), 2);
     }
 
     #[test]
@@ -6477,7 +6842,7 @@ mod tests {
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' cadence no-such-hook"#,
         ]);
         // Single-quoted (Error) + unknown sub (Warning) → exit 2
-        assert_eq!(run(Some(root.path()), false, false, false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false, NO_LIMITS), 2);
     }
 
     #[test]
@@ -6487,7 +6852,7 @@ mod tests {
         ]);
         // Capture stdout is not trivial in unit tests; we verify exit code here.
         // The output assertion is covered by manually running the binary.
-        assert_eq!(run(Some(root.path()), true, false, false), 0);
+        assert_eq!(run(Some(root.path()), true, false, false, NO_LIMITS), 0);
     }
 
     #[test]
@@ -6495,7 +6860,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true, false, false), 2);
+        assert_eq!(run(Some(root.path()), true, false, false, NO_LIMITS), 2);
     }
 
     #[test]
@@ -6503,7 +6868,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true, false, false), 0);
+        assert_eq!(run(Some(root.path()), true, false, false, NO_LIMITS), 0);
     }
 
     // ── orphan_dirs ──────────────────────────────────────────────────────────
@@ -7111,7 +7476,12 @@ mod tests {
         ));
     }
 
-    // ── prune liveness window (#902) ─────────────────────────────────────────
+    // ── prune liveness window (#902) and prune limits (#904) ─────────────────
+
+    const NO_LIMITS: PruneLimits = PruneLimits {
+        keep_newest: None,
+        older_than_secs: None,
+    };
 
     /// A shorter `CADENCE_SESSION_STALE_MINUTES` in the doctor's own env must
     /// never shrink the gate's window below the default: peers beat on the
@@ -7124,6 +7494,412 @@ mod tests {
         assert_eq!(prune_gate_window_secs(30), default);
         assert_eq!(prune_gate_window_secs(120), 7_200);
         assert_eq!(prune_gate_window_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn parse_age_accepts_each_unit() {
+        assert_eq!(parse_age("45s"), Ok(45));
+        assert_eq!(parse_age("90m"), Ok(5_400));
+        assert_eq!(parse_age("12h"), Ok(43_200));
+        assert_eq!(parse_age(" 7d "), Ok(604_800));
+        assert_eq!(parse_age("2w"), Ok(1_209_600));
+    }
+
+    #[test]
+    fn parse_age_rejects_anything_ambiguous() {
+        for bad in [
+            "",
+            "7",
+            "d",
+            "0d",
+            "7x",
+            "7 d",
+            "-1d",
+            "1.5h",
+            "7dd",
+            "99999999999999999999w",
+        ] {
+            assert!(parse_age(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    fn set_mtime(path: &Path, epoch: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(epoch))
+            .unwrap();
+    }
+
+    /// Write `<dir>/.orphaned_at` with `contents` and the given mtime.
+    fn stamp(dir: &Path, contents: &str, mtime: u64) {
+        let marker = dir.join(".orphaned_at");
+        fs::write(&marker, contents).unwrap();
+        set_mtime(&marker, mtime);
+    }
+
+    #[test]
+    fn orphaned_at_is_none_without_a_regular_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(orphaned_at(&bare), None, "no marker is unstamped");
+
+        let dir_marker = tmp.path().join("dir-marker");
+        fs::create_dir_all(dir_marker.join(".orphaned_at")).unwrap();
+        assert_eq!(orphaned_at(&dir_marker), None, "a directory is no stamp");
+
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("target");
+            fs::write(&target, "1").unwrap();
+            let linked = tmp.path().join("linked");
+            fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(&target, linked.join(".orphaned_at")).unwrap();
+            assert_eq!(orphaned_at(&linked), None, "a symlinked marker is no stamp");
+        }
+    }
+
+    /// The stamp is the LATER of the marker's mtime and its contents, reading
+    /// milliseconds as seconds, so every rule sees the dir at its youngest.
+    #[test]
+    fn orphaned_at_takes_the_later_of_contents_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v");
+        fs::create_dir_all(&dir).unwrap();
+
+        stamp(&dir, "1700000500", 1_700_000_000);
+        assert_eq!(
+            orphaned_at(&dir),
+            Some(1_700_000_500),
+            "seconds, later than mtime"
+        );
+
+        stamp(&dir, "1700000500123\n", 1_700_000_000);
+        assert_eq!(orphaned_at(&dir), Some(1_700_000_500), "milliseconds");
+
+        stamp(&dir, "1600000000", 1_700_000_000);
+        assert_eq!(
+            orphaned_at(&dir),
+            Some(1_700_000_000),
+            "older contents lose to mtime"
+        );
+
+        stamp(&dir, "2026-09-01T00:00:00Z", 1_700_000_000);
+        assert_eq!(
+            orphaned_at(&dir),
+            Some(1_700_000_000),
+            "unparsable contents fall back to mtime"
+        );
+    }
+
+    /// Write a live record into `dir` with the given start and vouch.
+    fn seed_record(dir: &Path, session_id: &str, started_epoch: u64, start_verified: bool) {
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: session_identity::short_id(session_id).into(),
+            session_id: session_id.into(),
+            started_epoch,
+            start_verified,
+            ..Default::default()
+        };
+        session_registry::write_record(dir, &rec).unwrap();
+    }
+
+    #[test]
+    fn live_start_bound_is_none_with_no_live_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(live_start_bound(None, None, 600), LiveStart::None);
+        assert_eq!(
+            live_start_bound(Some(tmp.path()), None, 600),
+            LiveStart::None
+        );
+
+        // A stale verified record is not live.
+        seed_record(tmp.path(), "stale-session", 1_000, true);
+        set_mtime(&tmp.path().join("stale-session.json"), 1_000);
+        assert_eq!(
+            live_start_bound(Some(tmp.path()), None, 600),
+            LiveStart::None
+        );
+    }
+
+    #[test]
+    fn live_start_bound_takes_the_earliest_vouched_start_across_registries() {
+        let local = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        seed_record(local.path(), "later-session", 5_000, true);
+        seed_record(global.path(), "earlier-session", 3_000, true);
+        assert_eq!(
+            live_start_bound(Some(local.path()), Some(global.path()), 600),
+            LiveStart::Earliest(3_000)
+        );
+    }
+
+    /// Anything that cannot vouch for when it loaded its plugins makes the
+    /// whole answer unknown, in either registry: an unverified record, a
+    /// verified one with no start, an unreadable file, and the same session
+    /// vouching in one registry but not the other.
+    #[test]
+    fn live_start_bound_is_unknown_on_any_record_that_cannot_vouch() {
+        type Seed = fn(&Path, &Path);
+        let cases: [(&str, Seed); 4] = [
+            ("unverified", |_, g| {
+                seed_record(g, "cleared-session", 5_000, false)
+            }),
+            ("zero start", |_, g| seed_record(g, "zero-session", 0, true)),
+            ("unreadable", |_, g| {
+                fs::write(g.join("garbage.json"), "not json {{").unwrap()
+            }),
+            ("copies disagree", |l, g| {
+                seed_record(l, "split-session", 5_000, true);
+                seed_record(g, "split-session", 5_000, false);
+            }),
+        ];
+        for (label, seed) in cases {
+            let local = tempfile::tempdir().unwrap();
+            let global = tempfile::tempdir().unwrap();
+            seed_record(local.path(), "vouched-session", 4_000, true);
+            seed(local.path(), global.path());
+            assert!(
+                matches!(
+                    live_start_bound(Some(local.path()), Some(global.path()), 600),
+                    LiveStart::Unknown(ref names) if !names.is_empty()
+                ),
+                "{label} must make the bound unknown"
+            );
+        }
+    }
+
+    const NOW: u64 = 2_000_000_000;
+    const DAY: u64 = 86_400;
+
+    fn decide(
+        stamps: &[(&str, Option<u64>)],
+        limits: PruneLimits,
+        live: LiveStart,
+    ) -> Vec<(String, Option<KeepReason>)> {
+        let stamped: Vec<(PathBuf, Option<u64>)> = stamps
+            .iter()
+            .map(|(n, at)| (PathBuf::from(n), *at))
+            .collect();
+        select_prunable(&stamped, limits, NOW, &live)
+            .into_iter()
+            .map(|(p, r)| (p.to_string_lossy().into_owned(), r))
+            .collect()
+    }
+
+    fn keep_newest(n: usize) -> PruneLimits {
+        PruneLimits {
+            keep_newest: Some(n),
+            older_than_secs: None,
+        }
+    }
+
+    fn older_than(secs: u64) -> PruneLimits {
+        PruneLimits {
+            keep_newest: None,
+            older_than_secs: Some(secs),
+        }
+    }
+
+    /// Unstamped dirs rank newest, take the keep slots first, and are kept
+    /// even past N: their age is unknown.
+    #[test]
+    fn keep_newest_counts_unstamped_dirs_as_newest() {
+        let got = decide(
+            &[
+                ("a", Some(NOW - 3 * DAY)),
+                ("u1", None),
+                ("b", Some(NOW - DAY)),
+                ("c", Some(NOW - 2 * DAY)),
+                ("u2", None),
+            ],
+            keep_newest(3),
+            LiveStart::None,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), None),
+                ("u1".into(), Some(KeepReason::Unstamped)),
+                ("b".into(), Some(KeepReason::Newest)),
+                ("c".into(), None),
+                ("u2".into(), Some(KeepReason::Unstamped)),
+            ]
+        );
+
+        let got = decide(
+            &[("u1", None), ("u2", None), ("a", Some(1))],
+            keep_newest(1),
+            LiveStart::None,
+        );
+        assert!(
+            got.iter().all(|(n, r)| (n == "a") == r.is_none()),
+            "an unstamped dir past N is still kept: {got:?}"
+        );
+    }
+
+    #[test]
+    fn keep_newest_zero_keeps_only_unstamped() {
+        let got = decide(
+            &[("a", Some(NOW - DAY)), ("u", None)],
+            keep_newest(0),
+            LiveStart::None,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), None),
+                ("u".into(), Some(KeepReason::Unstamped))
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_newest_breaks_ties_by_path() {
+        let got = decide(
+            &[("z", Some(NOW - DAY)), ("y", Some(NOW - DAY))],
+            keep_newest(1),
+            LiveStart::None,
+        );
+        assert_eq!(
+            got,
+            vec![("z".into(), None), ("y".into(), Some(KeepReason::Newest))]
+        );
+    }
+
+    #[test]
+    fn older_than_keeps_recent_future_and_unstamped_dirs() {
+        let got = decide(
+            &[
+                ("old", Some(NOW - 2 * DAY)),
+                ("edge", Some(NOW - DAY)),
+                ("recent", Some(NOW - DAY + 1)),
+                ("future", Some(NOW + DAY)),
+                ("u", None),
+            ],
+            older_than(DAY),
+            LiveStart::None,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("old".into(), None),
+                ("edge".into(), None),
+                ("recent".into(), Some(KeepReason::TooRecent)),
+                ("future".into(), Some(KeepReason::TooRecent)),
+                ("u".into(), Some(KeepReason::Unstamped)),
+            ]
+        );
+    }
+
+    /// Both bounds together delete only what each alone would.
+    #[test]
+    fn keep_newest_and_older_than_intersect() {
+        let limits = PruneLimits {
+            keep_newest: Some(1),
+            older_than_secs: Some(2 * DAY),
+        };
+        let got = decide(
+            &[
+                ("a", Some(NOW - 5 * DAY)),
+                ("b", Some(NOW - 4 * DAY)),
+                ("c", Some(NOW - DAY)),
+            ],
+            limits,
+            LiveStart::None,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), None),
+                ("b".into(), None),
+                ("c".into(), Some(KeepReason::Newest)),
+            ]
+        );
+    }
+
+    /// A dir is deleted past a live session only when it was orphaned more
+    /// than the margin before the earliest live start; the boundary keeps.
+    #[test]
+    fn a_live_session_keeps_every_dir_it_could_be_reading() {
+        let start = NOW - DAY;
+        let got = decide(
+            &[
+                ("well-before", Some(start - PRUNE_START_MARGIN_SECS - 1)),
+                ("at-margin", Some(start - PRUNE_START_MARGIN_SECS)),
+                ("just-before", Some(start - 60)),
+                ("after", Some(start + 60)),
+            ],
+            older_than(1),
+            LiveStart::Earliest(start),
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("well-before".into(), None),
+                ("at-margin".into(), Some(KeepReason::LiveSession)),
+                ("just-before".into(), Some(KeepReason::LiveSession)),
+                ("after".into(), Some(KeepReason::LiveSession)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_live_start_keeps_every_dir() {
+        let got = decide(
+            &[("ancient", Some(1)), ("u", None)],
+            keep_newest(0),
+            LiveStart::Unknown(vec!["abc".into()]),
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("ancient".into(), Some(KeepReason::LiveSession)),
+                ("u".into(), Some(KeepReason::Unstamped)),
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_limits_are_inactive_by_default() {
+        assert!(!PruneLimits::default().is_active());
+        assert!(keep_newest(0).is_active());
+        assert!(older_than(1).is_active());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlaps_a_pin_resolves_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-sha");
+        let other = tmp.path().join("other-sha");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let pin = tmp.path().join("pinned-sha");
+        std::os::unix::fs::symlink(&real, &pin).unwrap();
+        let pinned_real = vec![fs::canonicalize(&pin).unwrap()];
+
+        assert!(overlaps_a_pin(&real, &pinned_real), "the pin's real target");
+        assert!(
+            !overlaps_a_pin(&other, &pinned_real),
+            "an unrelated sibling"
+        );
+        assert!(
+            overlaps_a_pin(&tmp.path().join("missing"), &pinned_real),
+            "an unresolvable dir is treated as pinned"
+        );
+    }
+
+    #[test]
+    fn pins_lost_names_only_pins_that_vanished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kept = tmp.path().join("kept");
+        let gone = tmp.path().join("gone");
+        fs::create_dir_all(&kept).unwrap();
+        fs::create_dir_all(&gone).unwrap();
+        let before = vec![kept.clone(), gone.clone()];
+        assert!(pins_lost(&before).is_empty());
+        fs::remove_dir_all(&gone).unwrap();
+        assert_eq!(pins_lost(&before), vec![gone]);
     }
 
     // ── guardrails_identity_finding (#275) ───────────────────────────────────

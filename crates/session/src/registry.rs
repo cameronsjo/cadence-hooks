@@ -1189,6 +1189,41 @@ mod tests {
         );
     }
 
+    /// A heartbeat that recreates a swept record stamps `started_epoch` as now,
+    /// which is not when that session loaded its plugins, so the record must
+    /// not vouch for its start; one that refreshes a vouching record keeps the
+    /// vouch, in both registries (cameronsjo/cadence-hooks#904).
+    #[test]
+    fn touch_own_never_vouches_for_a_start_it_did_not_see() {
+        let local = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        touch_own(
+            local.path(),
+            Some(global.path()),
+            "resurrected",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !read_own(local.path(), "resurrected")
+                .unwrap()
+                .start_verified
+        );
+        assert!(
+            !read_own(global.path(), "resurrected")
+                .unwrap()
+                .start_verified
+        );
+
+        let mut rec = record("", "vouched");
+        rec.start_verified = true;
+        write_record(local.path(), &rec).unwrap();
+        touch_own(local.path(), Some(global.path()), "vouched", None, false).unwrap();
+        assert!(read_own(local.path(), "vouched").unwrap().start_verified);
+        assert!(read_own(global.path(), "vouched").unwrap().start_verified);
+    }
+
     /// `None` means do not mirror — the state every test runs in, and the
     /// reason a test can no longer reach the machine's real registry.
     #[test]

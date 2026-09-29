@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor --prune` takes `--keep-newest N` and `--older-than <age>`, so a machine that is never quiet can still prune.** Without them, `--prune --apply` refuses while any session is registered, and on a busy machine the live set turns over before it empties. With either bound, each dir is decided on its own: it is removed only when it carries an `.orphaned_at` stamp, falls outside the N newest (unstamped dirs rank newest and are always kept), is at least `<age>` old (`90m`, `12h`, `7d`, `2w`), and was orphaned more than ten minutes before every live session started, since a session that started later loaded the pin the manifest named then. Session records now carry `start_verified`, set only when a fresh `startup` registered them: a `/clear`, `/compact`, resume or fork registration, a record a heartbeat recreated, or a record from an older binary cannot say when its process loaded plugins, so while any of those is live the bounds keep every dir. `CADENCE_DOCTOR_PRUNE_FORCE=1` drops only the live-session check; the bounds still apply. Every `--prune` run also drops a candidate that resolves onto a pinned install through a symlink, and `--apply` exits 2, naming the path, if any install the manifest named is gone afterwards. (cameronsjo/cadence-hooks#904)
+
 ### Fixed
 
 - **The `doctor --prune --apply` gate no longer reads a working session as stale under a short `CADENCE_SESSION_STALE_MINUTES`.** A working session with no override refreshes its record every ten minutes, a third of the default window, whatever the reader's setting. A doctor run with the variable set to 5 read a peer between beats as stale and pruned under it. The gate now reads sessions on the longer of the variable and the default. The gaps 0.106.0 named remain, and closing them is an operator call: a session idle at the prompt for 30 minutes has its record swept by peers, and a session outside any git repo never registers. Close sessions before an unbounded `--prune --apply`. (cameronsjo/cadence-hooks#902)
