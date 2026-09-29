@@ -366,6 +366,15 @@ enum CadenceCommands {
         /// audit can tell a cleared roster from a legacy one (cadence-hooks#775)
         #[arg(long)]
         fresh: bool,
+        /// Record a dispositioned SKIP instead of a polish run, with the reason
+        /// — e.g. `--skip "dnsmasq address= line change only"`. The pre-PR gate
+        /// then treats the branch as dispositioned and echoes the reason.
+        /// Required non-trivial (not empty, `n/a`, `none`, `-`, `.`), at most
+        /// 120 bytes of `[A-Za-z0-9 .,:;()/_'#=+-]`; anything else is a usage
+        /// error (exit 2). Cannot be combined with `--scope`, `--arm*`, or
+        /// `--fresh` (cadence-hooks#787)
+        #[arg(long, value_name = "REASON", allow_hyphen_values = true)]
+        skip: Option<String>,
     },
 }
 
@@ -1547,6 +1556,7 @@ fn main() {
                 arm_model,
                 arm_report,
                 fresh,
+                skip,
             } => {
                 // Exit only on a nonzero code; the success path keeps falling
                 // through to main's own exit. `run_record` returns 0 when a
@@ -1556,7 +1566,7 @@ fn main() {
                 // (`--scope`, `--branch` — cadence-hooks#775, #801). This is a
                 // CLI action, not a hook, so a nonzero exit gates no tool call.
                 let code = cadence_hooks_cadence::record_polish::run_record(
-                    repo_root, branch, scope, arm, arm_model, arm_report, fresh,
+                    repo_root, branch, scope, arm, arm_model, arm_report, fresh, skip,
                 );
                 if code != 0 {
                     process::exit(code.into());

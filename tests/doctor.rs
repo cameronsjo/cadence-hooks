@@ -48,7 +48,11 @@ fn doctor_in_home(home: &std::path::Path, metrics: &std::path::Path) -> Command 
         .env("HOME", home)
         .env("CADENCE_METRICS_DIR", metrics)
         .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CADENCE_METRICS_STALE_DAYS");
+        .env_remove("CADENCE_METRICS_STALE_DAYS")
+        // Hermetic by default (cadence-hooks#902): the prune gate enumerates
+        // local claude processes, and the machine running the suite may have
+        // real ones. `true` prints nothing and exits 0: no processes.
+        .env("CADENCE_DOCTOR_PS", "true");
     cmd
 }
 
@@ -1556,4 +1560,142 @@ fn doctor_prune_apply_refuses_when_the_registry_cannot_be_listed() {
     assert!(stderr.contains("refusing to prune"), "{stderr}");
     assert!(stderr.contains("unreadable registry"), "{stderr}");
     assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}
+
+// ── doctor --prune process gate (cameronsjo/cadence-hooks#902) ──────────────
+
+/// An executable `ps` stand-in that prints `lines` and exits `code`.
+fn fake_ps(dir: &std::path::Path, lines: &[&str], code: i32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-ps");
+    let body: String = lines.iter().map(|l| format!("echo '{l}'\n")).collect();
+    std::fs::write(&path, format!("#!/bin/sh\n{body}exit {code}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+const ONE_CLAUDE: &[&str] = &["  4242 claude claude --resume"];
+
+#[test]
+fn doctor_prune_apply_refuses_an_unregistered_claude_process() {
+    // No registry record at all (a session outside any repo never registers),
+    // yet one claude process runs: the registry gate would proceed.
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let ps = fake_ps(home.path(), ONE_CLAUDE, 0);
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .env("CADENCE_DOCTOR_PS", &ps)
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(stderr.contains("1 claude process"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}
+
+#[test]
+fn doctor_prune_apply_fails_closed_when_processes_cannot_be_enumerated() {
+    // Two ways: `ps` exits non-zero, and `ps` cannot be spawned at all.
+    for ps in ["false", "/nonexistent/ps-binary"] {
+        let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+        let out = live_prune(home.path(), &config, &metrics, &[])
+            .env("CADENCE_DOCTOR_PS", ps)
+            .output()
+            .expect("failed to execute");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{ps}: {stderr}");
+        assert!(stderr.contains("refusing to prune"), "{ps}: {stderr}");
+        assert!(stderr.contains("cannot tell whether"), "{ps}: {stderr}");
+        assert!(
+            three_days.exists() && one_day.exists() && pinned.exists(),
+            "{ps}: nothing may be removed"
+        );
+    }
+}
+
+#[test]
+fn doctor_prune_apply_with_no_processes_still_prunes() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .output()
+        .expect("failed to execute");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!three_days.exists() && !one_day.exists(), "orphans removed");
+    assert!(pinned.exists());
+}
+
+#[test]
+fn doctor_prune_apply_force_overrides_the_process_gate() {
+    let (home, config, metrics, _pinned, three_days, one_day) = live_prune_fixture();
+    let ps = fake_ps(home.path(), ONE_CLAUDE, 1);
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .env("CADENCE_DOCTOR_PS", &ps)
+        .env("CADENCE_DOCTOR_PRUNE_FORCE", "1")
+        .output()
+        .expect("failed to execute");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!three_days.exists() && !one_day.exists());
+}
+
+#[test]
+fn doctor_prune_limits_keep_everything_for_a_process_no_record_vouches_for() {
+    // One vouching record, two claude processes: the second is invisible to the
+    // registry, so no orphaned dir can be ruled out.
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+    let ps = fake_ps(home.path(), &["  1 claude claude", "  2 claude claude"], 0);
+    let out = live_prune(home.path(), &config, &metrics, &["--older-than", "12h"])
+        .env("CADENCE_DOCTOR_PS", &ps)
+        .output()
+        .expect("failed to execute");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("running claude process"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn doctor_prune_limits_proceed_when_every_process_is_registered() {
+    let (home, config, metrics, _pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "vouching-0000", now - 2 * DAY, true, now);
+    let ps = fake_ps(home.path(), ONE_CLAUDE, 0);
+    let out = live_prune(home.path(), &config, &metrics, &["--older-than", "12h"])
+        .env("CADENCE_DOCTOR_PS", &ps)
+        .output()
+        .expect("failed to execute");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!three_days.exists(), "accounted for: pruned as before");
+    assert!(one_day.exists());
+}
+
+#[test]
+fn doctor_prune_dry_run_never_refuses_on_an_unreadable_process_list() {
+    let (home, config, metrics, _pinned, three_days, one_day) = live_prune_fixture();
+    let out = live_prune_dry(home.path(), &config, &metrics)
+        .env("CADENCE_DOCTOR_PS", "false")
+        .output()
+        .expect("failed to execute");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        three_days.exists() && one_day.exists(),
+        "dry-run deletes nothing"
+    );
+}
+
+fn live_prune_dry(
+    home: &std::path::Path,
+    config: &std::path::Path,
+    metrics: &std::path::Path,
+) -> std::process::Command {
+    let mut cmd = doctor_in_config_dir(home, config, metrics);
+    cmd.arg("--prune")
+        .current_dir(home)
+        .env_remove("CADENCE_DOCTOR_PRUNE_FORCE")
+        .env_remove("CADENCE_SESSION_STALE_MINUTES");
+    cmd
 }

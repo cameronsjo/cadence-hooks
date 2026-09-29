@@ -16,6 +16,13 @@
 //! guard's decision into another's — critically, it cannot loosen
 //! `enforce_worktree`'s BLOCK direction (cadence-hooks#164).
 //!
+//! **Trust.** The walk reads repo-controlled text (`gitdir:`, `commondir:`), so
+//! the result is an *unverified identity*, not git's own answer (#670). For
+//! guard consumers it fails closed — a gitdir or common dir that is not a
+//! directory holding a `HEAD` file resolves to `None`, which guards read as
+//! unknown. The metrics crate consumes it as a display **label only** (the
+//! `repo` field); a forged label misattributes a row and decides nothing.
+//!
 //! **Pure filesystem, no `git` spawn.** Resolution is a filesystem walk plus a
 //! few small reads of `HEAD`-family files, so it is cheap and testable without a
 //! subprocess — the same discipline `resolve_git_common_dir` already keeps.
@@ -98,6 +105,17 @@ impl GitState {
         // the outward-facing identity paths.
         let (worktree_kind, git_dir) = worktree_git_dir(&repo_root)?;
         let git_common_dir = resolve_git_common_dir(&repo_root)?;
+        // Fail closed on a layout the repo's own text could forge
+        // (cadence-hooks#670): `gitdir:` and `commondir:` are plain text under
+        // whoever controls the directory. Both targets must be real
+        // directories holding a `HEAD` *file*; anything else is unresolved,
+        // which every guard already reads as unknown. This narrows the forgery
+        // (a `.git` pointing at a bare file, a missing dir, or a dir with no
+        // `HEAD`) but does not close it — a directory an attacker fully
+        // populates still passes; that needs local write access.
+        if !is_git_dir(&git_dir) || !is_git_dir(&git_common_dir) {
+            return None;
+        }
         let branch = head_branch(&git_dir);
         let default_branch = default_branch_from(&git_common_dir);
         Some(GitState {
@@ -122,6 +140,11 @@ impl GitState {
     pub fn is_linked(&self) -> bool {
         self.worktree_kind == WorktreeKind::Linked
     }
+}
+
+/// A plausible git dir: a directory holding a regular `HEAD` file.
+fn is_git_dir(dir: &Path) -> bool {
+    dir.is_dir() && dir.join("HEAD").is_file()
 }
 
 /// The worktree's own git admin directory — where *this* checkout's `HEAD`
@@ -476,5 +499,108 @@ mod tests {
         assert!(GitState::resolve(tmp.path()).is_some());
         // …but a nonexistent child of it does not.
         assert_eq!(GitState::resolve(&tmp.path().join("not-created-yet")), None);
+    }
+
+    /// cameronsjo/cadence-hooks#670: forged `gitdir:`/`commondir:` targets that
+    /// are not real git dirs resolve to `None`; real layouts still resolve.
+    #[test]
+    fn forged_gitdir_and_commondir_targets_fail_closed() {
+        // (name, build the fixture under `root`, expect Some)
+        type Case = (&'static str, fn(&Path), bool);
+        let cases: [Case; 7] = [
+            (
+                "gitdir names a missing path",
+                |r| {
+                    std::fs::write(r.join(".git"), "gitdir: /nonexistent/x\n").unwrap();
+                },
+                false,
+            ),
+            (
+                "gitdir names a regular file",
+                |r| {
+                    std::fs::write(r.join("f"), "x").unwrap();
+                    std::fs::write(
+                        r.join(".git"),
+                        format!("gitdir: {}\n", r.join("f").display()),
+                    )
+                    .unwrap();
+                },
+                false,
+            ),
+            (
+                "gitdir is a dir with no HEAD",
+                |r| {
+                    std::fs::create_dir_all(r.join("admin")).unwrap();
+                    std::fs::write(
+                        r.join(".git"),
+                        format!("gitdir: {}\n", r.join("admin").display()),
+                    )
+                    .unwrap();
+                },
+                false,
+            ),
+            (
+                "HEAD is a directory, not a file",
+                |r| {
+                    std::fs::create_dir_all(r.join("admin").join("HEAD")).unwrap();
+                    std::fs::write(
+                        r.join(".git"),
+                        format!("gitdir: {}\n", r.join("admin").display()),
+                    )
+                    .unwrap();
+                },
+                false,
+            ),
+            (
+                "commondir names a dir with no HEAD",
+                |r| {
+                    let admin = r.join("admin");
+                    std::fs::create_dir_all(&admin).unwrap();
+                    std::fs::write(admin.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+                    std::fs::create_dir_all(r.join("common")).unwrap();
+                    std::fs::write(
+                        admin.join("commondir"),
+                        format!("{}\n", r.join("common").display()),
+                    )
+                    .unwrap();
+                    std::fs::write(r.join(".git"), format!("gitdir: {}\n", admin.display()))
+                        .unwrap();
+                },
+                false,
+            ),
+            (
+                "commondir names a missing path",
+                |r| {
+                    let admin = r.join("admin");
+                    std::fs::create_dir_all(&admin).unwrap();
+                    std::fs::write(admin.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+                    std::fs::write(admin.join("commondir"), "/nonexistent/common\n").unwrap();
+                    std::fs::write(r.join(".git"), format!("gitdir: {}\n", admin.display()))
+                        .unwrap();
+                },
+                false,
+            ),
+            // Control: a well-formed separate-git-dir layout still resolves.
+            (
+                "well-formed gitdir with HEAD",
+                |r| {
+                    let admin = r.join("admin");
+                    std::fs::create_dir_all(&admin).unwrap();
+                    std::fs::write(admin.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+                    std::fs::write(r.join(".git"), format!("gitdir: {}\n", admin.display()))
+                        .unwrap();
+                },
+                true,
+            ),
+        ];
+        for (name, build, expect_some) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            // Fixtures live beside the checkout so `r.join(..)` targets are
+            // inside the temp tree; `build` receives the checkout root.
+            build(&root);
+            assert_eq!(GitState::resolve(&root).is_some(), expect_some, "{name}");
+        }
     }
 }

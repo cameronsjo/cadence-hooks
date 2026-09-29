@@ -139,7 +139,6 @@ mod tests {
     /// same value, the steady state of a session that has not drifted.
     fn seed_record(dir: &Path, session_id: &str, branch: Option<&str>) {
         let rec = SessionRecord {
-            name: "quiet-loom".into(),
             session_id: session_id.into(),
             branch: branch.map(String::from),
             declared_branch: branch.map(String::from),

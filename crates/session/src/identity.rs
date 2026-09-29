@@ -18,19 +18,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SessionRecord {
-    /// The session's 8-char short id, duplicating `session_id`'s prefix.
-    ///
-    /// Retained for exactly one release (0.98.0) and always written as
-    /// [`short_id`]. A 0.97.0 binary declares this field WITHOUT a serde
-    /// default, so a record lacking it fails to parse there — and a registry
-    /// of unparsable records makes 0.97.0's `doctor --prune` liveness gate
-    /// count zero live sessions and prune dirs they are pinned to.
-    ///
-    /// Removal rides cadence-hooks#899, gated on a check rather than a date:
-    /// no `<= 0.97.0` binary on any machine (`brew list --versions
-    /// cadence-hooks` plus a sweep of `target/` and `.claude/worktrees/`
-    /// builds).
-    pub name: String,
     /// Full Claude Code session id.
     pub session_id: String,
     /// Git branch at registration / last heartbeat.
@@ -297,7 +284,6 @@ mod tests {
     #[test]
     fn record_round_trips_json() {
         let record = SessionRecord {
-            name: "e4739a12".into(),
             session_id: "e4739a12".into(),
             branch: Some("feat/issue-52".into()),
             declared_branch: Some("feat/issue-52".into()),
@@ -316,7 +302,6 @@ mod tests {
     #[test]
     fn record_omits_empty_optional_fields() {
         let record = SessionRecord {
-            name: "e4739a12".into(),
             session_id: "e4739a12".into(),
             ..Default::default()
         };
@@ -341,14 +326,18 @@ mod tests {
     }
 
     #[test]
-    fn record_parses_json_without_a_name() {
-        // `name` is retained for one release only (cadence-hooks#899). A
-        // record written after its removal — or hand-written without it — must
-        // still parse, or `doctor --prune`'s liveness gate reads a registry of
+    fn record_parses_with_or_without_a_legacy_name_key() {
+        // `name` was dropped (cadence-hooks#899). A record still carrying it
+        // (written by an older binary) must keep parsing — the unknown key is
+        // ignored — or `doctor --prune`'s liveness gate reads a registry of
         // live sessions as empty and prunes dirs they are pinned to.
-        let record: SessionRecord = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
-        assert_eq!(record.session_id, "s1");
-        assert!(record.name.is_empty());
+        for json in [
+            r#"{"session_id":"s1"}"#,
+            r#"{"name":"quiet-loom","session_id":"s1"}"#,
+        ] {
+            let record: SessionRecord = serde_json::from_str(json).unwrap();
+            assert_eq!(record.session_id, "s1", "{json}");
+        }
     }
 
     #[test]

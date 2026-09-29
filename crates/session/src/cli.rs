@@ -110,7 +110,6 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
 
     // Upsert: keep existing fields, apply the declaration.
     let mut record = registry::read_own(&dir, &sid).unwrap_or_else(|| identity::SessionRecord {
-        name: identity::short_id(&sid).to_string(),
         session_id: sid.clone(),
         started: identity::utc_timestamp(),
         started_epoch: identity::now_epoch(),
@@ -592,7 +591,6 @@ mod tests {
     fn status_peer(session_id: &str, branch: Option<&str>) -> registry::Peer {
         registry::Peer {
             record: identity::SessionRecord {
-                name: identity::short_id(session_id).into(),
                 session_id: session_id.into(),
                 branch: branch.map(str::to_string),
                 ..Default::default()
@@ -899,7 +897,6 @@ mod tests {
 
     fn declared_record() -> identity::SessionRecord {
         identity::SessionRecord {
-            name: "quiet-loom".into(),
             session_id: "s1".into(),
             intent: Some("cadence-hooks#52".into()),
             touching: vec!["crates/guardrails/".into()],

@@ -4356,6 +4356,15 @@ fn program_writes_nothing(word: &str, argv: &[String]) -> bool {
 /// A read-only `git` invocation, with no global option in front: a `-c`
 /// (`core.fsmonitor=…`) or `-C` could make any subcommand run a program or
 /// read elsewhere, so a global of any kind revokes.
+///
+/// **Trust assumption (accepted, cameronsjo/cadence-hooks#1157).** "Read-only"
+/// here means the *subcommand* writes nothing. A repository's own
+/// `.git/config` can still make these commands run programs (`diff.external`,
+/// `diff.<driver>.textconv`, `core.fsmonitor`, `core.pager`). That is accepted,
+/// not fixed: a clone cannot ship `.git/config`, so planting those keys already
+/// requires local write access to the checkout, at which point the attacker
+/// does not need this classifier. Only the command line is defended here (the
+/// global `-c`/`-C` revocation above), never the repository's config.
 fn git_is_read_only(args: &[String]) -> bool {
     let Some((sub, rest)) = args.split_first() else {
         return false;

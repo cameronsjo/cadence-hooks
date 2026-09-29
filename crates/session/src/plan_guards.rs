@@ -426,6 +426,11 @@ fn windowed_flips(command: &str) -> Vec<Vec<String>> {
 /// leaves no token behind and is not seen.
 fn flips_the_cwd_branch(tokens: &[String], cwd: &str, branch: &str) -> bool {
     let mut target = ship_target(tokens);
+    // The polish gate reads a numbered PR from the default branch as
+    // "cannot check" (cadence-hooks#1005). This guard's documented reading is
+    // the opposite — a number in the cwd's own repo IS a flip of this branch's
+    // PR — so it opts out of that rule.
+    target.names_pr = false;
     match pr_selector(tokens) {
         PrSelector::None | PrSelector::Number(_) => {}
         PrSelector::Url {
@@ -474,6 +479,44 @@ fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
     plan_scan::in_flight_plans(repo_root)
         .into_iter()
         .find(|plan| plan.branch.as_deref() == Some(branch.as_str()))
+}
+
+/// The commit-time pre-arm of the plan tick (cadence-hooks#691): the repo
+/// root's `git status --porcelain` says the current branch's in-flight plan
+/// is **modified but not staged** — the tick exists and is about to miss the
+/// commit. Returns the plan's repo-relative path, sanitized for display.
+///
+/// Read this against [`run_nudge_plan_tick`], which treats a dirty plan as
+/// *maintained* and stays silent: after the commit it is too late to fold the
+/// tick in, so a dirty-but-unstaged plan means "maintained" there and "about
+/// to miss" here. Deliberately no unticked-box clause — an in-flight plan
+/// always has unticked boxes.
+///
+/// Only the index-clean, worktree-modified state (` M`) counts. A staged plan
+/// (`M `, `MM`, `A `) is already in the commit's diff; an untracked plan is
+/// already named by the untracked-files warning. The scan is skipped unless a
+/// ` M docs/plans/*.md` line exists, so an ordinary commit pays nothing.
+/// Fails open on every input (no repo, no plan, a quoted path): `None`.
+///
+/// `porcelain` is `git status --porcelain` output, whose paths are relative
+/// to the repo root.
+pub fn unstaged_plan_at_commit(cwd: &str, porcelain: &str) -> Option<String> {
+    let candidates: Vec<&str> = porcelain
+        .lines()
+        .filter_map(|line| line.strip_prefix(" M docs/plans/"))
+        .filter(|name| name.ends_with(".md") && !name.contains('/'))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let repo_root = crate::registry::repo_root(cwd)?;
+    let plan = plan_for_current_branch(&repo_root)?;
+    let dirty_unstaged = candidates
+        .iter()
+        .any(|name| format!("docs/plans/{name}") == plan.rel_path);
+    dirty_unstaged.then(|| {
+        crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
+    })
 }
 
 /// Does git's commit summary line (`[branch abc1234] subject`) appear in
