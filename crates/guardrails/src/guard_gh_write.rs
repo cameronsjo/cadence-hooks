@@ -1853,6 +1853,12 @@ fn looped_write_kind(command: &str) -> LoopedWriteKind {
     LoopedWriteKind::RepoWrite
 }
 
+/// True when a resolved `owner/repo` still carries shell expansion syntax
+/// (`$1`, `${R}`, `$(…)`, a backtick) — a value only the running shell knows.
+fn repo_has_unexpanded_expansion(repo: &str) -> bool {
+    repo.contains('$') || repo.contains('`')
+}
+
 /// Resolve and judge a single gh write segment's target. Returns `Some(block)`
 /// when the segment targets a repo outside the allowlist (or one that can't be
 /// resolved), `None` when it's allowed. Per-segment resolution is what stops a
@@ -1941,6 +1947,25 @@ fn judge_write_segment(
         RepoResolution::Resolved { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 None
+            } else if repo_has_unexpanded_expansion(&repo) {
+                // The target is a shell expansion this guard never sees the
+                // value of, so it is UNRESOLVABLE, not unowned — and the
+                // unowned template's `-R <owner>/<name>` fix would graft an
+                // owner the caller never chose onto `$1` (#757).
+                Some(CheckResult::block_structured(
+                    format!(
+                        "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
+                         Target:  {repo} (an unexpanded shell expansion — its value is only known \
+                         when the shell runs)\n   \
+                         Fix: pass the target as a literal `-R owner/repo`"
+                    ),
+                    BlockMetadata {
+                        rule_id: "gh-write-target-unresolvable".to_string(),
+                        fix: "pass the target as a literal -R owner/repo".to_string(),
+                        allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                        severity: "error",
+                    },
+                ))
             } else {
                 let example_owner = allowed_owners
                     .first()
@@ -5894,5 +5919,37 @@ mod tests {
                 "{command}: {message}"
             );
         }
+    }
+
+    // --- #757: an unexpanded `--repo` value is unresolvable, not unowned ---
+
+    #[test]
+    fn unexpanded_repo_flag_blocks_without_grafting_an_owner() {
+        for command in [
+            r#"gh issue comment "$2" --repo "$1" --body-file "$3""#,
+            r#"gh pr create -R "${TARGET}" --title t"#,
+            "gh issue close 1 -R `cat target`",
+        ] {
+            let (message, meta) = block_in_tmp(command);
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
+            assert!(!meta.fix.contains("cameronsjo/"), "fix: {}", meta.fix);
+            assert!(!message.contains("don't own"), "message: {message}");
+            assert!(
+                message.contains("literal `-R owner/repo`"),
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_under_a_literal_owned_owner_is_still_judged_by_owner() {
+        // The owner is spelled out and owned, so the verdict is unchanged.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"gh issue comment 1 --repo cameronsjo/"$1" --body x"#,
+                "/tmp",
+            ));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 }
