@@ -11,11 +11,12 @@
 //! subcommand is the first non-flag token, so an unlisted global flag
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
+use cadence_hooks_core::push::may_redefine_known_commands;
 use cadence_hooks_core::shell::{
     ExpansionWork, carries_substitution, command_segments, command_segments_with_dirs,
-    command_word, evaluated_static_substitutions, executable_tokens, is_assignment_word,
-    may_spell_word, names_command_by_unknown_substitution, parse_work_dir, peel_command_runners,
-    skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
+    command_word, eval_is_tool_init, evaluated_static_substitutions, executable_tokens,
+    is_assignment_word, may_spell_word, names_command_by_unknown_substitution, parse_work_dir,
+    peel_command_runners, skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -749,8 +750,9 @@ fn unseen_execution(command: &str, segments: Option<&[String]>) -> Option<&'stat
             &owned
         }
     };
+    let mut exempt: Vec<String> = Vec::new();
     for segment in segments {
-        if is_alias_definition(segment) {
+        if is_alias_definition(segment) || exempt.iter().any(|e| e == segment.trim()) {
             continue;
         }
         let read = evaluated_static_substitutions(segment).unwrap_or_else(|| segment.clone());
@@ -780,6 +782,16 @@ fn unseen_execution(command: &str, segments: Option<&[String]>) -> Option<&'stat
                     .iter()
                     .any(|a| carries_substitution(a) || a.contains('$')) =>
             {
+                // Tool init (`eval "$(ssh-agent -s)"`, `direnv hook`, …) prints
+                // a fixed set of exports and hooks, unless the command
+                // redefined the tool first; `direnv export` prints whatever an
+                // `.envrc` says and still nudges (cadence-hooks#1172). The
+                // walk also surfaces the operand as a segment of its own.
+                let operands: Vec<&String> = argv[1..].iter().collect();
+                if !may_redefine_known_commands(command) && eval_is_tool_init(&operands) {
+                    exempt.extend(argv[1..].iter().map(|a| a.trim().to_string()));
+                    continue;
+                }
                 return Some("an eval of text built at run time");
             }
             _ if head.contains('/') && has_script_suffix(head) => {
@@ -2436,7 +2448,9 @@ mod tests {
             "source x.sh",
             ". ./x.sh",
             "eval \"$UNSET_ELSEWHERE\"",
-            "eval \"$(ssh-agent -s)\"",
+            "eval \"$(direnv export bash)\"",
+            "ssh-agent() { :; }; eval \"$(ssh-agent -s)\"",
+            "eval \"$(zoxide init --cmd cd bash)\"",
             "$(which python) x.py",
             "`which python` x.py",
             "\"$(git rev-parse --show-toplevel)/x.sh\"",
@@ -2458,6 +2472,12 @@ mod tests {
             "./target/debug/tool --flag",
             "source .venv/bin/activate",
             "eval \"$(echo ls)\"",
+            "eval \"$(ssh-agent -s)\"",
+            "eval \"$(direnv hook bash)\"",
+            "eval \"$(brew shellenv)\"",
+            "eval \"$(pyenv init -)\"",
+            "eval \"$(starship init bash)\"",
+            "eval \"$(mise activate bash)\"",
             "cat x.sh",
             "echo 'bash x.sh'",
             "cd \"$(git rev-parse --show-toplevel)\" && ls",
