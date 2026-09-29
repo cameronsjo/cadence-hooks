@@ -988,6 +988,9 @@ impl GhHostEnv {
     }
 
     fn observe_depth(&mut self, segment: &str, depth: usize) {
+        if observes_nothing(segment, self.var) {
+            return;
+        }
         let tokens = tokenize(segment);
         let normalized = strip_compound_openers(&tokens);
         let mut words: &[String] = &normalized;
@@ -1357,6 +1360,33 @@ fn mentions_gh_host(word: &str) -> bool {
 }
 
 /// [`mentions_gh_host`] for any variable name.
+/// Can [`GhHostEnv::observe_depth`] skip `segment` outright? Only when it is
+/// plain words — no quoting, escape, expansion, `=` or brace expansion that
+/// could spell something else once tokenized — none of which mentions `var`
+/// or names a builtin the observation reads. Every arm of the observation
+/// needs one of those, so such a segment leaves the state as it was; skipping
+/// its tokenization keeps a flood of plain commands cheap.
+fn observes_nothing(segment: &str, var: &str) -> bool {
+    if segment.contains(var)
+        || !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" \t\n_./:@%+-;|&(){}".contains(&b))
+    {
+        return false;
+    }
+    !segment
+        .split(|c: char| !(c.is_ascii_alphanumeric() || "_.-".contains(c)))
+        .any(|word| {
+            DECLARING_BUILTINS.contains(&word)
+                || NAME_OPERAND_BUILTINS.contains(&word)
+                || VAR_SETTING_BUILTINS.contains(&word)
+                || matches!(
+                    word,
+                    "unset" | "set" | "source" | "." | "eval" | "trap" | "builtin" | "command"
+                )
+        })
+}
+
 fn mentions_var(word: &str, name: &str) -> bool {
     let bytes = word.as_bytes();
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -2398,6 +2428,16 @@ pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
 const MAX_EVAL_DEPTH: usize = 3;
 
 fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
+    // Plain words only — no quoting, escape, expansion or brace group that
+    // could spell `gh` once tokenized — and no `gh` in any case: no token,
+    // and no `eval`/`env -S` script inside it, can resolve to `gh`.
+    if segment
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b" \t\n_./:@%+-;|&()".contains(&b))
+        && !contains_ignoring_ascii_case(segment, "gh")
+    {
+        return false;
+    }
     let tokens = tokenize(segment);
     if tokens_contain_gh(&tokens) {
         return true;
@@ -3202,8 +3242,22 @@ impl Check for GhWriteGuard {
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
 
-        // AST-based loop detection with regex fallback
-        match loop_analysis::analyze_gh_loops(command) {
+        // AST-based loop detection with regex fallback. A loop needs one of
+        // its reserved words spelled out in the text — they cannot come from
+        // an expansion — and so does the fallback pattern, so a command with
+        // none of them skips the parse: every answer it could give is
+        // `NoLoops` or a fallback that does not match.
+        static LOOP_WORD: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?:^|[^A-Za-z0-9_])(?:for|while|until|select)(?:[^A-Za-z0-9_]|$)")
+                .expect("pattern should compile")
+        });
+        let may_loop = LOOP_WORD.is_match(command);
+        let analysis = if may_loop {
+            loop_analysis::analyze_gh_loops(command)
+        } else {
+            LoopAnalysis::NoLoops
+        };
+        match analysis {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 // Only writes are ownership-gated; reads (gh pr view, issue list) are
                 // owner-independent and safe against any repo — mirror the MissingTargets
@@ -3437,6 +3491,11 @@ fn judge_write_segments(
 ) -> Option<CheckResult> {
     let mut gh_host_env = GhHostEnv::for_command(command);
     let mut gh_repo_env = GhHostEnv::for_repo(command);
+    // The segment observed last. Observation only ever adds a candidate or
+    // sets a flag, so observing the same text again at once changes nothing —
+    // and a segment that may run in several directories arrives once per
+    // directory, back to back, as does every `f` of an `f; f; …` flood.
+    let mut observed: Option<String> = None;
     for (segment, dir) in segments {
         // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
         // it decides which host every later gh write reaches (#548). A gh
@@ -3451,12 +3510,16 @@ fn judge_write_segments(
             gh_repo_env.add_unresolved();
         }
         if !segment_invokes_gh(&segment) {
-            gh_host_env.observe_wrapper_prefix(&segment);
-            gh_host_env.observe(&segment);
-            gh_repo_env.observe_wrapper_prefix(&segment);
-            gh_repo_env.observe(&segment);
+            if observed.as_deref() != Some(segment.as_str()) {
+                gh_host_env.observe_wrapper_prefix(&segment);
+                gh_host_env.observe(&segment);
+                gh_repo_env.observe_wrapper_prefix(&segment);
+                gh_repo_env.observe(&segment);
+                observed = Some(segment);
+            }
             continue;
         }
+        observed = None;
 
         // The write patterns are raw-text regexes, so the decoded words
         // are judged too: `gh $'issue' create` and `'gh' issue create` run
@@ -8342,6 +8405,67 @@ mod tests {
                     result.message
                 );
             }
+        });
+    }
+
+    /// The fast paths decline only segments the full reading declines too.
+    #[test]
+    fn plain_segment_fast_paths_agree_with_the_full_reading() {
+        for (segment, invokes_gh) in [
+            ("f", false),
+            ("cd /a/b && make -j4", false),
+            ("GH pr create", true),
+            ("/usr/bin/gh pr create", true),
+            ("eval gh pr create", true),
+            ("env -S gh pr create", true),
+            ("g\\h pr create", true),
+            ("'g'h pr create", true),
+            ("{g,x}h pr create", true),
+            ("echo gh", true),
+        ] {
+            assert_eq!(segment_invokes_gh(segment), invokes_gh, "{segment}");
+        }
+        for (segment, skipped) in [
+            ("f", true),
+            ("cd /a && make", true),
+            ("export GH_HOST=x", false),
+            ("GH_HOST=x", false),
+            ("set -a", false),
+            ("source ./env", false),
+            (". ./env", false),
+            ("read h", false),
+            ("ex\\port GH_HOST=x", false),
+            ("'export' X", false),
+            ("eval x", false),
+            ("trap x EXIT", false),
+            ("builtin export X", false),
+        ] {
+            assert_eq!(observes_nothing(segment, "GH_HOST"), skipped, "{segment}");
+        }
+    }
+
+    /// A 200 KB flood of plain function calls before a write is judged well
+    /// inside the hook deadline, which fails open.
+    #[test]
+    fn a_function_call_flood_before_a_write_blocks_promptly() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            let command = format!(
+                "f() {{ cd {u}; }}; {}gh pr create -t x",
+                "f; ".repeat(70_000)
+            );
+            let started = std::time::Instant::now();
+            let result = GhWriteGuard.run(&input_with(&command, o));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+            assert!(
+                started.elapsed().as_secs_f64() < limit,
+                "{:?}",
+                started.elapsed()
+            );
         });
     }
 

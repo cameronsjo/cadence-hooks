@@ -3095,7 +3095,7 @@ fn read_repo_flag(argv: &[String], i: usize) -> Option<(Option<String>, usize)> 
 }
 
 /// The branch a ship command names as its PR head (cadence-hooks#995).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum ShipHead {
     /// No `--head`: gh ships the branch checked out where the command runs.
     #[default]
@@ -3113,7 +3113,7 @@ pub enum ShipHead {
 /// This is a reading of the command text, with the same limits
 /// [`GhPrInvocation::targets_the_current_branch`] documents: an exported
 /// `GH_REPO` or `GH_HOST` leaves no token behind, so it cannot appear here.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ShipTarget {
     /// Every repo value the segment carries: `-R`/`--repo` in global and
     /// post-subcommand position (every spelling), and an inline `GH_REPO=`.
@@ -3139,7 +3139,7 @@ impl ShipTarget {
 
 /// One anchoring segment of a ship command: the anchor it trips and where it
 /// points gh (cadence-hooks#995).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShipSegment {
     /// `"create"`, `"ready"`, or `"merge"`, as [`polish_ship_anchor`] names it.
     pub anchor: &'static str,
@@ -5575,7 +5575,11 @@ impl DirWalk {
                 conditional: context.conditional || !compounds.is_empty(),
                 looped: context.looped || compounds.contains(&Compound::Loop),
             };
-            if let Some(head) = FUNCTION_HEAD.captures(command) {
+            let may_define = command.contains('(') || command.starts_with("function");
+            if let Some(head) = may_define
+                .then(|| FUNCTION_HEAD.captures(command))
+                .flatten()
+            {
                 let name = head.get(1).or(head.get(2)).map_or("", |m| m.as_str());
                 let body = &command[head.get(0).map_or(0, |m| m.end())..];
                 if body.starts_with(['{', '(']) {

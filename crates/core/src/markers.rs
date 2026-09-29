@@ -388,7 +388,7 @@ impl ShipLookups {
 
 /// One anchoring segment of a ship command and the directory it is judged in
 /// (cadence-hooks#997).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocatedShip {
     /// The anchor and the repo, host, and head the segment names.
     pub segment: ShipSegment,
@@ -490,7 +490,7 @@ fn dedup_ships(ships: Vec<LocatedShip>) -> Vec<LocatedShip> {
     let mut seen = std::collections::HashSet::new();
     ships
         .into_iter()
-        .filter(|ship| seen.insert(format!("{:?}\0{:?}", ship.segment, ship.work_dir)))
+        .filter(|ship| seen.insert(ship.clone()))
         .collect()
 }
 
