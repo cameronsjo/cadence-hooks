@@ -106,17 +106,7 @@ pub fn is_blocked(filename: &str, path: &str) -> bool {
         return true;
     }
 
-    if BLOCKED_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
-        return true;
-    }
-
-    if let Some(ext) = lower.rsplit('.').next()
-        && BLOCKED_EXTENSIONS.contains(&ext)
-    {
-        return true;
-    }
-
-    if lower.starts_with("service-account") && lower.ends_with(".json") {
+    if is_key_material_name(&lower, Filename::Known) {
         return true;
     }
 
@@ -124,6 +114,39 @@ pub fn is_blocked(filename: &str, path: &str) -> bool {
     BLOCKED_PATH_FRAGMENTS
         .iter()
         .any(|frag| lower_path.contains(frag))
+}
+
+/// Is this lowercased component a key-material file by NAME — the
+/// [`BLOCKED_SUFFIXES`], `service-account*.json`, or a [`BLOCKED_EXTENSIONS`]
+/// extension?
+///
+/// The one home for the three non-`.env` rules, shared by [`is_blocked`] (the
+/// tool paths, always [`Filename::Known`]) and [`is_dangerous_secret_token_at`]
+/// (the Bash paths), so the shell cannot read or delete what the tools refuse
+/// (cadence-hooks#814 — until then the Bash deny-set held only the `.env`
+/// family and the exact [`BLOCKED_FILENAMES`], and `cat prod.key` allowed).
+///
+/// The extension rule applies only when the caller vouches that the word names
+/// a file. `<name>.key` is the `<name>.env` problem again: `obj.key`,
+/// `.api.key`, and `config.key` are property paths in every jq, yq, and
+/// JavaScript expression, and a bare word off an arbitrary command line cannot
+/// be told apart from `prod.key`. A pure reader's operand, a redirection
+/// target, a writer's operand, and any token carrying a `/` still classify.
+/// The suffix and `service-account` rules carry their own `.pem`/`.json`
+/// extension, so nothing but a file is spelled that way, and they apply
+/// everywhere.
+pub(crate) fn is_key_material_name(component: &str, position: Filename) -> bool {
+    if BLOCKED_SUFFIXES.iter().any(|s| component.ends_with(s)) {
+        return true;
+    }
+    if component.starts_with("service-account") && component.ends_with(".json") {
+        return true;
+    }
+    position == Filename::Known
+        && component
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| BLOCKED_EXTENSIONS.contains(&ext))
 }
 
 /// Check if a filename is ambiguous (warn, not block).
@@ -378,8 +401,9 @@ fn resolve_position(trimmed: &str, position: Filename) -> Filename {
 }
 
 /// True if a shell token resolves to ANY deny-set secret file — the whole
-/// `.env` family (via `is_env_family_secret`) plus the non-`.env` credential
-/// stores in `BLOCKED_FILENAMES` and dir-qualified `BLOCKED_PATH_FRAGMENTS`.
+/// `.env` family (via `is_env_family_secret`), the non-`.env` credential
+/// stores in `BLOCKED_FILENAMES` and dir-qualified `BLOCKED_PATH_FRAGMENTS`,
+/// and the key-material names ([`is_key_material_name`], #814).
 /// Generalizes `is_dangerous_env_token` so the Bash arms judge the same
 /// deny-sets the tool paths already do via `is_blocked` (#138). Safe templates
 /// (`SAFE_SUFFIXES`) short-circuit FIRST so `id_rsa.pub` / `.aws/credentials.example`
@@ -400,8 +424,10 @@ pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
     if is_safe_template(component) {
         return false;
     }
-    is_env_family_secret_at(component, resolve_position(trimmed, position))
+    let position = resolve_position(trimmed, position);
+    is_env_family_secret_at(component, position)
         || BLOCKED_FILENAMES.contains(&component)
+        || is_key_material_name(component, position)
         || BLOCKED_PATH_FRAGMENTS
             .iter()
             .any(|frag| trimmed.contains(frag))
@@ -815,6 +841,61 @@ mod tests {
         ));
         assert!(!is_dangerous_secret_token("main.rs"));
         assert!(!is_dangerous_secret_token("config.toml"));
+    }
+
+    #[test]
+    fn key_material_tokens_match_the_tool_deny_set() {
+        // #814: every path the Read tool refuses, the Bash arms refuse too.
+        for (token, position) in [
+            ("/home/u/prod.key", Filename::Unqualified),
+            ("/home/u/service-account-x.json", Filename::Unqualified),
+            ("/home/u/deploy-key.pem", Filename::Unqualified),
+            ("/home/u/cert.p12", Filename::Unqualified),
+            ("./store.jks", Filename::Unqualified),
+            ("prod.key", Filename::Known),
+            ("cert.pfx", Filename::Known),
+            ("release.keystore", Filename::Known),
+            ("deploy-key.pem", Filename::Unqualified),
+            ("tls_key.pem", Filename::Unqualified),
+            ("app.private.pem", Filename::Unqualified),
+            ("service-account.json", Filename::Unqualified),
+            ("SERVICE-ACCOUNT-prod.JSON", Filename::Unqualified),
+        ] {
+            assert!(
+                is_dangerous_secret_token_at(token, position),
+                "{token} ({position:?}) must be dangerous"
+            );
+            let name = token.rsplit('/').next().unwrap_or(token);
+            assert!(is_blocked(name, token), "{token}: tool deny-set parity");
+        }
+    }
+
+    #[test]
+    fn key_extension_needs_a_filename_position() {
+        // `obj.key` is a property path, not a file, until something vouches.
+        for word in ["obj.key", ".api.key", "config.key", "x.p12", "a.jks"] {
+            assert!(
+                !is_dangerous_secret_token_at(word, Filename::Unqualified),
+                "{word} unqualified"
+            );
+            assert!(
+                is_dangerous_secret_token_at(word, Filename::Known),
+                "{word} known"
+            );
+        }
+        // Neighbours that are not key material stay clean everywhere.
+        for word in [
+            "cert.pem",
+            "keys.txt",
+            "service-account.yaml",
+            "monkey",
+            "key.pub",
+        ] {
+            assert!(
+                !is_dangerous_secret_token_at(word, Filename::Known),
+                "{word}"
+            );
+        }
     }
 
     // --- #85: secret-value content scanner ---

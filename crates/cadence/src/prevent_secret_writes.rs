@@ -375,6 +375,36 @@ mod tests {
     }
 
     #[test]
+    fn bash_key_material_writes_blocked() {
+        // #814: the Write tool refuses these paths, so the shell must too.
+        for command in [
+            "rm /home/u/prod.key",
+            "rm prod.key",
+            "echo x > /home/u/prod.key",
+            "echo x > deploy-key.pem",
+            "cp a.txt cert.p12",
+            "truncate -s0 service-account-x.json",
+            "tee release.keystore < /dev/null",
+            "mv new tls_key.pem",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn bash_key_material_neighbours_allowed() {
+        for command in [
+            "rm cert.pem",
+            "echo x > keys.txt",
+            "rm id_rsa.pub",
+            "cp prod.key /tmp/backup/prod.txt.bak",
+            "echo x > service-account.yaml",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
     fn bash_env_template_allowed() {
         assert!(!bash_targets_env_file("cat .env.example"));
     }
