@@ -101,10 +101,12 @@ fn head_deletes(argv: &[String]) -> bool {
 /// nothing follows.
 ///
 /// **Documented limit, not a bug:** a verb PRODUCED by a substitution in command
-/// position (`$(echo rm) note.md`, `` `echo rm` note.md ``) is unknowable
-/// without running it, so this guard does not judge it. Fail-closed on every
-/// unresolvable command word would block `$EDITOR note.md`; the operator ruled
-/// (#546, option b) to leave that shape and say so.
+/// position is unknowable without running it, so this guard does not judge it
+/// (`$(which rm) note.md`). Fail-closed on every unresolvable command word
+/// would block `$EDITOR note.md`; the operator ruled (#546, option b) to leave
+/// that shape and say so. A literal `echo`/`printf` is the exception: it is
+/// read as the text it prints, so `$(echo rm) note.md` is judged as `rm
+/// note.md` (cadence-hooks#1142).
 fn coproc_command(argv: &[String]) -> Option<&[String]> {
     const COMPOUND_STARTS: &[&str] = &[
         "{", "(", "((", "[[", "if", "while", "until", "for", "select", "case",
@@ -1650,6 +1652,42 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
+    /// cadence-hooks#1142: a literal `echo`/`printf` substitution that spells
+    /// the verb or the operand is judged as the `rm` it runs.
+    #[test]
+    fn rm_spelled_by_a_literal_substitution_is_judged() {
+        for command in [
+            "$(echo rm) note.md",
+            "`echo rm` note.md",
+            "$(printf rm) -rf note.md",
+            "$(echo rm -rf /vault/n.md)",
+            "eval \"$(echo 'rm note.md')\"",
+            "bash -c \"$(echo 'rm note.md')\"",
+            "r$(echo m) note.md",
+        ] {
+            let result =
+                check_destructive_in_vault(command, "/vault/notes", "/vault", &FakeFs::default());
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in [
+            "$(echo ls) note.md",
+            "$(echo echo) rm",
+            "echo $(echo rm) note.md",
+        ] {
+            let result =
+                check_destructive_in_vault(command, "/vault/notes", "/vault", &FakeFs::default());
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn rm_of_a_vault_path_handed_through_a_substitution_blocked() {
         // cadence-hooks#1106 keeps an unquoted substitution as one word, so
@@ -3000,8 +3038,10 @@ mod tests {
             ("coproc DEL { cat note.md; }", Allow),
             ("coproc", Allow),
             ("echo coproc rm note.md", Allow),
-            // Documented limit (#546): a substitution-produced verb is unknowable.
-            ("$(echo rm) note.md", Allow),
+            // Documented limit (#546): a substitution-produced verb is unknowable
+            // — except a literal `echo`/`printf`, which is read as printed (#1142).
+            ("$(which rm) note.md", Allow),
+            ("$(echo rm) note.md", Block),
         ];
         for (command, expected) in cases {
             assert_eq!(outcome_in_vault(command), *expected, "{command}");

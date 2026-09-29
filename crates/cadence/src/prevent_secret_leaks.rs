@@ -4814,6 +4814,38 @@ fn shell_reads_stdin(argv: &[String]) -> bool {
     true
 }
 
+/// The `echo`/`printf` literals a pipeline hands a shell on stdin
+/// (`echo 'cat .env' | bash`, `printf '…' | sh -s`): each is a script, so its
+/// text is judged as the commands it is. The same reading
+/// [`command_level_reads`] gives the immediate producer of a `| bash` stage,
+/// shared with guards that judge a command by what it names
+/// (`guard-gh-dangerous`, cadence-hooks#544). A producer whose output is not a
+/// literal (`cat script.sh | bash`) yields nothing here.
+pub fn piped_shell_scripts(command: &str) -> Vec<String> {
+    if !command.contains('|') {
+        return Vec::new();
+    }
+    let mut scripts = Vec::new();
+    let mut previous_text: Option<String> = None;
+    let mut piped_in = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        let tokens = tokenize(&segment);
+        let mut text = None;
+        if let Some((word, argv)) = resolve_command(&tokens) {
+            match word.as_ref() {
+                "echo" | "printf" => text = literal_output(&word, argv),
+                w if SHELL_HEADS.contains(&w) && piped_in && shell_reads_stdin(argv) => {
+                    scripts.extend(previous_text.take());
+                }
+                _ => {}
+            }
+        }
+        previous_text = text;
+        piped_in = op == Some("|");
+    }
+    scripts
+}
+
 /// Is `script` a command string that is nothing but an expansion — text the
 /// guard cannot read statically (`$(cat f)`, `` `cat f` ``, `$cmd`)?
 fn script_is_opaque(script: &str) -> bool {
@@ -11866,5 +11898,57 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    /// cadence-hooks#1142 / #1134: a word the shell builds from a substitution,
+    /// a pattern substitution or an array element still names the secret it
+    /// reads. Every blocking row reads `.env` under bash 5.2.
+    #[test]
+    fn substitutions_and_expansions_that_build_a_secret_name_block() {
+        assert_bash(
+            &[
+                "cat .env$(true)",
+                "cat .en$(echo)v",
+                "cat .env$(: a b)",
+                "cat .env`true`",
+                "cat \"$(pwd)\"/.env",
+                "$(echo cat .env)",
+                "$(echo 'cat .env')",
+                "`echo cat .env`",
+                "eval \"$(echo 'cat .env')\"",
+                "bash -c \"$(printf 'cat .env')\"",
+                "D=x; cat ${D/x/.env}",
+                "D=x; cat ${D//x/.env}",
+                "D=xx; cat ${D//x/.env}",
+                "D=x; cat ${D/#x/.env}",
+                "D=zz; cat ${D/q*/.env}",
+                "a[1]=.env; cat ${a[1]}",
+                "m[k]=.env; cat ${m[k]}",
+                "m[k]=.env; cat ${m[@]}",
+                "a=(x y); a[2]=.env; cat ${a[2]}",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "the command reads .env",
+        );
+    }
+
+    #[test]
+    fn everyday_substitutions_and_expansions_stay_allowed() {
+        assert_bash(
+            &[
+                "cat \"$(pwd)\"/x.txt",
+                "cat $(git rev-parse --show-toplevel)/README.md",
+                "cat $(echo README.md)",
+                "cd \"$(git rev-parse --show-toplevel)\" && ls",
+                "echo $(date)",
+                "$(echo ls) -la",
+                "D=x; cat ${D/x/README.md}",
+                "D=x; echo ${D//x/y}",
+                "a[1]=README.md; cat ${a[1]}",
+                "m[k]=notes.txt; cat ${m[k]}",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "nothing secret is named",
+        );
     }
 }
