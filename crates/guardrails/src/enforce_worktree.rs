@@ -3767,8 +3767,8 @@ fn commit_targets_of(
         "--git-dir",
     ];
     let mut redirect: Option<String> = None;
-    let mut work_tree: Option<Cow<'_, str>> = None;
-    let mut git_dir: Option<Cow<'_, str>> = None;
+    let mut work_tree: Option<&str> = None;
+    let mut git_dir: Option<&str> = None;
     let mut unread: Option<String> = None;
     let mut hops = 0;
     let mut idx = 1;
@@ -3819,19 +3819,24 @@ fn commit_targets_of(
                         });
                         redirect = Some(lexical_normalize(&hop));
                     }
-                    "--work-tree" => work_tree = Some(Cow::Borrowed(value)),
-                    "--git-dir" => git_dir = Some(Cow::Borrowed(value)),
+                    "--work-tree" => work_tree = Some(value),
+                    "--git-dir" => git_dir = Some(value),
                     _ => {}
                 }
             }
             idx += 2;
             continue;
         }
-        // The `=` forms are read off the UNESCAPED flag too: `--git-d\ir=<p>`
-        // is `--git-dir=<p>` to git (cadence-hooks#1058 review I4).
-        if let Some(v) = cow_strip_prefix(&flag, "--work-tree=") {
+        // The `=` forms match their flag NAME after escape removal:
+        // `--git-d\ir=<p>` is `--git-dir=<p>` to git (cadence-hooks#1058
+        // review I4). The VALUE stays raw, exactly like the space-separated
+        // form above and `-C`: a value unescaped here while its `--git-dir <p>`
+        // twin stays raw made the two spellings disagree, and on Windows the
+        // unescape turned a native `D:\repo\.git` into `D:repo.git`, a path
+        // naming no repo, so a commit into the primary read Allow.
+        if let Some(v) = eq_flag_value(t, "--work-tree=") {
             work_tree = Some(v);
-        } else if let Some(v) = cow_strip_prefix(&flag, "--git-dir=") {
+        } else if let Some(v) = eq_flag_value(t, "--git-dir=") {
             git_dir = Some(v);
         }
         idx += 1;
@@ -3855,13 +3860,9 @@ fn commit_targets_of(
         })
     };
     let resolved_work_tree = work_tree
-        .as_deref()
         .or(env_work_tree)
         .map(|p| resolve(p, "--work-tree"));
-    let resolved_git_dir = git_dir
-        .as_deref()
-        .or(env_git_dir)
-        .map(|p| resolve(p, "--git-dir"));
+    let resolved_git_dir = git_dir.or(env_git_dir).map(|p| resolve(p, "--git-dir"));
     if let Some(what) = unread
         && unreadable.is_none()
     {
@@ -3902,16 +3903,15 @@ fn commit_targets_of(
     targets
 }
 
-/// `word` with `prefix` removed, borrowing from the original argv word when
-/// `word` borrows from it.
-fn cow_strip_prefix<'a>(word: &Cow<'a, str>, prefix: &str) -> Option<Cow<'a, str>> {
-    match word {
-        Cow::Borrowed(w) => {
-            let w: &'a str = w;
-            w.strip_prefix(prefix).map(Cow::Borrowed)
-        }
-        Cow::Owned(w) => w.strip_prefix(prefix).map(|v| Cow::Owned(v.to_string())),
-    }
+/// The RAW value of a `--name=value` argv word whose name part, after the
+/// shell's escape removal, is `prefix` (which ends in `=`): `--git-d\ir=<p>`
+/// matches `--git-dir=`, and `<p>` comes back exactly as written.
+///
+/// Only the name is unescaped. The value is left raw so both spellings of a
+/// flag — `--git-dir=<p>` and `--git-dir <p>` — read the same path.
+fn eq_flag_value<'a>(word: &'a str, prefix: &str) -> Option<&'a str> {
+    let eq = word.find('=')?;
+    (unescape_word(&word[..=eq]) == prefix).then(|| &word[eq + 1..])
 }
 
 /// Scan `command`'s **top-level** segments for a leading in-chain
@@ -4733,10 +4733,45 @@ mod tests {
 
     /// This crate's own `target/`-relative scratch root — `env!` resolves at
     /// THIS call site, so the promoted `Scratch` still lands fixtures under
-    /// `crates/guardrails/../../target/`, exactly where the pre-promotion
-    /// in-crate helper put them.
+    /// the workspace `target/`, exactly where the pre-promotion in-crate
+    /// helper put them.
+    ///
+    /// Built by walking two `parent()`s, NOT by joining `../../target`: a
+    /// joined `..` survives into every fixture path, and the guard folds it
+    /// away, so a test comparing a fixture string to an emitted target fails
+    /// wherever the fixture is not relocated — i.e. on CI, whose checkout is
+    /// not under `.claude/worktrees/` (a local worktree run relocates to
+    /// `$XDG_CACHE_HOME` and never sees the `..`).
     fn scratch_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/enforce-worktree-scratch")
+        workspace_root()
+            .join("target")
+            .join("enforce-worktree-scratch")
+    }
+
+    /// The workspace root, `crates/guardrails/../..` with no `..` in it.
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("CARGO_MANIFEST_DIR is <workspace>/crates/guardrails")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn scratch_paths_carry_no_parent_dir_component() {
+        // Regression (CI red since #1074): a `..` in the fixture root made
+        // three `scan_targets` comparisons fail only off `.claude/worktrees/`.
+        let scratch = scratch("no-dotdot");
+        for path in [scratch_root(), scratch.path().to_path_buf()] {
+            assert!(
+                !path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(workspace_root().join("Cargo.toml").is_file());
     }
 
     /// Thin wrapper binding [`Scratch::new`] to this crate's own
@@ -8638,36 +8673,45 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
+        // Expected targets in the guard's own spelling: it folds every target
+        // (`normalize_target`), which on Windows lowercases the drive and
+        // turns `\` into `/`, so a raw native fixture string never matches.
+        let (here_t, there_t, missing_t) = (
+            normalize_target(&here_s),
+            normalize_target(&there_s),
+            normalize_target(&missing),
+        );
+
         let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).commits;
         // `;` runs the commit whether or not the cd worked.
         assert_eq!(
             on_disk(&format!("cd {missing}; git commit -m x")),
-            vec![here_s.clone(), missing.clone()]
+            vec![here_t.clone(), missing_t.clone()]
         );
         assert_eq!(
             on_disk(&format!("cd {missing} || git commit -m x")),
-            vec![here_s.clone(), missing.clone()]
+            vec![here_t.clone(), missing_t.clone()]
         );
         // `&&` runs it only if the cd worked — the lexical target, which is
         // what `git worktree add <p> && cd <p> && git commit` needs (review I3).
         assert_eq!(
             on_disk(&format!("cd {missing} && git commit -m x")),
-            vec![missing.clone()]
+            vec![missing_t.clone()]
         );
         // ...until the chain ends: a failed cd skipped it, and `;` goes on.
         assert_eq!(
             on_disk(&format!("cd {missing} && true; git commit -m x")),
-            vec![here_s.clone(), missing.clone()]
+            vec![here_t.clone(), missing_t.clone()]
         );
         assert_eq!(
             on_disk(&format!("cd {there_s}; git commit -m x")),
-            vec![there_s.clone()]
+            vec![there_t.clone()]
         );
         // A failed cd sets no OLDPWD: `cd -` can still mean `here`.
         let targets = on_disk(&format!(
             "cd {there_s}; cd {missing}; cd - ; git commit -m x"
         ));
-        assert!(targets.contains(&here_s), "{targets:?}");
+        assert!(targets.contains(&here_t), "{targets:?}");
     }
 
     #[test]
@@ -8952,6 +8996,10 @@ mod tests {
         let here_s = here.to_string_lossy().into_owned();
         let there_s = there.to_string_lossy().into_owned();
         let input_s = input.to_string_lossy().into_owned();
+        // Expected targets in the guard's own spelling: it folds every target
+        // (`normalize_target`), which on Windows lowercases the drive and
+        // turns `\` into `/`, so a raw native fixture string never matches.
+        let (here_t, there_t) = (normalize_target(&here_s), normalize_target(&there_s));
         let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).commits;
         for cmd in [
             format!(">/nonexistent/f cd {there_s}; git commit -m x"),
@@ -8961,7 +9009,7 @@ mod tests {
         ] {
             assert_eq!(
                 on_disk(&cmd),
-                vec![here_s.clone(), there_s.clone()],
+                vec![here_t.clone(), there_t.clone()],
                 "{cmd}"
             );
         }
@@ -8972,7 +9020,7 @@ mod tests {
         ] {
             assert_eq!(
                 on_disk(&cmd),
-                vec![here_s.clone(), there_s.clone()],
+                vec![here_t.clone(), there_t.clone()],
                 "{cmd}"
             );
         }
@@ -8982,7 +9030,7 @@ mod tests {
             format!("cd {there_s} 2>&1; git commit -m x"),
             format!("cd {there_s} < {input_s}; git commit -m x"),
         ] {
-            assert_eq!(on_disk(&cmd), vec![there_s.clone()], "{cmd}");
+            assert_eq!(on_disk(&cmd), vec![there_t.clone()], "{cmd}");
         }
     }
 
@@ -9271,7 +9319,10 @@ mod tests {
             .into_owned();
         let cmd = "git worktree add .claude/worktrees/x -b feat/x && cd .claude/worktrees/x \
                    && npm test 2>&1 | tail -3 && git commit -m x";
-        assert_eq!(scan_targets(cmd, &here_s, true).commits, vec![target]);
+        assert_eq!(
+            scan_targets(cmd, &here_s, true).commits,
+            vec![normalize_target(&target)]
+        );
     }
 
     #[cfg(unix)]
@@ -10277,6 +10328,45 @@ mod tests {
         assert_eq!(
             targets("env -u X GIT_WORK_TREE=/p git commit -m x"),
             vec!["/p"]
+        );
+    }
+
+    #[test]
+    fn both_spellings_of_a_git_dir_flag_read_the_same_raw_value() {
+        // Regression (Windows CI red since #1074): the `=` form took its value
+        // off the escape-removed word, so `--git-dir=D:\a\repo/.git` read
+        // `D:arepo/.git` — a relative fragment naming no repo — while the
+        // space form, `-C` and `cd` all kept the native path. A commit from a
+        // worktree into the primary then read Allow on Windows.
+        let t = |cmd: &str| scan_targets(cmd, "/w", false).commits;
+        for (joined, spaced) in [
+            (
+                r"git --git-dir=D:\a\repo/.git commit -m x",
+                r"git --git-dir D:\a\repo/.git commit -m x",
+            ),
+            (
+                r"git --work-tree=D:\a\repo commit -m x",
+                r"git --work-tree D:\a\repo commit -m x",
+            ),
+            (
+                r"git --git-dir=/p\ q/.git commit -m x",
+                r"git --git-dir /p\ q/.git commit -m x",
+            ),
+        ] {
+            assert_eq!(t(joined), t(spaced), "{joined}");
+        }
+        assert_eq!(
+            t(r"git --git-dir=D:\a\repo/.git commit -m x"),
+            vec!["d:/a/repo".to_string()]
+        );
+        // The flag NAME is still read after escape removal (#1058 review I4).
+        assert_eq!(
+            t(r"git --git-d\ir=/p/.git commit -m x"),
+            vec!["/p".to_string()]
+        );
+        assert_eq!(
+            t(r"git --work-tree\=/p commit -m x"),
+            vec!["/p".to_string()]
         );
     }
 
