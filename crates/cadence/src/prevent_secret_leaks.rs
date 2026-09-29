@@ -2050,12 +2050,14 @@ fn command_is_plain_jq_pipeline(command: &str) -> bool {
 ///
 /// The jq exemption (#947) skips one argv INDEX, so it is only sound when the
 /// tokenizer's argv equals the argv bash hands to jq. An index into a different
-/// argv exempts a different word: bash splits only on space, tab, and newline,
-/// while [`tokenize`] splits on every `char::is_whitespace`, so a vertical tab,
-/// form feed, carriage return, NBSP, or U+2003 inside an option value
-/// (`--rawfile a<VT>b .env.local .x`) is one word to bash and two to the
-/// tokenizer, and the dotenv that bash passes to `--rawfile` lands in the
-/// model's filter slot.
+/// argv exempts a different word. Before cadence-hooks#1055 [`tokenize`] split
+/// on every `char::is_whitespace`, so a vertical tab, form feed, carriage
+/// return, NBSP, or U+2003 inside an option value
+/// (`--rawfile a<VT>b .env.local .x`) was one word to bash and two to the
+/// tokenizer, and the dotenv that bash passes to `--rawfile` landed in the
+/// model's filter slot. The tokenizer now splits on bash's blanks only; this
+/// check stays as a second, independent line, because the exemption is only as
+/// sound as the tokenizer's fidelity on text nobody enumerated.
 ///
 /// Rather than enumerate which Unicode spaces and format characters diverge,
 /// this accepts only printable ASCII plus space, tab, and newline — a strict
@@ -6106,22 +6108,16 @@ mod tests {
     }
 
     #[test]
-    fn bash_fd_dup_redirection_is_an_accepted_miss() {
-        // `env 2>&1 make` still nudges, and NOT through anything this check
-        // decides: `split_segments` treats the `&` inside `2>&1` as a control
-        // operator, so the segment handed over is `env 2>` — a bare `env` with
-        // its operand in the *next* segment. Pre-existing (the old leading-word
-        // test nudged here too) and shared with every guard built on
-        // `split_segments`, so teaching it fd-dup syntax would move a primitive
-        // two block-capable guards depend on. Pinned so the miss is a recorded
-        // choice rather than a silent surprise, and so a future fix to the
-        // splitter shows up here as a failing test.
+    fn bash_fd_dup_redirection_does_not_hide_the_command_operand() {
+        // `split_segments` keeps `2>&1` in its segment (cadence-hooks#848), so
+        // `env 2>&1 make` reads as `env` running `make` — no environment dump —
+        // exactly as bash runs it. Before, the `&` ended the segment at
+        // `env 2>` and the bare `env` nudged.
         assert_eq!(
             SecretLeaksGuard::default()
                 .run(&make_bash_input("env 2>&1 make"))
                 .outcome,
-            cadence_hooks_core::Outcome::Nudge,
-            "accepted miss: the `&` of `2>&1` ends the segment before `make`"
+            cadence_hooks_core::Outcome::Allow,
         );
     }
 

