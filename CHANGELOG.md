@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.111.0] - 2026-09-29
+
 ### Security
 
 - **`prevent-secret-leaks` no longer trusts a `.envrc` the same command can replace, nudges on `/proc/<pid>/environ`, and reads secret files out of `openssl -in=` and HTTPie `field@FILE` values.** The pure-loader carve-out classified the file before the command ran, so `mv .envrc.bak .envrc; cat .envrc`, `git stash pop; cat .envrc` and `ln -sfn /proc/self/environ .envrc && cat .envrc` printed a file it never checked; a multi-segment command now keeps the carve-out only when every segment is on an allowlist of commands that cannot replace a file (`cat`, `grep`, `ls`, `pwd`, read-only `git`, `direnv allow`/`reload`, `sed`/`awk` without in-place or file-writing programs, …) with no assignment in front of it and no unquoted file-writing redirect, attached (`x>y`) or spaced. A procfs environment read gets the `env`-dump nudge, on Bash and Read. `curl --data=@.env` is not a gap: curl rejects `--opt=value`. (cameronsjo/cadence-hooks#1078)
