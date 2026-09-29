@@ -312,10 +312,13 @@ impl<'a> Walk<'a> {
 /// regard to order or scope: the set only grows, so an assignment after the
 /// clone, or in a subshell, can only add a host to judge. Any other mention —
 /// `$GH_HOST`, `${GH_HOST:=x}`, `read GH_HOST`, a value that is not a plain
-/// host — and any builtin that can assign a name the text does not spell
-/// (`export GH_HOS${X}T=…`, `eval`, `read`, `printf -v`) makes the host
-/// unreadable. This mirrors the candidate set guard-gh-write keeps for the
-/// same variable, more coarsely: coarseness here only costs a refusal.
+/// host — makes the host unreadable, and so does a builtin that assigns a
+/// name the text does not spell: a declaring builtin or `read`/`mapfile`/
+/// `getopts`/`printf -v` naming a non-literal variable (`export GH_HOS${X}T=…`,
+/// `read "$n"`), or an `eval` of text that is not literal — see
+/// [`GhHosts::observe_statements`]. This mirrors the candidate set
+/// guard-gh-write keeps for the same variable, more coarsely: coarseness here
+/// only costs a refusal.
 #[derive(Debug, Default)]
 struct GhHosts {
     hosts: Vec<String>,
@@ -337,19 +340,160 @@ impl GhHosts {
             .filter(|c| !matches!(c, '"' | '\'' | '\\'))
             .collect();
         hosts.observe(&flat);
+        hosts.observe_statements(command);
         hosts
     }
 
-    fn observe(&mut self, flat: &str) {
-        static INDIRECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    /// The builtins that can assign a variable the text does not spell.
+    ///
+    /// Only an operand that names a variable counts, so `export
+    /// PATH="$HOME/bin:$PATH"`, `printf '%s' "$x"` and `read -p "$prompt" x`
+    /// stay readable: a non-literal VALUE is not a non-literal NAME. A literal
+    /// `GH_HOST` name adds its value, which also covers a name
+    /// [`command_segments`](crate::shell::command_segments) resolved from a
+    /// same-command assignment (`n=GH_HOST; export $n=x`).
+    ///
+    /// `eval` runs text as a script, so a non-literal one is unreadable — except
+    /// the whole-operand `$(ssh-agent …)`, `$(brew shellenv …)` and `$(pyenv
+    /// init …)` idioms (plain words only: no second command, quote, or
+    /// redirection inside), which print a fixed set of variables, when the command
+    /// cannot have redefined those names. `direnv export` is NOT among them: it
+    /// prints whatever the `.envrc` exports, `GH_HOST` included.
+    fn observe_statements(&mut self, command: &str) {
+        static KNOWN_EVAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r"\b(?:export|declare|typeset|readonly|local|eval|read|printf|mapfile|readarray|getopts)\b[^;&|\n]*[$`]",
+                r#"^\$\((?:ssh-agent|brew[ \t]+shellenv|pyenv[ \t]+init)\b[^$`()'";&|<>\\\n]*\)$"#,
             )
             .expect("pattern should compile")
         });
-        if INDIRECT.is_match(flat) {
+        static REDEFINES_KNOWN_EVAL: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"(?:brew|pyenv)[ \t]*\(|\bfunction[ \t]+\\?(?:brew|pyenv)\b")
+                    .expect("pattern should compile")
+            });
+        let known_evals_ok =
+            !may_redefine_known_commands(command) && !REDEFINES_KNOWN_EVAL.is_match(command);
+        for segment in crate::shell::command_segments(command) {
+            let tokens = crate::shell::tokenize(&segment);
+            for (at, word) in tokens.iter().enumerate() {
+                // Operands only: a redirection and a detached target name a
+                // file, not a variable.
+                let mut rest: Vec<&String> = Vec::new();
+                let mut skip_target = false;
+                for token in &tokens[at + 1..] {
+                    if std::mem::take(&mut skip_target) {
+                        continue;
+                    }
+                    if crate::shell::is_redirect_token(token) {
+                        skip_target = token.ends_with(['<', '>']);
+                        continue;
+                    }
+                    rest.push(token);
+                }
+                match command_word(word).as_ref() {
+                    "export" | "declare" | "typeset" | "readonly" | "local" => {
+                        for operand in rest.iter().filter(|t| !t.starts_with(['-', '+'])) {
+                            let (name, value) = match operand.split_once('=') {
+                                Some((name, value)) => (name, Some(value)),
+                                None => (operand.as_str(), None),
+                            };
+                            self.observe_name(name, value);
+                        }
+                    }
+                    "read" | "mapfile" | "readarray" => {
+                        let value_options = if word.ends_with("read") {
+                            "dinNptu"
+                        } else {
+                            "dnOsuCc"
+                        };
+                        let mut idx = 0;
+                        while let Some(operand) = rest.get(idx) {
+                            idx += 1;
+                            if let Some(cluster) =
+                                operand.strip_prefix('-').filter(|c| !c.is_empty())
+                            {
+                                let last = cluster.chars().last().unwrap_or(' ');
+                                if last == 'a' && word.ends_with("read") {
+                                    if let Some(name) = rest.get(idx) {
+                                        self.observe_assigned(name);
+                                    }
+                                    idx += 1;
+                                } else if value_options.contains(last) {
+                                    idx += 1;
+                                }
+                                continue;
+                            }
+                            self.observe_assigned(operand);
+                        }
+                    }
+                    "getopts" => {
+                        if let Some(name) = rest.iter().filter(|t| !t.starts_with('-')).nth(1) {
+                            self.observe_assigned(name);
+                        }
+                    }
+                    "printf" => {
+                        let mut idx = 0;
+                        while let Some(operand) = rest.get(idx) {
+                            idx += 1;
+                            if *operand == "-v" {
+                                if let Some(name) = rest.get(idx) {
+                                    self.observe_assigned(name);
+                                }
+                                idx += 1;
+                            } else if let Some(name) = operand.strip_prefix("-v") {
+                                self.observe_assigned(name);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    "eval" => {
+                        let unreadable = rest.iter().any(|operand| {
+                            operand.contains("GH_HOST")
+                                || (operand.contains(['$', '`'])
+                                    && !(known_evals_ok && KNOWN_EVAL.is_match(operand)))
+                        });
+                        if unreadable {
+                            self.unreadable = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A variable `read`/`mapfile`/`getopts`/`printf -v` assigns: a value the
+    /// text never shows.
+    fn observe_assigned(&mut self, name: &str) {
+        self.observe_name(name, None);
+        if name == "GH_HOST" {
             self.unreadable = true;
         }
+    }
+
+    /// A variable a declaring builtin names, with the value when it wrote one.
+    fn observe_name(&mut self, name: &str, value: Option<&str>) {
+        let literal = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !literal {
+            self.unreadable = true;
+        } else if name == "GH_HOST" {
+            match value {
+                None => {}
+                Some(value) => match plain_host(value) {
+                    Some(host) if !self.hosts.contains(&host) => self.hosts.push(host),
+                    Some(_) => {}
+                    None => self.unreadable = true,
+                },
+            }
+        }
+    }
+
+    fn observe(&mut self, flat: &str) {
         let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
         for (at, _) in flat.match_indices("GH_HOST") {
             let before = flat[..at].chars().next_back();
@@ -2887,6 +3031,80 @@ mod tests {
             ("read GH_HOST; gh repo clone o/r", true, &[][..]),
             ("export GH_HOS${T}=x; gh repo clone o/r", true, &[][..]),
             ("GH_HOST+=x gh repo clone o/r", true, &[][..]),
+            (
+                "n=GH_HOST; export $n=x; gh repo clone o/r",
+                true,
+                &["x"][..],
+            ),
+            ("export ${n}=x; gh repo clone o/r", true, &[][..]),
+            ("read -r \"$n\"; gh repo clone o/r", true, &[][..]),
+            ("read -a $n; gh repo clone o/r", true, &[][..]),
+            ("mapfile -t $n; gh repo clone o/r", true, &[][..]),
+            ("getopts ab $n; gh repo clone o/r", true, &[][..]),
+            ("printf -v \"$n\" x; gh repo clone o/r", true, &[][..]),
+            ("printf -v$n x; gh repo clone o/r", true, &[][..]),
+            ("printf -v GH_HOST x; gh repo clone o/r", true, &[][..]),
+            ("eval \"$x\"; gh repo clone o/r", true, &[][..]),
+            ("eval `cat f`; gh repo clone o/r", true, &[][..]),
+            (
+                "eval \"$(direnv export bash)\"; gh repo clone o/r",
+                true,
+                &[][..],
+            ),
+            (
+                "eval \"$(ssh-agent -s; echo x)\"; gh repo clone o/r",
+                true,
+                &[][..],
+            ),
+            (
+                "ssh-agent(){ :; }; eval \"$(ssh-agent -s)\"; gh repo clone o/r",
+                true,
+                &[][..],
+            ),
+            (
+                "pyenv(){ :; }; eval \"$(pyenv init -)\"; gh repo clone o/r",
+                true,
+                &[][..],
+            ),
+            // A non-literal VALUE is not a non-literal NAME.
+            (
+                "export PATH=\"$HOME/.cargo/bin:$PATH\" && gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            (
+                "local x=$(date) y=\"$z\"; gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            (
+                "eval \"$(ssh-agent -s)\" && gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            (
+                "eval \"$(brew shellenv)\"; gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            (
+                "eval \"$(pyenv init -)\"; gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            ("eval 'echo hi'; gh repo clone o/r", false, &[][..]),
+            ("printf '%s\\n' \"$x\"; gh repo clone o/r", false, &[][..]),
+            (
+                "printf -v out '%s' \"$x\"; gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            (
+                "read -r -p \"$prompt\" answer; gh repo clone o/r",
+                false,
+                &[][..],
+            ),
+            ("read -r line < \"$f\"; gh repo clone o/r", false, &[][..]),
         ] {
             let hosts = GhHosts::for_command(command);
             assert_eq!(hosts.unreadable, unreadable, "{command}");
@@ -2917,12 +3135,14 @@ mod tests {
     #[test]
     fn a_cd_flood_walks_in_linear_time() {
         // Each `cd a` used to copy the whole path built so far: quadratic in
-        // a 200 KB flood.
+        // a 200 KB flood (~0.27 s of a release guard's budget). The bound is
+        // loose so a loaded test machine does not fail it; the release
+        // timings are the measurement.
         let command = format!("{}git push origin main", "cd a; ".repeat(40_000));
         let started = std::time::Instant::now();
         let pushes = push_locations(&command, "/repo");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
             started.elapsed()
         );

@@ -2491,6 +2491,40 @@ mod tests {
                     "GH_HOST=other.example gh repo clone cameronsjo/z && git push origin main",
                     Allow,
                 ),
+                // A builtin with a non-literal VALUE names no host.
+                (
+                    "export PATH=\"$HOME/.cargo/bin:$PATH\" && gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                (
+                    "eval \"$(ssh-agent -s)\" && gh repo clone cameronsjo/z && cd z && git push -u origin feat",
+                    Allow,
+                ),
+                (
+                    "printf '%s\\n' \"$x\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Allow,
+                ),
+                // A builtin that can name GH_HOST without spelling it.
+                (
+                    "n=GH_HOST; export $n=other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "read -r \"$n\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "printf -v \"$n\" other.example; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "eval \"$x\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
+                (
+                    "eval \"$(direnv export bash)\"; gh repo clone cameronsjo/z && cd z && git push",
+                    Block,
+                ),
             ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
