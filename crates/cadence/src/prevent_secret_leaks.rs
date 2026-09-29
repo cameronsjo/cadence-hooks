@@ -379,12 +379,23 @@ fn substitutions_live(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     let mut i = 0;
     let mut in_double = false;
+    // Was the previous byte a `$` that the shell reads as a sigil — not
+    // escaped (`\$`) and not half of `$$`? Only such a `$` makes the next
+    // `'` open an ANSI-C `$'…'` (#815 delta review I3: treating `\$'` or
+    // `$$'` as ANSI-C honoured `\'` inside a plain single-quoted string,
+    // overran it, and read a later live substitution as quoted).
+    let mut sigil = false;
     while i < bytes.len() {
+        let was_sigil = std::mem::replace(&mut sigil, false);
         match bytes[i] {
             b'\\' => i += 1,
+            b'$' => match bytes.get(i + 1) {
+                Some(b'(') => return true,
+                Some(b'$') => i += 1,
+                _ => sigil = true,
+            },
             b'\'' if !in_double => {
-                // `$'…'` honours backslash escapes; `'…'` does not.
-                let ansi = i > 0 && bytes[i - 1] == b'$';
+                let ansi = was_sigil;
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'\'' {
                     if ansi && bytes[i] == b'\\' {
@@ -392,15 +403,20 @@ fn substitutions_live(segment: &str) -> bool {
                     }
                     i += 1;
                 }
+                if i >= bytes.len() {
+                    // An unterminated single quote: the reading is unsure,
+                    // so it counts as live (fail closed).
+                    return true;
+                }
             }
             b'"' => in_double = !in_double,
             b'`' => return true,
-            b'$' if bytes.get(i + 1) == Some(&b'(') => return true,
             _ => {}
         }
         i += 1;
     }
-    false
+    // Non-live only when the scan ends with every quote closed.
+    in_double
 }
 
 /// `text` with every QUOTED-delimiter heredoc body removed (`<<'EOF'`,
@@ -410,35 +426,93 @@ fn substitutions_live(segment: &str) -> bool {
 /// quotes. A body is removed only when its terminator line is found.
 fn strip_quoted_heredoc_bodies(text: &str) -> Cow<'_, str> {
     static INTRO: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\([A-Za-z0-9_]+))"#)
+        Regex::new(r#"<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\([A-Za-z0-9_]+))"#)
             .expect("heredoc introducer compiles")
     });
     if !text.contains("<<") {
         return Cow::Borrowed(text);
     }
     let lines: Vec<&str> = text.split('\n').collect();
+    // Indexed ONCE: line text → the sorted line numbers holding it, exactly
+    // (`<<'X'`) and with leading tabs trimmed (`<<-'X'`). Finding a
+    // terminator is then a lookup plus a binary search, not a rescan of every
+    // remaining line per introducer — that rescan was quadratic (#815 delta
+    // review I1: 8000 unterminated introducers took 4.2 s). A delimiter with
+    // no entry at all is a missing terminator, answered by the same lookup.
+    let mut exact: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    let mut trimmed: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (n, line) in lines.iter().enumerate() {
+        exact.entry(line).or_default().push(n);
+        trimmed
+            .entry(line.trim_start_matches('\t'))
+            .or_default()
+            .push(n);
+    }
+    let next_at_or_after =
+        |index: &std::collections::HashMap<&str, Vec<usize>>, key: &str, from: usize| {
+            let at = index.get(key)?;
+            at.get(at.partition_point(|&n| n < from)).copied()
+        };
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         out.push(line);
         i += 1;
-        let delimiters: Vec<&str> = INTRO
+        let delimiters: Vec<(bool, &str)> = INTRO
             .captures_iter(line)
-            .filter_map(|c| c.get(1).or(c.get(2)).or(c.get(3)).map(|m| m.as_str()))
+            .filter_map(|c| {
+                let dash = c.get(1).is_some_and(|m| !m.as_str().is_empty());
+                c.get(2)
+                    .or(c.get(3))
+                    .or(c.get(4))
+                    .map(|m| (dash, m.as_str()))
+            })
             .collect();
-        for delimiter in delimiters {
-            let end = lines[i..]
-                .iter()
-                .position(|l| l.trim_start_matches('\t') == delimiter);
-            if let Some(end) = end {
-                i += end + 1;
+        // Bodies are consumed in order, each starting where the last ended —
+        // bash's rule for several heredocs on one line.
+        for (dash, delimiter) in delimiters {
+            // `<<-` strips leading TABS from the terminator; plain `<<` needs
+            // the line to match exactly.
+            let index = if dash { &trimmed } else { &exact };
+            if let Some(end) = next_at_or_after(index, delimiter, i) {
+                i = end + 1;
                 out.push(delimiter);
             }
         }
     }
     Cow::Owned(out.join("\n"))
 }
+
+/// A secret-file name in `text` once quoting is REMOVED, not split on — the
+/// fail-closed judgment for input the structured scan does not finish
+/// (#832/#815 delta review I2/I4). `".e"'nv'` and `.e\nv` normalize to
+/// `.env` here, where splitting at the quote left two harmless halves.
+fn normalized_secret_name(text: &str) -> Option<String> {
+    let normalized: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    normalized
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | '$' | '{' | '}' | '='
+                )
+        })
+        .find(|piece| {
+            !piece.is_empty() && is_dangerous_secret_token_at(piece, Filename::Unqualified)
+        })
+        .map(str::to_string)
+}
+
+/// Commands longer than this skip the structured scan: the shared segmenter
+/// and runner peel are super-linear on adversarial input (`su ` × N crossed
+/// the 5 s hook timeout near 180 KB), and a timed-out hook does not block.
+/// Over the cap, [`normalized_secret_name`] decides alone (#832 delta review
+/// I2).
+const STRUCTURED_SCAN_LIMIT: usize = 64 * 1024;
 
 /// [`segment_env_reads`] at a nesting depth: the segment's own operands, plus
 /// every command string it hands to something that runs it
@@ -914,6 +988,19 @@ const GIT_LOG_SAFE_LONG: &[&str] = &[
     "date-order",
     "color",
     "no-color",
+    "no-walk",
+    "diff-filter",
+    "summary",
+    "left-right",
+    "cherry-pick",
+    "regexp-ignore-case",
+    "all-match",
+    "invert-grep",
+    "parents",
+    "boundary",
+    "abbrev",
+    "show-signature",
+    "use-mailmap",
 ];
 
 /// Is every option of this `log`/`whatchanged` argv on the metadata
@@ -929,7 +1016,9 @@ fn git_log_flags_safe(operands: &[String]) -> bool {
             return GIT_LOG_SAFE_LONG.contains(&name);
         }
         let short = &t[1..];
-        short.chars().all(|c| c.is_ascii_digit()) || short.starts_with(['n', 'S', 'G'])
+        short == "i"
+            || short.chars().all(|c| c.is_ascii_digit())
+            || short.starts_with(['n', 'S', 'G'])
     })
 }
 
@@ -2818,6 +2907,16 @@ fn bash_leaks_secrets(
     cwd: Option<&str>,
     detect: fn() -> bool,
 ) -> Option<CheckResult> {
+    if command.len() > STRUCTURED_SCAN_LIMIT {
+        return normalized_secret_name(command).map(|name| {
+            CheckResult::block(format!(
+                "🚫 BLOCKED: prevent-secret-leaks: command is too long to scan and names a \
+                 secret file\n\
+                 Found: `{name}`\n\
+                 Fix: run the command directly, or split it into shorter commands."
+            ))
+        });
+    }
     let lower = command.to_lowercase();
 
     // #850 delta review I7: `git stash show -p` with untracked files prints
@@ -2924,7 +3023,7 @@ fn bash_leaks_secrets(
         // #832 delta review K1: the nested re-scan ran out of budget, so some
         // command strings went unscanned. Fail closed if the raw command names
         // a secret anywhere.
-        if budget.exhausted && rough_secret(command, Filename::Unqualified) {
+        if budget.exhausted && normalized_secret_name(command).is_some() {
             return Some(CheckResult::block(
                 "🚫 BLOCKED: prevent-secret-leaks: command nests too many command strings to \
                  scan, and names a secret file\n\
@@ -7464,6 +7563,154 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "metadata-only forms",
+        );
+    }
+
+    fn assert_fast_block(command: &str, limit_ms: u64) {
+        let started = std::time::Instant::now();
+        let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+        let elapsed = started.elapsed();
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            elapsed < std::time::Duration::from_millis(limit_ms),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn many_unterminated_quoted_heredocs_stay_linear() {
+        // #815 delta review I1: each introducer rescanned every later line.
+        let n = 8000;
+        let command = format!(
+            "echo \"$(cat {}\n{})\"; cat .env",
+            "<<'X' ".repeat(n),
+            "y\n".repeat(n)
+        );
+        assert!(
+            command.len() < STRUCTURED_SCAN_LIMIT,
+            "must exercise the structured scan"
+        );
+        assert_fast_block(&command, 1000);
+    }
+
+    #[test]
+    fn oversized_command_skips_the_structured_scan_and_fails_closed() {
+        // #832 delta review I2: `su ` × N is super-linear in the shared
+        // segmenter; past the cap only the normalized raw text is judged.
+        let command = format!("{}-c true; cat .env", "su ".repeat(30_000));
+        assert_fast_block(&command, 500);
+        let quoted = format!("{}-c true; cat .e\"\"n'v'", "su ".repeat(30_000));
+        assert_fast_block(&quoted, 500);
+        let benign = format!("{}-c true; cat README.md", "su ".repeat(30_000));
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn normalized_secret_name_removes_quotes_rather_than_splitting() {
+        // #815 delta review I4.
+        assert_eq!(
+            normalized_secret_name("cat .e\"\"n'v'").as_deref(),
+            Some(".env")
+        );
+        assert_eq!(
+            normalized_secret_name("cat .e\\nv").as_deref(),
+            Some(".env")
+        );
+        assert_eq!(
+            normalized_secret_name("x=$(cat 'id_rsa')").as_deref(),
+            Some("id_rsa")
+        );
+        assert_eq!(normalized_secret_name("cat README.md .env.example"), None);
+    }
+
+    #[test]
+    fn escaped_or_doubled_dollar_does_not_open_ansi_c_quoting() {
+        // #815 delta review I3: `\$'` and `$$'` open a PLAIN single-quoted
+        // string, where `\` is literal — reading it as `$'…'` skipped the
+        // closing quote and hid the live substitution after it.
+        assert!(substitutions_live(r"echo \$'a\' $(cat .env)"));
+        assert!(substitutions_live(r"echo $$'a\' $(cat .env)"));
+        assert!(substitutions_live(r"echo 'a\' `cat .env`"));
+        // A real `$'…'` does honour `\'`.
+        assert!(!substitutions_live(r"echo $'a\' $(x)'"));
+        // Unbalanced endings count as live.
+        assert!(substitutions_live("echo \"abc"));
+        assert!(substitutions_live("echo 'abc"));
+        assert!(!substitutions_live("echo 'a `b` $(c)'"));
+        assert_bash(
+            &["gh pr create --body \\$'x\\' \"$(cat .env)\""],
+            cadence_hooks_core::Outcome::Block,
+            "a live substitution after `\\$'`",
+        );
+    }
+
+    #[test]
+    fn git_log_metadata_flags_from_the_review_allow() {
+        // #850 delta review N1.
+        assert_bash(
+            &[
+                "git log --diff-filter=A -- .env",
+                "git log --no-walk --summary -- .env",
+                "git log --left-right --cherry-pick main...HEAD -- .env",
+                "git log --regexp-ignore-case -i --all-match --invert-grep --grep=x -- .env",
+                "git log --parents --boundary --abbrev=8 --show-signature --use-mailmap -- .env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "metadata-only log flags",
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_stripping_matches_bash() {
+        // #815 delta review N2. Each case states what bash does.
+        // Unterminated `<<'X'`: bash reads to end of input as the body, but
+        // the stripper cannot know the body ends there, so it KEEPS the
+        // lines — the fail-closed reading.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'X'\ncat .env"),
+            "cat <<'X'\ncat .env"
+        );
+        // `<<-'X'`: bash strips leading tabs, so `\tX` terminates it.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<-'X'\nbody\n\tX\nls"),
+            "cat <<-'X'\nX\nls"
+        );
+        // Plain `<<'X'`: `\tX` is NOT a terminator; the real one is `X`.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'X'\nbody\n\tX\nmore\nX\nls"),
+            "cat <<'X'\nX\nls"
+        );
+        // Two heredocs on one line: bodies are consumed in order.
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<'A' <<'B'\na\nA\nb\nB\nls"),
+            "cat <<'A' <<'B'\nA\nB\nls"
+        );
+        assert_bash(
+            &[
+                // An introducer inside double quotes is text; the read after
+                // it runs (bash prints `<<'X'`, then the file).
+                "echo \"<<'X'\"; cat .env",
+                "echo \"<<'X'\"\ncat .env\nX",
+                // `cat <<'X' .env` reads the FILE operand; the heredoc is
+                // stdin that `cat` ignores once given a file.
+                "cat <<'X' .env\nbody\nX",
+                // Unterminated: bash treats the rest as body and runs no
+                // `cat .env`, but the guard cannot prove that — block.
+                "cat <<'X'\ncat .env",
+                // Two heredocs, then a real read.
+                "cat <<'A' <<'B'\na\nA\nb\nB\ncat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "heredoc checklist",
+        );
+        assert_bash(
+            &[
+                "cat <<'A' <<'B'\ncat .env\nA\ncat .env\nB",
+                "cat <<-'X'\n\tcat .env\n\tX",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "heredoc bodies are data",
         );
     }
 }
