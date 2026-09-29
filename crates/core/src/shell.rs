@@ -134,6 +134,20 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
         '$' if chars.get(i + 1) == Some(&'\'') => (Quote::AnsiC, i + 2),
         _ => return None,
     };
+    if matches!(mode, Quote::AnsiC) {
+        // bash decodes `$'…'` before the word is used, so `> $'.en\x76'`
+        // writes `.env`. Keeping the character after each backslash verbatim
+        // produced `.enx76`, and the secret-writes guard judged a filename the
+        // shell never touches (cameronsjo/cadence-hooks#1103). The run ends at
+        // the first `'` no backslash escapes, as in [`tokenize_marked`].
+        let start = j;
+        while j < chars.len() && chars[j] != '\'' {
+            j += if chars[j] == '\\' { 2 } else { 1 };
+        }
+        let end = j.min(chars.len());
+        decode_ansi_c_run(&chars[start..end].iter().collect::<String>(), out);
+        return Some((end + 1).min(chars.len()));
+    }
     while j < chars.len() {
         let c = chars[j];
         if c == '\\' && mode.escapes_next(chars, j) {
@@ -370,6 +384,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                     expanding_prefix_len,
                     budget,
                 );
+                true
             },
         );
     });
@@ -382,13 +397,28 @@ fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
     let mut words = Vec::new();
     walk_words(command, &mut |text, flags, _, _| {
         words.push((text, flags.to_vec()));
+        true
     });
     words
 }
 
+/// The first word of `command` as [`raw_words`] reads it, walking no further
+/// than that word. [`strip_group_wrappers`] asks this at every leading `{`,
+/// and walking the whole remaining text each time made `{ ( ` nested 5000
+/// deep (50 KB) take seconds, past the hook deadline (PR #1118 review).
+fn first_raw_word(command: &str) -> Option<(String, Vec<bool>)> {
+    let mut first = None;
+    walk_words(command, &mut |text, flags, _, _| {
+        first = Some((text, flags.to_vec()));
+        false
+    });
+    first
+}
+
 /// Receives one finished word: its text, per-byte structural flags,
-/// `unquoted_prefix_len`, and `expanding_prefix_len`.
-type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) + 'a;
+/// `unquoted_prefix_len`, and `expanding_prefix_len`. Returns whether the walk
+/// should go on to the next word.
+type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) -> bool + 'a;
 
 /// The single tokenizer walk behind [`tokenize_marked`] and [`raw_words`]:
 /// calls `emit(text, structural, unquoted_prefix_len, expanding_prefix_len)`
@@ -500,7 +530,9 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                         let flags = std::mem::take(&mut structural);
                         let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
                         let expanding_prefix_len = lead.finish(text.len());
-                        emit(text, &flags, unquoted_prefix_len, expanding_prefix_len);
+                        if !emit(text, &flags, unquoted_prefix_len, expanding_prefix_len) {
+                            return;
+                        }
                         in_token = false;
                     }
                 }
@@ -518,7 +550,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     if in_token {
         let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
         let expanding_prefix_len = lead.finish(current.len());
-        emit(
+        let _ = emit(
             current,
             &structural,
             unquoted_prefix_len,
@@ -1045,6 +1077,24 @@ pub fn brace_expansion_overflows(command: &str) -> bool {
     })
 }
 
+/// Decode the body of one `$'…'` run (the text between the quotes) onto
+/// `out`, escapes resolved the way bash resolves them.
+fn decode_ansi_c_run(body: &str, out: &mut String) {
+    let mut chars = body.chars().peekable();
+    let mut nul = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(escaped) => decode_ansi_c_escape(escaped, &mut chars, out, &mut nul),
+                None if !nul => out.push('\\'),
+                None => {}
+            }
+        } else if !nul {
+            out.push(c);
+        }
+    }
+}
+
 /// Decode one `$'…'` escape — the character after the backslash is `escaped`
 /// — onto `out`, reading any further digits from `chars`, the way bash does.
 ///
@@ -1218,6 +1268,75 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
         return true;
     }
     h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// True unless `command` provably cannot spell the word `needle` — the only
+/// question a raw-text fast path may ask before skipping a guard.
+///
+/// [`contains_ignoring_ascii_case`] alone is stricter than the shell: bash
+/// assembles a word from text that never contains it — `$'\x67it'` (ANSI-C
+/// escapes), `g''it` / `g"h"` (quote splices), `g\it` (a backslash escape),
+/// `${G}it` or `$(printf git)` (expansions), `` `echo gh` ``, `{g,}h` (brace
+/// expansion). A fast path that bailed on the missing substring vetoed every
+/// such spelling before the tokenizer, which decodes them, ever ran
+/// (cameronsjo/cadence-hooks#1103). So the skip is allowed only when the
+/// command carries none of the characters that can build a word; otherwise
+/// the caller must judge the tokenized words.
+///
+/// A second, cheaper skip: a letter no byte of the command carries can come
+/// only from an escape (`\x67`, `\147`), a command's output (`$(…)`, a
+/// backtick), or a variable set outside the command, which no guard can read
+/// anyway. So a command with none of the needle's first letter, no `\\`, no
+/// backtick and no `$(` cannot spell it — whatever quoting or plain `$NAME`
+/// it carries — and a padded chain of plain assignments skips the full parse.
+pub fn may_spell_word(command: &str, needle: &str) -> bool {
+    if contains_ignoring_ascii_case(command, needle) {
+        return true;
+    }
+    if !command.contains(['$', '\'', '"', '\\', '`', '{']) {
+        return false;
+    }
+    let Some(first) = needle.bytes().next() else {
+        return true;
+    };
+    let carries_first = command.bytes().any(|b| b.eq_ignore_ascii_case(&first));
+    carries_first || command.contains(['\\', '`']) || command.contains("$(")
+}
+
+/// `segment` re-spelled from its decoded words: each [`tokenize`] word joined
+/// by one space, a word holding whitespace or a quote wrapped in single quotes
+/// (inner quotes replaced by `_`) so it stays one quoted word. Matching text
+/// only — it does not round-trip through the tokenizer.
+///
+/// For a raw-text matcher (`gh\s+repo\s+delete`) that must also see the words
+/// the shell runs. Quoting a command word or a subcommand (`'gh' repo delete`,
+/// `gh $'repo' delete`, `$'\x67h' …`) hides it from a regex over the raw
+/// text while bash runs it unchanged (cameronsjo/cadence-hooks#1103). A quoted
+/// PHRASE stays quoted here, so `echo "gh repo delete"` does not turn into the
+/// command it only mentions. Backslashes are removed from every word, as the
+/// shell removes an unquoted one (`g\h` runs `gh`). Detector direction: callers OR this with the raw
+/// text, never replace it.
+pub fn requote_words(segment: &str) -> String {
+    tokenize(segment)
+        .iter()
+        // [`tokenize`] keeps an unquoted backslash (`g\h`), which the shell
+        // removes; drop it so the word reads as the one bash runs.
+        .map(|word| unescape_word(word))
+        .map(|word| {
+            if word.is_empty() {
+                "''".to_string()
+            } else if word.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+                // A quote INSIDE the word becomes `_`: this text is for
+                // matching, not for re-parsing, and an escaped `'\''` would
+                // desync a scanner without backslash awareness
+                // ([`strip_quotes`]) into swallowing every later word.
+                format!("'{}'", word.replace(['\'', '"'], "_"))
+            } else {
+                word.into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The command word `token` names, normalized to the verb the shell will
@@ -1451,12 +1570,26 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
     // `cat,.env}`, a word nothing expands (cadence-hooks#1096).
     let mut rest = trimmed;
+    // Each `{` whose word runs on (`{a,b}`, `{{x`) costs a walk of that word;
+    // past [`MAX_GLUED_BRACE_WALKS`] the strip stops and keeps the text. A
+    // glued `{` is not a group opener to bash anyway (`{{echo` is a command
+    // name), so stopping loses nothing the shell would run, and it keeps a
+    // 50 KB run of openers linear (PR #1118 review).
+    let mut glued_walks = 0usize;
     loop {
         rest = rest.trim_start_matches(['(', ' ', '\t']);
-        match rest.strip_prefix('{') {
-            Some(after) if !opens_brace_expansion(rest) => rest = after,
-            _ => break,
+        let Some(after) = rest.strip_prefix('{') else {
+            break;
+        };
+        if brace_stands_alone(after) {
+            rest = after;
+            continue;
         }
+        glued_walks += 1;
+        if glued_walks > MAX_GLUED_BRACE_WALKS || opens_brace_expansion(rest) {
+            break;
+        }
+        rest = after;
     }
     loop {
         rest = rest.trim_end_matches([')', ';', ' ', '\t']);
@@ -1467,16 +1600,41 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many first-word walks [`opens_brace_expansion`] made on this
+    /// thread — the work the PR #1118 nesting fix bounds.
+    static FIRST_WORD_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Most leading `{` words [`strip_group_wrappers`] walks to ask whether they
+/// open a brace expansion. See the loop there.
+const MAX_GLUED_BRACE_WALKS: usize = 64;
+
+/// True when the text after a `{` ends that word at once — at the end, at
+/// whitespace, or at an operator character — so the word is the lone `{`,
+/// which is the group keyword and never a brace expansion. `{(echo hi)}` runs
+/// as a group in bash.
+fn brace_stands_alone(after: &str) -> bool {
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ')' | ';' | '&' | '|' | '<' | '>'))
+}
+
 /// Does `text` begin with a word whose leading `{` bash brace-expands (or that
-/// expands past the modelled bounds)? Judges only the first word.
+/// expands past the modelled bounds)? Judges only the first word, and walks
+/// no further than it.
 fn opens_brace_expansion(text: &str) -> bool {
-    if !text.starts_with('{') {
+    if !text.starts_with('{') || brace_stands_alone(&text[1..]) {
         return false;
     }
-    raw_words(text).first().is_some_and(|(word, flags)| {
+    #[cfg(test)]
+    FIRST_WORD_WALKS.with(|walks| walks.set(walks.get() + 1));
+    first_raw_word(text).is_some_and(|(word, flags)| {
         word.starts_with('{')
             && flags.first() == Some(&true)
-            && expanding_brace_word(word, flags).is_some()
+            && expanding_brace_word(&word, &flags).is_some()
     })
 }
 
@@ -5323,9 +5481,126 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
 /// "every command that will actually execute" view.
 pub fn command_segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut assignments: Vec<(String, String)> = Vec::new();
+    let spent = std::cell::Cell::new(0);
+    let mut assignments = AssignmentScope::root(&spent);
     expand_segments(command, &mut assignments, 0, &mut out);
     out
+}
+
+/// Longest value [`AssignmentScope`] stores whole. `D=ab; D=$D$D; D=$D$D; …`
+/// doubles the value per segment, so forty segments asked for a terabyte and
+/// the guard hung past its deadline (cadence-hooks#1114). A longer value is
+/// stored CLIPPED — its first and last [`CLIPPED_VALUE_HALF`] bytes — never
+/// dropped: dropping it left `$D` literal, and a padded `D=<./ ×2100>.env;
+/// echo hi > $D` wrote `.env` unseen (PR #1118 review). The tail is what names
+/// a file (`….env`), the head what names a command.
+const MAX_ASSIGNMENT_VALUE_LEN: usize = 4096;
+
+/// Half of a clipped stored value; see [`MAX_ASSIGNMENT_VALUE_LEN`].
+const CLIPPED_VALUE_HALF: usize = MAX_ASSIGNMENT_VALUE_LEN / 2;
+
+/// Bytes `$NAME` substitutions may add across one command at full length.
+/// Past it every reference is still substituted, but a value longer than
+/// [`SHORT_SUBSTITUTION_LEN`] goes in clipped to its head and tail, so output
+/// stays linear in the command's length. Leaving a reference literal once the
+/// budget ran out was a miss: a 5 KB prefix of `: $P $P …` spent it, and the
+/// `D=.env; cat $D` after it read `.env` unseen (PR #1118 review).
+const MAX_EXPANSION_BYTES: usize = 1 << 20;
+
+/// Longest value substituted whole once [`MAX_EXPANSION_BYTES`] is spent.
+const SHORT_SUBSTITUTION_LEN: usize = 64;
+
+/// `value` cut to its first `head` and last `tail` bytes (on char
+/// boundaries), or unchanged when it is no longer than the two together.
+fn clip_value(value: &str, head: usize, tail: usize) -> Cow<'_, str> {
+    if value.len() <= head + tail {
+        return Cow::Borrowed(value);
+    }
+    let mut h = head;
+    while !value.is_char_boundary(h) {
+        h -= 1;
+    }
+    let mut t = value.len() - tail;
+    while !value.is_char_boundary(t) {
+        t += 1;
+    }
+    Cow::Owned(format!("{}{}", &value[..h], &value[t..]))
+}
+
+/// The visible `VAR=value` assignments at one point in a command, indexed by
+/// name; a re-assignment replaces the value (newest wins).
+///
+/// Held as maps, not an append-ordered list: a reverse linear search per `$`
+/// made a padded chain of `Dn=$(x y);` quadratic (9.9 s at 200 KB, past the
+/// hook deadline, so the guard failed open — cadence-hooks#1114).
+///
+/// A subshell (a substitution body, a `-c` script) gets a CHILD scope that
+/// borrows its parent instead of cloning it: cloning per substitution was
+/// quadratic too. The walk is synchronous — the child is finished before the
+/// parent's next segment — so a borrow sees exactly the parent's state at that
+/// point, and the child's own assignments die with it. The chain is at most
+/// [`MAX_WRAPPER_DEPTH`] deep. No name is ever dropped for size: every bound
+/// here clips a value, never leaves a reference literal.
+struct AssignmentScope<'a> {
+    parent: Option<&'a AssignmentScope<'a>>,
+    values: std::collections::HashMap<String, String>,
+    /// Full-length substitution bytes spent, shared by the whole command.
+    spent: &'a std::cell::Cell<usize>,
+}
+
+impl<'a> AssignmentScope<'a> {
+    fn root(spent: &'a std::cell::Cell<usize>) -> Self {
+        Self {
+            parent: None,
+            values: std::collections::HashMap::new(),
+            spent,
+        }
+    }
+
+    fn child<'b>(&'b self) -> AssignmentScope<'b> {
+        AssignmentScope {
+            parent: Some(self),
+            values: std::collections::HashMap::new(),
+            spent: self.spent,
+        }
+    }
+
+    fn set(&mut self, name: String, value: String) {
+        let value = match clip_value(&value, CLIPPED_VALUE_HALF, CLIPPED_VALUE_HALF) {
+            Cow::Borrowed(_) => value,
+            Cow::Owned(clipped) => clipped,
+        };
+        self.values.insert(name, value);
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        let mut scope = Some(self);
+        while let Some(s) = scope {
+            if let Some(value) = s.values.get(name) {
+                return Some(value);
+            }
+            scope = s.parent;
+        }
+        None
+    }
+
+    /// The text to substitute for `$name`: the value whole while the
+    /// command's budget lasts, then clipped to [`SHORT_SUBSTITUTION_LEN`].
+    /// `None` only for a name never assigned (environment-sourced).
+    fn take(&self, name: &str) -> Option<Cow<'_, str>> {
+        let value = self.get(name)?;
+        let spent = self.spent.get().saturating_add(value.len());
+        if spent <= MAX_EXPANSION_BYTES {
+            self.spent.set(spent);
+            return Some(Cow::Borrowed(value));
+        }
+        let half = SHORT_SUBSTITUTION_LEN / 2;
+        Some(clip_value(value, half, half))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.parent.is_none_or(AssignmentScope::is_empty)
+    }
 }
 
 /// Recursive worker for [`command_segments`]. `assignments` accumulates in
@@ -5333,7 +5608,7 @@ pub fn command_segments(command: &str) -> Vec<String> {
 /// assignments that precede it.
 fn expand_segments(
     command: &str,
-    assignments: &mut Vec<(String, String)>,
+    assignments: &mut AssignmentScope<'_>,
     depth: usize,
     out: &mut Vec<String>,
 ) {
@@ -5342,8 +5617,8 @@ fn expand_segments(
         // Recorded AFTER this segment is expanded: a shell expands a word
         // before the assignment on that same line takes effect, so `F=new cmd
         // $F` passes the OLD `$F`.
-        if let Some(pair) = segment_assignment(&segment) {
-            assignments.push(pair);
+        if let Some((name, value)) = segment_assignment(&segment) {
+            assignments.set(name, value);
         }
         // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
         // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
@@ -5364,8 +5639,8 @@ fn expand_segments(
         // already generous.
         if depth < MAX_WRAPPER_DEPTH {
             for body in substitution_bodies(&segment) {
-                // A substitution is its own subshell too — snapshot.
-                let mut scope = assignments.clone();
+                // A substitution is its own subshell too — a child scope.
+                let mut scope = assignments.child();
                 expand_segments(&body, &mut scope, depth + 1, out);
             }
         }
@@ -5375,7 +5650,7 @@ fn expand_segments(
                 // A child shell inherits what is set so far, but its own
                 // assignments die with the subshell — recurse on a snapshot so
                 // they cannot reach the parent's later segments.
-                let mut scope = assignments.clone();
+                let mut scope = assignments.child();
                 expand_segments(&inner, &mut scope, depth + 1, out);
             }
             _ => out.push(segment),
@@ -6196,7 +6471,7 @@ fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
 /// outside single quotes. Only names present in `assignments` are touched; an
 /// unknown (environment-sourced) variable is left as-is (fail open).
-fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String {
+fn apply_assignments(segment: &str, assignments: &AssignmentScope<'_>) -> String {
     if assignments.is_empty() || !segment.contains('$') {
         return segment.to_string();
     }
@@ -6239,10 +6514,9 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
             if braced && chars.get(j) == Some(&'}') {
                 j += 1;
             }
-            // Newest wins: `assignments` is append-ordered, so a re-assignment
-            // must be found before the value it replaced.
+            // Newest wins: a re-assignment replaced the value in the scope.
             if !name.is_empty()
-                && let Some((_, value)) = assignments.iter().rev().find(|(n, _)| *n == name)
+                && let Some(value) = assignments.take(&name)
             {
                 // A whole `$(…)` value carrying whitespace (#970) is one word
                 // only inside `"…"`. Unquoted, the tokenizers downstream would
@@ -6251,10 +6525,10 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
                 // goes in quoted: the word boundaries stay where bash's are.
                 if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
                     out.push('"');
-                    out.push_str(value);
+                    out.push_str(&value);
                     out.push('"');
                 } else {
-                    out.push_str(value);
+                    out.push_str(&value);
                 }
                 i = j;
                 continue;
@@ -12842,5 +13116,209 @@ mod tests {
         let marked = tokenize_marked("2'>'x");
         let (len, _) = redirect_operator_span(&marked[0].text).unwrap();
         assert!(marked[0].unquoted_prefix_len < len);
+    }
+
+    // --- cadence-hooks#1114 item 1: bounded, indexed assignment tracking ---
+
+    /// The three padded shapes from the PR #1118 review, each of which turned
+    /// a size bound into a literal `$D` (a miss), plus the plain controls.
+    fn padded_prefixes() -> Vec<(&'static str, String)> {
+        let p = format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" "));
+        let names: String = (0..300).map(|n| format!("V{n}=v{n}; ")).collect();
+        vec![("none", String::new()), ("budget", p), ("names", names)]
+    }
+
+    #[test]
+    fn assignment_scope_never_leaves_a_padded_reference_literal() {
+        for (label, prefix) in padded_prefixes() {
+            let command = format!("{prefix}D=.env; cat $D");
+            let segments = command_segments(&command);
+            assert_eq!(
+                segments.last().map(String::as_str),
+                Some("cat .env"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_scope_resolves_like_the_shell() {
+        let cases = [
+            ("D=a; D=b; rm $D/.env", "rm b/.env"),
+            ("D=a; rm ${D}/.env", "rm a/.env"),
+            // A substitution is a subshell: its assignment dies with it.
+            ("echo $(D=a); echo $D", "echo $D"),
+            // A subshell sees its parent's assignments.
+            ("D=.env; echo $(cat $D)", "cat .env"),
+            ("D=.env; sh -c \"cat $D\"", "cat .env"),
+        ];
+        for (command, want) in cases {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|s| s == want),
+                "{command}: {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_clipped_to_head_and_tail_not_dropped() {
+        let command = format!("D={}.env; echo hi > $D", "./".repeat(2100));
+        let segments = command_segments(&command);
+        let last = segments.last().expect("segments");
+        assert!(last.starts_with("echo hi > ./"), "{last}");
+        assert!(last.ends_with("/.env"), "{last}");
+        assert!(
+            last.len() <= MAX_ASSIGNMENT_VALUE_LEN + 16,
+            "{}",
+            last.len()
+        );
+    }
+
+    #[test]
+    fn clip_value_keeps_char_boundaries() {
+        let cases = [
+            ("short", 3, 3, "short"),
+            ("abcdefgh", 2, 2, "abgh"),
+            ("ééééé", 3, 3, "éé"),
+        ];
+        for (value, head, tail, want) in cases {
+            assert_eq!(clip_value(value, head, tail), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn assignment_doubling_chain_stays_bounded() {
+        // `D=$D$D` doubles per segment: forty of them asked for a terabyte.
+        let command = format!("D=ab; {}; rm $D/.env", vec!["D=$D$D"; 40].join("; "));
+        let start = std::time::Instant::now();
+        let segments = command_segments(&command);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            segments
+                .iter()
+                .all(|s| s.len() <= 3 * MAX_ASSIGNMENT_VALUE_LEN)
+        );
+        let last = segments.last().expect("segments");
+        assert!(
+            last.starts_with("rm ab") && last.ends_with("ab/.env"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn substitution_output_stays_linear_past_the_budget() {
+        let value = "x".repeat(MAX_ASSIGNMENT_VALUE_LEN);
+        let refs = 10_000;
+        let command = format!("D={value}; echo {}", vec!["$D"; refs].join(" "));
+        let total: usize = command_segments(&command).iter().map(String::len).sum();
+        let ceiling = MAX_EXPANSION_BYTES + refs * (SHORT_SUBSTITUTION_LEN + 1) + 2 * command.len();
+        assert!(total <= ceiling, "{total} > {ceiling}");
+    }
+
+    // --- cadence-hooks#1103: raw-text prechecks vs shell word building ---
+
+    #[test]
+    fn may_spell_word_is_never_stricter_than_the_shell() {
+        let cases = [
+            ("git status", "git", true),
+            ("GIT status", "git", true),
+            (r"$'\x67it' push", "git", true),
+            ("g''it push", "git", true),
+            (r#"g"i"t push"#, "git", true),
+            (r"g\it push", "git", true),
+            ("${G}it push", "git", true),
+            ("`echo git` push", "git", true),
+            ("{g,}it push", "git", true),
+            // Only plain text without the word may skip.
+            ("ls -la", "git", false),
+            // No `g`, no escape, no substitution, no backtick: plain `$NAME`
+            // and quoting cannot produce the letter.
+            ("D=.env; cat \"$D\" {a,b}", "gh", false),
+            (r"$'\147it' push", "git", true),
+            ("$(tr a-z n-za-m <<< tvg) push", "git", true),
+            ("`tr a-z n-za-m <<< tvg` push", "git", true),
+            ("npm test && cargo build", "gh", false),
+        ];
+        for (command, needle, want) in cases {
+            assert_eq!(may_spell_word(command, needle), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn requote_words_spells_the_words_bash_runs() {
+        let cases = [
+            ("gh $'repo' delete x", "gh repo delete x"),
+            (r"$'\x67h' repo delete x", "gh repo delete x"),
+            ("'gh' repo delete x", "gh repo delete x"),
+            (r"g\h repo delete x", "gh repo delete x"),
+            // A quoted phrase stays one quoted word.
+            (r#"echo "gh repo delete""#, "echo 'gh repo delete'"),
+            // An inner quote cannot reopen a string for a later scanner.
+            (r#"echo "it's" gh"#, "echo 'it_s' gh"),
+            ("echo ''", "echo ''"),
+        ];
+        for (segment, want) in cases {
+            assert_eq!(requote_words(segment), want, "{segment}");
+        }
+    }
+
+    #[test]
+    fn redirect_targets_decode_ansi_c_escapes() {
+        let cases = [
+            (r"echo hi > $'.en\x76'", ".env"),
+            (r"echo hi > $'\056env'", ".env"),
+            (r"echo hi >> $'\x2e'env", ".env"),
+            (r"echo hi > $'a\'b'", "a'b"),
+            (r"echo hi > $'.env\0junk'", ".env"),
+            (r"echo hi >| $'.en\x76'", ".env"),
+        ];
+        for (segment, want) in cases {
+            assert_eq!(
+                redirect_targets(segment),
+                vec![want.to_string()],
+                "{segment}"
+            );
+        }
+        assert_eq!(
+            clobber_redirect_targets(r"echo hi > $'.en\x76'"),
+            vec![".env".to_string()]
+        );
+    }
+
+    #[test]
+    fn strip_group_wrappers_walks_a_bounded_number_of_first_words() {
+        // PR #1118 review: each leading `{` re-walked the whole rest of the
+        // segment, so 5000 levels of `{ (` took seconds.
+        let k = 5000;
+        let cases = [
+            (
+                format!("{}cat .env{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+                "cat .env",
+            ),
+            (
+                format!("{}cat .env{}", "{(".repeat(k), ")}".repeat(k)),
+                "cat .env",
+            ),
+            (
+                format!("{}cat .env{}", "{ ".repeat(k), " }".repeat(k)),
+                "cat .env",
+            ),
+            ("{ {cat,.env}; }".to_string(), "{cat,.env}"),
+            ("{(echo hi)}".to_string(), "echo hi"),
+        ];
+        for (segment, want) in cases {
+            FIRST_WORD_WALKS.with(|walks| walks.set(0));
+            assert_eq!(strip_group_wrappers(&segment), want);
+            let walks = FIRST_WORD_WALKS.with(std::cell::Cell::get);
+            assert!(walks <= MAX_GLUED_BRACE_WALKS + 1, "{walks} walks");
+        }
+        // A glued run of openers is a word, not groups; the walks stay capped
+        // and the text is kept.
+        let glued = format!("{}x", "{".repeat(k));
+        FIRST_WORD_WALKS.with(|walks| walks.set(0));
+        let kept = strip_group_wrappers(&glued);
+        assert!(kept.ends_with('x') && !kept.is_empty());
+        assert!(FIRST_WORD_WALKS.with(std::cell::Cell::get) <= MAX_GLUED_BRACE_WALKS + 1);
     }
 }
