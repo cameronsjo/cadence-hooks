@@ -179,17 +179,86 @@ pub fn has_unbalanced_groups(segment: &str) -> bool {
     opens != closes || backticks % 2 == 1
 }
 
-/// How many `(` and `)` in `segment` sit OUTSIDE quotes, as `(opens, closes)`.
+/// One piece of unquoted grouping syntax, in source order — see
+/// [`unquoted_group_events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupEvent {
+    /// An unquoted `(` — a subshell, a `$(` substitution, or a `case`
+    /// pattern's optional opener.
+    Open,
+    /// An unquoted `)`.
+    Close,
+    /// An unquoted word made only of `[A-Za-z0-9_]`, and whether it sits in
+    /// command position.
+    Word {
+        text: String,
+        command_position: bool,
+    },
+}
+
+/// The unquoted `(`, `)` and bare words of `segment`, in order.
 ///
-/// The same count [`has_unbalanced_groups`] makes, exposed for a caller that
-/// needs the direction of the imbalance and not just its presence: a walk that
-/// scopes a subshell's `cd` to the subshell has to know how many levels a
-/// segment opens and how many it closes (cadence-hooks#1058). Quoted parens
-/// (`-m "done :)"`) and escaped ones (`\(`) are not grouping and are not
-/// counted.
-pub fn unquoted_paren_counts(segment: &str) -> (usize, usize) {
-    let (opens, closes, _) = unquoted_group_counts(segment);
-    (opens, closes)
+/// A walk that scopes a subshell's `cd` must tell a subshell's `)` from a
+/// `case` pattern's `)` (`case x in a) …`), which only order can do: the
+/// pattern's close follows the words `case … in`. Counting parens alone
+/// popped the subshell early (cadence-hooks#1058 review). Quoted and escaped
+/// characters produce nothing. A word is a maximal run of `[A-Za-z0-9_]`;
+/// any other character ends it. It is in command position when only
+/// whitespace, an `Open`, a `$(` or a backtick stands between it and the
+/// segment start or the previous `Open`/backtick.
+pub fn unquoted_group_events(segment: &str) -> Vec<GroupEvent> {
+    fn flush(word: &mut String, at: bool, events: &mut Vec<GroupEvent>) {
+        if !word.is_empty() {
+            events.push(GroupEvent::Word {
+                text: std::mem::take(word),
+                command_position: at,
+            });
+        }
+    }
+    let chars: Vec<char> = segment.chars().collect();
+    let mut quote: Option<Quote> = None;
+    let mut events = Vec::new();
+    let mut word = String::new();
+    let mut word_at_command = false;
+    let mut command_position = true;
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            flush(&mut word, word_at_command, &mut events);
+            command_position = false;
+            i = next;
+            continue;
+        }
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() || c == '_' {
+            if word.is_empty() {
+                word_at_command = command_position;
+                command_position = false;
+            }
+            word.push(c);
+            i += 1;
+            continue;
+        }
+        flush(&mut word, word_at_command, &mut events);
+        match c {
+            '(' => {
+                events.push(GroupEvent::Open);
+                command_position = true;
+            }
+            ')' => {
+                events.push(GroupEvent::Close);
+                command_position = false;
+            }
+            '`' | '{' => command_position = true,
+            // `$(` opens a substitution; the `(` sets command position.
+            '$' if chars.get(i + 1) == Some(&'(') => {}
+            c if c.is_whitespace() => {}
+            _ => command_position = false,
+        }
+        i += 1;
+    }
+    flush(&mut word, word_at_command, &mut events);
+    events
 }
 
 /// Unquoted `(`, `)` and backtick counts — the one scan behind
@@ -3436,6 +3505,33 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, false)
+}
+
+/// [`split_segments_with_ops`], except that an `&` belonging to a redirection
+/// operator — `>&`/`<&` (`2>&1`, `>&2`, `<&-`) or `&>`/`&>>` — stays inside
+/// its segment instead of cutting it as a background `&`.
+///
+/// The default splitter cuts `cd /wt 2>&1 & git commit` into `cd /wt 2>`,
+/// `1`, and `git commit`, so a caller cannot tell a real background `&` from
+/// half of a redirection. A walk that scopes a backgrounded `cd` to its
+/// subshell needs exactly that distinction (cadence-hooks#1058). Decided
+/// lexically, the way the shell does: `&` right after an unescaped `>`/`<`, or
+/// right before `>`, is part of the operator; `cd /wt & >/dev/null git commit`
+/// (space before `>`) still backgrounds the cd.
+///
+/// Opt-in rather than a change to [`split_segments_with_ops`], whose many
+/// callers were written against its current segments.
+pub fn split_segments_with_ops_joining_redirects(
+    command: &str,
+) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, true)
+}
+
+fn split_segments_impl(
+    command: &str,
+    join_redirect_amp: bool,
+) -> Vec<(String, Option<&'static str>)> {
     // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
     // with the body scan, because the shell reads one logical line and only
     // then begins a heredoc body on the line after it (#475).
@@ -3515,6 +3611,13 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
                 quote = Some(Quote::Double);
                 current.push(c);
             }
+            '&' if join_redirect_amp
+                && chars.peek() != Some(&'&')
+                && (ends_with_unescaped_redirect_op(current.as_str())
+                    || chars.peek() == Some(&'>')) =>
+            {
+                current.push(c);
+            }
             '&' => {
                 // `&&` and `&` are both separators; consume the second `&`.
                 let op = if chars.peek() == Some(&'&') {
@@ -3551,6 +3654,15 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
         segments.push((trimmed.to_string(), None));
     }
     segments
+}
+
+/// Whether `text` ends, with no space before the next character, in an
+/// unescaped `>` or `<` — the first half of a `>&`/`<&` operator.
+fn ends_with_unescaped_redirect_op(text: &str) -> bool {
+    let Some(before) = text.strip_suffix(['>', '<']) else {
+        return false;
+    };
+    before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
 }
 
 /// Whether `text` ends in a `>` that the shell reads as a redirect operator
@@ -9717,6 +9829,62 @@ mod tests {
         assert_eq!(
             d.repo_flag.as_deref(),
             Some("https://github.com/evil/x.git")
+        );
+    }
+
+    #[test]
+    fn joining_splitter_keeps_redirection_ampersands_in_the_segment() {
+        let ops = |c: &str| split_segments_with_ops_joining_redirects(c);
+        assert_eq!(
+            ops("cd /wt 2>&1 & git x"),
+            vec![
+                ("cd /wt 2>&1".to_string(), Some("&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        assert_eq!(
+            ops("cd /wt &>/dev/null && git x"),
+            vec![
+                ("cd /wt &>/dev/null".to_string(), Some("&&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        // A space before `>` makes the `&` a real background operator.
+        assert_eq!(
+            ops("cd /wt & >/dev/null git x"),
+            vec![
+                ("cd /wt".to_string(), Some("&")),
+                (">/dev/null git x".to_string(), None)
+            ]
+        );
+        // The default splitter is unchanged.
+        assert_eq!(split_segments_with_ops("a 2>&1").len(), 2);
+    }
+
+    #[test]
+    fn group_events_keep_source_order_and_command_position() {
+        use GroupEvent::*;
+        let word = |t: &str, at: bool| Word {
+            text: t.to_string(),
+            command_position: at,
+        };
+        assert_eq!(
+            unquoted_group_events("x=$(case a in a) echo"),
+            vec![
+                word("x", true),
+                Open,
+                word("case", true),
+                word("a", false),
+                word("in", false),
+                word("a", false),
+                Close,
+                word("echo", false),
+            ]
+        );
+        // Quoted text yields nothing.
+        assert_eq!(
+            unquoted_group_events("echo 'case (' \")\""),
+            vec![word("echo", true)]
         );
     }
 }
