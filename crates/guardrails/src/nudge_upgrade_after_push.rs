@@ -25,27 +25,38 @@ fn is_main(name: &str) -> bool {
     name == "main" || name == "master"
 }
 
+/// Whether `work_dir`'s current branch is main (pure-filesystem HEAD read,
+/// cadence-hooks#164; a detached HEAD is not main).
+fn current_branch_is_main(work_dir: &str) -> bool {
+    GitState::resolve(Path::new(work_dir))
+        .and_then(|s| s.branch)
+        .is_some_and(|b| is_main(&b))
+}
+
 /// Whether this push publishes to the main branch.
 ///
 /// A named refspec is judged by the branch it writes on the remote: its
 /// destination, or its source when it names none (`git push origin main`).
-/// A bare `git push` publishes the current branch, read from `work_dir`
-/// (pure-filesystem HEAD read, cadence-hooks#164; a detached HEAD is not main).
-/// A dry run and a delete publish nothing.
+/// A remote side of `HEAD` or `@` (`git push -u origin HEAD`) and a bare
+/// `git push` both publish the current branch, read from `work_dir`.
+/// `--all`/`--mirror` publish every branch, main included. A dry run and a
+/// delete publish nothing.
 fn is_push_to_main(push: &PushInvocation) -> bool {
     if push.dry_run {
         return false;
     }
+    if push.all_or_mirror {
+        return true;
+    }
     push.refspecs.iter().filter(|r| !r.is_delete).any(|r| {
         if r.implicit {
-            return GitState::resolve(Path::new(&push.work_dir))
-                .and_then(|s| s.branch)
-                .is_some_and(|b| is_main(&b));
+            return current_branch_is_main(&push.work_dir);
         }
-        r.destination
-            .as_deref()
-            .or(r.source.as_deref())
-            .is_some_and(is_main)
+        match r.destination.as_deref().or(r.source.as_deref()) {
+            Some("HEAD" | "@") => current_branch_is_main(&push.work_dir),
+            Some(dst) => is_main(dst),
+            None => false,
+        }
     })
 }
 
@@ -216,6 +227,32 @@ mod tests {
         assert!(pushes_main("git -C /elsewhere push origin main", "/tmp"));
     }
 
+    #[test]
+    fn a_head_refspec_resolves_the_current_branch() {
+        let repo = crate::github_origin_repo(); // on main
+        let dir = repo.path().to_string_lossy().into_owned();
+        for cmd in [
+            "git push origin HEAD",
+            "git push -u origin HEAD",
+            "git push origin @",
+        ] {
+            assert!(pushes_main(cmd, &dir), "on main: {cmd}");
+        }
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["checkout", "-q", "-b", "feat"]);
+        for cmd in ["git push origin HEAD", "git push -u origin HEAD"] {
+            assert!(!pushes_main(cmd, &dir), "on a feature branch: {cmd}");
+        }
+        // An explicit remote side still wins over the current branch.
+        assert!(pushes_main("git push origin HEAD:main", &dir));
+    }
+
+    #[test]
+    fn all_and_mirror_push_main() {
+        assert!(pushes_main("git push --all origin", "/tmp"));
+        assert!(pushes_main("git push --mirror origin", "/tmp"));
+        assert!(!pushes_main("git push --all --dry-run origin", "/tmp"));
+    }
+
     /// cameronsjo/cadence-hooks#893: the words `git push origin main` in text
     /// that no shell runs as a push are not a push.
     #[test]
@@ -278,10 +315,10 @@ mod tests {
     }
 
     // Unix-only: exercises POSIX bash `cd <absolute-path>` resolution through
-    // parse_work_dir. A native Windows repo path (`D:\...`) is not a `/`-rooted
+    // the push walk's `cd` tracking. A native Windows repo path (`D:\...`) is not a `/`-rooted
     // bash absolute path, so it cannot drive this code path — and in production
     // Claude's Bash tool on Windows is Git Bash, where cd targets are `/d/...`
-    // mounts, not native paths. parse_work_dir's parsing itself is covered
+    // mounts, not native paths. The `cd` tracking itself is covered
     // portably by the unit tests in core::shell.
     #[cfg(not(windows))]
     #[test]
@@ -294,7 +331,7 @@ mod tests {
         assert_eq!(
             result.outcome,
             Outcome::Nudge,
-            "cd + push should detect cadence-hooks repo via parse_work_dir"
+            "cd + push should detect cadence-hooks repo via the push walk's cd tracking"
         );
     }
 
