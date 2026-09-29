@@ -2275,6 +2275,19 @@ fn print_platform_drift_status() {
     }
 }
 
+/// Prints the redaction identity tier's status, the same report as
+/// `redact-scan --status` (cameronsjo/cadence-hooks#617, #1067).
+///
+/// This is where an unarmed tier is said out loud, once per `doctor` run: the
+/// posting guard does not nudge per call, and `redact-scan` prints a single
+/// stderr line, so a machine that never replicated the term source would
+/// otherwise look identical to a clean one. A status line, not a `Finding` —
+/// an unarmed tier is a per-machine state, not a defect in the checked tree.
+fn print_redaction_status() {
+    let (report, _unarmed) = cadence_hooks_cadence::redact_external_content::status_report();
+    cadence_hooks_core::outln!("{report}");
+}
+
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
 /// registry-file reaps when nonzero. No threshold — reaping is normal
 /// operation; this is visibility, not an alarm.
@@ -3711,6 +3724,12 @@ pub fn run(
         crate::bypass_report::print_quiet_status();
     } else {
         crate::bypass_report::print_bypass_status();
+        // Reads the live machine's term source (`$HOME`), so it is gated off
+        // under `--root` like the other live-machine reads; it sits here, not
+        // with them, because it needs no plugin cache to be true.
+        if root_override.is_none() {
+            print_redaction_status();
+        }
     }
 
     // Resolve the install channel once — it's process-invariant, so the scan

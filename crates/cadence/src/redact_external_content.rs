@@ -66,6 +66,7 @@ use cadence_hooks_core::shell::{
     strip_quotes, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
+mod context;
 mod identity;
 
 use regex::Regex;
@@ -1034,15 +1035,24 @@ impl Check for RedactExternalContent {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        // Phase 0 — the term source, loaded once. Every failure yields an empty
-        // list (fail-open on the guard's own failure); the SessionStart probe,
-        // not this call, is what keeps an absent file from being a silent
-        // disarm.
-        let (identity_list, _status) = identity::load();
+        // Phase 0 — a call that carries neither a command nor editable text is
+        // a tool this check never judges (Read, Grep, an Agent spawn…). It
+        // returns before the term source is touched: under a single-dispatch
+        // wiring this runs on every tool call, and a file read plus TOML parse
+        // per no-op call is pure waste (#580).
+        let command = input.command();
+        if command.is_none() && input.edit_fragments().is_none() {
+            return CheckResult::allow();
+        }
 
         // Phase 1 — route by surface. Only Bash carries a postable command; a
         // Write/Edit runs the identity pass ONLY (see `run_edit`).
-        let Some(command) = input.command() else {
+        let Some(command) = command else {
+            // The term source, loaded once. Every failure yields an empty
+            // list (fail-open on the guard's own failure); doctor and the
+            // SessionStart probe, not this call, keep an absent file from
+            // being a silent disarm (#1067).
+            let (identity_list, _status) = identity::load();
             return run_edit(input, &identity_list);
         };
 
@@ -1053,6 +1063,13 @@ impl Check for RedactExternalContent {
         // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
         let (bodies, notes) = gather_posted(command, &base_dir);
+        // A command that posts nothing and has nothing to report never needs
+        // the term source: skip the load (#580). `notes` is only ever printed
+        // where the tier is armed, so it is the one reason to look.
+        if bodies.is_empty() && notes.is_empty() {
+            return CheckResult::allow();
+        }
+        let (identity_list, _status) = identity::load();
         // A text the identity scan could not read is said once on stderr, and
         // only where the tier is armed — a machine with no term source has
         // nothing the scan failed to do. The verdict is unchanged: fail open.
@@ -1077,6 +1094,18 @@ impl Check for RedactExternalContent {
         let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
         let d = resolve_dest_tier(env_audience.as_deref(), &config);
 
+        // The post's target repo, resolved at most once and only when a
+        // consumer needs it: a `destinations`-scoped allow (#630) or a shaped
+        // hit the owned-target downgrade could silence (#684). It spawns `git`
+        // for an origin lookup, so a command with neither pays nothing.
+        let targets: std::cell::OnceCell<Vec<Option<context::Target>>> = std::cell::OnceCell::new();
+        let targets = || targets.get_or_init(|| context::post_targets(command, &base_dir));
+        let destination = if identity_list.uses_destinations() {
+            context::shared_destination(targets())
+        } else {
+            None
+        };
+
         // Phase 4 — TWO passes over every body, deliberately without a
         // short-circuit. An identity hit does not skip the shaped scan: a
         // single post can carry both, and the operator fixing one should see
@@ -1096,7 +1125,12 @@ impl Check for RedactExternalContent {
             let passed = shell_passed_value(posted);
             for text in std::iter::once(body.to_string()).chain(passed.clone()) {
                 if !identity_seen.contains(&text) {
-                    identity_hits.extend(identity::scan_identity(&text, &identity_list, None));
+                    identity_hits.extend(identity::scan_identity(
+                        &text,
+                        &identity_list,
+                        None,
+                        destination.as_deref(),
+                    ));
                     identity_seen.insert(text);
                 }
             }
@@ -1120,11 +1154,33 @@ impl Check for RedactExternalContent {
             hits.extend(written);
         }
 
+        // Own-ecosystem targets: harness vocabulary is the subject matter on a
+        // repo that owns it (#684). Only the vocabulary categories go silent;
+        // local paths and repo-configured patterns still nudge, and the
+        // identity tier above is untouched. The target is resolved only when
+        // there is a vocabulary hit to silence.
+        if hits.iter().any(|h| is_vocabulary(h.category)) && context::all_owned(targets()) {
+            hits.retain(|h| !is_vocabulary(h.category));
+        }
+
+        // A large fenced block bound for a public audience is likely pasted
+        // tool output (#974) — a nudge, and only where the audience is stated.
+        let mut notes: Vec<String> = Vec::new();
+        if explicit_public(env_audience.as_deref(), &config)
+            && let Some(n) = bodies
+                .iter()
+                .map(|posted| context::longest_fence(&posted.0))
+                .max()
+                .and_then(pasted_output_note)
+        {
+            notes.push(n);
+        }
+
         // Config warnings ride the nudge channel (exit 0 / stdout → lands in
         // the transcript). A clean scan with a broken config still nudges —
         // otherwise the drop is exactly as silent as the #536 defect was.
         let warnings = loaded.warnings;
-        combine(&identity_hits, &hits, &warnings, identity_list.mode)
+        combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode)
     }
 }
 
@@ -1169,6 +1225,15 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         return CheckResult::allow();
     }
 
+    // A code or config file under a temp root never leaves the machine on its
+    // own — a helper script, a repro fixture, the session journal's scripts —
+    // so the identity pass is skipped for it (#1013, #716, #603). Prose
+    // (`.md`, `.txt`, no extension) keeps the scan even there, because a draft
+    // can be handed to `--body-file`; that post-time scan is the real gate.
+    if context::is_scratch_code_path(file_path) {
+        return CheckResult::allow();
+    }
+
     let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
     for (new, old) in &fragments {
         // Scan only what the edit introduces. A term already present in `old`
@@ -1183,7 +1248,7 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         // this function's whole contract rests on. (Both review seats found
         // this independently.)
         let mut by_snippet: HashMap<String, Vec<identity::IdentityHit>> = HashMap::new();
-        for hit in identity::scan_identity(new, identity_list, file_path) {
+        for hit in identity::scan_identity(new, identity_list, file_path, None) {
             by_snippet.entry(hit.snippet.clone()).or_default().push(hit);
         }
         for (snippet, found) in by_snippet {
@@ -1193,7 +1258,7 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
             identity_hits.extend(found.into_iter().skip(already));
         }
     }
-    combine(&identity_hits, &[], &[], identity_list.mode)
+    combine(&identity_hits, &[], &[], &[], identity_list.mode)
 }
 
 /// One work-identifiable term found by [`identity_matches`]: the term's
@@ -1228,7 +1293,7 @@ pub fn identity_matches_from(text: &str, source: &std::path::Path) -> Vec<TermMa
 }
 
 fn to_term_matches(text: &str, list: &identity::IdentityList) -> Vec<TermMatch> {
-    identity::scan_identity(text, list, None)
+    identity::scan_identity(text, list, None, None)
         .into_iter()
         .map(|h| TermMatch {
             id: h.id,
@@ -1261,6 +1326,7 @@ fn combine(
     identity_hits: &[identity::IdentityHit],
     hits: &[Hit],
     warnings: &[String],
+    notes: &[String],
     mode: identity::Mode,
 ) -> CheckResult {
     let bypass = sensitive_terms_bypass();
@@ -1281,6 +1347,7 @@ fn combine(
     if !warnings.is_empty() {
         sections.push(build_config_warning(warnings));
     }
+    sections.extend(notes.iter().cloned());
     if sections.is_empty() {
         return CheckResult::allow();
     }
@@ -1402,6 +1469,39 @@ fn load_redaction_config(
         };
     };
     cadence_hooks_core::config::load_cadence_section_lenient(&root, "redaction")
+}
+
+/// The shaped categories that are harness *vocabulary* — meaningful only inside
+/// this ecosystem, and so native to a repo that owns it (#684). `local-path`
+/// (a machine's filesystem layout) and `custom` (repo-configured patterns) are
+/// not vocabulary and are never downgraded.
+fn is_vocabulary(category: &str) -> bool {
+    matches!(category, "skill-id" | "marketplace" | "harness-noun")
+}
+
+/// Fenced blocks longer than this many lines read as pasted tool output.
+const PASTED_OUTPUT_LINES: usize = 40;
+
+/// The nudge for a body whose longest fenced block is `lines` long, if it is
+/// long enough to look like pasted tool output (#974).
+fn pasted_output_note(lines: usize) -> Option<String> {
+    (lines > PASTED_OUTPUT_LINES).then(|| {
+        format!(
+            "⚠️  redact-external-content: this body carries a fenced block of {lines} lines for a \
+             public audience. Pasted tool output can quote private text no term list knows to \
+             catch — summarize its shape and counts instead, or re-run against a synthetic fixture."
+        )
+    })
+}
+
+/// Is the audience STATED as public — by `CADENCE_AUDIENCE` or the config's
+/// `originAudience`? [`resolve_dest_tier`] falls back to public when nothing is
+/// stated, which is right for redaction (unknown widens) and wrong for a nudge
+/// (unknown must stay quiet), so the visibility-gated nudges ask this instead.
+fn explicit_public(env_audience: Option<&str>, config: &RedactionConfig) -> bool {
+    env_audience
+        .or(config.origin_audience.as_deref())
+        .is_some_and(|a| a == "public")
 }
 
 /// Resolve the destination-tier ordinal (PURE — env passed as an argument, never
@@ -1732,17 +1832,38 @@ fn build_message(hits: &[Hit]) -> String {
 /// would sail through and look exactly like success. The report goes to stdout
 /// so a SessionStart hook can surface it in the transcript.
 pub fn run_status() -> u8 {
+    let (report, unarmed) = status_report();
+    cadence_hooks_core::outln!("{report}");
+    u8::from(unarmed)
+}
+
+/// The `--status` report and whether it describes an unarmed tier. One home
+/// for the text, because `cadence-hooks doctor` prints the same report
+/// (cameronsjo/cadence-hooks#617, #1067): two spellings would drift, and an
+/// operator comparing them would not know which to trust.
+///
+/// An armed tier also reports `term_count` and `term_digest` on their own
+/// lines (#589) — the count and a 12-hex-character fingerprint of the sorted
+/// term values, so provisioning can check it got the RIGHT list rather than
+/// merely a well-formed one. A term source that demands a newer binary adds
+/// one line naming the minimum.
+pub fn status_report() -> (String, bool) {
     let (list, status) = identity::load();
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
-    let report = match &status {
+    let mut report = match &status {
         identity::Status::Armed(n) => {
             let mode = match list.mode {
                 identity::Mode::Enforce => "enforce (blocking)",
                 identity::Mode::Warn => "warn (advisory)",
             };
-            format!("redaction identity tier: ARMED — {n} term(s), mode {mode} [{path}]")
+            format!(
+                "redaction identity tier: ARMED — {n} term(s), mode {mode} [{path}]\n\
+                 term_count: {}\nterm_digest: {}",
+                list.term_count(),
+                list.term_digest()
+            )
         }
         identity::Status::Absent => format!(
             "⚠️  redaction identity tier: NOT ARMED — no term source at {path}\n\
@@ -1764,10 +1885,62 @@ pub fn run_status() -> u8 {
              parse: {e}\nFix the file to re-arm; nothing is being caught until then."
         ),
     };
-    cadence_hooks_core::outln!("{report}");
+    if let Some(note) = list.too_new_note() {
+        report.push_str(&format!("\n⚠️  {note}"));
+    }
     // One source of truth for "is this a state the operator must be told
-    // about" — the exit code derives from it rather than restating it per arm.
-    u8::from(status.needs_notice())
+    // about" — the flag derives from it rather than restating it per arm.
+    (report, status.needs_notice())
+}
+
+/// Entry for `redact-scan --validate-config`: parse the term source and check
+/// what the runtime would otherwise swallow. Exit 0 valid; exit 2 with every
+/// problem named on stderr (cameronsjo/cadence-hooks#617).
+///
+/// Stricter than arming on purpose. The runtime is fail-open — an allow entry
+/// with a broken regex is silently inert, a zero-term file silently disarms —
+/// so the validator is where those become loud. A term source that needs a
+/// newer binary than this one exits 2 with the minimum-version line.
+pub fn run_validate_config() -> u8 {
+    let (list, status) = identity::load();
+    let path = identity::terms_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+    let mut errors: Vec<String> = Vec::new();
+    match &status {
+        identity::Status::Absent => errors.push(format!("no term source at {path}")),
+        identity::Status::Unreadable => errors.push(format!(
+            "term source at {path} exists but could not be read (permissions, not a regular \
+             file, or over the size cap)"
+        )),
+        identity::Status::Malformed(e) => {
+            errors.push(format!("term source at {path} failed to parse: {e}"))
+        }
+        identity::Status::ZeroTerms => errors.push(format!(
+            "term source at {path} parses but carries zero terms — the tier would be inert"
+        )),
+        identity::Status::Armed(_) => {}
+    }
+    if matches!(
+        status,
+        identity::Status::Armed(_) | identity::Status::ZeroTerms
+    ) {
+        errors.extend(identity::validate(&list));
+        if let Some(note) = list.too_new_note() {
+            errors.push(note);
+        }
+    }
+    if errors.is_empty() {
+        cadence_hooks_core::outln!(
+            "redact-scan: term source valid — {} term(s) [{path}]",
+            list.term_count()
+        );
+        return 0;
+    }
+    for e in &errors {
+        eprintln!("redact-scan: invalid term source: {}", stderr_safe(e));
+    }
+    2
 }
 
 /// Entry for the `redact-scan` CLI action. Returns the process exit code.
@@ -1880,8 +2053,18 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
     // An unarmed tier yields no hits and no error (`scan_identity` returns
     // early), which is the fail-open posture ADR-0001 requires and matches the
     // hook, equally inert in that state.
-    let (identity_list, _status) = identity::load();
-    let identity_hits = identity::scan_identity(&input, &identity_list, None);
+    let (identity_list, status) = identity::load();
+    // An unarmed tier is otherwise indistinguishable from a clean scan: exit 0,
+    // no output. One stderr line says the identity check did not run. The exit
+    // code is unchanged, and the posting guard deliberately does not repeat
+    // this per call — `doctor` reports the state once (#1067).
+    if status.needs_notice() {
+        eprintln!(
+            "redact-scan: identity tier not armed — no term source loaded, so work-identifiable \
+             terms were NOT checked (see `cadence-hooks cadence redact-scan --status`)"
+        );
+    }
+    let identity_hits = identity::scan_identity(&input, &identity_list, None, None);
     let bypass = sensitive_terms_bypass();
     // The EXIT MAPPING mirrors `combine` arm for arm: only Enforce blocks, and
     // only with no bypass armed. Warn mode and a bypassed block both fall
@@ -1897,6 +2080,14 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
         && bypass.is_none();
     for line in identity_scan_lines(&input, &identity_hits, identity_list.mode, bypass.is_some()) {
         eprintln!("{line}");
+    }
+
+    // Pasted-output nudge (#974): only where the audience is STATED public
+    // (flag, env, or config) — unknown stays quiet. Advisory: exit unchanged.
+    if explicit_public(audience.as_deref().or(env_audience.as_deref()), &config)
+        && let Some(note) = pasted_output_note(context::longest_fence(&input))
+    {
+        eprintln!("redact-scan: {note}");
     }
 
     // No short-circuit: identity hits do not skip the shaped scan. One composed
@@ -4418,6 +4609,394 @@ term = "acmecorp"
             start.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
             start.elapsed()
+        );
+    }
+
+    // === Operator-ruled cluster: #1067 #617 #589 #580 #1013/#716/#603 #630
+    // #684 #974 ===
+
+    /// Serialize, install `toml_body` as the term source, and clear the env
+    /// the cluster's behaviors read, so an ambient `CADENCE_AUDIENCE` or
+    /// `CADENCE_ALLOWED_OWNERS` cannot decide a verdict. `env` is then applied.
+    fn with_env<R>(toml_body: &str, env: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        with_terms(toml_body, || {
+            let _cleanup = EnvCleanup(&["CADENCE_AUDIENCE", "CADENCE_ALLOWED_OWNERS", "GH_REPO"]);
+            // SAFETY: serialized by TERMS_ENV_LOCK, held by `with_terms`.
+            unsafe {
+                std::env::remove_var("CADENCE_AUDIENCE");
+                std::env::remove_var("CADENCE_ALLOWED_OWNERS");
+                std::env::remove_var("GH_REPO");
+                for (k, v) in env {
+                    std::env::set_var(k, v);
+                }
+            }
+            f()
+        })
+    }
+
+    /// A post from a directory that is not a checkout, so the target comes
+    /// from `-R` alone and never from this repo's real origin.
+    fn post(cmd: &str) -> CheckResult {
+        let dir = tempfile::tempdir().unwrap();
+        RedactExternalContent.run(&make_bash_with_cwd(cmd, dir.path().to_str().unwrap()))
+    }
+
+    const DEST_FIXTURE: &str = r#"
+version = 1
+[[terms]]
+id = "T1"
+term = "acmecorp"
+[[terms.allow]]
+destinations = ["me/*", "them/exact"]
+"#;
+
+    #[test]
+    fn destination_scoped_allow_table() {
+        // (command, expected) — the term is excused only where the post's
+        // target resolves inside the entry's scope.
+        let table: &[(&str, Outcome)] = &[
+            (
+                "gh issue comment 1 -R me/tool --body acmecorp",
+                Outcome::Allow,
+            ),
+            (
+                "gh issue comment 1 -R ME/Tool --body acmecorp",
+                Outcome::Allow,
+            ),
+            (
+                "gh issue comment 1 -R them/exact --body acmecorp",
+                Outcome::Allow,
+            ),
+            // Same owner as an exact entry, different repo.
+            (
+                "gh issue comment 1 -R them/other --body acmecorp",
+                Outcome::Block,
+            ),
+            // Outside every scope.
+            (
+                "gh issue comment 1 -R out/side --body acmecorp",
+                Outcome::Block,
+            ),
+            // An owner that merely starts with the glob's owner.
+            (
+                "gh issue comment 1 -R menace/tool --body acmecorp",
+                Outcome::Block,
+            ),
+            // Unresolvable target: no -R and no origin. Unknown stays blocked.
+            ("gh issue comment 1 --body acmecorp", Outcome::Block),
+            (
+                "gh api -X POST repos/me/tool/issues -f body=acmecorp",
+                Outcome::Block,
+            ),
+            // Two segments disagreeing on a target: no shared destination.
+            (
+                "gh issue comment 1 -R me/a --body acmecorp && gh issue comment 1 -R out/b --body acmecorp",
+                Outcome::Block,
+            ),
+            // Agreeing segments keep the scope.
+            (
+                "gh issue comment 1 -R me/a --body acmecorp && gh issue comment 2 -R me/a --body acmecorp",
+                Outcome::Allow,
+            ),
+        ];
+        with_env(DEST_FIXTURE, &[], || {
+            for (cmd, want) in table {
+                assert_eq!(post(cmd).outcome, *want, "cmd: {cmd}");
+            }
+        });
+    }
+
+    #[test]
+    fn destination_scoped_allow_never_excuses_a_write() {
+        // A Write/Edit carries no destination, so a scoped entry never applies.
+        with_env(DEST_FIXTURE, &[], || {
+            let input = HookInput {
+                tool_name: Some("Write".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/home/u/repo/notes.md".into()),
+                    content: Some("acmecorp".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Block);
+        });
+    }
+
+    const OWNED_BODY_CASES: &[(&str, &str, Outcome, bool)] = &[
+        // (target, body, outcome, message mentions the skill id)
+        ("me/tool", "see cadence:attune", Outcome::Allow, false),
+        ("me/tool", "the tool_input field", Outcome::Allow, false),
+        ("them/tool", "see cadence:attune", Outcome::Nudge, true),
+        // A local path is not harness vocabulary: still nudged on an owned repo.
+        ("me/tool", "at /Users/alice/proj", Outcome::Nudge, false),
+    ];
+
+    #[test]
+    fn owned_target_silences_harness_vocabulary_only() {
+        with_env(FIXTURE, &[("CADENCE_ALLOWED_OWNERS", "me")], || {
+            for (target, body, want, mentions_skill) in OWNED_BODY_CASES {
+                let r = post(&format!("gh issue comment 1 -R {target} --body '{body}'"));
+                assert_eq!(r.outcome, *want, "{target}: {body}");
+                let msg = r.message.unwrap_or_default();
+                assert_eq!(msg.contains("cadence:attune"), *mentions_skill, "{msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn owned_target_keeps_the_identity_tier_armed() {
+        with_env(FIXTURE, &[("CADENCE_ALLOWED_OWNERS", "me")], || {
+            let r = post("gh issue comment 1 -R me/tool --body 'acmecorp and cadence:attune'");
+            assert_eq!(r.outcome, Outcome::Block);
+            let msg = r.message.unwrap_or_default();
+            assert!(msg.contains("acmecorp"), "{msg}");
+            assert!(
+                !msg.contains("cadence:attune"),
+                "the vocabulary is silent there: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn owned_downgrade_requires_a_configured_owner_and_every_segment_owned() {
+        let body = "'see cadence:attune'";
+        // No CADENCE_ALLOWED_OWNERS: nothing is owned.
+        with_env(FIXTURE, &[], || {
+            let r = post(&format!("gh issue comment 1 -R me/tool --body {body}"));
+            assert_eq!(r.outcome, Outcome::Nudge);
+        });
+        with_env(FIXTURE, &[("CADENCE_ALLOWED_OWNERS", "me")], || {
+            // One unowned segment spoils the command.
+            let r = post(&format!(
+                "gh issue comment 1 -R me/a --body {body} && gh issue comment 1 -R them/b --body {body}"
+            ));
+            assert_eq!(r.outcome, Outcome::Nudge);
+            // An unresolvable target is not an owned one.
+            assert_eq!(
+                post(&format!("gh issue comment 1 --body {body}")).outcome,
+                Outcome::Nudge
+            );
+            assert_eq!(
+                post(&format!("gh gist create --body {body}")).outcome,
+                Outcome::Nudge
+            );
+        });
+    }
+
+    fn fenced(lines: usize) -> String {
+        format!("```\n{}```\n", "output line\n".repeat(lines))
+    }
+
+    #[test]
+    fn pasted_output_nudge_table() {
+        // (audience env, fenced lines, nudges?) — a nudge, only past 40 lines,
+        // only where the audience is STATED public.
+        let table: &[(Option<&str>, usize, bool)] = &[
+            (Some("public"), 41, true),
+            (Some("public"), 200, true),
+            (Some("public"), 40, false),
+            (Some("public"), 3, false),
+            // Unknown audience: skip, even though redaction itself treats
+            // unknown as public.
+            (None, 41, false),
+            (Some("private-external"), 41, false),
+            (Some("owned-internal"), 41, false),
+        ];
+        for (audience, lines, want) in table {
+            let env: Vec<(&str, &str)> = audience
+                .map(|a| vec![("CADENCE_AUDIENCE", a)])
+                .unwrap_or_default();
+            with_env(FIXTURE, &env, || {
+                let r = post(&format!(
+                    "gh issue comment 1 -R them/x --body '{}'",
+                    fenced(*lines)
+                ));
+                assert_ne!(r.outcome, Outcome::Block, "a nudge never blocks");
+                let msg = r.message.unwrap_or_default();
+                assert_eq!(
+                    msg.contains("fenced block"),
+                    *want,
+                    "audience {audience:?}, {lines} lines: {msg}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn pasted_output_nudge_does_not_soften_an_identity_block() {
+        with_env(FIXTURE, &[("CADENCE_AUDIENCE", "public")], || {
+            let body = format!("acmecorp\n{}", fenced(60));
+            let r = post(&format!("gh issue comment 1 -R them/x --body '{body}'"));
+            assert_eq!(r.outcome, Outcome::Block);
+            let msg = r.message.unwrap_or_default();
+            assert!(
+                msg.contains("BLOCKED") && msg.contains("fenced block"),
+                "{msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn scratch_code_writes_skip_the_identity_scan_but_prose_does_not() {
+        // (tool, path, expected). The `.md`/`.txt`/no-extension rows are the
+        // pins that keep prose drafts blocked even under a temp root.
+        let table: &[(&str, &str, Outcome)] = &[
+            ("Write", "/tmp/scratch/poll.sh", Outcome::Allow),
+            ("Write", "/tmp/repro.py", Outcome::Allow),
+            ("Write", "/tmp/fixture.json", Outcome::Allow),
+            ("Write", "/private/tmp/x.yml", Outcome::Allow),
+            ("Edit", "/tmp/scratch/poll.sh", Outcome::Allow),
+            ("Write", "/tmp/notes.md", Outcome::Block),
+            ("Write", "/tmp/notes.txt", Outcome::Block),
+            ("Write", "/tmp/draft", Outcome::Block),
+            ("Edit", "/tmp/notes.md", Outcome::Block),
+            // Not under a temp root, or escaping one.
+            ("Write", "/home/u/repo/poll.sh", Outcome::Block),
+            ("Write", "/tmp/../home/u/poll.sh", Outcome::Block),
+        ];
+        with_env(FIXTURE, &[], || {
+            for (tool, path, want) in table {
+                let ti = cadence_hooks_core::ToolInput {
+                    file_path: Some((*path).into()),
+                    content: (*tool == "Write").then(|| "we ship acmecorp tooling".into()),
+                    new_string: (*tool == "Edit").then(|| "we ship acmecorp tooling".into()),
+                    old_string: (*tool == "Edit").then(|| "we ship".into()),
+                    ..Default::default()
+                };
+                let input = HookInput {
+                    tool_name: Some((*tool).into()),
+                    tool_input: Some(ti),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    RedactExternalContent.run(&input).outcome,
+                    *want,
+                    "{tool} {path}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_tool_with_nothing_to_judge_allows_without_reading_the_term_source() {
+        // A term source that would BLOCK anything is never consulted for a
+        // Read: the verdict is Allow, and the same fixture still blocks a Write.
+        with_env(FIXTURE, &[], || {
+            let read = HookInput {
+                tool_name: Some("Read".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/acmecorp.md".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&read).outcome, Outcome::Allow);
+            assert_eq!(post("ls acmecorp").outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn unarmed_guard_is_silent_and_status_reports_it_once() {
+        // The posting guard does not nudge per call when no term source is
+        // loaded (#1067); `status_report` is where the state is said.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.toml");
+        with_terms("", || {
+            let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
+            unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", &missing) };
+            let r = post("gh issue comment 1 -R them/x --body hello");
+            assert_eq!(r.outcome, Outcome::Allow);
+            assert!(r.message.is_none(), "{:?}", r.message);
+            let (report, unarmed) = status_report();
+            assert!(unarmed);
+            assert!(report.contains("NOT ARMED"), "{report}");
+            assert_eq!(run_status(), 1);
+        });
+    }
+
+    #[test]
+    fn status_reports_count_and_digest_when_armed() {
+        with_terms(FIXTURE, || {
+            let (report, unarmed) = status_report();
+            assert!(!unarmed);
+            assert!(report.contains("term_count: 1"), "{report}");
+            let digest = report
+                .lines()
+                .find_map(|l| l.strip_prefix("term_digest: "))
+                .expect("a digest line");
+            assert_eq!(digest.len(), 12);
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest}");
+        });
+    }
+
+    #[test]
+    fn validate_config_table() {
+        // (term source, expected exit). Only a source the runtime fully
+        // understands exits 0; everything it would swallow exits 2.
+        let table: &[(&str, u8)] = &[
+            (FIXTURE, 0),
+            (
+                "version = 1\nmin_version = \"0.1.0\"\n[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+                0,
+            ),
+            ("terms = [ not toml", 2),
+            ("version = 1\n", 2),
+            ("[[terms]]\nterm = \"x\"\n", 2), // missing id
+            ("[[terms]]\nid = \"T1\"\nterm = \"  \"\n", 2),
+            (
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n[[terms.allow]]\npattern = \"(unclosed\"\n",
+                2,
+            ),
+            (
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n[[terms.allow]]\ndestinations = [\"just-an-owner\"]\n",
+                2,
+            ),
+            (
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n[[terms.allow]]\ndestinations = [\"a/b/c\"]\n",
+                2,
+            ),
+            (
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n[[terms.allow]]\ndestinations = [\"o/*\", \"o/r\"]\n",
+                0,
+            ),
+            // Too new for this binary: by format version, and by min_version.
+            ("version = 999\n[[terms]]\nid=\"T1\"\nterm=\"x\"\n", 2),
+            (
+                "min_version = \"999.0.0\"\n[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+                2,
+            ),
+            (
+                "min_version = \"soon\"\n[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+                2,
+            ),
+        ];
+        for (toml_body, want) in table {
+            with_terms(toml_body, || {
+                assert_eq!(run_validate_config(), *want, "source: {toml_body}");
+            });
+        }
+    }
+
+    #[test]
+    fn validate_config_of_an_absent_source_exits_2() {
+        let dir = tempfile::tempdir().unwrap();
+        with_terms("", || {
+            let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
+            unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", dir.path().join("absent.toml")) };
+            assert_eq!(run_validate_config(), 2);
+        });
+    }
+
+    #[test]
+    fn too_new_source_status_names_the_minimum_release() {
+        with_terms(
+            "min_version = \"999.1.2\"\n[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+            || {
+                let (report, _) = status_report();
+                assert!(report.contains("999.1.2"), "{report}");
+                assert!(report.contains("cadence-hooks >="), "{report}");
+            },
         );
     }
 }

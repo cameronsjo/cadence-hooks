@@ -320,6 +320,11 @@ enum CadenceCommands {
         /// to announce itself once per session. Exit 0 armed / 1 unarmed.
         #[arg(long)]
         status: bool,
+        /// Parse the term source and check what the runtime swallows (bad
+        /// allow regexes, malformed `destinations`, an empty term, a file that
+        /// needs a newer binary). Exit 0 valid / 2 with each problem on stderr.
+        #[arg(long)]
+        validate_config: bool,
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     /// Exit: 0 recorded, 1 nothing recorded (detached HEAD, not a repo, write failed),
@@ -1560,7 +1565,14 @@ fn main() {
                 audience,
                 init,
                 status,
+                validate_config,
             } => {
+                if validate_config {
+                    process::exit(
+                        cadence_hooks_cadence::redact_external_content::run_validate_config()
+                            .into(),
+                    );
+                }
                 if status {
                     process::exit(
                         cadence_hooks_cadence::redact_external_content::run_status().into(),
