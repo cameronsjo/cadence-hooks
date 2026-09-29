@@ -305,7 +305,7 @@ pub const HOOKS: &[HookEntry] = &[
     // rules
     HookEntry {
         name: "validate-frontmatter",
-        description: "Validate SKILL.md and command frontmatter",
+        description: "Validate SKILL.md, command, living-plan, and plugin-agent frontmatter",
         namespace: "rules",
         event: Some(HookEvent::PreToolUse),
     },
@@ -630,17 +630,17 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // neither, so `try` would fail open before ever reaching the write
         // path.
         //
-        // `cwd` is a deliberately NONEXISTENT path, and `try_hook`'s
-        // `CWD_OVERRIDE_REFUSED` list keeps it that way — this hook has a
-        // genuine filesystem WRITE side effect, and `try`'s normal behavior
-        // (inject the REAL current_dir(), so most checks exercise real repo
-        // detection) would otherwise let a bare `cadence-hooks try session
-        // persist-plan-approval` actually create a plan doc in whatever repo
-        // the user ran it from (cameronsjo/cadence-hooks#396 review: verified
-        // end to end — a real plan doc landed in a real repo during review). A
-        // nonexistent directory makes `repo_root`'s `git -C <cwd> …` spawn
-        // fail deterministically, so the check reaches (and exercises) its
-        // "not a git repo" fail-open arm instead of ever writing.
+        // This hook has a genuine filesystem WRITE side effect, so `try` must
+        // never let it write (cameronsjo/cadence-hooks#396 review: a real plan
+        // doc once landed in a real repo). A sandbox `cwd` alone no longer
+        // guarantees that: the destination resolver follows
+        // `CLAUDE_PROJECT_DIR` and falls back to a user-scoped plans dir
+        // (cameronsjo/cadence-hooks#1021). What stops the write is `try_hook`
+        // running this hook with `CADENCE_NO_PERSIST_PLAN=1` and without
+        // `CLAUDE_PROJECT_DIR`: the opt-out is the resolver's first check, so
+        // `try` always reports ALLOW here and demonstrates none of the hook's
+        // branches. The nonexistent `cwd` (kept by `CWD_OVERRIDE_REFUSED`) is
+        // a second layer, not the guarantee.
         ("session", "persist-plan-approval") => Some(
             // Extra `#` in the raw-string delimiter: the payload's own plan
             // text embeds a literal `"#` (a quote immediately followed by an

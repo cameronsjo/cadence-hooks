@@ -15,6 +15,7 @@ serde_json = "1"
 serde_ignored = "0.1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 regex = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 clap = { version = "4", features = ["derive"] }
 brush-parser = "0.3"
 dialoguer = "0.11"

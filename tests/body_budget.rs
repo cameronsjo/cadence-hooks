@@ -12,6 +12,8 @@
 //! written by a heredoc to an absolute `$TMPDIR` path that sits outside every
 //! git root (so the per-repo config lookup finds nothing).
 
+mod support;
+
 use std::io::Write;
 use std::process::Command;
 
@@ -24,7 +26,7 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 }
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // A runner session can ambiently carry any of these, and each one would
     // turn a block-expecting assertion into a confident false pass.
     cmd.env_remove("CADENCE_BYPASS");

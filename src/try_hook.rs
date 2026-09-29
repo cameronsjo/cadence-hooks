@@ -106,6 +106,15 @@ pub fn run(
     if let Some(scratch) = &metrics_scratch {
         command.env("CADENCE_METRICS_DIR", scratch.path());
     }
+    // A write-side-effect hook gets a genuine no-write path, not just a
+    // non-repo `cwd`: since cadence-hooks#1021, `persist-plan-approval` takes
+    // its destination from `CLAUDE_PROJECT_DIR` and sends a non-repo root to
+    // the user-scoped plans dir, so a sandbox `cwd` alone no longer keeps it
+    // from writing. The opt-out stops it before any directory is resolved.
+    if CWD_OVERRIDE_REFUSED.contains(&(namespace, subcommand)) {
+        command.env("CADENCE_NO_PERSIST_PLAN", "1");
+        command.env_remove("CLAUDE_PROJECT_DIR");
+    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -264,16 +273,17 @@ fn payload_preview(payload: &str, user_supplied: bool, show_payload: bool) -> St
 /// dangerous for a hook with a genuine filesystem WRITE side effect: injecting
 /// a real repo path let a bare `cadence-hooks try session persist-plan-approval`
 /// (or the since-removed `persist-plan`) actually create a plan doc in whatever repo the
-/// user happened to be standing in when they ran `try` — reachable endpoints
-/// included `~/.claude/rules/`. Verified end to end (cameronsjo/cadence-hooks#396
-/// review): a real plan doc landed in a real repo during review, then had to
-/// be manually removed.
+/// user happened to be standing in when they ran `try` (cameronsjo/cadence-hooks#396
+/// review: a real plan doc landed in a real repo, then had to be removed).
 ///
-/// Every entry here MUST carry its own `cwd` in its `registry::sample_for`
-/// override (see `session persist-plan-approval`'s override),
-/// pointed at a path that cannot resolve as a git repo — never left absent,
-/// since an absent `cwd` degrades most Checks to a no-op fail-open, not a
-/// demonstration of the hook's real behavior.
+/// A sandbox `cwd` is no longer what keeps `try` from writing: the
+/// persist-plan resolver follows `CLAUDE_PROJECT_DIR` and falls back to a
+/// user-scoped plans dir (cameronsjo/cadence-hooks#1021). For every entry here
+/// `try` also sets `CADENCE_NO_PERSIST_PLAN=1` and removes `CLAUDE_PROJECT_DIR`
+/// on the child, and that opt-out stops the hook before it resolves anything.
+/// So `try` always reports ALLOW for `session persist-plan-approval` and
+/// demonstrates none of its branches. The nonexistent sample `cwd` each entry
+/// carries in its `registry::sample_for` override is a second layer only.
 const CWD_OVERRIDE_REFUSED: &[(&str, &str)] = &[("session", "persist-plan-approval")];
 
 /// The sample payload for a hook, with the real working directory injected

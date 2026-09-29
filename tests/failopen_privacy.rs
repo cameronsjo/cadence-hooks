@@ -13,8 +13,10 @@
 //! trigger in `dispatch.rs`, so they pass only against a debug build, which is
 //! what `cargo test` produces.
 
+mod support;
+
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 const CANARY: &str = "CNRY959ZQ";
 const CANARY_NUMBER: &str = "959424242";
@@ -34,7 +36,7 @@ fn read_failopen_rows(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
 /// metrics dir. Returns the output and the dir.
 fn run(args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> (Output, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.args(args)
         .env_remove("CADENCE_DISABLE")
         .env_remove("CADENCE_BYPASS")

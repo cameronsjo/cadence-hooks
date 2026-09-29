@@ -9,6 +9,8 @@
 //!   which owns the synthetic `CADENCE_TEST_PANIC` trigger
 //! - Missing binary (exit 127) — handled by consuming plugins' shell guards
 
+mod support;
+
 use std::process::Command;
 
 /// The binary under test, with `CADENCE_METRICS_DIR` pointed at a fresh temp
@@ -22,7 +24,7 @@ use std::process::Command;
 /// `_tmp`, never `_`.
 fn cadence_hooks() -> (Command, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("create a temp metrics dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", tmp.path());
     (cmd, tmp)
 }

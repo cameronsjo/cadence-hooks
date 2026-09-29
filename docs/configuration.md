@@ -242,8 +242,8 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_METRICS_DEBUG` | `log-subagent` | Set to `1` to append a `_keys` array of the raw payload's top-level keys to subagent records — surfaces schema additions across Claude Code releases |
 | `CADENCE_LOG_NUDGES` | denial log | Nudge-fire rows in `denials.jsonl` are ON by default (#420); set `0`/`false`/`off` (case-insensitive) or set-but-empty to opt out. Any other value, including the legacy opt-in `1`, keeps them on. Deny/Ask rows are unconditional either way |
 | `CADENCE_METRICS_STALE_DAYS` | `warn-stale` | Days of metrics-write silence before the SessionStart alarm fires and `doctor` reports staleness (default 4); zero or unparseable falls back to the default |
-| `CADENCE_SESSION_STALE_MINUTES` | `session` hooks | Minutes of heartbeat silence before a session is presumed dead (default 10) |
-| `CADENCE_DOCTOR_PRUNE_FORCE` | `doctor --prune` | Set to `1` or `true` to bypass the live-session gate and let `doctor --prune --apply` delete orphaned plugin-cache version dirs even while peer sessions are running. The gate's refusal message names this override; otherwise run `/reload-plugins` in the live session first to release the retired dirs |
+| `CADENCE_SESSION_STALE_MINUTES` | `session` hooks | Minutes of heartbeat silence before a session is presumed dead (default 30). The `doctor --prune` gate never reads sessions on a window shorter than the default, since peers refresh on the default cadence |
+| `CADENCE_DOCTOR_PRUNE_FORCE` | `doctor --prune` | Set to `1` or `true` to bypass the live-session gate and let `doctor --prune --apply` delete orphaned plugin-cache version dirs even while peer sessions are running. The gate's refusal message names this override. For a machine that is never quiet, `--keep-newest N` and `--older-than <age>` (e.g. `7d`) bound the prune instead: they delete a dir only when it was orphaned before every live session started, and keep everything while any live session cannot say when it started (one registered or re-registered by `/clear`, `/compact`, resume or fork, or by an older binary). They see only registered sessions: one idle at the prompt past the staleness window, or one whose cwd is outside any git repo, is invisible to them, so close those first. With either bound, this override drops only the live-session check; the bounds still apply |
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Maximum seconds to wait after `gh pr merge` before checking for straggler issues; returns early after 2 s once every referenced issue is closed (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
 | `CADENCE_ALLOW_SOPS_DECRYPT` | `guard-sops-decrypt` | Set truthy (`1`/`true`/`yes`) to let a decrypt through; the allow is recorded as a bypass row. **Weakens a protected guard** |
@@ -259,6 +259,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public |
 | `CADENCE_NO_OUTRO_BACKSTOP` | `backstop-record`, `backstop-warn` | Set to turn off the loose-ends backstop |
 | `CADENCE_NO_PERSIST_PLAN` | `persist-plan-approval` | Set to stop writing approved plans to disk |
+| `CADENCE_PLANS_DIR` | `persist-plan-approval` | Read from a repo's (or a non-repo session root's) `.claude/settings*.json` `env` block, never the process env. A relative path for approved plans, default `docs/plans`; it must stay inside the checkout, and `\`, `..` or a `.git` component is refused. Empty stops the persist. A session root outside any repo, a repo with a remote outside `CADENCE_ALLOWED_OWNERS`, or a dir that escapes the checkout sends the plan to `<config_dir>/cadence/plans` instead |
 | `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook; any value that is not an absolute path to an executable makes the wrapper inert (every hook exits 0, one notice per day) — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
 | `CLAUDE_EFFORT` | every hook (latent) | A check can skip itself at a given effort level; no check does today |
 | `CADENCE_FAILOPEN_DISCLOSE_MIN` | `session start` fail-open disclosure | How many fail-open events before the session-start disclosure fires; a large value hides it |
@@ -312,13 +313,49 @@ an explicit `--hostname` (separate or `=` form) overrides an inline
 hook process's `GH_HOST` and finally the `github.com` default. Host comparisons
 are case-insensitive.
 
-Only those two spellings are read. An assignment `export`ed in an earlier segment
-of the same command string (`export GH_HOST=... && gh ...`) reaches gh but is not
-yet tracked, so the guard judges the write against the default host. A bare
-`GH_HOST=...; gh ...` needs no tracking: without `export` it stays a shell
-variable that gh never sees, so the guard and gh already agree.
+Below those two, an `export GH_HOST=...` in an earlier segment of the same
+command string (`export GH_HOST=... && gh ...`) replaces the hook process's
+`GH_HOST`. The guard cannot tell whether an earlier segment actually ran
+(`false && export ...`), so every host the command may have left in place is a
+candidate, and the write must be owned on each. An `unset GH_HOST` therefore adds
+the default host back as a candidate rather than removing the exported one. A bare
+`GH_HOST=...; gh ...` changes nothing: without `export` it stays a shell variable
+that gh never sees. It does count once the variable is exported: after an earlier
+`export GH_HOST`, after `set -a`, or when the hook process already carries
+`GH_HOST`. An `export` inside `eval` counts like one outside it. Other forms that
+can set the variable resolve to an unknown host that matches no allowlist entry,
+so the write blocks:
 
-**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`.
+- `declare`, `typeset`, `readonly`, or `local` naming `GH_HOST`, any nameref
+  (`declare -n`), and `export -n`.
+- `read`, `printf -v`, `mapfile`/`readarray`, or `getopts` writing `GH_HOST`
+  or a variable whose name is not a plain literal.
+- An `eval` nested more than three levels deep.
+- Inside a subshell, function body, or case arm, a declaring or name-writing
+  builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
+  fails closed wherever the command position is not recognized.
+- A `trap` action or an `eval` string that sets it. Both are read like a
+  command. An `eval` or `trap` whose command word comes from an expansion is
+  text the guard cannot read, so it also blocks: `eval "$X"`, `eval "$(…)"`,
+  `` eval `…` ``. That includes `eval "$(direnv export bash)"` and
+  `eval "$(ssh-agent -s)"` in front of a `-R` write.
+- A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
+  names `GH_HOST` or declares a non-literal name.
+- An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
+  assignment anywhere in the command.
+- Any of those builtins, `export` included, or an `env`-style prefix before gh,
+  naming a variable whose name the shell builds at expansion time
+  (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).
+- A value that is still a `$` expansion.
+- An assignment inside `${GH_HOST:=...}` or `$((GH_HOST=...))`.
+
+A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
+command's own `--title` or `--body`. A gh segment runs as a child process, so it
+is never read for changes. A `source`d file is not read. That includes a file
+written earlier in the same command, the same class as `source
+.venv/bin/activate`.
+
+**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 
 **Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
 
