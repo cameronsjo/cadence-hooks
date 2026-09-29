@@ -793,24 +793,6 @@ mod tests {
         crate::git_fixtures::Scratch::new(&scratch_root(), tag)
     }
 
-    fn init_repo_with_commit(dir: &Path) {
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-    }
-
     // `would_block_here` reads real process env (`CADENCE_ALLOW_MAIN`,
     // `CADENCE_NO_ENFORCE_WORKTREE`), which a caller's own environment may
     // already set (e.g. a session-wide `CADENCE_ALLOW_MAIN=true`) — clear
@@ -822,7 +804,7 @@ mod tests {
     fn primary_checkout_would_block() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let scratch = scratch("would-block");
-        init_repo_with_commit(scratch.path());
+        crate::git_fixtures::init_repo(scratch.path());
         // SAFETY: serialized via ENV_LOCK; no other test in this module reads
         // these vars concurrently.
         let prev_allow = std::env::var("CADENCE_ALLOW_MAIN").ok();
@@ -848,7 +830,7 @@ mod tests {
     #[test]
     fn linked_worktree_does_not_block() {
         let scratch = scratch("would-block-wt");
-        init_repo_with_commit(scratch.path());
+        crate::git_fixtures::init_repo(scratch.path());
         let wt = scratch.path().join("wt");
         let ok = std::process::Command::new("git")
             .arg("-C")
@@ -872,7 +854,7 @@ mod tests {
     #[test]
     fn claude_managed_subdir_does_not_block() {
         let scratch = scratch("would-block-claude");
-        init_repo_with_commit(scratch.path());
+        crate::git_fixtures::init_repo(scratch.path());
         let claude_dir = scratch.path().join(".claude").join("worktrees").join("x");
         std::fs::create_dir_all(&claude_dir).unwrap();
         assert!(!would_block_here(&claude_dir));
@@ -881,7 +863,7 @@ mod tests {
     #[test]
     fn plan_doc_subdir_does_not_block() {
         let scratch = scratch("would-block-plans");
-        init_repo_with_commit(scratch.path());
+        crate::git_fixtures::init_repo(scratch.path());
         let plans_dir = scratch.path().join("docs").join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
         assert!(!would_block_here(&plans_dir));

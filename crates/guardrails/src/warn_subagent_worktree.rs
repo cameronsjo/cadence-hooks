@@ -173,6 +173,15 @@ impl Check for WarnSubagentWorktree {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        self.run_with_allowed(input, is_subagent_from_main_allowed())
+    }
+}
+
+impl WarnSubagentWorktree {
+    /// [`Check::run`] with the `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` verdict passed
+    /// in rather than read from process env, so tests need no env mutation
+    /// (cadence-hooks#486).
+    fn run_with_allowed(&self, input: &HookInput, allowed: bool) -> CheckResult {
         // Only subagent dispatches. `Agent` is the current tool name; `Task` is
         // the pre-2.1.63 name, kept for resilience. Every other tool call exits
         // here before any git spawn. (In production the hooks.json matcher
@@ -205,7 +214,6 @@ impl Check for WarnSubagentWorktree {
 
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
-        let allowed = is_subagent_from_main_allowed();
 
         let result = assess_spawn(
             in_main,
@@ -351,7 +359,7 @@ mod tests {
     fn non_agent_tool_allows() {
         // A Bash call must never trip the warning — it returns before any git
         // spawn, so no repo is needed.
-        let result = WarnSubagentWorktree.run(&make_bash("git status"));
+        let result = WarnSubagentWorktree.run_with_allowed(&make_bash("git status"), false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
@@ -361,7 +369,7 @@ mod tests {
         // fail-open allow.
         let dir = tempfile::tempdir().unwrap();
         let input = make_agent(Some("general-purpose"), None, dir.path().to_str().unwrap());
-        let result = WarnSubagentWorktree.run(&input);
+        let result = WarnSubagentWorktree.run_with_allowed(&input, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
@@ -372,11 +380,9 @@ mod tests {
     // fact survives the swap end to end: a dispatch from the primary checkout
     // nudges, and one from inside the sibling worktree does not.
 
-    // Serialize the env-reading dispatch tests via the crate-shared
-    // CADENCE_ENV_TEST_LOCK: `assess_spawn`'s `allowed` arm reads
-    // `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` from real process env, which an
-    // ambient session value — or a concurrent env-mutating test elsewhere in
-    // this crate (#446) — could otherwise flip to a false allow.
+    // These call `run_with_allowed(.., false)`: the
+    // `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` verdict is passed in, never read from
+    // process env, so no env lock is needed (cadence-hooks#486).
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
@@ -392,15 +398,6 @@ mod tests {
 
     #[test]
     fn dispatch_from_primary_with_sibling_worktree_nudges() {
-        let _guard = crate::CADENCE_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN").ok();
-        // SAFETY: serialized via CADENCE_ENV_TEST_LOCK; restored below.
-        unsafe {
-            std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN");
-        }
-
         let tmp = tempfile::tempdir().unwrap();
         let primary = tmp.path();
         git(primary, &["init", "-q", "-b", "main"]);
@@ -422,7 +419,7 @@ mod tests {
 
         // From the primary checkout: primary + a sibling worktree exists → nudge.
         let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
-        let r = WarnSubagentWorktree.run(&from_primary);
+        let r = WarnSubagentWorktree.run_with_allowed(&from_primary, false);
         assert_eq!(
             r.outcome,
             Outcome::Nudge,
@@ -431,7 +428,7 @@ mod tests {
 
         // From inside the linked worktree: `.git` is a file → not primary → allow.
         let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
-        let r = WarnSubagentWorktree.run(&from_wt);
+        let r = WarnSubagentWorktree.run_with_allowed(&from_wt, false);
         assert_eq!(
             r.outcome,
             Outcome::Allow,
@@ -442,20 +439,12 @@ mod tests {
         // read-only subagent_type → silent even though every other condition
         // that would otherwise nudge still holds.
         let read_only = make_agent(Some("Explore"), None, primary.to_str().unwrap());
-        let r = WarnSubagentWorktree.run(&read_only);
+        let r = WarnSubagentWorktree.run_with_allowed(&read_only, false);
         assert_eq!(
             r.outcome,
             Outcome::Allow,
             "Explore dispatch from primary + sibling worktree is silent (read-only by convention)"
         );
-
-        // SAFETY: serialized via CADENCE_ENV_TEST_LOCK.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", v),
-                None => std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN"),
-            }
-        }
     }
 
     #[test]
@@ -466,10 +455,7 @@ mod tests {
         // silently skipped on a genuine primary. `is_primary_checkout` (which
         // the block-capable enforce-worktree path uses) always called it
         // primary; the two now share one classifier and this dispatch nudges.
-        // #446 landed the shared `with_env` while this branch was open: it owns
-        // the lock and restores on unwind, so an assertion below can no longer
-        // leave the var unset for the rest of the process.
-        crate::with_env(&[("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", None)], || {
+        {
             let tmp = tempfile::tempdir().unwrap();
             let primary = tmp.path().join("work");
             let gitdir = tmp.path().join("gitdir");
@@ -504,7 +490,7 @@ mod tests {
             );
 
             let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
-            let r = WarnSubagentWorktree.run(&from_primary);
+            let r = WarnSubagentWorktree.run_with_allowed(&from_primary, false);
             assert_eq!(
                 r.outcome,
                 Outcome::Nudge,
@@ -516,11 +502,13 @@ mod tests {
             // rather than calling every `.git` file primary.
             let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
             assert_eq!(
-                WarnSubagentWorktree.run(&from_wt).outcome,
+                WarnSubagentWorktree
+                    .run_with_allowed(&from_wt, false)
+                    .outcome,
                 Outcome::Allow,
                 "dispatch from inside the linked worktree stays silent"
             );
-        });
+        }
     }
 
     // --- isolation() round-trips via make_agent ---

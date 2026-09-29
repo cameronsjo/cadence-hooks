@@ -957,50 +957,41 @@ mod tests {
 
     // ---- nudge message format ----
     // `nudge_message` is a pure `format!` and reads no env — the `canonical()`
-    // helper these wrappers were written for is gone. The `with_env` calls are
-    // kept because they are harmless and still serialize these tests against
-    // env-mutating neighbours via CADENCE_ENV_TEST_LOCK.
+    // helper these wrappers were written for is gone, so these tests need no
+    // env pinning or lock (cadence-hooks#486).
 
     #[test]
     fn nudge_message_names_the_check() {
-        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
-            let msg = nudge_message("cameronsjo/workbench");
-            assert!(
-                msg.contains("warn-issue-tracker:"),
-                "message should name the check: {msg}"
-            );
-        });
+        let msg = nudge_message("cameronsjo/workbench");
+        assert!(
+            msg.contains("warn-issue-tracker:"),
+            "message should name the check: {msg}"
+        );
     }
 
     #[test]
     fn nudge_message_names_the_target() {
-        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
-            let msg = nudge_message("cameronsjo/workbench");
-            assert!(
-                msg.contains("cameronsjo/workbench"),
-                "message should name the filing target: {msg}"
-            );
-        });
+        let msg = nudge_message("cameronsjo/workbench");
+        assert!(
+            msg.contains("cameronsjo/workbench"),
+            "message should name the filing target: {msg}"
+        );
     }
 
     #[test]
     fn nudge_message_names_the_canonical() {
-        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
-            let msg = nudge_message("cameronsjo/workbench");
-            assert!(
-                msg.contains("cameronsjo/cadence-ecosystem"),
-                "message should name the canonical tracker: {msg}"
-            );
-        });
+        let msg = nudge_message("cameronsjo/workbench");
+        assert!(
+            msg.contains("cameronsjo/cadence-ecosystem"),
+            "message should name the canonical tracker: {msg}"
+        );
     }
 
     #[test]
     fn nudge_message_is_advisory_not_blocking() {
-        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
-            let msg = nudge_message("cameronsjo/workbench");
-            assert!(!msg.contains("🚫"), "nudge should not contain block emoji");
-            assert!(msg.contains("carry on"), "nudge should give user an out");
-        });
+        let msg = nudge_message("cameronsjo/workbench");
+        assert!(!msg.contains("🚫"), "nudge should not contain block emoji");
+        assert!(msg.contains("carry on"), "nudge should give user an out");
     }
 
     // ---- Check::run integration tests ----

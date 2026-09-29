@@ -229,6 +229,12 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
     },
     HookEntry {
+        name: "warn-agent-dispatch",
+        description: "Warn on an Agent/Task dispatch with no model, a model on a fork, or an execution brief with no isolated HOME",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+    },
+    HookEntry {
         name: "warn-branch-base",
         description: "Warn when creating a branch from a non-main base",
         namespace: "guardrails",
@@ -784,6 +790,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // directory to resolve against.
         ("guardrails", "warn-subagent-worktree") => Some(
             r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
+        // warn-agent-dispatch only engages on an Agent/Task spawn; a general-purpose
+        // dispatch with no model shows the omit-model nudge under `try`.
+        ("guardrails", "warn-agent-dispatch") => Some(
+            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose","prompt":"x"},"cwd":"/tmp"}"#,
         ),
         // enforce-worktree only engages on a file mutation or git commit; the
         // generic Bash sample would no-op. Note `try` substitutes the process

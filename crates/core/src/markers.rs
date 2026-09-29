@@ -195,11 +195,96 @@ pub fn session_marker(input: &HookInput, kind: &str, repo_root: Option<&str>) ->
 /// key-miss by construction — the property the pre-PR gate keys its branch
 /// scoping on.
 pub fn polish_marker(repo_root: &str, branch: &str) -> PathBuf {
-    marker_dir().join(format!(
-        "polish-{:x}-{:x}",
-        hash_of(repo_root),
-        hash_of(branch)
-    ))
+    polish_dir().join(polish_marker_name(repo_root, branch))
+}
+
+fn polish_marker_name(repo_root: &str, branch: &str) -> String {
+    format!("polish-{:x}-{:x}", hash_of(repo_root), hash_of(branch))
+}
+
+/// Where the polish marker lives (cadence-hooks#565 part 2): `<claude config
+/// dir>/cadence-hooks/markers`, hardened `0700`, instead of the temp-based
+/// [`marker_dir`]. A per-profile config dir has no shared base to fall back
+/// to, so the fail-open into a world-writable directory is gone rather than
+/// checked for. `CADENCE_MARKER_DIR`, when set non-empty, still wins and
+/// resolves exactly as [`marker_dir`] does, which keeps the test and
+/// integration sandboxes working. The rest of the marker family stays on
+/// [`marker_dir`].
+pub fn polish_dir() -> PathBuf {
+    polish_dir_from(
+        std::env::var("CADENCE_MARKER_DIR").ok(),
+        &paths::claude_config_dir(),
+    )
+    .0
+}
+
+/// True when [`polish_dir`] is a hardened private directory. Gates polish
+/// presence and content reads, like [`marker_dir_is_private`] does for the
+/// rest of the family.
+pub fn polish_dir_is_private() -> bool {
+    polish_dir_from(
+        std::env::var("CADENCE_MARKER_DIR").ok(),
+        &paths::claude_config_dir(),
+    )
+    .1
+}
+
+/// Pure resolver behind [`polish_dir`] and [`polish_dir_is_private`]: the
+/// directory and whether it is private.
+fn polish_dir_from(override_dir: Option<String>, config_dir: &Path) -> (PathBuf, bool) {
+    if override_dir.as_deref().is_some_and(|d| !d.is_empty()) {
+        let private =
+            marker_dir_from(override_dir.clone()) != marker_base_from(override_dir.clone());
+        return (marker_dir_from(override_dir), private);
+    }
+    let dir = config_dir.join("cadence-hooks").join("markers");
+    let private = harden_marker_dir(&dir).is_ok();
+    (dir, private)
+}
+
+/// The legacy (pre-config-dir) polish marker directory, read for one release
+/// so markers recorded before the move still count. `None` under a
+/// `CADENCE_MARKER_DIR` override (the new dir *is* the legacy dir there) and
+/// when the legacy dir is degraded, since a plantable dir is never evidence.
+fn legacy_polish_dir() -> Option<PathBuf> {
+    let unset = std::env::var("CADENCE_MARKER_DIR")
+        .ok()
+        .is_none_or(|d| d.is_empty());
+    (unset && marker_dir_is_private()).then(marker_dir)
+}
+
+/// The existing polish marker file for a key: the config-dir one, else the
+/// legacy-dir one. `None` when neither exists or the dir holding it is not
+/// private. `legacy_dir` is [`legacy_polish_dir`]'s answer, passed in so the
+/// lookup is testable without env mutation.
+fn find_polish_marker(
+    new_dir: &Path,
+    new_private: bool,
+    legacy_dir: Option<&Path>,
+    repo_root: &str,
+    branch: &str,
+) -> Option<PathBuf> {
+    let name = polish_marker_name(repo_root, branch);
+    let new = new_dir.join(&name);
+    if new_private && new.is_file() {
+        return Some(new);
+    }
+    let old = legacy_dir?.join(name);
+    old.is_file().then_some(old)
+}
+
+fn polish_marker_file(repo_root: &str, branch: &str) -> Option<PathBuf> {
+    let (dir, private) = polish_dir_from(
+        std::env::var("CADENCE_MARKER_DIR").ok(),
+        &paths::claude_config_dir(),
+    );
+    find_polish_marker(
+        &dir,
+        private,
+        legacy_polish_dir().as_deref(),
+        repo_root,
+        branch,
+    )
 }
 
 /// Which checkout a ship command's polish marker lives in (cadence-hooks#995).
@@ -785,8 +870,7 @@ pub fn polish_marker_present(target: &MarkerTarget) -> bool {
     // (cadence-hooks#565): on a degraded shared base a co-tenant can pre-plant
     // the predictable marker name, so presence there is not evidence. A
     // degraded dir reads as absent, which nudges — the safe direction.
-    marker_dir_is_private()
-        && marker_key(target).is_some_and(|(root, branch)| polish_marker(&root, &branch).is_file())
+    marker_key(target).is_some_and(|(root, branch)| polish_marker_file(&root, &branch).is_some())
 }
 
 /// The `(repo_root, branch)` marker key for a [`MarkerTarget::Local`].
@@ -1031,10 +1115,7 @@ pub fn read_polish_marker(target: &MarkerTarget) -> Option<PolishRecord> {
 /// unreadable, or malformed markers return `None`; non-string arm values are
 /// filtered from the optional roster instead of failing the whole record.
 pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord> {
-    if !marker_dir_is_private() {
-        return None;
-    }
-    let path = polish_marker(repo_root, branch);
+    let path = polish_marker_file(repo_root, branch)?;
     let content = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
     Some(PolishRecord {
@@ -3798,6 +3879,95 @@ mod tests {
         ] {
             let ships = located_ship_segments(&command, cwd);
             assert_eq!(resolve_located_ships(&ships), want, "{command:.40}…");
+        }
+    }
+}
+
+#[cfg(test)]
+mod polish_dir_tests {
+    //! cadence-hooks#565 part 2: the polish marker lives under the config dir,
+    //! with a one-release read of the legacy dir. Pure resolvers, so no env
+    //! mutation.
+    use super::*;
+
+    #[test]
+    fn polish_dir_anchors_on_config_dir_and_is_private() {
+        let cfg = tempfile::tempdir().unwrap();
+        let (dir, private) = polish_dir_from(None, cfg.path());
+        assert_eq!(dir, cfg.path().join("cadence-hooks").join("markers"));
+        assert!(private);
+        assert!(dir.is_dir());
+        // An empty override is unset, like every other override here.
+        assert_eq!(polish_dir_from(Some(String::new()), cfg.path()).0, dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn polish_dir_is_not_private_when_config_path_is_blocked() {
+        // No shared base to fall back to: a config dir that cannot host the
+        // subdir reads as not private, never as a temp-dir marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("occupied");
+        std::fs::write(&blocked, "").unwrap();
+        let (dir, private) = polish_dir_from(None, &blocked);
+        assert!(!private);
+        assert!(dir.starts_with(&blocked));
+    }
+
+    #[test]
+    fn override_still_wins_over_config_dir() {
+        let cfg = tempfile::tempdir().unwrap();
+        let ov = tempfile::tempdir().unwrap();
+        let (dir, private) = polish_dir_from(Some(ov.path().display().to_string()), cfg.path());
+        assert!(dir.starts_with(ov.path()));
+        assert!(private);
+        assert!(!cfg.path().join("cadence-hooks").exists());
+    }
+
+    #[test]
+    fn find_marker_table() {
+        let new = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let name = polish_marker_name("/r", "b");
+        // (in new, in old, new private, legacy offered) -> found in
+        let cases: [(bool, bool, bool, bool, Option<&str>); 7] = [
+            (false, false, true, true, None),
+            (true, false, true, true, Some("new")),
+            (false, true, true, true, Some("old")),
+            (true, true, true, true, Some("new")),
+            // Legacy not offered (degraded or override): old markers ignored.
+            (false, true, true, false, None),
+            // New dir not private: its file is not evidence; legacy still is.
+            (true, false, false, true, None),
+            (true, true, false, true, Some("old")),
+        ];
+        for (in_new, in_old, new_private, legacy, want) in cases {
+            for d in [new.path(), old.path()] {
+                let _ = std::fs::remove_file(d.join(&name));
+            }
+            if in_new {
+                std::fs::write(new.path().join(&name), "{}").unwrap();
+            }
+            if in_old {
+                std::fs::write(old.path().join(&name), "{}").unwrap();
+            }
+            let got = find_polish_marker(
+                new.path(),
+                new_private,
+                legacy.then_some(old.path()),
+                "/r",
+                "b",
+            );
+            let want = want.map(|w| match w {
+                "new" => new.path().join(&name),
+                _ => old.path().join(&name),
+            });
+            assert_eq!(got, want, "case {in_new} {in_old} {new_private} {legacy}");
         }
     }
 }

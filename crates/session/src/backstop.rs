@@ -240,9 +240,15 @@ impl Logger for BackstopRecord {
         // loose, it's in progress, and recording it would cry wolf about a
         // teammate's live edits at the next start. `live_peers` excludes self,
         // so an empty result means we're the last one leaving.
+        //
+        // "In this repo" spans every worktree: each has its own registry, and
+        // the unpushed-worktree scan below already reaches all of them, so a
+        // live session in a sibling worktree keeps the backstop quiet too
+        // (cadence-hooks#928). Only this gate widens; `sessions_dir` and the
+        // lane guards stay per-working-tree by design.
         let sid = input.session_id.as_deref().unwrap_or_default();
         let stale_secs = registry::stale_minutes() * 60;
-        let last_out = registry::live_peers(&dir, sid, stale_secs).is_empty();
+        let last_out = !repo_has_live_peer(cwd, dir.clone(), sid, stale_secs);
 
         let mut marker = detect_loose_ends(&root);
         if !sid.is_empty() {
@@ -252,6 +258,17 @@ impl Logger for BackstopRecord {
 
         run_record(input.hook_event_name.as_deref(), &dir, &marker, last_out);
     }
+}
+
+/// True when any session other than `own_session_id` is live in ANY worktree
+/// of the repository `cwd` is in: the own registry plus every sibling
+/// worktree's, via the same enumeration `session status` uses. When
+/// `git worktree list` cannot answer, only the own registry is checked, which
+/// is the pre-#928 behavior.
+fn repo_has_live_peer(cwd: &str, own_dir: PathBuf, own_session_id: &str, stale_secs: u64) -> bool {
+    let (dirs, _) = crate::cli::repo_registries(cwd, own_dir);
+    dirs.iter()
+        .any(|d| !registry::live_peers(d, own_session_id, stale_secs).is_empty())
 }
 
 /// Testable core: write `marker` into `dir`, but ONLY on SessionEnd, only when
@@ -399,6 +416,80 @@ mod tests {
             ended: "2026-06-19T00:00:00Z".into(),
             ..Default::default()
         }
+    }
+
+    // --- repo_has_live_peer (#928): the last-out gate spans worktrees ---
+
+    fn peer_record(sid: &str) -> identity::SessionRecord {
+        identity::SessionRecord {
+            session_id: sid.into(),
+            branch: Some("main".into()),
+            started: "2026-06-02T00:00:00Z".into(),
+            started_epoch: identity::now_epoch(),
+            ..Default::default()
+        }
+    }
+
+    /// A primary checkout plus one linked worktree, each with its own registry.
+    fn two_checkouts(name: &str) -> (Scratch, PathBuf, PathBuf) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/backstop-scratch");
+        let scratch = Scratch::new(&root, name);
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = scratch.path().join("wt");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/a",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        (scratch, repo, wt)
+    }
+
+    #[test]
+    fn live_session_in_a_sibling_worktree_keeps_the_backstop_from_firing() {
+        let (_s, repo, wt) = two_checkouts("sibling-live");
+        let repo_cwd = repo.to_string_lossy().to_string();
+        let wt_cwd = wt.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&repo_cwd).unwrap();
+        let sibling = registry::sessions_dir(&wt_cwd).unwrap();
+        assert_ne!(own, sibling, "registries stay per-working-tree");
+        registry::write_record(&sibling, &peer_record("sibling-session")).unwrap();
+
+        // The lane guards read only the own registry: unchanged, blind to it.
+        assert!(registry::live_peers(&own, "self", 600).is_empty());
+        // The backstop gate sees it, from either side.
+        assert!(repo_has_live_peer(&repo_cwd, own.clone(), "self", 600));
+        assert!(repo_has_live_peer(&wt_cwd, sibling.clone(), "other", 600));
+        // And the record is then skipped end to end.
+        let out = TempDir::new().unwrap();
+        let last_out = !repo_has_live_peer(&repo_cwd, own, "self", 600);
+        run_record(Some("SessionEnd"), out.path(), &marker(2, 1, 0), last_out);
+        assert!(read_marker(out.path()).is_none());
+    }
+
+    #[test]
+    fn no_live_peer_in_any_worktree_is_last_out() {
+        let (_s, repo, wt) = two_checkouts("sibling-none");
+        let repo_cwd = repo.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&repo_cwd).unwrap();
+        let sibling = registry::sessions_dir(&wt.to_string_lossy()).unwrap();
+        // Our own record is not a peer, and a stale sibling does not count.
+        registry::write_record(&own, &peer_record("self")).unwrap();
+        registry::write_record(&sibling, &peer_record("old")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!repo_has_live_peer(&repo_cwd, own.clone(), "self", 0));
+        assert!(
+            repo_has_live_peer(&repo_cwd, own, "self", 600),
+            "fresh sibling counts"
+        );
     }
 
     // --- has_signals ---

@@ -135,6 +135,8 @@ pub mod nudge_upgrade_after_push;
 pub mod snooze_meta;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
 pub mod verify_pr_autoclose;
+/// Warn when dispatching a subagent from main while a sibling worktree exists.
+pub mod warn_agent_dispatch;
 /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
 pub mod warn_alias_parsing;
 /// Warn when `git commit --amend` would rewrite a commit a remote already has.
@@ -165,7 +167,6 @@ pub mod warn_pr_issue_link;
 pub mod warn_stacked_base_delete;
 /// Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited after the branch gained commits.
 pub mod warn_stale_pr_body;
-/// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
 /// Warn on `gh pr ready`/`gh pr merge` when the PR's head SHA has no reviewed signal.
 pub mod warn_unreviewed_ready_flip;
