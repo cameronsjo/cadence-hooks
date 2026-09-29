@@ -558,7 +558,10 @@ fn check_pushes_elsewhere(
     let mut elsewhere: Vec<(&str, Option<&str>)> = Vec::new();
     for push in pushes {
         let entry = (push.work_dir.as_str(), push.repository.as_deref());
-        if push.work_dir != work_dir && !elsewhere.contains(&entry) {
+        // An aliased push is invisible to the text-based judgement that
+        // covers the session's own directory, so it is judged here wherever
+        // it runs.
+        if (push.work_dir != work_dir || push.via_alias) && !elsewhere.contains(&entry) {
             elsewhere.push(entry);
         }
     }
@@ -1541,6 +1544,14 @@ mod tests {
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
 
     /// Allowlist = `cameronsjo` only, on the default `github.com` host.
+    /// Variables that make gh act as an account its config file does not name.
+    const NO_GH_TOKENS: [(&str, Option<&str>); 4] = [
+        ("GH_TOKEN", None),
+        ("GITHUB_TOKEN", None),
+        ("GH_ENTERPRISE_TOKEN", None),
+        ("GITHUB_ENTERPRISE_TOKEN", None),
+    ];
+
     fn owners_only() -> Vec<(&'static str, Option<&'static str>)> {
         vec![
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
@@ -1914,6 +1925,35 @@ mod tests {
                     Allow,
                 ),
                 ("eval \"$(ssh-agent -s)\"; git push origin feat", Allow),
+                // Tool-init evals do not move (cameronsjo/cadence-hooks#1172).
+                ("eval \"$(direnv hook bash)\"; git push origin feat", Allow),
+                (
+                    "eval \"$(mise activate bash)\"; git push origin feat",
+                    Allow,
+                ),
+                ("eval \"$(zoxide init bash)\"; git push origin feat", Allow),
+                (
+                    "eval \"$(direnv export bash)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "eval \"$(zoxide init bash --cmd cd)\"; git push origin feat",
+                    Block,
+                ),
+                (
+                    "brew() { echo cd {other}; }; eval \"$(brew shellenv)\"; git push origin feat",
+                    Block,
+                ),
+                // A subshell's `cd` ends with it; a push inside it does not
+                // (cameronsjo/cadence-hooks#1172).
+                ("(cd {other} && git status); git push origin HEAD", Allow),
+                ("(cd {other}; git status); git push origin feat", Allow),
+                ("(cd {other} && git push origin HEAD)", Block),
+                (
+                    "(cd {other} && git status); cd {other} && git push origin HEAD",
+                    Block,
+                ),
+                ("{ cd {other}; }; git push origin HEAD", Block),
                 (
                     "eval \"$(ssh-agent -s)\" && cd \"$D\" && git push origin feat",
                     Nudge,
@@ -2394,6 +2434,103 @@ mod tests {
         });
     }
 
+    /// A bare `gh repo clone REPO` is the signed-in account's, which gh's own
+    /// config names (cameronsjo/cadence-hooks#1172). Every row runs from an
+    /// owned checkout; each Block row is a bare clone whose account this
+    /// guard cannot vouch for.
+    #[test]
+    fn a_bare_gh_clone_is_judged_as_the_account_gh_is_signed_in_to() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let modern = |user: &str| {
+            format!(
+                "github.com:\n    users:\n        {user}:\n            oauth_token: x\n    git_protocol: https\n    user: {user}\n"
+            )
+        };
+        let configs: [(&str, Option<String>); 6] = [
+            ("owned", Some(modern("cameronsjo"))),
+            ("unowned", Some(modern("evil"))),
+            // Only the `users:` map, no active `user:`.
+            (
+                "no-user",
+                Some(
+                    "github.com:\n    users:\n        cameronsjo:\n            oauth_token: x\n"
+                        .into(),
+                ),
+            ),
+            (
+                "other-host",
+                Some(modern("cameronsjo").replace("github.com", "other.example")),
+            ),
+            (
+                "legacy",
+                Some("github.com:\n  user: cameronsjo\n  oauth_token: x\n".into()),
+            ),
+            ("missing", None),
+        ];
+        for (name, config) in configs {
+            let dir = tempfile::tempdir().expect("create gh config dir");
+            if let Some(config) = config {
+                std::fs::write(dir.path().join("hosts.yml"), config).expect("write hosts.yml");
+            }
+            let mut env = owners_only();
+            env.push(("GH_CONFIG_DIR", dir.path().to_str()));
+            env.extend(NO_GH_TOKENS);
+            with_env(&env, || {
+                let owned_account = matches!(name, "owned" | "legacy");
+                for (command, allowed) in [
+                    (
+                        "gh repo clone z && cd z && git push origin feat",
+                        owned_account,
+                    ),
+                    (
+                        "gh repo clone z w && cd w && git push origin feat",
+                        owned_account,
+                    ),
+                    // The account named in the command cannot be checked.
+                    (
+                        "GH_TOKEN=x gh repo clone z && cd z && git push origin feat",
+                        false,
+                    ),
+                    (
+                        "export GITHUB_TOKEN=x; gh repo clone z && cd z && git push",
+                        false,
+                    ),
+                    (
+                        "gh auth switch -u evil; gh repo clone z && cd z && git push",
+                        false,
+                    ),
+                    (
+                        "GH_CONFIG_DIR=/tmp/x gh repo clone z && cd z && git push",
+                        false,
+                    ),
+                    (
+                        "GH_HOST=other.example gh repo clone z && cd z && git push",
+                        false,
+                    ),
+                    // A named owner never needed the config.
+                    (
+                        "gh repo clone cameronsjo/z && cd z && git push origin feat",
+                        true,
+                    ),
+                    (
+                        "gh repo clone evil/z && cd z && git push origin feat",
+                        false,
+                    ),
+                ] {
+                    let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                    let want = if allowed { Allow } else { Block };
+                    assert_eq!(
+                        result.outcome, want,
+                        "{name}: {command}: {:?}",
+                        result.message
+                    );
+                }
+            });
+        }
+    }
+
     /// cadence-hooks#1161 and the `find -exec` lane: every row runs from an
     /// owned checkout. Each Block row was ALLOW on main; the clone rows were
     /// measured against real git with the unowned URL rewritten to a local
@@ -2405,7 +2542,12 @@ mod tests {
         let other = checkout_with_origin("https://github.com/evil/y.git");
         let cwd = owned.path().to_string_lossy().to_string();
         let other = other.path().to_string_lossy().to_string();
-        with_env(&owners_only(), || {
+        // No gh config: a bare `gh repo clone y` names no account.
+        let no_config = tempfile::tempdir().expect("create empty gh config dir");
+        let mut env = owners_only();
+        env.push(("GH_CONFIG_DIR", no_config.path().to_str()));
+        env.extend(NO_GH_TOKENS);
+        with_env(&env, || {
             for (command, outcome) in [
                 // A clone decides where a later push in its directory goes.
                 (
@@ -2450,7 +2592,23 @@ mod tests {
                     "git -c alias.p='push https://github.com/evil/y' p".into(),
                     Block,
                 ),
-                ("git -c 'alias.p=push origin main' p".into(), Block),
+                ("git -c 'alias.p=push origin main' p".into(), Block),                // An alias defined as exactly `push` is the push it writes
+                // (cameronsjo/cadence-hooks#1172): judged like any other.
+                ("git -c alias.p=push p origin feat".into(), Allow),
+                ("git -c alias.P=push p origin feat".into(), Allow),
+                ("git -c 'alias.p=push ' p origin feat".into(), Allow),
+                ("git -c alias.p=push p https://github.com/evil/y feat".into(), Block),
+                ("git -c alias.p=push -c remote.origin.pushurl=https://github.com/evil/y p origin feat".into(), Block),
+                ("git -c alias.p=push p --repo https://github.com/evil/y".into(), Block),
+                (format!("git -c alias.p=push -C {other} p origin feat"), Block),
+                (
+                    "git -c alias.p=q -c alias.q=push p https://github.com/evil/y feat".into(),
+                    Block,
+                ),
+                ("git -c alias.q=push -c alias.p=q p origin feat".into(), Allow),
+                ("git -c alias.p='!git push' p origin feat".into(), Block),
+                ("git -c alias.p='push --force' p origin feat".into(), Block),
+
                 ("git -c 'alias.p=!git pu\"\"sh origin main' p".into(), Block),
                 ("git -c alias.P='!true' p".into(), Block),
                 ("git --config-env=alias.p=X p".into(), Block),

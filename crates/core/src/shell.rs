@@ -6337,6 +6337,17 @@ impl DirWalk {
     }
 }
 
+/// The subshells one top-level segment opens and closes: leading `(` openers
+/// plus a `$(…)` the splitter cut open, and unpaired `)`s. The push walk keeps
+/// a subshell's `cd` from moving its parent with them.
+pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let shape = segment_shape(peeled.command.unwrap_or(""));
+    let opens = peeled.opens.iter().filter(|&&paren| paren).count() + shape.inner_open;
+    (opens, shape.paren_closes)
+}
+
 /// How far a segment opens (positive) or closes (negative) groups — the
 /// depth a function body's definition is recorded by.
 fn group_depth_change(raw: &str) -> isize {
