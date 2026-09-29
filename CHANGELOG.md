@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.109.0] - 2026-09-29
+
 ### Added
 
 - **`guardrails warn-stale-pr-body` nudges at the ready flip when the PR body was never edited after the branch gained commits.** On `gh pr ready`/`gh pr merge` it reads the PR's `createdAt`, `lastEditedAt`, and newest commits in one GraphQL call and warns when the body is untouched while at least one commit's committer date is after creation, so the entry-posture placeholder does not become the squash-merge record. It resolves the PR exactly as `warn-unreviewed-ready-flip` does (that guard's resolution is now shared), queries only `github.com` or `origin`'s host, and fails open on any error. Built but not yet wired. (cameronsjo/cadence-hooks#766)
