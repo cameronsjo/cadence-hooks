@@ -1266,42 +1266,45 @@ fn is_literal_identifier(name: &str) -> bool {
 /// function definition head (`name()`, `name(){`, `name ( ) {`,
 /// `function name {`), and a case arm's pattern (`case x in x)`, `y)`).
 fn strip_compound_openers(tokens: &[String]) -> Vec<String> {
+    // A cursor rather than removing from the front: a segment of thousands of
+    // `case x in x)` openers shifted the whole vector once per opener, and a
+    // 200 KB flood spent half a second here.
     let mut words: Vec<String> = tokens.to_vec();
+    let mut at = 0;
     loop {
-        let Some(first) = words.first().cloned() else {
-            return words;
+        let Some(first) = words.get(at).cloned() else {
+            return words.split_off(at.min(words.len()));
         };
+        let rest = &words[at..];
         if first == "(" || first == "{" || first == "()" {
-            words.remove(0);
-        } else if let Some(rest) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
-            words[0] = rest.to_string();
-        } else if first == "function" && words.len() > 1 {
-            words.drain(..2);
+            at += 1;
+        } else if let Some(tail) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
+            words[at] = tail.to_string();
+        } else if first == "function" && rest.len() > 1 {
+            at += 2;
         } else if let Some((name, _)) = first.split_once("()")
             && is_literal_identifier(&name.replace('-', "_"))
         {
             let tail = first[name.len() + 2..].trim_start_matches('{').to_string();
             if tail.is_empty() {
-                words.remove(0);
+                at += 1;
             } else {
-                words[0] = tail;
+                words[at] = tail;
             }
-        } else if words.get(1).is_some_and(|w| w == "()" || w == "(){")
+        } else if rest.get(1).is_some_and(|w| w == "()" || w == "(){")
             && is_literal_identifier(&first.replace('-', "_"))
         {
-            words.drain(..2);
+            at += 2;
         } else if first == "case" {
-            match words.iter().position(|w| w.ends_with(')')) {
-                Some(end) => {
-                    words.drain(..=end);
-                }
-                None => return words,
+            match rest.iter().position(|w| w.ends_with(')')) {
+                Some(end) => at += end + 1,
+                None => return words.split_off(at),
             }
         } else if first.len() > 1 && first.ends_with(')') && !first.contains("$(") {
             // A later case arm: `y) export …`.
-            words.remove(0);
+            at += 1;
         } else {
-            return words;
+            return words.split_off(at);
         }
     }
 }
