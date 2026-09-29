@@ -1287,6 +1287,49 @@ pub fn gh_pr_segments(command: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// One `gh issue <sub>` call, read by the same walk as `gh pr` ones
+/// ([`gh_group_invocation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhIssueCall {
+    /// The issue subcommand (`close`, `create`, …).
+    pub subcommand: String,
+    /// Every token after the subcommand — its own flags and operands.
+    pub operands: Vec<String>,
+    /// Every `-R`/`--repo`/`GH_REPO=` value, in any position. A repo flag with
+    /// no readable value contributes nothing here but still sets
+    /// [`GhIssueCall::retargeted`].
+    pub repo_targets: Vec<String>,
+    /// Anything pointed the call away from the cwd's repository.
+    pub retargeted: bool,
+    /// A `GH_HOST=` assignment prefix was present.
+    pub host_overridden: bool,
+}
+
+/// Every `gh issue <sub>` call in `command`, in [`command_segments`] order.
+/// Segments are reduced the way [`gh_pr_segments`] reduces them (reserved
+/// words and group punctuation stripped, a path-qualified `gh` accepted).
+pub fn gh_issue_calls(command: &str) -> Vec<GhIssueCall> {
+    command_segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let mut tokens = executable_tokens(segment);
+            let head = tokens.len() - skip_transparent_prefixes(&tokens).len();
+            if command_word(tokens.get(head)?).as_ref() != "gh" {
+                return None;
+            }
+            tokens[head] = "gh".to_string();
+            let inv = gh_group_invocation(&tokens, "issue")?;
+            Some(GhIssueCall {
+                subcommand: inv.subcommand.to_string(),
+                operands: inv.operands.to_vec(),
+                repo_targets: inv.repo_targets.clone(),
+                retargeted: inv.retargeted,
+                host_overridden: inv.host_overridden,
+            })
+        })
+        .collect()
+}
+
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
 /// create` that gh reads as no draft ([`create_is_draft`]) *in that same
 /// segment*. Scoping the draft-flag scan to one segment is what keeps an
@@ -1732,6 +1775,15 @@ pub(crate) fn is_redirect_token(token: &str) -> bool {
 /// looks at them. That is why the scan reads the *skipped* prefix region rather
 /// than only `argv`.
 fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
+    gh_group_invocation(tokens, "pr")
+}
+
+/// [`gh_pr_invocation`]'s walk for any gh command group (`pr`, `issue`): the
+/// same command-word anchoring, transparent-prefix and assignment handling,
+/// and global/group-level repo-flag skipping, with only the literal group
+/// token varying. One walk, so a spelling the ship anchor sees is seen by the
+/// `issue` readers too.
+fn gh_group_invocation<'a>(tokens: &'a [String], group: &str) -> Option<GhPrInvocation<'a>> {
     let argv = skip_transparent_prefixes(tokens);
     if argv.first().map(String::as_str) != Some("gh") {
         return None;
@@ -1766,7 +1818,7 @@ fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
             i += 1;
         }
     }
-    if argv.get(i).map(String::as_str) != Some("pr") {
+    if argv.get(i).map(String::as_str) != Some(group) {
         return None;
     }
     // gh also takes the repo override between `pr` and the subcommand
