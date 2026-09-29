@@ -1122,7 +1122,12 @@ fn plan_store_relative_names<'p>(
 /// INSIDE the store is unsupported even when it stays inside — Claude Code
 /// writes plans flat into the store, so nothing legitimate needs one.
 ///
-/// **Other platforms (best-effort).** No `openat` in std: the path is
+/// The root itself is found by path, on purpose, so a symlinked root keeps
+/// working. Re-pointing it needs write access to the root's parent
+/// (`~/.claude`), which already lets an attacker rewrite the hooks in
+/// `settings.json`, so that is outside this check's threat model.
+///
+/// **Other platforms (best-effort). See cadence-hooks#1147.** No `openat` in std: the path is
 /// canonicalized and nesting-checked, opened, and the opened handle is
 /// compared to the canonical path's metadata by length, modified, and created
 /// time. That narrows but does not close the swap window, and an attacker able
@@ -3897,7 +3902,7 @@ mod tests {
     #[test]
     fn plan_store_read_never_leaks_under_a_live_directory_swap() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let base = TempDir::new().unwrap();
         let root = base.path().join("store");
         fs::create_dir_all(root.join("sub")).unwrap();
@@ -3907,15 +3912,17 @@ mod tests {
         std::os::unix::fs::symlink(base.path().join("outside"), root.join("evil")).unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
+        let flips = Arc::new(AtomicUsize::new(0));
         let swapper = {
             let stop = Arc::clone(&stop);
+            let flips = Arc::clone(&flips);
             let a = std::ffi::CString::new(root.join("sub").to_string_lossy().as_bytes()).unwrap();
             let b = std::ffi::CString::new(root.join("evil").to_string_lossy().as_bytes()).unwrap();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    // SAFETY: two valid NUL-terminated paths; the return value
-                    // is ignored (an exchange failure just skips a flip).
-                    unsafe {
+                    // SAFETY: two valid NUL-terminated paths. A failed exchange
+                    // skips a flip; the count below proves some landed.
+                    let rc = unsafe {
                         libc::syscall(
                             libc::SYS_renameat2,
                             libc::AT_FDCWD,
@@ -3923,22 +3930,33 @@ mod tests {
                             libc::AT_FDCWD,
                             b.as_ptr(),
                             libc::RENAME_EXCHANGE,
-                        );
+                        )
+                    };
+                    if rc == 0 {
+                        flips.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
         };
         let candidate = root.join("sub/plan.md").to_string_lossy().into_owned();
-        let mut leaks = 0;
+        let (mut leaks, mut reads) = (0, 0);
         for _ in 0..20_000 {
-            if read_plan_store_file_within(&candidate, &root).is_some_and(|t| t.contains("SECRET"))
-            {
-                leaks += 1;
+            match read_plan_store_file_within(&candidate, &root) {
+                Some(t) if t.contains("SECRET") => leaks += 1,
+                Some(_) => reads += 1,
+                None => {}
             }
         }
         stop.store(true, Ordering::Relaxed);
         swapper.join().unwrap();
         assert_eq!(leaks, 0);
+        // Guard against a vacuous pass: the swap must really have run, and the
+        // reader must really have read the in-store plan between swaps.
+        assert!(
+            flips.load(Ordering::Relaxed) > 0,
+            "RENAME_EXCHANGE never succeeded"
+        );
+        assert!(reads > 0, "the in-store plan was never read");
     }
 
     #[test]
