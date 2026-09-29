@@ -1542,7 +1542,7 @@ pub fn run_measure(file: &str, surface: &str) -> u8 {
         "verdict": verdict_slug(&verdict),
         "escape": escape.is_some(),
     });
-    println!("{line}");
+    cadence_hooks_core::outln!("{line}");
     0
 }
 

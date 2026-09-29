@@ -24,6 +24,7 @@ pub mod pathclass;
 pub mod paths;
 pub mod push;
 pub mod shell;
+pub mod stdout;
 pub mod time;
 pub mod transcript;
 pub mod worktree;
@@ -1940,7 +1941,7 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
         feedback_footer().as_deref(),
     );
     if let Some(out) = rendered.stdout {
-        println!("{out}");
+        crate::outln!("{out}");
     }
     if let Some(err) = rendered.stderr {
         eprint!("{err}");
