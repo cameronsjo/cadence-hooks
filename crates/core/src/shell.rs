@@ -4933,22 +4933,26 @@ pub const UNRESOLVABLE_DIR: &str = "\0unresolvable directory";
 /// The per-segment reading a guard judges alongside the whole-command
 /// [`parse_work_dir`] one; see [`segment_work_dirs`].
 pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std::rc::Rc<str>)> {
-    // A segment that may run in several directories is located once per
-    // directory, consecutively; expand it once.
+    // Each distinct segment text is expanded once: a segment that may run in
+    // several directories is located once per directory, and a flood repeats
+    // one segment (`f; f; …`).
     let mut out = Vec::new();
-    let mut last: Option<(String, Vec<String>)> = None;
+    let mut expanded: std::collections::HashMap<String, std::rc::Rc<[String]>> =
+        std::collections::HashMap::new();
     for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
-        if last.as_ref().is_none_or(|(text, _)| *text != raw) {
-            let expanded = command_segments(&raw);
-            last = Some((raw, expanded));
-        }
-        if let Some((_, expanded)) = &last {
-            out.extend(
-                expanded
-                    .iter()
-                    .map(|segment| (segment.clone(), dir.clone())),
-            );
-        }
+        let segments = match expanded.get(&raw) {
+            Some(segments) => segments.clone(),
+            None => {
+                let segments: std::rc::Rc<[String]> = command_segments(&raw).into();
+                expanded.insert(raw, segments.clone());
+                segments
+            }
+        };
+        out.extend(
+            segments
+                .iter()
+                .map(|segment| (segment.clone(), dir.clone())),
+        );
     }
     out
 }
@@ -5020,15 +5024,24 @@ impl DirSet {
     /// Add [`UNRESOLVABLE_DIR`]: the shell may be somewhere this walk cannot
     /// name.
     fn add_unresolvable(&mut self) {
+        if self.dirs.iter().any(|dir| dir == UNRESOLVABLE_DIR) {
+            return;
+        }
         let mut dirs = self.dirs.clone();
         dirs.push(UNRESOLVABLE_DIR.to_string());
         self.set(dirs);
     }
 
     /// Deduplicate and cap, then install.
-    fn set(&mut self, mut dirs: Vec<String>) {
-        let mut seen = std::collections::HashSet::new();
-        dirs.retain(|dir| seen.insert(dir.clone()));
+    fn set(&mut self, dirs: Vec<String>) {
+        // A handful at most, past which the set collapses: a linear dedup.
+        let mut unique: Vec<String> = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            if !unique.contains(&dir) {
+                unique.push(dir);
+            }
+        }
+        let mut dirs = unique;
         if dirs.len() > MAX_POSSIBLE_DIRS {
             dirs = vec![UNRESOLVABLE_DIR.to_string()];
         }
@@ -5089,11 +5102,27 @@ struct DirWalk {
     /// The whole command, where [`DirWalk::expansion_may_name_a_mover`]
     /// looks for what a variable was set to.
     command: String,
+    /// What each variable the command sets was set to, per
+    /// [`literal_values_of`], looked up once per name.
+    variables: std::collections::HashMap<String, Option<VariableValues>>,
+    /// [`variable_mentions`] of the command, built at the first expansion
+    /// in command position.
+    mentions: Option<std::collections::HashMap<String, Vec<usize>>>,
     located: Vec<LocatedSegment>,
     /// Each defined function's body, or `None` when its body is a form this
     /// walk does not record (`f() if …; fi`).
     functions: std::collections::HashMap<String, Option<Script>>,
     replayed: usize,
+}
+
+/// What a command sets one variable to ([`literal_values_of`]).
+#[derive(Clone)]
+enum VariableValues {
+    /// A form this walk does not read, or a directory verb, `eval`,
+    /// `builtin`, `command`, or `trap`.
+    MayMove,
+    /// Plain values, one of which may still name a function.
+    Plain(std::rc::Rc<std::collections::HashSet<String>>),
 }
 
 /// A function definition whose body segments are still being recorded.
@@ -5258,45 +5287,75 @@ fn names_a_path(word: &str) -> bool {
     false
 }
 
-/// Is `name` named anywhere in `command` other than as a `$name` read?
-fn variable_is_set_in(command: &str, name: &str) -> bool {
-    word_mentions(command, name).next().is_some()
-}
-
-/// Every mention of `name` as a whole word in `command` that is not a plain
-/// `$name`/`${name}` read, as the text after it.
-fn word_mentions<'c>(command: &'c str, name: &'c str) -> impl Iterator<Item = &'c str> + 'c {
+/// Where each name in `command` is mentioned other than as a plain
+/// `$name`/`${name}` read — an assignment `name=…`, `read name`, `for name
+/// in`, `${name:=…}` — as the byte offset just after the name. Built in one
+/// pass, so a flood of distinct variables costs linear time.
+fn variable_mentions(command: &str) -> std::collections::HashMap<String, Vec<usize>> {
+    static IDENT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("pattern should compile"));
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    command.match_indices(name).filter_map(move |(at, _)| {
-        let before = &command[..at];
-        let after = &command[at + name.len()..];
-        if before.ends_with(is_word) || after.starts_with(is_word) {
-            return None;
+    let mut mentions: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for found in IDENT.find_iter(command) {
+        let before = &command[..found.start()];
+        let after = &command[found.end()..];
+        if before.ends_with(is_word)
+            || before.ends_with('$')
+            || (before.ends_with("${") && after.starts_with('}'))
+        {
+            continue;
         }
-        if before.ends_with('$') || (before.ends_with("${") && after.starts_with('}')) {
-            return None;
-        }
-        Some(after)
-    })
+        mentions
+            .entry(found.as_str().to_string())
+            .or_default()
+            .push(found.end());
+    }
+    mentions
 }
 
-/// The values `command` gives `name`, when every mention of it is a plain
-/// `name=literal` assignment; `None` otherwise.
-fn literal_values_of(command: &str, name: &str) -> Option<Vec<String>> {
+/// The values `command` gives a variable whose mentions end at `ends`
+/// in `mentions` ([`variable_mentions`]), when every mention is a plain `name=literal`
+/// assignment; `None` otherwise. A quoted value is read whole, and one with
+/// a blank or an expansion in it is not read: `c=' cd'; $c /u` splits to
+/// `cd /u`.
+fn literal_values_of(
+    command: &str,
+    mentions: &std::collections::HashMap<String, Vec<usize>>,
+    ends: &[usize],
+) -> Option<Vec<String>> {
+    if mentions.contains_key("IFS") {
+        // A changed field separator splits a value anywhere.
+        return None;
+    }
     let mut values = Vec::new();
-    for after in word_mentions(command, name) {
-        let value = after.strip_prefix('=')?;
+    for &end in ends {
+        let value = command[end..].strip_prefix('=')?;
         if value.starts_with('=') {
             return None;
         }
-        let end = value
+        let stop = value
             .find(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
             .unwrap_or(value.len());
-        let value = &value[..end];
-        if value.contains(['$', '`', '\\']) {
+        let word = &value[..stop];
+        let read = match word.chars().next() {
+            Some(quote @ ('\'' | '"')) => {
+                let inner = &value[1..];
+                let close = inner.find(quote)?;
+                let rest = &inner[close + 1..];
+                if !rest.is_empty()
+                    && !rest.starts_with(|c: char| c.is_whitespace() || ";&|()<>".contains(c))
+                {
+                    return None;
+                }
+                &inner[..close]
+            }
+            _ => word,
+        };
+        if read.contains(|c: char| c.is_whitespace() || "$`\\'\"".contains(c)) {
             return None;
         }
-        values.push(value.replace(['\'', '"'], ""));
+        values.push(read.to_string());
     }
     Some(values)
 }
@@ -5556,7 +5615,7 @@ impl DirWalk {
     /// every place the command names it is a plain `NAME=literal`: `read c`,
     /// `for c in …`, `${c:=…}`, `c+=…`, a value with an expansion, or a word
     /// gluing a set variable to more text (`${c}d`) is not read here.
-    fn expansion_may_name_a_mover(&self, word: &str) -> bool {
+    fn expansion_may_name_a_mover(&mut self, word: &str) -> bool {
         static EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(.))")
                 .expect("pattern should compile")
@@ -5564,31 +5623,60 @@ impl DirWalk {
         if word.contains('`') || word.contains("$(") {
             return true;
         }
-        let mut set_names = Vec::new();
+        let mut set_values = Vec::new();
         for caps in EXPANSION.captures_iter(word) {
             let Some(name) = caps.get(1).or(caps.get(2)) else {
                 // `$1`, `$@`, `${x:-…}`, `$'…'`.
                 return true;
             };
-            if variable_is_set_in(&self.command, name.as_str()) {
-                set_names.push(name.as_str());
+            let command = &self.command;
+            let mentions = self
+                .mentions
+                .get_or_insert_with(|| variable_mentions(command));
+            // `None`: never set here.
+            let set = self
+                .variables
+                .entry(name.as_str().to_string())
+                .or_insert_with(|| {
+                    mentions.get(name.as_str()).map(|ends| {
+                        match literal_values_of(command, mentions, ends) {
+                            Some(values)
+                                if !values.iter().any(|value| {
+                                    matches!(
+                                        value.as_str(),
+                                        "cd" | "pushd"
+                                            | "popd"
+                                            | "eval"
+                                            | "builtin"
+                                            | "command"
+                                            | "trap"
+                                    )
+                                }) =>
+                            {
+                                VariableValues::Plain(std::rc::Rc::new(
+                                    values.into_iter().collect(),
+                                ))
+                            }
+                            _ => VariableValues::MayMove,
+                        }
+                    })
+                });
+            if let Some(values) = set {
+                set_values.push(values.clone());
             }
         }
-        match set_names.as_slice() {
+        let whole_word = EXPANSION
+            .find(word)
+            .is_some_and(|m| m.as_str().len() == word.len());
+        match set_values.as_slice() {
             [] => false,
-            [name]
-                if EXPANSION
-                    .find(word)
-                    .is_some_and(|m| m.as_str().len() == word.len()) =>
-            {
-                match literal_values_of(&self.command, name) {
-                    Some(values) => values.iter().any(|value| {
-                        matches!(
-                            value.as_str(),
-                            "cd" | "pushd" | "popd" | "eval" | "builtin" | "command" | "trap"
-                        ) || self.functions.contains_key(value)
-                    }),
-                    None => true,
+            [VariableValues::Plain(values)] if whole_word => {
+                if values.len() < self.functions.len() {
+                    values
+                        .iter()
+                        .any(|value| self.functions.contains_key(value))
+                } else {
+                    self.functions.keys().any(|name| values.contains(name))
                 }
             }
             _ => true,
@@ -5618,8 +5706,14 @@ impl DirWalk {
         let body = strip_group_wrappers(command);
         // Most commands name a plain program in their first word; tokenizing
         // every segment re-expanded each brace word of a flood.
-        let first_word = body.split([' ', '\t', '\n']).next().unwrap_or("");
-        let plain = !first_word.contains(['$', '`', '\\', '\'', '"', '=', '{']);
+        let special = |word: &str| word.contains(['$', '`', '\\', '\'', '"', '{', '(', ')']);
+        // Plain `NAME=value` prefixes first: they run nothing.
+        let first_word = body
+            .split([' ', '\t', '\n'])
+            .filter(|word| !word.is_empty())
+            .find(|word| !is_assignment_word(word) || special(word))
+            .unwrap_or("");
+        let plain = !special(first_word) && !first_word.contains('=');
         if first_word.is_empty()
             || plain
                 && !matches!(
@@ -17331,6 +17425,10 @@ mod tests {
             ("X=$(echo \"a b\") cd /u; gh pr create", &["/u"]),
             ("X=\"$(\" cd /u; gh pr create", &["/cwd", X]),
             ("t=\"feat(x): y\"; gh pr create", &["/cwd"]),
+            ("c=' cd'; $c /u; gh pr create", &["/cwd", X]),
+            ("c=\"cd\"; $c /u; gh pr create", &["/cwd", X]),
+            ("c=cd/u; IFS=/; $c; gh pr create", &["/cwd", X]),
+            ("c='gh'; $c pr view 1; gh pr create", &["/cwd"]),
             ("f() { $1 /u; }; f cd; gh pr create", &["/cwd", X]),
             // One it never sets names a program from the environment.
             ("$c /u; gh pr create", &["/cwd"]),
@@ -17555,12 +17653,29 @@ mod tests {
         let loops = "while x; do cd a; done; gh pr create; ".repeat(6_000);
         let cases = "case x in x) cd /u;; y) cd v;; esac; gh pr create; ".repeat(5_000);
         let deep_eval = "eval \"eval 'eval cd /u'\"; ".repeat(8_000);
+        let variables = (0..14_000)
+            .map(|i| format!("v{i}=gh; $v{i} x; "))
+            .collect::<String>();
+        let same_variable = "c=gh; $c /u; gh pr create; ".repeat(8_000);
         // Release bound 0.5 s (the hook deadline fails open); debug is slower.
         let limit =
             std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
         for command in [
-            relative, newlines, absolute, subshells, groups, nested, writes, calls, evals,
-            branches, loops, cases, deep_eval,
+            relative,
+            newlines,
+            absolute,
+            subshells,
+            groups,
+            nested,
+            writes,
+            calls,
+            evals,
+            branches,
+            loops,
+            cases,
+            deep_eval,
+            variables,
+            same_variable,
         ] {
             assert!(command.len() >= 200_000, "{}", command.len());
             let start = std::time::Instant::now();

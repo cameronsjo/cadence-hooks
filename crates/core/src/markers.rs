@@ -503,11 +503,21 @@ fn per_segment_ships(
     origins: &mut OriginCache,
 ) -> Vec<LocatedShip> {
     let mut located = Vec::new();
+    // A segment that may run in several directories is located once per
+    // directory, consecutively: expand it once.
+    let mut expanded: Option<(String, Vec<String>, Vec<String>)> = None;
     for LocatedSegment { raw, dir } in segment_work_dirs(whole.command, cwd) {
-        let body = strip_group_wrappers(&raw);
-        let origin = origins.for_command(&whole.of(body), &dir);
+        if expanded.as_ref().is_none_or(|(text, _, _)| *text != raw) {
+            let body = whole.of(strip_group_wrappers(&raw)).into_owned();
+            let segments = whole.of(&raw).into_owned();
+            expanded = Some((raw, body, segments));
+        }
+        let Some((_, body, segments)) = &expanded else {
+            continue;
+        };
+        let origin = origins.for_command(body, &dir);
         located.extend(
-            polish_ship_segments_in(&whole.of(&raw), origin.as_deref())
+            polish_ship_segments_in(segments, origin.as_deref())
                 .into_iter()
                 .map(|segment| LocatedShip {
                     segment,
