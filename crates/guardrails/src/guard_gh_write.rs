@@ -141,6 +141,12 @@ pub(crate) fn is_write_command(command: &str) -> bool {
     if API_WRITE_METHOD.is_match(command) {
         return true;
     }
+    // The same method read from the flag stream: the attached spellings
+    // (`-XDELETE`, `--method=DELETE`) the spaced regex above cannot see, and a
+    // method the shell builds at run time (cadence-hooks#1139).
+    if api_method_forces_write(command) {
+        return true;
+    }
     if API_FIELD_FLAGS.is_match(command) || API_INPUT_FLAG.is_match(command) {
         // These flags read as a write only because gh switches an otherwise-GET
         // `gh api` to POST as soon as a parameter is added. An explicit
@@ -2302,6 +2308,40 @@ fn api_explicit_method(segment: &str) -> Option<String> {
     match scan_unanimous_flag(&words, 'X', "--method", Some(&GH_API_FLAGS)) {
         FlagScan::Single(method) => Some(method.to_ascii_uppercase()),
         FlagScan::Absent | FlagScan::Ambiguous => None,
+    }
+}
+
+/// True when a `gh api` segment's `-X`/`--method` readings make it a write
+/// on their own, whatever parameters it carries (cadence-hooks#1139):
+///
+/// - a write verb in any spelling pflag accepts — `-XDELETE` and
+///   `--method=DELETE` never matched [`API_WRITE_METHOD`], which wants a
+///   blank after the flag, so a parameterless one read as a GET;
+/// - a value carrying `$` or a backtick — `-X $(echo DELETE)`, `-X "$M"` —
+///   which only the shell knows. Treating it as a GET judged no target at all;
+///   as a write, the target is judged;
+/// - readings that disagree or cannot be attributed ([`FlagScan::Ambiguous`]),
+///   the "I cannot tell" answer every caller of the scan fails closed on.
+///
+/// A literal non-write method (`GET`, `HEAD`, a typo) stays with the implicit
+/// rule [`is_write_command`] applies below.
+fn api_method_forces_write(segment: &str) -> bool {
+    if gh_api_endpoint(segment).is_none() {
+        return false;
+    }
+    let Some(words) = gh_argv(segment) else {
+        return false;
+    };
+    match scan_unanimous_flag(&words, 'X', "--method", Some(&GH_API_FLAGS)) {
+        FlagScan::Absent => false,
+        FlagScan::Ambiguous => true,
+        FlagScan::Single(method) => {
+            method.contains(['$', '`'])
+                || matches!(
+                    method.to_ascii_uppercase().as_str(),
+                    "POST" | "PUT" | "PATCH" | "DELETE"
+                )
+        }
     }
 }
 
@@ -4654,6 +4694,48 @@ mod tests {
                 );
                 let result = GhWriteGuard.run(&input);
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            },
+        );
+    }
+
+    #[test]
+    fn api_method_read_from_the_flag_stream_decides_the_write() {
+        // cadence-hooks#1139: every BLOCK row was ALLOW on main — the attached
+        // spellings and a method built by the shell read as a GET, so the
+        // unowned target was never judged.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                use cadence_hooks_core::Outcome::{Allow, Block};
+                for (command, want) in [
+                    ("gh api -X $(echo DELETE) repos/someoneelse/r", Block),
+                    ("gh api --method `echo PUT x` repos/someoneelse/r", Block),
+                    ("gh api -X \"$M\" repos/someoneelse/r", Block),
+                    ("gh api -X ${M} repos/someoneelse/r", Block),
+                    ("gh api --method=$(echo DELETE) repos/someoneelse/r", Block),
+                    ("gh api -X$(echo DELETE) repos/someoneelse/r", Block),
+                    ("gh api -X DEL$(echo ETE) repos/someoneelse/r", Block),
+                    ("gh api -XDELETE repos/someoneelse/r", Block),
+                    ("gh api -XPUT repos/someoneelse/r/topics", Block),
+                    ("gh api --method=DELETE repos/someoneelse/r", Block),
+                    ("gh api -XGET -XDELETE repos/someoneelse/r", Block),
+                    // Controls: an owned target, and reads.
+                    ("gh api -X $(echo DELETE) repos/cameronsjo/r", Allow),
+                    ("gh api -XDELETE repos/cameronsjo/r", Allow),
+                    ("gh api repos/someoneelse/r", Allow),
+                    ("gh api -X GET repos/someoneelse/r", Allow),
+                    ("gh api -XGET repos/someoneelse/r", Allow),
+                    ("gh api --method=GET repos/someoneelse/r", Allow),
+                    ("gh api -X HEAD repos/someoneelse/r", Allow),
+                    ("gh api --jq .x repos/someoneelse/r", Allow),
+                ] {
+                    let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                    assert_eq!(result.outcome, want, "{command}");
+                }
             },
         );
     }
