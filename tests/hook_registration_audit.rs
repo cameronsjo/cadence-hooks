@@ -1048,8 +1048,9 @@ struct AuditSubject {
     label: &'static str,
     /// The triage line for a failure from THIS subject. Per-subject because
     /// the two subjects fail for structurally different reasons and the wrong
-    /// hint sends the reader to the wrong repository.
-    hint: &'static str,
+    /// hint sends the reader to the wrong repository. Owned, because the
+    /// sibling's carries that checkout's measured position.
+    hint: String,
     refs: BTreeMap<String, Vec<HookRef>>,
     root: PathBuf,
 }
@@ -1076,13 +1077,132 @@ fn audit_subjects() -> Vec<AuditSubject> {
     }
     enforce_complete_scan(&scan);
 
+    let position = sibling_position(&scan.workspace_root.join("cadence"));
     subjects.push(AuditSubject {
         label: "sibling cadence checkout",
-        hint: STALE_CHECKOUT_HINT,
+        hint: format!(
+            "{STALE_CHECKOUT_HINT}\nSibling checkout: {}.",
+            render_sibling_position(position)
+        ),
         refs: scan.resolved,
         root: scan.workspace_root,
     });
     subjects
+}
+
+/// The sibling checkout's `(behind, ahead)` commit counts against its
+/// `origin/main`, or `None` when git cannot say (no checkout there, no
+/// `origin/main` ref).
+///
+/// The sibling leg reads a working tree that moves on its own schedule, so a
+/// red from it on an untouched checkout is often skew, not drift
+/// (cameronsjo/cadence-hooks#629). Measuring the position and printing it
+/// with the failure turns "go check whether the sibling is current" into an
+/// answer the reader already has.
+///
+/// `GIT_DIR`/`GIT_WORK_TREE` are cleared (a test run started from a git hook
+/// inherits them and would measure the wrong repository), and the counts are
+/// trusted only when git's top level IS `checkout`. A missing checkout inside
+/// some enclosing repo would otherwise report that repo's position.
+fn sibling_position(checkout: &Path) -> Option<(usize, usize)> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(checkout)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let toplevel = git(&["rev-parse", "--show-toplevel"])?;
+    let toplevel = PathBuf::from(String::from_utf8(toplevel.stdout).ok()?.trim());
+    if toplevel.canonicalize().ok()? != checkout.canonicalize().ok()? {
+        return None;
+    }
+    let output = git(&["rev-list", "--left-right", "--count", "origin/main...HEAD"])?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut counts = text.split_whitespace().map(str::parse::<usize>);
+    Some((counts.next()?.ok()?, counts.next()?.ok()?))
+}
+
+/// The sentence a sibling-leg failure carries about the checkout's position.
+fn render_sibling_position(position: Option<(usize, usize)>) -> String {
+    let fetch = "as of its last `git fetch`";
+    match position {
+        None => {
+            "position against origin/main unknown (no checkout, or no origin/main ref)".to_string()
+        }
+        Some((0, 0)) => format!(
+            "at origin/main ({fetch}), so this is not local checkout skew — unless origin/main \
+             itself moved since this repo's lists were written"
+        ),
+        Some((behind, 0)) => format!(
+            "{behind} commit(s) BEHIND origin/main ({fetch}) with nothing of its own — this red \
+             is most likely checkout skew: pull it and re-run before treating it as drift"
+        ),
+        Some((0, ahead)) => format!(
+            "{ahead} commit(s) ahead of origin/main ({fetch}) — local wiring not yet merged; \
+             this red describes that unmerged work"
+        ),
+        Some((behind, ahead)) => format!(
+            "diverged from origin/main ({fetch}): {behind} behind, {ahead} ahead — rebase or \
+             pull it before treating this as drift"
+        ),
+    }
+}
+
+#[test]
+fn render_sibling_position_names_skew() {
+    let behind = render_sibling_position(Some((3, 0)));
+    assert!(
+        behind.contains("3 commit(s) BEHIND") && behind.contains("skew"),
+        "{behind}"
+    );
+    let ahead = render_sibling_position(Some((0, 2)));
+    assert!(ahead.contains("2 commit(s) ahead"), "{ahead}");
+    let diverged = render_sibling_position(Some((1, 1)));
+    assert!(diverged.contains("1 behind, 1 ahead"), "{diverged}");
+    assert!(render_sibling_position(Some((0, 0))).starts_with("at origin/main"));
+    assert!(render_sibling_position(None).contains("unknown"));
+}
+
+/// The measurement itself, on a hermetic clone one commit behind its origin.
+#[test]
+fn sibling_position_counts_a_checkout_behind_origin_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?} failed in {dir:?}");
+    };
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    git(&upstream, &["config", "user.email", "t@t"]);
+    git(&upstream, &["config", "user.name", "t"]);
+    git(&upstream, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let checkout = tmp.path().join("checkout");
+    git(
+        tmp.path(),
+        &["clone", "-q", upstream.to_str().unwrap(), "checkout"],
+    );
+    assert_eq!(sibling_position(&checkout), Some((0, 0)));
+
+    git(&upstream, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    git(&checkout, &["fetch", "-q", "origin"]);
+    assert_eq!(sibling_position(&checkout), Some((1, 0)));
+
+    assert_eq!(sibling_position(&tmp.path().join("absent")), None);
+    // A subdirectory is not the checkout: its enclosing repo's position must
+    // not be reported as the sibling's.
+    let nested = checkout.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(sibling_position(&nested), None);
 }
 
 /// The fixture leg. It must always resolve completely: the fixture ships in
@@ -1114,7 +1234,7 @@ fn fixture_subject() -> AuditSubject {
 
     AuditSubject {
         label: "checked-in fixture",
-        hint: FIXTURE_FAILURE_HINT,
+        hint: FIXTURE_FAILURE_HINT.to_string(),
         refs: scan.resolved,
         root,
     }

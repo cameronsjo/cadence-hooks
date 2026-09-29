@@ -52,6 +52,11 @@ struct MigrateReport {
     skipped: Vec<(&'static str, SkipReason)>,
     /// Legacy files renamed to `*.json.migrated`.
     renamed: Vec<PathBuf>,
+    /// Legacy files whose section WAS written but whose rename then failed,
+    /// with the error. Reported beside what succeeded rather than replacing it
+    /// (cameronsjo/cadence-hooks#314): `cadence.json` already carries these
+    /// sections, so a re-run skips them and never retries the rename.
+    rename_failures: Vec<(PathBuf, String)>,
 }
 
 impl MigrateReport {
@@ -66,7 +71,10 @@ impl MigrateReport {
 /// Pure of process state (operates on the passed directory), so tests drive it
 /// against a tempdir. Returns the report, or an error string when the existing
 /// `cadence.json` is not a JSON object (the one case we refuse to proceed on,
-/// to avoid destroying unexpected content) or a write/rename fails.
+/// to avoid destroying unexpected content) or the write fails. A rename that
+/// fails after the write is not an `Err`: it lands in
+/// [`MigrateReport::rename_failures`] so the caller can still report what the
+/// run did.
 fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
     let cadence_path = claude_dir.join("cadence.json");
 
@@ -172,25 +180,102 @@ fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
 
     let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root_obj))
         .map_err(|e| format!("failed to serialize {}: {e}", cadence_path.display()))?;
-    std::fs::write(&cadence_path, format!("{serialized}\n"))
+    write_atomically(&cadence_path, format!("{serialized}\n").as_bytes())
         .map_err(|e| format!("failed to write {}: {e}", cadence_path.display()))?;
 
     // Rename consumed legacy files only after the write succeeds, so a failed
-    // write never strands the source. If a rename fails mid-loop (disk full,
-    // permission denied) after cadence.json is already written, that section is
-    // now `AlreadyPresent`, so a re-run non-destructively skips it but never
+    // write never strands the source. If a rename fails (disk full, permission
+    // denied) after cadence.json is already written, that section is now
+    // `AlreadyPresent`, so a re-run non-destructively skips it but never
     // retries the rename — the orphaned legacy file lingers and `doctor` keeps
     // warning until it's removed by hand. Low-probability (same-filesystem
     // rename after a successful write), and non-destructive, so it's surfaced
-    // rather than transactionally rolled back.
+    // rather than transactionally rolled back: recorded, and the remaining
+    // renames still run, so the report says exactly what happened.
     for legacy_path in to_rename {
         let migrated = migrated_path(&legacy_path);
-        std::fs::rename(&legacy_path, &migrated)
-            .map_err(|e| format!("failed to rename {}: {e}", legacy_path.display()))?;
-        report.renamed.push(migrated);
+        match std::fs::rename(&legacy_path, &migrated) {
+            Ok(()) => report.renamed.push(migrated),
+            Err(e) => report.rename_failures.push((legacy_path, e.to_string())),
+        }
     }
 
     Ok(report)
+}
+
+/// Write `contents` to `path` through a fresh sibling temp file and a rename
+/// (cameronsjo/cadence-hooks#314).
+///
+/// Two gaps a direct `fs::write` left open:
+///
+/// - **Truncation.** `fs::write` truncates first and writes second, so a crash
+///   in between left a short `cadence.json`. The rename swaps in a complete
+///   file or nothing.
+/// - **Check-then-write race.** The caller's symlink check and a following
+///   `fs::write` were two steps, and a link swapped in between would have been
+///   followed. The temp file is opened with `create_new` (`O_EXCL`), which
+///   refuses any existing path, symlink included, and `rename` replaces the
+///   directory entry at `path` without following a link there.
+///
+/// An existing file's permissions are carried over, applied to the temp file
+/// before a single byte is written, so the content is never readable under a
+/// wider mode than the file it replaces ([`create_temp`]). The temp name is
+/// unique per process and instant, the parent directory is fsynced after the
+/// rename (unix, best effort), and the temp file is removed on any failure.
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.tmp-{}-{nanos}", std::process::id()));
+    let existing = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.permissions());
+    let result = (|| {
+        let mut file = create_temp(&tmp, existing)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // Durability of the rename itself. Best effort: the new file is already
+    // in place, so a failed directory fsync must not report the write failed.
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    result
+}
+
+/// Create the temp file with `O_EXCL`, already carrying `existing`'s
+/// permissions when there is a file being replaced. On unix it is created
+/// `0600` in that case, so even the instant between `open` and
+/// `set_permissions` exposes nothing wider than owner-only, and it holds no
+/// content yet either way. With no existing file the default mode (umask)
+/// applies, as `fs::write` would have.
+fn create_temp(
+    tmp: &Path,
+    existing: Option<std::fs::Permissions>,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if existing.is_some() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(tmp)?;
+    if let Some(perms) = existing {
+        file.set_permissions(perms)?;
+    }
+    Ok(file)
 }
 
 /// `redaction.json` → `redaction.json.migrated`. Appends the suffix rather than
@@ -244,7 +329,8 @@ fn skip_text(reason: &SkipReason) -> &'static str {
 /// directory, migrates its `.claude/`, prints a scannable summary to stdout
 /// (diagnostics to stderr), and returns the process exit code: 0 on success or
 /// a clean no-op, 1 on any error (no git root, unreadable/non-object
-/// `cadence.json`, or a write/rename failure).
+/// `cadence.json`, or a write/rename failure). A rename failure after the
+/// write still prints everything that did succeed first.
 pub fn run() -> u8 {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
@@ -274,6 +360,13 @@ pub fn run() -> u8 {
             }
             for path in &report.renamed {
                 println!("{}·{} renamed legacy → {}", p.dim, p.reset, path.display());
+            }
+            for (path, err) in &report.rename_failures {
+                eprintln!(
+                    "cadence-hooks migrate-config: its section was written, but renaming {} failed: {err} — \
+                     remove or rename it by hand (a re-run will not retry it)",
+                    path.display()
+                );
             }
             for (section, reason) in &report.skipped {
                 // A bare "no legacy file" for both sections is the ordinary
@@ -305,7 +398,11 @@ pub fn run() -> u8 {
                     report.renamed.len()
                 );
             }
-            0
+            if report.rename_failures.is_empty() {
+                0
+            } else {
+                1
+            }
         }
         Err(msg) => {
             eprintln!("cadence-hooks migrate-config: {msg}");
@@ -549,6 +646,106 @@ mod tests {
         assert!(err.contains("could not be read"), "{err}");
         // Legacy file left in place (refused before any rename).
         assert!(claude.join("redaction.json").exists());
+    }
+
+    #[test]
+    fn a_failed_rename_keeps_the_rest_of_the_report() {
+        // A directory already sitting at the `.migrated` target makes that one
+        // rename fail, as root or not. The other rename and the written
+        // sections must still be reported (cameronsjo/cadence-hooks#314).
+        let dir = seed(
+            &[
+                ("terminology.json", r#"{"exemptions":[]}"#),
+                ("redaction.json", r#"{"allowlist":["x"]}"#),
+            ],
+            None,
+        );
+        let claude = dir.path().join(".claude");
+        let blocker = claude.join("redaction.json.migrated");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), "x").unwrap();
+
+        let report = migrate_claude_dir(&claude).expect("the write succeeded");
+        assert_eq!(report.written, vec!["terminology", "redaction"]);
+        assert_eq!(
+            report.renamed,
+            vec![claude.join("terminology.json.migrated")]
+        );
+        assert_eq!(
+            report.rename_failures.len(),
+            1,
+            "{:?}",
+            report.rename_failures
+        );
+        assert_eq!(report.rename_failures[0].0, claude.join("redaction.json"));
+        assert!(claude.join("redaction.json").exists(), "left in place");
+        assert_eq!(read_cadence(dir.path())["redaction"]["allowlist"][0], "x");
+    }
+
+    #[test]
+    fn write_atomically_replaces_the_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cadence.json");
+        std::fs::write(&path, "old").unwrap();
+        write_atomically(&path, b"new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != "cadence.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_replaces_a_symlink_instead_of_following_it() {
+        // The race the pre-write symlink check could not close: a link that
+        // appears after the check. The rename swaps the directory entry, so
+        // the link's target is never written.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.json");
+        std::fs::write(&target, "keep").unwrap();
+        let path = dir.path().join("cadence.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        write_atomically(&path, b"{}\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_applies_the_existing_mode_before_any_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".cadence.json.tmp");
+        let file = create_temp(&tmp, Some(std::fs::Permissions::from_mode(0o600))).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            meta.len(),
+            0,
+            "the mode is set while the file is still empty"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_keeps_the_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cadence.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomically(&path, b"new").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

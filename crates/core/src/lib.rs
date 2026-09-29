@@ -47,6 +47,19 @@ use std::io::{IsTerminal, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
 
+// Every panic guard in the workspace — the binary's `src/dispatch.rs` seam,
+// the logger wrapper below, and the per-check ones (`persist-plan-approval`,
+// `lint-plan-shape`, the guardrails wrapper) — relies on panics unwinding. Under
+// `panic = "abort"` (a common binary-size setting) each `catch_unwind` stops
+// catching and a guard's own bug kills the hook instead of failing open
+// (ADR-0001), with no test going red: cargo builds tests with unwind
+// regardless of the profile. Refuse to compile that configuration instead
+// (cameronsjo/cadence-hooks#762).
+#[cfg(panic = "abort")]
+compile_error!(
+    "cadence-hooks requires panic = \"unwind\": its fail-open panic guards use catch_unwind, which abort disables"
+);
+
 /// The hook event type determines output format for nudges.
 ///
 /// PreToolUse and PostToolUse use different JSON structures in the
