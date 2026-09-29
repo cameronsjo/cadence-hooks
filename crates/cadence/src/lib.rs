@@ -47,6 +47,8 @@ pub mod warn_instruction_narrative;
 pub mod warn_live_memory_write;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
+/// Nudge on a write that creates plugin-root `docs/` or `scripts/` content.
+pub mod warn_plugin_root_cruft;
 
 // Tests that write real marker files (#302) sandbox them through
 // `cadence_hooks_core::test_builders::with_marker_dir` — the ONE helper, over

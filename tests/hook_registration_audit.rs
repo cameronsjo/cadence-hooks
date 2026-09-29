@@ -316,6 +316,10 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    (
+        "cadence warn-plugin-root-cruft",
+        "cameronsjo/cadence-hooks#282",
+    ),
     ),
 ];
 

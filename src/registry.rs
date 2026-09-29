@@ -97,6 +97,9 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
     HookEntry {
         name: "warn-instruction-narrative",
         description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
@@ -109,6 +112,9 @@ pub const HOOKS: &[HookEntry] = &[
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "warn-plugin-root-cruft",
+        description: "Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace",
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
