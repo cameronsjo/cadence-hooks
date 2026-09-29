@@ -333,7 +333,7 @@ pub fn resolve_located_ships(ships: &[LocatedShip]) -> Vec<MarkerTarget> {
 struct ShipLookups {
     /// Per directory: `None` outside any repo, else the checkout root and its
     /// branch (`None` for a detached HEAD).
-    states: std::collections::HashMap<String, Option<(String, Option<String>)>>,
+    states: std::collections::HashMap<String, Option<(String, Option<String>, bool)>>,
     remotes: std::collections::HashMap<String, Vec<(String, String)>>,
     worktrees: std::collections::HashMap<(String, String), Option<String>>,
 }
@@ -347,11 +347,22 @@ impl ShipLookups {
             .states
             .entry(cwd_dir.to_string())
             .or_insert_with(|| {
-                GitState::resolve(Path::new(cwd_dir))
-                    .map(|state| (state.repo_root.to_string_lossy().into_owned(), state.branch))
+                GitState::resolve(Path::new(cwd_dir)).map(|state| {
+                    let on_default = state.branch.as_deref().is_some_and(|b| {
+                        match state.default_branch.as_deref() {
+                            Some(default) => b == default,
+                            None => matches!(b, "main" | "master"),
+                        }
+                    });
+                    (
+                        state.repo_root.to_string_lossy().into_owned(),
+                        state.branch,
+                        on_default,
+                    )
+                })
             })
             .clone();
-        let Some((root, branch)) = state else {
+        let Some((root, branch, on_default)) = state else {
             return cannot_check(
                 "the command runs outside a git checkout, so the branch it ships cannot be looked up"
                     .to_string(),
@@ -360,6 +371,17 @@ impl ShipLookups {
         let Some(cwd_branch) = branch else {
             return MarkerTarget::Unknown;
         };
+        // A PR number or URL from a checkout on the default branch names a PR
+        // whose branch is elsewhere; the command text cannot say which, and
+        // looking it up would be a network call (cadence-hooks#1005). Say so
+        // rather than judging the default branch's (absent) marker.
+        if !target.names_another_target() && target.names_pr && on_default {
+            return cannot_check(
+                "the command names a PR by number or URL from a checkout on the default branch, \
+                 so that PR's own branch cannot be looked up from here"
+                    .to_string(),
+            );
+        }
         if !target.names_another_target() {
             return MarkerTarget::Local {
                 work_dir: cwd_dir.to_string(),
@@ -2110,6 +2132,7 @@ mod tests {
             repos: repos.iter().map(|r| r.to_string()).collect(),
             host: host.map(str::to_string),
             head,
+            ..Default::default()
         }
     }
 
@@ -2399,6 +2422,81 @@ mod tests {
             resolve_ship_target(&ShipTarget::default(), Some(gone.to_str().unwrap())),
             MarkerTarget::CannotCheck { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_ship_target_numbered_pr_from_the_default_branch_cannot_check() {
+        // cadence-hooks#1005 (option 2, narrowed): `gh pr ready 6` run from a
+        // checkout on the default branch cannot be judged on that branch — the
+        // PR's own branch is elsewhere and no network lookup is made. A
+        // feature-branch cwd, or no selector, keeps the local judgment.
+        // (selector names a PR?, cwd branch, expect cannot-check)
+        let cases = [
+            (true, "main", true),
+            (true, "master", true),
+            (true, "feat/x", false),
+            (false, "main", false),
+            (false, "feat/x", false),
+        ];
+        for (names_pr, branch, want_cannot) in cases {
+            let (repo, _root) = init_repo_on_branch(branch);
+            let t = ShipTarget {
+                names_pr,
+                ..Default::default()
+            };
+            let got = resolve_ship_target(&t, Some(repo.path().to_str().unwrap()));
+            match (want_cannot, &got) {
+                (true, MarkerTarget::CannotCheck { reason }) => {
+                    assert!(reason.contains("default branch"), "{reason}");
+                }
+                (false, MarkerTarget::Local { .. }) => {}
+                _ => panic!("names_pr={names_pr} on {branch}: got {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_ship_target_honors_origin_head_for_the_default_branch() {
+        // A repo whose default is `trunk` (origin/HEAD says so): `main` is
+        // then a feature branch, `trunk` is the default.
+        let (repo, _root) = init_repo_on_branch("trunk");
+        let dir = repo.path().to_str().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        let t = ShipTarget {
+            names_pr: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_ship_target(&t, Some(dir)),
+            MarkerTarget::CannotCheck { .. }
+        ));
+        git(&["checkout", "-q", "-b", "main"]);
+        assert!(
+            matches!(
+                resolve_ship_target(&t, Some(dir)),
+                MarkerTarget::Local { .. }
+            ),
+            "with origin/HEAD naming trunk, `main` is an ordinary branch"
+        );
     }
 
     // --- read_polish_marker / PolishRecord (#467) ---

@@ -288,3 +288,35 @@ fn a_skip_cannot_be_combined_with_a_run_record() {
         assert_eq!(recorded.status.code(), Some(2), "{extra:?}: {recorded:?}");
     }
 }
+
+#[test]
+fn a_numbered_pr_from_the_default_branch_gets_the_cannot_check_advisory() {
+    // cadence-hooks#1005: `gh pr ready 6` from a checkout on the default
+    // branch cannot be judged on that branch, and no gh lookup is made.
+    let (_scratch, repo, markers) = repo("numbered-default");
+    git_in(&repo, &["checkout", "-q", "main"]);
+    for command in [
+        "gh pr ready 6",
+        "gh pr ready https://github.com/own/repo/pull/6",
+    ] {
+        let gated = gate(&markers, &repo, command);
+        assert_eq!(gated.status.code(), Some(0), "{gated:?}");
+        let out = stdout(&gated);
+        assert!(out.contains("Can't check polish"), "{command}: {out}");
+        assert!(!out.contains("No polish recorded"), "{command}: {out}");
+    }
+}
+
+#[test]
+fn a_numbered_pr_from_a_feature_branch_keeps_its_local_judgment() {
+    let (_scratch, repo, markers) = repo("numbered-feature");
+    let gated = gate(&markers, &repo, "gh pr ready 6");
+    assert!(
+        stdout(&gated).contains("No polish recorded"),
+        "{}",
+        stdout(&gated)
+    );
+    assert_eq!(record(&markers, &repo, FULL_RECORD).status.code(), Some(0));
+    let gated = gate(&markers, &repo, "gh pr ready 6");
+    assert_eq!(stdout(&gated), "", "a polished feature branch passes");
+}
