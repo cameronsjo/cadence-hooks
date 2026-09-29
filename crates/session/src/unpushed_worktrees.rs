@@ -61,6 +61,39 @@ use serde::{Deserialize, Serialize};
 /// warning renders, so a marker cannot grow the text without bound.
 pub const MAX_WORKTREES: usize = 16;
 
+/// How old a worktree's last commit may be before its unpushed commits are
+/// treated as parked rather than in flight (cadence-hooks#928). A branch nobody
+/// has committed to in two weeks and never pushed is a deliberate parking spot,
+/// and re-nudging it at every session end trains readers to ignore the line.
+///
+/// No explicit park marker exists in this codebase, so age is the only signal;
+/// a branch that goes quiet for this long and is then worked on again is
+/// simply reported again from its next commit.
+pub const PARKED_AFTER_DAYS: u64 = 14;
+
+/// True when a commit stamped `commit_epoch` (unix seconds) is more than
+/// [`PARKED_AFTER_DAYS`] older than `now_epoch`. A commit dated in the future
+/// (clock skew) is not parked: uncertainty keeps the nudge, the pre-#928
+/// behavior.
+pub fn is_parked(commit_epoch: u64, now_epoch: u64) -> bool {
+    now_epoch.saturating_sub(commit_epoch) > PARKED_AFTER_DAYS * 86_400
+}
+
+/// Seconds since the epoch of `dir`'s HEAD commit (committer date), or `None`
+/// when git could not answer — read as "not parked".
+fn head_commit_epoch(dir: &str) -> Option<u64> {
+    match git_output_detailed(dir, &["log", "-1", "--format=%ct", "HEAD"]) {
+        GitOutput::Ok(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// One worktree whose branch carries commits no remote has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnpushedWorktree {
@@ -272,7 +305,11 @@ pub fn scan(dir: &str) -> WorktreeScan {
     for entry in candidates.into_iter().take(MAX_WORKTREES) {
         let Some(branch) = entry.branch else { continue };
         match unpushed_count(&entry.path, has_remote_refs) {
-            Ok(Some(commits)) if commits > 0 => {
+            Ok(Some(commits))
+                if commits > 0
+                    && !head_commit_epoch(&entry.path)
+                        .is_some_and(|epoch| is_parked(epoch, now_epoch())) =>
+            {
                 scan.unpushed.push(UnpushedWorktree {
                     path: canonical_path(&entry.path),
                     branch,
@@ -422,6 +459,47 @@ detached
             git_in(&path, &["commit", "-q", "-m", "work"]);
         }
         path
+    }
+
+    #[test]
+    fn is_parked_table() {
+        // cadence-hooks#928: (commit age in days, parked?)
+        let now = 1_800_000_000u64;
+        for (days, want) in [
+            (0u64, false),
+            (13, false),
+            (14, false),
+            (15, true),
+            (400, true),
+        ] {
+            assert_eq!(is_parked(now - days * 86_400, now), want, "{days} days");
+        }
+        assert!(
+            !is_parked(now + 86_400, now),
+            "a future stamp is not parked"
+        );
+    }
+
+    #[test]
+    fn a_branch_whose_last_commit_is_older_than_the_cutoff_is_not_reported() {
+        let scratch = Scratch::new(&scratch_root(), "parked");
+        let repo = repo_with_remote(&scratch);
+        let old = worktree_with_commits(&repo, "old", "feat/old", 1);
+        let fresh = worktree_with_commits(&repo, "fresh", "feat/fresh", 1);
+        // Re-stamp the old branch's only commit 30 days back.
+        let stamp = format!("{} +0000", now_epoch() - 30 * 86_400);
+        let ok = std::process::Command::new("git")
+            .args(["commit", "-q", "--amend", "--no-edit", "--date", &stamp])
+            .env("GIT_COMMITTER_DATE", &stamp)
+            .current_dir(&old)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+
+        let scan = scan(&repo.to_string_lossy());
+        let branches: Vec<&str> = scan.unpushed.iter().map(|w| w.branch.as_str()).collect();
+        assert_eq!(branches, vec!["feat/fresh"], "{scan:?} ({fresh:?})");
     }
 
     #[test]

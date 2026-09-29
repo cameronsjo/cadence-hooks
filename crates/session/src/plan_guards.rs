@@ -426,6 +426,11 @@ fn windowed_flips(command: &str) -> Vec<Vec<String>> {
 /// leaves no token behind and is not seen.
 fn flips_the_cwd_branch(tokens: &[String], cwd: &str, branch: &str) -> bool {
     let mut target = ship_target(tokens);
+    // The polish gate reads a numbered PR from the default branch as
+    // "cannot check" (cadence-hooks#1005). This guard's documented reading is
+    // the opposite — a number in the cwd's own repo IS a flip of this branch's
+    // PR — so it opts out of that rule.
+    target.names_pr = false;
     match pr_selector(tokens) {
         PrSelector::None | PrSelector::Number(_) => {}
         PrSelector::Url {
