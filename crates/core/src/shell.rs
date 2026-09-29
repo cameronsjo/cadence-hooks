@@ -4943,7 +4943,16 @@ fn shell_c_argument(segment: &str) -> Option<String> {
 /// its own fixed set, so peeling `git`'s globals here would resolve a
 /// subcommand name into an executable position it never occupies. Callers that
 /// want that peel ask for it by name, via [`skip_git_global_options`].
-pub const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
+///
+/// `setsid` runs its operand in a new session with stdout untouched, so
+/// `setsid sops -d secrets.yaml | grep x` prints the plaintext exactly as the
+/// bare decrypt does; outside this list it stayed the command word and hid the
+/// verb from every gate that peels here (cadence-hooks#1090). Its grammar is
+/// three argument-free flags; `-h`/`-V` print and exit, so they stay unlisted
+/// and refuse the peel.
+pub const COMMAND_RUNNERS: &[&str] = &[
+    "sudo", "xargs", "nice", "stdbuf", "timeout", "env", "setsid",
+];
 
 /// Peel transparent prefixes and command runners off the front of an executable
 /// position, returning the slice that begins at the command that will run.
@@ -5095,6 +5104,12 @@ const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
 const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
 const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
 
+/// `setsid`'s options (util-linux): `-c`/`--ctty`, `-f`/`--fork`,
+/// `-w`/`--wait`, none taking a value. `-h`/`--help` and `-V`/`--version` never
+/// run the command, so they are left out and refuse the walk.
+const SETSID_NO_ARGUMENT_SHORT_FLAGS: &str = "cfw";
+const SETSID_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ctty", "--fork", "--wait"];
+
 /// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
 /// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
 /// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
@@ -5175,6 +5190,12 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
             TIMEOUT_NO_ARGUMENT_LONG_FLAGS,
             TIMEOUT_VALUE_LONG_FLAGS,
         ),
+        "setsid" => (
+            SETSID_NO_ARGUMENT_SHORT_FLAGS,
+            "",
+            SETSID_NO_ARGUMENT_LONG_FLAGS,
+            &[] as &[&str],
+        ),
         "env" => (
             ENV_NO_ARGUMENT_SHORT_FLAGS,
             ENV_VALUE_SHORT_FLAGS,
@@ -5202,7 +5223,7 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
 /// Walk a command runner's OWN options, returning the slice that begins at the
 /// command it will run — or `None` when a token cannot be classified, in which
 /// case the caller must not peel further. Modelled runners: `sudo`, `xargs`,
-/// `nice`, `stdbuf`, `timeout`, `env`, and `git` (whose "command" is its
+/// `nice`, `stdbuf`, `timeout`, `env`, `setsid`, and `git` (whose "command" is its
 /// subcommand); any other verb returns `None`.
 ///
 /// **This is now the ONLY runner walk, and the sudo-specific one it replaced is
@@ -9475,6 +9496,13 @@ mod tests {
             ("nice -n 10 env -i sudo -u me rm", Some("rm")),
             ("command nice -n 10 rm", Some("rm")),
             ("FOO=1 nice -n 10 rm", Some("rm")),
+            // cadence-hooks#1090: `setsid` runs its operand; `-h`/`-V` do not,
+            // so they refuse the walk.
+            ("setsid rm", Some("rm")),
+            ("setsid -w -f rm", Some("rm")),
+            ("setsid --wait -- rm", Some("rm")),
+            ("/usr/bin/setsid -c rm", Some("rm")),
+            ("setsid -V rm", Some("setsid")),
             // `git` is NOT a command runner: it runs a subcommand from its own
             // fixed set, so peeling its globals here would drop a subcommand
             // name into an executable position it never occupies.
