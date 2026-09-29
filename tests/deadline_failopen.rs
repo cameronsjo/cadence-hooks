@@ -10,6 +10,8 @@
 //! wiring is exercised, not a unit seam.
 #![cfg(unix)]
 
+mod support;
+
 use cadence_hooks_core::git_fixtures::{Scratch, git_in};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +19,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn cadence_hooks() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    support::cadence_hooks()
 }
 
 /// Write an executable `git` into `dir` that sleeps far past any test budget.

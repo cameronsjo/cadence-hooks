@@ -4,11 +4,13 @@
 //! The interactive multi-select cannot be tested without a TTY,
 //! so we focus on the non-interactive paths.
 
+mod support;
+
 use std::fs;
 use std::process::Command;
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");

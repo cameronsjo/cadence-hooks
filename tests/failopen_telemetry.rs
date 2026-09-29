@@ -12,11 +12,13 @@
 //! Those two tests therefore only pass against a debug build, which is what
 //! `cargo test` produces.
 
+mod support;
+
 use std::io::Write;
 use std::process::{Command, Output};
 
 fn cadence_hooks() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    support::cadence_hooks()
 }
 
 fn failopen_rows(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
@@ -34,14 +36,6 @@ fn read_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
     }
 }
 
-/// How long the parent stalls before feeding the child stdin. Both dispatch
-/// wrappers start their timer *before* the blocking stdin read, so this stall
-/// lands inside the measured span and puts `elapsed_ms` deterministically above
-/// the zeroed threshold below — without it a panicking dispatch clocks 0 ms and
-/// `log_timing`'s strict `>` writes nothing, which would make the
-/// "dispatch resumed" assertion vacuous rather than merely flaky.
-const STDIN_STALL: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// Run the binary with `{}` on stdin and the synthetic panic trigger armed,
 /// against a fresh metrics dir. Returns the process output plus the dir, so a
 /// caller can read both `failopen.jsonl` and `hooks.jsonl` from it.
@@ -58,7 +52,6 @@ fn run_with_panic_armed(args: &[&str]) -> (Output, tempfile::TempDir) {
     cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().expect("failed to spawn binary");
-    std::thread::sleep(STDIN_STALL);
     if let Some(ref mut stdin) = child.stdin {
         match stdin.write_all(b"{}") {
             Ok(()) => {}

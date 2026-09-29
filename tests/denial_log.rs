@@ -7,11 +7,13 @@
 //! an unwritable metrics dir proves the write is fail-open and never perturbs
 //! the block (ADR-0001).
 
+mod support;
+
 use std::io::Write;
 use std::process::{Command, Output};
 
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     // Isolate from the test runner's session env so the block output and the
     // logging decision are deterministic.
     cmd.env_remove("CADENCE_BYPASS");
