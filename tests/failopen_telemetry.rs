@@ -259,3 +259,66 @@ fn a_panicking_logger_still_exits_zero() {
         "the timing write after the guard still ran: {timings:?}"
     );
 }
+
+/// Pipe `payload` to `args` against a fresh metrics dir; return the dir.
+fn run_with_payload(args: &[&str], payload: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = cadence_hooks()
+        .args(args)
+        .env("CADENCE_METRICS_DIR", tmp.path())
+        .env_remove("CADENCE_DISABLE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().expect("failed to wait on binary");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "drift never changes the exit code"
+    );
+    tmp
+}
+
+/// #364: an object whose declared field mismatches writes one `schema_drift`
+/// row naming only the key, on both the check and the logger dispatch paths.
+#[test]
+fn object_shaped_mismatch_writes_schema_drift_row() {
+    let secret = "never-copy-this-value";
+    let payload = format!(
+        r#"{{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{{"command":"ls"}},"tool_response":{{"stdout":{{"t":"{secret}"}}}}}}"#
+    );
+    for args in [
+        &["metrics", "log-subagent"][..],
+        &["cadence", "git-safety"][..],
+    ] {
+        let tmp = run_with_payload(args, &payload);
+        let rows = failopen_rows(tmp.path());
+        assert_eq!(rows.len(), 1, "{args:?}: {rows:?}");
+        assert_eq!(rows[0]["reason"], "schema_drift");
+        assert_eq!(rows[0]["subcommand"], args[1]);
+        assert_eq!(
+            rows[0]["error"],
+            "tool_response: object did not match its typed shape"
+        );
+        let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+        assert!(!raw.contains(secret), "no payload value reaches the ledger");
+    }
+}
+
+/// #364: expected per-tool variance (a non-object response) stays silent.
+#[test]
+fn non_object_tool_response_writes_no_failopen_row() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Read","tool_response":"contents"}"#;
+    for args in [
+        &["metrics", "log-subagent"][..],
+        &["cadence", "git-safety"][..],
+    ] {
+        let tmp = run_with_payload(args, payload);
+        assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
+    }
+}
