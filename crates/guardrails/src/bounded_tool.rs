@@ -1,17 +1,18 @@
 //! Bounded runner for the external tools the advisory nudges query (`gh`,
 //! `chezmoi`).
 //!
-//! Every spawn goes through [`run_bounded_with`], the same wall-clock bound
+//! Every spawn goes through [`run_bounded_capped`], the same wall-clock bound
 //! the git probes use, capped at [`TOOL_CAP`] and never past what the shared
 //! per-invocation budget ([`cadence_hooks_core::deadline`]) has left. A tool
 //! that stalls on the network or a lock is killed and reaped in time for the
 //! hook to exit on its own, instead of the external hooks.json timeout
-//! killing it from outside. Every failure — spawn error, non-zero exit,
+//! killing it from outside. Stdout is capped at [`MAX_STDOUT`], so a tool
+//! that loops output is killed at the cap rather than filling memory. Every failure — spawn error, non-zero exit,
 //! timeout, truncated output — is `None`, and the callers read `None` as
 //! "stay silent" (ADR-0001).
 
 use cadence_hooks_core::deadline::{self, BudgetState};
-use cadence_hooks_core::shell::{GitSpawn, run_bounded_with};
+use cadence_hooks_core::shell::{GitSpawn, run_bounded_capped};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -24,12 +25,16 @@ use crate::warn_unreviewed_ready_flip::GhRunner;
 /// nudges, and no nudge is worth an unbounded wait.
 pub const TOOL_CAP: Duration = Duration::from_millis(2000);
 
+/// The most stdout one tool call may return. The largest legitimate answer
+/// (a 100-node GraphQL page, a `chezmoi status` listing) is far below it.
+pub const MAX_STDOUT: usize = 1024 * 1024;
+
 /// The timeout for the next tool spawn, or `None` when the shared budget is
 /// already spent.
-fn next_timeout() -> Option<Duration> {
+fn next_timeout(program: &'static str) -> Option<Duration> {
     match deadline::state() {
         BudgetState::Armed(remaining) if remaining.is_zero() => {
-            deadline::note_hit();
+            deadline::note_hit_by(program);
             None
         }
         BudgetState::Armed(remaining) => Some(remaining.min(TOOL_CAP)),
@@ -41,17 +46,24 @@ fn next_timeout() -> Option<Duration> {
 /// Run `program args…` in `cwd` with `env` added, returning trimmed stdout on
 /// a zero exit and `None` on anything else.
 pub fn run_tool(
-    program: &str,
+    program: &'static str,
     args: &[&str],
     cwd: &std::path::Path,
     env: &[(String, String)],
 ) -> Option<String> {
-    let timeout = next_timeout()?;
+    let timeout = next_timeout(program)?;
     let mut cmd = Command::new(program);
     cmd.current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .args(args);
-    match run_bounded_with(&mut cmd, timeout) {
+    let was_hit = deadline::hit();
+    let result = run_bounded_capped(&mut cmd, timeout, Some(MAX_STDOUT));
+    // The runner records a bare deadline hit; when this spawn is what hit
+    // it, name the tool so the exit breadcrumb does not blame git.
+    if !was_hit && deadline::hit() {
+        deadline::note_hit_by(program);
+    }
+    match result {
         GitSpawn::Completed(out) if out.status.success() => {
             Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
@@ -107,6 +119,18 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(run_tool("sleep", &["10"], &dir, &[]), None);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_loops_output_is_cut_off_at_the_byte_cap() {
+        let dir = std::env::temp_dir();
+        let started = std::time::Instant::now();
+        assert_eq!(run_tool("yes", &[], &dir, &[]), None);
+        assert!(
+            started.elapsed() < TOOL_CAP,
+            "the byte cap, not the wall-clock cap, must end the run"
+        );
     }
 
     #[cfg(unix)]

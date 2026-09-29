@@ -19,12 +19,18 @@
 //! `--include`, the message says so and suggests `chezmoi apply <file>` or
 //! `--include=files`. An unscoped apply over a clean tree stays silent.
 //!
-//! **What is never run.** `chezmoi status` evaluates templates, so the hook
-//! runs it only in the default configuration: an apply carrying a flag that
-//! relocates the source, destination, config, or state (`-S`, `-D`, `-c`,
-//! `-W`, `--cache`, `--persistent-state`, `--override-data*`) is left alone
-//! rather than letting command text choose what executes before the user
-//! approves the command. A dry run (`-n`) writes nothing and is skipped.
+//! **What is never run.** `chezmoi status` evaluates templates, so running it
+//! means running the user's own source-state templates (and anything they
+//! shell out to) *before* the user has approved the apply. The hook accepts
+//! that only in the default configuration, where those templates are the
+//! same ones every `chezmoi` command already runs: an apply carrying a flag
+//! that relocates the source, destination, config, or state (`-S`, `-D`,
+//! `-c`, `-W`, `--cache`, `--persistent-state`, `--override-data*`), or that
+//! changes what status would answer (`--init`, `--source-path`,
+//! `-P`/`--parent-dirs`, `--interactive`), or that runs under a `VAR=value`
+//! or `env` prefix (`HOME=`, `XDG_CONFIG_HOME=`, `CHEZMOI_*`), is left alone
+//! rather than letting command text choose what executes before approval. A
+//! dry run (`-n`) writes nothing and is skipped.
 //!
 //! Advisory only, and fails open (ADR-0001): `chezmoi` absent from `PATH`, a
 //! non-zero exit, a timeout, or unreadable output all mean silence — never a
@@ -32,7 +38,8 @@
 //! ([`crate::bounded_tool`]).
 
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, skip_transparent_prefixes,
+    command_segments, command_word, executable_tokens, is_assignment_word,
+    skip_transparent_prefixes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
@@ -81,6 +88,15 @@ const RELOCATING_FLAGS: &[&str] = &[
     "--persistent-state",
     "--override-data",
     "--override-data-file",
+    // Not relocating, but each makes the default `chezmoi status` the wrong
+    // question: `--init` regenerates the config first, `--source-path` and
+    // `-P`/`--parent-dirs` change what the targets mean, and `--interactive`
+    // has the user decide per file.
+    "--init",
+    "--source-path",
+    "-P",
+    "--parent-dirs",
+    "--interactive",
 ];
 
 /// One `chezmoi apply` as the hook reads it.
@@ -120,6 +136,15 @@ fn is_short_dry_run(token: &str) -> bool {
     })
 }
 
+/// True for a short boolean cluster carrying `P` (`-P`, `-vP`).
+fn is_short_parent_dirs(token: &str) -> bool {
+    token.strip_prefix('-').is_some_and(|c| {
+        !c.starts_with('-')
+            && c.contains('P')
+            && c.bytes().all(|b| matches!(b, b'n' | b'v' | b'k' | b'P'))
+    })
+}
+
 /// Read the `chezmoi apply` in one segment's argv (starting at `chezmoi`).
 fn read_apply(argv: &[String]) -> Option<ApplyCall> {
     let mut call = ApplyCall::default();
@@ -135,7 +160,7 @@ fn read_apply(argv: &[String]) -> Option<ApplyCall> {
         }
         if token.starts_with('-') && token.len() > 1 {
             let (name, attached) = split_flag(token);
-            if RELOCATING_FLAGS.contains(&name) {
+            if RELOCATING_FLAGS.contains(&name) || is_short_parent_dirs(token) {
                 call.relocated = true;
             }
             if name == "--dry-run" || is_short_dry_run(token) {
@@ -181,7 +206,18 @@ pub fn apply_calls(command: &str) -> Vec<ApplyCall> {
             if command_word(argv.first()?).as_ref() != "chezmoi" {
                 return None;
             }
-            read_apply(argv)
+            let mut call = read_apply(argv)?;
+            // `HOME=… chezmoi apply`, `CHEZMOI_…=…`, `env X=… chezmoi`: the
+            // apply runs in an environment the hook's own status would not
+            // share, so treat it like a relocating flag.
+            let prefix = &tokens[..tokens.len() - argv.len()];
+            if prefix
+                .iter()
+                .any(|t| is_assignment_word(t) || command_word(t).as_ref() == "env")
+            {
+                call.relocated = true;
+            }
+            Some(call)
         })
         .collect()
 }
@@ -265,6 +301,24 @@ fn drift_in_scope(call: &ApplyCall, drift: &[String], cwd: &Path, home: &Path) -
         .collect()
 }
 
+/// The most characters of one status path the nudge shows.
+const MAX_SHOWN_PATH: usize = 200;
+
+/// A status path made safe for model-facing text: control characters and
+/// backticks dropped, clamped to [`MAX_SHOWN_PATH`] characters.
+fn clamp_path(path: &str) -> String {
+    let clean: String = path
+        .chars()
+        .filter(|c| !c.is_control() && *c != '`')
+        .collect();
+    if clean.chars().count() > MAX_SHOWN_PATH {
+        let cut: String = clean.chars().take(MAX_SHOWN_PATH).collect();
+        format!("{cut}…")
+    } else {
+        clean
+    }
+}
+
 /// Core decision, given the apply and a lazy `chezmoi status` probe.
 pub fn evaluate(
     call: &ApplyCall,
@@ -283,7 +337,7 @@ pub fn evaluate(
     let shown = hits
         .iter()
         .take(5)
-        .map(|p| format!("~/{p}"))
+        .map(|p| format!("~/{}", clamp_path(p)))
         .collect::<Vec<_>>()
         .join(", ");
     let more = if hits.len() > 5 {
@@ -420,6 +474,16 @@ mod tests {
             "chezmoi apply -n",
             "chezmoi apply --dry-run",
             "chezmoi -nv apply",
+            "chezmoi apply --init",
+            "chezmoi apply --source-path src/dot_zshrc",
+            "chezmoi apply -P ~/.config/app/a.toml",
+            "chezmoi apply --parent-dirs ~/.config/app/a.toml",
+            "chezmoi apply -vP ~/.config/app/a.toml",
+            "chezmoi apply --interactive",
+            "HOME=/tmp/h chezmoi apply",
+            "XDG_CONFIG_HOME=/tmp/x chezmoi apply",
+            "CHEZMOI_SOURCE_DIR=/tmp/s chezmoi apply",
+            "env HOME=/tmp/h chezmoi apply",
         ] {
             let calls = apply_calls(cmd);
             let call = calls.first().expect(cmd);
@@ -431,6 +495,17 @@ mod tests {
                 "{cmd}"
             );
         }
+    }
+
+    #[test]
+    fn shown_paths_are_clamped_and_stripped_of_control_characters() {
+        let long = "a".repeat(500);
+        let status = format!("MM .x\u{1b}[31m`evil`\nMM {long}\n");
+        let msg = eval("chezmoi apply", Some(&status)).expect("nudge");
+        assert!(!msg.contains('\u{1b}'), "{msg:?}");
+        assert!(!msg.contains("`evil`"), "{msg}");
+        assert!(msg.contains(&format!("~/{}…", "a".repeat(200))), "{msg}");
+        assert!(!msg.contains(&"a".repeat(201)), "{msg}");
     }
 
     #[test]

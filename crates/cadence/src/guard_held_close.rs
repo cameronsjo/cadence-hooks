@@ -33,8 +33,11 @@
 //! Deliberately let through, each for a stated reason: a non-literal selector
 //! whose value never appears in the command text (read from a file or a
 //! pipe); `gh issue close` behind a prefix the shared walk does not peel
-//! (`xargs`, `sudo`); and closes that do not go through `gh issue close` at
-//! all (`gh api -X PATCH …/issues/N`, a merged PR's closing keyword). The
+//! (`xargs`, `sudo`, `timeout`, `env -i`); a gh alias that expands to a close
+//! (the alias name is not `issue close` in the command text); and every route
+//! that ends or removes an issue without `gh issue close` — `gh issue delete`,
+//! `gh issue transfer`, `gh api -X PATCH …/issues/N -f state=closed`, a
+//! GraphQL `closeIssue` mutation, and a merged PR's closing keyword. The
 //! guard's own failure to read the ledger allows (ADR-0001).
 
 use cadence_hooks_core::shell::{
@@ -120,18 +123,28 @@ enum Candidate {
     Url(Slug, u64),
 }
 
-/// Read `N`, `#N`, or an `http(s)://HOST/OWNER/REPO/issues/N[…]` URL.
+/// Strip a case-insensitive `prefix` from `s`.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// Read `N`, `#N`, `+N` (gh's `strconv.Atoi` accepts a leading `+`), or an
+/// `http(s)://HOST/OWNER/REPO/issues/N[…]` URL, scheme and path segment
+/// matched case-insensitively.
 fn candidate(token: &str) -> Option<Candidate> {
     let bare = token.strip_prefix('#').unwrap_or(token);
+    let bare = bare.strip_prefix('+').unwrap_or(bare);
     if !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_digit()) {
         return bare.parse().ok().map(Candidate::Number);
     }
-    let rest = token
-        .strip_prefix("https://")
-        .or_else(|| token.strip_prefix("http://"))?;
+    let rest = strip_prefix_ci(token, "https://").or_else(|| strip_prefix_ci(token, "http://"))?;
     let parts: Vec<&str> = rest.split(['/', '?', '#']).collect();
     match parts.as_slice() {
-        [_host, owner, repo, "issues", number, ..] if is_name(owner) && is_name(repo) => {
+        [_host, owner, repo, issues, number, ..]
+            if issues.eq_ignore_ascii_case("issues") && is_name(owner) && is_name(repo) =>
+        {
             let n = number.parse().ok()?;
             Some(Candidate::Url(
                 (owner.to_ascii_lowercase(), repo.to_ascii_lowercase()),
@@ -403,6 +416,21 @@ mod tests {
         assert_eq!(
             hits("gh -R github.com/cameronsjo/cadence issue close 107", &[]),
             ["cameronsjo/cadence#107"]
+        );
+    }
+
+    #[test]
+    fn plus_signed_numbers_and_uppercase_url_schemes_are_read() {
+        assert_eq!(
+            hits("gh issue close +354 -R cameronsjo/cadence-ecosystem", &[]),
+            ["cameronsjo/cadence-ecosystem#354"]
+        );
+        assert_eq!(
+            hits(
+                "gh issue close HTTPS://GitHub.com/cameronsjo/cadence-ecosystem/Issues/354",
+                &[]
+            ),
+            ["cameronsjo/cadence-ecosystem#354"]
         );
     }
 

@@ -2998,7 +2998,25 @@ pub enum GitQuery {
 /// the reader a budget and takes whatever bytes have arrived, returning
 /// [`GitSpawn::Truncated`] when EOF was never observed.
 pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
+    run_bounded_capped(cmd, timeout, None)
+}
+
+/// [`run_bounded_with`] with an optional cap on collected stdout.
+///
+/// With `max_stdout: Some(limit)`, the reader stops once more than `limit`
+/// bytes have arrived: the child is killed and reaped and the call returns
+/// [`GitSpawn::Truncated`] holding at most `limit` bytes, so a tool that loops
+/// output costs bounded memory and returns promptly instead of filling RAM
+/// until the wall-clock bound. Overflow is not a deadline hit and is not
+/// recorded as one. `None` keeps the uncapped behaviour the git probes rely
+/// on.
+pub fn run_bounded_capped(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    max_stdout: Option<usize>,
+) -> GitSpawn {
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
@@ -3024,9 +3042,13 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
     // closure and no clone is kept here: a sender alive in the parent would
     // never disconnect, turning every drain into a full-budget stall.
     let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // Set by the reader when `max_stdout` is exceeded; checked before any
+    // "complete" verdict so a capped read never reports as Completed.
+    let overflow = Arc::new(AtomicBool::new(false));
     let done = child.stdout.take().map(|mut out| {
         let (tx, rx) = mpsc::channel::<()>();
         let sink = Arc::clone(&sink);
+        let overflow = Arc::clone(&overflow);
         // The thread is deliberately leaked when it is still blocked on a read
         // the orphan holds open — joining it IS the hang this function exists
         // to avoid. Bounded in practice for hooks, which are short-lived
@@ -3044,10 +3066,18 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
                     // parity with the previous `read_to_end`, which also
                     // discarded its error, and is kept deliberately.
                     Ok(0) | Err(_) => break,
-                    Ok(n) => sink
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let mut buf = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match max_stdout {
+                            Some(limit) if buf.len() + n > limit => {
+                                let room = limit.saturating_sub(buf.len());
+                                buf.extend_from_slice(&chunk[..room]);
+                                overflow.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            _ => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                 }
             }
             let _ = tx.send(());
@@ -3076,10 +3106,30 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
 
     let started = std::time::Instant::now();
     loop {
+        if overflow.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let status = child.wait();
+            let _ = drained(Duration::ZERO);
+            return match status {
+                Ok(status) => GitSpawn::Truncated(std::process::Output {
+                    status,
+                    stdout: bytes_so_far(),
+                    stderr: Vec::new(),
+                }),
+                Err(_) => GitSpawn::SpawnFailed,
+            };
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
                 let complete = drained(budget);
+                if overflow.load(Ordering::SeqCst) {
+                    return GitSpawn::Truncated(std::process::Output {
+                        status,
+                        stdout: bytes_so_far(),
+                        stderr: Vec::new(),
+                    });
+                }
                 let output = std::process::Output {
                     status,
                     stdout: bytes_so_far(),
@@ -6484,6 +6534,44 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_unbounded_output_is_truncated_at_the_limit_and_returns_promptly() {
+        // `yes` never stops writing; uncapped, this is the ~1.9 GB RSS case.
+        let mut cmd = Command::new("yes");
+        let started = std::time::Instant::now();
+        let result = run_bounded_capped(
+            &mut cmd,
+            std::time::Duration::from_secs(10),
+            Some(64 * 1024),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "an overflow must end the run, not wait out the timeout"
+        );
+        match result {
+            GitSpawn::Truncated(out) => assert_eq!(out.stdout.len(), 64 * 1024),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_output_under_the_limit_completes() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf abc"]);
+        match run_bounded_capped(&mut cmd, std::time::Duration::from_secs(10), Some(3)) {
+            GitSpawn::Completed(out) => assert_eq!(out.stdout, b"abc"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf abcd"]);
+        assert!(matches!(
+            run_bounded_capped(&mut cmd, std::time::Duration::from_secs(10), Some(3)),
+            GitSpawn::Truncated(_)
+        ));
     }
 
     #[cfg(unix)]

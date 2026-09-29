@@ -12,7 +12,7 @@
 //! - `git push <remote> --delete <branch>…` / `-d` / `:<branch>`, read by the
 //!   shared push walk ([`push_invocations`]). The remote is resolved from
 //!   local git config (`git remote get-url`), or read directly when it is a
-//!   URL.
+//!   URL. Either way its host must be `github.com` or `origin`'s host.
 //! - `gh pr merge --delete-branch` / `-d`: the PR is resolved exactly as the
 //!   ready-flip guards resolve it ([`FlipTarget`], [`resolve_pr`]) and its
 //!   head branch is the one deleted. A cross-repository (fork) PR is skipped:
@@ -22,8 +22,9 @@
 //! `baseRefName` equal to it. Any hit nudges, naming the PR numbers and the
 //! retarget command. Advisory only — deleting a branch nothing bases on is
 //! the ordinary case — and fails open (ADR-0001) on every error. gh is never
-//! pointed at a host the command text alone names unless it is `github.com`
-//! or `origin`'s host, and every gh call is bounded ([`crate::bounded_tool`]).
+//! pointed at a host other than `github.com` or `origin`'s host, whether the
+//! command names it or a non-origin remote's URL does, and every gh call is
+//! bounded ([`crate::bounded_tool`]).
 
 use cadence_hooks_core::shell::{
     gh_pr_segments, gh_pr_subcommand, git_command, host_and_repo_from_url, push_invocations,
@@ -169,21 +170,18 @@ fn is_safe_remote_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Resolve a push's repository argument to `(host, owner, name, from_config)`.
-fn resolve_remote(work_dir: &str, repository: &str) -> Option<(String, String, String, bool)> {
-    let (url, from_config) = if repository.contains("://") || repository.contains('@') {
-        (repository.to_string(), false)
+/// Resolve a push's repository argument to `(host, owner, name)`.
+fn resolve_remote(work_dir: &str, repository: &str) -> Option<(String, String, String)> {
+    let url = if repository.contains("://") || repository.contains('@') {
+        repository.to_string()
     } else if is_safe_remote_name(repository) {
-        (
-            git_command(work_dir, &["remote", "get-url", repository])?,
-            true,
-        )
+        git_command(work_dir, &["remote", "get-url", repository])?
     } else {
         return None;
     };
     let (host, slug) = host_and_repo_from_url(&url)?;
     let (owner, name) = slug.split_once('/')?;
-    Some((host, owner.to_string(), name.to_string(), from_config))
+    Some((host, owner.to_string(), name.to_string()))
 }
 
 /// Nudges when a branch delete would close PRs based on it.
@@ -204,54 +202,61 @@ impl WarnStackedBaseDelete {
     }
 
     fn run_push(input: &HookInput, command: &str) -> Option<String> {
-        let cwd_fallback = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| ".".to_string());
-        let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-        for push in push_invocations(command, cwd) {
-            let branches: Vec<String> = push
-                .refspecs
-                .iter()
-                .filter(|r| r.is_delete)
-                .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
-                .collect();
-            if branches.is_empty() || push.unresolved {
-                continue;
-            }
-            let Some(repository) = push.repository.as_deref() else {
-                continue;
-            };
-            let Some((host, owner, name, from_config)) = resolve_remote(&push.work_dir, repository)
-            else {
-                continue;
-            };
-            // A URL typed in the command is not local config: query only a
-            // host the user already trusts.
-            if !from_config {
-                let origin_host = git_command(&push.work_dir, &["remote", "get-url", "origin"])
-                    .and_then(|u| host_and_repo_from_url(&u))
-                    .map(|(h, _)| h);
-                if !hosts_are_trusted(std::slice::from_ref(&host), origin_host.as_deref()) {
-                    continue;
-                }
-            }
-            let env = if host.eq_ignore_ascii_case("github.com") {
-                Vec::new()
-            } else {
-                vec![("GH_HOST".to_string(), host)]
-            };
-            let gh = BoundedGhRunner {
-                cwd: PathBuf::from(&push.work_dir),
-                env,
-            };
-            let repo = QueryRepo::Named { owner, name };
-            if let Some(msg) = evaluate_push(&gh, &repo, &branches) {
-                return Some(msg);
-            }
-        }
-        None
+        run_push_with(input, command, &|cwd, env| {
+            Box::new(BoundedGhRunner { cwd, env }) as Box<dyn GhRunner>
+        })
     }
+}
+
+/// Builds the gh runner for one push's working dir and env; a seam so tests
+/// can record what (if anything) would be queried.
+type GhFactory<'a> = dyn Fn(PathBuf, Vec<(String, String)>) -> Box<dyn GhRunner> + 'a;
+
+/// The `git push --delete` path with an injectable gh runner.
+fn run_push_with(input: &HookInput, command: &str, make_gh: &GhFactory<'_>) -> Option<String> {
+    let cwd_fallback = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| ".".to_string());
+    let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+    for push in push_invocations(command, cwd) {
+        let branches: Vec<String> = push
+            .refspecs
+            .iter()
+            .filter(|r| r.is_delete)
+            .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
+            .collect();
+        if branches.is_empty() || push.unresolved {
+            continue;
+        }
+        let Some(repository) = push.repository.as_deref() else {
+            continue;
+        };
+        let Some((host, owner, name)) = resolve_remote(&push.work_dir, repository) else {
+            continue;
+        };
+        // Query only a host the user already trusts: github.com or origin's
+        // host. This applies to a named remote too — any remote's URL can
+        // point anywhere, and `GH_HOST` makes gh send its enterprise token
+        // to that host.
+        let origin_host = git_command(&push.work_dir, &["remote", "get-url", "origin"])
+            .and_then(|u| host_and_repo_from_url(&u))
+            .map(|(h, _)| h);
+        if !hosts_are_trusted(std::slice::from_ref(&host), origin_host.as_deref()) {
+            continue;
+        }
+        let env = if host.eq_ignore_ascii_case("github.com") {
+            Vec::new()
+        } else {
+            vec![("GH_HOST".to_string(), host)]
+        };
+        let gh = make_gh(PathBuf::from(&push.work_dir), env);
+        let repo = QueryRepo::Named { owner, name };
+        if let Some(msg) = evaluate_push(gh.as_ref(), &repo, &branches) {
+            return Some(msg);
+        }
+    }
+    None
 }
 
 impl Check for WarnStackedBaseDelete {
@@ -445,6 +450,47 @@ mod tests {
             .map(|p| p.repository)
             .collect();
         assert_eq!(repos, [Some("up".to_string())]);
+    }
+
+    /// Records every gh call made through the factory; answers dependents.
+    fn push_calls(dir: &std::path::Path, command: &str) -> (Option<String>, usize) {
+        use std::rc::Rc;
+        let calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        struct Counting(Rc<RefCell<usize>>);
+        impl GhRunner for Counting {
+            fn run(&self, _args: &[&str]) -> Option<String> {
+                *self.0.borrow_mut() += 1;
+                Some(deps(&[7]))
+            }
+        }
+        let input =
+            cadence_hooks_core::test_builders::make_bash_with_cwd(command, dir.to_str().unwrap());
+        let seen = Rc::clone(&calls);
+        let msg = run_push_with(&input, command, &move |_cwd, _env| {
+            Box::new(Counting(Rc::clone(&seen))) as Box<dyn GhRunner>
+        });
+        let n = *calls.borrow();
+        (msg, n)
+    }
+
+    #[test]
+    fn a_named_remote_on_an_untrusted_host_is_never_queried() {
+        use cadence_hooks_core::git_fixtures::{git_in, init_repo};
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "up", "https://evil.example/o/r.git"],
+        );
+        let (msg, calls) = push_calls(repo.path(), "git push up --delete feat");
+        assert_eq!((msg, calls), (None, 0), "untrusted named remote");
+        // Positive control: the same shape against the trusted origin queries.
+        let (msg, calls) = push_calls(repo.path(), "git push origin --delete feat");
+        assert!(calls > 0 && msg.is_some(), "origin must be queried");
     }
 
     #[test]

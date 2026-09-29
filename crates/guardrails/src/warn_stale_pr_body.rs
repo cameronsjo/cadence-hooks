@@ -39,7 +39,7 @@ use crate::warn_unreviewed_ready_flip::{
 const BODY_STATE_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
     repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
     createdAt lastEditedAt \
-    commits(last: 100) { totalCount nodes { commit { committedDate } } } } } }";
+    commits(last: 100) { nodes { commit { committedDate } } } } } }";
 
 /// What the query says about the body's age against the branch.
 #[derive(Debug, PartialEq, Eq)]
@@ -185,8 +185,7 @@ mod tests {
             .map(|d| format!(r#"{{"commit":{{"committedDate":"{d}"}}}}"#))
             .collect();
         format!(
-            r#"{{"data":{{"repository":{{"pullRequest":{{"createdAt":"2026-09-01T10:00:00Z","lastEditedAt":{last_edited},"commits":{{"totalCount":{},"nodes":[{}]}}}}}}}}}}"#,
-            nodes.len(),
+            r#"{{"data":{{"repository":{{"pullRequest":{{"createdAt":"2026-09-01T10:00:00Z","lastEditedAt":{last_edited},"commits":{{"nodes":[{}]}}}}}}}}}}"#,
             nodes.join(",")
         )
     }
