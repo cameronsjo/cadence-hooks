@@ -20,19 +20,7 @@ pub struct LoopedCommand {
     /// Suffix arguments (subcommands, flags) — enables downstream consumers to
     /// distinguish reads from writes without coupling analysis to action lists.
     pub args: Vec<String>,
-    /// Prefix items before the command word, raw. An assignment keeps its
-    /// `NAME=value` text; a redirection or anything else is recorded as a
-    /// non-assignment marker, so a consumer requiring a plain prefix refuses
-    /// it.
-    pub prefix: Vec<String>,
-    /// The command reads its stdin from a pipe (it is not the first command of
-    /// its pipeline).
-    pub piped_into: bool,
 }
-
-/// Marker [`LoopedCommand::prefix`] records for a prefix item that is not an
-/// assignment (a redirection, a process substitution).
-pub const NON_ASSIGNMENT_PREFIX: &str = "<non-assignment prefix>";
 
 /// Result of analyzing loops in a shell command.
 #[derive(Debug)]
@@ -146,8 +134,6 @@ fn collect_top_level_pushes_from_pipeline(pipeline: &Pipeline, out: &mut Vec<Loo
                     name: "git push".to_string(),
                     explicit_repo: extract_push_remote(simple),
                     args: suffix_words(simple),
-                    prefix: prefix_words(simple),
-                    piped_into: false,
                 });
             }
             Command::Compound(compound, _) => {
@@ -419,15 +405,13 @@ fn collect_gh_from_and_or_item(item: &CompoundListItem, out: &mut Vec<LoopedComm
 }
 
 fn collect_gh_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
-    for (position, cmd) in pipeline.seq.iter().enumerate() {
+    for cmd in &pipeline.seq {
         match cmd {
             Command::Simple(simple) if is_gh_command(simple) => {
                 out.push(LoopedCommand {
                     name: "gh".to_string(),
                     explicit_repo: extract_repo_flag(simple),
                     args: suffix_words(simple),
-                    prefix: prefix_words(simple),
-                    piped_into: position > 0,
                 });
             }
             Command::Compound(compound, _) => {
@@ -541,8 +525,6 @@ fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>)
                     name: "git push".to_string(),
                     explicit_repo: extract_push_remote(simple),
                     args: suffix_words(simple),
-                    prefix: prefix_words(simple),
-                    piped_into: false,
                 });
             }
             Command::Compound(compound, _) => match compound {
@@ -674,20 +656,6 @@ fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
 }
 
 /// Extract word values from a command's suffix.
-fn prefix_words(cmd: &SimpleCommand) -> Vec<String> {
-    let Some(prefix) = &cmd.prefix else {
-        return Vec::new();
-    };
-    prefix
-        .0
-        .iter()
-        .map(|item| match item {
-            CommandPrefixOrSuffixItem::AssignmentWord(_, w) => w.value.clone(),
-            _ => NON_ASSIGNMENT_PREFIX.to_string(),
-        })
-        .collect()
-}
-
 fn suffix_words(cmd: &SimpleCommand) -> Vec<String> {
     let Some(suffix) = &cmd.suffix else {
         return Vec::new();
@@ -708,23 +676,6 @@ mod tests {
     use super::*;
 
     // --- analyze_gh_loops ---
-
-    #[test]
-    fn looped_gh_records_prefix_and_pipe_position() {
-        let LoopAnalysis::MissingTargets(cmds) = analyze_gh_loops(
-            r#"for i in 1; do X=1 N="$(date)" gh issue create --help; echo a | gh pr create --help; done"#,
-        ) else {
-            panic!("expected MissingTargets");
-        };
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(
-            cmds[0].prefix,
-            vec!["X=1".to_string(), r#"N="$(date)""#.to_string()]
-        );
-        assert!(!cmds[0].piped_into);
-        assert!(cmds[1].prefix.is_empty());
-        assert!(cmds[1].piped_into);
-    }
 
     #[test]
     fn no_loop_returns_no_loops() {

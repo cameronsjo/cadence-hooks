@@ -330,6 +330,14 @@ so the write blocks:
 - `read`, `printf -v`, `mapfile`/`readarray`, or `getopts` writing `GH_HOST`
   or a variable whose name is not a plain literal.
 - An `eval` nested more than three levels deep.
+- Inside a subshell, function body, or case arm, a declaring or name-writing
+  builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
+  fails closed wherever the command position is not recognized.
+- Any `trap`, whose body runs later from a string.
+- A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
+  names `GH_HOST` or declares a non-literal name.
+- An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
+  assignment anywhere in the command.
 - Any of those builtins, `export` included, or an `env`-style prefix before gh,
   naming a variable whose name the shell builds at expansion time
   (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).

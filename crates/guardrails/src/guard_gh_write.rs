@@ -10,7 +10,7 @@ use cadence_hooks_core::config::{
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, command_segments, command_word, contains_ignoring_ascii_case,
-    host_and_repo_from_url, parse_work_dir, split_segments_with_ops, strip_quotes, tokenize,
+    host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -769,6 +769,9 @@ struct GhHostEnv {
     allexport: bool,
     /// The hook process (and so the shell) inherited a `GH_HOST`.
     inherited: bool,
+    /// The whole command, raw — heredoc bodies included, which the segment
+    /// list strips. Read only for a `source`/`.` fed by a heredoc.
+    raw_command: String,
 }
 
 impl GhHostEnv {
@@ -779,6 +782,16 @@ impl GhHostEnv {
             exported: inherited,
             allexport: false,
             inherited,
+            raw_command: String::new(),
+        }
+    }
+
+    /// [`Self::from_process`] for judging `command`, whose raw text a heredoc
+    /// fed to `source` is read from.
+    fn for_command(command: &str) -> Self {
+        Self {
+            raw_command: command.to_string(),
+            ..Self::from_process()
         }
     }
 
@@ -812,7 +825,13 @@ impl GhHostEnv {
 
     fn observe_depth(&mut self, segment: &str, depth: usize) {
         let tokens = tokenize(segment);
-        let mut words: &[String] = &tokens;
+        // A `trap` body runs later, in this shell, from a string this walk does
+        // not parse (`trap 'export GH_HOS''T=…' DEBUG`) (#1073 live review).
+        if tokens.iter().any(|t| t == "trap") {
+            self.add_unresolved();
+        }
+        let normalized = strip_compound_openers(&tokens);
+        let mut words: &[String] = &normalized;
         while words
             .first()
             .is_some_and(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
@@ -830,6 +849,44 @@ impl GhHostEnv {
             rest = &rest[1..];
         }
         let command = rest.first().map(|w| w.rsplit('/').next().unwrap_or(w));
+
+        // FAIL CLOSED where the command position was not understood: a
+        // subshell, function body or case arm this normalization missed still
+        // runs its builtin in some shell, so a declaring or name-writing
+        // builtin ANYWHERE in the segment, next to a `GH_HOST` mention or a
+        // non-literal `NAME=`, is unresolved (#1073 live review).
+        let understood = command.is_some_and(|c| {
+            DECLARING_BUILTINS.contains(&c)
+                || NAME_OPERAND_BUILTINS.contains(&c)
+                || c == "unset"
+                || c == "eval"
+        });
+        if !understood
+            && tokens.iter().any(|t| {
+                let word = t.trim_start_matches(['(', '{']);
+                DECLARING_BUILTINS.contains(&word)
+                    || NAME_OPERAND_BUILTINS.contains(&word)
+                    || word == "unset"
+            })
+            && tokens.iter().any(|t| {
+                mentions_gh_host(t)
+                    || (!t.starts_with('-')
+                        && t.split_once('=')
+                            .is_some_and(|(name, _)| !is_literal_identifier(name)))
+            })
+        {
+            self.add_unresolved();
+        }
+
+        // `source`/`.` fed by a heredoc or stdin runs text the segment list
+        // never shows (#1073 live review).
+        if matches!(command, Some("source" | "."))
+            && sources_inline_text(segment)
+            && (self.raw_command.contains("GH_HOST")
+                || RAW_NONLITERAL_DECLARATION.is_match(&self.raw_command))
+        {
+            self.add_unresolved();
+        }
 
         if command == Some("set")
             && rest[1..].iter().any(|w| {
@@ -982,12 +1039,66 @@ fn is_literal_identifier(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// `NAME=value` with a plain literal `NAME` (no `+=`) — the only prefix a pure
-/// help segment may carry ([`segment_is_pure_help`]).
-fn is_plain_assignment(word: &str) -> bool {
-    word.split_once('=')
-        .is_some_and(|(name, _)| !name.ends_with('+') && is_literal_identifier(name))
+/// Tokens with the openers of a compound command removed, so the builtin
+/// inside is found at command position: a leading `(` (`(export …`), a
+/// function definition head (`name()`, `name(){`, `name ( ) {`,
+/// `function name {`), and a case arm's pattern (`case x in x)`, `y)`).
+fn strip_compound_openers(tokens: &[String]) -> Vec<String> {
+    let mut words: Vec<String> = tokens.to_vec();
+    loop {
+        let Some(first) = words.first().cloned() else {
+            return words;
+        };
+        if first == "(" || first == "{" || first == "()" {
+            words.remove(0);
+        } else if let Some(rest) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
+            words[0] = rest.to_string();
+        } else if first == "function" && words.len() > 1 {
+            words.drain(..2);
+        } else if let Some((name, _)) = first.split_once("()")
+            && is_literal_identifier(&name.replace('-', "_"))
+        {
+            let tail = first[name.len() + 2..].trim_start_matches('{').to_string();
+            if tail.is_empty() {
+                words.remove(0);
+            } else {
+                words[0] = tail;
+            }
+        } else if words.get(1).is_some_and(|w| w == "()" || w == "(){")
+            && is_literal_identifier(&first.replace('-', "_"))
+        {
+            words.drain(..2);
+        } else if first == "case" {
+            match words.iter().position(|w| w.ends_with(')')) {
+                Some(end) => {
+                    words.drain(..=end);
+                }
+                None => return words,
+            }
+        } else if first.len() > 1 && first.ends_with(')') && !first.contains("$(") {
+            // A later case arm: `y) export …`.
+            words.remove(0);
+        } else {
+            return words;
+        }
+    }
 }
+
+/// True when a `source`/`.` segment reads its script from text in the command
+/// itself: a heredoc or here-string, stdin, or a process substitution.
+fn sources_inline_text(segment: &str) -> bool {
+    segment.contains("<<") || segment.contains("/dev/stdin") || segment.contains("<(")
+}
+
+/// A declaring builtin naming a variable the shell builds at expansion time,
+/// anywhere in raw text (a heredoc body): `export GH_HOS''T=…`,
+/// `declare -x GH_HOS${X}T=…`.
+static RAW_NONLITERAL_DECLARATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\b(?:export|declare|typeset|readonly|local)\s+(?:[-+]\S*\s+)*[^\s=]*[$`{'"\\][^\s=]*="#,
+    )
+    .expect("pattern should compile")
+});
 
 /// `NAME=value` / `NAME+=value` in command-word position.
 fn is_shell_assignment(word: &str) -> bool {
@@ -1044,11 +1155,22 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
 
     // A prefix word whose NAME is not a plain literal (`env GH_HOS${X}T=h gh`)
     // may expand to `GH_HOST=h`, so it resolves to no known host (#548).
-    let obfuscated_prefix = tokens[..gh_index].iter().any(|token| {
-        token
-            .split_once('=')
-            .is_some_and(|(name, _)| !name.starts_with('-') && !is_literal_identifier(name))
-    });
+    // `env -S`/`--split-string` re-splits one string into assignments and a
+    // command, so its host is not readable from these tokens either.
+    let prefix_words = &tokens[..gh_index];
+    let split_string = prefix_words
+        .iter()
+        .any(|t| t.rsplit('/').next() == Some("env"))
+        && prefix_words.iter().any(|t| {
+            t.starts_with("--split-string")
+                || (t.starts_with('-') && !t.starts_with("--") && t.contains('S'))
+        });
+    let obfuscated_prefix = split_string
+        || prefix_words.iter().any(|token| {
+            token
+                .split_once('=')
+                .is_some_and(|(name, _)| !name.starts_with('-') && !is_literal_identifier(name))
+        });
     let inline_host = if obfuscated_prefix {
         Some(UNRESOLVED_GH_HOST.to_string())
     } else {
@@ -2269,125 +2391,8 @@ fn api_unverifiable_block(
     )
 }
 
-/// True when the arguments after `gh` are a PURE help request: exactly a
-/// literal `<noun> <verb>` followed only by literal `--help` tokens (#868).
-///
-/// gh prints help and exits for that shape without contacting GitHub, so it is
-/// a read whatever the verb. The shape is deliberately this narrow, because a
-/// help token anywhere else is not proof: pflag hands the token after a
-/// value-taking flag to that flag, so `gh issue create --title --help` creates
-/// an issue titled `--help`. Requiring every token past the verb to be `--help`
-/// means nothing can consume one. The noun and verb must be plain lowercase
-/// words — an expansion there (`gh issue create $ARGS --help`) could splice a
-/// value-taking flag in front of the help token, so it does not count.
-///
-/// `-h` is NOT a help token: under `gh repo edit` and `gh repo create` it is
-/// `--homepage`, which takes a value, so `gh repo edit -h -h` is a write.
-///
-/// The argv shape alone is not enough either — see [`segment_is_pure_help`] for
-/// the conditions on where the invocation sits.
-fn gh_args_are_pure_help(args: &[String]) -> bool {
-    let is_word = |w: &String| {
-        w.starts_with(|c: char| c.is_ascii_lowercase())
-            && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-    };
-    args.len() > 2 && args[..2].iter().all(is_word) && args[2..].iter().all(|a| a == "--help")
-}
-
-/// True when `segment` is a bare, pure help invocation: optional shell keywords
-/// and plain `NAME=value` assignments, then the literal command word `gh`,
-/// then exactly [`gh_args_are_pure_help`]'s shape (#868).
-///
-/// The command word must be `gh` itself. Behind any wrapper the help token is
-/// no longer the last word gh sees: `xargs gh issue create --help` appends
-/// stdin, and `--help=false --title t` arriving there turns help off again
-/// (pflag's last value wins) and creates the issue. `find -exec`, `parallel`,
-/// `env`, `sudo` and the rest are refused for the same reason, without
-/// enumerating them.
-fn segment_is_pure_help(segment: &str) -> bool {
-    if has_command_substitution(segment) {
-        return false;
-    }
-    let tokens = tokenize(segment);
-    let mut words: &[String] = &tokens;
-    while words
-        .first()
-        .is_some_and(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
-    {
-        words = &words[1..];
-    }
-    while words.first().is_some_and(|w| help_prefix_ok(w)) {
-        words = &words[1..];
-    }
-    words.first().map(String::as_str) == Some("gh") && gh_args_are_pure_help(&words[1..])
-}
-
-/// A substitution that runs a command: `$(…)`, a backtick, `<(…)`, `>(…)`. In a
-/// help segment's prefix it would run an arbitrary command — possibly a gh
-/// write — as a side effect of the "read" (#1073 review I-b).
-fn has_command_substitution(text: &str) -> bool {
-    text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
-}
-
-/// A prefix word a pure help invocation may carry: a plain `NAME=value`
-/// assignment whose value runs nothing, and whose NAME does not steer gh.
-/// `GH_*` (host, token, config dir, pager, …), `PAGER`, `BROWSER`, `EDITOR`
-/// and `VISUAL` change what gh does or runs, so they are refused rather than
-/// argued one by one (#1073 review N-b).
-fn help_prefix_ok(word: &str) -> bool {
-    let Some((name, value)) = word.split_once('=') else {
-        return false;
-    };
-    is_plain_assignment(word)
-        && !has_command_substitution(value)
-        && !name.starts_with("GH_")
-        && !matches!(name, "PAGER" | "BROWSER" | "EDITOR" | "VISUAL")
-}
-
-/// Matches an alias or function DEFINITION named `gh` anywhere in a command:
-/// `alias gh=…`, `gh() {…}`, `function gh {…}`.
-static GH_SHADOW: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\balias\b[^;&|\n]*(?:^|[\s'"])gh=|(?:^|[\s;&|({])gh\s*\(\s*\)|\bfunction\s+gh\b"#)
-        .expect("pattern should compile")
-});
-
-/// True when `command` defines an alias or function named `gh`. Then the word
-/// `gh` may not run the gh binary at all, so no invocation in the command earns
-/// the help exemption (#1073 review N-b).
-fn command_shadows_gh(command: &str) -> bool {
-    GH_SHADOW.is_match(command)
-}
-
-/// The top-level segments of `command`, each paired with whether it may be
-/// skipped as a pure help invocation (#868): it is [`segment_is_pure_help`],
-/// it does NOT sit on the right-hand side of a pipe, and the command defines no
-/// `gh` alias or function. A pipe hands the command stdin, which is how `xargs`
-/// turns data into arguments; refusing every pipe right-hand side keeps that
-/// door shut even for spellings this check does not model.
-fn top_level_help_exemptions(command: &str) -> Vec<(String, bool)> {
-    let shadowed = command_shadows_gh(command);
-    let mut out = Vec::new();
-    let mut after_pipe = false;
-    for (segment, op) in split_segments_with_ops(command) {
-        let exempt = !shadowed && !after_pipe && segment_is_pure_help(&segment);
-        out.push((segment.trim().to_string(), exempt));
-        after_pipe = op == Some("|");
-    }
-    out
-}
-
-/// [`looped_write_kind`] for one loop-analysis command, with a pure help
-/// request read as a read (#868) — under the same conditions the per-segment
-/// gate applies: a plain prefix ([`help_prefix_ok`]), not fed by a pipe, and no
-/// `gh` alias or function in the command (#1073 review I-a).
-fn looped_command_kind(c: &loop_analysis::LoopedCommand, gh_shadowed: bool) -> LoopedWriteKind {
-    if !gh_shadowed
-        && !c.piped_into
-        && c.prefix.iter().all(|w| help_prefix_ok(w))
-        && gh_args_are_pure_help(&c.args)
-    {
-        return LoopedWriteKind::ReadOrAllowed;
-    }
+/// [`looped_write_kind`] for one loop-analysis command.
+fn looped_command_kind(c: &loop_analysis::LoopedCommand) -> LoopedWriteKind {
     looped_write_kind(&format!("gh {}", c.args.join(" ")))
 }
 
@@ -2639,8 +2644,6 @@ impl Check for GhWriteGuard {
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
 
-        let gh_shadowed = command_shadows_gh(command);
-
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
@@ -2651,7 +2654,7 @@ impl Check for GhWriteGuard {
                 for c in &cmds {
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_command_kind(c, gh_shadowed)
+                    } = looped_command_kind(c)
                     {
                         return api_unverifiable_block(
                             &format!("gh {}", c.args.join(" ")),
@@ -2664,7 +2667,7 @@ impl Check for GhWriteGuard {
                 let dh = default_host();
                 let unowned_write_targets: Vec<&str> = cmds
                     .iter()
-                    .filter(|c| looped_command_kind(c, gh_shadowed) == LoopedWriteKind::RepoWrite)
+                    .filter(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite)
                     .filter(|c| {
                         !c.explicit_repo
                             .as_ref()
@@ -2695,7 +2698,7 @@ impl Check for GhWriteGuard {
                 for c in &cmds {
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_command_kind(c, gh_shadowed)
+                    } = looped_command_kind(c)
                     {
                         return api_unverifiable_block(
                             &format!("gh {}", c.args.join(" ")),
@@ -2707,7 +2710,7 @@ impl Check for GhWriteGuard {
                 }
                 let has_write = cmds
                     .iter()
-                    .any(|c| looped_command_kind(c, gh_shadowed) == LoopedWriteKind::RepoWrite);
+                    .any(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite);
                 if has_write {
                     // Relaxed-when-deterministic policy (#44): a loop whose
                     // body never changes directory, running in an owned
@@ -2731,8 +2734,7 @@ impl Check for GhWriteGuard {
                             .iter()
                             .filter(|c| {
                                 c.explicit_repo.is_none()
-                                    && looped_command_kind(c, gh_shadowed)
-                                        == LoopedWriteKind::RepoWrite
+                                    && looped_command_kind(c) == LoopedWriteKind::RepoWrite
                             })
                             .map(|c| format!("`gh {}`", c.args.join(" ")))
                             .collect();
@@ -2776,37 +2778,25 @@ impl Check for GhWriteGuard {
         // disallowed / unresolvable write segment blocks.
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
-        let mut gh_host_env = GhHostEnv::from_process();
-        // Segment identity for the help exemption is positional: the flat
-        // segment list meets each top-level segment in order, so a cursor
-        // pairs every exemption with exactly one segment, never with any
-        // segment that merely has the same text (#1073 review N-a).
-        let top_level = top_level_help_exemptions(command);
-        let mut top_cursor = 0;
-
+        let mut gh_host_env = GhHostEnv::for_command(command);
         for segment in command_segments(command) {
-            let exempt_as_help = match top_level.get(top_cursor) {
-                Some((text, exempt)) if text == segment.trim() => {
-                    top_cursor += 1;
-                    *exempt
-                }
-                _ => false,
-            };
             // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
             // it decides which host every later gh write reaches (#548). A gh
             // segment is a child process and cannot change it.
+            // A shell started with `BASH_ENV=`/`ENV=` sources that file first,
+            // so anything it runs may inherit a GH_HOST this guard never sees.
+            if tokenize(&segment)
+                .iter()
+                .any(|t| t.starts_with("BASH_ENV=") || t.starts_with("ENV="))
+            {
+                gh_host_env.add_unresolved();
+            }
             if !segment_invokes_gh(&segment) {
                 gh_host_env.observe(&segment);
                 continue;
             }
 
             if !is_write_command(&segment) {
-                continue;
-            }
-
-            // `gh <noun> <verb> --help` prints help and writes nothing (#868).
-            // Only a top-level, bare, non-pipe-fed invocation qualifies.
-            if exempt_as_help && segment_is_pure_help(&segment) {
                 continue;
             }
 
@@ -6663,57 +6653,7 @@ mod tests {
         });
     }
 
-    // --- #868: a pure `--help` request is not a write ---
-
-    #[test]
-    fn pure_help_shape_is_exactly_noun_verb_then_help_flags() {
-        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
-        for yes in [
-            "issue create --help",
-            "pr merge --help",
-            "secret set --help --help",
-        ] {
-            assert!(gh_args_are_pure_help(&args(yes)), "{yes}");
-        }
-        for no in [
-            // A value-taking flag in front consumes the help token.
-            "issue create --title --help",
-            "issue create --help --title x",
-            // A positional or expansion could splice a flag in front of it.
-            "issue create x --help",
-            "issue create $A --help",
-            "issue $V --help",
-            "issue create --help=true",
-            "issue create -- --help",
-            "issue create",
-            "-R evil/x issue create --help",
-            "issue --help",
-            // `-h` is `--homepage` under `gh repo edit`/`create` (#868 review).
-            "repo edit -h -h",
-            "pr merge -h",
-            "issue create --help -h",
-        ] {
-            assert!(!gh_args_are_pure_help(&args(no)), "{no}");
-        }
-    }
-
-    #[test]
-    fn looped_pure_help_is_allowed_outside_any_repo() {
-        with_env(&owners_env(), || {
-            for command in [
-                "for i in $(seq 1 30); do gh issue create --help | grep -q -- '--parent' || fails=$((fails+1)); done",
-                "for i in 1 2; do gh pr create --help; done",
-                "X=1 gh issue create --help",
-                "gh issue create --help",
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
-                    "expected ALLOW: {command}"
-                );
-            }
-        });
-    }
+    // --- #868: a `--help` token never makes a gh write a read ---
 
     #[test]
     fn help_does_not_cover_a_real_write_beside_it() {
@@ -6911,7 +6851,7 @@ mod tests {
         });
     }
 
-    // --- #1073 delta review: suspected gaps, tested before the fix ---
+    // --- #1073 review: help invocations stay writes; GH_HOST edge forms ---
 
     /// Run one delta case, recording a mismatch instead of panicking so a
     /// test reports every failing case at once.
@@ -6927,13 +6867,8 @@ mod tests {
     }
 
     #[test]
-    fn delta_ia_loop_help_obeys_the_segment_conditions() {
+    fn looped_help_with_a_substitution_or_pipe_blocks() {
         let mut bad = Vec::new();
-        run_case(
-            &mut bad,
-            "for i in 1 2; do X=1 gh issue create --help; done",
-            false,
-        );
         run_case(
             &mut bad,
             r#"for i in 1 2; do NAME="$(gh issue create -R evil/x -t t)" gh issue create --help; done"#,
@@ -6948,7 +6883,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_ib_substitution_in_a_help_prefix_blocks() {
+    fn help_with_a_substituting_prefix_blocks() {
         let mut bad = Vec::new();
         for command in [
             r#"NAME="$(gh issue create -R evil/x -t t)" gh issue create --help"#,
@@ -6958,13 +6893,11 @@ mod tests {
         ] {
             run_case(&mut bad, command, true);
         }
-        // Without a substitution the prefix is fine.
-        run_case(&mut bad, "NAME=plain gh issue create --help", false);
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
     #[test]
-    fn delta_ic_namerefs_and_indirect_names_block() {
+    fn namerefs_and_indirect_gh_host_names_block() {
         let mut bad = Vec::new();
         for command in [
             "declare -n r=GH_HOST; r=evil.example.com; export GH_HOST; gh pr create -R cameronsjo/x -t t",
@@ -6996,7 +6929,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_id_eval_past_the_depth_cap_is_unresolved() {
+    fn eval_past_the_depth_cap_is_unresolved() {
         let mut bad = Vec::new();
         run_case(
             &mut bad,
@@ -7022,7 +6955,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_nb_help_refuses_env_steering_prefixes_and_gh_shadows() {
+    fn help_behind_steering_prefixes_or_gh_shadows_blocks() {
         let mut bad = Vec::new();
         for command in [
             "GH_HOST=evil gh issue create --help",
@@ -7041,7 +6974,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_na_help_skip_is_positional_not_textual() {
+    fn piped_help_blocks_beside_a_bare_one() {
         let mut bad = Vec::new();
         // The same text in a pipe right-hand side must not borrow the
         // top-level segment's exemption.
@@ -7050,6 +6983,57 @@ mod tests {
             "gh issue create --help; echo x | gh issue create --help",
             true,
         );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn gh_host_set_inside_compound_commands_blocks() {
+        let mut bad = Vec::new();
+        for command in [
+            "(export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b)",
+            "( export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b )",
+            "setit(){ export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
+            "setit() { export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
+            "function setit { export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
+            "f(){ local -x GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b; }; f",
+            "case x in x) export GH_HOST=evil.com;; esac; gh issue create -R cameronsjo/x -t a -b b",
+            "case x in y) true;; x) export GH_HOST=evil.com;; esac; gh issue create -R cameronsjo/x -t a -b b",
+            "(export GH_HOS${X}T=evil.com); gh issue create -R cameronsjo/x -t a -b b",
+            // #5: a trap body runs later from a string.
+            "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            // #6: a heredoc fed to source.
+            "source /dev/stdin <<EOF\nexport GH_HOST=evil.com\nEOF\ngh issue create -R cameronsjo/x -t a -b b",
+            ". /dev/stdin <<'EOF'\nexport GH_HOS''T=evil.com\nEOF\ngh issue create -R cameronsjo/x -t a -b b",
+            "source <(echo export GH_HOST=evil.com); gh issue create -R cameronsjo/x -t a -b b",
+            // #7: env -S and a sourced-at-start shell env file.
+            "env -S 'GH_HOST=evil.com' gh issue create -R cameronsjo/x -t a -b b",
+            "env --split-string='GH_HOST=evil.com' gh issue create -R cameronsjo/x -t a -b b",
+            "BASH_ENV=/tmp/e bash -c 'gh issue create -R cameronsjo/x -t a -b b'",
+            "ENV=/tmp/e sh -c 'gh issue create -R cameronsjo/x -t a -b b'",
+        ] {
+            run_case(&mut bad, command, true);
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn common_shell_setup_still_allows_an_owned_write() {
+        let mut bad = Vec::new();
+        for command in [
+            "export PATH=\"$HOME/bin:$PATH\"; gh issue create -R cameronsjo/x -t a -b b",
+            "read -r x; gh issue create -R cameronsjo/x -t a -b b",
+            "set -euo pipefail; gh issue create -R cameronsjo/x -t a -b b",
+            "printf -v OUT '%s' x; gh issue create -R cameronsjo/x -t a -b b",
+            "(cd /tmp && export FOO=1); gh issue create -R cameronsjo/x -t a -b b",
+            "f(){ local n=1; echo $n; }; f; gh issue create -R cameronsjo/x -t a -b b",
+            "case $1 in a) export MODE=a;; esac; gh issue create -R cameronsjo/x -t a -b b",
+            "source .venv/bin/activate && gh issue create -R cameronsjo/x -t a -b b",
+            "while read -r line; do echo \"$line\"; done < f; gh issue create -R cameronsjo/x -t a -b b",
+            "env FOO=1 gh issue create -R cameronsjo/x -t a -b b",
+        ] {
+            run_case(&mut bad, command, false);
+        }
         assert!(bad.is_empty(), "{bad:#?}");
     }
 }
