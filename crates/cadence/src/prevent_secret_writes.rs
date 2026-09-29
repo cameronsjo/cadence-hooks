@@ -6,9 +6,11 @@
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
+use crate::prevent_secret_leaks::argv_program_opens;
 use crate::secret_patterns::{
-    Filename, envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token_at,
-    is_safe_template, is_secret_scan_exempt, scan_secret_values,
+    Filename, ProgramOpen, curl_write_targets, envrc_carveout_allows, is_ambiguous, is_blocked,
+    is_dangerous_secret_token_at, is_safe_template, is_secret_scan_exempt, scan_secret_values,
+    wget_write_targets,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, redirect_targets, skip_git_global_options,
@@ -138,9 +140,49 @@ fn writer_targets(segment: &str) -> Vec<String> {
                 Vec::new()
             }
         }
+        // #1125: `curl -o`/`-O`/`--output-dir`, `wget -O` and a plain
+        // `wget URL`, which saves under the URL's own name.
+        "curl" => curl_write_targets(&tokens[start..]),
+        "wget" => wget_write_targets(&tokens[start..]),
+        // #1130: a file the sed/awk program writes by itself — `sed 'w .env'`,
+        // `awk '{print > ".env"}'`.
+        "sed" | "gsed" | "awk" | "gawk" | "mawk" | "nawk" => {
+            argv_program_opens(cmd, &tokens[start..])
+                .into_iter()
+                .filter_map(|open| match open {
+                    ProgramOpen::Write(file) => Some(file),
+                    _ => None,
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
+
+/// Shell commands a `sed`/`awk` program in this segment runs (#1130) — `sed
+/// '1e …'`, awk's `system(…)` and pipes — judged as commands in their own
+/// right.
+fn program_commands(segment: &str) -> Vec<String> {
+    let tokens = tokenize(segment);
+    let start = tokens
+        .iter()
+        .position(|t| !COMMAND_WRAPPERS.contains(&command_word(t).as_ref()))
+        .unwrap_or(tokens.len());
+    let Some(first) = tokens.get(start) else {
+        return Vec::new();
+    };
+    argv_program_opens(&command_word(first), &tokens[start..])
+        .into_iter()
+        .filter_map(|open| match open {
+            ProgramOpen::Command(command) => Some(command),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How deep [`matched_secret_write_target`] follows a command a sed/awk
+/// program runs into another such command.
+const PROGRAM_COMMAND_DEPTH: usize = 3;
 
 /// True if a `find` invocation deletes or writes its matched files: a
 /// `-delete` action, or an exec-family flag whose command is a writer verb.
@@ -179,6 +221,11 @@ fn bash_targets_env_file(command: &str) -> bool {
 /// used only for that classification; it is never echoed into the message,
 /// because it comes out of the agent's own command text.
 fn matched_secret_write_target(command: &str) -> Option<String> {
+    matched_secret_write_target_at(command, 0)
+}
+
+/// [`matched_secret_write_target`] at a program-command nesting depth.
+fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String> {
     // No raw-substring prefilter here, deliberately (#655). A quote-split
     // target (`.en''v`) resolves to `.env` only AFTER tokenizing, so any gate
     // that reads the raw command text vetoes the resolver that would have
@@ -215,6 +262,13 @@ fn matched_secret_write_target(command: &str) -> Option<String> {
             // operand, so the shell has already told us it names a file — the
             // `<name>.env` shape applies without further qualification.
             .find(|t| is_dangerous_secret_token_at(t, Filename::Known))
+        {
+            return Some(target);
+        }
+        if depth < PROGRAM_COMMAND_DEPTH
+            && let Some(target) = program_commands(&segment)
+                .iter()
+                .find_map(|inner| matched_secret_write_target_at(inner, depth + 1))
         {
             return Some(target);
         }
@@ -1732,6 +1786,147 @@ mod tests {
         ];
         for command in allowed {
             assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn curl_and_wget_output_files_block() {
+        // #1125: each writes the named file.
+        let blocked = [
+            "curl -o .env https://x",
+            "curl --output .env https://x",
+            "curl -o.env https://x",
+            "curl -so.env https://x",
+            "curl -so .env https://x",
+            "curl https://x -o .env",
+            "curl -o ~/.ssh/id_rsa https://x",
+            "curl --out .env https://x",
+            "curl -D .env https://x",
+            "curl -c .env https://x",
+            "curl --trace-ascii .env https://x",
+            "curl --output-dir ~/.aws -o credentials https://x",
+            "curl --output-dir ~/.ssh -O https://x/id_rsa",
+            "curl -O https://x/.env",
+            "curl -OL https://x/.env",
+            "curl -LO 'https://x/id_rsa?v=1'",
+            "curl --remote-name https://x/.env",
+            "curl --remote-name-all https://x/a https://x/.env",
+            "wget -O .env https://x",
+            "wget -O.env https://x",
+            "wget -qO.env https://x",
+            "wget --output-document=.env https://x",
+            "wget --output-document .env https://x",
+            "wget --output-doc=.env https://x",
+            "wget -o .env https://x",
+            "wget -a .env https://x",
+            "wget -e output_document=.env https://x",
+            "wget https://x/.env",
+            "wget -P ~/.ssh https://x/id_rsa",
+            "wget --directory-prefix=~/.aws https://x/credentials",
+        ];
+        for command in blocked {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        let allowed = [
+            "curl -o out.json https://x/api",
+            "curl --output=.env https://x",
+            "curl -O https://x/file.tar.gz",
+            "curl -O https://x/.env.example",
+            "curl --output-dir /tmp/dl -O https://x/a.zip",
+            "curl -s https://x/.env",
+            "curl -H 'X: y' -o /dev/null https://x/.env",
+            "wget -O out.html https://x/.env",
+            "wget -O - https://x/.env",
+            "wget --spider https://x/.env",
+            "wget https://x/archive.tgz",
+            "wget -P /tmp https://x/",
+        ];
+        for command in allowed {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn files_written_by_sed_and_awk_programs_block() {
+        // #1130: the program itself writes the file, or runs a command that
+        // does.
+        let blocked = [
+            "sed 'w .env' foo",
+            "sed 'W .env' foo",
+            "sed -n '1w .env' foo",
+            "sed 's/a/b/w .env' foo",
+            "sed -n 's/a/b/gw .env' foo",
+            "sed -e p -e 'w .aws/credentials' foo",
+            "sed '1e echo x > .env' foo",
+            "bash -c \"sed 'w .env' foo\"",
+            "awk '{print > \".env\"}' foo",
+            "awk '{print >> \".env\"}' foo",
+            "awk '{printf \"x\" > \".env\"}' foo",
+            "awk 'BEGIN{f=\".env\"; print \"x\" > f}'",
+            "awk '{print | \"cat > .env\"}' foo",
+            "awk 'BEGIN{system(\"echo x > .env\")}'",
+            "awk '{print > (\".e\" \"nv\")}' foo",
+        ];
+        for command in blocked {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        let allowed = [
+            "sed 's/foo/bar/' file.txt",
+            "sed -i 's/a/b/g' config.yml",
+            "sed 's/grep/rg/w out.txt' f",
+            "awk -F, '{print $2 > \"out.csv\"}' file",
+            "awk '{print \".env\"}' file",
+            "awk '$1 > 5 {print \".env\"}' file",
+            // A read is prevent-secret-leaks' shape.
+            "sed 'r .env' foo",
+            "awk 'BEGIN{getline l < \".env\"}'",
+        ];
+        for command in allowed {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn declared_appended_and_defaulted_write_targets_block() {
+        // #1124: the variable resolves to the secret file bash writes.
+        let blocked = [
+            "local D=.env; echo x > $D",
+            "declare -x D=.env; echo x > $D",
+            "readonly D=.env; cp x $D",
+            "D=.en; D+=v; echo x > $D",
+            "echo x > ${D:-.env}",
+            "echo x > ${D:=.env}",
+            "echo ${D:=.env}; echo x > $D",
+            "arr=(a .env); echo x > ${arr[1]}",
+        ];
+        for command in blocked {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        for command in [
+            "D=x; echo x > ${D:-.env}",
+            "arr=(.env a); echo x > ${arr[1]}",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn padded_network_and_program_writes_stay_fast() {
+        let commands = [
+            format!("curl {}https://x/.env", "-O ".repeat(60_000)),
+            format!("wget {}", "https://x/a ".repeat(18_000)),
+            format!("sed '{}' f", ";r".repeat(100_000)),
+            format!("awk '{{{}}}' f", "print | \"x\";".repeat(16_000)),
+            format!("cat {}.env", "${D:-".repeat(40_000)),
+        ];
+        for command in &commands {
+            let start = std::time::Instant::now();
+            let _ = bash_targets_env_file(command);
+            assert!(
+                start.elapsed() < nest_time_limit_1118(),
+                "{:?}",
+                start.elapsed()
+            );
         }
     }
 
