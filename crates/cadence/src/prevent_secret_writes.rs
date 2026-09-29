@@ -443,6 +443,10 @@ mod tests {
             "truncate -s0 .[!A-Z]nv",
             "rm *credentials*",
             "rm id_*",
+            // #1114: a dot plus one literal still sweeps the dotfiles.
+            "rm .e*",
+            "truncate -s0 .e*",
+            "rm -f .n*",
         ] {
             assert!(bash_targets_env_file(command), "{command}");
         }
@@ -455,6 +459,8 @@ mod tests {
             "rm *.json",
             "rm -f certs/*.pem",
             "cp a.json config/*.json",
+            "rm .eslintrc*",
+            "rm .x*",
         ] {
             assert!(!bash_targets_env_file(command), "{command}");
         }

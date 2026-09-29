@@ -311,6 +311,20 @@ pub struct MarkedToken {
     ///
     /// Safety direction: a shorter prefix only ever declines an expansion.
     pub expanding_prefix_len: usize,
+    /// Does `text` carry a pathname-expansion character — `*`, `?`, `[`, or
+    /// an extglob `(` — that bash saw unquoted and unescaped, so it may expand
+    /// the word into file names? `'.*TODO'` and `\*` report `false`, `.env*`
+    /// and `'a'*` report `true`. A brace expansion of a word carrying one
+    /// reports it on every expansion.
+    ///
+    /// **This is what tells a regex from a glob.** `grep '.env*' x` hands grep
+    /// the regex `.env*`; `grep .env* x` hands it `.env .env.local x`, and the
+    /// second file is read (cadence-hooks#1114). Both arrive as the same text.
+    ///
+    /// Safety direction: `true` is the default a consumer must read as "may
+    /// expand", so an exemption keyed on `false` only ever holds for a word
+    /// whose every such character was quoted.
+    pub unquoted_glob: bool,
 }
 
 /// Where a token's leading quoting-context run stands while
@@ -584,6 +598,10 @@ fn push_expanded_token(
     expanding_prefix_len: usize,
     budget: &mut BraceBudget,
 ) {
+    let unquoted_glob = text
+        .bytes()
+        .zip(structural)
+        .any(|(b, &live)| live && matches!(b, b'*' | b'?' | b'[' | b'('));
     match brace_expand_word(&text, structural, budget) {
         BraceExpansion::Expanded(words) => {
             let unquoted = unquoted_prefix_len == text.len();
@@ -593,6 +611,7 @@ fn push_expanded_token(
                     text: word,
                     unquoted_prefix_len: len,
                     expanding_prefix_len: len,
+                    unquoted_glob,
                 }
             }));
         }
@@ -600,6 +619,7 @@ fn push_expanded_token(
             text,
             unquoted_prefix_len,
             expanding_prefix_len,
+            unquoted_glob,
         }),
     }
 }
@@ -8305,6 +8325,39 @@ mod tests {
         let marked = tokenize_marked("'$a' $HOME");
         assert_eq!(marked[0].expanding_prefix_len, 0);
         assert_eq!(marked[1].expanding_prefix_len, 5);
+    }
+
+    #[test]
+    fn tokenize_marked_reports_an_unquoted_glob() {
+        // cadence-hooks#1114: only a pathname-expansion character bash sees
+        // unquoted and unescaped can turn a regex into file operands.
+        for (command, want) in [
+            (".env*", true),
+            ("x?", true),
+            ("[ab]", true),
+            ("@(x)", true),
+            ("'a'*", true),
+            ("\"a\"?b", true),
+            ("{a,b*}", true),
+            ("'.env*'", false),
+            ("\".*TODO\"", false),
+            ("$'a*'", false),
+            ("\\*", false),
+            ("a\\?b", false),
+            ("'a'\\*", false),
+            ("plain", false),
+            ("{a,b}", false),
+        ] {
+            let marked = tokenize_marked(command);
+            assert!(
+                marked.iter().all(|t| t.unquoted_glob == want),
+                "{command:?} → {marked:?}"
+            );
+        }
+        // The mark does not leak across a token boundary.
+        let marked = tokenize_marked("a* 'b*'");
+        assert!(marked[0].unquoted_glob);
+        assert!(!marked[1].unquoted_glob);
     }
 
     #[test]
