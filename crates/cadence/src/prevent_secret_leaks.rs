@@ -7300,6 +7300,55 @@ mod tests {
     }
 
     #[test]
+    fn globs_that_could_expand_to_a_secret_block() {
+        // #1052, #814: the shell expands these to the secret before `cat` runs.
+        assert_bash(
+            &[
+                "cat .env*",
+                "head .en?",
+                "cat .e*v",
+                "cat .[e]nv",
+                "cat .e{n,}v",
+                "cat {a,.env}",
+                "cat .*",
+                "cp .env* /tmp/l",
+                "grep KEY .env*",
+                "cat ~/.ssh/*",
+                "cat ~/.ssh/id_*",
+                "cat ~/.aws/*",
+                "cat ~/.a?s/cred*",
+                "cat *.json",
+                "cat *.key",
+                "cat *env",
+                "bash -c 'cat .env*'",
+                "echo ok && tail -n5 config/.env.*",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a glob that could match a secret is a read of it",
+        );
+        assert_bash(
+            &[
+                "cat *.md",
+                "cat src/*.rs",
+                "head -1 *.txt",
+                "cat *",
+                "grep -n TODO *",
+                "cat x/*",
+                "ls -la .env*",
+                "rm .env*",
+                "cat .env*.example",
+                "cat {README,CHANGELOG}.md",
+                "for f in *.md; do wc -l \"$f\"; done",
+                "jq -r '.items[]?.name' x.json | xargs echo",
+                "curl 'https://h/p?x=1'",
+                "cat .envrc.example",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a glob that cannot match a secret, or a metadata-only command",
+        );
+    }
+
+    #[test]
     fn operands_that_spell_a_secret_only_after_tokenizing_block() {
         // #819: the raw text names no deny-set file, so the old substring
         // pre-filter skipped the resolver that classifies each of these.

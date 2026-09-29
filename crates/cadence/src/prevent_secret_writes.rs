@@ -405,6 +405,34 @@ mod tests {
     }
 
     #[test]
+    fn bash_glob_targets_that_could_name_a_secret_blocked() {
+        // #814, #1052: `> .env*` reaches `redirect_targets` as the literal
+        // `.env*`, and the write lands on the real file.
+        for command in [
+            "rm .env*",
+            "echo x > .env*",
+            "echo x > .en?",
+            "rm -f .env.*",
+            "rm .[e]nv",
+            "cp x .e{n,}v",
+            "rm *.key",
+            "rm ~/.ssh/*",
+            "tee ~/.aws/cred* < /dev/null",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        for command in [
+            "rm -rf dist/*",
+            "rm *.md",
+            "echo x > out/*.log",
+            "rm .env*.example",
+            "rm -rf node_modules/.cache/*",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
     fn bash_env_template_allowed() {
         assert!(!bash_targets_env_file("cat .env.example"));
     }
