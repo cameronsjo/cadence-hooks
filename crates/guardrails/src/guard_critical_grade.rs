@@ -127,12 +127,7 @@ fn endpoint_can_apply_labels(endpoint: &str) -> bool {
     let Some(pos) = segs.iter().position(|s| *s == "issues" || *s == "pulls") else {
         return false;
     };
-    match &segs[pos + 1..] {
-        [] => true,
-        [_] => true,
-        [_, "labels"] => true,
-        _ => false,
-    }
+    matches!(&segs[pos + 1..], [] | [_] | [_, "labels"])
 }
 
 /// A `-f`/`-F` field value, read from a file for the `@path` form.
