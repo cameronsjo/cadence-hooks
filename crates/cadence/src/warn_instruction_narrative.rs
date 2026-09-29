@@ -593,11 +593,9 @@ mod tests {
                     let d = line.chars().take_while(char::is_ascii_digit).count();
                     d > 0 && line[d..].starts_with(". ")
                 });
-            if (!in_fence && line.trim().is_empty()) || top_item {
-                if !cur.is_empty() {
-                    out.push(cur.join("\n"));
-                    cur.clear();
-                }
+            if ((!in_fence && line.trim().is_empty()) || top_item) && !cur.is_empty() {
+                out.push(cur.join("\n"));
+                cur.clear();
             }
             if !line.trim().is_empty() || in_fence {
                 cur.push(line);
