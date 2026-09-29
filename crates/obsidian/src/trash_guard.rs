@@ -151,6 +151,24 @@ pub trait FileMeta {
     fn physical(&self, _path: &str) -> Option<String> {
         None
     }
+
+    /// The canonical form of an EXISTING directory `path`, symlinks resolved and
+    /// any Windows verbatim prefix stripped; `None` when it does not exist. One
+    /// call is one `canonicalize`, which the caller budgets (cadence-hooks#1171).
+    fn canonical_dir(&self, _path: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Strip the Windows verbatim prefix `canonicalize` emits, so its output
+/// compares against the plain paths a hook payload carries: `\\?\C:\x`
+/// becomes `C:\x` and `\\?\UNC\srv\share` becomes `\\srv\share`. Pure string
+/// logic, so it is exercised on every platform.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
 /// Production impl over `std::fs`. Uses `symlink_metadata(...).is_ok()` — a
@@ -164,7 +182,9 @@ impl FileMeta for RealFs {
     fn physical(&self, path: &str) -> Option<String> {
         let path = std::path::Path::new(path);
         if let Ok(resolved) = std::fs::canonicalize(path) {
-            return Some(normalize_path(&resolved.to_string_lossy()));
+            return Some(normalize_path(&strip_verbatim_prefix(
+                &resolved.to_string_lossy(),
+            )));
         }
         // Find the longest existing prefix by binary search — existence is
         // monotone along the prefix chain — and resolve it once. A per-step
@@ -183,7 +203,16 @@ impl FileMeta for RealFs {
         }
         let mut resolved = canonicalize_or_parent(&prefix(lo))?;
         resolved.extend(&components[lo..]);
-        Some(normalize_path(&resolved.to_string_lossy()))
+        Some(normalize_path(&strip_verbatim_prefix(
+            &resolved.to_string_lossy(),
+        )))
+    }
+
+    fn canonical_dir(&self, path: &str) -> Option<String> {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        Some(normalize_path(&strip_verbatim_prefix(
+            &resolved.to_string_lossy(),
+        )))
     }
 }
 
@@ -433,12 +462,180 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     true
 }
 
+/// Collect the path operands of every deletion in `command`, read through the
+/// same segment/peel/`eval`/`find -exec` walk [`is_destructive_at`] uses, so an
+/// operand is judged only where a deleting verb receives it. Options and
+/// unquoted redirections are skipped; `find` contributes its start paths. A
+/// deletion whose operands arrive on stdin (`xargs rm`) names none here.
+fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
+    for segment in command_segments(command) {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+        let argv = peel_command_runners(&tokens);
+        let Some(first) = argv.first() else {
+            continue;
+        };
+        let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
+        let verb = command_word(first);
+        if head_deletes(argv) {
+            let mut start = 1;
+            if verb == "git" {
+                let rest = skip_git_global_options(&argv[1..]);
+                start = argv.len() - rest.len() + 1;
+            }
+            collect_operands(argv, lens, start, false, out);
+        } else if verb == "find" {
+            let is_delete = argv.iter().any(|t| t == "-delete");
+            let has_exec = argv.iter().any(|t| EXEC_ACTIONS.contains(&t.as_str()));
+            if is_delete || has_exec {
+                collect_operands(argv, lens, 1, true, out);
+            }
+            for (i, token) in argv.iter().enumerate() {
+                if !EXEC_ACTIONS.contains(&token.as_str()) {
+                    continue;
+                }
+                let action_argv = peel_command_runners(&argv[i + 1..]);
+                if depth < MAX_NESTED_DEPTH {
+                    for script in child_scripts(action_argv, "") {
+                        deletion_operands(&script, depth + 1, out);
+                    }
+                }
+            }
+        } else if verb == "eval" && depth < MAX_NESTED_DEPTH && argv.len() > 1 {
+            deletion_operands(&argv[1..].join(" "), depth + 1, out);
+        }
+    }
+}
+
+/// Push the operands of `argv[start..]`. `roots_only` (a `find`) stops at the
+/// first expression token instead of skipping options.
+fn collect_operands(
+    argv: &[String],
+    lens: &[usize],
+    start: usize,
+    roots_only: bool,
+    out: &mut Vec<String>,
+) {
+    let mut options_done = false;
+    let mut i = start;
+    while let Some(arg) = argv.get(i) {
+        if let Some((operator_len, bare)) = redirect_operator_span(arg)
+            && lens.get(i).is_some_and(|&len| len >= operator_len)
+        {
+            i += if bare { 2 } else { 1 };
+            continue;
+        }
+        if roots_only && (arg.starts_with('-') || arg == "(" || arg == "!") {
+            break;
+        }
+        if !options_done && !roots_only {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg.len() > 1 && arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        options_done = true;
+        out.push(arg.clone());
+        i += 1;
+    }
+}
+
+/// Resolve a deletion operand lexically against `cwd` (`~` against `home`,
+/// `..` collapsed). `None` for a `~user` form, which no text settles.
+fn resolve_operand(operand: &str, cwd: &str, home: Option<&str>) -> Option<String> {
+    let operand = normalize_path(operand);
+    let joined = if operand == "~" || operand.starts_with("~/") {
+        format!("{}{}", normalize_path(home?), &operand[1..])
+    } else if operand.starts_with('~') {
+        return None;
+    } else if looks_absolute(&operand) {
+        operand
+    } else {
+        format!("{cwd}/{operand}")
+    };
+    looks_absolute(&joined).then(|| collapse_dots(&joined))
+}
+
+/// Most `canonicalize` calls one command may cost (cadence-hooks#1171).
+const MAX_CANONICALIZE_CALLS: usize = 64;
+
+/// With the shell standing OUTSIDE the vault, does any deletion operand name
+/// the vault, something inside it, or an ancestor of it? Judged like a
+/// deletion inside the vault: lexically first, then through the operand's
+/// canonical PARENT, so `rm /outside/link/x` lands in the vault while `rm
+/// /outside/link` (removing only the link) does not. Past the canonicalize
+/// budget the answer is yes: an unjudged operand is read as inside.
+fn operands_touch_vault(
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+    meta: &dyn FileMeta,
+) -> bool {
+    let mut operands = Vec::new();
+    deletion_operands(command, 0, &mut operands);
+    let mut calls = 0;
+    let mut canonical_vault: Option<Option<String>> = None;
+    for operand in operands {
+        let Some(path) = resolve_operand(&operand, cwd, home) else {
+            continue;
+        };
+        if touches_vault(&path, vault) {
+            return true;
+        }
+        if path.len() > MAX_OPERAND_LEN || path.chars().any(char::is_control) {
+            continue;
+        }
+        let Some((parent, name)) = path.rsplit_once('/') else {
+            continue;
+        };
+        let parent = if parent.is_empty() { "/" } else { parent };
+        calls += 1;
+        if canonical_vault.is_none() {
+            calls += 1;
+            canonical_vault = Some(meta.canonical_dir(vault).map(|v| normalize_path(&v)));
+        }
+        if calls > MAX_CANONICALIZE_CALLS {
+            return true;
+        }
+        let Some(real_parent) = meta.canonical_dir(parent) else {
+            continue;
+        };
+        let real = format!("{}/{name}", normalize_path(&real_parent));
+        if touches_vault(&real, vault)
+            || canonical_vault
+                .as_ref()
+                .and_then(Option::as_deref)
+                .is_some_and(|v| touches_vault(&real, v))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if a destructive command targets the Obsidian vault, or if a
 /// clobber (`>`, `>|`) redirect would truncate an existing vault file.
 fn check_destructive_in_vault(
     command: &str,
     cwd: &str,
     vault: &str,
+    meta: &dyn FileMeta,
+) -> CheckResult {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    check_destructive_in_vault_at(command, cwd, vault, home.as_deref(), meta)
+}
+
+/// [`check_destructive_in_vault`] with the home directory passed in.
+fn check_destructive_in_vault_at(
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
     meta: &dyn FileMeta,
 ) -> CheckResult {
     // Normalize both sides before the prefix test: the vault root comes from
@@ -480,6 +677,13 @@ fn check_destructive_in_vault(
                     in_vault = true;
                     break;
                 }
+            }
+            // The words above catch a named vault path. A target that reaches
+            // the vault by being an ancestor of it (`rm -rf ~/Documents`), a
+            // relative climb, or a symlink parent needs the operands resolved
+            // (cadence-hooks#1171).
+            if !in_vault {
+                in_vault = operands_touch_vault(command, &cwd, &vault, home, meta);
             }
         }
 
@@ -862,6 +1066,174 @@ mod tests {
             // physically.
             assert_eq!(judge(&format!("rm {vault_s}/note.md"), &alias_s), Block);
             assert_eq!(judge(&format!("rm {outside_s}/plain.txt"), &alias_s), Allow);
+        }
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_from_canonical_output() {
+        for (raw, want) in [
+            (r"\\?\C:\Users\me\Vault", r"C:\Users\me\Vault"),
+            (r"\\?\UNC\srv\share\Vault", r"\\srv\share\Vault"),
+            (r"C:\Users\me", r"C:\Users\me"),
+            ("/home/me/Vault", "/home/me/Vault"),
+            (r"\\srv\share", r"\\srv\share"),
+            ("", ""),
+        ] {
+            assert_eq!(strip_verbatim_prefix(raw), want, "{raw}");
+        }
+    }
+
+    /// cadence-hooks#1171: with the shell OUTSIDE the vault, a deletion whose
+    /// operand is the vault, inside it, or an ancestor of it is a vault
+    /// deletion; everyday deletions stay allowed.
+    #[test]
+    fn deletion_from_outside_cwd_is_judged_by_its_resolved_operands() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let vault = "/home/me/Documents/Vault";
+        let cases: &[(&str, &str, cadence_hooks_core::Outcome)] = &[
+            ("/home/me", "rm -rf ~/Documents", Block),
+            ("/home/me", "rm -rf ~/Documents/", Block),
+            ("/home/me", "rm -rf ~", Block),
+            ("/home/me", "rm -rf Documents", Block),
+            ("/home/me", "rm -rf ./Documents/../Documents", Block),
+            ("/home/me/Documents", "rm -rf .", Block),
+            ("/home/me/Documents", "rm -r ../Documents", Block),
+            ("/home/me/Documents/x", "rm -rf ..", Block),
+            ("/home/me/Documents", "rm -rf Vault", Block),
+            ("/home/me/Documents", "rm -rf Vault/note.md", Block),
+            ("/home/me", "rm -rf /home/me/Documents", Block),
+            ("/home/me", "rm -rf /home", Block),
+            ("/home/me", "rm -rf /", Block),
+            ("/home/me", "sudo rm -rf ~/Documents", Block),
+            ("/home/me", "unlink ~/Documents", Block),
+            ("/home/me", "git rm -r ~/Documents", Block),
+            ("/home/me", "find ~/Documents -delete", Block),
+            ("/home/me", "find ~/Documents -exec rm {} +", Block),
+            ("/home/me", "eval rm -rf ~/Documents", Block),
+            ("/home/me", "sh -c 'rm -rf ~/Documents'", Block),
+            ("/home/me", "rm -f -- ~/Documents", Block),
+            ("/home/me", "rm -rf /tmp/x ~/Documents", Block),
+            // Everyday deletions stay allowed.
+            ("/home/me/project", "rm -rf target/", Allow),
+            ("/home/me/project", "rm /tmp/x", Allow),
+            ("/home/me", "rm -rf ~/Downloads", Allow),
+            ("/home/me", "rm -rf ~/Documents2", Allow),
+            ("/home/me", "rm -rf ~/Documents/Vault2", Allow),
+            ("/home/me/Documents", "rm -rf Other", Allow),
+            ("/home/me/Documents", "rm -rf ../Downloads", Allow),
+            ("/home/me/Documents", "rm Vault2/x", Allow),
+            ("/home/me/project", "rm -rf ~/.cache/x", Allow),
+            ("/home/me", "rm -rf ~other/Documents", Allow),
+            // Words that are not deletion operands are not judged.
+            ("/home/me", "echo ~/Documents", Allow),
+            ("/home/me", "ls ~/Documents; rm x", Allow),
+            ("/home/me", "rm -rf x > ~/Documents.log", Allow),
+        ];
+        for &(cwd, command, expected) in cases {
+            let result = check_destructive_in_vault_at(
+                command,
+                cwd,
+                vault,
+                Some("/home/me"),
+                &FakeFs::default(),
+            );
+            assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+        }
+        // No HOME: a tilde operand cannot be resolved, so it is not judged.
+        let result = check_destructive_in_vault_at(
+            "rm -rf ~/Documents",
+            "/home/me",
+            vault,
+            None,
+            &FakeFs::default(),
+        );
+        assert_eq!(result.outcome, Allow);
+    }
+
+    /// Fake canonicalizer: maps a directory to its canonical form, or reports
+    /// it absent; counts calls so the budget is observable.
+    struct LinkFs {
+        map: std::collections::HashMap<String, String>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl FileMeta for LinkFs {
+        fn exists(&self, path: &str) -> bool {
+            self.map.contains_key(path)
+        }
+        fn canonical_dir(&self, path: &str) -> Option<String> {
+            self.calls.set(self.calls.get() + 1);
+            self.map.get(path).cloned()
+        }
+    }
+
+    #[test]
+    fn deletion_through_a_symlinked_parent_is_judged_by_the_canonical_parent() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let fs = LinkFs {
+            map: [
+                ("/vault", "/vault"),
+                ("/outside/link", "/vault"),
+                ("/outside/link/notes", "/vault/notes"),
+                ("/outside", "/outside"),
+                ("/outside/plain", "/outside/plain"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            calls: std::cell::Cell::new(0),
+        };
+        let judge = |command: &str| {
+            check_destructive_in_vault_at(command, "/work", "/vault", None, &fs).outcome
+        };
+        assert_eq!(judge("rm /outside/link/x"), Block);
+        assert_eq!(judge("rm -r /outside/link/notes/x"), Block);
+        assert_eq!(judge("rm -r /outside/link/notes"), Block);
+        // `rm link` removes only the link.
+        assert_eq!(judge("rm /outside/link"), Allow);
+        assert_eq!(judge("rm /outside/plain/x"), Allow);
+        // A parent that does not exist is never stat-ed into a verdict.
+        assert_eq!(judge("rm /outside/missing/x"), Allow);
+        // Budget: 64 calls in total; one past it reads as inside.
+        let many = |n: usize| format!("rm {}", vec!["/outside/plain/x"; n].join(" "));
+        fs.calls.set(0);
+        assert_eq!(judge(&many(63)), Allow);
+        assert_eq!(fs.calls.get(), 64);
+        assert_eq!(judge(&many(64)), Block);
+    }
+
+    /// The same, on real disk: an outside symlink into the vault, judged by its
+    /// canonical parent, with the fixtures kept out of `/tmp`.
+    #[test]
+    fn deletion_from_outside_cwd_through_a_real_symlink_blocks() {
+        use cadence_hooks_core::git_fixtures::Scratch;
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures");
+        let scratch = Scratch::new(&root, "trash-guard-1171");
+        let base = scratch
+            .path()
+            .canonicalize()
+            .expect("scratch canonicalizes");
+        let vault = base.join("docs").join("vault");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(vault.join("notes")).expect("vault dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&vault, outside.join("link")).expect("symlink");
+        let vault_s = vault.to_string_lossy().into_owned();
+        let outside_s = outside.to_string_lossy().into_owned();
+        let docs_s = base.join("docs").to_string_lossy().into_owned();
+        let judge = |command: &str| {
+            check_destructive_in_vault_at(command, &outside_s, &vault_s, None, &RealFs).outcome
+        };
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_eq!(judge("rm plain.txt"), Allow);
+        assert_eq!(judge(&format!("rm -rf {docs_s}")), Block);
+        assert_eq!(judge("rm -rf ../docs"), Block);
+        #[cfg(unix)]
+        {
+            assert_eq!(judge("rm link/notes/x.md"), Block);
+            assert_eq!(judge("rm link"), Allow);
         }
     }
 

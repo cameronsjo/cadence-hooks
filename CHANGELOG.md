@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`obsidian trash-guard` judges a deletion issued from outside the vault by where its operand lands.** An `rm` (or `unlink`, `shred`, `truncate`, `git rm`, `find -delete`) whose target is the vault or an ancestor of it (`rm -rf ~/Documents` over a vault at `~/Documents/Vault`) is now blocked like a deletion inside it, resolved lexically against the working directory (`~`, `..`, relative). A target reached through a symlink into the vault is judged by its canonical parent (`rm link/x` blocks, `rm link` does not), at most 64 `canonicalize` calls per command, with the Windows `\\?\` verbatim prefix stripped before comparing. (cameronsjo/cadence-hooks#1171)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security
