@@ -864,10 +864,21 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         // possibly-unowned push through, and no timing/count heuristic can
         // separate that flood from a slow host — a slow host inflates each
         // probe, keeping any completion-count discriminator under its bar.
+        // One probe per DISTINCT remote, and a bounded number of those
+        // (cadence-hooks#1161). A 200 KB `for …; do git push origin main;
+        // …; done;` flood spawned one `git remote get-url` per looped push —
+        // ~2300 subprocesses for one remote — and reached the hook deadline,
+        // which fails open.
+        let mut probed: Vec<&str> = Vec::new();
+        let mut spawned = 0;
         for cmd in cmds {
             let Some(remote) = &cmd.explicit_repo else {
                 continue;
             };
+            if probed.contains(&remote.as_str()) {
+                continue;
+            }
+            probed.push(remote);
 
             // An explicit URL is validated DIRECTLY, never looked up as a
             // remote name. `git remote get-url --push <url>` always fails,
@@ -893,6 +904,13 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 continue;
             }
 
+            spawned += 1;
+            if spawned > MAX_PUSH_DIRECTORIES {
+                return CheckResult::block(
+                    "🚫 git-guardrails: too many push-loop remotes to verify\n   \
+                     Fix: run pushes individually so each remote is validated.",
+                );
+            }
             match resolve_push_url(&work_dir_loop, Some(remote)) {
                 PushUrlResolution::Url(url) => {
                     if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
