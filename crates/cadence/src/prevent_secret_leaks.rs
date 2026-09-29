@@ -1485,12 +1485,12 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 /// too, so none is opened by #538; they are named because a reader who sees
 /// `command cd` fixed will otherwise assume `command -p cd` is:
 ///
-/// - A leading REDIRECTION parks itself in `argv[0]`, so `>/tmp/o cd /x` and
-///   `2>/dev/null cd /x` hide the verb. [`command_words`] already strips
-///   redirections for the dump arm ([`redirection_of`]); this scan does not
-///   compose that strip with [`executable_tokens`].
-/// - A WRAPPER'S OWN FLAG stops the peel one token short: `command -p cd /x`,
-///   `time -p cd /x`. The loop skips a `CD_WRAPPERS` word, not a flag behind it.
+/// - **RESOLVED (#832).** A leading REDIRECTION (`>/tmp/o cd /x`,
+///   `2>/dev/null cd /x`) is peeled like a wrapper word, and so is a
+///   wrapper's own flag (`command -p cd /x`, `time -p cd /x`). `sudo -D /x`
+///   and `sudo --chdir=/x` are a chdir by flag and are detected as one.
+///   `command if cd /x; then …; fi` was named alongside these and is not a
+///   miss: bash rejects it as a syntax error and runs nothing.
 /// - **RESOLVED (cadence-hooks#237 security review, F6).** A mid-word backslash
 ///   used to go unfolded: `command_word` stripped one LEADING backslash while
 ///   bash removes every unquoted one, so `c\d /x` was a `cd` the resolver read
@@ -1506,18 +1506,43 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 /// - `env -S 'cd /x; …'`, which the `-S` posture stops the walk on — measured,
 ///   it does not chdir on macOS anyway.
 ///
-/// The first three are closeable in this function alone and in the
-/// blocks-only direction; they are held back from #538 so each widening keeps
-/// its own differential, which is this file's standing rule.
 fn command_changes_directory(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let tokens = executable_tokens(&segment);
         let mut argv = tokens.as_slice();
+        let mut after_wrapper = false;
         // Peel while something follows: a lone trailing wrapper word runs
         // nothing, and stopping at one token keeps `argv[0]` addressable.
         while argv.len() > 1 {
             let head = &argv[0];
-            if is_assignment_word(head) || CD_WRAPPERS.contains(&command_word(head).as_ref()) {
+            // A redirection may sit anywhere in a simple command, including in
+            // front of the verb: `>/tmp/o cd /x` is a `cd` (#832).
+            if let Some(target_is_next) = redirection_of(head) {
+                argv = &argv[if target_is_next { 2 } else { 1 }.min(argv.len())..];
+                continue;
+            }
+            // A wrapper's own flags (`command -p cd`, `time -p cd`) stop the
+            // peel one token short otherwise (#832). Flags are dropped without
+            // parsing their values: a valued flag leaves its value as the head,
+            // which is not `cd`, so the cost is a miss the pre-#832 walk had
+            // too, never a new one. A `v`/`V` flag ends the peel instead:
+            // `command -v cd` looks `cd` up and runs nothing.
+            if after_wrapper && head.starts_with('-') && !head.contains(['v', 'V']) {
+                argv = &argv[1..];
+                continue;
+            }
+            let word = command_word(head);
+            if CD_WRAPPERS.contains(&word.as_ref()) {
+                // `sudo -D /x` and `sudo --chdir=/x` run the command in `/x`,
+                // the same shape as `env -C` (#832). Searched across the rest
+                // of the segment rather than parsed, so a later operand that
+                // happens to spell a chdir flag over-blocks — fail-closed.
+                if word == "sudo" && argv[1..].iter().any(|t| sudo_chdir_flag(t)) {
+                    return true;
+                }
+                after_wrapper = true;
+                argv = &argv[1..];
+            } else if is_assignment_word(head) {
                 argv = &argv[1..];
             } else {
                 break;
@@ -1559,6 +1584,21 @@ fn command_changes_directory(command: &str) -> bool {
         }
         false
     })
+}
+
+/// Is `token` a `sudo` option that changes the working directory — `-D DIR`,
+/// `--chdir=DIR`, or any unambiguous abbreviation `getopt_long` accepts
+/// (`--chd`)? A `D` anywhere in a short-option cluster counts, including one
+/// that is really another option's value (`-uDave`): over-reading is the
+/// fail-closed direction for a detector.
+fn sudo_chdir_flag(token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return name.len() >= 3 && "chdir".starts_with(name);
+    }
+    token
+        .strip_prefix('-')
+        .is_some_and(|cluster| cluster.contains('D'))
 }
 
 /// Content-aware `.envrc` carve-out for the Bash read path (#193): the Read/Grep
@@ -5623,5 +5663,69 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "only a provable secret path blocks",
         );
+    }
+
+    #[test]
+    fn chdir_behind_a_redirection_or_wrapper_flag_is_seen() {
+        // #832: each of these moves the shell (or sudo's child) away from
+        // `input.cwd` before the read, so the pure loader proven there is not
+        // the file `cat` opens.
+        for command in [
+            ">/tmp/o cd /x && cat .envrc",
+            "> /tmp/o cd /x && cat .envrc",
+            "2>/dev/null cd /x && cat .envrc",
+            "command -p cd /x && cat .envrc",
+            "time -p cd /x && cat .envrc",
+            "command -- cd /x && cat .envrc",
+            "sudo -D /x cat .envrc",
+            "sudo -u root -D /x cat .envrc",
+            "sudo --chdir=/x cat .envrc",
+            "sudo --chdir /x cat .envrc",
+            "sudo --chd=/x cat .envrc",
+        ] {
+            assert!(command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn chdir_scan_still_ignores_non_chdir_shapes() {
+        for command in [
+            "cat .envrc",
+            ">/tmp/o cat .envrc",
+            "command -v cd",
+            "sudo -u root cat .envrc",
+            "sudo --chroot=/x cat .envrc",
+            "time -p make",
+        ] {
+            assert!(!command_changes_directory(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn relative_envrc_read_after_a_hidden_chdir_blocks() {
+        // End to end: the carve-out allows the loader at `input.cwd`, and each
+        // hidden chdir must now revoke it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let run = |c: &str| {
+            SecretLeaksGuard::default()
+                .run(&make_bash_with_cwd(c, cwd))
+                .outcome
+        };
+        assert_eq!(run("cat .envrc"), cadence_hooks_core::Outcome::Allow);
+        for command in [
+            ">/tmp/o cd /x && cat .envrc",
+            "command -p cd /x && cat .envrc",
+            "time -p cd /x && cat .envrc",
+            "sudo -D /x cat .envrc",
+            "sudo --chdir=/x cat .envrc",
+        ] {
+            assert_eq!(
+                run(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
     }
 }
