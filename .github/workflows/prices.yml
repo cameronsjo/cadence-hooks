@@ -54,7 +54,9 @@ jobs:
 
   refresh:
     name: Refresh prices.json
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Main only: a dispatch from another branch would otherwise push a price
+    # PR built from that branch's generator.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # One refresh at a time; a second queued run would only race the first
@@ -79,20 +81,27 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # No persisted credentials: the generator runs with no token in
+      # .git/config, and the push below names its credential explicitly.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          persist-credentials: false
 
       # A refresh PR left unreviewed would otherwise be joined by a new one
-      # every Monday.
+      # every Monday. Only this app's same-repo PRs count: anyone can open a
+      # fork PR with a matching branch name, and that must not suppress the
+      # refresh.
       - name: Skip while a refresh PR is open
         id: open
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
           count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-            --json headRefName \
-            --jq '[.[] | select(.headRefName | startswith("chore/prices-refresh-"))] | length')
+            --json headRefName,isCrossRepository,author |
+            jq --arg author "app/${APP_SLUG}" \
+              '[.[] | select((.isCrossRepository | not) and .author.login == $author and (.headRefName | startswith("chore/prices-refresh-")))] | length')
           echo "count=$count" >> "$GITHUB_OUTPUT"
           if [ "$count" != "0" ]; then
             echo "A refresh PR is already open; skipping."
@@ -121,11 +130,13 @@ jobs:
           bot_id=$(gh api "/users/${bot}" --jq .id)
           git config user.name "$bot"
           git config user.email "${bot_id}+${bot}@users.noreply.github.com"
-          branch="chore/prices-refresh-$(date -u +%Y%m%d)"
+          # The run id keeps a same-day re-dispatch from colliding with a
+          # branch an earlier run left behind.
+          branch="chore/prices-refresh-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
           git switch -c "$branch"
           git add crates/metrics/prices.json
           git commit -m "chore(metrics): refresh prices.json from the published pricing table"
-          git push origin "$branch"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$branch"
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
             --title "chore(metrics): refresh prices.json from the published pricing table" \
             --body-file "$RUNNER_TEMP/prices-body.md"
