@@ -10,14 +10,16 @@
 //! The expected string is HARDCODED here. Importing it from the crate would
 //! make this test agree with whatever the constant became.
 
+mod support;
+
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// The block text a machine without `forgectl` must still see, byte for byte.
 const TODAYS_WRITE_BLOCK: &str = "🚫 BLOCKED: '.env' is a protected file (secrets/credentials). Modify manually outside Claude Code.";
 
 fn run_guard(subcommand: &str, payload: &str, path: &str) -> (i32, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut child = support::cadence_hooks()
         .args(["cadence", subcommand])
         .env("PATH", path)
         // Both confounds this repo documents: an ambient `CADENCE_DISABLE`

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Three test-only races are closed; no shipped behavior changes.** Two `persist_plan` nudge-composition tests called `persist_and_nudge` without the shared metrics lock, so their placeholder `plan-links.jsonl` rows landed in whichever `CADENCE_METRICS_DIR` a locked sibling had set, or in the live ledger; they now run under `with_scratch_metrics_dir` (cameronsjo/cadence-hooks#1062, cameronsjo/cadence-hooks#768).
+- **`closed_stdout_covers_doctor` accepts both legitimate outcomes.** It passes on death by SIGPIPE or on `doctor`'s clean exit 2 for the missing manifest, and still fails on a panic, a `Broken pipe` complaint, any other exit code, or a failopen row. The file's closed-stdout pipe is now close-on-exec, so a sibling test's `fork` can no longer carry a live reader into its child and turn the expected SIGPIPE into exit 0 (cameronsjo/cadence-hooks#1061).
+- **The synthetic-panic seam now guarantees a measurable span.** `a_panicking_check_fails_open_and_dispatch_survives_it` relied on the parent stalling stdin, which loses under load when the child starts after the stall; the debug-only `CADENCE_TEST_PANIC=1` trigger now sleeps 5 ms so `log_timing`'s strict threshold always writes its row (cameronsjo/cadence-hooks#540).
+
+### Changed
+
+- **Binary-level integration tests can no longer write into the real `~/.claude`.** Every helper that spawns the binary now goes through `tests/support`'s `cadence_hooks()`, which pins `CLAUDE_CONFIG_DIR` to a fresh per-binary dir under cargo's target tmp dir and drops an ambient `CLAUDE_PROJECT_DIR`; `tests/try_hook.rs` and `tests/persist_plan_driver_tier.rs` are handled in cameronsjo/cadence-hooks#1065. Test-only, no shipped behavior changes (cameronsjo/cadence-hooks#1062).
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed

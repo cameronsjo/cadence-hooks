@@ -6,8 +6,10 @@
 //! that a refused disable does not silence it, and that the report reaches
 //! Claude Code as SessionStart `additionalContext` on exit 0.
 
+mod support;
+
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 /// Throwaway metrics root, so a run of this suite cannot append rows to the
 /// operator's real ledger. Held process-lifetime so it outlives every child.
@@ -20,7 +22,7 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 /// Run the hook with exactly the given switches set; every other ambient
 /// switch is cleared so a runner session cannot decide the outcome.
 fn run(bypass_value: Option<&str>, disable_value: Option<&str>) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.args(["guardrails", "enforcement-status"])
         .env_remove("CADENCE_BYPASS")
         .env_remove("CADENCE_DISABLE")

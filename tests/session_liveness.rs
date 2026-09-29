@@ -6,6 +6,8 @@
 //! `doctor --prune --apply` gate reads the local and mirror records' mtimes
 //! to decide whether a session is live.
 
+mod support;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -39,7 +41,7 @@ fn post_tool_use(repo: &Path, config: &Path, metrics: &Path) {
         "cwd": repo,
     })
     .to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let mut child = support::cadence_hooks()
         .args(["session", "persist-plan-approval"])
         .env_remove("CADENCE_BYPASS")
         .env_remove("CADENCE_DISABLE")
