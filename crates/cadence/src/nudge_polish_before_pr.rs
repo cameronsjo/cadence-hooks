@@ -60,9 +60,14 @@
 //!   is the whole of item 6;
 //! - a marker whose attestation says the security arm ran, but names a model
 //!   family that is not Opus, on a branch that touches code → the
-//!   **wrong-family nudge** (cadence-hooks#775 item 1). An *unattested*
-//!   `security=ran` stays silent — every marker the estate carries today is
-//!   unattested, so escalating those is a rollout nag, not a finding.
+//!   **wrong-family nudge** (cadence-hooks#775 item 1).
+//! - a marker whose roster says the security arm ran but attests **no**
+//!   family for it, on a branch that touches code → the **unattested-security
+//!   nudge** (cadence-hooks#785). This was silent through the attestation
+//!   rollout; the polish skill has emitted `--arm-model` since 2026-08-26
+//!   (cameronsjo/cadence#1078) and the marker TTL is 30 days, so every live
+//!   skill-recorded marker is attested and an unattested one is a hand record
+//!   or an older tool.
 //! - a marker whose recorded change-set digest differs from a live digest of
 //!   the working tree, on any branch → the **stale-marker nudge**
 //!   (cadence-hooks#874): a polish ran here, but not on what ships.
@@ -128,12 +133,8 @@
 
 use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files, working_tree_digest};
 use cadence_hooks_core::markers::{
-    MarkerTarget, POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
-    read_polish_marker, resolve_ship_target,
-};
-use cadence_hooks_core::shell::{
-    git_command, merge_anchor_repo_targets, origin_triple, parse_work_dir,
-    polish_ship_segments_for_origin,
+    MarkerTarget, POLISH_MARKER_TTL_DAYS, located_ship_segments, marker_dir, marker_dir_is_private,
+    polish_marker_present, read_polish_marker, resolve_located_ships,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -166,8 +167,9 @@ pub enum MarkerState {
     /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
     ///
     /// `security_model` is the attested model family for the security arm
-    /// (cadence-hooks#775 item 1), `None` on every unattested marker — which is
-    /// every marker the estate carries today, and which stays silent.
+    /// (cadence-hooks#775 item 1), `None` on an unattested marker — which
+    /// draws the unattested-security nudge on a code branch
+    /// (cadence-hooks#785).
     ///
     /// `roster_read` discriminates the two ways `security_ran` reaches `None`
     /// (cadence-hooks#775 item 6): `true` means the marker's content was
@@ -211,37 +213,20 @@ impl Check for NudgePolishBeforePr {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-        // Only a ship anchor (`gh pr ready`, a non-draft `gh pr create`, or a
-        // bare `gh pr merge`) pays the git-resolution cost; every other command
-        // short-circuits to allow inside `decide`.
-        let cwd = input.cwd.as_deref();
-        // Both the origin resolution below and the lazy predicates further
-        // down need the same `cd`-aware working directory, so it is resolved
-        // ONCE here rather than per-consumer. This is string parsing with no
-        // I/O — the cost the laziness elsewhere protects against is the git
-        // work, not this.
-        let work_dir = cwd.map(|cwd| parse_work_dir(command, cwd));
-        // The `git remote get-url origin` spawn is paid only when a
-        // repo-retargeted `gh pr merge` segment could still anchor pending an
-        // origin match (cadence-hooks#881) — `merge_anchor_repo_targets` is
-        // `None` for every other shape (no merge segment, an
-        // already-decided bare merge, a `GH_HOST=` override, a merge naming a
-        // PR), so the common `create`/`ready` paths never pay for this.
-        let origin = work_dir
-            .as_deref()
-            .filter(|_| merge_anchor_repo_targets(command).is_some())
-            .and_then(|dir| git_command(dir, &["remote", "get-url", "origin"]))
-            // The same host mapping the #995 resolver applies to every remote
-            // (an SSH alias, `ssh.github.com`), so both compare sites agree.
-            .and_then(|url| origin_triple(&url));
         // Every anchoring segment is judged, not only the first (security
         // review, #995 I1): `gh pr create --head polished && gh pr create
         // --head unpolished` ships twice, and a polished first ship must not
-        // vouch for the second. Each segment resolves its own target and is
-        // measured in its own `work_dir`; the sharpest verdict wins.
-        polish_ship_segments_for_origin(command, origin.as_deref())
+        // vouch for the second. Each ship is judged both in the directory its
+        // own segment runs in and in the whole-command directory
+        // (cadence-hooks#997), so a `cd` inside `( … )` or between two ships
+        // can add a nudge but never clear one; the sharpest verdict wins. The
+        // `git remote get-url origin` spawn is paid only for a repo-retargeted
+        // `gh pr merge` (cadence-hooks#881), so the common `create`/`ready`
+        // paths never pay for it. Each distinct target is judged once, and
+        // past `MAX_JUDGED_SHIPS` the rest nudge unjudged (cadence-hooks#1152).
+        resolve_located_ships(&located_ship_segments(command, input.cwd.as_deref()))
             .iter()
-            .map(|segment| judge_target(&resolve_ship_target(&segment.target, work_dir.as_deref())))
+            .map(judge_target)
             .min()
             .map_or_else(CheckResult::allow, Verdict::into_result)
     }
@@ -328,9 +313,8 @@ fn satisfies_security_requirement(family: &str) -> bool {
 /// The attested model family for the **security** arm, or `None` when the
 /// marker attests nothing for it (cadence-hooks#775 item 1).
 ///
-/// Every marker the estate carries today is unattested, so `None` is the
-/// overwhelming common case and it keeps allowing — the gate escalates only on
-/// an affirmative family that fails the requirement.
+/// `None` beside `security=ran` is the unattested case (cadence-hooks#785);
+/// an affirmative family that fails the requirement is the wrong-family one.
 fn attested_security_family(record: &cadence_hooks_core::markers::PolishRecord) -> Option<String> {
     record.attest.as_ref()?.get("security")?.model.clone()
 }
@@ -391,6 +375,8 @@ fn recorded_digest(record: Option<&cadence_hooks_core::markers::PolishRecord>) -
 ///   item 1).
 /// - ship anchor + a marker whose content was READ and names no roster, on a
 ///   branch that touches code → the unknown-roster nudge (#775 item 6).
+/// - ship anchor + a marker whose security arm ran with no attested family,
+///   on a branch that touches code → the unattested-security nudge (#785).
 /// - ship anchor + any other marker (security ran, or unknown because the
 ///   content could not be read at all) → allow (silent), carrying
 ///   `annotations` as exit-0 context when the caller resolved any.
@@ -400,8 +386,8 @@ fn recorded_digest(record: Option<&cadence_hooks_core::markers::PolishRecord>) -
 ///
 /// **The match order IS the precedence, and it is total**: absent →
 /// cannot-check → expired →
-/// security-skipped → wrong-family → digest-moved → unknown-roster → allow
-/// (+annotations).
+/// security-skipped → wrong-family → digest-moved → unknown-roster →
+/// unattested-security → allow (+annotations).
 /// Each verdict names a strictly more specific gap than the one after it, so a
 /// marker that qualifies for two reports the sharper one.
 ///
@@ -446,6 +432,7 @@ enum Verdict {
     WrongFamily(String),
     StaleMarker,
     UnknownRoster,
+    UnattestedSecurity,
     /// A clean allow that carries advisory annotations as exit-0 context.
     AllowAnnotated(String),
     Allow,
@@ -463,6 +450,7 @@ impl Verdict {
             Verdict::WrongFamily(family) => CheckResult::nudge(wrong_family_nudge_message(&family)),
             Verdict::StaleMarker => CheckResult::nudge(stale_marker_nudge_message()),
             Verdict::UnknownRoster => CheckResult::nudge(unknown_roster_nudge_message()),
+            Verdict::UnattestedSecurity => CheckResult::nudge(unattested_security_nudge_message()),
             Verdict::AllowAnnotated(annotations) => CheckResult::nudge(annotations),
             Verdict::Allow => CheckResult::allow(),
         }
@@ -487,9 +475,8 @@ fn judge(
         } if branch_touches_code() => Verdict::SecuritySkipped,
         // The security arm ran, and the marker names the family that ran it —
         // and it is not one that satisfies the independent-review requirement
-        // (#775 item 1). An UNattested `ran` falls through to the allow below:
-        // every legacy marker is unattested, so escalating those would be a
-        // rollout nag rather than a finding.
+        // (#775 item 1). An UNattested `ran` is its own, milder arm below
+        // (#785).
         MarkerState::Present {
             security_ran: Some(true),
             security_model: Some(family),
@@ -518,6 +505,16 @@ fn judge(
             roster_read: true,
             ..
         } if branch_touches_code() => Verdict::UnknownRoster,
+        // The security arm ran and nothing attests which family ran it
+        // (#785). Silent through the #775 rollout, when every marker was
+        // unattested; past the skill wiring plus the 30-day TTL, an
+        // unattested `ran` is a hand record or an older tool — a gap in the
+        // record, so the ask is the attestation.
+        MarkerState::Present {
+            security_ran: Some(true),
+            security_model: None,
+            ..
+        } if branch_touches_code() => Verdict::UnattestedSecurity,
         // Polish recorded a marker for this branch, and nothing affirmatively
         // says the security arm was skipped on a code branch — allow, silent
         // unless an advisory annotation has something to add.
@@ -626,6 +623,19 @@ fn unknown_roster_nudge_message() -> String {
     )
 }
 
+/// The #785 escalation: the roster says the security arm ran, but nothing
+/// attests which model family ran it, on a branch that touches code. The ask
+/// is the attestation, so the re-record command is named in full.
+fn unattested_security_nudge_message() -> String {
+    format!(
+        "Polish recorded the SECURITY arm as run but not which model family ran it, and this \
+         branch's diff vs origin/main touches code. Record which family ran the security arm: \
+         if an Opus-family reviewer ran it, re-record with `cadence-hooks cadence record-polish \
+         --arm security=ran --arm-model security=opus` from this worktree; if not, run \
+         `cadence-forge:security-reviewer` (Opus) first. {SCOPE_CLAUSES}"
+    )
+}
+
 /// The #874 escalation: the marker's recorded change-set digest and the live
 /// working tree disagree, so the arms reviewed something other than what ships.
 ///
@@ -709,6 +719,7 @@ mod tests {
         security_model: None,
         roster_read: false,
     };
+    /// `security=ran` with no attested family (cadence-hooks#785).
     const PRESENT_SECURITY_RAN: MarkerState = MarkerState::Present {
         security_ran: Some(true),
         security_model: None,
@@ -770,7 +781,7 @@ mod tests {
         assert_eq!(
             decide(
                 "gh pr create --title x",
-                PRESENT_SECURITY_RAN,
+                present_security_ran_by("opus"),
                 || true,
                 || None,
                 &[],
@@ -1286,7 +1297,7 @@ mod tests {
         with_marker_dir(marker_tmp.path(), || {
             write_marker(
                 &polish_marker(&root, "feat/own-repo-merge-marked"),
-                r#"{"scope":"full","arms":{"security":"ran"}}"#,
+                r#"{"scope":"full","arms":{"security":"ran"},"attest":{"security":{"model":"opus"}}}"#,
             )
             .unwrap();
 
@@ -1484,7 +1495,7 @@ mod tests {
         with_marker_dir(marker_tmp.path(), || {
             write_marker(
                 &polish_marker(&root, "feat/roster-ran"),
-                r#"{"scope":"full","arms":{"security":"ran"}}"#,
+                r#"{"scope":"full","arms":{"security":"ran"},"attest":{"security":{"model":"opus"}}}"#,
             )
             .unwrap();
 
@@ -1595,12 +1606,12 @@ mod tests {
     }
 
     #[test]
-    fn decide_unattested_security_ran_stays_silent() {
-        // PINS the no-transitional-nudge ruling (#775): an UNattested
-        // `security=ran` is today's behavior and stays silent. Every marker in
-        // the estate is unattested, so nudging them all would be a rollout
-        // nag, not a finding. Escalating unattested `ran` is a dated follow-up
-        // issue, deliberately not this change.
+    fn decide_unattested_security_ran_nudges_on_a_code_branch_only() {
+        // #785: the #775 rollout kept an UNattested `security=ran` silent.
+        // Past its date gate (the skill's `--arm-model` wiring + the 30-day
+        // TTL) an unattested record is a gap, so a code branch nudges for the
+        // attestation, and a docs-only branch stays silent like every other
+        // roster arm.
         let result = decide(
             "gh pr create --title x",
             PRESENT_SECURITY_RAN,
@@ -1609,8 +1620,30 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(result.outcome, Outcome::Allow);
-        assert!(result.message.is_none());
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(msg.contains("not which model family"), "{msg}");
+        assert!(msg.contains("--arm-model security=opus"), "{msg}");
+        assert!(!msg.contains("No polish recorded"), "{msg}");
+
+        let docs = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_RAN,
+            || false,
+            || None,
+            &[],
+            None,
+        );
+        assert_eq!(docs.outcome, Outcome::Allow);
+        assert!(docs.message.is_none());
+    }
+
+    #[test]
+    fn decide_unattested_security_ranks_below_every_other_nudge() {
+        // The sharpness order across segments (#995 I1): an unattested record
+        // is the mildest gap, so any other nudge on another ship wins.
+        assert!(Verdict::UnknownRoster < Verdict::UnattestedSecurity);
+        assert!(Verdict::UnattestedSecurity < Verdict::AllowAnnotated(String::new()));
     }
 
     #[test]
@@ -1656,8 +1689,8 @@ mod tests {
         // session's `additionalContext`, so a hand-edited marker was a prompt-
         // injection and terminal-escape channel. The bound is enforced on the
         // READ side now, so every out-of-charset family reads as UNattested and
-        // the gate falls through to its normal verdict — a silent allow for a
-        // `security=ran` roster.
+        // the gate falls through to its normal verdict — the unattested-
+        // security nudge (#785), whose text echoes no recorded value.
         let (tmp, root) = init_repo_with_origin_and_files("feat/hostile-family", &["src/lib.rs"]);
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
@@ -1683,13 +1716,14 @@ mod tests {
                 let result = NudgePolishBeforePr.run(&input);
                 assert_eq!(
                     result.outcome,
-                    Outcome::Allow,
-                    "a hostile family reads as unattested, so the gate allows: {body}"
+                    Outcome::Nudge,
+                    "a hostile family reads as unattested: {body}"
                 );
-                assert!(
-                    result.message.is_none(),
-                    "no hostile value may reach the message surface: {:?}",
-                    result.message
+                let msg = result.message.unwrap_or_default();
+                assert_eq!(
+                    msg,
+                    unattested_security_nudge_message(),
+                    "no hostile value may reach the message surface"
                 );
             }
         });
@@ -1740,7 +1774,9 @@ mod tests {
     /// A marker body carrying a roster (so the unknown-roster nudge stays out
     /// of the way) and the given `diff_digest` block verbatim.
     fn marker_with_digest(digest_block: &str) -> String {
-        format!(r#"{{"scope":"full","arms":{{"security":"ran"}},"diff_digest":{digest_block}}}"#)
+        format!(
+            r#"{{"scope":"full","arms":{{"security":"ran"}},"attest":{{"security":{{"model":"opus"}}}},"diff_digest":{digest_block}}}"#
+        )
     }
 
     /// `git -C dir add -A && git commit`, for the commit-side halves below.
@@ -1855,7 +1891,7 @@ mod tests {
             let input = make_bash_with_cwd("gh pr create --title x", dir);
 
             let silent = [
-                r#"{"scope":"full","arms":{"security":"ran"}}"#.to_string(),
+                r#"{"scope":"full","arms":{"security":"ran"},"attest":{"security":{"model":"opus"}}}"#.to_string(),
                 marker_with_digest(r#"{"base":"deadbeef","digest":"skipped","files":9000}"#),
             ];
             for body in &silent {
@@ -2455,7 +2491,8 @@ mod tests {
     // --- cadence-hooks#995: resolve the PR's head checkout ---
 
     const OWN_URL: &str = "https://github.com/own/repo.git";
-    const RAN: &str = r#"{"scope":"full","arms":{"security":"ran"}}"#;
+    const RAN: &str =
+        r#"{"scope":"full","arms":{"security":"ran"},"attest":{"security":{"model":"opus"}}}"#;
 
     /// A primary checkout on `main` (the session cwd) with a real `origin`
     /// remote, and `feat/x` carrying `files` checked out in a separate linked
@@ -2900,6 +2937,143 @@ mod tests {
         });
     }
 
+    // --- #997: each ship is judged in the directory it runs in ---
+
+    /// A primary checkout on `main` with `feat/pol` (marker, security ran)
+    /// and `feat/unpol` (no marker), each in a linked worktree named `pol` and
+    /// `unpol` under one parent. `f` gets the primary and that parent.
+    fn with_sibling_worktrees(f: impl FnOnce(&str, &str)) {
+        let (repo, root) = init_repo_with_real_origin_remote("feat/pol", OWN_URL, &["src/lib.rs"]);
+        git_in(repo.path(), &["branch", "feat/unpol"]);
+        git_in(repo.path(), &["checkout", "-q", "main"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        for (name, branch) in [("pol", "feat/pol"), ("unpol", "feat/unpol")] {
+            let wt = wt_parent.path().join(name);
+            git_in(
+                repo.path(),
+                &["worktree", "add", "-q", wt.to_str().unwrap(), branch],
+            );
+        }
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/pol"), RAN).unwrap();
+            f(
+                repo.path().to_str().unwrap(),
+                wt_parent.path().to_str().unwrap(),
+            );
+        });
+    }
+
+    #[test]
+    fn a_ship_is_judged_in_the_directory_its_own_segment_runs_in() {
+        with_sibling_worktrees(|primary, parent| {
+            let pol = format!("{parent}/pol");
+            let unpol = format!("{parent}/unpol");
+            // Controls: the fixture allows the polished worktree and nudges
+            // the unpolished one.
+            let control = run_at("gh pr create -t a", &pol);
+            assert_eq!(control.outcome, Outcome::Allow, "{:?}", control.message);
+            assert_no_polish_nudge(&run_at("gh pr create -t a", &unpol));
+            // #997's rows, cwd = the polished worktree.
+            for command in [
+                "(cd ../unpol && gh pr create -t a)",
+                "{ cd ../unpol && gh pr create -t a; }",
+                "cd ../unpol && gh pr create -t a",
+                "(cd ../pol && gh pr ready) ; cd ../unpol && gh pr ready",
+            ] {
+                assert_no_polish_nudge(&run_at(command, &pol));
+            }
+            // #997's third row, from the primary checkout: the second `cd`
+            // must not vouch for the first ship.
+            assert_no_polish_nudge(&run_at(
+                &format!("cd {unpol} && gh pr create -t a ; cd {pol} && gh pr create -t a"),
+                primary,
+            ));
+            // A `cd` that runs in its own process moves nothing, so the ship
+            // stays in the polished cwd.
+            for command in [
+                "(cd ../unpol) && gh pr create -t a",
+                "(cd ../unpol && gh pr list) ; gh pr create -t a",
+            ] {
+                let result = run_at(command, &pol);
+                assert_eq!(
+                    result.outcome,
+                    Outcome::Allow,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+            // Every ship is also judged in the whole-command directory (the
+            // pre-#997 reading), so a subshell into the polished worktree
+            // does not clear a ship from the unpolished cwd.
+            for command in [
+                "(cd ../pol && gh pr create -t a) ; gh pr create -t a",
+                "(cd ../pol && gh pr create -t a)",
+            ] {
+                assert_no_polish_nudge(&run_at(command, &unpol));
+            }
+        });
+    }
+
+    #[test]
+    fn a_leaked_subshell_cd_never_clears_an_unpolished_ship() {
+        // #997 review I2/I3: each of these ran the ship in the unpolished cwd
+        // while the walker judged it in the polished worktree. origin/main
+        // nudges on every one.
+        with_sibling_worktrees(|_primary, parent| {
+            let unpol = format!("{parent}/unpol");
+            for command in [
+                // I2: parens inside quotes.
+                "(cd ../pol && grep -c \"fn main(\" src/lib.rs) ; gh pr create -t a -b b",
+                "(cd ../pol && echo \":(\") ; gh pr create -t a -b b",
+                "(cd ../pol && echo ')') ; gh pr create -t a -b b",
+                // I3: a piped or backgrounded brace group, and a `cd` in a
+                // substitution.
+                "{ cd ../pol; } | true; gh pr create -t a -b b",
+                "{ cd ../pol; } & gh pr create -t a -b b",
+                // Pre-#997 reading kept: a piped `cd` still nudges.
+                "cd ../pol | true; gh pr create -t a -b b",
+            ] {
+                assert_no_polish_nudge(&run_at(command, &unpol));
+            }
+            // The whole-command reading takes `../pol)` for this `cd`'s
+            // target, a directory that does not exist, so its verdict is the
+            // cannot-check advisory, which outranks the absent marker. Never
+            // silent either way.
+            let substitution = run_at("echo $(true; cd ../pol); gh pr create -t a -b b", &unpol);
+            assert_eq!(substitution.outcome, Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn a_whole_command_only_ship_is_judged_beside_a_located_merge() {
+        // #997 review I1: a merge the per-segment reading anchors (its
+        // subshell's origin matches `-R`) and a ship only the whole command
+        // reveals (`$G`) tied the old count comparison, and the unpolished
+        // `$G` ship was dropped. Both readings are judged now.
+        let (other, other_root) = init_repo_with_real_origin_remote(
+            "feat/merged",
+            "https://github.com/other/repo.git",
+            &["src/lib.rs"],
+        );
+        let (cwd, _) = init_repo_with_real_origin_remote("feat/unpol", OWN_URL, &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&other_root, "feat/merged"), RAN).unwrap();
+            let other = other.path().to_str().unwrap();
+            let cwd = cwd.path().to_str().unwrap();
+            // Control: the merge alone anchors in its own repo and allows.
+            let control = run_at(&format!("(cd {other} && gh pr merge -R other/repo)"), other);
+            assert_eq!(control.outcome, Outcome::Allow, "{:?}", control.message);
+            assert_no_polish_nudge(&run_at(
+                &format!(
+                    "(cd {other} && gh pr merge -R other/repo) ; G=gh; $G pr create -t a -b b"
+                ),
+                cwd,
+            ));
+        });
+    }
+
     // --- preserved matcher tests (is_polish_ship_anchor) ---
 
     #[test]
@@ -2979,5 +3153,109 @@ mod tests {
                 .outcome,
             Outcome::Allow
         );
+    }
+
+    // --- cadence-hooks#1152: distinct-target floods stay cheap ---
+
+    /// A repo on `feat/x` with a real `origin`, a recorded full polish, and
+    /// `dirs` empty subdirectories `d0`, `d1`, … for `cd` targets.
+    fn polished_repo_with_subdirs(dirs: usize) -> (tempfile::TempDir, String) {
+        let (tmp, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, &["src/lib.rs"]);
+        for i in 0..dirs {
+            std::fs::create_dir(tmp.path().join(format!("d{i}"))).unwrap();
+        }
+        (tmp, root)
+    }
+
+    #[test]
+    fn ship_floods_stay_within_the_hook_deadline() {
+        // cadence-hooks#1152: every distinct ship spawned git, so a 200 KB
+        // flood of distinct `-R` values or `cd` targets took 3 s in a
+        // checkout. Identical floods keep the verdict one copy draws; a
+        // flood past MAX_JUDGED_SHIPS distinct targets nudges.
+        let flood = |unit: &str| unit.repeat(200 * 1024 / unit.len());
+        let distinct = |unit: &dyn Fn(usize) -> String| {
+            let mut command = String::new();
+            let mut i = 0;
+            while command.len() < 200 * 1024 {
+                command.push_str(&unit(i));
+                i += 1;
+            }
+            command
+        };
+        let (tmp, root) = polished_repo_with_subdirs(6000);
+        let cwd = tmp.path().to_str().unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for (command, want, needle) in [
+                (flood("gh pr ready; "), Outcome::Allow, ""),
+                (flood("gh pr create -t a -b b; "), Outcome::Allow, ""),
+                (
+                    flood("(cd d0 && gh pr merge -R own/repo); "),
+                    Outcome::Allow,
+                    "",
+                ),
+                (flood("gh pr ready 1 -R x/y; "), Outcome::Nudge, "x/y"),
+                (
+                    distinct(&|i| format!("gh pr ready 1 -R x{i}/y{i}; ")),
+                    Outcome::Nudge,
+                    "Can't check polish",
+                ),
+                (
+                    distinct(&|i| format!("(cd d{i} && gh pr merge -R own/repo); ")),
+                    Outcome::Nudge,
+                    "more than 32 distinct targets",
+                ),
+            ] {
+                let start = std::time::Instant::now();
+                let result = run_at(&command, cwd);
+                let elapsed = start.elapsed();
+                let head = &command[..24];
+                assert_eq!(result.outcome, want, "{head:?}…");
+                let msg = result.message.unwrap_or_default();
+                assert!(msg.contains(needle), "{head:?}…: {msg}");
+                // Release is the shipped profile; debug builds get headroom.
+                let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+                assert!(elapsed.as_secs_f64() < limit, "{head:?}…: {elapsed:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn ship_judging_caps_distinct_targets() {
+        // cadence-hooks#1152: at or under MAX_JUDGED_SHIPS distinct (dir,
+        // target) pairs each is judged; past it the rest go unjudged and
+        // the gate nudges instead of going silent.
+        use cadence_hooks_core::markers::MAX_JUDGED_SHIPS;
+        let (tmp, root) = polished_repo_with_subdirs(MAX_JUDGED_SHIPS + 1);
+        let cwd = tmp.path().to_str().unwrap();
+        // Each subshell ship is judged in its own `dN` and again in the
+        // whole-command directory, which is the cwd for all of them.
+        let subshells = |n: usize| {
+            (0..n)
+                .map(|i| format!("(cd d{i} && gh pr ready)"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for (command, want) in [
+                (subshells(MAX_JUDGED_SHIPS - 1), Outcome::Allow),
+                (subshells(MAX_JUDGED_SHIPS), Outcome::Nudge),
+                // Repeats collapse before the count.
+                (
+                    vec!["(cd d0 && gh pr ready)"; 500].join("; "),
+                    Outcome::Allow,
+                ),
+            ] {
+                let result = run_at(&command, cwd);
+                assert_eq!(result.outcome, want, "{command:.40}…");
+                if want == Outcome::Nudge {
+                    assert_cannot_check(&result, "more than 32 distinct targets");
+                }
+            }
+        });
     }
 }
