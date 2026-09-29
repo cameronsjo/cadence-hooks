@@ -183,81 +183,122 @@ pub fn has_unbalanced_groups(segment: &str) -> bool {
 /// [`unquoted_group_events`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupEvent {
-    /// An unquoted `(` — a subshell, a `$(` substitution, or a `case`
-    /// pattern's optional opener.
+    /// An unquoted `(` — a subshell, a `$(` substitution, an array value
+    /// (`a=(…)`), or a `case` pattern's optional opener.
     Open,
     /// An unquoted `)`.
     Close,
-    /// An unquoted word made only of `[A-Za-z0-9_]`, and whether it sits in
-    /// command position.
+    /// One shell word (split at whitespace, parens and backticks). `text` is
+    /// the word when it is made only of `[A-Za-z0-9_]` with no quoting, else
+    /// empty — a keyword such as `case` is only ever a plain word.
     Word {
         text: String,
         command_position: bool,
     },
 }
 
-/// The unquoted `(`, `)` and bare words of `segment`, in order.
+/// Reserved words after which the next word is still in command position.
+const KEEPS_COMMAND_POSITION: &[&str] = &[
+    "then", "do", "else", "elif", "if", "while", "until", "time", "!",
+];
+
+/// The unquoted `(`, `)` and shell words of `segment`, in order.
 ///
 /// A walk that scopes a subshell's `cd` must tell a subshell's `)` from a
 /// `case` pattern's `)` (`case x in a) …`), which only order can do: the
-/// pattern's close follows the words `case … in`. Counting parens alone
-/// popped the subshell early (cadence-hooks#1058 review). Quoted and escaped
-/// characters produce nothing. A word is a maximal run of `[A-Za-z0-9_]`;
-/// any other character ends it. It is in command position when only
-/// whitespace, an `Open`, a `$(` or a backtick stands between it and the
-/// segment start or the previous `Open`/backtick.
+/// pattern's close follows `case <word> in`. Counting parens alone popped the
+/// subshell early (cadence-hooks#1058 review).
+///
+/// A word is in command position when it starts the segment, or follows a
+/// `(` that opens a subshell or `$(`, an OPENING backtick, a standalone `{`,
+/// or a reserved word that keeps command position (`then`, `do`, `!`, …). A
+/// `(` right after `=` opens an array value, not a command. A `{` inside a
+/// word (`{a,b}`, `${x}`) is brace or parameter syntax and makes the word
+/// non-plain.
 pub fn unquoted_group_events(segment: &str) -> Vec<GroupEvent> {
-    fn flush(word: &mut String, at: bool, events: &mut Vec<GroupEvent>) {
-        if !word.is_empty() {
-            events.push(GroupEvent::Word {
-                text: std::mem::take(word),
-                command_position: at,
-            });
+    /// The word being built: its unquoted characters, whether any quoting
+    /// was part of it, and whether it started in command position.
+    #[derive(Default)]
+    struct Pending {
+        text: String,
+        quoted: bool,
+        at: bool,
+    }
+    impl Pending {
+        fn is_empty(&self) -> bool {
+            self.text.is_empty() && !self.quoted
         }
+    }
+    fn flush(word: &mut Pending, command_position: &mut bool, events: &mut Vec<GroupEvent>) {
+        if word.is_empty() {
+            return;
+        }
+        let w = std::mem::take(word);
+        let plain = !w.quoted
+            && w.text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let text = if plain { w.text } else { String::new() };
+        *command_position = KEEPS_COMMAND_POSITION.contains(&text.as_str());
+        events.push(GroupEvent::Word {
+            text,
+            command_position: w.at,
+        });
     }
     let chars: Vec<char> = segment.chars().collect();
     let mut quote: Option<Quote> = None;
     let mut events = Vec::new();
-    let mut word = String::new();
-    let mut word_at_command = false;
+    let mut word = Pending::default();
     let mut command_position = true;
+    let mut in_backtick = false;
     let mut i = 0;
     while i < chars.len() {
         if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
-            flush(&mut word, word_at_command, &mut events);
-            command_position = false;
+            if word.is_empty() {
+                word.at = command_position;
+            }
+            word.quoted = true;
             i = next;
             continue;
         }
         let c = chars[i];
-        if c.is_ascii_alphanumeric() || c == '_' {
-            if word.is_empty() {
-                word_at_command = command_position;
-                command_position = false;
-            }
-            word.push(c);
-            i += 1;
-            continue;
-        }
-        flush(&mut word, word_at_command, &mut events);
         match c {
+            c if c.is_whitespace() => flush(&mut word, &mut command_position, &mut events),
             '(' => {
+                // `$(` opens a substitution, `=(` an array value.
+                let substitution = !word.quoted && word.text.ends_with('$');
+                let array = word.text.ends_with('=');
+                if substitution {
+                    word.text.pop();
+                }
+                flush(&mut word, &mut command_position, &mut events);
                 events.push(GroupEvent::Open);
-                command_position = true;
+                command_position = substitution || !array;
             }
             ')' => {
+                flush(&mut word, &mut command_position, &mut events);
                 events.push(GroupEvent::Close);
                 command_position = false;
             }
-            '`' | '{' => command_position = true,
-            // `$(` opens a substitution; the `(` sets command position.
-            '$' if chars.get(i + 1) == Some(&'(') => {}
-            c if c.is_whitespace() => {}
-            _ => command_position = false,
+            '`' => {
+                flush(&mut word, &mut command_position, &mut events);
+                in_backtick = !in_backtick;
+                command_position = in_backtick;
+            }
+            '{' if word.is_empty() && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {
+                // A standalone `{` opens a group: the next word is a command.
+                command_position = true;
+            }
+            c => {
+                if word.is_empty() {
+                    word.at = command_position;
+                }
+                word.text.push(c);
+            }
         }
         i += 1;
     }
-    flush(&mut word, word_at_command, &mut events);
+    flush(&mut word, &mut command_position, &mut events);
     events
 }
 
@@ -1668,10 +1709,27 @@ fn skip_redirect(operands: &[String], i: usize) -> Option<usize> {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
+///
+/// A named-descriptor prefix (`{fd}>/dev/null`, bash's `{varname}` form) is
+/// stripped the same way as a digit one.
 pub fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
+    let rest = strip_named_fd(rest).unwrap_or(rest);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// `rest` after a leading `{ident}` descriptor name, or `None` when it has
+/// none.
+fn strip_named_fd(rest: &str) -> Option<&str> {
+    let inner = rest.strip_prefix('{')?;
+    let (name, after) = inner.split_once('}')?;
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(after)
 }
 
 /// The `gh pr <sub>` invocation in `tokens`, or `None`.
@@ -9871,7 +9929,7 @@ mod tests {
         assert_eq!(
             unquoted_group_events("x=$(case a in a) echo"),
             vec![
-                word("x", true),
+                word("", true),
                 Open,
                 word("case", true),
                 word("a", false),
@@ -9881,10 +9939,41 @@ mod tests {
                 word("echo", false),
             ]
         );
-        // Quoted text yields nothing.
+        // A quoted word is a word, but never a plain one.
         assert_eq!(
             unquoted_group_events("echo 'case (' \")\""),
-            vec![word("echo", true)]
+            vec![word("echo", true), word("", false), word("", false)]
         );
+        // Reserved words keep command position; a standalone `{` sets it.
+        assert_eq!(
+            unquoted_group_events("then { case"),
+            vec![word("then", true), word("case", true)]
+        );
+    }
+
+    #[test]
+    fn group_events_do_not_put_brace_array_or_closing_backtick_words_in_command_position() {
+        let case_at_command = |segment: &str| {
+            unquoted_group_events(segment).iter().any(|e| {
+                matches!(e, GroupEvent::Word { text, command_position: true } if text == "case")
+            })
+        };
+        for segment in [
+            "echo {case,in}",
+            "git log --grep={case,in}",
+            "echo ${case} in",
+            "a=(case in)",
+            "echo `echo` case in",
+        ] {
+            assert!(!case_at_command(segment), "{segment}");
+        }
+        for segment in [
+            "case x in",
+            "x=$(case y in",
+            "(case y in",
+            "echo `case y in",
+        ] {
+            assert!(case_at_command(segment), "{segment}");
+        }
     }
 }

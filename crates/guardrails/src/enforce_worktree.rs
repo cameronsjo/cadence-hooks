@@ -133,15 +133,10 @@
 //! why that heuristic is unsafe here; issues #213, #224). A `cd` behind
 //! `builtin`, `command`, `time`, `!`, a redirection or an assignment word is a
 //! `cd` (#1057). The walk tracks a small SET of directories the shell may be
-//! in ([`CdScope`]) and judges a commit at each. A `cd` that cannot move this
-//! shell moves nothing: one inside `(…)`, or in a pipeline element before the
-//! last or in the background. Where the outcome is unknown both directories
-//! are kept: a pipeline's last element, and a `cd` that may fail (a missing
-//! target, or a redirection that may fail). `cd -` follows the walk's own
-//! previous directory while nothing could have rebound `OLDPWD`. A target the
-//! walk cannot compute (a variable, a glob, a brace, more than one operand, a
-//! plain `cd` in a script that redefines it) keeps the pre-cd directory
-//! (#1058; see [`resolve_cd`]).
+//! in ([`CdScope`]) and judges a commit at each; every ambiguity adds
+//! directories and none removes one. [`walk_segments`] lists the ambiguities
+//! and [`resolve_cd`] the targets it cannot read (#1058). Past the set's cap a
+//! commit blocks unless every target is provably a linked worktree.
 //!
 //! Commits inside `sh -c '…'` wrappers, `$(…)`/backtick substitutions, and
 //! behind `env`/`VAR=value` prefixes ARE seen (#228) — any run of
@@ -180,8 +175,8 @@ use cadence_hooks_core::shell::{
     GroupEvent, MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word,
     expand_leading_home, is_assignment_word, is_redirect_token, is_transparent_prefix_word,
     looks_absolute, redirect_targets, resolve_cd_target, skip_transparent_prefixes, split_segments,
-    split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_heredoc_bodies,
-    tokenize, tokenize_marked, unescape_word, unquoted_group_events,
+    split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
+    strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word, unquoted_group_events,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -670,24 +665,18 @@ fn is_shell_absolute(path: &str) -> bool {
 /// wins) and never *also* nudges.
 ///
 /// `on_disk` is true in production; see [`CdEnv`].
-fn scan_targets(
-    command: &str,
-    cwd: &str,
-    on_disk: bool,
-) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
-    let mut commits = Vec::new();
-    let mut mutations = Vec::new();
+fn scan_targets(command: &str, cwd: &str, on_disk: bool) -> Scan {
+    let mut out = Scan::default();
     let home = dollar_home(command);
     collect_targets(
         command,
         cwd,
         0,
-        &mut commits,
-        &mut mutations,
+        &mut out,
         (None, None),
         CdEnv::new(home.as_deref(), cwd, on_disk),
     );
-    (commits, mutations)
+    out
 }
 
 /// Test stand-in for the on-disk probes: every path exists, so the parser
@@ -700,14 +689,14 @@ fn assume_exists(_: &str) -> bool {
 /// [`scan_targets`]); the many commit-parsing tests exercise it directly.
 #[cfg(test)]
 fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
-    scan_targets(command, cwd, false).0
+    scan_targets(command, cwd, false).commits
 }
 
 /// Test-only view of the mutation channel (production reads both channels via
 /// [`scan_targets`]).
 #[cfg(test)]
 fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
-    scan_targets(command, cwd, false).1
+    scan_targets(command, cwd, false).mutations
 }
 
 /// A package-manager subcommand that mutates a manifest/lockfile in its cwd:
@@ -878,8 +867,7 @@ fn collect_targets(
     script: &str,
     cwd: &str,
     depth: usize,
-    targets: &mut Vec<CommitTarget>,
-    mutations: &mut Vec<MutationTarget>,
+    out: &mut Scan,
     inherited_env: (Option<&str>, Option<&str>),
     cd_env: CdEnv<'_>,
 ) {
@@ -894,16 +882,16 @@ fn collect_targets(
         ..cd_env
     };
     walk_segments(script, &mut scope, |seg| {
+        // The words the command runs with: redirections dropped wherever they
+        // stand (`>/dev/null git commit`, `git 2>&1 commit`, `{fd}>x git …`),
+        // and a leading `!`/`time [-p]` peeled — the shell runs what follows.
+        // Detector direction only: nothing dropped is a word the command sees.
+        let tokens = command_tokens(seg.marked);
         // Strip transparent prefixes / assignment words up front so BOTH the
         // child-script extraction (a wrapper behind `exec`/`env`/`VAR=x`, e.g.
         // `env GIT_AUTHOR_NAME=x bash -c 'git commit'`) and the git
         // leading-word gate below see the real command word — the two
         // transparency mechanisms must compose (#228 review finding 1).
-        // A redirection may stand before the command word (`>/dev/null git
-        // commit`); it is the shell's, so it is dropped before the command
-        // word is read. Otherwise the redirection read as the verb and the
-        // commit went unseen.
-        let tokens = without_leading_redirects(seg.tokens);
         let argv = skip_transparent_prefixes(&tokens);
 
         // The git env prefix comes from the RAW tokens — `skip_transparent_prefixes`
@@ -924,7 +912,8 @@ fn collect_targets(
 
         // Every directory the shell may be in runs this segment; a commit is
         // judged at each, and blocks if any is a primary checkout. Past the
-        // candidate cap the session cwd is judged too (see [`CdScope::add`]).
+        // candidate cap the session cwd is judged too, and [`run_enforce`]
+        // blocks unless every target is provably a linked worktree.
         let mut dirs: Vec<&str> = seg.dirs.iter().map(|d| d.pwd.as_str()).collect();
         if seg.overflowed && !dirs.contains(&cd_env.session_cwd) {
             dirs.push(cd_env.session_cwd);
@@ -940,8 +929,7 @@ fn collect_targets(
                         &child,
                         effective_dir,
                         depth + 1,
-                        targets,
-                        mutations,
+                        out,
                         (env_work_tree, env_git_dir),
                         child_env,
                     );
@@ -959,7 +947,7 @@ fn collect_targets(
             // git segments included: a redirect can ride any command, and
             // `is_package_mutation`/`file_mutation_targets` key on the verb so a
             // `git commit` never registers as a mutator.
-            detect_mutations(argv, seg.segment, effective_dir, mutations);
+            detect_mutations(argv, seg.segment, effective_dir, &mut out.mutations);
 
             // `argv` is the prefix-/assignment-stripped view computed above
             // (`command`/`env`/`VAR=x git commit` → leading `git`); the commit
@@ -968,35 +956,52 @@ fn collect_targets(
             // in-chain scan resolves commit targets identically (#239 F4, #228) —
             // both call sites must resolve the same way or the in-chain dismiss
             // map stops matching (#378).
-            targets.extend(commit_targets_of(
-                argv,
-                effective_dir,
-                env_work_tree,
-                env_git_dir,
-            ));
+            let found = commit_targets_of(argv, effective_dir, env_work_tree, env_git_dir);
+            if seg.overflowed && !found.is_empty() {
+                out.overflowed_commit = true;
+            }
+            out.commits.extend(found);
         }
     });
 }
 
-/// `tokens` without the redirections in its leading region — the prefix and
-/// assignment words before the command word, which a redirection may sit
-/// among. Detector direction only: it exposes a command word the shell runs.
-fn without_leading_redirects(tokens: &[String]) -> Vec<String> {
-    let mut kept = Vec::with_capacity(tokens.len());
+/// What one walk found: the block channel, the nudge channel, and whether a
+/// commit was judged after the candidate set overflowed.
+#[derive(Default)]
+struct Scan {
+    commits: Vec<CommitTarget>,
+    mutations: Vec<MutationTarget>,
+    overflowed_commit: bool,
+}
+
+/// The words a segment's command runs with: every unquoted redirection (and a
+/// bare operator's target) removed, then a leading `!` and `time [-p]` — both
+/// reserved words that run the command after them — peeled.
+fn command_tokens(marked: &[MarkedToken]) -> Vec<String> {
+    let mut words: Vec<String> = Vec::with_capacity(marked.len());
     let mut i = 0;
-    while let Some(t) = tokens.get(i) {
-        if is_redirect_token(t) {
-            i += if is_bare_redirect(t) { 2 } else { 1 };
+    while let Some(t) = marked.get(i) {
+        if is_unquoted_redirect(t) {
+            i += if is_bare_redirect(&t.text) { 2 } else { 1 };
             continue;
         }
-        if !is_transparent_prefix_word(tokens, i) {
-            break;
-        }
-        kept.push(t.clone());
+        words.push(t.text.clone());
         i += 1;
     }
-    kept.extend(tokens[i.min(tokens.len())..].iter().cloned());
-    kept
+    let mut start = 0;
+    loop {
+        match words.get(start).map(String::as_str) {
+            Some("!") => start += 1,
+            Some("time") => {
+                start += 1;
+                if words.get(start).map(String::as_str) == Some("-p") {
+                    start += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    words.split_off(start.min(words.len()))
 }
 
 /// Asks the filesystem (or a test stand-in) whether a path exists.
@@ -1049,29 +1054,61 @@ fn is_path_on_disk(path: &str) -> bool {
     Path::new(path).exists()
 }
 
-/// The most directories a walk tracks at once. Past it, the walk keeps the
-/// first ones and also judges the session cwd (see [`CdScope::add`]).
+/// The most directories a walk tracks at once (see [`CdScope::put`]).
 const MAX_CD_CANDIDATES: usize = 4;
 
-/// One directory the shell may be in, and the one `cd -` returns to from
-/// there (`None` when unknown: before any `cd` in this walk, or after a
-/// segment that could have rebound `OLDPWD`).
+/// One directory the shell may be in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShellDir {
     pwd: String,
+    /// Where `cd -` goes from here, as the walk last knew it (`None` when
+    /// unknown: before any `cd` in this walk).
     oldpwd: Option<String>,
+    /// A segment since then may have rebound `OLDPWD`, so `cd -` goes to
+    /// `oldpwd` or somewhere unknown: both outcomes are kept.
+    oldpwd_suspect: bool,
+}
+
+impl ShellDir {
+    fn at(pwd: &str) -> Self {
+        ShellDir {
+            pwd: pwd.to_string(),
+            oldpwd: None,
+            oldpwd_suspect: false,
+        }
+    }
+
+    /// The shell after a `cd` from here into `pwd`.
+    fn moved_to(&self, pwd: String) -> Self {
+        ShellDir {
+            pwd,
+            oldpwd: Some(self.pwd.clone()),
+            oldpwd_suspect: false,
+        }
+    }
+}
+
+/// The candidate directories at one point of the walk, and the pending
+/// fallbacks: where the shell is if a `cd` earlier in the current `&&` chain
+/// failed or never ran. A failed link skips the rest of an `&&` chain, so the
+/// fallbacks join the candidates where the chain ends ([`CdScope::settle`]).
+#[derive(Clone, Debug, Default)]
+struct DirState {
+    dirs: Vec<ShellDir>,
+    fallback: Vec<ShellDir>,
 }
 
 /// A syntactic scope open across segments.
 enum Frame {
-    /// A `(…)` subshell or `$(…)` substitution: the directories, and the
-    /// pending fallbacks, to restore when it closes.
+    /// A `(…)` subshell, `$(…)` substitution or array value: the state to
+    /// restore when it closes, and the enclosing list's start.
     Subshell {
-        dirs: Vec<ShellDir>,
-        fallback: Vec<ShellDir>,
+        saved: DirState,
+        outer_list: DirState,
     },
-    /// A `case … in … esac`, whose pattern `)`s close nothing.
-    Case { awaiting_in: bool, in_pattern: bool },
+    /// A `case`: `words` counts the words after `case` (the subject, then
+    /// `in`); `in_pattern` is true while a pattern is being read.
+    Case { words: u8, in_pattern: bool },
 }
 
 /// The directory state a scoped walk carries across one script's segments.
@@ -1084,23 +1121,20 @@ enum Frame {
 ///
 /// It holds a SET of directories, not one: where the guard cannot tell
 /// whether a `cd` took effect, it keeps both outcomes, and a commit is judged
-/// at every candidate. The ambiguous points are a pipeline's last element
-/// (zsh runs it in the current shell, bash forks), a `cd` that may fail (a
-/// missing target, or a redirection that may fail), and a `)` the walk cannot
-/// attribute.
+/// at every candidate. Every ambiguity adds candidates and none removes one;
+/// see [`walk_segments`] for the list.
 struct CdScope<'a> {
-    dirs: Vec<ShellDir>,
-    /// Where the shell is if a may-fail `cd` earlier in the current `&&`
-    /// chain failed. A failed cd skips the rest of the chain, so these join
-    /// `dirs` at the first connector that is not `&&` ([`Self::settle`]).
-    fallback: Vec<ShellDir>,
+    state: DirState,
+    /// The state where the current and-or list began: restored when the list
+    /// turns out to be backgrounded (`cd /wt && true & git commit`).
+    list_start: DirState,
     frames: Vec<Frame>,
     env: CdEnv<'a>,
-    /// This script, or an enclosing one, redefines `cd`.
+    /// This script, or an enclosing one, may redefine `cd`.
     cd_redefined: bool,
-    /// The candidate cap was hit.
+    /// The candidate cap was hit at some point; it never clears.
     overflowed: bool,
-    /// The first `cd` whose target this walk could not resolve, as written.
+    /// The first `cd` whose outcome this walk could not settle, as written.
     unresolved: Option<String>,
 }
 
@@ -1112,18 +1146,34 @@ struct Seg<'s> {
     /// The segment, group punctuation stripped.
     segment: &'s str,
     tokens: &'s [String],
+    marked: &'s [MarkedToken],
     next_op: Option<&'static str>,
     is_cd: bool,
 }
 
+/// How the `cd` being applied was reached.
+#[derive(Clone, Copy, Default)]
+struct CdEntry {
+    /// It is a pipeline's last element: zsh runs it in the current shell,
+    /// bash forks it. The pre-cd directories stay candidates.
+    after_pipe: bool,
+    /// It follows `||`: it runs only if the left side failed, so the pre-cd
+    /// directories stay candidates.
+    after_or: bool,
+    /// It follows `&&` after a command that is not a `cd`: it runs only if
+    /// that command succeeded, so the pre-cd directories become fallbacks.
+    after_and: bool,
+}
+
 impl<'a> CdScope<'a> {
     fn new(cwd: &str, script: &str, env: CdEnv<'a>) -> Self {
-        CdScope {
-            dirs: vec![ShellDir {
-                pwd: cwd.to_string(),
-                oldpwd: None,
-            }],
+        let state = DirState {
+            dirs: vec![ShellDir::at(cwd)],
             fallback: Vec::new(),
+        };
+        CdScope {
+            list_start: state.clone(),
+            state,
             frames: Vec::new(),
             cd_redefined: env.cd_redefined || script_redefines_cd(script),
             env,
@@ -1132,45 +1182,77 @@ impl<'a> CdScope<'a> {
         }
     }
 
-    /// Add candidates, deduplicated. Past [`MAX_CD_CANDIDATES`] the rest are
-    /// dropped and `overflowed` is set, which makes the commit walk judge the
-    /// session cwd as well — so an overflow still blocks when the session cwd
-    /// or any kept candidate is a primary.
+    /// Replace the candidates with `ordered`, deduplicated and capped. The
+    /// cap keeps the FIRST entries, so callers list the directories the shell
+    /// stays in (pre-cd, fallback) before the ones a `cd` moves to. Past
+    /// [`MAX_CD_CANDIDATES`], `overflowed` is set for good, and a commit judged
+    /// afterwards blocks unless every target is provably a linked worktree.
     ///
     /// Candidates are keyed by directory: two that agree on it but not on
-    /// `OLDPWD` merge into one whose `OLDPWD` is unknown, so `cd -` from it is
-    /// unresolved rather than the set growing.
-    fn add(&mut self, extra: impl IntoIterator<Item = ShellDir>) {
-        for dir in extra {
-            if let Some(known) = self.dirs.iter_mut().find(|d| d.pwd == dir.pwd) {
+    /// `OLDPWD` merge into one whose `OLDPWD` is unknown.
+    fn put(&mut self, ordered: Vec<ShellDir>) {
+        let mut dirs: Vec<ShellDir> = Vec::new();
+        for dir in ordered {
+            if let Some(known) = dirs.iter_mut().find(|d| d.pwd == dir.pwd) {
                 if known.oldpwd != dir.oldpwd {
                     known.oldpwd = None;
                 }
+                known.oldpwd_suspect |= dir.oldpwd_suspect;
                 continue;
             }
-            if self.dirs.len() >= MAX_CD_CANDIDATES {
+            if dirs.len() >= MAX_CD_CANDIDATES {
                 self.overflowed = true;
                 continue;
             }
-            self.dirs.push(dir);
+            dirs.push(dir);
+        }
+        self.state.dirs = dirs;
+    }
+
+    /// Add candidates after the current ones.
+    fn add(&mut self, extra: Vec<ShellDir>) {
+        let mut ordered = std::mem::take(&mut self.state.dirs);
+        ordered.extend(extra);
+        self.put(ordered);
+    }
+
+    /// Merge the pending fallbacks into the candidates, ahead of them.
+    fn settle(&mut self) {
+        let mut ordered = std::mem::take(&mut self.state.fallback);
+        ordered.append(&mut self.state.dirs);
+        self.put(ordered);
+    }
+
+    /// Queue `dirs` as fallbacks.
+    fn defer(&mut self, dirs: Vec<ShellDir>) {
+        for dir in dirs {
+            if !self.state.fallback.contains(&dir) {
+                self.state.fallback.push(dir);
+            }
         }
     }
 
-    /// Merge pending may-fail fallbacks into the candidates.
-    fn settle(&mut self) {
-        let fallback = std::mem::take(&mut self.fallback);
-        self.add(fallback);
+    /// The directories the innermost subshell below the top frame restores.
+    fn enclosing_subshell_dirs(&self) -> Option<Vec<ShellDir>> {
+        self.frames.iter().rev().find_map(|f| match f {
+            Frame::Subshell { saved, .. } => Some(saved.dirs.clone()),
+            Frame::Case { .. } => None,
+        })
     }
 
     /// Process grouping events in order: `(` opens a subshell (a copy of the
-    /// directories that its close restores), `case … in` makes the following
-    /// `)` a pattern end rather than a close, and `esac` ends the case.
+    /// state that its close restores), `case <word> in` makes the following
+    /// `)` a pattern end, and `esac` ends the case.
     ///
     /// A `(` subshell gets its own copy of the directory, so a `cd` inside it
     /// does not persist (cadence-hooks#1058). The segmenter cuts on `;`/`&&`
     /// inside a group, so `(cd /wt && git commit); git commit` arrives as
     /// `(cd /wt`, `git commit)` and `git commit`, and the frames live across
     /// segments. A `{ …; }` group runs in the current shell and is not a frame.
+    ///
+    /// Every `)` a case frame takes — a pattern end, or one after a `case`
+    /// that never reached `in` — could instead have closed a subshell, so it
+    /// also adds the directories that subshell would restore (fail closed).
     fn apply_events(&mut self, events: &[GroupEvent]) {
         for event in events {
             match event {
@@ -1183,35 +1265,29 @@ impl<'a> CdScope<'a> {
                         continue;
                     }
                     self.frames.push(Frame::Subshell {
-                        dirs: self.dirs.clone(),
-                        fallback: self.fallback.clone(),
+                        saved: self.state.clone(),
+                        outer_list: self.list_start.clone(),
                     });
+                    // A list starts right after the `(`.
+                    self.list_start = self.state.clone();
                 }
                 GroupEvent::Close => match self.frames.last_mut() {
                     Some(Frame::Subshell { .. }) => {
-                        if let Some(Frame::Subshell { dirs, fallback }) = self.frames.pop() {
-                            self.dirs = dirs;
-                            self.fallback = fallback;
+                        if let Some(Frame::Subshell { saved, outer_list }) = self.frames.pop() {
+                            self.state = saved;
+                            self.list_start = outer_list;
                         }
                     }
-                    // A pattern's `)`: the first after `in`, or a later arm's
-                    // (the `;;` between arms is invisible to the segmenter).
-                    Some(Frame::Case {
-                        awaiting_in: false,
-                        in_pattern,
-                    }) => *in_pattern = false,
-                    // `case` with no `in` yet: this `)` cannot be attributed.
-                    // Drop the case, and keep both outcomes — the directory
-                    // here, and the one the nearest subshell would restore.
-                    Some(Frame::Case {
-                        awaiting_in: true, ..
-                    }) => {
-                        self.frames.pop();
-                        let restored = self.frames.iter().rev().find_map(|f| match f {
-                            Frame::Subshell { dirs, .. } => Some(dirs.clone()),
-                            Frame::Case { .. } => None,
-                        });
-                        if let Some(restored) = restored {
+                    Some(Frame::Case { words, in_pattern }) => {
+                        if *words >= 2 {
+                            // A pattern end: the first after `in`, or a later
+                            // arm's (the `;;` between arms is invisible here).
+                            *in_pattern = false;
+                        } else {
+                            // `case` never reached `in`: not a case at all.
+                            self.frames.pop();
+                        }
+                        if let Some(restored) = self.enclosing_subshell_dirs() {
                             self.add(restored);
                         }
                     }
@@ -1220,79 +1296,107 @@ impl<'a> CdScope<'a> {
                 GroupEvent::Word {
                     text,
                     command_position,
-                } => match (text.as_str(), self.frames.last_mut()) {
-                    ("case", _) if *command_position => self.frames.push(Frame::Case {
-                        awaiting_in: true,
-                        in_pattern: false,
-                    }),
-                    (
-                        "in",
-                        Some(Frame::Case {
-                            awaiting_in,
-                            in_pattern,
-                        }),
-                    ) if *awaiting_in => {
-                        *awaiting_in = false;
-                        *in_pattern = true;
+                } => match self.frames.last_mut() {
+                    Some(Frame::Case { words, in_pattern }) if *words < 2 => {
+                        *words += 1;
+                        if *words == 2 {
+                            if text == "in" {
+                                *in_pattern = true;
+                            } else {
+                                // `in` must be exactly the second word.
+                                self.frames.pop();
+                            }
+                        }
                     }
-                    ("esac", Some(Frame::Case { .. })) if *command_position => {
+                    Some(Frame::Case { .. }) if text == "esac" && *command_position => {
                         self.frames.pop();
                     }
+                    _ if text == "case" && *command_position => self.frames.push(Frame::Case {
+                        words: 0,
+                        in_pattern: false,
+                    }),
                     _ => {}
                 },
             }
         }
     }
 
-    /// Forget `cd -`'s target: a segment that could have rebound `OLDPWD`.
-    fn forget_oldpwd(&mut self) {
-        for dir in &mut self.dirs {
-            dir.oldpwd = None;
+    /// A segment may have rebound `OLDPWD`: `cd -` keeps both outcomes.
+    fn suspect_oldpwd(&mut self) {
+        for dir in self
+            .state
+            .dirs
+            .iter_mut()
+            .chain(self.state.fallback.iter_mut())
+        {
+            dir.oldpwd_suspect = true;
         }
-        for dir in &mut self.fallback {
-            dir.oldpwd = None;
+    }
+
+    /// A literal `OLDPWD=<value>` assignment: `cd -` now goes to `value`.
+    fn set_oldpwd(&mut self, value: &str) {
+        for dir in self
+            .state
+            .dirs
+            .iter_mut()
+            .chain(self.state.fallback.iter_mut())
+        {
+            dir.oldpwd = Some(value.to_string());
+            dir.oldpwd_suspect = false;
         }
     }
 
     /// Apply the `cd` at `cd` in `tokens` to every candidate.
     ///
     /// A cd that lands moves the candidate. A cd that may fail moves it too,
-    /// and parks the pre-cd directory as a fallback. A cd this walk cannot
-    /// resolve leaves the candidate where it was — the fail-CLOSED direction
-    /// from a primary checkout. The last may-fail or unresolved target is
-    /// remembered for the block message. `after_pipe` marks a pipeline's last
-    /// element, which moves the shell under zsh but not under bash: the
-    /// pre-cd directories stay candidates.
-    fn apply_cd(&mut self, tokens: &[MarkedToken], cd: CdWord, after_pipe: bool) {
-        let before = std::mem::take(&mut self.dirs);
+    /// and parks the pre-cd directory as a fallback. A `cd -` whose target may
+    /// have been rebound keeps both. A cd this walk cannot resolve leaves the
+    /// candidate where it was — the fail-CLOSED direction from a primary
+    /// checkout — with `OLDPWD` unknown. How the cd was reached ([`CdEntry`])
+    /// can keep or defer the pre-cd directories as well. The directories the
+    /// shell may stay in are listed first, so the cap never drops them for a
+    /// moved-to one.
+    fn apply_cd(&mut self, tokens: &[MarkedToken], cd: CdWord, entry: CdEntry) {
+        let before = self.state.dirs.clone();
+        let mut staying: Vec<ShellDir> = Vec::new();
+        let mut moved: Vec<ShellDir> = Vec::new();
+        let mut failed: Vec<ShellDir> = Vec::new();
         let mut uncertain = false;
-        let mut failed = Vec::new();
+        if entry.after_pipe || entry.after_or {
+            staying.extend(before.iter().cloned());
+        }
         for here in &before {
-            let moved = |pwd: String| ShellDir {
-                pwd,
-                oldpwd: Some(here.pwd.clone()),
-            };
             match resolve_cd(tokens, cd, here, self.env, self.cd_redefined) {
-                CdOutcome::Lands(dir) => self.add([moved(dir)]),
+                CdOutcome::Lands(dir) => moved.push(here.moved_to(dir)),
                 CdOutcome::MayFail(dir) => {
                     uncertain = true;
-                    self.add([moved(dir)]);
+                    moved.push(here.moved_to(dir));
                     failed.push(here.clone());
+                }
+                CdOutcome::Either(dir) => {
+                    uncertain = true;
+                    staying.push(ShellDir {
+                        oldpwd: None,
+                        ..here.clone()
+                    });
+                    moved.push(here.moved_to(dir));
                 }
                 CdOutcome::Unresolved => {
                     uncertain = true;
-                    self.add([here.clone()]);
+                    staying.push(ShellDir {
+                        oldpwd: None,
+                        oldpwd_suspect: false,
+                        ..here.clone()
+                    });
                 }
             }
         }
-        if after_pipe {
-            self.add(before);
+        if entry.after_and {
+            failed.extend(before);
         }
-        for dir in failed {
-            if !self.fallback.contains(&dir) {
-                self.fallback.push(dir);
-            }
-        }
+        staying.append(&mut moved);
+        self.put(staying);
+        self.defer(failed);
         if uncertain && self.unresolved.is_none() {
             let words: Vec<&str> = tokens[cd.index + 1..]
                 .iter()
@@ -1301,21 +1405,53 @@ impl<'a> CdScope<'a> {
             self.unresolved = Some(words.join(" "));
         }
     }
+
+    /// Close out a segment whose connector is `next_op`. `exits_next` is true
+    /// when the segment after a `||` is a bare `exit`/`return` that ends its
+    /// list, so the failure path never reaches what follows.
+    fn end_segment(&mut self, next_op: Option<&str>, exits_next: bool) {
+        match next_op {
+            // The whole and-or list ran in the background: undo it.
+            Some("&") => {
+                self.state = self.list_start.clone();
+                self.settle();
+                self.list_start = self.state.clone();
+            }
+            Some("||") if exits_next => self.state.fallback.clear(),
+            Some("||") => self.settle(),
+            // `&&` continues the chain; `|` continues the pipeline, whose
+            // status is its last element's.
+            Some("&&") | Some("|") => {}
+            _ => {
+                self.settle();
+                self.list_start = self.state.clone();
+            }
+        }
+    }
 }
 
 /// Walk `script`'s top-level segments, calling `visit` for each one BEFORE
 /// its own `cd` (if it is one) takes effect — a `cd "$(…)"` substitution runs
 /// in the directory the cd starts from.
 ///
-/// A `cd` that runs in a forked child changes nothing: one in any pipeline
-/// element but the last, or in the background. The segments come from
-/// [`split_segments_with_ops_joining_redirects`], so `cd /wt 2>&1 &` is one
-/// segment followed by a real background `&`. A pipeline's LAST element keeps
-/// both outcomes (zsh runs it in the current shell, bash does not).
+/// Candidates only ever grow at an ambiguity:
+///
+/// - a pipeline's last-element `cd` keeps the pre-cd directories (zsh runs it
+///   in the current shell, bash forks it); a `cd` in any other pipeline
+///   element, or sent to the background, changes nothing. The segments come
+///   from [`split_segments_with_ops_joining_redirects`], so `cd /wt 2>&1 &`
+///   is one segment followed by a real background `&`;
+/// - a whole and-or list that ends in `&` is undone (`cd /wt && true &`);
+/// - a `cd` after `||` keeps the pre-cd directories; one after `&&` behind a
+///   non-`cd` command, or one that may fail, defers them to where the chain
+///   ends;
+/// - a `)` a `case` frame takes adds what a subshell close would restore;
+/// - a segment that may rebind `OLDPWD` makes `cd -` keep both outcomes.
 fn walk_segments(script: &str, scope: &mut CdScope<'_>, mut visit: impl FnMut(Seg<'_>)) {
     let segments = split_segments_with_ops_joining_redirects(script);
     let mut prev_op: Option<&str> = None;
-    for (raw, next_op) in &segments {
+    let mut prev_was_cd = false;
+    for (idx, (raw, next_op)) in segments.iter().enumerate() {
         let events = unquoted_group_events(raw);
         // The opens in the segment's leading `(`/`{` run take effect before
         // its command; everything else after it.
@@ -1324,57 +1460,110 @@ fn walk_segments(script: &str, scope: &mut CdScope<'_>, mut visit: impl FnMut(Se
             .take_while(|e| matches!(e, GroupEvent::Open))
             .count();
         scope.apply_events(&events[..leading]);
-        let segment = strip_group_wrappers(raw);
+        let segment = strip_group_punctuation(raw);
         let tokens = tokenize(segment);
         let marked = tokenize_marked(segment);
         let cd = cd_word(&marked);
         visit(Seg {
-            dirs: &scope.dirs,
+            dirs: &scope.state.dirs,
             overflowed: scope.overflowed,
             segment,
             tokens: &tokens,
+            marked: &marked,
             next_op: *next_op,
             is_cd: cd.is_some(),
         });
         match cd {
             Some(_) if matches!(next_op, Some("|") | Some("&")) => {}
-            Some(cd) => scope.apply_cd(&marked, cd, prev_op == Some("|")),
-            None if !leaves_oldpwd_alone(segment, &tokens) => scope.forget_oldpwd(),
-            None => {}
+            Some(cd) => scope.apply_cd(
+                &marked,
+                cd,
+                CdEntry {
+                    after_pipe: prev_op == Some("|"),
+                    after_or: prev_op == Some("||"),
+                    after_and: prev_op == Some("&&") && !prev_was_cd,
+                },
+            ),
+            None => match literal_oldpwd_assignment(&tokens) {
+                Some(value) => scope.set_oldpwd(&value),
+                None if !leaves_oldpwd_alone(segment, &tokens) => scope.suspect_oldpwd(),
+                None => {}
+            },
         }
         scope.apply_events(&events[leading..]);
-        if *next_op != Some("&&") {
-            scope.settle();
-        }
+        let exits_next = *next_op == Some("||")
+            && segments.get(idx + 1).is_some_and(|(next, op)| {
+                let words = tokenize(strip_group_wrappers(next));
+                matches!(words.first().map(String::as_str), Some("exit" | "return"))
+                    && words.len() <= 2
+                    && !matches!(op, Some("&&" | "||" | "|"))
+            });
+        scope.end_segment(*next_op, exits_next);
         prev_op = *next_op;
+        prev_was_cd = cd.is_some();
     }
 }
 
+/// [`strip_group_wrappers`], except that a leading `{` is group syntax only
+/// when a blank follows it: `{fd}>/dev/null git commit` starts with a
+/// named-descriptor redirection, and stripping its `{` left `fd}>/dev/null` as
+/// the command word, which hid the commit.
+fn strip_group_punctuation(raw: &str) -> &str {
+    let mut rest = raw.trim();
+    loop {
+        let trimmed = rest.trim_start_matches(['(', ' ', '\t']);
+        let trimmed = match trimmed.strip_prefix('{') {
+            Some(after) if after.starts_with([' ', '\t']) || after.is_empty() => after,
+            _ => trimmed,
+        };
+        if trimmed.len() == rest.len() {
+            break;
+        }
+        rest = trimmed;
+    }
+    rest.trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
 /// Command words after which `cd -` still knows where it goes — the same idea
-/// as [`HOME_SAFE_WORDS`]. Any other segment could rebind `OLDPWD`
-/// (`OLDPWD=<p>`, `export OLDPWD=<p>`, `read`, `eval`, a function), so it
-/// clears the walk's record and a later `cd -` is unresolved.
+/// as [`HOME_SAFE_WORDS`]. Any other segment could rebind `OLDPWD` (`read`,
+/// `eval`, a function, `make`), so it makes `cd -` keep both outcomes.
 const OLDPWD_SAFE_WORDS: &[&str] = &["git", "ls", "echo", "pwd", "true", "cd"];
 
 /// Does this (non-`cd`) segment leave `OLDPWD` alone? Its command word must be
 /// in [`OLDPWD_SAFE_WORDS`], and it must carry no arithmetic or parameter
-/// expansion (`$((OLDPWD=…))`, `${OLDPWD:=…}` assign in the running shell)
-/// and no mention of `OLDPWD` at all.
+/// expansion (`$((OLDPWD=…))`, `${OLDPWD:=…}` assign in the running shell).
+/// Reading `$OLDPWD` is fine.
 fn leaves_oldpwd_alone(segment: &str, tokens: &[String]) -> bool {
     let Some(head) = tokens.first() else {
         return true;
     };
     OLDPWD_SAFE_WORDS.contains(&unescape_word(head).as_ref())
-        && !["OLDPWD", "$((", "$[", "${", "(("]
+        && !["$((", "$[", "${", "(("]
             .iter()
             .any(|needle| segment.contains(needle))
 }
 
-/// Does `script` redefine `cd` — a `cd()`/`function cd` definition, an
-/// `alias cd=…`, or an `enable` naming `cd` (`enable -n cd`)? Then a plain
-/// `cd` may not be the builtin, and only `builtin cd`/`command cd` resolve.
-/// Matched on tokens anywhere in the script, so a definition inside a compound
-/// command counts too.
+/// A segment that only assigns — `OLDPWD=<value>`, or `export OLDPWD=<value>`
+/// — with a literal value: the value `cd -` goes to next. `None` for anything
+/// else, including a value with an expansion, a glob or a tilde in it.
+fn literal_oldpwd_assignment(tokens: &[String]) -> Option<String> {
+    let words = match tokens.first().map(String::as_str) {
+        Some("export") => &tokens[1..],
+        _ => tokens,
+    };
+    if words.is_empty() || !words.iter().all(|w| is_assignment_word(w)) {
+        return None;
+    }
+    let value = words.iter().rev().find_map(|w| w.strip_prefix("OLDPWD="))?;
+    (!value.is_empty() && !value.contains(['$', '`', '*', '?', '[', '{', '(', '~', '\\']))
+        .then(|| value.to_string())
+}
+
+/// Could `script` redefine `cd`? A `cd()`/`function cd` definition or an
+/// `alias … cd=…` anywhere, or any `enable`, `source` or `.` in command
+/// position — `enable -n c{d,x}` and `source <file>` can do it without
+/// spelling `cd` literally. Then a plain `cd` may not be the builtin, and only
+/// `builtin cd`/`command cd` resolve.
 fn script_redefines_cd(script: &str) -> bool {
     split_segments(script).iter().any(|segment| {
         let tokens = tokenize(strip_group_wrappers(segment));
@@ -1392,8 +1581,11 @@ fn script_redefines_cd(script: &str) -> bool {
         });
         let aliases =
             words.iter().any(|w| w == "alias") && words.iter().any(|w| w.starts_with("cd="));
-        let disables = words.iter().any(|w| w == "enable") && words.iter().any(|w| w == "cd");
-        defines_function || aliases || disables
+        let head = skip_transparent_prefixes(strip_compound_heads(&words))
+            .first()
+            .map(String::as_str);
+        let rebinds = matches!(head, Some("enable" | "source" | "."));
+        defines_function || aliases || rebinds
     })
 }
 
@@ -1491,9 +1683,10 @@ fn is_bare_redirect(text: &str) -> bool {
 /// Can this redirection fail, and so stop the command it rides from running?
 /// bash skips a builtin whose redirection fails, so a `cd` carrying one may
 /// not move the shell (cadence-hooks#1058 review I6). Safe: an output to
-/// `/dev/null`, a descriptor duplication or close (`2>&1`, `>&-`), a heredoc
-/// or here-string, and an input from a file that exists. Anything else,
-/// including a target with an expansion in it, may fail.
+/// `/dev/null`, a duplication of descriptor 0, 1 or 2 (`2>&1`), a close
+/// (`>&-`), a heredoc or here-string, and an input from a file that exists.
+/// Anything else may fail — including a duplication of any other descriptor
+/// (`2>&3` fails when 3 is not open) and a target with an expansion in it.
 fn redirect_may_fail(
     op: &MarkedToken,
     next: Option<&MarkedToken>,
@@ -1502,7 +1695,11 @@ fn redirect_may_fail(
 ) -> bool {
     let text = op.text.as_str();
     let rest = text.strip_prefix('&').unwrap_or(text);
-    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    // The source descriptor: digits, or a `{name}` bash allocates.
+    let rest = match rest.strip_prefix('{').and_then(|r| r.split_once('}')) {
+        Some((_, after)) => after,
+        None => rest.trim_start_matches(|c: char| c.is_ascii_digit()),
+    };
     let (operator_len, output) = if rest.starts_with("<<") {
         return false;
     } else if [">&", "<&", ">>", ">|", "<>"]
@@ -1525,8 +1722,16 @@ fn redirect_may_fail(
         attached
     };
     let duplicates = rest.starts_with(">&") || rest.starts_with("<&");
-    if duplicates && (target == "-" || target.chars().all(|c| c.is_ascii_digit())) {
-        return false;
+    if duplicates {
+        // `N>&M-` moves M; `>&-` closes. Only the standard descriptors are
+        // known to be open.
+        let fd = target.strip_suffix('-').unwrap_or(target);
+        if fd.is_empty() {
+            return false;
+        }
+        if fd.chars().all(|c| c.is_ascii_digit()) {
+            return !matches!(fd, "0" | "1" | "2");
+        }
     }
     if target.contains(['$', '`', '*', '?', '[', '{', '(', '~']) {
         return true;
@@ -1545,6 +1750,9 @@ enum CdOutcome {
     /// It moves here if it runs, but it may fail — the target is not an
     /// existing directory, or a redirection on it may fail.
     MayFail(String),
+    /// It may go here or somewhere unknown (`cd -` after a segment that may
+    /// have rebound `OLDPWD`): both this and the pre-cd directory stay.
+    Either(String),
     /// This walk cannot tell where it goes.
     Unresolved,
 }
@@ -1601,9 +1809,12 @@ fn resolve_cd(
     env: CdEnv<'_>,
     cd_redefined: bool,
 ) -> CdOutcome {
-    let Some(landed) = cd_target(tokens, cd, here, env, cd_redefined) else {
+    let Some((landed, dash)) = cd_target(tokens, cd, here, env, cd_redefined) else {
         return CdOutcome::Unresolved;
     };
+    if dash && here.oldpwd_suspect {
+        return CdOutcome::Either(landed);
+    }
     let mut redirects_may_fail = false;
     let mut i = 0;
     while let Some(t) = tokens.get(i) {
@@ -1621,15 +1832,15 @@ fn resolve_cd(
     }
 }
 
-/// The lexical directory the `cd` at `cd` names from `here`, or `None` when
-/// it cannot be read — see [`resolve_cd`].
+/// The lexical directory the `cd` at `cd` names from `here`, and whether it
+/// came from `cd -`; `None` when it cannot be read — see [`resolve_cd`].
 fn cd_target(
     tokens: &[MarkedToken],
     cd: CdWord,
     here: &ShellDir,
     env: CdEnv<'_>,
     cd_redefined: bool,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     if cd.rebinds || (cd_redefined && !cd.forces_builtin) {
         return None;
     }
@@ -1667,7 +1878,8 @@ fn cd_target(
     };
     let text = target.text.as_str();
     let landed = if text == "-" {
-        here.oldpwd.clone()?
+        // `cd -` is `cd "$OLDPWD"`: a relative value is relative to here.
+        resolve_cd_target(here.oldpwd.as_deref()?, &here.pwd)
     } else {
         let (literal, spelled) = if text.starts_with('$') {
             let expanded = expand_leading_home(target, env.home?)?;
@@ -1698,7 +1910,7 @@ fn cd_target(
         }
         resolve_cd_target(&spelled, &here.pwd)
     };
-    Some(landed)
+    Some((landed, text == "-"))
 }
 
 /// Command words that cannot rebind HOME in the shell running the command —
@@ -2058,20 +2270,18 @@ fn inchain_dismissed_commits(
             // — which sees the segment's own leading token — can arm one. What
             // recurses here is commit DETECTION, which must see everything the
             // block channel sees.
-            let mut seg_targets: Vec<CommitTarget> = Vec::new();
-            let mut discarded: Vec<MutationTarget> = Vec::new();
+            let mut seg_scan = Scan::default();
             for dir in seg.dirs {
                 collect_targets(
                     seg.segment,
                     &dir.pwd,
                     0,
-                    &mut seg_targets,
-                    &mut discarded,
+                    &mut seg_scan,
                     (None, None),
                     cd_env,
                 );
             }
-            for target in seg_targets {
+            for target in seg_scan.commits {
                 if let Some(reason) = active.get(&target) {
                     dismissed.entry(target).or_insert_with(|| reason.clone());
                 }
@@ -2180,6 +2390,18 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
         ));
     }
     msg
+}
+
+/// The block message when a command's `cd`s leave more possible directories
+/// than the walk tracks.
+fn overflow_block_message(target: &str) -> String {
+    let target = sanitize_field(target, MAX_PATH_DISPLAY);
+    format!(
+        "Blocked: this command's `cd`s leave more possible directories than \
+         enforce-worktree tracks ({MAX_CD_CANDIDATES}), and `{target}` is not provably a \
+         linked worktree, so the commit may land in a primary checkout.\n\
+         Split the command, or name the directory with `git -C <path> commit`."
+    )
 }
 
 /// Quote `s` as one shell word for a command the block message suggests: bare
@@ -2585,7 +2807,11 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // evaluated FIRST — the composition contract is block-first: a
             // `uv add && git commit` into the primary must BLOCK (commit wins),
             // never double-fire a nudge.
-            let (commit_targets, mutation_targets) = scan_targets(command, cwd, true);
+            let Scan {
+                commits: commit_targets,
+                mutations: mutation_targets,
+                overflowed_commit,
+            } = scan_targets(command, cwd, true);
             // A leading `&&`-chained `dismiss-enforce-worktree` for the SAME
             // repo licenses a commit ordered after it (#323): the dismiss will
             // have armed the snooze before the commit runs, so honoring it here
@@ -2627,6 +2853,22 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                         continue;
                     }
                     return with_unresolved_cd_hint(result, command, cwd);
+                }
+                // Past the candidate cap the walk dropped directories it could
+                // not keep, so an allow proves nothing about them: the commit
+                // blocks unless this target is provably a linked worktree, or
+                // an explicit bypass allowed it (#1058 review C1).
+                if overflowed_commit
+                    && result.bypass.is_none()
+                    && !probe
+                        .repo_root(&dir)
+                        .is_some_and(|root| !is_primary_checkout(&root))
+                {
+                    return with_unresolved_cd_hint(
+                        CheckResult::block(overflow_block_message(&target)),
+                        command,
+                        cwd,
+                    );
                 }
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
@@ -4353,22 +4595,27 @@ mod tests {
     }
 
     #[test]
-    fn cd_nonexistent_or_exit_is_judged_from_the_pre_cd_dir() {
+    fn cd_nonexistent_or_exit_is_judged_only_at_the_target() {
         // `cd <nonexistent> || exit; git commit` — in real bash the cd fails
         // (no such directory), `|| exit` fires, and the commit never runs at
-        // all. This used to Allow by resolving the nonexistent directory and
-        // failing open, which is the same mechanism that let
-        // `cd <nonexistent>; git commit` commit into the primary
-        // (cadence-hooks#1058). A cd that cannot land now leaves the pre-cd
-        // directory in place, and the guard does not model `exit`, so this
-        // blocks: a block on a command that would have committed nothing.
+        // all. A may-fail cd keeps the pre-cd directory as a fallback
+        // (cadence-hooks#1058), but a bare `exit` after `||` drops it.
         let scratch = scratch("cd-nonexistent");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd ./does-not-exist-xyz || exit; git commit -m 'x'");
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
-        assert_eq!(r.outcome, Outcome::Block);
+        // `|| exit` ends the failure path, so the pre-cd directory never
+        // reaches the commit, and the lexical target names no repo.
+        assert_eq!(r.outcome, Outcome::Allow);
+        // `|| true` does not.
+        let mut input = make_bash("cd ./does-not-exist-xyz || true; git commit -m 'x'");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        assert_eq!(
+            run_enforce(&input, &cfg(false, false)).outcome,
+            Outcome::Block
+        );
     }
 
     #[cfg(unix)]
@@ -6503,7 +6750,7 @@ mod tests {
         // zsh runs the last element in the current shell; bash forks it.
         assert_eq!(
             git_commit_targets("true | cd /wt; git commit -m x", "/cwd"),
-            vec!["/wt".to_string(), "/cwd".to_string()]
+            vec!["/cwd".to_string(), "/wt".to_string()]
         );
     }
 
@@ -6522,15 +6769,15 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).0;
+        let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).commits;
         // `;` runs the commit whether or not the cd worked.
         assert_eq!(
             on_disk(&format!("cd {missing}; git commit -m x")),
-            vec![missing.clone(), here_s.clone()]
+            vec![here_s.clone(), missing.clone()]
         );
         assert_eq!(
             on_disk(&format!("cd {missing} || git commit -m x")),
-            vec![missing.clone(), here_s.clone()]
+            vec![here_s.clone(), missing.clone()]
         );
         // `&&` runs it only if the cd worked — the lexical target, which is
         // what `git worktree add <p> && cd <p> && git commit` needs (review I3).
@@ -6541,7 +6788,7 @@ mod tests {
         // ...until the chain ends: a failed cd skipped it, and `;` goes on.
         assert_eq!(
             on_disk(&format!("cd {missing} && true; git commit -m x")),
-            vec![missing.clone(), here_s.clone()]
+            vec![here_s.clone(), missing.clone()]
         );
         assert_eq!(
             on_disk(&format!("cd {there_s}; git commit -m x")),
@@ -6735,11 +6982,10 @@ mod tests {
             "(cd /p; x=$(case a in a) echo y;; esac); git commit -m x)",
             "(cd /p; case a in (a) true;; b|c) false;; esac; git commit -m x)",
         ] {
-            assert_eq!(
-                git_commit_targets(cmd, "/cwd"),
-                vec!["/p".to_string()],
-                "{cmd}"
-            );
+            // Each pattern `)` could have closed the subshell, so the
+            // directory it would restore is kept too (fail closed).
+            let targets = git_commit_targets(cmd, "/cwd");
+            assert!(targets.contains(&"/p".to_string()), "{cmd}: {targets:?}");
         }
         // ...and the subshell still ends at its own `)`.
         assert_eq!(
@@ -6790,26 +7036,40 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_that_may_rebind_oldpwd_makes_cd_dash_unresolved() {
-        // I2: `cd -` reads $OLDPWD, which these segments may have rebound, so
-        // it no longer resolves to the walk's own record.
-        for cmd in [
-            "cd /a; OLDPWD=/p; cd -; git commit -m x",
-            "cd /a; export OLDPWD=/p; cd -; git commit -m x",
-            "cd /a; echo $((OLDPWD=1)); cd -; git commit -m x",
-            "cd /a; read OLDPWD <<< /p; cd -; git commit -m x",
+    fn a_segment_that_may_rebind_oldpwd_keeps_both_cd_dash_outcomes() {
+        // I2/C3: `cd -` reads $OLDPWD. A literal assignment sets it; any other
+        // segment outside the allowlist may have rebound it, so `cd -` keeps
+        // both the last-known target and where it stands.
+        for (cmd, want) in [
+            ("cd /a; OLDPWD=/p; cd -; git commit -m x", vec!["/p"]),
+            ("cd /a; export OLDPWD=/p; cd -; git commit -m x", vec!["/p"]),
+            (
+                "cd /a; echo $((OLDPWD=1)); cd -; git commit -m x",
+                vec!["/a", "/cwd"],
+            ),
+            (
+                "cd /a; read OLDPWD <<< /p; cd -; git commit -m x",
+                vec!["/a", "/cwd"],
+            ),
+            (
+                "cd /a && make -v && cd - && git commit -m x",
+                vec!["/a", "/cwd"],
+            ),
+            (
+                "cd /a && cat /dev/null && cd - && git commit -m x",
+                vec!["/a", "/cwd"],
+            ),
+            // Reading $OLDPWD, or an allowlisted command, keeps it.
+            (
+                "cd /a && echo $OLDPWD && cd - && git commit -m x",
+                vec!["/cwd"],
+            ),
+            ("cd /a; git status; cd -; git commit -m x", vec!["/cwd"]),
         ] {
-            assert_eq!(
-                git_commit_targets(cmd, "/cwd"),
-                vec!["/a".to_string()],
-                "{cmd}"
-            );
+            let mut got = git_commit_targets(cmd, "/cwd");
+            got.sort();
+            assert_eq!(got, want, "{cmd}");
         }
-        // An allowlisted command in between keeps it.
-        assert_eq!(
-            git_commit_targets("cd /a; git status; cd -; git commit -m x", "/cwd"),
-            vec!["/cwd".to_string()]
-        );
     }
 
     #[test]
@@ -6838,7 +7098,7 @@ mod tests {
         let here_s = here.to_string_lossy().into_owned();
         let there_s = there.to_string_lossy().into_owned();
         let input_s = input.to_string_lossy().into_owned();
-        let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).0;
+        let on_disk = |cmd: &str| scan_targets(cmd, &here_s, true).commits;
         for cmd in [
             format!(">/nonexistent/f cd {there_s}; git commit -m x"),
             format!("cd {there_s} > /nonexistent/f; git commit -m x"),
@@ -6847,7 +7107,7 @@ mod tests {
         ] {
             assert_eq!(
                 on_disk(&cmd),
-                vec![there_s.clone(), here_s.clone()],
+                vec![here_s.clone(), there_s.clone()],
                 "{cmd}"
             );
         }
@@ -6893,10 +7153,26 @@ mod tests {
     fn a_candidate_overflow_also_judges_the_session_cwd() {
         let cmd = "cd /s && true | cd /a; true | cd /b; true | cd /c; true | cd /d; \
                    git commit -m x";
-        let targets = git_commit_targets(cmd, "/cwd");
-        assert!(targets.contains(&"/cwd".to_string()), "{targets:?}");
-        assert!(targets.contains(&"/d".to_string()), "{targets:?}");
-        assert!(targets.len() <= MAX_CD_CANDIDATES + 1, "{targets:?}");
+        let scan = scan_targets(cmd, "/cwd", false);
+        // The pre-cd directories are kept ahead of the moved-to ones.
+        assert!(
+            scan.commits.contains(&"/s".to_string()),
+            "{:?}",
+            scan.commits
+        );
+        assert!(
+            scan.commits.contains(&"/cwd".to_string()),
+            "{:?}",
+            scan.commits
+        );
+        assert!(
+            scan.commits.len() <= MAX_CD_CANDIDATES + 1,
+            "{:?}",
+            scan.commits
+        );
+        assert!(scan.overflowed_commit);
+        // A commit before the overflow is not marked.
+        assert!(!scan_targets("git commit -m x; true | cd /a", "/cwd", false).overflowed_commit);
     }
 
     #[test]
@@ -6982,5 +7258,248 @@ mod tests {
                 "{cmd}"
             );
         }
+    }
+
+    // --- delta review of the candidate walk (#1058 delta review) ---
+
+    /// The commit targets of `cmd` from `cwd`, sorted, as `&str`s.
+    fn sorted_targets(cmd: &str, cwd: &str) -> Vec<String> {
+        let mut got = git_commit_targets(cmd, cwd);
+        got.sort();
+        got.dedup();
+        got
+    }
+
+    #[test]
+    fn an_overflow_keeps_the_directories_the_shell_may_stay_in() {
+        // C1: the moved-to directories used to fill the set first, so the cap
+        // dropped the pre-cd one.
+        let scan = scan_targets(
+            "true | cd /p; true | cd /x1; true | cd /x2; true | cd /x3; git commit -m x",
+            "/w",
+            false,
+        );
+        assert!(
+            scan.commits.contains(&"/p".to_string()),
+            "{:?}",
+            scan.commits
+        );
+        assert!(
+            scan.commits.contains(&"/w".to_string()),
+            "{:?}",
+            scan.commits
+        );
+        assert!(scan.overflowed_commit);
+    }
+
+    #[test]
+    fn brace_array_parameter_and_backtick_words_do_not_open_a_case() {
+        // C2: each of these read `case … in` and swallowed the subshell's `)`.
+        for cmd in [
+            "(cd /wt; echo {case,in}); git commit -m x",
+            "(cd /wt; git log --grep={case,in}); git commit -m x",
+            "(cd /wt; echo ${case} in); git commit -m x",
+            "(cd /wt; a=(case in)); git commit -m x",
+            "(cd /wt; echo `echo` case in); git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_dup_of_an_unopened_descriptor_may_fail() {
+        // C4: bash fails `2>&3` when 3 is not open, and skips the cd.
+        for cmd in [
+            "cd /p; cd /w 2>&3; git commit -m x",
+            "cd /p; cd /w <&3; git commit -m x",
+            "cd /p; cd /w 2>&4-; git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/w"), vec!["/p", "/w"], "{cmd}");
+        }
+        for cmd in [
+            "cd /p; cd /w 2>&1; git commit -m x",
+            "cd /p; cd /w >&-; git commit -m x",
+            "cd /p; cd /w 2>&1-; git commit -m x",
+            "cd /p; cd /w {fd}>/dev/null; git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/w"), vec!["/w"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_negated_or_timed_commit_is_seen() {
+        // C5.
+        for cmd in [
+            "! >/dev/null git commit -m x",
+            "! git commit -m x",
+            "time -p git commit -m x",
+            "! time git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_cd_behind_a_conditional_keeps_the_pre_cd_directories() {
+        // I1.
+        for (cmd, cwd, want) in [
+            ("cd /p || cd /w; git commit -m x", "/w", vec!["/p", "/w"]),
+            ("false && cd /w; git commit -m x", "/p", vec!["/p", "/w"]),
+            ("true || cd /w && git commit -m x", "/p", vec!["/p", "/w"]),
+            (
+                "cd /p && false && cd /w; git commit -m x",
+                "/w",
+                vec!["/p", "/w"],
+            ),
+            // Inside the `&&` chain only the cd's success reaches the commit.
+            ("true && cd /w && git commit -m x", "/p", vec!["/w"]),
+        ] {
+            assert_eq!(sorted_targets(cmd, cwd), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_backgrounded_and_or_list_is_undone() {
+        // I2.
+        for cmd in [
+            "cd /wt && true & git commit -m x",
+            "cd /wt && true | cat & git commit -m x",
+            "cd /wt && (true) & git commit -m x",
+            "(cd /wt; true) & git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
+        // A list before `;` still counts.
+        assert_eq!(
+            sorted_targets("cd /wt && true; git commit -m x", "/cwd"),
+            vec!["/wt"]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_cd_forgets_oldpwd() {
+        // I3: after `cd $X`, OLDPWD is /a in the world where the cd ran.
+        assert_eq!(
+            sorted_targets("cd /a && cd $X && cd - && git commit -m x", "/cwd"),
+            vec!["/a"]
+        );
+    }
+
+    #[test]
+    fn redirections_anywhere_in_the_command_are_not_its_words() {
+        // I4.
+        for cmd in [
+            "{fd}>/dev/null git commit -m x",
+            "git >/dev/null commit -m x",
+            "git 2>&1 commit -m x",
+            "git -C /p 2>/dev/null commit -m x",
+        ] {
+            let want = if cmd.contains("/p") { "/p" } else { "/cwd" };
+            assert_eq!(sorted_targets(cmd, "/cwd"), vec![want], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn any_enable_or_source_may_redefine_cd() {
+        // I5: none of these spells `cd` where a token scan can see it.
+        for cmd in [
+            "enable -n c{d,x}; cd /wt && git commit -m x",
+            "enable -n ${X:-cd}; cd /wt && git commit -m x",
+            "X=cd; enable -n $X; cd /wt && git commit -m x",
+            r#"source /dev/stdin <<<"cd(){ :; }"; cd /wt && git commit -m x"#,
+            ". ./env.sh; cd /wt && git commit -m x",
+        ] {
+            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
+        // `git add .` is not `.`.
+        assert_eq!(
+            sorted_targets("git add .; cd /wt && git commit -m x", "/cwd"),
+            vec!["/wt"]
+        );
+    }
+
+    #[test]
+    fn a_pipe_does_not_settle_the_chain() {
+        // Nit: `| tail` inside the chain let the missing-dir fallback in.
+        let scratch = scratch("pipe-settle");
+        let here = scratch.path().join("here");
+        std::fs::create_dir(&here).unwrap();
+        let here_s = here.to_string_lossy().into_owned();
+        let target = here
+            .join(".claude/worktrees/x")
+            .to_string_lossy()
+            .into_owned();
+        let cmd = "git worktree add .claude/worktrees/x -b feat/x && cd .claude/worktrees/x \
+                   && npm test 2>&1 | tail -3 && git commit -m x";
+        assert_eq!(scan_targets(cmd, &here_s, true).commits, vec![target]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_repros_from_a_worktree_into_the_primary_block() {
+        let scratch = scratch("cd-delta-wt-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy().into_owned();
+        let w = wt.to_string_lossy().into_owned();
+        let nx = scratch.path().join("nx").to_string_lossy().into_owned();
+        for cmd in [
+            format!("cd {p}; cd {nx}1; cd {nx}2; cd {nx}3; cd {nx}4; git commit -m x"),
+            format!(
+                "true | cd {p}; true | cd {nx}1; true | cd {nx}2; true | cd {nx}3; \
+                 git commit -m x"
+            ),
+            format!("cd {p}; cd {w} 2>&3; git commit -m x"),
+            format!("cd {p} || cd {w}; git commit -m x"),
+            format!("cd {p} && false && cd {w}; git commit -m x"),
+            format!("cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(w.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Block,
+                "{cmd}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delta_repros_from_the_primary_block() {
+        let scratch = scratch("cd-delta-primary-e2e");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let w = wt.to_string_lossy().into_owned();
+        for cmd in [
+            format!("(cd {w}; echo {{case,in}}); git commit -m x"),
+            format!("cd {w} && make -v >/dev/null && cd - && git commit -m x"),
+            format!("cd {w}; cat /dev/null; cd -; git commit -m x"),
+            "! >/dev/null git commit -m x".to_string(),
+            format!("false && cd {w}; git commit -m x"),
+            format!("true || cd {w} && git commit -m x"),
+            format!("cd {w} && true & git commit -m x"),
+            format!("cd {w} && true | cat & git commit -m x"),
+            "{fd}>/dev/null git commit -m x".to_string(),
+            "git >/dev/null commit -m x".to_string(),
+            format!("enable -n c{{d,x}}; cd {w} && git commit -m x"),
+            format!(r#"source /dev/stdin <<<"cd(){{ :; }}"; cd {w} && git commit -m x"#),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Block,
+                "{cmd}"
+            );
+        }
+        // The worktree recipe with a piped test step still passes.
+        let mut input = make_bash(
+            "git worktree add .claude/worktrees/x -b feat/x && cd .claude/worktrees/x \
+             && npm test 2>&1 | tail -3 && git commit -m x",
+        );
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        assert_eq!(
+            run_enforce(&input, &cfg(false, false)).outcome,
+            Outcome::Allow
+        );
     }
 }
