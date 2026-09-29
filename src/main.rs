@@ -1153,6 +1153,9 @@ fn print_hook_manifest(format: ManifestFormat) {
                         // joins its vendored snapshot on (plugin, name), so a new
                         // key is inert there.
                         "bypassExempt": bypass::is_bypass_exempt_hook(hook.name),
+                        // Additive: behavior under CLAUDE_CODE_REMOTE=true
+                        // (`run`, `self-disable`, `block-with-reason`).
+                        "remote": hook.remote.label(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1446,6 +1449,13 @@ fn main() {
             // runs, and there is nothing to say about it.
             BypassState::Enforced => {}
         }
+    }
+
+    // Cloud sessions (CLAUDE_CODE_REMOTE=true): apply the entry's declared
+    // remote policy. Ahead of any stdin read, so a self-disabled hook never
+    // touches its payload or its machine-local state (cadence-hooks#1197).
+    if let Some(name) = hook_name(&cli.command) {
+        registry::enforce_remote_policy(name);
     }
 
     // The canonical registry hook name for the dispatched subcommand, threaded

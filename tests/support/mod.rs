@@ -39,6 +39,9 @@ fn config_dir() -> &'static PathBuf {
 pub fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     cmd.env("CLAUDE_CONFIG_DIR", config_dir())
-        .env_remove("CLAUDE_PROJECT_DIR");
+        .env_remove("CLAUDE_PROJECT_DIR")
+        // A cloud session exports this; ambient, it would self-disable the hooks
+        // these tests exercise (cadence-hooks#1197). Tests that want it set it.
+        .env_remove("CLAUDE_CODE_REMOTE");
     cmd
 }

@@ -266,6 +266,20 @@ fn resolve_message_path(path: &str, cwd: Option<&str>) -> Option<PathBuf> {
 // Nudge: the computed producer-tuple trailer block
 // ---------------------------------------------------------------------------
 
+/// The `Machine:` value: a fixed `cloud` in a cloud session, where a hostname
+/// digest identifies a throwaway VM (cameronsjo/cadence-hooks#1197).
+fn machine_field(host: &str) -> String {
+    machine_field_for(host, cadence_hooks_core::remote::is_remote())
+}
+
+fn machine_field_for(host: &str, remote: bool) -> String {
+    if remote {
+        cadence_hooks_core::remote::CLOUD_MACHINE.to_string()
+    } else {
+        provenance::machine_digest(host)
+    }
+}
+
 /// Render the nudge: an instruction line plus the trailer block, with each
 /// tuple field's line present only when resolvable — an unresolvable field
 /// is omitted, never rendered blank or guessed (the nudge's job is making
@@ -299,7 +313,7 @@ fn build_nudge(input: &HookInput, host: &str) -> String {
             identity::sanitize_field(&harness, identity::MAX_FIELD_DISPLAY)
         ));
     }
-    lines.push(format!("Machine: {}", provenance::machine_digest(host)));
+    lines.push(format!("Machine: {}", machine_field(host)));
 
     format!(
         "This commit message doesn't carry a `{SESSION_ID_MARKER}` trailer. For traceable \
@@ -606,6 +620,16 @@ mod tests {
         });
     }
 
+    #[test]
+    fn machine_field_is_cloud_only_when_remote() {
+        assert_eq!(machine_field_for("host", true), "cloud");
+        assert_eq!(
+            machine_field_for("host", false),
+            provenance::machine_digest("host")
+        );
+        assert_ne!(machine_field_for("host", false), "cloud");
+    }
+
     // --- once-per-session suppression (#370) ---
 
     #[test]
@@ -704,10 +728,10 @@ mod tests {
             assert!(msg.contains("Model: claude-fable-5"), "{msg}");
             assert!(msg.contains("Harness: claude-code 2.1.214"), "{msg}");
             assert!(
-                msg.contains(&format!(
-                    "Machine: {}",
-                    provenance::machine_digest("sjomba.local")
-                )),
+                // `machine_field` follows the ambient CLAUDE_CODE_REMOTE, so the
+                // expectation does too; both branches are pinned in
+                // `machine_field_is_cloud_only_when_remote`.
+                msg.contains(&format!("Machine: {}", machine_field("sjomba.local"))),
                 "computed machine digest present: {msg}"
             );
         });
