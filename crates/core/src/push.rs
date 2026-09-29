@@ -362,7 +362,7 @@ impl GhHosts {
     fn observe_statements(&mut self, command: &str) {
         static KNOWN_EVAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r#"^\$\((?:ssh-agent|brew[ \t]+shellenv|pyenv[ \t]+init)\b[^$`()'";&|<>\\\n]*\)$"#,
+                r#"^\$\((?:ssh-agent|brew[ \t]+shellenv|pyenv[ \t]+init|rbenv[ \t]+init|direnv[ \t]+hook|starship[ \t]+init|zoxide[ \t]+init|fnm[ \t]+env|mise[ \t]+activate)\b[^$`()'";&|<>\\\n]*\)$"#,
             )
             .expect("pattern should compile")
         });
@@ -564,11 +564,11 @@ fn plain_host(value: &str) -> Option<String> {
 /// costs a nudge or a block, and never an allow the command did not earn. Any
 /// `alias` at all counts, since `shopt -s expand_aliases` can arrive by the
 /// same routes.
-fn may_redefine_known_commands(command: &str) -> bool {
+pub fn may_redefine_known_commands(command: &str) -> bool {
     static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(concat!(
-            r"(?:git|ssh-agent)[ \t]*\([ \t]*\)",
-            r"|\bfunction[ \t]+\\?(?:git|ssh-agent)\b",
+            r"(?:git|ssh-agent|direnv|brew|pyenv|rbenv|starship|zoxide|fnm|mise)[ \t]*\([ \t]*\)",
+            r"|\bfunction[ \t]+\\?(?:git|ssh-agent|direnv|brew|pyenv|rbenv|starship|zoxide|fnm|mise)\b",
             r"|\balias\b|\bhash\b|\benable\b|\bsource\b",
             r"|(?:^|[;&|(\n])[ \t]*\.[ \t]",
             r"|\bPATH\+?=",
@@ -1356,7 +1356,7 @@ fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>
     // keeps the later segments honest (cadence-hooks#237 security review, F20).
     if unescape_word(candidate).as_ref() == "eval" {
         // Redirections are not operands: `eval "$(ssh-agent -s)" >/dev/null`.
-        if known_ok && evals_only_an_agent_environment(&strip_redirections(&rest[1..])) {
+        if known_ok && crate::shell::eval_is_tool_init(&strip_redirections(&rest[1..])) {
             return None;
         }
         return Some(DirectoryVerb::Unknowable);
@@ -1393,7 +1393,7 @@ fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>
 /// directory. Matched exactly: a single operand that is a substitution of
 /// `ssh-agent` with option words only, so `eval "$(ssh-agent -s)"; cd …` is
 /// still a separate segment and `eval "$(cat x)"` still refuses.
-fn evals_only_an_agent_environment(operands: &[&String]) -> bool {
+pub fn evals_only_an_agent_environment(operands: &[&String]) -> bool {
     let Some(body) = substitution_body(operands) else {
         return false;
     };
@@ -1465,7 +1465,7 @@ fn names_the_current_toplevel(operands: &[&String]) -> bool {
 /// trailing `)`. Rejoining quoted pieces (`cd '$(git' …`) yields the same text,
 /// which is harmless here: the shell then refuses the extra operands and
 /// stays where it is, which is where this walk reports it.
-fn substitution_body(operands: &[&String]) -> Option<String> {
+pub fn substitution_body(operands: &[&String]) -> Option<String> {
     let joined = operands
         .iter()
         .map(|word| word.as_str())
