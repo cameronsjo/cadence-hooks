@@ -689,16 +689,22 @@ impl Check for RedactExternalContent {
         // retry.
         let mut hits: Vec<Hit> = Vec::new();
         let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
+        // Identity reports dedup by (id, snippet), so a text it has already
+        // scanned adds nothing — skipping repeats keeps a command that posts
+        // one value thousands of times inside the hook deadline.
+        let mut identity_seen: HashSet<String> = HashSet::new();
         for posted in &bodies {
             let body = posted.0.as_str();
             // Config-blind by signature — no config, no tier, no allowlist.
-            identity_hits.extend(identity::scan_identity(body, &identity_list, None));
-            // The value the shell actually passes, when it differs. Identity
-            // dedups by (id, snippet), so a term both spellings carry reports
-            // once. The shaped tiers read the text as written only: they list
-            // every occurrence, and a second spelling would repeat them.
-            if let Some(passed) = shell_passed_value(posted) {
-                identity_hits.extend(identity::scan_identity(&passed, &identity_list, None));
+            // The value the shell actually passes is scanned too, when it
+            // differs; the shaped tiers read the text as written only, since
+            // they list every occurrence and a second spelling would repeat
+            // them.
+            for text in std::iter::once(body.to_string()).chain(shell_passed_value(posted)) {
+                if !identity_seen.contains(&text) {
+                    identity_hits.extend(identity::scan_identity(&text, &identity_list, None));
+                    identity_seen.insert(text);
+                }
             }
             hits.extend(scan_body(body, &config, d));
         }
@@ -3038,6 +3044,86 @@ term = "acmecorp"
                 "echo \"gh api repos/o/r/issues -f body=acmecorp\"",
                 "gh issue list --search acmecorp",
                 "gh pr view --title acmecorp",
+            ] {
+                assert_eq!(
+                    run_in(cmd, dir.path()).outcome,
+                    Outcome::Allow,
+                    "must allow: {cmd}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn shell_removed_backslashes_reach_the_identity_block() {
+        // The identity tier scanned values as the tokenizer returns them, with
+        // an unquoted backslash still in place, while bash removes it:
+        // `--body acme\corp` posts `acmecorp`. Every row's posted value spells
+        // the term (checked with `bash -c "printf '%s' <word>"`); each must
+        // block. The `$'…'` and adjacent-quote rows were already caught (the
+        // tokenizer decodes and joins them) and stay here as regressions.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --body acme\corp",
+                r"gh pr comment 3 --body \a\c\m\e\c\o\r\p",
+                r"gh pr comment 3 --body 'the '\acme\corp' thing'",
+                r"gh pr comment 3 --body=acme\corp",
+                r"gh pr comment 3 -b acme\corp",
+                r"gh pr comment 3 -bacme\corp",
+                r"gh pr comment 3 --body --body=acme\corp",
+                r"gh pr create --title acme\corp --body hi",
+                r"gh pr create -t acme\corp --body hi",
+                r"gh issue edit 3 --title=acme\corp",
+                r"gh release create v1 --notes acme\corp",
+                r"gh gist create -d acme\corp f.txt",
+                r"gh repo edit o/r --description acme\corp",
+                r"gh pr merge 3 --subject acme\corp",
+                r"tea pr create --title acme\corp",
+                r"git commit -m acme\corp",
+                r"git commit -macme\corp",
+                r"git commit -am acme\corp",
+                r"git commit -vmacme\corp",
+                r"gh api repos/o/r/issues -f body=acme\corp",
+                r"gh api repos/o/r/issues -f acme\corp=1",
+                r"gh api repos/o/r/issues -F title=acme\corp",
+                r"gh pr comment 3 --body $'acme\x63orp'",
+                r"gh pr comment 3 --body $'acme\143orp'",
+                r"gh pr comment 3 --body acme''corp",
+                r#"gh pr comment 3 --body acme""corp"#,
+                r"gh pr comment 3 --body 'acme''corp'",
+                r"gh pr comment 3 --body acme$'c'orp",
+                r"gh api repos/o/r/issues -f body=$'acme\x63orp'",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("[T1]"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn literal_backslashes_that_spell_no_term_stay_allowed() {
+        // Prose carrying a real backslash, an escaped backslash bash keeps
+        // (`acme\\corp` posts `acme\corp`), and a file or JSON payload whose
+        // bytes hold a backslash: none posts the term, so none may block. Files
+        // are posted as they are, so no shell unescaping applies to them.
+        let dir = post_fixture_dir();
+        std::fs::write(dir.path().join("bs.md"), "acme\\corp\n").unwrap();
+        std::fs::write(dir.path().join("bs.json"), r#"{"body":"acme\\corp"}"#).unwrap();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                r"gh pr comment 3 --body 'see C:\new\path'",
+                r"gh pr comment 3 --body path\ with\ spaces",
+                r"gh pr comment 3 --body acme\\corp",
+                r"gh pr comment 3 --body acme\ corp",
+                r"git commit -m 'fix \n handling'",
+                r"gh pr comment 3 --body-file bs.md",
+                r"gh release create v1 --notes-file bs.md",
+                r"git commit -F bs.md",
+                r"gh api repos/o/r/issues -F body=@bs.md",
+                r"gh api repos/o/r/issues --input bs.json",
             ] {
                 assert_eq!(
                     run_in(cmd, dir.path()).outcome,

@@ -653,6 +653,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_bodies_sourced_tags_words_and_files() {
+        // A word keeps its unquoted backslash (the caller decides how to read
+        // it); a file's contents are tagged so no caller unescapes them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "file \\text").unwrap();
+        let base = dir.path().to_str().unwrap();
+        let cases: &[(&str, Vec<(&str, BodySource)>)] = &[
+            (
+                r"gh pr comment 3 --body a\b",
+                vec![(r"a\b", BodySource::Word)],
+            ),
+            (
+                r"gh pr comment 3 --body=a\b",
+                vec![(r"a\b", BodySource::Word)],
+            ),
+            (r"git commit -ma\b", vec![(r"a\b", BodySource::Word)]),
+            (
+                "gh pr comment 3 --body-file b.md",
+                vec![(r"file \text", BodySource::File)],
+            ),
+            (
+                "git commit -Fb.md -m x",
+                vec![(r"file \text", BodySource::File), ("x", BodySource::Word)],
+            ),
+        ];
+        for (cmd, want) in cases {
+            let got = extract_bodies_sourced(cmd, base);
+            let want: Vec<(String, BodySource)> =
+                want.iter().map(|(t, s)| (t.to_string(), *s)).collect();
+            assert_eq!(got, want, "{cmd}");
+        }
+    }
+
     // ---- parse_gh_api (cadence-hooks#930) ----
 
     fn argv(s: &str) -> Vec<String> {
