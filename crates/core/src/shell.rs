@@ -1111,6 +1111,15 @@ pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
     })
 }
 
+/// The subcommand of a single `gh pr <sub>` segment (`"merge"`, `"ready"`, …),
+/// read by the ship anchor's own walk ([`gh_pr_invocation`]), or `None` when
+/// the segment is not a `gh pr` invocation. Lets a caller holding
+/// [`pr_flip_segments`] output tell a merge from a ready flip without a
+/// second parser.
+pub fn gh_pr_subcommand(segment_tokens: &[String]) -> Option<&str> {
+    gh_pr_invocation(segment_tokens).map(|invocation| invocation.subcommand)
+}
+
 /// The tokens of every `gh pr ready` / `gh pr merge` segment in `command`, in
 /// [`command_segments`] order. **The one matcher the ready-flip guards share**
 /// (`guardrails::warn_unreviewed_ready_flip`, `session::plan_guards`), so the
@@ -6882,6 +6891,14 @@ mod tests {
         ] {
             assert!(pr_flip_segments(command).is_empty(), "{command}");
         }
+    }
+
+    #[test]
+    fn gh_pr_subcommand_reads_past_global_flags() {
+        let segments = pr_flip_segments("gh -R o/r pr merge 5 && gh pr ready 6");
+        assert_eq!(gh_pr_subcommand(&segments[0]), Some("merge"));
+        assert_eq!(gh_pr_subcommand(&segments[1]), Some("ready"));
+        assert_eq!(gh_pr_subcommand(&tokenize("git status")), None);
     }
 
     #[test]

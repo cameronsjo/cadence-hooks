@@ -9,7 +9,10 @@
 //! the referenced issues and returns when GitHub has already closed them all;
 //! otherwise it sleeps the rest of the wait and checks again.
 
-use cadence_hooks_core::shell::{git_command, host_and_repo_from_url, pr_url_parts};
+use cadence_hooks_core::shell::{
+    GH_DEFAULT_HOST, PrSelector, forge_host, gh_pr_subcommand, git_command, host_and_repo_from_url,
+    pr_flip_segments, pr_selector, pr_url_parts, repo_value_names_remote, ship_target,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Seconds into the merge wait at which referenced issues are first checked.
@@ -61,25 +64,76 @@ pub fn pr_from_create_stdout(stdout: &str) -> Option<(String, String, u64)> {
     })
 }
 
-/// Extract the PR number from a `gh pr merge` command string.
+/// The PR a `gh pr merge` command acts on, resolved against `origin`
+/// (cadence-hooks#759, merge half).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeTarget {
+    /// No `gh pr merge` segment.
+    NotAMerge,
+    /// No selector and no repo override: the PR of the cwd's branch in
+    /// origin's repo.
+    CurrentBranch,
+    /// This PR number, in origin's repo.
+    Number(u64),
+    /// The command points somewhere this check cannot confirm is origin's
+    /// repo, or its PR cannot be read. The merge flow stays silent.
+    Unsure,
+}
+
+/// Resolve which PR `cmd` merges, and whether it is in origin's repo.
 ///
-/// Looks for the first bare integer token after `gh pr merge`. Returns `None`
-/// when no number is present (bare `gh pr merge --squash` falls back to the
-/// current-branch PR at runtime).
-pub fn pr_number_from_merge_cmd(cmd: &str) -> Option<u64> {
-    // Find "gh pr merge" then scan tokens after it for a bare integer
-    let after = cmd.split("gh pr merge").nth(1)?;
-    for token in after.split_whitespace() {
-        if token.starts_with('-') {
-            continue;
-        }
-        if let Ok(n) = token.parse::<u64>() {
-            return Some(n);
-        }
-        // First non-flag, non-integer token → stop (e.g. a branch name)
-        break;
+/// `origin_host` is origin's forge host ([`forge_host`]) and `origin_slug` its
+/// lowercased `owner/repo`. The segment is found by the shared
+/// [`pr_flip_segments`] matcher, and its repo and PR are read with
+/// [`ship_target`] and [`pr_selector`], so every `-R`/`--repo` spelling, an
+/// inline `GH_REPO=`/`GH_HOST=`, and a PR URL are seen. The comparison with
+/// origin is the shared [`repo_value_names_remote`]; a bare `OWNER/REPO`
+/// means gh's default host unless an inline `GH_HOST=` names another.
+///
+/// Anything short of a confirmed match is [`MergeTarget::Unsure`]: a repo or
+/// URL naming another repo or host, a repo flag with no selector (gh refuses
+/// it), a branch or other selector this check cannot map to a number, an
+/// unreadable selector, or more than one merge in the command. The merge
+/// flow closes issues, so it must never act on a guessed repo. An exported
+/// `GH_REPO`/`GH_HOST` leaves no token and is not seen.
+pub fn merge_target(cmd: &str, origin_host: &str, origin_slug: &str) -> MergeTarget {
+    let merges: Vec<Vec<String>> = pr_flip_segments(cmd)
+        .into_iter()
+        .filter(|tokens| gh_pr_subcommand(tokens) == Some("merge"))
+        .collect();
+    let tokens = match merges.as_slice() {
+        [] => return MergeTarget::NotAMerge,
+        [tokens] => tokens,
+        _ => return MergeTarget::Unsure,
+    };
+    let names_origin = |value: &str, implied: Option<&str>| {
+        repo_value_names_remote(value, implied, origin_host, origin_slug)
+    };
+    let ship = ship_target(tokens);
+    if let Some(host) = &ship.host
+        && forge_host(host.to_ascii_lowercase()) != origin_host
+    {
+        return MergeTarget::Unsure;
     }
-    None
+    let implied = ship.host.as_deref().unwrap_or(GH_DEFAULT_HOST);
+    if !ship
+        .repos
+        .iter()
+        .all(|value| names_origin(value, Some(implied)))
+    {
+        return MergeTarget::Unsure;
+    }
+    match pr_selector(tokens) {
+        PrSelector::None if ship.repos.is_empty() => MergeTarget::CurrentBranch,
+        PrSelector::Number(n) => MergeTarget::Number(n),
+        PrSelector::Url {
+            host,
+            owner,
+            repo,
+            number,
+        } if names_origin(&format!("{host}/{owner}/{repo}"), None) => MergeTarget::Number(number),
+        _ => MergeTarget::Unsure,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,17 +315,23 @@ pub fn handle_create(origin_host: Option<&str>, stdout: &str, gh: &dyn GhRunner)
 /// `wait_secs` (none at 0). Returns a summary message naming the closed
 /// issues, or `None` when there was nothing to do. The caller routes the
 /// message through `CheckResult::nudge` so Claude sees it.
+///
+/// `origin_host` is origin's host (`None` for github.com). The PR is resolved
+/// by [`merge_target`]; a merge it cannot confirm is in origin's repo makes
+/// no `gh` call at all.
 pub fn handle_merge(
     slug: &str,
+    origin_host: Option<&str>,
     cmd: &str,
     gh: &dyn GhRunner,
     clock: &dyn Clock,
     wait_secs: u64,
 ) -> Option<String> {
-    // Resolve PR number: from command or from `gh pr view`
-    let pr_num = match pr_number_from_merge_cmd(cmd) {
-        Some(n) => n,
-        None => {
+    let origin_host = forge_host(origin_host.unwrap_or(GH_DEFAULT_HOST).to_ascii_lowercase());
+    let pr_num = match merge_target(cmd, &origin_host, &slug.to_ascii_lowercase()) {
+        MergeTarget::NotAMerge | MergeTarget::Unsure => return None,
+        MergeTarget::Number(n) => n,
+        MergeTarget::CurrentBranch => {
             let raw = gh.run(&[
                 "pr", "view", "--json", "number", "-q", ".number", "-R", slug,
             ]);
@@ -443,7 +503,7 @@ impl Check for VerifyPrAutoclose {
             let stdout = input.tool_response_stdout().unwrap_or("");
             handle_create(gh.gh_host.as_deref(), stdout, &gh)
         } else if cmd.contains("gh pr merge") {
-            handle_merge(&slug, cmd, &gh, &clock, wait_secs)
+            handle_merge(&slug, gh.gh_host.as_deref(), cmd, &gh, &clock, wait_secs)
         } else {
             // Not a create or merge command — no handler invoked
             None
@@ -545,19 +605,63 @@ mod tests {
         );
     }
 
-    // Case 9: pr_number_from_merge_cmd — number present
+    // Case 9: merge_target — a number in origin's repo
     #[test]
-    fn pr_number_from_merge_cmd_with_number() {
+    fn merge_target_reads_a_number_in_origin() {
+        for cmd in [
+            "gh pr merge 17 --squash",
+            "gh pr merge --squash 17",
+            "gh pr merge 17 -R owner/repo",
+            "gh -R github.com/Owner/Repo pr merge 17",
+            "gh pr merge https://github.com/owner/repo/pull/17",
+            "GH_TOKEN=x gh pr merge 17",
+        ] {
+            assert_eq!(
+                merge_target(cmd, "github.com", "owner/repo"),
+                MergeTarget::Number(17),
+                "{cmd}"
+            );
+        }
+    }
+
+    // Case 10: merge_target — no selector is the current branch
+    #[test]
+    fn merge_target_no_selector_is_the_current_branch() {
         assert_eq!(
-            pr_number_from_merge_cmd("gh pr merge 17 --squash"),
-            Some(17)
+            merge_target(
+                "gh pr merge --squash --delete-branch",
+                "github.com",
+                "owner/repo"
+            ),
+            MergeTarget::CurrentBranch
         );
     }
 
-    // Case 10: pr_number_from_merge_cmd — no number → None
+    // cadence-hooks#759: anything not confirmed as origin's repo is unsure.
     #[test]
-    fn pr_number_from_merge_cmd_no_number_is_none() {
-        assert_eq!(pr_number_from_merge_cmd("gh pr merge --squash"), None);
+    fn merge_target_is_unsure_off_origin_or_unreadable() {
+        for cmd in [
+            "gh pr merge 16 -R other/repo",
+            "gh -R other/repo pr merge 16",
+            "gh pr merge 16 --repo=other/repo",
+            "GH_REPO=other/repo gh pr merge 16",
+            "GH_HOST=ghe.example.com gh pr merge 16",
+            "gh pr merge 16 -R ghe.example.com/owner/repo",
+            "gh pr merge https://github.com/other/repo/pull/16",
+            "gh pr merge -R owner/repo",
+            "gh pr merge feat/branch",
+            "gh pr merge 5 && gh pr merge 6",
+        ] {
+            assert_eq!(
+                merge_target(cmd, "github.com", "owner/repo"),
+                MergeTarget::Unsure,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            merge_target("git status", "github.com", "owner/repo"),
+            MergeTarget::NotAMerge
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -900,7 +1004,7 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0)
+        let msg = handle_merge("owner/repo", None, "gh pr merge 8 --squash", &gh, &clock, 0)
             .expect("closing a straggler should produce a summary");
 
         assert!(
@@ -943,6 +1047,7 @@ mod tests {
 
             let msg = handle_merge(
                 "owner/repo",
+                None,
                 "gh pr merge 8 --merge --admin",
                 &gh,
                 &clock,
@@ -961,6 +1066,46 @@ mod tests {
         }
     }
 
+    // cadence-hooks#759: a merge in another repo never reaches `gh`, so no
+    // issue in origin's repo can be closed on its behalf.
+    #[test]
+    fn merge_in_another_repo_makes_no_calls() {
+        for cmd in [
+            "gh pr merge 16 -R other/repo",
+            "gh pr merge https://github.com/other/repo/pull/16",
+        ] {
+            let gh = FakeGh::new()
+                .with_issue(5, "OPEN")
+                .with_pr_body("Closes #5");
+            let clock = FakeClock::new();
+            assert_eq!(handle_merge("owner/repo", None, cmd, &gh, &clock, 10), None);
+            assert!(gh.repo_args.borrow().is_empty(), "{cmd}: no gh call");
+            assert!(gh.close_calls.borrow().is_empty(), "{cmd}: no close");
+            assert!(clock.sleep_calls.borrow().is_empty(), "{cmd}: no wait");
+        }
+    }
+
+    #[test]
+    fn merge_in_origin_still_closes_stragglers() {
+        for cmd in [
+            "gh pr merge 8 --squash",
+            "gh pr merge 8 -R owner/repo",
+            "gh pr merge https://github.com/owner/repo/pull/8",
+        ] {
+            let gh = FakeGh::new()
+                .with_issue(5, "OPEN")
+                .with_pr_body("Closes #5");
+            let clock = FakeClock::new();
+            let msg = handle_merge("owner/repo", None, cmd, &gh, &clock, 0);
+            assert!(msg.is_some_and(|m| m.contains("#5")), "{cmd}");
+            assert_eq!(gh.close_calls.borrow().len(), 1, "{cmd}");
+            assert!(
+                gh.repo_args.borrow().iter().all(|r| r == "owner/repo"),
+                "{cmd}"
+            );
+        }
+    }
+
     // Case 16: merge #8, body refs #5 already CLOSED → no close call
     #[test]
     fn merge_already_closed_issue_skipped() {
@@ -970,7 +1115,7 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0);
+        let msg = handle_merge("owner/repo", None, "gh pr merge 8 --squash", &gh, &clock, 0);
 
         assert_eq!(msg, None, "nothing closed → no summary message");
         assert!(
@@ -987,6 +1132,7 @@ mod tests {
         let clock = FakeClock::new();
         let msg = handle_merge(
             "owner/repo",
+            None,
             "gh pr merge --squash", // no number in cmd
             &gh,
             &clock,
@@ -1011,7 +1157,14 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 9 --squash", &gh, &clock, 10);
+        let msg = handle_merge(
+            "owner/repo",
+            None,
+            "gh pr merge 9 --squash",
+            &gh,
+            &clock,
+            10,
+        );
 
         assert_eq!(msg, None);
         assert!(
@@ -1031,7 +1184,14 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+        let msg = handle_merge(
+            "owner/repo",
+            None,
+            "gh pr merge 8 --squash",
+            &gh,
+            &clock,
+            10,
+        );
 
         assert_eq!(msg, None);
         assert_eq!(*clock.sleep_calls.borrow(), vec![2u64]);
@@ -1048,7 +1208,14 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+        let msg = handle_merge(
+            "owner/repo",
+            None,
+            "gh pr merge 8 --squash",
+            &gh,
+            &clock,
+            10,
+        );
 
         assert!(msg.is_some_and(|m| m.contains("#5")));
         assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
@@ -1067,7 +1234,14 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+        let msg = handle_merge(
+            "owner/repo",
+            None,
+            "gh pr merge 8 --squash",
+            &gh,
+            &clock,
+            10,
+        );
 
         assert_eq!(msg, None);
         assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
@@ -1084,7 +1258,14 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 10);
+        let msg = handle_merge(
+            "owner/repo",
+            None,
+            "gh pr merge 8 --squash",
+            &gh,
+            &clock,
+            10,
+        );
 
         assert!(msg.is_some_and(|m| m.contains("#5")));
         assert_eq!(*clock.sleep_calls.borrow(), vec![2u64, 8]);
@@ -1101,7 +1282,7 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 1);
+        let msg = handle_merge("owner/repo", None, "gh pr merge 8 --squash", &gh, &clock, 1);
 
         assert!(msg.is_some_and(|m| m.contains("#5")));
         assert_eq!(*clock.sleep_calls.borrow(), vec![1u64]);
@@ -1116,9 +1297,12 @@ mod tests {
         // We can't call VerifyPrAutoclose::run here because it hits git remote.
         // Instead test the logic path: if cmd doesn't contain "gh pr create" or "gh pr merge",
         // neither handler is invoked. We verify this via pr_number_from_create_stdout
-        // and pr_number_from_merge_cmd returning None for unrelated commands.
+        // and merge_target reading no merge in unrelated commands.
         assert_eq!(pr_from_create_stdout("git status output"), None);
-        assert_eq!(pr_number_from_merge_cmd("git status"), None);
+        assert_eq!(
+            merge_target("git status", "github.com", "o/r"),
+            MergeTarget::NotAMerge
+        );
 
         // Additionally verify the Check returns allow (the guard is the top-level command check)
         // This will attempt git remote; if not in a git repo → allow
@@ -1145,15 +1329,6 @@ mod tests {
     #[test]
     fn pr_from_create_stdout_no_url_is_none() {
         assert_eq!(pr_from_create_stdout("Created pull request"), None);
-    }
-
-    #[test]
-    fn pr_number_from_merge_cmd_flags_only() {
-        // --squash and --delete-branch are flags, not a number
-        assert_eq!(
-            pr_number_from_merge_cmd("gh pr merge --squash --delete-branch"),
-            None
-        );
     }
 
     #[test]
