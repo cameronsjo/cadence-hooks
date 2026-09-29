@@ -8,9 +8,11 @@
 //! guard enforces *irreversibility* — a repo delete is blocked even for a repo
 //! you own, because there is no undo.
 
+use crate::guard_gh_write::gh_argv;
 use cadence_hooks_core::shell::{
-    command_segments, command_word, contains_ignoring_ascii_case, fold_verb, heredoc_introducers,
-    logical_lines, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
+    brace_expansion_overflows, command_segments, command_word, contains_ignoring_ascii_case,
+    fold_verb, gh_command_path, heredoc_introducers, logical_lines, strip_comments,
+    strip_heredoc_bodies, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -306,6 +308,29 @@ impl Check for GhDangerousGuard {
                     m.as_str().trim(),
                 ));
             }
+            // The same question asked of the parsed argv: the group and verb
+            // cobra finds (`gh_command_path`), over the tokens the shell runs
+            // AFTER brace expansion. The text regex never sees `gh repo
+            // {delete,} o/r` or `{gh,} repo delete o/r`, both of which bash
+            // runs as `gh repo delete o/r` (cadence-hooks#1115).
+            if gh_argv(segment).is_some_and(|argv| gh_command_path(&argv, 2) == ["repo", "delete"])
+            {
+                return CheckResult::block(crate::messages::repo_delete_blocked_message(
+                    segment.trim(),
+                ));
+            }
+        }
+        // A brace expansion past what the tokenizer models leaves its word
+        // whole, so the command it spells is invisible to the argv pass above.
+        // For an irreversible operation, refuse rather than guess.
+        if segments.iter().any(|segment| {
+            segment.contains('{')
+                && contains_ignoring_ascii_case(segment, "gh")
+                && brace_expansion_overflows(segment)
+        }) {
+            return CheckResult::block(crate::messages::repo_delete_blocked_message(
+                "a gh command whose brace expansion is too large to read",
+            ));
         }
         // Coarse wrapper pass, kept ALONGSIDE the per-segment loop rather than
         // replaced by it. `command_segments` expands a wrapper only when it can
@@ -385,6 +410,34 @@ impl Check for GhDangerousGuard {
 mod tests {
     use super::*;
     use cadence_hooks_core::test_builders::make_bash;
+
+    /// cadence-hooks#1115: the delete is read from the brace-expanded argv
+    /// bash runs, with the group and verb found the way cobra finds them.
+    #[test]
+    fn brace_expanded_repo_delete_is_judged_by_what_runs() {
+        for (command, blocks) in [
+            ("gh repo {delete,} o/r --yes", true),
+            ("{gh,} repo delete o/r --yes", true),
+            ("gh {repo,} delete o/r --yes", true),
+            ("sh -c 'gh repo {delete,} o/r --yes'", true),
+            // bash runs `gh repo re delete …`, which gh refuses.
+            ("gh re{po,} delete o/r --yes", false),
+            ("gh repo {view,} o/r", false),
+            ("echo \"gh repo {delete,} o/r\"", false),
+        ] {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                blocks,
+                "{command}"
+            );
+        }
+        let flood = format!("gh repo {}delete o/r --yes", "{a,b}".repeat(65));
+        assert!(matches!(
+            GhDangerousGuard.run(&make_bash(&flood)).outcome,
+            cadence_hooks_core::Outcome::Block
+        ));
+    }
 
     #[test]
     fn direct_repo_delete_blocked() {

@@ -585,40 +585,23 @@ fn is_git_push_command(cmd: &SimpleCommand) -> bool {
         .is_some_and(|w| w == "push")
 }
 
-/// Extract `-R` or `--repo` flag value from a `gh` command's arguments.
+/// Extract the `-R`/`--repo` target from a `gh` command's arguments.
 ///
-/// Later readings win, which is what pflag does. The scan stops at `--`:
-/// cobra stops parsing flags there and treats every later token as positional,
-/// so a `-R` after it is an argument gh never reads as a repo. Scanning past it
-/// made this resolve a repository gh will not act on — and in the
-/// `-R evil/b -- -R owned/a` orientation that error points at ALLOW, leaving
-/// the block to `guard_gh_write::repo_flag`'s fail-closed backstop.
+/// Read by the shared parser ([`crate::shell::gh_repo_flags`],
+/// cadence-hooks#937), so this agrees with `guard_gh_write` on every spelling
+/// (`-R=o/r` included), on `--`, and on which readings count. Only a CERTAIN
+/// target is explicit: readings that disagree, or that may each be another
+/// flag's value (`--body -Ro/r`), give `None`, which routes the loop to the
+/// missing-target policy instead of vouching for a repo gh may never touch.
+/// The old last-wins read let `--repo evil/x --body -Rown/r` resolve to the
+/// decoy.
 fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
-    let words = suffix_words(cmd);
-    let mut result = None;
-    let mut index = 0;
-    while index < words.len() {
-        let word = &words[index];
-        if word == "--" {
-            break;
-        }
-        if (word == "-R" || word == "--repo")
-            && let Some(value) = words.get(index + 1)
-        {
-            result = Some(value.clone());
-            index += 2;
-            continue;
-        }
-        // Handle -Rowner/repo (no space)
-        if let Some(repo) = word.strip_prefix("-R").filter(|r| !r.is_empty()) {
-            result = Some(repo.to_string());
-        }
-        if let Some(repo) = word.strip_prefix("--repo=") {
-            result = Some(repo.to_string());
-        }
-        index += 1;
+    let mut argv = vec!["gh".to_string()];
+    argv.extend(suffix_words(cmd));
+    match crate::shell::gh_repo_flags(&argv).resolve() {
+        crate::shell::GhRepoFlag::Target(repo) => Some(repo),
+        _ => None,
     }
-    result
 }
 
 /// Extract the explicit remote name from `git push <remote>` arguments.
@@ -905,34 +888,41 @@ mod tests {
         }
     }
 
+    /// Every spelling reads through the shared parser (cadence-hooks#937), and
+    /// only a target every reading agrees on is explicit. gh obeys the last
+    /// REAL `-R`, but whether a later `-R`-shaped token is real depends on a
+    /// flag table this analysis lacks, so disagreement is not explicit — the
+    /// missing-target policy and `guard_gh_write`'s per-segment check decide.
     #[test]
-    fn last_repo_flag_wins_across_all_four_spellings() {
+    fn repo_flag_readings_are_explicit_only_when_they_agree() {
         for (flags, expected) in [
-            ("-R first/a --repo second/b", "second/b"),
-            ("--repo first/a -Rsecond/b", "second/b"),
-            ("--repo=first/a -R second/b", "second/b"),
-            ("-Rfirst/a --repo=second/b", "second/b"),
+            ("-R own/a", Some("own/a")),
+            ("-Rown/a", Some("own/a")),
+            ("-R=own/a", Some("own/a")),
+            ("--repo own/a", Some("own/a")),
+            ("--repo=own/a", Some("own/a")),
+            ("-R own/a --repo=own/a", Some("own/a")),
+            ("-R first/a --repo second/b", None),
+            ("--repo first/a -Rsecond/b", None),
+            ("--repo=first/a -R second/b", None),
+            ("-Rfirst/a --repo=second/b", None),
+            // `-R` takes the next token whatever it is, so `--repo=first/value`
+            // is a value here — and it disagrees with the later reading.
+            ("-R --repo=first/value -Rfinal/target", None),
+            // A reading that may be `--body`'s value is not a certain target:
+            // gh may use it, or no override at all.
+            ("--body -Rown/a", None),
+            // The decoy last-wins used to pick over the real target.
+            ("--repo evil/x --body -Rown/a", None),
         ] {
             let command = format!("for i in 1 2; do gh issue close $i {flags}; done");
-            match analyze_gh_loops(&command) {
-                LoopAnalysis::AllTargetsExplicit(cmds) => {
-                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some(expected), "{flags}");
+            let explicit = match analyze_gh_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) | LoopAnalysis::MissingTargets(cmds) => {
+                    cmds[0].explicit_repo.clone()
                 }
-                other => panic!("expected AllTargetsExplicit for {flags}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn repo_flag_value_is_not_reparsed_as_another_flag() {
-        let result = analyze_gh_loops(
-            "for i in 1 2; do gh issue close $i -R --repo=first/value -Rfinal/target; done",
-        );
-        match result {
-            LoopAnalysis::AllTargetsExplicit(cmds) => {
-                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("final/target"));
-            }
-            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+                other => panic!("expected a looped gh command for {flags}, got {other:?}"),
+            };
+            assert_eq!(explicit.as_deref(), expected, "{flags}");
         }
     }
 

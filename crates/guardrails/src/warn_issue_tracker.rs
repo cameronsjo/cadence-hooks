@@ -17,7 +17,9 @@
 
 use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::shell::{
-    contains_ignoring_ascii_case, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+    GhRepoFlag, command_segments, command_word, contains_ignoring_ascii_case, gh_command_path,
+    gh_repo_flags, git_command, host_and_repo_from_url, parse_gh_repo_value, parse_work_dir,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -118,31 +120,6 @@ static GH_ISSUE_CREATE: LazyLock<Regex> =
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
 
-/// Extract a `-R`/`--repo` flag value from a raw command string.
-///
-/// Handles `-R x`, `-Rx`, `--repo x`, `--repo=x`. Quote-trims values so
-/// `--repo "o/r"` resolves to `o/r`.
-fn extract_repo_flag(command: &str) -> Option<String> {
-    let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
-    let words: Vec<&str> = command.split_whitespace().collect();
-    let mut iter = words.iter();
-    while let Some(word) = iter.next() {
-        if *word == "-R" || *word == "--repo" {
-            return iter.next().map(|s| trim_value(s));
-        }
-        if let Some(repo) = word.strip_prefix("--repo=") {
-            return Some(trim_value(repo));
-        }
-        if let Some(repo) = word.strip_prefix("-R")
-            && !repo.is_empty()
-            && !repo.starts_with('-')
-        {
-            return Some(trim_value(repo));
-        }
-    }
-    None
-}
-
 /// True when `stripped` (a quote-stripped command) is an issue-create write.
 ///
 /// Matches:
@@ -158,6 +135,33 @@ fn is_issue_create(stripped: &str) -> bool {
             || API_INPUT_FLAG.is_match(stripped))
 }
 
+/// The argv of the first gh invocation in `segment` (`gh` at index 0), found
+/// the way `guard_gh_write` finds it: the first token that resolves to `gh`.
+fn gh_argv(segment: &str) -> Option<Vec<String>> {
+    let tokens = tokenize(segment);
+    let start = tokens.iter().position(|t| command_word(t) == "gh")?;
+    Some(tokens[start..].to_vec())
+}
+
+/// True when `segment` is a `gh issue create` by its parsed argv — the
+/// group and verb found the way cobra finds them ([`gh_command_path`]), so
+/// `gh -R o/r issue create` and the brace-expanded `gh {issue,} create` count
+/// (cadence-hooks#1077, #1115), and quoted prose never does.
+fn segment_is_issue_create_argv(segment: &str) -> bool {
+    gh_argv(segment).is_some_and(|argv| gh_command_path(&argv, 2) == ["issue", "create"])
+}
+
+/// What the tracker nudge has to say about one command.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IssueNudge {
+    /// The issue files to this owned, non-tracker `owner/repo`.
+    Target(String),
+    /// The `-R`/`--repo` target cannot be read — readings disagree, or gh's
+    /// value grammar does not split it — so where the issue lands is unknown.
+    /// Advisory only: this guard nudges, and never blocks (cadence-hooks#937).
+    Unreadable(String),
+}
+
 /// Pure judge: returns `Some(owner/repo)` when the command should fire a nudge.
 ///
 /// Nudge gate — returns `Some(target)` only when ALL hold:
@@ -168,36 +172,105 @@ fn is_issue_create(stripped: &str) -> bool {
 ///   owner that hosts a known tracker)
 /// - The target owner is in `CADENCE_ALLOWED_OWNERS`
 /// - The target is not among the known ecosystem issue trackers
+///
+/// The [`IssueNudge::Target`] half of [`judge_issue_command`].
 pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
-    let stripped = strip_quotes(command);
+    match judge_issue_command(command, work_dir)? {
+        IssueNudge::Target(target) => Some(target),
+        IssueNudge::Unreadable(_) => None,
+    }
+}
 
-    if !is_issue_create(&stripped) {
+/// [`judge_issue_target`], plus the [`IssueNudge::Unreadable`] case.
+///
+/// The `-R`/`--repo` target is read by the shared parser (`gh_repo_flags` +
+/// `parse_gh_repo_value`, cadence-hooks#937) from the issue-create segment's
+/// parsed argv — not by splitting the raw text on whitespace, which let a
+/// `-R` quoted inside `--title` win over the real flag (cadence-hooks#737) and
+/// took the FIRST of two flags where gh takes the last. URL-shaped and
+/// `HOST/OWNER/REPO` values now resolve to the repo they name.
+pub fn judge_issue_command(command: &str, work_dir: &Path) -> Option<IssueNudge> {
+    let stripped = strip_quotes(command);
+    let segments = command_segments(command);
+    let segment = segments
+        .iter()
+        .find(|segment| segment_is_issue_create_argv(segment))
+        .map(String::as_str);
+    if segment.is_none() && !is_issue_create(&stripped) {
         return None;
     }
+    // The segment the flag is read from: the issue-create one, else (a
+    // `gh api` POST, or a spelling only the text patterns match) the first gh
+    // segment, else the whole command.
+    let segment = segment
+        .or_else(|| {
+            segments
+                .iter()
+                .find(|segment| gh_argv(segment).is_some())
+                .map(String::as_str)
+        })
+        .unwrap_or(command);
 
     let dh = default_host();
     let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
     let extra_hosts = env_extra_hosts();
 
     // Resolve host + target repo.
-    // Precedence: (a) -R/--repo flag, (b) gh api path, (c) git remote.
-    let (host, target) = if let Some(repo) = extract_repo_flag(command) {
-        (dh.clone(), repo.to_lowercase())
-    } else if let Some(caps) = API_ISSUES_PATH.captures(command) {
-        let repo = caps
-            .get(1)
-            .map(|m| m.as_str().to_lowercase())
-            .unwrap_or_default();
-        (dh.clone(), repo)
-    } else {
-        let wd = work_dir.to_str().unwrap_or(".");
-        let origin_url = git_command(wd, &["remote", "get-url", "origin"])?;
-        match host_and_repo_from_url(&origin_url) {
-            Some((h, r)) => (h, r.to_lowercase()),
-            None => return None,
+    // Precedence: (a) -R/--repo flag, (b) gh api path, (c) git remote. A flag
+    // reading that may be another flag's value leaves (b)/(c) in play too.
+    let flag = gh_argv(segment).map_or(GhRepoFlag::Absent, |argv| gh_repo_flags(&argv).resolve());
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let flag_value = match flag {
+        GhRepoFlag::Ambiguous => {
+            return Some(IssueNudge::Unreadable(
+                "-R/--repo readings that disagree or cannot be attributed".to_string(),
+            ));
         }
+        GhRepoFlag::Target(value) => Some((value, true)),
+        GhRepoFlag::TargetOrAbsent(value) => Some((value, false)),
+        GhRepoFlag::Absent => None,
     };
+    let mut fallback_needed = true;
+    if let Some((value, certain)) = flag_value {
+        let Some(spec) = parse_gh_repo_value(&value) else {
+            return Some(IssueNudge::Unreadable(value));
+        };
+        candidates.push((
+            spec.host.unwrap_or_else(|| dh.clone()),
+            format!("{}/{}", spec.owner, spec.name).to_lowercase(),
+        ));
+        fallback_needed = !certain;
+    }
+    if fallback_needed {
+        if let Some(caps) = API_ISSUES_PATH.captures(command) {
+            let repo = caps
+                .get(1)
+                .map(|m| m.as_str().to_lowercase())
+                .unwrap_or_default();
+            candidates.push((dh.clone(), repo));
+        } else {
+            let wd = work_dir.to_str().unwrap_or(".");
+            if let Some((h, r)) = git_command(wd, &["remote", "get-url", "origin"])
+                .and_then(|url| host_and_repo_from_url(&url))
+            {
+                candidates.push((h, r.to_lowercase()));
+            }
+        }
+    }
 
+    candidates.into_iter().find_map(|(host, target)| {
+        nudge_target(&host, &target, &dh, &allowed_owners, &extra_hosts).map(IssueNudge::Target)
+    })
+}
+
+/// The nudge gates for one resolved `(host, owner/repo)`.
+fn nudge_target(
+    host: &str,
+    target: &str,
+    dh: &str,
+    allowed_owners: &[config::AllowEntry],
+    extra_hosts: &[String],
+) -> Option<String> {
     // Gate: default host only (gh CLI convention; self-hosted forges are out of scope).
     if host != dh {
         return None;
@@ -215,22 +288,33 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
 
     // Gate: target must be owned.
     if !config::is_allowed_with_extra_hosts(
-        &host,
+        host,
         owner,
         repo_name,
-        &allowed_owners,
+        allowed_owners,
         &[],
-        &extra_hosts,
+        extra_hosts,
     ) {
         return None;
     }
 
     // Gate: target must not be a known ecosystem tracker.
-    if trackers().iter().any(|t| t == &target) {
+    if trackers().iter().any(|t| t == target) {
         return None;
     }
 
-    Some(target)
+    Some(target.to_string())
+}
+
+fn unreadable_message(value: &str) -> String {
+    format!(
+        "warn-issue-tracker: can't tell which repo this issue files to — the -R/--repo \
+         target ({value}) is not a single `owner/repo` this check can read.\n\
+         Issues route by the component that owns the defect:\n\
+         cadence plugins → cameronsjo/cadence · cadence-hooks → cameronsjo/cadence-hooks ·\n\
+         forgectl/claunch → cameronsjo/forgectl · meta/orchestration → cameronsjo/cadence-ecosystem.\n\
+         Spell the target as `-R owner/repo` to confirm it."
+    )
 }
 
 fn nudge_message(target: &str) -> String {
@@ -265,6 +349,10 @@ impl Check for WarnIssueTracker {
         let stripped = strip_quotes(command);
         if !contains_ignoring_ascii_case(&stripped, "gh issue create")
             && !contains_ignoring_ascii_case(&stripped, "gh api")
+            && !(contains_ignoring_ascii_case(&stripped, "gh")
+                && command_segments(command)
+                    .iter()
+                    .any(|segment| segment_is_issue_create_argv(segment)))
         {
             return CheckResult::allow();
         }
@@ -277,8 +365,9 @@ impl Check for WarnIssueTracker {
         let work_dir_str = parse_work_dir(command, cwd);
         let work_dir = Path::new(&work_dir_str);
 
-        match judge_issue_target(command, work_dir) {
-            Some(target) => CheckResult::nudge(nudge_message(&target)),
+        match judge_issue_command(command, work_dir) {
+            Some(IssueNudge::Target(target)) => CheckResult::nudge(nudge_message(&target)),
+            Some(IssueNudge::Unreadable(value)) => CheckResult::nudge(unreadable_message(&value)),
             None => CheckResult::allow(),
         }
     }
@@ -302,6 +391,78 @@ mod tests {
 
     fn workdir(path: &str) -> PathBuf {
         PathBuf::from(path)
+    }
+
+    /// cadence-hooks#737, #937, #1077, #1115: the `-R` target is read by the
+    /// shared parser from the parsed argv. `None` is no nudge.
+    #[test]
+    fn repo_flag_is_read_with_gh_grammar() {
+        let target = |repo: &str| Some(IssueNudge::Target(repo.to_string()));
+        let unreadable = |value: &str| Some(IssueNudge::Unreadable(value.to_string()));
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+                ("GH_HOST", None),
+            ],
+            || {
+                for (command, expected) in [
+                    // #737: a `-R` quoted inside another argument is prose.
+                    (
+                        "gh issue create --title \"see -R other/x\" -R cameronsjo/random",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh issue create -R cameronsjo/random --title \"see -R cameronsjo/cadence\"",
+                        target("cameronsjo/random"),
+                    ),
+                    // #1077: `-R` before the group; #1115: brace expansion.
+                    (
+                        "gh -R cameronsjo/random issue create -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh {issue,} create -R cameronsjo/random -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    // #937: URL and host-qualified values.
+                    (
+                        "gh issue create -R https://github.com/cameronsjo/random -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh issue create -R github.com/cameronsjo/random -t t",
+                        target("cameronsjo/random"),
+                    ),
+                    (
+                        "gh issue create -R github.com/cameronsjo/cadence -t t",
+                        None,
+                    ),
+                    (
+                        "gh issue create -R ghe.example/cameronsjo/random -t t",
+                        None,
+                    ),
+                    // #937: first-wins read a repo gh does not act on; any
+                    // disagreement is now an unreadable-target nudge.
+                    (
+                        "gh issue create -R cameronsjo/cadence -R cameronsjo/random -t t",
+                        unreadable("-R/--repo readings that disagree or cannot be attributed"),
+                    ),
+                    (
+                        "gh issue create -R cameronsjo -t t",
+                        unreadable("cameronsjo"),
+                    ),
+                    ("gh issue create -R cameronsjo/cadence -t t", None),
+                ] {
+                    assert_eq!(
+                        judge_issue_command(command, &workdir("/tmp")),
+                        expected,
+                        "{command}"
+                    );
+                }
+            },
+        );
     }
 
     // ---- guard-clause tests — return before reading env vars, no lock needed ----

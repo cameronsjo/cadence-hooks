@@ -2177,20 +2177,24 @@ struct GhPrInvocation<'a> {
 /// can only be that flag: no other gh flag on `pr merge` begins with a capital
 /// `R`, and the separated form is `-R` exactly.
 ///
-/// **Sibling scanners for the same flag**, so a change to one grammar does not
-/// silently orphan the others (cadence-hooks#881; reproducible with
-/// `rg -- '-R"|--repo' crates/`):
+/// **One reader for the flag** (cadence-hooks#937). Every site that reads a
+/// repo override goes through [`read_gh_repo_flag`] (one position) or
+/// [`gh_repo_flags`] (a whole invocation), and every site that splits its value
+/// goes through [`parse_gh_repo_value`]:
 ///
-/// | site | what it does |
+/// | site | what it asks |
 /// |---|---|
-/// | `is_repo_flag` (here) | prefix test, detect-only |
-/// | `gh_pr_invocation` (here) | value, retarget detection + target capture |
-/// | `scan_operands` (here) | value, post-subcommand target capture, `--`-aware |
-/// | `scan_ship_flags` (here) | value, every operand, pflag clusters, per-subcommand grammar, `--`-aware |
-/// | `pr_selector` (here) | skips the value via `read_flag_token` to find the PR positional, `--`-aware |
-/// | `loop_analysis::extract_repo_flag` (this crate) | value over parsed AST words, last-wins, stops at `--` |
-/// | `warn_issue_tracker::extract_repo_flag` (guardrails crate) | value, first-wins, whitespace split |
-/// | `guard_gh_write::repo_flag` → `scan_unanimous_flag` (guardrails crate) | value, unanimity, fail-closed |
+/// | `is_repo_flag` (here) | prefix test, detect-only: any retarget spelling at all |
+/// | `gh_group_invocation` / `scan_operands` (here) | every value, via [`read_gh_repo_flag`] |
+/// | `loop_analysis::extract_repo_flag` (this crate) | [`gh_repo_flags`], certain target only |
+/// | `warn_issue_tracker` (guardrails crate) | [`gh_repo_flags`] + [`parse_gh_repo_value`], nudges when unreadable |
+/// | `guard_gh_write::repo_flag` (guardrails crate) | [`gh_repo_flags`] + [`parse_gh_repo_value`], blocks when unreadable |
+///
+/// `scan_ship_flags` (here) is the one walker that keeps its own cluster
+/// reading, because it has what the shared parser deliberately lacks: a
+/// per-subcommand flag table for `gh pr create`/`ready`/`merge`, which lets it
+/// read `-fRother/r` precisely. Its values still split through
+/// [`gh_repo_value_parts`].
 ///
 /// `git push --repo` is deliberately NOT a sibling: it is a different
 /// executable's flag (`PUSH_SEPARATE_VALUE_LONG_OPTS`, this file), spelled
@@ -2351,11 +2355,12 @@ fn scan_operands(operands: &[String]) -> OperandScan {
                 repo_targets,
             };
         }
-        if token == "-R" || token == "--repo" {
-            match operands.get(i + 1) {
+        // Every spelling through the one reader (cadence-hooks#937).
+        if let Some(read) = read_gh_repo_flag(operands, i) {
+            match read.value {
                 Some(value) => {
-                    repo_targets.push(value.clone());
-                    i += 2;
+                    repo_targets.push(value);
+                    i = read.next;
                     continue;
                 }
                 // A trailing repo flag with no value cannot be attributed a
@@ -2367,16 +2372,6 @@ fn scan_operands(operands: &[String]) -> OperandScan {
                     };
                 }
             }
-        }
-        if let Some(value) = token.strip_prefix("--repo=") {
-            repo_targets.push(value.to_string());
-            i += 1;
-            continue;
-        }
-        if let Some(value) = token.strip_prefix("-R").filter(|v| !v.is_empty()) {
-            repo_targets.push(value.to_string());
-            i += 1;
-            continue;
         }
         // A positional operand selects a PR; any other repo-flag spelling
         // `is_repo_flag` recognizes that isn't handled above retargets with
@@ -2655,14 +2650,11 @@ fn gh_group_invocation<'a>(tokens: &'a [String], group: &str) -> Option<GhPrInvo
 /// when `argv[i]` is not a repo override. The separate form (`-R o/r`,
 /// `--repo o/r`) consumes an extra token; every attached spelling
 /// (`--repo=o/r`, `-Ro/r`) consumes only itself.
+///
+/// A thin adapter over [`read_gh_repo_flag`], the one reader of the flag
+/// (cadence-hooks#937) — so `-R=o/r` is `o/r` here too, not `=o/r`.
 fn read_repo_flag(argv: &[String], i: usize) -> Option<(Option<String>, usize)> {
-    let flag = argv.get(i)?;
-    if flag == "--repo" || flag == "-R" {
-        return Some((argv.get(i + 1).cloned(), i + 2));
-    }
-    flag.strip_prefix("--repo=")
-        .or_else(|| flag.strip_prefix("-R").filter(|v| !v.is_empty()))
-        .map(|value| (Some(value.to_string()), i + 1))
+    read_gh_repo_flag(argv, i).map(|read| (read.value, read.next))
 }
 
 /// The branch a ship command names as its PR head (cadence-hooks#995).
@@ -3299,34 +3291,383 @@ fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> To
     TokenRead::plain(Vec::new())
 }
 
+// --- gh's repo override: the one parser (cadence-hooks#937) ---
+//
+// gh takes its target repository from `-R`/`--repo`, a persistent flag cobra
+// accepts anywhere before `--` — before the command group (`gh -R o/r issue
+// create`), between the group and its verb, or after the verb — and from
+// `GH_REPO` when the flag is absent or empty. Every reader of that flag goes
+// through [`read_gh_repo_flag`] (one position) or [`gh_repo_flags`] (a whole
+// invocation), and every reader of its VALUE through [`parse_gh_repo_value`],
+// so the guards and nudges cannot disagree with each other about which repo a
+// command names. Before this there were five scanners with four grammars
+// (first-wins, last-wins, unanimity, prefix-only), none of them URL-aware.
+
+/// One gh repo-override flag read at a single argv position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhRepoFlagRead {
+    /// The value the flag carries. `None` for a separate-form flag with
+    /// nothing after it — gh refuses that command (`flag needs an argument`).
+    pub value: Option<String>,
+    /// The index of the first token after the flag and any separate value.
+    pub next: usize,
+}
+
+/// Read gh's repo override at `argv[i]`, in every spelling pflag accepts:
+/// `-R v` and `--repo v` (the value is the next token, whatever it looks
+/// like — pflag takes `-R --title` as the repo `--title`), `--repo=v`, `-Rv`,
+/// and `-R=v`. `None` when `argv[i]` is none of them.
+///
+/// Mirrors pflag exactly on the attached shorthand: `-R=v` is `v`, but a bare
+/// `-R=` is the value `=`, because pflag only strips the `=` when something
+/// follows it. A shorthand cluster that carries `R` after another letter
+/// (`-fRo/r`) is not read here — whether the earlier letter consumed it needs
+/// the subcommand's flag table; [`gh_repo_flags`] reports it as unattributable.
+pub fn read_gh_repo_flag(argv: &[String], i: usize) -> Option<GhRepoFlagRead> {
+    let flag = argv.get(i)?;
+    if flag == "-R" || flag == "--repo" {
+        return Some(GhRepoFlagRead {
+            value: argv.get(i + 1).cloned(),
+            next: i + 2,
+        });
+    }
+    let value = match flag.strip_prefix("--repo=") {
+        Some(value) => value,
+        None => {
+            let rest = flag.strip_prefix("-R")?;
+            match rest.strip_prefix('=') {
+                Some(value) if !value.is_empty() => value,
+                _ => rest,
+            }
+        }
+    };
+    Some(GhRepoFlagRead {
+        value: Some(value.to_string()),
+        next: i + 1,
+    })
+}
+
+/// Every reading of gh's repo override in one invocation — see
+/// [`gh_repo_flags`], and [`GhRepoFlags::resolve`] for what they add up to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GhRepoFlags {
+    /// Each value read, in argv order, with whether the reading is CERTAIN:
+    /// no earlier token could have consumed the flag as its own value.
+    readings: Vec<(String, bool)>,
+    /// A shorthand cluster carries `R` after its first letter, so it may or
+    /// may not set the repo depending on a flag table this parser lacks.
+    unattributable: bool,
+}
+
+/// What an invocation's repo-override readings say gh will target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRepoFlag {
+    /// No reading: gh falls back to `GH_REPO`, then the checkout's remotes.
+    Absent,
+    /// gh targets this value. At least one reading is certain, and every
+    /// reading agrees on it.
+    Target(String),
+    /// Every reading agrees on this value, but gh may use none of them: each
+    /// could be another flag's value (`--body -Ro/r`), or an empty `-R ''`
+    /// resets the override. The caller must judge BOTH this value and the
+    /// fallback target.
+    TargetOrAbsent(String),
+    /// The readings name more than one repository, or one cannot be
+    /// attributed. Which one gh obeys is not readable from the argv.
+    Ambiguous,
+}
+
+impl GhRepoFlags {
+    /// Collapse the readings into what gh will target.
+    ///
+    /// **Why agreement, when pflag is last-wins.** gh obeys the last REAL
+    /// `-R`, but a `-R`-shaped token after an unknown flag may be that flag's
+    /// value, and telling them apart needs each subcommand's flag table.
+    /// Guessing either way resolves toward ALLOW for somebody: skipping a real
+    /// flag falls back to the cwd, keeping a decoy judges a repo gh never
+    /// touches. So disagreeing readings are [`GhRepoFlag::Ambiguous`], and a
+    /// reading that may be a value leaves the fallback in play
+    /// ([`GhRepoFlag::TargetOrAbsent`]). Readings that agree are exact.
+    ///
+    /// An empty value is gh's "no override" (`-R ''` falls back to `GH_REPO`
+    /// and the cwd), so it counts as the fallback, not as a repo. A value
+    /// carrying whitespace is dropped: gh forwards it, but GitHub resolves no
+    /// repository from it, so no write can land there — and counting it would
+    /// turn prose like `--body "use -R owner/repo"` into a false disagreement.
+    pub fn resolve(&self) -> GhRepoFlag {
+        if self.unattributable {
+            return GhRepoFlag::Ambiguous;
+        }
+        let usable = self
+            .readings
+            .iter()
+            .filter(|(value, _)| !value.contains(char::is_whitespace));
+        let mut values: Vec<&str> = Vec::new();
+        let mut certain = false;
+        let mut resets = false;
+        for (value, is_certain) in usable {
+            if value.is_empty() {
+                resets = true;
+                continue;
+            }
+            certain |= is_certain;
+            if !values.contains(&value.as_str()) {
+                values.push(value);
+            }
+        }
+        match values.as_slice() {
+            [] => GhRepoFlag::Absent,
+            [value] if certain && !resets => GhRepoFlag::Target((*value).to_string()),
+            [value] => GhRepoFlag::TargetOrAbsent((*value).to_string()),
+            _ => GhRepoFlag::Ambiguous,
+        }
+    }
+
+    /// Every non-empty value read, in argv order — for callers that compare
+    /// each one (the ship anchor's own-repo test) rather than resolving them.
+    pub fn values(&self) -> impl Iterator<Item = &str> {
+        self.readings
+            .iter()
+            .map(|(value, _)| value.as_str())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Long flags that are boolean in EVERY gh subcommand that defines them, so a
+/// `-R` right after one is certainly a flag (`gh pr merge --squash -R o/r`)
+/// rather than its value. Kept to the common ship/merge spellings, each a
+/// documented boolean (`pr create`, `pr merge`, `release create`, `repo
+/// delete`, `--web` everywhere). A name belongs here only if no subcommand
+/// takes a value for it: a wrong entry
+/// would read another flag's value as the target, which is the fail-open
+/// direction. Anything absent is treated as possibly value-taking.
+const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
+    "admin",
+    "auto",
+    "delete-branch",
+    "draft",
+    "fill",
+    "merge",
+    "rebase",
+    "squash",
+    "web",
+    "yes",
+];
+
+/// Read every repo override in a gh argv (`argv[0]` is `gh` itself), with
+/// gh's own grammar: every spelling [`read_gh_repo_flag`] reads, in ANY
+/// position — cobra takes the persistent `-R` before the command group as
+/// readily as after the verb — up to a `--`, after which cobra reads nothing
+/// as a flag.
+///
+/// A reading is **certain** when the token before it cannot have consumed it
+/// as a value: that token is `gh`, a positional, a flag with its value
+/// attached (`--x=y`), or a value a certain separate `-R` already took. After
+/// any other flag (`--body -Ro/r`, `-t -Ro/r`) the reading is uncertain,
+/// since the flag may take a value. A separate `-R` that is itself uncertain
+/// does not consume its value here, so a repo override hiding behind it
+/// (`--body -R -Revil/x`) is still read.
+pub fn gh_repo_flags(argv: &[String]) -> GhRepoFlags {
+    let mut out = GhRepoFlags::default();
+    let mut prev_may_consume = false;
+    let mut i = 1;
+    while let Some(token) = argv.get(i) {
+        let token = token.as_str();
+        if token == "--" {
+            break;
+        }
+        if let Some(read) = read_gh_repo_flag(argv, i) {
+            let certain = !prev_may_consume;
+            let separate = read.next == i + 2;
+            if let Some(value) = read.value {
+                out.readings.push((value, certain));
+            }
+            if certain {
+                i = read.next;
+                prev_may_consume = false;
+            } else {
+                i += 1;
+                prev_may_consume = separate;
+            }
+            continue;
+        }
+        prev_may_consume = if let Some(long) = token.strip_prefix("--") {
+            !long.contains('=') && !GH_BOOLEAN_LONG_FLAGS.contains(&long)
+        } else if let Some(cluster) = token.strip_prefix('-').filter(|c| !c.is_empty()) {
+            // Only letters before an `=` are flags; after it, all is value.
+            let letters = cluster.split('=').next().unwrap_or("");
+            if letters.chars().skip(1).any(|c| c == 'R') {
+                out.unattributable = true;
+            }
+            !cluster.contains('=')
+        } else {
+            false
+        };
+        i += 1;
+    }
+    out
+}
+
+/// The command words of a gh argv (`argv[0]` is `gh`) — the group and the
+/// verb, `["issue", "create"]` — as cobra finds them, at most `depth` deep.
+///
+/// Cobra locates a subcommand by stripping flags first (`stripFlags`): a
+/// `--long` without `=`, or a two-character `-x`, consumes the next token as
+/// its value, whatever that token is; anything else starting with `-` stands
+/// alone; `--` ends the search. So `gh -R evil/x issue create` names
+/// `issue create` — the spelling a `gh\s+issue\s+create` text regex never sees
+/// (cadence-hooks#1077). The rule is cobra's for every flag it does not know
+/// to be boolean, and gh defines no boolean flag above the verb except
+/// `--help`, which runs nothing.
+pub fn gh_command_path(argv: &[String], depth: usize) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut i = 1;
+    while let Some(token) = argv.get(i) {
+        if words.len() >= depth || token == "--" {
+            break;
+        }
+        let token = token.as_str();
+        if token.starts_with('-') {
+            let consumes =
+                !token.contains('=') && (token.starts_with("--") || token.chars().count() == 2);
+            i += if consumes { 2 } else { 1 };
+            continue;
+        }
+        if !token.is_empty() {
+            words.push(token);
+        }
+        i += 1;
+    }
+    words
+}
+
+/// A `-R`/`--repo`/`GH_REPO` value, split the way gh splits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhRepoSpec {
+    /// The host the value names, normalized as gh normalizes it (lowercased,
+    /// a leading `www.` dropped). `None` for a bare `OWNER/REPO`, which gh
+    /// resolves against its default host (`GH_HOST`, else `github.com`).
+    pub host: Option<String>,
+    /// The owner, as written.
+    pub owner: String,
+    /// The repository name, as written, less a trailing `.git`.
+    pub name: String,
+}
+
+/// Split a repo value exactly as gh does (go-gh `repository.Parse`), or
+/// `None` where gh would refuse it — or where this parser cannot promise to
+/// agree with gh, which a guard must treat the same way.
+///
+/// gh's rules, which this follows rather than git's:
+///
+/// - **A URL only when it looks like one to gh**: it starts with `git@` or a
+///   supported scheme (`https:`, `http:`, `ssh:`, `git:`, `git+ssh:`,
+///   `git+https:`). An scp-like `git@host:owner/repo` becomes
+///   `ssh://git@host/owner/repo`. The host is the URL's hostname — userinfo
+///   and port dropped — and the path must be exactly `owner/repo`.
+/// - **Anything else splits on `/`**: `OWNER/REPO` or `HOST/OWNER/REPO`, no
+///   empty part, nothing more. So `github.com:x@evil.example/o/r` names the
+///   host `github.com:x@evil.example` — gh connects to `evil.example` — and
+///   never the scp host `github.com` that a git-remote parser reads from it
+///   (cadence-hooks#1037). That is also why this does not reuse
+///   [`host_and_repo_from_url`]: a remote URL is git's grammar, a repo value
+///   is gh's.
+///
+/// Refused as unreadable, because Go's URL parser would decode or reject
+/// them and matching that is not worth the risk: `%`, `?`, `#`, `[`, a
+/// backslash, whitespace, or a control character anywhere in a URL form.
+pub fn parse_gh_repo_value(value: &str) -> Option<GhRepoSpec> {
+    const SCHEMES: &[&str] = &["ssh:", "git+ssh:", "git:", "http:", "git+https:", "https:"];
+    let is_url = value.starts_with("git@") || SCHEMES.iter().any(|s| value.starts_with(s));
+    let normalize = |host: &str| {
+        host.strip_prefix("www.")
+            .unwrap_or(host)
+            .to_ascii_lowercase()
+    };
+    let strip_git = |name: &str| name.strip_suffix(".git").unwrap_or(name).to_string();
+    if !is_url {
+        let parts: Vec<&str> = value.splitn(4, '/').collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        let (host, owner, name) = match parts.as_slice() {
+            [owner, name] => (None, *owner, *name),
+            [host, owner, name] => (Some(normalize(host)), *owner, *name),
+            _ => return None,
+        };
+        let name = strip_git(name);
+        return (!name.is_empty()).then(|| GhRepoSpec {
+            host,
+            owner: owner.to_string(),
+            name,
+        });
+    }
+    if value.contains(['%', '?', '#', '[', '\\'])
+        || value.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    // go-gh rewrites a scheme-less (scp-like) value to ssh://, replacing its
+    // FIRST colon with a slash. Without a colon it stays a relative reference
+    // with no host, which gh refuses.
+    let possible_scheme = SCHEMES
+        .iter()
+        .chain(&["ftp:", "ftps:", "file:"])
+        .any(|s| value.starts_with(s));
+    let rewritten;
+    let url = if possible_scheme || !value.contains(':') {
+        value
+    } else {
+        rewritten = format!("ssh://{}", value.replacen(':', "/", 1));
+        rewritten.as_str()
+    };
+    let (_scheme, rest) = url.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    let hostport = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = hostport.split_once(':').unwrap_or((hostport, ""));
+    if host.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let parts: Vec<&str> = path.trim_matches('/').splitn(3, '/').collect();
+    let [owner, name] = parts.as_slice() else {
+        return None;
+    };
+    let name = strip_git(name);
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    // gh normalizes the host twice — once reading the URL, once building the
+    // repo — so a doubled `www.` loses both.
+    Some(GhRepoSpec {
+        host: Some(normalize(&normalize(host))),
+        owner: owner.to_string(),
+        name,
+    })
+}
+
 /// Split a `-R`/`--repo`/`GH_REPO=` value into the host it names, if any, and
 /// its lowercased `owner/repo` slug (cadence-hooks#995).
 ///
-/// A URL form (https, ssh, SCP-style) names its host. `HOST/OWNER/REPO` names
-/// the first segment as host. A bare `OWNER/REPO` names none, so the caller
-/// decides whether to default it. A trailing `.git` on the repo segment is
-/// dropped in every form, so `owner/repo.git` matches `owner/repo`. Anything
-/// else (one segment, an empty owner or repo) is `None`.
+/// The split is gh's own, via [`parse_gh_repo_value`]: a URL form gh accepts
+/// (https, ssh, `git@host:…`) names its host, `HOST/OWNER/REPO` names the first
+/// segment as host, and a bare `OWNER/REPO` names none, so the caller decides
+/// whether to default it. A trailing `.git` on the repo segment is dropped.
+/// Anything gh would refuse is `None` — including an scp-looking value that
+/// does not start with `git@`, which gh splits on `/` rather than reading as a
+/// URL (cadence-hooks#1037).
 pub fn gh_repo_value_parts(value: &str) -> Option<(Option<String>, String)> {
-    if let Some((host, slug)) = host_and_repo_from_url(value) {
-        return Some((Some(host), slug.to_ascii_lowercase()));
-    }
-    let parts: Vec<&str> = value.split('/').filter(|s| !s.is_empty()).collect();
-    let (host, owner, repo) = match parts.as_slice() {
-        [owner, repo] => (None, *owner, *repo),
-        [host, owner, repo, ..] => (Some(host.to_ascii_lowercase()), *owner, *repo),
-        _ => return None,
-    };
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if repo.is_empty() {
-        return None;
-    }
+    let spec = parse_gh_repo_value(value)?;
     Some((
-        host,
+        spec.host,
         format!(
             "{}/{}",
-            owner.to_ascii_lowercase(),
-            repo.to_ascii_lowercase()
+            spec.owner.to_ascii_lowercase(),
+            spec.name.to_ascii_lowercase()
         ),
     ))
 }
@@ -8951,6 +9292,192 @@ mod tests {
         assert_eq!(anchors, vec!["create", "create", "ready"]);
     }
 
+    fn argv(command: &str) -> Vec<String> {
+        command.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// cadence-hooks#937: every pflag spelling of the repo override, one reader.
+    #[test]
+    fn read_gh_repo_flag_reads_every_pflag_spelling() {
+        for (token, value, next) in [
+            ("-R o/r", Some("o/r"), 2),
+            ("--repo o/r", Some("o/r"), 2),
+            ("-R", None, 2),
+            ("--repo=o/r", Some("o/r"), 1),
+            ("--repo=", Some(""), 1),
+            ("-Ro/r", Some("o/r"), 1),
+            ("-R=o/r", Some("o/r"), 1),
+            // pflag strips the `=` only when a value follows it.
+            ("-R=", Some("="), 1),
+            // A separate value is taken whatever it looks like.
+            ("-R --title", Some("--title"), 2),
+        ] {
+            let words = argv(token);
+            let read = read_gh_repo_flag(&words, 0).unwrap_or_else(|| panic!("{token}"));
+            assert_eq!(read.value.as_deref(), value, "{token}");
+            assert_eq!(read.next, next, "{token}");
+        }
+        for token in ["--repository", "--repo-name", "-r", "-fR", "o/r", "--"] {
+            assert_eq!(read_gh_repo_flag(&argv(token), 0), None, "{token}");
+        }
+    }
+
+    /// cadence-hooks#937, #1069, #1077: what a gh argv's repo overrides add up
+    /// to, read with gh's grammar.
+    #[test]
+    fn gh_repo_flags_resolve_with_gh_grammar() {
+        let target = |v: &str| GhRepoFlag::Target(v.to_string());
+        let maybe = |v: &str| GhRepoFlag::TargetOrAbsent(v.to_string());
+        for (command, expected) in [
+            ("gh issue create --title t", GhRepoFlag::Absent),
+            ("gh issue create -R o/r", target("o/r")),
+            // A persistent flag is read in every position (#1077).
+            ("gh -R o/r issue create", target("o/r")),
+            ("gh --repo=o/r pr create", target("o/r")),
+            ("gh pr -Ro/r create", target("o/r")),
+            ("gh pr create -R=o/r", target("o/r")),
+            ("gh issue create -R o/r --repo=o/r", target("o/r")),
+            // Disagreement: gh obeys the last REAL flag, which needs a table.
+            ("gh issue create -R own/a -R evil/b", GhRepoFlag::Ambiguous),
+            (
+                "gh -R own/a issue create --repo evil/b",
+                GhRepoFlag::Ambiguous,
+            ),
+            // Nothing after `--` is a flag.
+            ("gh issue create -R own/a -- -R evil/b", target("own/a")),
+            ("gh issue create -- -R evil/b", GhRepoFlag::Absent),
+            // After an unknown flag, a reading may be that flag's value (#1069).
+            ("gh issue create --body -Rown/a", maybe("own/a")),
+            ("gh issue create -b -R own/a", maybe("own/a")),
+            ("gh issue create --body -R -Revil/b", GhRepoFlag::Ambiguous),
+            // ...but not after a positional, an attached value, or a boolean.
+            ("gh issue create --body x -R own/a", target("own/a")),
+            ("gh issue create --body=x -R own/a", target("own/a")),
+            ("gh pr merge --squash -R own/a", target("own/a")),
+            ("gh pr create --draft -R own/a", target("own/a")),
+            // `-R ''` is gh's "no override".
+            ("gh issue create -R own/a --repo=", maybe("own/a")),
+            // A cluster with R after its first letter needs a table.
+            ("gh pr create -fRown/a", GhRepoFlag::Ambiguous),
+            ("gh pr create -t=Release", GhRepoFlag::Absent),
+            // A dangling flag reads nothing; gh refuses the command.
+            ("gh issue create -R", GhRepoFlag::Absent),
+        ] {
+            assert_eq!(
+                gh_repo_flags(&argv(command)).resolve(),
+                expected,
+                "{command}"
+            );
+        }
+        // Prose carrying whitespace is not a repo gh can reach, so it cannot
+        // manufacture a disagreement.
+        let prose = vec![
+            "gh".to_string(),
+            "issue".to_string(),
+            "create".to_string(),
+            "-R".to_string(),
+            "own/a".to_string(),
+            "--body".to_string(),
+            "-R other repo".to_string(),
+        ];
+        assert_eq!(gh_repo_flags(&prose).resolve(), target("own/a"));
+    }
+
+    /// cadence-hooks#1077: the group and verb, found the way cobra finds them.
+    #[test]
+    fn gh_command_path_follows_cobra() {
+        for (command, expected) in [
+            ("gh issue create --title t", vec!["issue", "create"]),
+            ("gh -R o/r issue create", vec!["issue", "create"]),
+            ("gh --repo o/r pr create", vec!["pr", "create"]),
+            ("gh --repo=o/r pr create", vec!["pr", "create"]),
+            ("gh -Ro/r pr create", vec!["pr", "create"]),
+            ("gh pr -R o/r create", vec!["pr", "create"]),
+            ("gh repo delete o/r --yes", vec!["repo", "delete"]),
+            // An unknown flag consumes the next word, as cobra's stripFlags does.
+            ("gh --foo pr create", vec!["create"]),
+            ("gh -- pr create", vec![]),
+            ("gh", vec![]),
+        ] {
+            assert_eq!(gh_command_path(&argv(command), 2), expected, "{command}");
+        }
+    }
+
+    /// cadence-hooks#937, #1037: a repo value split the way gh splits it.
+    #[test]
+    fn parse_gh_repo_value_follows_go_gh() {
+        let spec = |host: Option<&str>, owner: &str, name: &str| {
+            Some(GhRepoSpec {
+                host: host.map(str::to_string),
+                owner: owner.to_string(),
+                name: name.to_string(),
+            })
+        };
+        for (value, expected) in [
+            ("own/repo", spec(None, "own", "repo")),
+            ("own/repo.git", spec(None, "own", "repo")),
+            (
+                "github.com/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "GitHub.com/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "www.github.com/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "https://github.com/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "https://github.com/own/repo.git/",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "git@github.com:own/repo.git",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "ssh://git@github.com:22/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            (
+                "git+https://github.com/own/repo",
+                spec(Some("github.com"), "own", "repo"),
+            ),
+            // Userinfo is not the host: gh connects to what follows the `@`.
+            (
+                "https://github.com:x@evil.example/own/repo",
+                spec(Some("evil.example"), "own", "repo"),
+            ),
+            // #1037: not a URL to gh — it splits on `/`, and the host is the
+            // whole first part, never the scp host `github.com`.
+            (
+                "github.com:x@evil.example/own/repo",
+                spec(Some("github.com:x@evil.example"), "own", "repo"),
+            ),
+            // Refused by gh, or not safely splittable here.
+            ("repo", None),
+            ("", None),
+            ("own/", None),
+            ("/own/repo", None),
+            ("own//repo", None),
+            ("a/own/repo/extra", None),
+            ("own/.git", None),
+            ("https://github.com/own", None),
+            ("https://github.com/own/repo/extra", None),
+            ("https:github.com/own/repo", None),
+            ("https://github.com/%6fwn/repo", None),
+            ("https://github.com:x/own/repo", None),
+            ("git@github.com/own/repo", None),
+        ] {
+            assert_eq!(parse_gh_repo_value(value), expected, "{value}");
+        }
+    }
+
     #[test]
     fn gh_repo_value_parts_normalizes_every_form() {
         let own = |host: Option<&str>| Some((host.map(str::to_string), "own/repo".to_string()));
@@ -8971,6 +9498,11 @@ mod tests {
         assert_eq!(gh_repo_value_parts("repo"), None);
         assert_eq!(gh_repo_value_parts(""), None);
         assert_eq!(gh_repo_value_parts("own/.git"), None);
+        // cadence-hooks#1037: gh reads no scp host here.
+        assert_eq!(
+            gh_repo_value_parts("github.com:x@evil.example/own/repo"),
+            own(Some("github.com:x@evil.example"))
+        );
     }
 
     #[test]

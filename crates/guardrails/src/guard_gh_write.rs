@@ -9,8 +9,9 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, command_word, contains_ignoring_ascii_case,
-    host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
+    COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
+    command_segments, command_word, contains_ignoring_ascii_case, gh_command_path, gh_repo_flags,
+    host_and_repo_from_url, parse_gh_repo_value, parse_work_dir, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -132,6 +133,9 @@ pub(crate) fn is_write_command(command: &str) -> bool {
     if WRITE_ACTIONS.is_match(command) || WRITE_ACTIONS_EXTRA.is_match(command) {
         return true;
     }
+    if argv_names_write(command) {
+        return true;
+    }
     // A spelled-out write method wins outright, before any narrowing below.
     if API_WRITE_METHOD.is_match(command) {
         return true;
@@ -189,13 +193,49 @@ pub(crate) fn is_write_command(command: &str) -> bool {
     false
 }
 
+/// True when the command group and verb of the segment's gh invocation, found
+/// the way cobra finds them ([`gh_command_path`]), name a write.
+///
+/// The text regexes above demand `gh <group> <verb>` be adjacent, but cobra
+/// takes the persistent `-R` anywhere before the verb: `gh -R evil/x issue
+/// create` and `gh pr -R evil/x create` both write, and neither matched
+/// (cadence-hooks#1077). Reading the parsed argv also sees what the shell
+/// actually runs after brace expansion — `gh {pr,} create`, `{gh,} pr create`
+/// — which the raw text never spells (cadence-hooks#1115). The group and verb
+/// are matched against the SAME patterns, rebuilt as `gh <group> <verb>`, so
+/// the two routes cannot disagree about which verbs write. Only ever adds
+/// writes: the text regexes still run first.
+///
+/// Every token that resolves to `gh` is tried as the start of the invocation,
+/// not just the first: in `sudo -u gh gh -R evil/x pr create` the first `gh`
+/// is sudo's user name.
+fn argv_names_write(segment: &str) -> bool {
+    let Some((tokens, start)) = gh_command_tokens(segment) else {
+        return false;
+    };
+    (start..tokens.len())
+        .filter(|&at| token_is_gh(&tokens[at]))
+        .any(|at| {
+            let [group, verb] = gh_command_path(&tokens[at..], 2)[..] else {
+                return false;
+            };
+            let canonical = format!("gh {group} {verb}");
+            WRITE_ACTIONS.is_match(&canonical) || WRITE_ACTIONS_EXTRA.is_match(&canonical)
+        })
+}
+
 /// What a segment's `gh` invocation says about its `-R`/`--repo` target.
 #[derive(Debug, PartialEq)]
 pub(crate) enum RepoFlag {
     /// No repo-flag reading anywhere in the invocation.
     Absent,
-    /// Every reading agrees on one target.
+    /// Every reading agrees on one target, and at least one is certainly a
+    /// real flag.
     Target(String),
+    /// Every reading agrees on one target, but each may be another flag's
+    /// value (`--body -Ro/r`) or be reset by `-R ''`, so gh may use no
+    /// override at all. Both the value and the fallback are judged.
+    TargetOrAbsent(String),
     /// Two or more readings disagree, so which one gh obeys depends on a flag
     /// table this guard does not have. Fails closed — see [`repo_flag`].
     Ambiguous,
@@ -203,44 +243,37 @@ pub(crate) enum RepoFlag {
 
 /// Read the `-R`/`--repo` target out of a segment's `gh` invocation.
 ///
-/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`.
-/// Values keep their quotes trimmed so `--repo "o/r"` resolves to `o/r`.
-///
-/// `loop_analysis::extract_repo_flag` reads the same flag over parsed AST words
-/// but does NOT mirror this one: it resolves last-wins, while this scan reports
-/// [`RepoFlag::Ambiguous`] when readings disagree. That divergence is
-/// deliberate — see the fail-closed note below — and it is why this function
-/// backstops the loop gate rather than agreeing with it.
+/// The grammar is the shared one ([`gh_repo_flags`], cadence-hooks#937): every
+/// spelling pflag accepts (`-R x`, `-Rx`, `-R=x`, `--repo x`, `--repo=x`), in
+/// any position before `--` — before the command group as readily as after the
+/// verb — so this guard, `loop_analysis`, and `warn-issue-tracker` cannot
+/// disagree about which repo a command names.
 ///
 /// Reads [`gh_argv`], not the raw string, on both counts that matter. Quoted
 /// text is one token, so a `-R owner/repo` spelled inside another flag's value
 /// cannot pose as the flag; and the scan starts at the `gh` token, so an
 /// `eval "gh … -R evil/target"` wrapper is peeled like every other arm already
-/// peels it. Scanning `tokenize` directly left arm 1 the ONLY resolution path
-/// blind to `eval`, and a plain unescaped wrapper walked through it (#463).
+/// peels it (#463).
 ///
 /// **Disagreement fails closed, because "which `-R` wins" is not answerable
 /// here.** gh obeys the last *real* repo flag, but a token that merely looks
 /// like one may be another flag's value — `--body -Rcameronsjo/allowed` is a
 /// body, not a target. Distinguishing them needs gh's per-subcommand flag
-/// table: skipping the token after every flag would swallow the real `-R` after
-/// a boolean like `--draft`, and skipping after none lets the decoy win. Both
-/// mistakes resolve toward ALLOW — dropping the flag falls through to the
-/// cwd-remote arm, which passes from an owned checkout. So when readings
-/// disagree this reports [`RepoFlag::Ambiguous`] and the caller blocks. Readings
-/// that AGREE are not ambiguous, so a repeated or echoed target still resolves.
+/// table, and both wrong guesses resolve toward ALLOW. So disagreeing readings
+/// are [`RepoFlag::Ambiguous`] and the caller blocks; and a lone reading that
+/// may be a value is [`RepoFlag::TargetOrAbsent`], which judges the cwd
+/// fallback too — without that, `--body -Rcameronsjo/x` from an unowned
+/// checkout was judged as the owned decoy while gh wrote to the checkout's own
+/// repo (cadence-hooks#1069).
 pub(crate) fn repo_flag(command: &str) -> RepoFlag {
     let Some(words) = gh_argv(command) else {
         return RepoFlag::Absent;
     };
-    // No shorthand table: `repo_flag` runs against EVERY gh subcommand, and the
-    // per-subcommand tables disagree (`-t` is `--template` under `gh api` and
-    // `--title` under `gh pr create`). Passing `None` selects the conservative
-    // cluster rule — see [`scan_unanimous_flag`].
-    match scan_unanimous_flag(&words, 'R', "--repo", None) {
-        FlagScan::Absent => RepoFlag::Absent,
-        FlagScan::Single(repo) => RepoFlag::Target(repo),
-        FlagScan::Ambiguous => RepoFlag::Ambiguous,
+    match gh_repo_flags(&words).resolve() {
+        GhRepoFlag::Absent => RepoFlag::Absent,
+        GhRepoFlag::Target(repo) => RepoFlag::Target(repo),
+        GhRepoFlag::TargetOrAbsent(repo) => RepoFlag::TargetOrAbsent(repo),
+        GhRepoFlag::Ambiguous => RepoFlag::Ambiguous,
     }
 }
 
@@ -549,6 +582,11 @@ enum RepoResolution {
     /// `Unresolvable` only in the message — a target WAS spelled out, so "add
     /// `-R`" would be useless advice — and blocks under the same rule id.
     AmbiguousFlags,
+    /// A `-R`/`--repo`/`GH_REPO` value gh would not read as a URL or
+    /// `[HOST/]OWNER/REPO` — or that this guard cannot promise to split the
+    /// way gh does ([`parse_gh_repo_value`]). Blocks: a target that cannot be
+    /// read cannot be judged owned (cadence-hooks#937).
+    UnreadableFlag(String),
     /// Resolution abandoned at the #271 subprocess deadline. Distinct from
     /// `Unresolvable` (git answered; genuinely ambiguous — fail-closed block
     /// stands): a timeout is the guard's own infrastructure failing, which
@@ -578,8 +616,8 @@ enum RepoResolution {
 /// A per-subcommand table written from memory would be wrong somewhere and
 /// reintroduce the fail-open direction under a new name, so the only grammar
 /// used is the one this file verified against `gh api --help`, applied only to
-/// `api`. This mirrors [`repo_flag`], which already passes no table for the
-/// same reason.
+/// `api`. The shared repo-flag parser ([`gh_repo_flags`]) likewise uses no
+/// per-subcommand table, for the same reason.
 fn host_scan_flags(argv: &[String]) -> Option<&'static FlagTable> {
     gh_api_subcommand_index(argv).map(|_| &GH_API_FLAGS)
 }
@@ -821,6 +859,56 @@ impl GhHostEnv {
 
     fn observe(&mut self, segment: &str) {
         self.observe_depth(segment, 0);
+    }
+
+    /// A `GH_HOST` assigned in front of a command that runs gh one level
+    /// down — `GH_HOST=h bash -c "gh …"`, `env GH_HOST=h sh -c '…'`. The
+    /// segment list hands the inner gh over as its own segment, without the
+    /// prefix, so the host the child inherits has to be recorded here
+    /// (cadence-hooks#1077). Only the leading words are read — assignments,
+    /// command runners and their options — up to the command they run, so a
+    /// `GH_HOST=…` that is merely an argument (`echo GH_HOST=x`) counts for
+    /// nothing. A name that is not a plain literal may expand to `GH_HOST`,
+    /// so it is unresolved, as [`gh_command_host`] treats it.
+    ///
+    /// Recorded for every later gh segment of the command, not just the
+    /// wrapper's own: over-inclusive, which can only add a host to judge.
+    fn observe_wrapper_prefix(&mut self, segment: &str) {
+        if !contains_ignoring_ascii_case(segment, "gh") {
+            return;
+        }
+        let tokens = tokenize(segment);
+        let mut hosts: Vec<Option<&str>> = Vec::new();
+        let mut command_at = tokens.len();
+        for (at, token) in tokens.iter().enumerate() {
+            let is_runner = COMMAND_RUNNERS.contains(&command_word(token).as_ref());
+            if is_runner || token.starts_with('-') || SEGMENT_KEYWORDS.contains(&token.as_str()) {
+                continue;
+            }
+            match token.split_once('=') {
+                Some(("GH_HOST", value)) => hosts.push(Some(value)),
+                Some((name, _)) if !is_literal_identifier(name) => hosts.push(None),
+                Some(_) => {}
+                None => {
+                    command_at = at;
+                    break;
+                }
+            }
+        }
+        // Only a command that goes on to run gh: `GH_HOST=h make docs` sets
+        // the host for `make` alone.
+        if !tokens[command_at..]
+            .iter()
+            .any(|token| contains_ignoring_ascii_case(token, "gh"))
+        {
+            return;
+        }
+        for host in hosts {
+            match host {
+                Some(value) => self.add_assigned(value),
+                None => self.add_unresolved(),
+            }
+        }
     }
 
     fn observe_depth(&mut self, segment: &str, depth: usize) {
@@ -1293,23 +1381,118 @@ fn resolve_target_repo(
     resolve_target_repo_on(command, work_dir, allowed_owners, &default_host())
 }
 
-/// [`resolve_target_repo`] with the inherited `GH_HOST` supplied by the caller
-/// — see [`gh_command_host`].
+/// The first of [`resolve_target_repos_on`]'s resolutions — the one the
+/// command's own spelling names first.
+#[cfg(test)]
 fn resolve_target_repo_on(
     command: &str,
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     env_host: &str,
 ) -> RepoResolution {
+    resolve_target_repos_on(command, work_dir, allowed_owners, env_host)
+        .into_iter()
+        .next()
+        .unwrap_or(RepoResolution::Unresolvable)
+}
+
+/// Every repo gh may write to for one segment, with the inherited `GH_HOST`
+/// supplied by the caller — see [`gh_command_host`]. The write must be owned
+/// on EVERY one: more than one appears only where the command text cannot
+/// say which of them gh picks.
+///
+/// - A `-R` whose readings agree but may each be another flag's value
+///   ([`RepoFlag::TargetOrAbsent`]) adds the fallback the command would take
+///   without it (cadence-hooks#1069).
+/// - An inline `GH_REPO=` adds its value: gh reads it wherever `-R` is absent
+///   or empty, and this guard cannot tell which subcommands honor it.
+fn resolve_target_repos_on(
+    command: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    env_host: &str,
+) -> Vec<RepoResolution> {
     let dh = gh_command_host(command, env_host);
 
-    // 1. Explicit -R / --repo flag (targets the command-selected gh host).
-    match repo_flag(command) {
-        RepoFlag::Target(repo) => return RepoResolution::Resolved { host: dh, repo },
-        RepoFlag::Ambiguous => return RepoResolution::AmbiguousFlags,
-        RepoFlag::Absent => {}
+    // 1. Explicit -R / --repo flag.
+    let mut resolutions = match repo_flag(command) {
+        RepoFlag::Target(repo) => return vec![flag_value_resolution(&repo, &dh)],
+        RepoFlag::Ambiguous => return vec![RepoResolution::AmbiguousFlags],
+        RepoFlag::TargetOrAbsent(repo) => vec![flag_value_resolution(&repo, &dh)],
+        RepoFlag::Absent => Vec::new(),
+    };
+    if let Some(repo) = inline_gh_repo(command) {
+        resolutions.push(flag_value_resolution(&repo, &dh));
     }
+    resolutions.push(resolve_unflagged_target(
+        command,
+        work_dir,
+        allowed_owners,
+        &dh,
+    ));
+    resolutions
+}
 
+/// Judge-ready form of one `-R`/`--repo`/`GH_REPO` value, split the way gh
+/// splits it ([`parse_gh_repo_value`]): a bare `OWNER/REPO` lands on the
+/// command's host `dh`, while a URL or `HOST/OWNER/REPO` names its own —
+/// so `-R github.com/cameronsjo/x` is `cameronsjo/x` on github.com, not a
+/// repo owned by `github.com` (cadence-hooks#1077), and
+/// `-R https://evil.example/cameronsjo/x` is judged on `evil.example`.
+///
+/// A value carrying a shell expansion keeps its raw text, so the
+/// unexpanded-expansion block names it (#757); any other value gh would not
+/// split is [`RepoResolution::UnreadableFlag`].
+fn flag_value_resolution(value: &str, dh: &str) -> RepoResolution {
+    match parse_gh_repo_value(value) {
+        Some(spec) => RepoResolution::Resolved {
+            host: spec.host.unwrap_or_else(|| dh.to_string()),
+            repo: format!("{}/{}", spec.owner, spec.name),
+        },
+        None if repo_has_unexpanded_expansion(value) => RepoResolution::Resolved {
+            host: dh.to_string(),
+            repo: value.to_string(),
+        },
+        None => RepoResolution::UnreadableFlag(value.to_string()),
+    }
+}
+
+/// True when an explicit `-R` value names a repo owned on the host it lands
+/// on — the loop gate's form of [`flag_value_resolution`]. An unreadable
+/// value is not owned.
+fn flag_value_is_owned(
+    value: &str,
+    dh: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> bool {
+    match flag_value_resolution(value, dh) {
+        RepoResolution::Resolved { host, repo } => {
+            is_allowed(&host, &repo, allowed_owners, allowed_repos)
+        }
+        _ => false,
+    }
+}
+
+/// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
+/// invocation. gh treats an empty one as unset.
+fn inline_gh_repo(command: &str) -> Option<String> {
+    let (tokens, gh_index) = gh_command_tokens(command)?;
+    tokens[..gh_index]
+        .iter()
+        .filter_map(|token| token.strip_prefix("GH_REPO="))
+        .rfind(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Where a write goes when no `-R` names its target: a `gh repo` positional,
+/// a `gh api repos/…` endpoint, or the checkout's git remotes.
+fn resolve_unflagged_target(
+    command: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    dh: &str,
+) -> RepoResolution {
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
     if let Some((subcommand, spec_host, first_arg)) = gh_repo_positional_target(command) {
         if first_arg.contains('/') {
@@ -1319,7 +1502,7 @@ fn resolve_target_repo_on(
                 // an allowed-looking owner to a forge the allowlist never
                 // named. Bare allowlist entries match the default host only, so
                 // the spec blocks unless that host was explicitly allowed.
-                host: spec_host.unwrap_or_else(|| dh.clone()),
+                host: spec_host.unwrap_or_else(|| dh.to_string()),
                 repo: first_arg,
             };
         }
@@ -1327,11 +1510,11 @@ fn resolve_target_repo_on(
         if subcommand == "create" {
             let default_owner = allowed_owners
                 .iter()
-                .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
+                .find(|e| e.host.is_none() || e.host.as_deref() == Some(dh))
                 .map(|e| e.owner.as_str())
                 .unwrap_or("");
             return RepoResolution::Resolved {
-                host: dh,
+                host: dh.to_string(),
                 repo: format!("{default_owner}/{first_arg}"),
             };
         }
@@ -1344,7 +1527,10 @@ fn resolve_target_repo_on(
     if let Some(endpoint) = gh_api_endpoint(command)
         && let Some(repo) = api_repos_target(&endpoint)
     {
-        return RepoResolution::Resolved { host: dh, repo };
+        return RepoResolution::Resolved {
+            host: dh.to_string(),
+            repo,
+        };
     }
 
     // 4. Git remotes (with fork detection)
@@ -1649,7 +1835,7 @@ fn api_flag_takes_separate_value(flag: &str) -> bool {
 ///    and argument-position (`xargs gh …`, `find … -exec gh …`) forms that the
 ///    regexes covered. Requiring the command word would drop those to the
 ///    cwd-remote fallback — turning a named off-owner target into a guess.
-fn gh_argv(segment: &str) -> Option<Vec<String>> {
+pub(crate) fn gh_argv(segment: &str) -> Option<Vec<String>> {
     let (tokens, start) = gh_command_tokens(segment)?;
     Some(tokens[start..].to_vec())
 }
@@ -1674,6 +1860,99 @@ fn gh_command_tokens_depth(segment: &str, depth: usize) -> Option<(Vec<String>, 
             .is_some_and(|t| t.rsplit('/').next().unwrap_or(t) == "eval")
     {
         return gh_command_tokens_depth(&tokens[1..].join(" "), depth + 1);
+    }
+    if depth < MAX_EVAL_DEPTH
+        && let Some(script) = env_split_string_script(&tokens)
+    {
+        return gh_command_tokens_depth(&script, depth + 1);
+    }
+    None
+}
+
+/// The command an `env -S '<string>'` (`--split-string`) runs, as one string
+/// to re-tokenize: GNU env splits the string into words and runs them as if
+/// they had been written in its place, so `env -S 'gh issue create -R evil/x'`
+/// is that gh invocation — while [`tokenize`] keeps the quoted string as ONE
+/// token no `gh` test ever matches (cadence-hooks#1077). Assignments written
+/// before the option reach the command too, so they are carried in front of
+/// the string, where [`gh_command_host`] reads an inline `GH_HOST`.
+///
+/// `None` unless the segment's command word is `env` and one of its options
+/// is `-S`. The option walk mirrors GNU env: `-u`/`-C` (and their long forms
+/// without `=`) take the next token; `S` in a short cluster takes the rest of
+/// the cluster or the next token; the first word that is neither an option
+/// nor an assignment ends the options.
+fn env_split_string_script(tokens: &[String]) -> Option<String> {
+    // Any `NAME=…` word counts as an assignment here, literal name or not:
+    // carried forward, a non-literal one (`GH_HOS${X}T=…`) is exactly what
+    // [`gh_command_host`] resolves to an unknown host.
+    let assignment = |t: &str| !t.starts_with('-') && t.contains('=');
+    // `env` may sit behind other runners (`sudo -u me env -S …`, `timeout 5
+    // env -S …`); their own options are not modelled here, which can only
+    // unwrap more, never less.
+    let first = tokens.iter().find(|t| !assignment(t))?;
+    let head = command_word(first);
+    if head != "env"
+        && !COMMAND_RUNNERS.contains(&head.as_ref())
+        && !TRANSPARENT.contains(&head.as_ref())
+    {
+        return None;
+    }
+    let env_at = tokens.iter().position(|t| command_word(t) == "env")?;
+    let options = &tokens[env_at + 1..];
+    let mut assignments: Vec<&str> = tokens[..env_at]
+        .iter()
+        .map(String::as_str)
+        .filter(|t| assignment(t))
+        .collect();
+    let mut i = 0;
+    while let Some(token) = options.get(i) {
+        let script = if let Some(long) = token.strip_prefix("--") {
+            match long.split_once('=') {
+                Some(("split-string", value)) => Some((value.to_string(), i + 1)),
+                None if long == "split-string" => {
+                    options.get(i + 1).map(|value| (value.clone(), i + 2))
+                }
+                None if matches!(long, "unset" | "chdir") => {
+                    i += 2;
+                    continue;
+                }
+                _ => None,
+            }
+        } else if let Some(cluster) = token.strip_prefix('-').filter(|c| !c.is_empty()) {
+            match cluster.find(['S', 'u', 'C']) {
+                Some(at) if cluster[at..].starts_with('S') => {
+                    let attached = &cluster[at + 1..];
+                    if attached.is_empty() {
+                        options.get(i + 1).map(|value| (value.clone(), i + 2))
+                    } else {
+                        Some((attached.to_string(), i + 1))
+                    }
+                }
+                Some(at) if cluster.len() == at + 1 => {
+                    i += 2;
+                    continue;
+                }
+                _ => None,
+            }
+        } else if assignment(token) {
+            assignments.push(token);
+            i += 1;
+            continue;
+        } else {
+            return None;
+        };
+        if let Some((script, next)) = script {
+            let mut words = assignments.join(" ");
+            words.push(' ');
+            words.push_str(&script);
+            for word in &options[next..] {
+                words.push(' ');
+                words.push_str(word);
+            }
+            return Some(words);
+        }
+        i += 1;
     }
     None
 }
@@ -1918,12 +2197,11 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
 /// unanimity — rather than gh's own last-occurrence-wins rule — is the safe
 /// reading here.
 ///
-/// Shares [`scan_unanimous_flag`] with [`repo_flag`] — the flag grammar is the
-/// same on both, and keeping one scanner is what stopped them drifting apart
-/// (the compact-form whitespace rule lived in only one of the two). This side
-/// passes gh `api`'s shorthand table, so a cluster is walked precisely instead
-/// of failing closed; only `gh api` is inspected, since a `-X` belonging to
-/// another subcommand is not a method.
+/// Reads through [`scan_unanimous_flag`], which passes gh `api`'s shorthand
+/// table, so a cluster is walked precisely instead of failing closed; only
+/// `gh api` is inspected, since a `-X` belonging to another subcommand is not
+/// a method. (`-R` no longer shares this scanner: it reads through the shared
+/// [`gh_repo_flags`], cadence-hooks#937.)
 fn api_explicit_method(segment: &str) -> Option<String> {
     gh_api_endpoint(segment)?;
     let words = gh_argv(segment)?;
@@ -2000,6 +2278,11 @@ fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
         let inner = tokens[1..].join(" ");
         return segment_invokes_gh_depth(&inner, depth + 1);
     }
+    if depth < MAX_EVAL_DEPTH
+        && let Some(script) = env_split_string_script(&tokens)
+    {
+        return segment_invokes_gh_depth(&script, depth + 1);
+    }
     false
 }
 
@@ -2012,16 +2295,9 @@ fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
 /// silently ALLOWED. Measured ALLOW→BLOCK (cadence-hooks#450 review — one of
 /// four divergent copies of this normalization, now one).
 ///
-/// **This alone does not make a `gh.exe` write block, and the reason is a
-/// different mechanism.** Reaching the ownership decision needs
-/// [`is_write_command`] to fire first, and that is a raw-TEXT regex
-/// (`gh\s+<noun>\s+<verb>`) which `gh.exe issue create` does not match — `gh`
-/// is followed by `.exe`, not whitespace. `/opt/\gh issue create` matches only
-/// because the path happens to END in `gh`, leaving `gh issue create` as a
-/// substring. Normalizing the write detection would mean running it over a
-/// reconstructed argv instead of the command text, which is a real change to a
-/// block-capable guard and belongs in its own issue rather than riding along
-/// here. Pinned below so the gap is a recorded choice.
+/// `gh.exe issue create` is a detected write too: the raw-TEXT regex misses it
+/// (`gh` is followed by `.exe`, not whitespace), but [`argv_names_write`] reads
+/// the parsed argv, where this function resolves it (cadence-hooks#1077).
 fn token_is_gh(tok: &str) -> bool {
     command_word(tok) == "gh"
 }
@@ -2551,7 +2827,47 @@ fn judge_write_segment(
     extra_hosts: &[String],
     env_host: &str,
 ) -> Option<CheckResult> {
-    match resolve_target_repo_on(segment, work_dir, allowed_owners, env_host) {
+    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host)
+        .into_iter()
+        .find_map(|resolution| {
+            judge_resolution(
+                resolution,
+                segment,
+                work_dir,
+                allowed_owners,
+                allowed_repos,
+                extra_hosts,
+            )
+        })
+}
+
+/// The verdict on one repo a write segment may land on.
+fn judge_resolution(
+    resolution: RepoResolution,
+    segment: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> Option<CheckResult> {
+    match resolution {
+        RepoResolution::UnreadableFlag(value) => Some(CheckResult::block_structured(
+            format!(
+                "🚫 git-guardrails: gh write names a target repo this guard cannot read\n   \
+                 Command: {segment}\n   \
+                 Target:  {value}\n   \
+                 gh reads a repo as a URL or `[HOST/]OWNER/REPO`; this value is neither, or \
+                 is spelled in a way this guard cannot split exactly as gh does, so it cannot \
+                 be checked for ownership.\n   \
+                 Fix: spell the target as `-R owner/repo`"
+            ),
+            BlockMetadata {
+                rule_id: "gh-write-target-unresolvable".to_string(),
+                fix: "spell the target as -R owner/repo".to_string(),
+                allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                severity: "error",
+            },
+        )),
         RepoResolution::Fork {
             origin_host,
             origin,
@@ -2706,6 +3022,32 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         }
 
+        // A word whose brace expansion is past what the tokenizer models is
+        // left whole, so the gh invocation it spells (`gh {pr,}{…}… create`)
+        // is invisible to every reading below. Refuse rather than judge a
+        // command this guard cannot see (cadence-hooks#1115).
+        if let Some(segment) = command_segments(command).into_iter().find(|segment| {
+            segment.contains('{')
+                && contains_ignoring_ascii_case(segment, "gh")
+                && brace_expansion_overflows(segment)
+        }) {
+            let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+            let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
+            return CheckResult::block_structured(
+                format!(
+                    "🚫 git-guardrails: gh command uses a brace expansion too large to read\n   \
+                     Command: {segment}\n   \
+                     Fix: spell the gh command out without the brace expansion"
+                ),
+                BlockMetadata {
+                    rule_id: "gh-write-target-unresolvable".to_string(),
+                    fix: "spell the gh command out without the brace expansion".to_string(),
+                    allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
+                    severity: "error",
+                },
+            );
+        }
+
         let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
@@ -2735,9 +3077,9 @@ impl Check for GhWriteGuard {
                     .iter()
                     .filter(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite)
                     .filter(|c| {
-                        !c.explicit_repo
-                            .as_ref()
-                            .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
+                        !c.explicit_repo.as_ref().is_some_and(|r| {
+                            flag_value_is_owned(r, &dh, &allowed_owners, &allowed_repos)
+                        })
                     })
                     .filter_map(|c| c.explicit_repo.as_deref())
                     .collect();
@@ -2858,6 +3200,7 @@ impl Check for GhWriteGuard {
                 gh_host_env.add_unresolved();
             }
             if !segment_invokes_gh(&segment) {
+                gh_host_env.observe_wrapper_prefix(&segment);
                 gh_host_env.observe(&segment);
                 continue;
             }
@@ -3013,15 +3356,11 @@ mod tests {
     }
 
     #[test]
-    fn exe_spelling_is_not_yet_a_detected_write() {
-        // Recorded gap, not an oversight. `token_is_gh` now resolves `gh.exe`,
-        // but reaching the ownership decision needs `is_write_command` first,
-        // and that is a raw-TEXT regex (`gh\s+<noun>\s+<verb>`) which does not
-        // match `gh.exe issue create`. Closing it means running write detection
-        // over a reconstructed argv rather than the command text — a real
-        // change to a block-capable guard, filed separately rather than ridden
-        // in on #450. This test fails the day that lands, which is the point.
-        assert!(!is_write_command("gh.exe issue create --title x"));
+    fn exe_spelling_is_a_detected_write() {
+        // Was a recorded gap (#450): the raw-TEXT regex does not match
+        // `gh.exe issue create`. Write detection now also reads the parsed argv
+        // (cadence-hooks#1077), where `token_is_gh` resolves `gh.exe`.
+        assert!(is_write_command("gh.exe issue create --title x"));
         assert!(is_write_command("gh issue create --title x"));
     }
 
@@ -6787,6 +7126,205 @@ mod tests {
                     .block_metadata
                     .unwrap_or_else(|| panic!("expected a structured block: {command}"));
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    /// A hermetic checkout whose `origin` is `url`.
+    fn origin_checkout(url: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("create git fixture");
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", url]);
+        repo
+    }
+
+    /// How gh's target repo is read (cadence-hooks#1077, #1069, #937, #1115):
+    /// every row is `(command, run from the owned checkout?, blocks?)`.
+    #[test]
+    fn gh_target_repo_is_read_with_gh_grammar() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        with_env(&owners_env(), || {
+            for (command, in_owned, blocks) in [
+                // #1077 4a: `-R` before the group, or between group and verb.
+                ("gh -R evil/x issue create --title x", true, true),
+                ("gh --repo evil/x issue create --title x", true, true),
+                ("gh --repo=evil/x pr create --title x", true, true),
+                ("gh -Revil/x pr create --title x", true, true),
+                ("gh pr -R evil/x create --title x", true, true),
+                ("gh -R cameronsjo/y issue create --title x", true, false),
+                ("gh -R evil/x issue view 1", true, false),
+                // #1077 I3: a GH_HOST on the command that wraps gh.
+                (
+                    "GH_HOST=evil.com bash -c \"gh pr create -R cameronsjo/x -t t\"",
+                    true,
+                    true,
+                ),
+                (
+                    "env GH_HOST=evil.com sh -c 'gh pr create -R cameronsjo/x -t t'",
+                    true,
+                    true,
+                ),
+                (
+                    "GH_HOST=evil.com timeout 5 bash -c 'gh pr create -R cameronsjo/x -t t'",
+                    true,
+                    true,
+                ),
+                (
+                    "GH_HOST=github.com bash -c 'gh pr create -R cameronsjo/x -t t'",
+                    true,
+                    false,
+                ),
+                // #1077 comment: `env -S` runs its string as a command.
+                ("env -S 'gh issue create -R evil/x -t a -b b'", true, true),
+                (
+                    "env --split-string='gh issue create -R evil/x -t a'",
+                    true,
+                    true,
+                ),
+                (
+                    "env -S 'GH_HOST=evil.com gh issue create -R cameronsjo/x -t a'",
+                    true,
+                    true,
+                ),
+                (
+                    "env -S 'gh issue create -R cameronsjo/x -t a -b b'",
+                    true,
+                    false,
+                ),
+                (
+                    "timeout 5 env -S 'gh issue create -R evil/x -t a'",
+                    true,
+                    true,
+                ),
+                ("sudo -u gh gh -R evil/x pr create -t t", true, true),
+                // #1077 comment + #937: host-qualified and URL values name
+                // their own host.
+                (
+                    "gh issue create -R github.com/cameronsjo/x -t t",
+                    true,
+                    false,
+                ),
+                (
+                    "gh issue create -R https://github.com/cameronsjo/x -t t",
+                    true,
+                    false,
+                ),
+                (
+                    "gh issue create -R git@github.com:cameronsjo/x.git -t t",
+                    true,
+                    false,
+                ),
+                (
+                    "gh issue create -R evil.example/cameronsjo/x -t t",
+                    true,
+                    true,
+                ),
+                (
+                    "gh issue create -R https://github.com/evil/x -t t",
+                    true,
+                    true,
+                ),
+                (
+                    "gh issue create -R https://github.com:x@evil.example/cameronsjo/x -t t",
+                    true,
+                    true,
+                ),
+                // #1037: gh reads no scp host from this; it goes to evil.example.
+                (
+                    "gh issue create -R github.com:x@evil.example/cameronsjo/x -t t",
+                    true,
+                    true,
+                ),
+                // #937: a value gh would refuse, or that cannot be split
+                // exactly as gh does, fails closed.
+                ("gh issue create -R cameronsjo -t t", true, true),
+                ("gh issue create -R cameronsjo/x/y/z -t t", true, true),
+                (
+                    "gh issue create -R https://github.com/%63ameronsjo/x -t t",
+                    true,
+                    true,
+                ),
+                // #1069: a `-R`-shaped decoy in another flag's value.
+                ("gh issue create -t t --body -Rcameronsjo/x", false, true),
+                ("gh issue create -t -Rcameronsjo/x -b b", false, true),
+                ("gh issue create -R cameronsjo/x -R '' -t t", false, true),
+                (
+                    "gh issue create -R cameronsjo/x -t t --body 'see -R evil/x'",
+                    true,
+                    false,
+                ),
+                (
+                    "gh issue create -R evil/x -t t --body 'see -R cameronsjo/x'",
+                    true,
+                    true,
+                ),
+                ("gh issue create -R cameronsjo/x -t t", false, false),
+                ("gh pr merge --squash -R cameronsjo/x", false, false),
+                // #1115: the brace-expanded argv is what runs.
+                ("gh {pr,} create -R evil/x -t t", true, true),
+                ("{gh,} pr create -R evil/x -t t", true, true),
+                ("gh pr {create,} -R evil/x -t t", true, true),
+                ("gh {pr,} view 1 -R evil/x", true, false),
+                // An inline GH_REPO is where gh goes when `-R` is absent.
+                ("GH_REPO=evil/x gh issue create -t t", true, true),
+                ("GH_REPO=cameronsjo/y gh issue create -t t", true, false),
+                // Loops judge a URL-shaped explicit target by what it names.
+                (
+                    "for i in 1 2; do gh issue comment $i -R https://github.com/cameronsjo/x -b b; done",
+                    true,
+                    false,
+                ),
+                (
+                    "for i in 1 2; do gh issue comment $i -R https://github.com/evil/x -b b; done",
+                    true,
+                    true,
+                ),
+            ] {
+                let cwd = if in_owned {
+                    owned.path()
+                } else {
+                    unowned.path()
+                };
+                let result = GhWriteGuard.run(&input_with(command, cwd.to_str().unwrap()));
+                let blocked = matches!(result.outcome, cadence_hooks_core::Outcome::Block);
+                assert_eq!(blocked, blocks, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    #[test]
+    fn a_gh_segment_with_an_unreadable_brace_expansion_blocks() {
+        with_env(&owners_env(), || {
+            let command = format!("gh {}pr create -R cameronsjo/x -t t", "{a,b}".repeat(65));
+            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
+            assert!(result.block_metadata.is_some(), "expected a block");
+            // A flood elsewhere in the command does not touch a gh read.
+            let command = format!("echo {}; gh pr view 1", "{a,b}".repeat(65));
+            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    /// The per-owner guard's perf bound on the new argv readings.
+    #[test]
+    fn adversarial_repo_flag_floods_stay_fast() {
+        with_env(&owners_env(), || {
+            for command in [
+                format!(
+                    "gh issue create{} -R evil/x",
+                    " --body -Rcameronsjo/x".repeat(8_000)
+                ),
+                format!("gh{} issue create -R evil/x", " -R".repeat(60_000)),
+                format!("env -S 'gh issue create{}' -R evil/x", " -t".repeat(60_000)),
+            ] {
+                let started = std::time::Instant::now();
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert!(!matches!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow
+                ));
+                assert!(started.elapsed() < std::time::Duration::from_secs(4));
             }
         });
     }
