@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`prevent-secret-leaks` no longer reads a quoted regex inside `<(…)` as a file operand.** An input process substitution is now cut out of the outer command, which sees `/dev/fd/63`, and its body is judged as the command it is, so `grep -f <(grep -vE '*(#' f) g` allows while `diff <(cat .env) x` still blocks. (cameronsjo/cadence-hooks#1166)
+- **`prevent-secret-leaks` reads an unknown `$VAR` in a filename as `*` when the literal part names a deny-set family.** `cat .env$X` and `cat id_rsa$X` now block; `cat $X.json` and `cat "$OUT"/*.pem` are judged as their `*` spellings are. A command past the 16 KiB scan cap now expands brace groups too, so a padded `cat {a,.env}` blocks. (cameronsjo/cadence-hooks#1099)
+- **`prevent-secret-leaks` allows an assignment named exactly `KUBECONFIG=` whose value is a literal path under `.kube/`.** `export KUBECONFIG=~/.kube/config` reads nothing. No other assignment is exempt (`V=.env; cat $V` still blocks), and a value with an expansion, `..`, `:` list or non-`.kube` path keeps the full scan. (cameronsjo/cadence-hooks#771)
+- **`forgectl env redact` is no longer exempt.** It prints `#` comment lines verbatim, so it is judged like any other read of the file; the closed exempt set is `keys`, `set`, `get` and `check`. (cameronsjo/cadence-hooks#855)
+- **The retired `debt:` note on the redirection-target parser is removed.** The segmenter keeps `>&` joined (#848), so the note and its stale doc paragraph no longer applied. (cameronsjo/cadence-hooks#1139)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security

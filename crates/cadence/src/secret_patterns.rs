@@ -495,6 +495,64 @@ fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
         || (globs
             && has_glob_syntax(trimmed)
             && glob_may_name_secret(trim_operand(token), position))
+        || (globs && var_glob_may_name_secret(token, position))
+}
+
+/// `token` with each unexpanded parameter reference (`$X`, `${X}`, `${X:-a}`,
+/// `$1`) replaced by `*`, or `None` when it carries none. A command
+/// substitution `$(…)` and an ANSI-C `$'…'` are not parameters and stay as
+/// they are.
+fn parameters_as_globs(token: &str) -> Option<String> {
+    if !token.contains('$') {
+        return None;
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    let mut found = false;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 1..];
+        let consumed = if let Some(braced) = tail.strip_prefix('{') {
+            braced.find('}').map(|end| end + 2)
+        } else {
+            let name = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            let leading_digit = tail.starts_with(|c: char| c.is_ascii_digit());
+            match name {
+                0 => None,
+                _ if leading_digit => Some(1),
+                n => Some(n),
+            }
+        };
+        match consumed {
+            Some(n) => {
+                out.push('*');
+                found = true;
+                rest = &tail[n.min(tail.len())..];
+            }
+            None => {
+                out.push('$');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    found.then_some(out)
+}
+
+/// An unknown `$VAR` in a filename may hold any text, so it is read as `*` for
+/// the glob judgment (#1099) — but only where the literal part already names a
+/// deny-set family through [`glob_may_name_secret`]'s own stem rule: `.env$X`
+/// and `id_rsa$X` block, while `$X.json` and `"$OUT"/*.pem` are judged exactly
+/// as their `*` spellings are (`*.json` and `*/*.pem` name no stem). A bare
+/// `$X` carries no literal and is never a finding.
+fn var_glob_may_name_secret(token: &str, position: Filename) -> bool {
+    let Some(globbed) = parameters_as_globs(token) else {
+        return false;
+    };
+    let lower = globbed.to_lowercase();
+    has_glob_syntax(trim_operand(&lower)) && glob_may_name_secret(trim_operand(&globbed), position)
 }
 
 /// A shell operand with the curl/httpie upload `@` and a subshell's closing
@@ -1833,6 +1891,35 @@ pub(crate) fn program_opens(cmd: &str, program: &str) -> Vec<ProgramOpen> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parameters_read_as_globs_only_where_the_literal_names_a_family() {
+        for (token, secret) in [
+            (".env$X", true),
+            (".env${X}", true),
+            ("id_rsa$X", true),
+            ("$X.env", true),
+            ("credentials$1", true),
+            ("$X.json", false),
+            ("$X", false),
+            ("${X}", false),
+            ("$OUT/*.pem", false),
+            ("a$", false),
+            ("$(echo x).json", false),
+        ] {
+            assert_eq!(
+                is_dangerous_secret_token_at(token, Filename::Known),
+                secret,
+                "{token}"
+            );
+        }
+        assert_eq!(
+            parameters_as_globs("a${X:-b}c$Y.d").as_deref(),
+            Some("a*c*.d")
+        );
+        assert_eq!(parameters_as_globs("plain"), None);
+        assert_eq!(parameters_as_globs("$(x)"), None);
+    }
+
     use super::*;
 
     #[test]
