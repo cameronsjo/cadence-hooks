@@ -469,7 +469,11 @@ fn has_trigger_clause(text: &str) -> bool {
     TRIGGER_PATTERN.find_iter(&lower).any(|m| {
         // Negated when not / don't / never is one of the two words before the
         // match ("do not ever use when").
+        // The lookback stops at a sentence boundary (. ; !).
         !lower[..m.start()]
+            .rsplit(['.', ';', '!'])
+            .next()
+            .unwrap_or_default()
             .split_whitespace()
             .rev()
             .take(2)
@@ -504,7 +508,11 @@ fn description_problems(content: &str, fields: &[(String, String)]) -> Vec<Probl
             .get(i + 1..end)
             .unwrap_or_default()
             .iter()
-            .find(|l| !l.trim().is_empty())
+            // Blank lines fold, and an indented `# …` is a YAML comment.
+            .find(|l| {
+                !l.trim().is_empty()
+                    && !(l.starts_with(char::is_whitespace) && l.trim_start().starts_with('#'))
+            })
             .is_some_and(|next| next.starts_with(char::is_whitespace))
     });
 
@@ -558,94 +566,62 @@ fn trigger_nudge(content: &str, fields: &[(String, String)]) -> Option<Problem> 
     })
 }
 
-/// Length of a code-fence marker line (`` ``` `` or `~~~`, three or more of
-/// one char), with the marker char.
+/// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
+/// and bypasses conditional activation.
 ///
-/// CommonMark: an opener indented four or more columns is not a fence, and a
-/// backtick fence's info string may not contain a backtick (so a line like
-/// ` ```not a fence``` ` is an inline span, not an opener).
-fn fence_marker(line: &str) -> Option<(char, usize)> {
-    let indent = line.chars().take_while(|c| matches!(c, ' ' | '\t')).count();
-    if indent > 3 || line.starts_with('\t') {
-        return None;
+/// Markdown structure comes from a real CommonMark parser, not a hand-rolled
+/// scan: only text outside code blocks and inline code is read (so fences in
+/// list items, indented code, multi-line code spans and escaped backticks all
+/// follow the spec). Text inside links and emphasis is prose and is scanned.
+/// Backticks and fences remain the documented escape hatch; indentation alone
+/// is not one unless CommonMark makes it a code block. The token must start a
+/// word (`user@skills/x` does not match) and loses trailing `.,;:)` and backticks.
+fn force_load_refs(content: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut refs = Vec::new();
+    let mut buf = String::new();
+    let mut in_code_block = false;
+    for event in Parser::new(content) {
+        match event {
+            Event::Text(t) if !in_code_block => buf.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => buf.push(' '),
+            Event::Code(_) => buf.push(' '),
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. })
+            | Event::End(
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link,
+            ) => {}
+            Event::Start(Tag::CodeBlock(_)) => {
+                scan_tokens(&buf, &mut refs);
+                buf.clear();
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            _ => {
+                scan_tokens(&buf, &mut refs);
+                buf.clear();
+            }
+        }
     }
-    let t = &line[indent..];
-    let c = t.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let n = t.chars().take_while(|x| *x == c).count();
-    if n < 3 || (c == '`' && t[n..].contains('`')) {
-        return None;
-    }
-    Some((c, n))
+    scan_tokens(&buf, &mut refs);
+    refs
 }
 
-/// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
-/// and bypasses conditional activation. Tokens inside fenced blocks or inline
-/// code spans are mentions, not references, and are skipped —
-/// the leniency that lets the rule be documented. A fence closes only on the
-/// same marker char at least as long as the opener. Indented lines are NOT
-/// code: at four spaces they are prose in a list item or after a paragraph.
-/// The token must start a
-/// word (`user@skills/x` does not match) and loses trailing `.,;:)`.
-fn force_load_refs(content: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-    for line in content.lines() {
-        if let Some((c, n)) = fence {
-            if fence_marker(line).is_some_and(|(c2, n2)| c2 == c && n2 >= n)
-                && line.trim().chars().all(|x| x == c)
-            {
-                fence = None;
-            }
+fn scan_tokens(text: &str, refs: &mut Vec<String>) {
+    for (pos, _) in text.match_indices("@skills/") {
+        let prev = text[..pos].chars().next_back();
+        if prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '_' | '.' | '-')) {
             continue;
         }
-        if let Some(open) = fence_marker(line) {
-            fence = Some(open);
-            continue;
-        }
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let (pos, c) = chars[i];
-            if c == '`' {
-                // A code span opens on a backtick run and closes on a later run
-                // of EXACTLY the same length; an unclosed run is literal text,
-                // so the rest of the line is still scanned.
-                let n = chars[i..].iter().take_while(|(_, x)| *x == '`').count();
-                let mut j = i + n;
-                let mut close = None;
-                while j < chars.len() {
-                    if chars[j].1 == '`' {
-                        let m = chars[j..].iter().take_while(|(_, x)| *x == '`').count();
-                        if m == n {
-                            close = Some(j + m);
-                            break;
-                        }
-                        j += m;
-                    } else {
-                        j += 1;
-                    }
-                }
-                i = close.unwrap_or(i + n);
-                continue;
-            }
-            let prev = i.checked_sub(1).map(|k| chars[k].1);
-            if line[pos..].starts_with("@skills/")
-                && prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '.' | '-')))
-            {
-                let token: String = line[pos..]
-                    .chars()
-                    .take_while(|ch| !ch.is_whitespace())
-                    .collect();
-                refs.push(
-                    token
-                        .trim_end_matches(['.', ',', ';', ':', ')'])
-                        .to_string(),
-                );
-            }
-            i += 1;
-        }
+        let token: String = text[pos..]
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .collect();
+        refs.push(
+            token
+                .trim_end_matches(['.', ',', ';', ':', ')', '`'])
+                .to_string(),
+        );
     }
-    refs
 }
 
 /// `@skills/` references the resulting document has that the on-disk one did
@@ -704,6 +680,34 @@ fn check_agent(content: &str) -> CheckResult {
 /// Is the first non-blank line a `---` that opens a real second frontmatter
 /// block — a later closing `---` with at least one `key:` line between the
 /// markers? A bare thematic break right after the frontmatter is not one.
+/// Does a FENCED code block whose first non-blank line is `provenance:` appear
+/// before the first heading? Parsed as CommonMark, so a fence's extent and an
+/// indented code block follow the spec; a body below a heading may document it.
+fn fenced_provenance_before_heading(body: &str) -> bool {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+    let mut in_fence = false;
+    let mut text = String::new();
+    for event in Parser::new(body) {
+        match event {
+            Event::Start(Tag::Heading { .. }) => return false,
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
+                in_fence = true;
+                text.clear();
+            }
+            Event::Text(t) if in_fence => text.push_str(&t),
+            Event::End(TagEnd::CodeBlock) if in_fence => {
+                in_fence = false;
+                let first = text.lines().find(|l| !l.trim().is_empty());
+                if first.map(str::trim_end) == Some("provenance:") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn second_frontmatter_block(rest: &[&str]) -> bool {
     let Some(open) = rest.iter().position(|l| !l.trim().is_empty()) else {
         return false;
@@ -714,13 +718,16 @@ fn second_frontmatter_block(rest: &[&str]) -> bool {
     let Some(len) = rest[open + 1..].iter().position(|l| *l == "---") else {
         return false;
     };
-    rest[open + 1..open + 1 + len].iter().any(|l| {
+    let inner = &rest[open + 1..open + 1 + len];
+    let is_key = |l: &str| {
         l.split_once(':').is_some_and(|(k, _)| {
             !k.is_empty()
                 && k.chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
         })
-    })
+    };
+    // A `key:` line directly after the opener and no blank line inside.
+    inner.first().is_some_and(|l| is_key(l)) && inner.iter().all(|l| !l.trim().is_empty())
 }
 
 fn plan_problems(content: &str) -> Vec<Problem> {
@@ -746,32 +753,12 @@ fn plan_problems(content: &str) -> Vec<Problem> {
             0,
         ));
     }
-    let mut fence: Option<(char, usize)> = None;
-    let mut first_in_fence = false;
-    for line in &lines[end + 1..] {
-        if let Some((c, n)) = fence {
-            if fence_marker(line).is_some_and(|(c2, n2)| c2 == c && n2 >= n)
-                && line.trim().chars().all(|x| x == c)
-            {
-                fence = None;
-            } else if first_in_fence && !line.trim().is_empty() {
-                first_in_fence = false;
-                if line.trim_end() == "provenance:" {
-                    errors.push((
-                        "plan-fenced-provenance",
-                        "a fenced nested 'provenance:' block above the first heading — plans use flat frontmatter keys instead".into(),
-                        0,
-                    ));
-                }
-            }
-            continue;
-        }
-        if let Some(open) = fence_marker(line) {
-            fence = Some(open);
-            first_in_fence = true;
-        } else if line.starts_with('#') {
-            break; // first heading: fences below it are body content
-        }
+    if fenced_provenance_before_heading(&lines[end + 1..].join("\n")) {
+        errors.push((
+            "plan-fenced-provenance",
+            "a fenced nested 'provenance:' block above the first heading — plans use flat frontmatter keys instead".into(),
+            0,
+        ));
     }
     errors
 }
@@ -2376,7 +2363,7 @@ mod tests {
             "1. Step\n    Then load @skills/x/SKILL.md",
             "- outer\n    - inner @skills/x/SKILL.md",
             "-\tbullet @skills/x/SKILL.md",
-            "\t- tab-indented bullet @skills/x/SKILL.md",
+            "- outer\n\t- tab-indented bullet @skills/x/SKILL.md",
             "Para\n    @skills/x/SKILL.md",
         ] {
             assert_eq!(
@@ -2442,12 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn n3_fence_openers_follow_commonmark() {
-        assert_eq!(fence_marker("```rust"), Some(('`', 3)));
-        assert_eq!(fence_marker("   ~~~~"), Some(('~', 4)));
-        assert_eq!(fence_marker("```not a fence```"), None);
-        assert_eq!(fence_marker("    ```"), None);
-        assert_eq!(fence_marker("\t```"), None);
+    fn n3_a_non_fence_does_not_hide_the_rest_of_the_document() {
         // A non-fence must not hide the rest of the document.
         assert_eq!(
             force_load_refs("```not a fence```\n@skills/y"),
@@ -2499,6 +2481,64 @@ mod tests {
         let (o, _) = skill_verdict("description : >-\n  Use when x");
         assert_eq!(o, cadence_hooks_core::Outcome::Block);
         let (o, _) = skill_verdict("description : Use when x\n\n  more");
+        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---- CommonMark parser replaces the hand-rolled scan ----
+
+    #[test]
+    fn commonmark_repros_from_review() {
+        let f = "```";
+        let allow = [
+            format!("- item\n\n    {f}\n    @skills/x/SKILL.md\n    {f}"),
+            "Para\n\n    @skills/x/SKILL.md".to_string(),
+            format!("{f}\n@skills/x/SKILL.md\n{f}"),
+        ];
+        for doc in &allow {
+            assert!(force_load_refs(doc).is_empty(), "{doc:?}");
+        }
+        let block = [
+            format!("- item\n  {f}\n  code\n- next @skills/x/SKILL.md"),
+            format!(" \t{f}\n@skills/x/SKILL.md"),
+            "text `a\nb` @skills/x/SKILL.md `c`".to_string(),
+            "\\` @skills/x/SKILL.md `".to_string(),
+        ];
+        for doc in &block {
+            assert_eq!(force_load_refs(doc), vec!["@skills/x/SKILL.md"], "{doc:?}");
+        }
+    }
+
+    #[test]
+    fn links_and_emphasis_are_prose_and_backtick_is_trimmed() {
+        assert_eq!(
+            force_load_refs("[see @skills/x/SKILL.md](http://e)"),
+            vec!["@skills/x/SKILL.md"]
+        );
+        assert_eq!(force_load_refs("*@skills/x*"), vec!["@skills/x"]);
+        assert_eq!(force_load_refs("@skills/x`"), vec!["@skills/x"]);
+    }
+
+    #[test]
+    fn na_negation_lookback_stops_at_sentence_boundary() {
+        assert!(has_trigger_clause("Never touch X. Use when Y"));
+        assert!(has_trigger_clause("Not for X; use when Y"));
+        assert!(has_trigger_clause("Don't panic! Use when Y"));
+        assert!(!has_trigger_clause("Never use when Y"));
+    }
+
+    #[test]
+    fn nb_second_frontmatter_needs_key_directly_after_opener_and_no_blanks() {
+        let a = "---\nstatus: p\n---\n---\n\ndate: x\n---\n# Plan\n";
+        assert_eq!(plan_verdict(a).0, cadence_hooks_core::Outcome::Allow);
+        let b = "---\nstatus: p\n---\n---\ndate: x\n\nmore: y\n---\n# Plan\n";
+        assert_eq!(plan_verdict(b).0, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn nc_indented_yaml_comment_after_description_is_not_a_continuation() {
+        let (o, _) = skill_verdict("description: Use when x\n  # a comment");
+        assert_eq!(o, cadence_hooks_core::Outcome::Allow);
+        let (o, _) = skill_verdict("description: Use when x\n  # a comment\n  real continuation");
         assert_eq!(o, cadence_hooks_core::Outcome::Block);
     }
 }
