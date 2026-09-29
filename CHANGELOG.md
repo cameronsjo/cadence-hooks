@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.114.0] - 2026-09-29
+
 ### Security
 
 - **`prevent-secret-leaks` judges `find … | xargs <reader>` as a read of the secret-shaped name `find` selects.** `find /evil -name .env | xargs cat` (also `-print0 | xargs -0`, `head`, `tail`, `less`, `grep`, `sh -c`) is blocked when a `-name`/`-iname`/`-path`/`-ipath`/`-regex` names a secret-shaped file, with no `.envrc` carve-out because the match lies outside the cwd; a `find` with no secret-shaped selector, and `xargs ls`/`wc`/`rm`, stay allowed. (cameronsjo/cadence-hooks#1081)
