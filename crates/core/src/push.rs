@@ -1170,7 +1170,10 @@ fn resolve_directory_verb(
         {
             Some((
                 resolve_cd_target(target, effective_dir),
-                target.starts_with('/'),
+                // A Windows drive path is as absolute as `/x`, the same test
+                // `resolve_cd_target` uses; `starts_with('/')` alone kept the
+                // doubt of an earlier `cd "$HOME"` alive past `cd C:\repo`.
+                crate::shell::looks_absolute(target),
             ))
         }
         _ => None,
@@ -2266,6 +2269,17 @@ mod tests {
             (
                 "cd \"$HOME\" && cd /abs/own && git push origin main",
                 "/abs/own",
+                false,
+            ),
+            // So does a Windows drive path, in either separator.
+            (
+                "cd \"$HOME\" && cd C:\\abs\\own && git push origin main",
+                "C:\\abs\\own",
+                false,
+            ),
+            (
+                "cd \"$HOME\" && cd D:/abs/own && git push origin main",
+                "D:/abs/own",
                 false,
             ),
             (
