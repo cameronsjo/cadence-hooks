@@ -107,6 +107,8 @@ pub mod gh_context;
 pub mod guard_body_budget;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
+/// Block applying the human-only `impact:critical` / `likelihood:critical` labels.
+pub mod guard_critical_grade;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.
 pub mod guard_dotfiles;
 /// Block `tea`/`glab` write operations targeting repos you don't own.

@@ -1,0 +1,70 @@
+# Corrective layer for the human-only Critical grades (cameronsjo/cadence-hooks#896).
+#
+# When `impact:critical` or `likelihood:critical` is applied by a sender who is
+# not a permitted grader, remove it, add the `high` sibling, and comment why.
+# The preventive layer is the `guard-critical-grade` PreToolUse guard (#895).
+#
+# Allowlist source: the repo variable CRITICAL_GRADERS (comma-separated logins),
+# falling back to the repository owner. The variable is this repo's copy; the
+# issue's `scripts/labels/taxonomy.json` `critical_allowlist` in cadence-ecosystem
+# is not readable from here, so the two must be kept in step by hand.
+#
+# Security: no checkout (a `pull_request_target` run must never touch PR code),
+# no actions, and every event-derived value reaches the shell through `env:`,
+# never through `${{ }}` inside `run:`, so a label name or login cannot inject.
+name: critical-grade-labeled
+
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  downgrade:
+    if: >-
+      github.event.label.name == 'impact:critical' ||
+      github.event.label.name == 'likelihood:critical'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Downgrade a Critical grade set by a non-grader
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          LABEL: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+          GRADERS: ${{ vars.CRITICAL_GRADERS }}
+        run: |
+          set -euo pipefail
+          allow="${GRADERS:-$OWNER}"
+          sender_lc="$(printf '%s' "$SENDER" | tr '[:upper:]' '[:lower:]')"
+          IFS=',' read -r -a graders <<< "$allow"
+          for g in "${graders[@]}"; do
+            g="$(printf '%s' "$g" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            if [ -n "$g" ] && [ "$g" = "$sender_lc" ]; then
+              echo "sender is an allowlisted grader; leaving $LABEL"
+              exit 0
+            fi
+          done
+
+          axis="${LABEL%%:*}"
+          lower="${axis}:high"
+          enc="$(printf '%s' "$LABEL" | jq -sRr @uri)"
+          gh api -X DELETE "repos/$REPO/issues/$NUMBER/labels/$enc" >/dev/null
+          gh api -X POST "repos/$REPO/issues/$NUMBER/labels" -f "labels[]=$lower" >/dev/null
+
+          body="$(printf '%s\n' \
+            "\`$LABEL\` is a human-only grade, so it was removed and \`$lower\` applied instead." \
+            "" \
+            "- Actor: @$SENDER (not on the Critical grader allowlist)" \
+            "- Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "- Axis: $axis" \
+            "- Rationale: the allowlist is the \`CRITICAL_GRADERS\` repo variable, else the repository owner (cameronsjo/cadence-hooks#896). A grader can re-apply the label.")"
+          gh api -X POST "repos/$REPO/issues/$NUMBER/comments" -f "body=$body" >/dev/null
