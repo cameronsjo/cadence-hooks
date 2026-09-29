@@ -7,8 +7,8 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    child_scripts, clobber_redirect_targets, command_segments, command_word, executable_tokens,
-    looks_absolute, peel_command_runners, skip_git_global_options, tokenize,
+    carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
+    executable_tokens, looks_absolute, peel_command_runners, skip_git_global_options, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -239,7 +239,21 @@ fn check_destructive_in_vault(
             // leading `"` that defeats `looks_absolute`. tokenize keeps a
             // quoted path in one token and strips the quotes, so the
             // absolute/in-vault test sees the real path (#82).
-            for part in tokenize(command) {
+            //
+            // A word carrying a substitution is also read as the words of its
+            // source, grouping syntax blanked out. The tokenizer keeps an
+            // unquoted `$(echo /vault/x)` as ONE word (cadence-hooks#1106),
+            // and `"$(echo /vault/x)"` always was one, but the vault path the
+            // `rm` is handed sits inside it. One re-read per word keeps this
+            // linear, where re-tokenizing every nested `command_segments`
+            // body multiplied the work by the nesting depth.
+            let words = tokenize(command);
+            let inner_words: Vec<String> = words
+                .iter()
+                .filter(|word| carries_substitution(word))
+                .flat_map(|word| tokenize(&word.replace(['(', ')', '`'], " ")))
+                .collect();
+            for part in words.into_iter().chain(inner_words) {
                 let part = normalize_path(&part);
                 if looks_absolute(&part) && (part == vault || part.starts_with(&vault_prefix)) {
                     in_vault = true;
@@ -415,6 +429,44 @@ mod tests {
     fn rm_inside_vault_blocked() {
         let result =
             check_destructive_in_vault("rm note.md", "/vault/notes", "/vault", &FakeFs::default());
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_of_a_vault_path_handed_through_a_substitution_blocked() {
+        // cadence-hooks#1106 keeps an unquoted substitution as one word, so
+        // the vault path is read from the substitution's own segment.
+        for command in [
+            "rm -rf $(echo /vault/n.md)",
+            "rm -rf `echo /vault/n.md`",
+            "rm -rf \"$(echo /vault/n.md)\"",
+            "rm -rf $(realpath /vault/notes)/n.md",
+        ] {
+            let result =
+                check_destructive_in_vault(command, "/home/user", "/vault", &FakeFs::default());
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let result = check_destructive_in_vault(
+            "rm -rf $(echo /elsewhere/n.md)",
+            "/home/user",
+            "/vault",
+            &FakeFs::default(),
+        );
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn clobber_of_a_glued_brace_name_judges_the_file_bash_writes() {
+        // cadence-hooks#1092: `> note}` writes `note}`, not `note`.
+        let fs = FakeFs(["/vault/note".to_string()].into_iter().collect());
+        let result = check_destructive_in_vault("echo x > note}", "/vault", "/vault", &fs);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        let fs = FakeFs(["/vault/note}".to_string()].into_iter().collect());
+        let result = check_destructive_in_vault("echo x > note}", "/vault", "/vault", &fs);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 

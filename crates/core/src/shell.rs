@@ -460,12 +460,44 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     // escaped, so this one is literal to bash (`\{a,b\}` does not expand).
     let mut escape_pending = false;
     let mut chars = command.chars().peekable();
+    // Iterations left before [`unquoted_substitution_len`] may scan again.
+    // A failed scan read `n` characters; no opener among them is scanned
+    // again (each takes the old split-at-blanks reading), so failed scans
+    // never overlap and a successful one consumes what it read — the walk
+    // stays linear under an opener flood (the hook deadline fails open).
+    let mut no_scan_for = 0usize;
 
     while let Some(c) = chars.next() {
         let escaped = std::mem::take(&mut escape_pending);
+        no_scan_for = no_scan_for.saturating_sub(1);
         // Backfill whatever the previous iteration pushed from a quoted arm —
         // at the TOP, because those arms `continue` past the bottom.
         structural.resize(current.len(), false);
+        // An unquoted `$(…)` or `` `…` `` is ONE piece of the word it sits in,
+        // blanks and all: bash reads `rm $(realpath .)/.env` as the single
+        // word `$(realpath .)/.env` and only field-splits the OUTPUT. Splitting
+        // the source at the inner space handed guards `$(realpath` and
+        // `.)/.env`, a path no classifier recognises (cadence-hooks#1106). The
+        // span is copied verbatim and marked non-structural (bash brace-expands
+        // its body inside the substitution, not in this word). Unbalanced, or
+        // past the depth/work bounds, it falls back to the old reading.
+        if quote.is_none()
+            && !escaped
+            && no_scan_for == 0
+            && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
+        {
+            match unquoted_substitution_len(c, chars.clone()) {
+                Ok(len) => {
+                    lead.unquoted();
+                    current.push(c);
+                    current.extend(chars.by_ref().take(len));
+                    structural.resize(current.len(), false);
+                    in_token = true;
+                    continue;
+                }
+                Err(read) => no_scan_for = read,
+            }
+        }
         match quote {
             Some(Quote::Single) => {
                 if c == '\'' {
@@ -552,7 +584,12 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     structural.resize(current.len(), false);
                     in_token = true;
                 }
-                c if c.is_whitespace() => {
+                // Only bash's blanks end a word: space, tab, and the newline
+                // that separates commands. VT, FF, CR and Unicode spaces are
+                // ordinary word characters to bash, so `cat\u{b}.env` runs
+                // a command of that whole name; splitting there handed guards
+                // an argv bash never builds (cadence-hooks#1055, #1084).
+                c if is_bash_blank(c) => {
                     if in_token {
                         structural.resize(current.len(), false);
                         let text = std::mem::take(&mut current);
@@ -586,6 +623,108 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
             expanding_prefix_len,
         );
     }
+}
+
+/// Is `c` one of the characters bash splits words on — space, tab, newline?
+/// Everything else `char::is_whitespace` accepts (VT, FF, CR, NBSP, U+2003…)
+/// is an ordinary word character to bash (cadence-hooks#1055).
+pub fn is_bash_blank(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n')
+}
+
+/// Does `word` carry command-substitution syntax — `$(` or a backtick — so
+/// that its value is the output of a command only the running shell sees?
+pub fn carries_substitution(word: &str) -> bool {
+    word.contains("$(") || word.contains('`')
+}
+
+/// Deepest `(` nesting [`unquoted_substitution_len`] follows before giving up.
+const MAX_UNQUOTED_SPAN_DEPTH: usize = 16;
+
+/// How many characters after the opener `open` (`$`, whose `(` is next, or a
+/// backtick) belong to one balanced command substitution on the same line, or
+/// `Err(read)` — how many characters the scan read before giving up — when the
+/// span cannot be bounded confidently. Callers skip rescanning from any opener
+/// inside those `read` characters, which keeps every walk linear.
+///
+/// Every doubt is an `Err`, and an `Err` keeps the old split-at-blanks
+/// reading, so this can only ever glue text bash also keeps in one word:
+///
+/// - **`$(…)`** counts `(`/`)` depth and skips `'…'`, `"…"` (with `\` escapes)
+///   and backslash-escaped characters, the way bash reads the body as shell
+///   code. A `case` pattern's `)`, a `)` inside `${…}` or a nested backtick can
+///   close it EARLIER than bash does — the safe direction, since the rest is
+///   split as before.
+/// - **`` `…` ``** ends at the first unescaped backtick; bash honours no quotes
+///   there (see [`substitution_spans`]).
+/// - **A newline, or a `#` that could start a comment, gives up.** Past either,
+///   an apostrophe in a comment or heredoc body could open a phantom quote and
+///   run the span LONGER than bash's — gluing text bash splits, the direction a
+///   guard cannot afford.
+/// - Past [`MAX_UNQUOTED_SPAN_DEPTH`], gives up.
+fn unquoted_substitution_len(open: char, rest: impl Iterator<Item = char>) -> Result<usize, usize> {
+    let mut read = 0usize;
+    let closed = substitution_span_closes(open, &mut rest.inspect(|_| read += 1));
+    if closed { Ok(read) } else { Err(read) }
+}
+
+/// The scan behind [`unquoted_substitution_len`]: whether `rest` reached the
+/// span's closing delimiter, left consumed exactly through it.
+fn substitution_span_closes(open: char, rest: &mut impl Iterator<Item = char>) -> bool {
+    // A continuation (backslash-newline) is a doubt like a bare newline.
+    let escaped_ok = |rest: &mut dyn Iterator<Item = char>| rest.next().is_some_and(|c| c != '\n');
+    if open == '`' {
+        while let Some(c) = rest.next() {
+            match c {
+                '\\' if !escaped_ok(rest) => return false,
+                '`' => return true,
+                '\n' => return false,
+                _ => {}
+            }
+        }
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    // A word could begin here, so a `#` would open a comment.
+    let mut boundary = false;
+    while let Some(c) = rest.next() {
+        if c == '\n' {
+            return false;
+        }
+        if let Some(q) = quote {
+            if q == '"' && c == '\\' {
+                if !escaped_ok(rest) {
+                    return false;
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        let was_boundary = std::mem::replace(&mut boundary, false);
+        match c {
+            '\\' if !escaped_ok(rest) => return false,
+            '\'' | '"' => quote = Some(c),
+            '#' if was_boundary => return false,
+            '(' => {
+                depth += 1;
+                if depth > MAX_UNQUOTED_SPAN_DEPTH {
+                    return false;
+                }
+                boundary = true;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            ' ' | '\t' | ';' | '&' | '|' => boundary = true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Push one finished word onto `tokens`, brace-expanded the way bash expands it
@@ -3588,6 +3727,12 @@ impl GhRepoFlags {
     /// carrying whitespace is dropped: gh forwards it, but GitHub resolves no
     /// repository from it, so no write can land there — and counting it would
     /// turn prose like `--body "use -R owner/repo"` into a false disagreement.
+    /// **Unless it carries a command substitution** (`$(…)`, a backtick): the
+    /// whitespace is then in the SOURCE, and gh is handed the output, so
+    /// `-R $(cat target)` and `-R "$(cat target)"` name a repo only the running
+    /// shell knows. Dropping them fell back to the cwd's repo. The tokenizer
+    /// keeps an unquoted substitution whole since cadence-hooks#1106, which is
+    /// what made the unquoted spelling reach this filter.
     pub fn resolve(&self) -> GhRepoFlag {
         if self.unattributable {
             return GhRepoFlag::Ambiguous;
@@ -3595,7 +3740,9 @@ impl GhRepoFlags {
         let usable: Vec<&(String, bool)> = self
             .readings
             .iter()
-            .filter(|(value, _)| !value.contains(char::is_whitespace))
+            .filter(|(value, _)| {
+                !value.contains(char::is_whitespace) || carries_substitution(value)
+            })
             .collect();
         let last_certain = usable.iter().rposition(|(_, certain)| *certain);
         let deciding = &usable[last_certain.unwrap_or(0)..];
@@ -5485,13 +5632,14 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
     split_segments_impl(command, false)
 }
 
-/// [`split_segments_with_ops`], except that an `&` belonging to a redirection
-/// operator — `>&`/`<&` (`2>&1`, `>&2`, `<&-`) or `&>`/`&>>` — stays inside
-/// its segment instead of cutting it as a background `&`.
+/// [`split_segments_with_ops`], except that an `&` opening an `&>`/`&>>`
+/// redirection also stays inside its segment instead of cutting it as a
+/// background `&`. (`>&`/`<&` — `2>&1`, `>&2`, `<&-` — stay joined in every
+/// mode since cadence-hooks#848.)
 ///
-/// The default splitter cuts `cd /wt 2>&1 & git commit` into `cd /wt 2>`,
-/// `1`, and `git commit`, so a caller cannot tell a real background `&` from
-/// half of a redirection. A walk that scopes a backgrounded `cd` to its
+/// The default splitter cuts `cd /wt &>/dev/null & git commit` into `cd /wt`,
+/// `>/dev/null`, and `git commit`, so a caller cannot tell a real background
+/// `&` from half of a redirection. A walk that scopes a backgrounded `cd` to its
 /// subshell needs exactly that distinction (cadence-hooks#1058). Decided
 /// lexically, the way the shell does: `&` right after an unescaped `>`/`<`, or
 /// right before `>`, is part of the operator; `cd /wt & >/dev/null git commit`
@@ -5626,10 +5774,18 @@ fn split_segments_impl(
                 quote = Some(Quote::Double);
                 current.push(c);
             }
-            '&' if join_redirect_amp
-                && chars.peek() != Some(&'&')
+            // `>&` and `<&` are single redirection operators to bash's lexer
+            // (`2>&1`, `>&2`, `<&-`, `>& file`), never a `>` followed by a
+            // background `&`. Cutting there shredded every fd duplication into
+            // `… 2>` and `1`, and left `echo x >& .env` — which writes BOTH
+            // streams to `.env` — as a writer with a dangling `>` and a lone
+            // `.env` segment no redirect parser read (cadence-hooks#848,
+            // #849). Every spelling this joins is either that operator or a
+            // bash syntax error (`cmd > & x`, with the space, is not joined).
+            // `&>` stays opt-in: its callers were written against the cut.
+            '&' if chars.peek() != Some(&'&')
                 && (ends_with_unescaped_redirect_op(current.as_str())
-                    || chars.peek() == Some(&'>')) =>
+                    || (join_redirect_amp && chars.peek() == Some(&'>'))) =>
             {
                 current.push(c);
             }
@@ -5955,80 +6111,14 @@ fn flush_segment_with_op(
 /// redirect behind a phantom string (cameronsjo/cadence-hooks#551). A
 /// stream-prefixed form (`2>`, `1>`) still names a file
 /// that gets clobbered, so its target is included — the leading digit is just
-/// an ordinary character before the operator. A fd-duplication form (`>&2`)
-/// has no file target: the target-collection loop below stops at `&`,
-/// yielding an empty string that is discarded. Targets may be quoted (`>
-/// "my note.md"`); the returned string has the quotes stripped. A
-/// backslash-escaped whitespace char (`Daily\ Note.md`) stays part of the
-/// token rather than terminating it — Obsidian filenames routinely contain
-/// spaces. A trailing unmatched `)`/`}` — the artifact of a glued subshell
-/// close like `(: > note.md)` — is stripped from the collected target, since
-/// the parser doesn't track group nesting; a legitimate filename ending in
-/// those characters is the rarer case.
+/// an ordinary character before the operator. A fd-duplication form (`>&2`,
+/// `>&-`) has no file target, but `>& file` names one — bash writes both
+/// streams there (cadence-hooks#849). Targets may be quoted (`>
+/// "my note.md"`); the returned string has the quotes stripped. Where a name
+/// ends — escaped blanks, a glued `)` or `}`, a substitution — is
+/// [`read_redirect_target`]'s rule, shared with [`redirect_targets`].
 pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
-    let chars: Vec<char> = segment.chars().collect();
-    let mut targets = Vec::new();
-    let mut i = 0;
-    let mut quote: Option<Quote> = None;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
-            i = next;
-            continue;
-        }
-        match c {
-            '>' => {
-                i += 1;
-                // `>>` (append) does not clobber — consume the doubled
-                // operator but record no target for it.
-                if i < chars.len() && chars[i] == '>' {
-                    i += 1;
-                    continue;
-                }
-                // `>|` is the explicit force-clobber operator.
-                if i < chars.len() && chars[i] == '|' {
-                    i += 1;
-                }
-                // Skip whitespace between the operator and the filename.
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                // Collect the target token, honoring a quoted filename.
-                let mut target = String::new();
-                while i < chars.len() {
-                    let tc = chars[i];
-                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
-                        i = next;
-                        continue;
-                    }
-                    // A backslash-escaped whitespace char is part of the
-                    // filename, not a token terminator — consume the
-                    // backslash and keep the escaped char.
-                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
-                        target.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
-                        break;
-                    }
-                    target.push(tc);
-                    i += 1;
-                }
-                // Strip a trailing unmatched `)`/`}` — the artifact of a
-                // glued subshell/group close (`(: > note.md)`), not a real
-                // filename character in the realistic case.
-                let target = target.trim_end_matches([')', '}']).to_string();
-                if !target.is_empty() {
-                    targets.push(target);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-
-    targets
+    redirect_targets_impl(segment, false)
 }
 
 /// Extract **every** redirect target in a command segment — the filename after
@@ -6050,66 +6140,117 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
 /// into a tracked file in the primary checkout is a tree mutation). Keeping one
 /// implementation means one parser for the security review to scrutinize.
 pub fn redirect_targets(segment: &str) -> Vec<String> {
+    redirect_targets_impl(segment, true)
+}
+
+/// The single walk behind [`clobber_redirect_targets`] (`with_append: false`,
+/// which consumes `>>` but records no target) and [`redirect_targets`].
+fn redirect_targets_impl(segment: &str, with_append: bool) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
     let mut i = 0;
     let mut quote: Option<Quote> = None;
+    // No substitution scan starts before this index: see [`read_redirect_target`].
+    let mut scan_floor = 0usize;
 
     while i < chars.len() {
-        let c = chars[i];
         if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
             i = next;
             continue;
         }
-        match c {
-            '>' => {
-                i += 1;
-                // Consume a doubled `>>` (append) or `>|` (clobber).
-                if i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
-                    i += 1;
-                }
-                // Skip whitespace between the operator and the filename.
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                // Collect the target token, honoring a quoted filename.
-                let mut target = String::new();
-                while i < chars.len() {
-                    let tc = chars[i];
-                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
-                        i = next;
-                        continue;
-                    }
-                    // A backslash-escaped whitespace char is part of the
-                    // filename, not a token terminator — consume the backslash
-                    // and keep the escaped char. Without this,
-                    // `>> my\ dir/.env` truncated the target at the escaped
-                    // space (`my\`), so the append to a real `.env` inside a
-                    // space-bearing directory reached no guard — while the
-                    // quoted spelling `>> "my dir/.env"` blocked correctly. The
-                    // sibling [`clobber_redirect_targets`] already carried this
-                    // branch; the two redirect parsers must not disagree on
-                    // where a filename ends (cameronsjo/cadence-hooks#551).
-                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
-                        target.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
-                        break;
-                    }
-                    target.push(tc);
-                    i += 1;
-                }
-                if !target.is_empty() {
-                    targets.push(target);
-                }
-            }
-            _ => i += 1,
+        if chars[i] != '>' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let append = chars.get(i) == Some(&'>');
+        // `>&WORD` is a duplication when WORD is a descriptor number or `-`
+        // (`>&2`, `2>&1`, `>&-`); any other WORD is a FILE both stdout and
+        // stderr are written to, so `echo x >& .env` writes `.env`. Reading
+        // every `>&` as a duplication missed that write (cadence-hooks#849).
+        let duplication = chars.get(i) == Some(&'&');
+        // Consume a doubled `>>` (append), `>|` (clobber) or `>&`.
+        if append || duplication || chars.get(i) == Some(&'|') {
+            i += 1;
+        }
+        let (target, next) = read_redirect_target(&chars, i, &mut scan_floor);
+        i = next;
+        let names_a_descriptor =
+            duplication && (target == "-" || target.chars().all(|c| c.is_ascii_digit()));
+        if !target.is_empty() && !names_a_descriptor && (with_append || !append) {
+            targets.push(target);
         }
     }
 
     targets
+}
+
+/// The filename after a redirect operator ending just before `i`, quotes
+/// removed, and the index just past it.
+///
+/// Blanks before it are skipped. It ends at unquoted whitespace (a
+/// backslash-escaped one is part of the name: `Daily\ Note.md`), at an
+/// operator character, or at an unquoted `)` — a metacharacter bash never
+/// keeps inside a word, so `(: > note.md)` and `{ (echo hi > .env)}` write
+/// `note.md` and `.env`. A balanced unquoted `$(…)` or `` `…` `` stays whole
+/// ([`unquoted_substitution_len`]), so `> $(mktemp -d)/.env` names
+/// `$(mktemp -d)/.env` rather than `$(mktemp` (cadence-hooks#1106).
+///
+/// **A glued `}` is kept.** `}` closes a group only as a word of its own; in
+/// `> note}` it is part of the name bash writes. The old unconditional trim of
+/// a trailing `)`/`}` judged `note` instead (cadence-hooks#1092, the rule
+/// cadence-hooks#889 set for [`strip_group_wrappers`]).
+///
+/// `scan_floor` is shared by every call for one segment: a failed substitution
+/// scan raises it past what it read, so no opener there is scanned again and
+/// the whole walk stays linear.
+fn read_redirect_target(chars: &[char], mut i: usize, scan_floor: &mut usize) -> (String, usize) {
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    let mut target = String::new();
+    while i < chars.len() {
+        let tc = chars[i];
+        if let Some(next) = take_quoted_run(chars, i, &mut target) {
+            i = next;
+            continue;
+        }
+        // A backslash-escaped whitespace char is part of the filename, not a
+        // token terminator — consume the backslash and keep the escaped char.
+        // Without this, `>> my\ dir/.env` truncated the target at the escaped
+        // space (`my\`), so the append to a real `.env` inside a space-bearing
+        // directory reached no guard (cameronsjo/cadence-hooks#551).
+        if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+            target.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        // Any other escaped character is part of the name too — `\)` and
+        // `\;` included, which would otherwise end it. Both characters are
+        // kept, as before, for the classifiers that unescape a word themselves.
+        if tc == '\\' && i + 1 < chars.len() {
+            target.push(tc);
+            target.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if i >= *scan_floor && (tc == '`' || (tc == '$' && chars.get(i + 1) == Some(&'('))) {
+            match unquoted_substitution_len(tc, chars[i + 1..].iter().copied()) {
+                Ok(len) => {
+                    target.extend(&chars[i..=i + len]);
+                    i += len + 1;
+                    continue;
+                }
+                Err(read) => *scan_floor = i + 1 + read,
+            }
+        }
+        if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&' | ')') {
+            break;
+        }
+        target.push(tc);
+        i += 1;
+    }
+    (target, i)
 }
 
 /// Like [`split_segments`], but also expands what a shell would actually run:
@@ -11204,14 +11345,9 @@ mod tests {
         // would leave the `12` after it unexamined, smuggling a selector past
         // the gate. Only a standalone `#` ends the command.
         assert!(!is_polish_ship_anchor("gh pr merge -t '#123' 12"));
-        // The limit this does NOT reach, stated rather than implied:
-        // `split_segments` cuts at the `&` of `2>&1`, so a token written after
-        // that redirect lands in a different segment — `gh pr merge 2>&1 12`
-        // anchors despite naming a PR. That is `command_segments`' reach,
-        // shared repo-wide; `merge` is simply the only anchor that inspects
-        // operands, so it is the only one that loses anything to it. Pinned
-        // here as a KNOWN hole so a future segmenter fix has a test to flip.
-        assert!(is_polish_ship_anchor("gh pr merge 2>&1 12"));
+        // `split_segments` keeps `2>&1` whole (cadence-hooks#848), so a PR
+        // named after the redirect stays in the merge's segment and is seen.
+        assert!(!is_polish_ship_anchor("gh pr merge 2>&1 12"));
     }
 
     #[test]
@@ -11440,6 +11576,85 @@ mod tests {
     #[test]
     fn tokenize_splits_on_whitespace() {
         assert_eq!(tokenize("gh pr create"), vec!["gh", "pr", "create"]);
+    }
+
+    #[test]
+    fn tokenize_keeps_an_unquoted_substitution_in_its_word() {
+        // cadence-hooks#1106: bash reads each of these as the words shown —
+        // the substitution's inner blanks do not end the word it sits in.
+        // Measured with `printf '[%s]\n'` in bash 5.2 on the source spellings.
+        for (command, want) in [
+            ("rm $(realpath .)/.env", vec!["rm", "$(realpath .)/.env"]),
+            ("cat `pwd -P`/.env", vec!["cat", "`pwd -P`/.env"]),
+            (
+                "cd $(git rev-parse --show-toplevel) && x",
+                vec!["cd", "$(git rev-parse --show-toplevel)", "&&", "x"],
+            ),
+            (
+                "a pre$(echo \")\" x)post b",
+                vec!["a", "pre$(echo \")\" x)post", "b"],
+            ),
+            (
+                "a $(echo 'x )' $(b c)) d",
+                vec!["a", "$(echo 'x )' $(b c))", "d"],
+            ),
+            ("echo $((1 + 2))", vec!["echo", "$((1 + 2))"]),
+            ("a `x \\` y` b", vec!["a", "`x \\` y`", "b"]),
+            // The body is not brace-expanded as part of the outer word.
+            ("echo $(echo {a,b})x", vec!["echo", "$(echo {a,b})x"]),
+        ] {
+            assert_eq!(tokenize(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn tokenize_splits_a_substitution_it_cannot_bound_as_before() {
+        // Every doubt falls back to splitting at blanks: unbalanced, escaped,
+        // a newline or a comment inside (an apostrophe there could otherwise
+        // open a phantom quote and glue text bash splits).
+        for (command, want) in [
+            ("echo $(a b", vec!["echo", "$(a", "b"]),
+            ("echo `a b", vec!["echo", "`a", "b"]),
+            ("echo \\$(a b)", vec!["echo", "\\$(a", "b)"]),
+            ("echo $(a # it's\n) b", vec!["echo", "$(a", "#", "its\n) b"]),
+            ("echo $(a\nb) c", vec!["echo", "$(a", "b)", "c"]),
+        ] {
+            assert_eq!(tokenize(command), want, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn tokenize_substitution_scan_stays_linear_on_an_opener_flood() {
+        for flood in [
+            "$( ".repeat(70_000),
+            "$(a ".repeat(50_000),
+            "` ".repeat(100_000),
+        ] {
+            let started = std::time::Instant::now();
+            let _ = tokenize(&flood);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn tokenize_splits_only_on_bash_blanks() {
+        // cadence-hooks#1055 / #1084: bash's word separators are space, tab
+        // and newline. VT, FF, CR and Unicode spaces are word characters.
+        for (command, want) in [
+            ("cat\t.env", vec!["cat", ".env"]),
+            ("a\nb", vec!["a", "b"]),
+            ("cat\u{b}.env", vec!["cat\u{b}.env"]),
+            ("cat a\u{c}.env", vec!["cat", "a\u{c}.env"]),
+            ("cd W\r", vec!["cd", "W\r"]),
+            ("rm\u{a0}.env", vec!["rm\u{a0}.env"]),
+            (
+                "jq --rawfile a\u{b}b .env.local .x",
+                vec!["jq", "--rawfile", "a\u{b}b", ".env.local", ".x"],
+            ),
+            ("x\u{2003}y", vec!["x\u{2003}y"]),
+        ] {
+            assert_eq!(tokenize(command), want, "{command:?}");
+        }
     }
 
     #[test]
@@ -12225,6 +12440,93 @@ mod tests {
         );
     }
 
+    /// The pre-#1084 `take_logical_line`, kept as the reference the linear
+    /// rewrite is checked against.
+    fn take_logical_line_rescanning(lines: &[&str], i: &mut usize) -> String {
+        let mut line = lines[*i].to_string();
+        *i += 1;
+        while *i < lines.len() {
+            let probe = line.strip_suffix('\r').unwrap_or(&line);
+            if !comment_spans(probe).is_empty() {
+                break;
+            }
+            let trailing = probe.chars().rev().take_while(|&c| c == '\\').count();
+            if trailing % 2 == 0 {
+                break;
+            }
+            line.truncate(probe.len() - 1);
+            line.push_str(lines[*i]);
+            *i += 1;
+        }
+        line
+    }
+
+    #[test]
+    fn take_logical_line_matches_the_rescanning_reference() {
+        for command in [
+            "a \\\nb \\\nc",
+            "a\\\\\nb",
+            "a\\\\\\\nb",
+            "\\\n\\\n\\",
+            "a \\\r\nb\r\nc",
+            "echo a #;\\\nrm -rf ~/Documents",
+            "x \\\necho a # c \\\nrm y\nz",
+            "echo 'it''s' \\\n# c\\\nnext",
+            "echo \"$(echo x) # \\\n\" \\\ncat .env",
+            "echo ${x:- # } \\\n; rm z",
+            "a\\\n\\\\\n\\\nb",
+            "",
+            "\n\n",
+        ] {
+            let lines: Vec<&str> = command.split('\n').collect();
+            let (mut i, mut j) = (0, 0);
+            while i < lines.len() {
+                let fast = take_logical_line(&lines, &mut i);
+                let slow = take_logical_line_rescanning(&lines, &mut j);
+                assert_eq!((fast, i), (slow, j), "{command:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn take_logical_line_is_linear_in_continuations() {
+        // cadence-hooks#1084: 8,000 continuations took 1.6 s in release.
+        for line in ["x \\\n", "\"a\" \\\n", "\\\\\\\n"] {
+            let command = line.repeat(40_000);
+            let started = std::time::Instant::now();
+            let _ = logical_lines(&command);
+            let _ = split_segments(&command);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_segments_keeps_an_fd_duplication_whole() {
+        // cadence-hooks#848: `>&`/`<&` is one operator to bash.
+        for (command, want) in [
+            ("cargo test 2>&1 | tail", vec!["cargo test 2>&1", "tail"]),
+            ("echo x >&2 && rm f", vec!["echo x >&2", "rm f"]),
+            ("echo x 2>&- ; rm f", vec!["echo x 2>&-", "rm f"]),
+            ("read x <&0 & y", vec!["read x <&0", "y"]),
+            ("echo SECRET >& .env", vec!["echo SECRET >& .env"]),
+            (
+                "cd /wt 2>&1 & git commit",
+                vec!["cd /wt 2>&1", "git commit"],
+            ),
+            // An escaped `>` is a literal: the `&` still backgrounds.
+            ("echo \\>& rm f", vec!["echo \\>", "rm f"]),
+            // A blank between them: `>` then a background `&` (a bash syntax
+            // error either way), cut as before.
+            ("echo x > & y", vec!["echo x >", "y"]),
+            ("a >&& b", vec!["a >", "b"]),
+        ] {
+            assert_eq!(split_segments(command), want, "{command}");
+        }
+    }
+
     #[test]
     fn split_segments_escaped_space_is_not_a_word_boundary() {
         // `\ ` joins two halves of ONE word, so `a\ #x` is the single argument
@@ -12852,10 +13154,69 @@ mod tests {
     }
 
     #[test]
-    fn clobber_redirect_glued_closing_brace_stripped() {
-        // Glued directly (no separator before `}`) so it lands on the target
-        // token, unlike a `;`-separated close which is already a break char.
-        assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md"]);
+    fn clobber_redirect_glued_closing_brace_is_part_of_the_name() {
+        // cadence-hooks#1092: a `}` glued to a word is not a group closer, so
+        // bash writes `note.md}` (and, lacking a closer, rejects the group).
+        assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md}"]);
+    }
+
+    #[test]
+    fn redirect_targets_apply_the_closer_rule_to_parens_and_braces() {
+        // cadence-hooks#1092, measured against bash 5.2: an unquoted `)` is a
+        // metacharacter and ends the name; a glued `}` is part of it.
+        for (segment, want) in [
+            ("echo x > note}", "note}"),
+            ("echo x > x)", "x"),
+            ("{ echo a > f; }", "f"),
+            ("(echo a > f)", "f"),
+            ("{ (echo hi > .env)}", ".env"),
+            ("echo x > ${HOME}/.env", "${HOME}/.env"),
+            ("echo x > .e${N}", ".e${N}"),
+            ("echo x > \"a)\"", "a)"),
+            ("echo x > a\\)b", "a\\)b"),
+            ("echo x > a\\;b", "a\\;b"),
+        ] {
+            assert_eq!(clobber_redirect_targets(segment), vec![want], "{segment}");
+            assert_eq!(redirect_targets(segment), vec![want], "{segment}");
+        }
+    }
+
+    #[test]
+    fn redirect_targets_read_a_spaced_or_glued_fd_duplication_to_a_file() {
+        // cadence-hooks#849: `>& WORD` writes both streams to the FILE `WORD`
+        // unless WORD names a descriptor (digits) or is `-`.
+        for (segment, want) in [
+            ("echo SECRET >& .env", vec![".env"]),
+            ("echo SECRET >&.env", vec![".env"]),
+            ("echo x >& \"my file\"", vec!["my file"]),
+            ("echo x >&2", vec![]),
+            ("echo x 2>&1", vec![]),
+            ("echo x >& 2", vec![]),
+            ("echo x >&-", vec![]),
+            ("echo x 1>&2 >& .env.local", vec![".env.local"]),
+            ("echo x &> .env", vec![".env"]),
+        ] {
+            assert_eq!(redirect_targets(segment), want, "{segment}");
+            assert_eq!(clobber_redirect_targets(segment), want, "{segment}");
+        }
+        // `>>` stays excluded from the clobber set.
+        assert!(clobber_redirect_targets("echo x >> .env").is_empty());
+    }
+
+    #[test]
+    fn redirect_targets_keep_a_substitution_whole() {
+        // cadence-hooks#1106: the substitution's inner space is not the end of
+        // the name.
+        for (segment, want) in [
+            ("echo x > $(mktemp -d)/.env", "$(mktemp -d)/.env"),
+            ("echo x >$(pwd)/.env", "$(pwd)/.env"),
+            ("echo x > `pwd -P`/.env", "`pwd -P`/.env"),
+            ("echo x > $(echo \")\")/.env", "$(echo \")\")/.env"),
+        ] {
+            assert_eq!(redirect_targets(segment), vec![want], "{segment}");
+        }
+        // Unbalanced: the old reading, cut at the first blank.
+        assert_eq!(redirect_targets("echo x > $(mktemp -d"), vec!["$(mktemp"]);
     }
 
     // --- redirect_targets (all redirects, append INCLUDED) ---
@@ -14383,11 +14744,18 @@ mod tests {
             let out = command_segments(command);
             assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
         }
-        // Not plain enough to read with confidence: the token's fragment, as
-        // before.
+        // Quotes or nesting inside: the tokenizer now keeps a balanced
+        // unquoted substitution whole (cadence-hooks#1106), so the value is the
+        // whole span rather than the fragment up to its first space.
         for (command, expected) in [
-            ("D=$(mktemp -d \"$T/x\"); touch $D/a", "touch $(mktemp/a"),
-            ("D=$(echo $(pwd) x); touch $D/a", "touch $(echo/a"),
+            (
+                "D=$(mktemp -d \"$T/x\"); touch $D/a",
+                "touch \"$(mktemp -d \"$T/x\")\"/a",
+            ),
+            (
+                "D=$(echo $(pwd) x); touch $D/a",
+                "touch \"$(echo $(pwd) x)\"/a",
+            ),
         ] {
             let out = command_segments(command);
             assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
@@ -15353,8 +15721,10 @@ mod tests {
                 (">/dev/null git x".to_string(), None)
             ]
         );
-        // The default splitter is unchanged.
-        assert_eq!(split_segments_with_ops("a 2>&1").len(), 2);
+        // The default splitter keeps `>&`/`<&` (cadence-hooks#848) but still
+        // cuts before `&>`.
+        assert_eq!(split_segments_with_ops("a 2>&1").len(), 1);
+        assert_eq!(split_segments_with_ops("a &>/dev/null").len(), 2);
     }
 
     #[test]
