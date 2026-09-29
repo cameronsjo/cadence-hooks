@@ -126,8 +126,8 @@ fn rules_absence_line_from(config_dir: &Path) -> Option<String> {
     Some(
         "cadence-rules.md is NOT installed (rules/cadence/ under the Claude config dir) — \
          sessions on this machine run with none of the cadence doctrine (principles, plan \
-         execution, verification). Install it: the cadence-groundwork initializing-cadence \
-         skill (cadence#942)."
+         execution, verification). Claude: tell the user, and offer to install it with the \
+         cadence-groundwork initializing-cadence skill (cadence#942)."
             .to_string(),
     )
 }
@@ -287,7 +287,7 @@ pub fn run_start(
 /// itself (cadence-hooks#236).
 fn worktree_posture_line(cwd: &str) -> Option<String> {
     would_block_here(Path::new(cwd)).then(|| {
-        "Branch-mode repo, primary checkout: feature work starts in a worktree \
+        "Branch-mode repo, primary checkout: Claude, start feature work in a worktree \
          (EnterWorktree / git worktree add) — the first Edit/Write here will be blocked."
             .to_string()
     })
@@ -356,7 +356,7 @@ fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
         String::new()
     };
     Some(format!(
-        "Uncommitted living plan(s): {}{tail} — commit them (explicit-path git add); an \
+        "Uncommitted living plan(s): {}{tail} — Claude: commit them (explicit-path git add); an \
          uncommitted plan is invisible to every other session and checkout.",
         hits.join(", ")
     ))
@@ -488,6 +488,10 @@ mod machine_lines_tests {
                 .expect("missing rules file must draw the line");
             assert!(line.contains("cadence-rules.md is NOT installed"));
             assert!(line.contains("initializing-cadence"));
+            assert!(
+                line.contains("Claude: tell the user"),
+                "actor named (#358): {line}"
+            );
             // Same calendar day: the daily gate holds.
             assert_eq!(rules_absence_line_from(config.path()), None);
         });
@@ -978,6 +982,10 @@ mod tests {
             msg.contains("Uncommitted living plan(s): docs/plans/2026-07-25-x.md"),
             "uncommitted line present: {msg}"
         );
+        assert!(
+            msg.contains("Claude: commit them"),
+            "the imperative names its actor (#358): {msg}"
+        );
     }
 
     #[test]
@@ -1365,6 +1373,10 @@ mod tests {
         assert!(msg.contains("primary checkout"));
         assert!(msg.contains("EnterWorktree"));
         assert!(msg.contains("blocked"));
+        assert!(
+            msg.contains("Claude, start feature work in a worktree"),
+            "the imperative names its actor (#358): {msg}"
+        );
     }
 
     #[test]

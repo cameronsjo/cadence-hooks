@@ -303,7 +303,10 @@ impl FlipTarget {
     /// values disagree or one does not parse, or when a URL-shaped selector
     /// has no readable host: gh's target is then unknown, and staying silent
     /// is a deliberate fail-open allow (ADR-0001).
-    fn from_tokens(tokens: &[String]) -> Option<Self> {
+    ///
+    /// `pub` so the other flip-anchored nudges (`warn-stale-pr-body`,
+    /// `warn-stacked-base-delete`) resolve the PR the same hardened way.
+    pub fn from_tokens(tokens: &[String]) -> Option<Self> {
         let ship = ship_target(tokens);
         let selector = pr_selector(tokens);
         let mut repo_host: Option<String> = None;
@@ -705,9 +708,25 @@ fn changes_requested_sentence(
 /// The repo half of the GraphQL request: explicit `owner`/`name` values, or
 /// gh's `{owner}`/`{repo}` placeholders, which gh fills from the repo it
 /// resolves in the cwd.
-enum QueryRepo {
+pub enum QueryRepo {
     Named { owner: String, name: String },
     Placeholders,
+}
+
+impl QueryRepo {
+    /// The `(flag, owner, name)` field triple for `gh api graphql`: `-f`
+    /// sends a value raw, and gh fills a `{owner}`/`{repo}` placeholder only
+    /// in a `-F` field.
+    pub fn graphql_fields(&self) -> (&'static str, String, String) {
+        match self {
+            QueryRepo::Named { owner, name } => {
+                ("-f", format!("owner={owner}"), format!("name={name}"))
+            }
+            QueryRepo::Placeholders => {
+                ("-F", "owner={owner}".to_string(), "name={repo}".to_string())
+            }
+        }
+    }
 }
 
 /// Ask gh which PR a selector-less or non-numeric flip names:
@@ -742,26 +761,14 @@ fn resolve_with_pr_view(
     Some((QueryRepo::Named { owner, name }, number))
 }
 
-/// Core decision logic, injected with a `GhRunner` for testability. Returns
-/// `Some(message)` to nudge, `None` to stay silent (reviewed, or any
-/// fetch/parse/resolution failure — fail open).
+/// Which PR a flip names: its query repo and number, or `None` when that
+/// cannot be said with confidence (fail-open allow, ADR-0001). Callers vet
+/// hosts first ([`hosts_are_trusted`]); this may call `gh pr view`.
 ///
-/// The runner is expected to run gh in the session cwd, with the command's
-/// host, so the placeholder and `pr view` rows resolve the repo the flip
-/// itself would. `origin_host` is `origin`'s host from local git config, or
-/// `None` when it cannot be read.
-pub fn evaluate(
-    target: &FlipTarget,
-    origin_host: Option<&str>,
-    gh: &dyn GhRunner,
-) -> Option<String> {
-    // Fail-open allow (ADR-0001): this runs before the user approves the
-    // command, so a host only the command text names must not receive a
-    // request. Only `github.com` and origin's host are queried.
-    if !hosts_are_trusted(&target.named_hosts, origin_host) {
-        return None;
-    }
-    let (query_repo, pr_num) = match (&target.selector, &target.repo) {
+/// Shared with the other flip-anchored nudges so every one of them resolves
+/// the PR exactly the way this guard does.
+pub fn resolve_pr(target: &FlipTarget, gh: &dyn GhRunner) -> Option<(QueryRepo, u64)> {
+    Some(match (&target.selector, &target.repo) {
         // A URL names its own repo; gh ignores `-R` for it.
         (
             PrSelector::Url {
@@ -803,7 +810,29 @@ pub fn evaluate(
         // Fail-open allow (ADR-0001): an unknown flag or a lone `-` hides
         // which token is the PR, so no PR can be named with confidence.
         (PrSelector::Unreadable, _) => return None,
-    };
+    })
+}
+
+/// Core decision logic, injected with a `GhRunner` for testability. Returns
+/// `Some(message)` to nudge, `None` to stay silent (reviewed, or any
+/// fetch/parse/resolution failure — fail open).
+///
+/// The runner is expected to run gh in the session cwd, with the command's
+/// host, so the placeholder and `pr view` rows resolve the repo the flip
+/// itself would. `origin_host` is `origin`'s host from local git config, or
+/// `None` when it cannot be read.
+pub fn evaluate(
+    target: &FlipTarget,
+    origin_host: Option<&str>,
+    gh: &dyn GhRunner,
+) -> Option<String> {
+    // Fail-open allow (ADR-0001): this runs before the user approves the
+    // command, so a host only the command text names must not receive a
+    // request. Only `github.com` and origin's host are queried.
+    if !hosts_are_trusted(&target.named_hosts, origin_host) {
+        return None;
+    }
+    let (query_repo, pr_num) = resolve_pr(target, gh)?;
 
     // One request for the head, the author, and the reviews. Each `gh` call is
     // a process start plus a network round trip (~0.4s), and this used to make
@@ -811,15 +840,7 @@ pub fn evaluate(
     // nothing from the command is spliced into the query text.
     let query = format!("query={PR_STATE_QUERY}");
     let number = format!("number={pr_num}");
-    let (owner, name) = match &query_repo {
-        QueryRepo::Named { owner, name } => (format!("owner={owner}"), format!("name={name}")),
-        QueryRepo::Placeholders => ("owner={owner}".to_string(), "name={repo}".to_string()),
-    };
-    // `-f` sends a value raw. gh fills a placeholder only in a `-F` field.
-    let repo_flag = match query_repo {
-        QueryRepo::Named { .. } => "-f",
-        QueryRepo::Placeholders => "-F",
-    };
+    let (repo_flag, owner, name) = query_repo.graphql_fields();
     let state_json = gh.run(&[
         "api", "graphql", "-f", &query, repo_flag, &owner, repo_flag, &name, "-F", &number,
     ])?;
@@ -860,27 +881,18 @@ pub fn evaluate(
     Some(msg)
 }
 
-/// Nudges on `gh pr ready` / `gh pr merge` when the PR's head SHA has no
-/// reviewed signal.
-pub struct WarnUnreviewedReadyFlip;
+/// Where and how a flip-anchored nudge runs gh: the session cwd, `origin`'s
+/// host (local git config, `None` when unread or not needed), and the
+/// `GH_HOST` override to scope to the spawned process.
+pub struct FlipContext {
+    pub cwd: String,
+    pub origin_host: Option<String>,
+    pub env: Vec<(String, String)>,
+}
 
-impl Check for WarnUnreviewedReadyFlip {
-    fn name(&self) -> &str {
-        "warn-unreviewed-ready-flip"
-    }
-
-    fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(command) = input.command() else {
-            return CheckResult::allow();
-        };
-        let Some(tokens) = flip_segment_tokens(command) else {
-            return CheckResult::allow();
-        };
-        // Conflicting or unparseable repo values: fail-open allow (ADR-0001).
-        let Some(target) = FlipTarget::from_tokens(&tokens) else {
-            return CheckResult::allow();
-        };
-
+impl FlipContext {
+    /// Resolve the context for `target` from the hook payload.
+    pub fn for_target(target: &FlipTarget, input: &HookInput) -> Self {
         let cwd_fallback = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
@@ -912,14 +924,44 @@ impl Check for WarnUnreviewedReadyFlip {
             }
             origin_host.clone().filter(|h| h != "github.com")
         });
-        let gh = RealGhRunner {
-            cwd: PathBuf::from(cwd),
+        FlipContext {
+            cwd: cwd.to_string(),
+            origin_host,
             env: host
                 .map(|h| vec![("GH_HOST".to_string(), h)])
                 .unwrap_or_default(),
+        }
+    }
+}
+
+/// Nudges on `gh pr ready` / `gh pr merge` when the PR's head SHA has no
+/// reviewed signal.
+pub struct WarnUnreviewedReadyFlip;
+
+impl Check for WarnUnreviewedReadyFlip {
+    fn name(&self) -> &str {
+        "warn-unreviewed-ready-flip"
+    }
+
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let Some(command) = input.command() else {
+            return CheckResult::allow();
+        };
+        let Some(tokens) = flip_segment_tokens(command) else {
+            return CheckResult::allow();
+        };
+        // Conflicting or unparseable repo values: fail-open allow (ADR-0001).
+        let Some(target) = FlipTarget::from_tokens(&tokens) else {
+            return CheckResult::allow();
         };
 
-        match evaluate(&target, origin_host.as_deref(), &gh) {
+        let ctx = FlipContext::for_target(&target, input);
+        let gh = RealGhRunner {
+            cwd: PathBuf::from(&ctx.cwd),
+            env: ctx.env,
+        };
+
+        match evaluate(&target, ctx.origin_host.as_deref(), &gh) {
             Some(msg) => CheckResult::nudge(msg),
             None => CheckResult::allow(),
         }

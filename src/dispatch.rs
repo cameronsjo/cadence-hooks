@@ -959,6 +959,7 @@ fn log_schema_drift(drift: &[&'static str], namespace: Option<&str>, hook: Optio
 /// Both writes are fully fail-open and never perturb the verdict or exit code.
 fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, enforced: bool) {
     use cadence_hooks_core::deadline;
+    let probe = deadline::hit_tool().unwrap_or("git");
     if deadline::suppressed_block() && !enforced {
         cadence_hooks_metrics::log_failopen(
             "deadline_block_suppressed",
@@ -970,7 +971,7 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
             None,
         );
         eprintln!(
-            "cadence-hooks: {hook_name}: git probe deadline exceeded; a fail-closed block was degraded to allow (see failopen.jsonl)"
+            "cadence-hooks: {hook_name}: {probe} probe deadline exceeded; a fail-closed block was degraded to allow (see failopen.jsonl)"
         );
     } else if deadline::hit() && !enforced {
         cadence_hooks_metrics::log_failopen(
@@ -981,7 +982,7 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
             None,
         );
         eprintln!(
-            "cadence-hooks: {hook_name}: git probe deadline exceeded; git-backed checks degraded to fail-open"
+            "cadence-hooks: {hook_name}: {probe} probe deadline exceeded; {probe}-backed checks degraded to fail-open"
         );
     }
 }
