@@ -646,7 +646,13 @@ fn build_identity_message(
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for hit in hits {
         if seen.insert((hit.id.as_str(), hit.snippet.as_str())) {
-            out.push_str(&format!("  [{}] {}\n", hit.id, hit.snippet));
+            // The block message reaches the transcript: strip control
+            // characters and cap length, as the scan's stderr lines do (#828).
+            out.push_str(&format!(
+                "  [{}] {}\n",
+                stderr_safe(&hit.id),
+                stderr_safe(&hit.snippet)
+            ));
         }
     }
     out.push_str(
@@ -2770,6 +2776,22 @@ term = "acmecorp"
             let (_dir2, ident_only) = scan_fixture("see acmecorp here\n");
             assert_eq!(run_scan(Some(ident_only), Some("public".into()), false), 0);
         });
+    }
+
+    #[test]
+    fn identity_block_message_strips_control_characters() {
+        let hits = [identity::IdentityHit {
+            id: "T\u{1b}1".to_string(),
+            snippet: "acme\u{1b}[2J\u{9b}corp\r\u{7}".to_string(),
+            offset: 0,
+        }];
+        let msg = build_identity_message(&hits, identity::Mode::Enforce, false);
+        let hit_line = msg.lines().nth(1).expect("one hit line");
+        assert!(!hit_line.chars().any(char::is_control), "{hit_line:?}");
+        assert!(
+            hit_line.contains("acme") && hit_line.contains("corp"),
+            "{hit_line:?}"
+        );
     }
 
     #[test]
