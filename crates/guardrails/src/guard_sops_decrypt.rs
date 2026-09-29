@@ -92,8 +92,8 @@
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_segments,
-    command_word, peel_command_runners, skip_transparent_prefixes, split_segments_with_ops,
-    strip_group_wrappers, tokenize,
+    command_word, peel_command_runners, resolved_readings, skip_transparent_prefixes,
+    split_segments_with_ops, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -295,6 +295,17 @@ fn render_found(segment: &str, consumer: Option<&str>) -> String {
 /// hidden inside a substitution or a wrapper is still seen, and a `&&`/`;`
 /// chain is walked to its end rather than judged on its first command.
 fn first_unsafe_decrypt(script: &str, depth: usize, vouched: &Vouch) -> Option<String> {
+    // The script as written, then with its variables resolved and its literal
+    // `echo`/`printf` substitutions evaluated: `C=x; ${C:-sops} -d f` and
+    // `$(echo sops) -d f` run a decrypt the text never spells
+    // (cadence-hooks#1134, #1142).
+    std::iter::once(script.to_string())
+        .chain(resolved_readings(script))
+        .find_map(|reading| first_unsafe_decrypt_in(&reading, depth, vouched))
+}
+
+/// [`first_unsafe_decrypt`] over one reading of the script.
+fn first_unsafe_decrypt_in(script: &str, depth: usize, vouched: &Vouch) -> Option<String> {
     let segments = split_segments_with_ops(script);
 
     for (index, (segment, op)) in segments.iter().enumerate() {

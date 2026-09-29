@@ -4801,6 +4801,38 @@ fn shell_reads_stdin(argv: &[String]) -> bool {
     true
 }
 
+/// The `echo`/`printf` literals a pipeline hands a shell on stdin
+/// (`echo 'cat .env' | bash`, `printf '…' | sh -s`): each is a script, so its
+/// text is judged as the commands it is. The same reading
+/// [`command_level_reads`] gives the immediate producer of a `| bash` stage,
+/// shared with guards that judge a command by what it names
+/// (`guard-gh-dangerous`, cadence-hooks#544). A producer whose output is not a
+/// literal (`cat script.sh | bash`) yields nothing here.
+pub fn piped_shell_scripts(command: &str) -> Vec<String> {
+    if !command.contains('|') {
+        return Vec::new();
+    }
+    let mut scripts = Vec::new();
+    let mut previous_text: Option<String> = None;
+    let mut piped_in = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        let tokens = tokenize(&segment);
+        let mut text = None;
+        if let Some((word, argv)) = resolve_command(&tokens) {
+            match word.as_ref() {
+                "echo" | "printf" => text = literal_output(&word, argv),
+                w if SHELL_HEADS.contains(&w) && piped_in && shell_reads_stdin(argv) => {
+                    scripts.extend(previous_text.take());
+                }
+                _ => {}
+            }
+        }
+        previous_text = text;
+        piped_in = op == Some("|");
+    }
+    scripts
+}
+
 /// Is `script` a command string that is nothing but an expansion — text the
 /// guard cannot read statically (`$(cat f)`, `` `cat f` ``, `$cmd`)?
 fn script_is_opaque(script: &str) -> bool {

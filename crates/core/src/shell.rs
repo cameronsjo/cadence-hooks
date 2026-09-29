@@ -7804,6 +7804,59 @@ pub fn command_segments(command: &str) -> Vec<String> {
     out
 }
 
+/// The other readings of `script` as ONE script, for a walker that keeps the
+/// pipeline structure [`command_segments`] flattens away (a guard asking what
+/// the next segment in a pipeline is): the script with every visible variable
+/// resolved (a `${D:-word}` choice that turned on `D` being set taken the
+/// other way in the second reading) and every literal `echo`/`printf`
+/// substitution replaced by its output (cadence-hooks#1134, #1142). Empty when
+/// no reading differs from `script`; never contains `script` itself.
+pub fn resolved_readings(script: &str) -> Vec<String> {
+    if !script.contains('$') && !script.contains('`') {
+        return Vec::new();
+    }
+    if !ExpansionWork::charge(script.len()) {
+        return Vec::new();
+    }
+    let spent = std::cell::Cell::new(0);
+    let mut scope = AssignmentScope::root(&spent);
+    let evaluate = |text: &str| match static_subst::rewrite(text) {
+        Some(read) => read.evaluated.unwrap_or_else(|| text.to_string()),
+        None => text.to_string(),
+    };
+    let (mut primary, mut alternate) = (String::new(), String::new());
+    for (segment, op) in split_segments_with_ops(script) {
+        let (mut defaults, mut ambiguous) = (Vec::new(), false);
+        let expanded = apply_assignments(&segment, &scope, &mut defaults, false, &mut ambiguous);
+        let other = if ambiguous {
+            apply_assignments(&segment, &scope, &mut Vec::new(), true, &mut false)
+        } else {
+            expanded.clone()
+        };
+        for (name, value) in defaults {
+            scope.set(name, value);
+        }
+        for assignment in segment_assignments(&expanded) {
+            scope.assign(assignment);
+        }
+        for (out, text) in [(&mut primary, &expanded), (&mut alternate, &other)] {
+            out.push_str(&unmark(evaluate(text)));
+            if let Some(op) = op {
+                out.push(' ');
+                out.push_str(op);
+                out.push(' ');
+            }
+        }
+    }
+    let mut readings = Vec::new();
+    for reading in [primary, alternate] {
+        if reading != script && !readings.contains(&reading) {
+            readings.push(reading);
+        }
+    }
+    readings
+}
+
 thread_local! {
     static EXPANSION_WORK_LEFT: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
@@ -7961,7 +8014,12 @@ impl<'a> AssignmentScope<'a> {
             value,
             elements,
             append,
+            index,
         } = assignment;
+        if let Some(index) = index {
+            self.assign_element(&name, &index, value, append);
+            return;
+        }
         let Some(elements) = elements else {
             let value = match self.get(&name).filter(|_| append) {
                 Some(old) => format!("{old}{value}"),
@@ -7992,6 +8050,28 @@ impl<'a> AssignmentScope<'a> {
         if let Some(zero) = self.get(&key(0)).map(str::to_string) {
             self.set(name.clone(), zero);
         }
+        self.set(format!("{name}[*]"), joined.clone());
+        self.set(format!("{name}[@]"), joined);
+    }
+
+    /// `NAME[index]=value` (cadence-hooks#1134): the element is stored under
+    /// its own key, and the value joins `NAME[@]`/`NAME[*]` so a reference
+    /// whose index cannot be evaluated (`${m[k]}` on an associative array)
+    /// reads every element it might mean. Element 0 is `NAME` itself.
+    fn assign_element(&mut self, name: &str, index: &str, value: String, append: bool) {
+        let key = format!("{name}[{index}]");
+        let value = match self.get(&key).filter(|_| append) {
+            Some(old) => format!("{old}{value}"),
+            None => value,
+        };
+        self.set(key, value.clone());
+        if index == "0" {
+            self.set(name.to_string(), value.clone());
+        }
+        let joined = match self.get(&format!("{name}[@]")) {
+            Some(old) => format!("{old} {value}"),
+            None => value,
+        };
         self.set(format!("{name}[*]"), joined.clone());
         self.set(format!("{name}[@]"), joined);
     }
@@ -9536,6 +9616,9 @@ struct Assignment {
     /// `NAME+=value`: concatenate onto the current value (or append the
     /// elements) instead of replacing it.
     append: bool,
+    /// `NAME[index]=value`: the element this assignment sets, by its index
+    /// text (a number, or an associative array's key; cadence-hooks#1134).
+    index: Option<String>,
 }
 
 /// Builtins whose operands are assignments (cadence-hooks#1124): `local
@@ -9582,6 +9665,17 @@ fn segment_assignments(segment: &str) -> Vec<Assignment> {
             Some(base) => (base, true),
             None => (name, false),
         };
+        // `a[1]=v`, `m[key]=v`: an element assignment (cadence-hooks#1134).
+        let (name, index) = match name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+            Some((base, index))
+                if !index.is_empty()
+                    && index.len() <= 64
+                    && !index.contains(['[', ']', '$', '`', '(']) =>
+            {
+                (base, Some(index.to_string()))
+            }
+            _ => (name, None),
+        };
         if name.is_empty()
             || name.starts_with(|c: char| c.is_ascii_digit())
             || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -9614,6 +9708,7 @@ fn segment_assignments(segment: &str) -> Vec<Assignment> {
                 value: elements.join(" "),
                 elements: Some(elements),
                 append,
+                index: None,
             });
             continue;
         }
@@ -9638,6 +9733,7 @@ fn segment_assignments(segment: &str) -> Vec<Assignment> {
             value,
             elements: None,
             append,
+            index,
         });
     }
     out
@@ -9853,6 +9949,9 @@ impl ReferenceWalk<'_, '_> {
             }
             return Some((text, end));
         }
+        if chars.get(after_name) == Some(&'/') {
+            return self.pattern_substitution(chars, after_name, name, in_double, depth);
+        }
         let colon = usize::from(chars.get(after_name) == Some(&':'));
         let op = *chars.get(after_name + colon)?;
         if !matches!(op, '-' | '=' | '+' | '?') {
@@ -9903,6 +10002,87 @@ impl ReferenceWalk<'_, '_> {
                 text = word;
             }
         }
+        Some((text, end))
+    }
+}
+
+impl ReferenceWalk<'_, '_> {
+    /// `${NAME/pattern/replacement}`, `${NAME//…}`, `${NAME/#…}` and
+    /// `${NAME/%…}` on an assigned `NAME` (cadence-hooks#1134), read as
+    /// `(text, index past the closing brace)`.
+    ///
+    /// The result depends on whether the pattern matches the value, which the
+    /// walk can decide only for a literal pattern: there the substitution is
+    /// carried out. Every other pattern leaves the value, and either way the
+    /// REPLACEMENT is the candidate the `alternate` reading takes — a guard
+    /// judges both, so `D=x; cat ${D/x/.env}` reads `.env` whatever the
+    /// pattern turns out to match. `${NAME#…}`, `%` and `^^` stay
+    /// value-derived, as before.
+    fn pattern_substitution(
+        &mut self,
+        chars: &[char],
+        slash: usize,
+        name: &str,
+        in_double: bool,
+        depth: usize,
+    ) -> Option<(String, usize)> {
+        let value = self.assignments.get(name)?.to_string();
+        let close = parameter_word_end(chars, slash + 1, in_double, &mut self.scan_budget)?;
+        let end = close + 1;
+        let raw = &chars[slash + 1..close];
+        let (all, anchor, body) = match raw.first() {
+            Some('/') => (true, None, &raw[1..]),
+            Some(&a @ ('#' | '%')) => (false, Some(a), &raw[1..]),
+            _ => (false, None, raw),
+        };
+        let mut split = None;
+        let mut k = 0;
+        while k < body.len() {
+            match body[k] {
+                '\\' => k += 1,
+                '/' => {
+                    split = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let (pattern, replacement) = match split {
+            Some(k) => (&body[..k], &body[k + 1..]),
+            None => (body, &body[..0]),
+        };
+        let replacement: String = if depth < MAX_DEFAULT_WORD_DEPTH {
+            self.expand(replacement, depth + 1)
+        } else {
+            replacement.iter().collect()
+        };
+        *self.ambiguous = true;
+        let text = if self.alternate {
+            replacement
+        } else {
+            let pattern: String = pattern.iter().collect();
+            let literal = !pattern.is_empty()
+                && !pattern.contains(['*', '?', '[', '\\', '$', '`', '\'', '"']);
+            let replaced = if !literal {
+                value
+            } else if all {
+                value.replace(&pattern, &replacement)
+            } else {
+                match anchor {
+                    Some('#') => value
+                        .strip_prefix(&pattern)
+                        .map_or(value.clone(), |rest| format!("{replacement}{rest}")),
+                    Some(_) => value
+                        .strip_suffix(&pattern)
+                        .map_or(value.clone(), |rest| format!("{rest}{replacement}")),
+                    None => value.replacen(&pattern, &replacement, 1),
+                }
+            };
+            let mut text = String::new();
+            push_value(&mut text, &replaced, in_double);
+            text
+        };
         Some((text, end))
     }
 }

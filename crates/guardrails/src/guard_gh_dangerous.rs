@@ -9,10 +9,12 @@
 //! you own, because there is no undo.
 
 use crate::guard_gh_write::gh_argv;
+use cadence_hooks_cadence::prevent_secret_leaks::piped_shell_scripts;
 use cadence_hooks_core::shell::{
-    brace_expansion_overflows, command_segments, command_word, contains_ignoring_ascii_case,
-    fold_verb, gh_command_path, heredoc_introducers, logical_lines, may_spell_word, requote_words,
-    strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
+    MAX_WRAPPER_DEPTH, brace_expansion_overflows, carries_substitution, command_segments,
+    command_word, contains_ignoring_ascii_case, fold_verb, gh_command_path, heredoc_introducers,
+    logical_lines, may_spell_word, requote_words, strip_comments, strip_heredoc_bodies,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -284,7 +286,31 @@ impl Check for GhDangerousGuard {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
+        Self::judge(command, 0)
+    }
+}
 
+impl GhDangerousGuard {
+    /// Judge one command string. A literal piped into a shell is a script
+    /// (`echo 'gh repo delete o/r' | bash -s`), so its text is judged too,
+    /// within [`MAX_WRAPPER_DEPTH`] levels of literals piping literals
+    /// (cadence-hooks#544).
+    fn judge(command: &str, depth: usize) -> CheckResult {
+        let direct = Self::judge_text(command);
+        if direct.outcome == cadence_hooks_core::Outcome::Block || depth >= MAX_WRAPPER_DEPTH {
+            return direct;
+        }
+        for script in piped_shell_scripts(command) {
+            let piped = Self::judge(&script, depth + 1);
+            if piped.outcome == cadence_hooks_core::Outcome::Block {
+                return piped;
+            }
+        }
+        direct
+    }
+
+    /// The checks over one command text.
+    fn judge_text(command: &str) -> CheckResult {
         // Pre-filter on a folded copy, then match on the ORIGINAL text. The
         // fold belongs here and not in the patterns' nouns: `GH` is a spelling
         // the shell runs, `REPO DELETE` is not (cadence-hooks#488). A
@@ -293,7 +319,9 @@ impl Check for GhDangerousGuard {
         //
         // Nor may it be stricter than the shell's word building: `$'\x67h'`
         // and `g''h` run `gh` from text without the substring (#1103).
-        if !may_spell_word(command, "gh") {
+        // A substitution can print the word (`$(echo g)h repo delete`), which
+        // the segment pass below reads evaluated (cadence-hooks#1142).
+        if !may_spell_word(command, "gh") && !carries_substitution(command) {
             return CheckResult::allow();
         }
 
