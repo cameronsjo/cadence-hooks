@@ -397,6 +397,8 @@ enum GuardrailsCommands {
     WarnMainBranch,
     /// Warn when dispatching a subagent from main while a sibling worktree exists
     WarnSubagentWorktree,
+    /// Warn on Agent/Task dispatch traps: omitted model, fork model override, unisolated execution brief
+    WarnAgentDispatch,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
@@ -636,6 +638,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
+            GuardrailsCommands::WarnAgentDispatch => "warn-agent-dispatch",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
@@ -866,6 +869,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::WarnSubagentWorktree => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree),
+                pre,
+            ),
+            GuardrailsCommands::WarnAgentDispatch => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_agent_dispatch::WarnAgentDispatch),
                 pre,
             ),
             GuardrailsCommands::WarnBranchBase => CheckPlan::new(

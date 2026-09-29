@@ -415,6 +415,15 @@ pub struct ToolInput {
     /// means the spawn gets a fresh agent-owned worktree; absent means the
     /// subagent inherits the spawning session's working directory.
     pub isolation: Option<String>,
+    /// Agent/Task tool: the dispatch prompt (the subagent's brief). Live-probed
+    /// on the PreToolUse wire payload (claude-code 2.1.271, cadence-hooks#374).
+    /// Untrusted free text: never echo it into a hook message.
+    pub prompt: Option<String>,
+    /// Agent/Task tool: the short dispatch label (`description`). Untrusted.
+    pub description: Option<String>,
+    /// Agent/Task tool: the model override for the spawn. Absent means the
+    /// subagent inherits (or its agent definition decides).
+    pub model: Option<String>,
     /// Skill tool: the invoked skill id (e.g. `cadence:attune`).
     pub skill: Option<String>,
     /// Skill tool: the skill's argument string. NEVER logged raw — only a
@@ -600,6 +609,9 @@ const TOOL_INPUT_KEYS: &[&str] = &[
     "questions",
     "subagent_type",
     "isolation",
+    "prompt",
+    "description",
+    "model",
     "skill",
     "args",
     "plan",
@@ -1137,6 +1149,25 @@ impl HookInput {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.subagent_type.as_deref())
+    }
+
+    /// The dispatch prompt of an Agent/Task spawn, if carried
+    /// (cadence-hooks#374). Untrusted free text: read it, never echo it.
+    pub fn agent_prompt(&self) -> Option<&str> {
+        self.tool_input.as_ref().and_then(|ti| ti.prompt.as_deref())
+    }
+
+    /// The short dispatch label (`description`) of an Agent/Task spawn, if
+    /// carried. Untrusted free text.
+    pub fn agent_description(&self) -> Option<&str> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.description.as_deref())
+    }
+
+    /// The `model` override of an Agent/Task spawn, if set.
+    pub fn agent_model(&self) -> Option<&str> {
+        self.tool_input.as_ref().and_then(|ti| ti.model.as_deref())
     }
 
     /// The content being written (Write tool) or the replacement text (Edit tool).
@@ -3485,6 +3516,38 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.subagent_type(), None);
         assert_eq!(input.isolation(), None);
+    }
+
+    #[test]
+    fn deserialize_agent_prompt_description_model() {
+        // Shape captured live from a PreToolUse Agent payload (#374).
+        let table = [
+            (
+                r#"{"tool_name":"Agent","tool_input":{"description":"Ping","prompt":"reply ping","subagent_type":"general-purpose","model":"haiku"}}"#,
+                Some("reply ping"),
+                Some("Ping"),
+                Some("haiku"),
+            ),
+            (
+                r#"{"tool_name":"Agent","tool_input":{"subagent_type":"fork"}}"#,
+                None,
+                None,
+                None,
+            ),
+            // Wrong-typed values are salvaged to None, not fatal.
+            (
+                r#"{"tool_name":"Agent","tool_input":{"prompt":5,"model":["x"],"description":"d"}}"#,
+                None,
+                Some("d"),
+                None,
+            ),
+        ];
+        for (json, prompt, description, model) in table {
+            let input = HookInput::from_json(json).unwrap();
+            assert_eq!(input.agent_prompt(), prompt, "{json}");
+            assert_eq!(input.agent_description(), description, "{json}");
+            assert_eq!(input.agent_model(), model, "{json}");
+        }
     }
 
     // --- Path normalization ---
