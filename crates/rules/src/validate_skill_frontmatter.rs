@@ -365,19 +365,112 @@ fn strip_inline_comment(value: &str) -> &str {
 /// it would lock edits to skills nobody is touching the description of.
 const DESCRIPTION_MAX_CHARS: usize = 1024;
 
-/// The Description Format Rules that are mechanically checkable (#613): a
-/// single YAML line, within the spec length cap, carrying a "Use when/after"
-/// trigger clause (in `description`, or in `when_to_use`, which the platform
-/// appends to it).
-///
-/// A block scalar (`>-`, `|`) or a continuation line silently fragments
-/// routing: the listing shows the indicator or the first line only.
-fn description_problems(content: &str, fields: &[(String, String)]) -> Vec<String> {
-    let mut problems = Vec::new();
+/// A problem found in a document: a stable `kind` (used to decide whether an
+/// edit INTRODUCED it) and the message shown to the user.
+type Problem = (&'static str, String);
+
+/// Keep only the problems whose kind the on-disk document did not already
+/// have. Every new blocking rule is introduced-only: a file that already
+/// violates stays editable, so a rule can never lock a file for an unrelated
+/// edit (ticking a plan checkbox, fixing a typo). No readable on-disk file
+/// (a new Write) means every problem counts as introduced.
+fn introduced(now: Vec<Problem>, before: Option<Vec<Problem>>) -> Vec<Problem> {
+    let before = before.unwrap_or_default();
+    now.into_iter()
+        .filter(|(kind, _)| !before.iter().any(|(k, _)| k == kind))
+        .collect()
+}
+
+/// The text of a scalar value with quoting resolved BEFORE any comment strip:
+/// inside quotes a `#` is content (`"Parses # headings"`, `'#12'`), and a
+/// comment can only follow the closing quote. An unclosed quote yields the
+/// rest of the line, without the quote.
+fn scalar_text(raw: &str) -> String {
+    let raw = raw.trim();
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(q @ ('"' | '\'')) => {
+            let mut out = String::new();
+            let mut it = raw[1..].chars().peekable();
+            while let Some(c) = it.next() {
+                if q == '"' && c == '\\' {
+                    if let Some(n) = it.next() {
+                        out.push(n);
+                    }
+                } else if c == q {
+                    if q == '\'' && it.peek() == Some(&'\'') {
+                        it.next();
+                        out.push('\'');
+                    } else {
+                        return out;
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        _ => strip_inline_comment(raw).to_string(),
+    }
+}
+
+/// Text of a top-level frontmatter field, including a block scalar's or
+/// continuation lines' indented text, so a `when_to_use: >-` value is read
+/// before the trigger check runs.
+fn field_full_text(content: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.first() != Some(&"---") {
+        return None;
+    }
+    let end = lines[1..].iter().position(|l| *l == "---")? + 1;
+    let prefix = format!("{key}:");
+    let i = (1..end).find(|&i| lines[i].starts_with(&prefix))?;
+    let raw = lines[i][prefix.len()..].trim();
+    let mut text = if raw.starts_with('|') || raw.starts_with('>') {
+        String::new()
+    } else {
+        scalar_text(raw)
+    };
+    for l in lines[i + 1..end]
+        .iter()
+        .take_while(|l| l.starts_with(char::is_whitespace) || l.trim().is_empty())
+    {
+        text.push(' ');
+        text.push_str(l.trim());
+    }
+    Some(text)
+}
+
+static TRIGGER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:use\b(?: this(?: skill)?| it| proactively)?\s+(?:when|whenever|after|before)|invoke when)\b",
+    )
+    .expect("pattern should compile")
+});
+
+/// Does `text` carry a trigger clause ("Use when", "Use this skill after",
+/// "Invoke when" …) that is not negated by a preceding not / don't / never?
+fn has_trigger_clause(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    TRIGGER_PATTERN.find_iter(&lower).any(|m| {
+        let before = lower[..m.start()].trim_end();
+        !(before.ends_with("not")
+            || before.ends_with("don't")
+            || before.ends_with("dont")
+            || before.ends_with("never"))
+    })
+}
+
+/// The BLOCKING Description Format Rules (#613): a single YAML line — no block
+/// scalar, no continuation line, no multi-line quoted string — within the spec
+/// length cap. A block scalar or continuation fragments skill routing: the
+/// listing shows the indicator or the first line only.
+fn description_problems(content: &str, fields: &[(String, String)]) -> Vec<Problem> {
+    let mut problems: Vec<Problem> = Vec::new();
     let Some((_, raw)) = fields.iter().find(|(k, _)| k == "description") else {
         return problems; // missing-field error is reported elsewhere
     };
-    let value = strip_inline_comment(raw);
+    let raw = raw.trim();
 
     let lines: Vec<&str> = content.lines().collect();
     let end = lines
@@ -390,67 +483,90 @@ fn description_problems(content: &str, fields: &[(String, String)]) -> Vec<Strin
         .position(|l| l.starts_with("description:"))
         .map(|p| p + 1);
     let continued = idx.is_some_and(|i| {
-        lines.get(i + 1).is_some_and(|next| {
-            i + 1 < end && next.starts_with(char::is_whitespace) && !next.trim().is_empty()
-        })
+        i + 1 < end
+            && lines.get(i + 1).is_some_and(|next| {
+                next.starts_with(char::is_whitespace) && !next.trim().is_empty()
+            })
     });
 
-    if value.starts_with('|') || value.starts_with('>') {
-        problems.push(
+    if raw.starts_with('|') || raw.starts_with('>') {
+        problems.push((
+            "description-shape",
             "description must be a single YAML line — a block scalar ('>-', '|') fragments skill routing".into(),
-        );
+        ));
         return problems;
     }
     if continued {
-        problems.push(
-            "description must be a single YAML line — an indented continuation line is not part of the routing text".into(),
-        );
+        problems.push((
+            "description-shape",
+            "description must be a single YAML line — an indented continuation line, including a multi-line quoted string, is not part of the routing text".into(),
+        ));
         return problems;
     }
 
-    let unquoted = value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-        .unwrap_or(value);
-    let len = unquoted.chars().count();
+    let len = scalar_text(raw).chars().count();
     if len > DESCRIPTION_MAX_CHARS {
-        problems.push(format!(
-            "description is {len} characters — the spec cap is {DESCRIPTION_MAX_CHARS}"
+        problems.push((
+            "description-length",
+            format!("description is {len} characters — the spec cap is {DESCRIPTION_MAX_CHARS}"),
         ));
-    }
-
-    let has_trigger = |text: &str| {
-        let lower = text.to_ascii_lowercase();
-        lower.contains("use when") || lower.contains("use after")
-    };
-    let when_to_use = fields
-        .iter()
-        .find(|(k, _)| k == "when_to_use")
-        .map_or("", |(_, v)| v.as_str());
-    if !unquoted.is_empty() && !has_trigger(unquoted) && !has_trigger(when_to_use) {
-        problems.push(
-            "description has no trigger clause — say when to use the skill ('Use when …' / 'Use after …')".into(),
-        );
     }
     problems
 }
 
+/// The trigger-clause rule is a NUDGE, never a block: it also reaches
+/// third-party and synced first-party skills ("Use this skill when …") that
+/// cannot be gated. Accepts the clause in `description` or `when_to_use`.
+fn trigger_nudge(content: &str, fields: &[(String, String)]) -> Option<Problem> {
+    let (_, raw) = fields.iter().find(|(k, _)| k == "description")?;
+    if raw.trim().is_empty() || raw.trim().starts_with(['|', '>']) {
+        return None; // shape error reported instead
+    }
+    let mut text = scalar_text(raw);
+    if let Some(w) = field_full_text(content, "when_to_use") {
+        text.push(' ');
+        text.push_str(&w);
+    }
+    (!has_trigger_clause(&text)).then(|| {
+        (
+            "description-trigger",
+            "description has no trigger clause — say when to use the skill ('Use when …' / 'Use after …' / 'Use before …')".to_string(),
+        )
+    })
+}
+
+/// Length of a code-fence marker line (`` ``` `` or `~~~`, three or more of
+/// one char), with the marker char.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let t = line.trim_start();
+    let c = t.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let n = t.chars().take_while(|x| *x == c).count();
+    (n >= 3).then_some((c, n))
+}
+
 /// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
-/// and bypasses conditional activation. Tokens inside fenced blocks or inline
-/// code spans are mentions, not references, and are skipped — the leniency
-/// that lets the rule be documented; the token must also start a word so
-/// `user@skills/x` does not match.
+/// and bypasses conditional activation. Tokens inside fenced blocks, indented
+/// code, or inline code spans are mentions, not references, and are skipped —
+/// the leniency that lets the rule be documented. A fence closes only on the
+/// same marker char at least as long as the opener. The token must start a
+/// word (`user@skills/x` does not match) and loses trailing `.,;:)`.
 fn force_load_refs(content: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let mut in_fence = false;
+    let mut fence: Option<(char, usize)> = None;
     for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        if let Some((c, n)) = fence {
+            if fence_marker(line).is_some_and(|(c2, n2)| c2 == c && n2 >= n)
+                && line.trim().chars().all(|x| x == c)
+            {
+                fence = None;
+            }
             continue;
         }
-        if in_fence {
+        if let Some(open) = fence_marker(line) {
+            fence = Some(open);
+            continue;
+        }
+        if line.starts_with("    ") || line.starts_with('\t') {
             continue;
         }
         let mut in_code = false;
@@ -464,7 +580,11 @@ fn force_load_refs(content: &str) -> Vec<String> {
                 && prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '.' | '-')))
             {
                 let token: String = rest.chars().take_while(|ch| !ch.is_whitespace()).collect();
-                refs.push(token);
+                refs.push(
+                    token
+                        .trim_end_matches(['.', ',', ';', ':', ')'])
+                        .to_string(),
+                );
             }
             prev = Some(c);
             rest = &rest[c.len_utf8()..];
@@ -518,49 +638,74 @@ fn check_agent(content: &str) -> CheckResult {
 
 /// Living-plan frontmatter shape (#607): producer tuple as FLAT keys in one
 /// frontmatter block above the title, never a nested `provenance:` block. A
-/// plan with no frontmatter at all predates the contract and is allowed — it
-/// cannot be told from a hand-written doc.
-fn check_plan(content: &str) -> CheckResult {
+/// plan with no frontmatter at all predates the contract and is not checked.
+/// The fenced-block rule looks only at fences BEFORE the first heading, so a
+/// plan body can document the rule.
+fn plan_problems(content: &str) -> Vec<Problem> {
     let lines: Vec<&str> = content.lines().collect();
+    let mut errors: Vec<Problem> = Vec::new();
     if lines.first() != Some(&"---") {
-        return CheckResult::allow();
+        return errors;
     }
     let Some(end) = lines[1..].iter().position(|l| *l == "---").map(|p| p + 1) else {
-        return CheckResult::allow();
+        return errors;
     };
-    let mut errors = Vec::new();
-    if lines[1..end]
-        .iter()
-        .any(|l| l.trim_end() == "provenance:" || l.starts_with("provenance:"))
-    {
-        errors.push("a 'provenance:' key in frontmatter — a plan carries the producer tuple as flat keys (date, session_id, model, harness, machine)");
+    if lines[1..end].iter().any(|l| l.starts_with("provenance:")) {
+        errors.push((
+            "plan-provenance-key",
+            "a 'provenance:' key in frontmatter — a plan carries the producer tuple as flat keys (date, session_id, model, harness, machine)".into(),
+        ));
     }
     if lines[end + 1..].iter().find(|l| !l.trim().is_empty()) == Some(&"---") {
-        errors.push("a second frontmatter block — a plan has exactly one, above the title");
+        errors.push((
+            "plan-second-frontmatter",
+            "a second frontmatter block — a plan has exactly one, above the title".into(),
+        ));
     }
-    let mut in_fence = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut first_in_fence = false;
     for line in &lines[end + 1..] {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            first_in_fence = in_fence;
+        if let Some((c, n)) = fence {
+            if fence_marker(line).is_some_and(|(c2, n2)| c2 == c && n2 >= n)
+                && line.trim().chars().all(|x| x == c)
+            {
+                fence = None;
+            } else if first_in_fence && !line.trim().is_empty() {
+                first_in_fence = false;
+                if line.trim_end() == "provenance:" {
+                    errors.push((
+                        "plan-fenced-provenance",
+                        "a fenced nested 'provenance:' block above the first heading — plans use flat frontmatter keys instead".into(),
+                    ));
+                }
+            }
             continue;
         }
-        if in_fence && first_in_fence && !line.trim().is_empty() {
-            first_in_fence = false;
-            if line.trim_end() == "provenance:" {
-                errors.push(
-                    "a fenced nested 'provenance:' block — plans use flat frontmatter keys instead",
-                );
-            }
+        if let Some(open) = fence_marker(line) {
+            fence = Some(open);
+            first_in_fence = true;
+        } else if line.starts_with('#') {
+            break; // first heading: fences below it are body content
         }
     }
+    errors
+}
+
+fn check_plan(path: &str, content: &str) -> CheckResult {
+    let before = std::fs::read_to_string(path)
+        .ok()
+        .map(|old| plan_problems(&old));
+    let errors = introduced(plan_problems(content), before);
     if errors.is_empty() {
         CheckResult::allow()
     } else {
         CheckResult::block(format!(
             "Living-plan frontmatter validation failed: {}",
-            errors.join("; ")
+            errors
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect::<Vec<_>>()
+                .join("; ")
         ))
     }
 }
@@ -592,7 +737,7 @@ impl Check for ValidateSkillFrontmatter {
         };
 
         match file_type {
-            FileType::Plan => return check_plan(&content),
+            FileType::Plan => return check_plan(&path, &content),
             FileType::Agent => return check_agent(&content),
             _ => {}
         }
@@ -602,6 +747,7 @@ impl Check for ValidateSkillFrontmatter {
         };
 
         let mut errors = Vec::new();
+        let mut nudge: Option<String> = None;
 
         // Check for unknown fields
         for (key, _) in &fields {
@@ -669,7 +815,24 @@ impl Check for ValidateSkillFrontmatter {
                     }
                 }
 
-                errors.extend(description_problems(&content, &fields));
+                let before = std::fs::read_to_string(&path).ok();
+                let before_fields = before.as_deref().and_then(extract_frontmatter);
+                errors.extend(
+                    introduced(
+                        description_problems(&content, &fields),
+                        before_fields
+                            .as_deref()
+                            .map(|f| description_problems(before.as_deref().unwrap_or(""), f)),
+                    )
+                    .into_iter()
+                    .map(|(_, m)| m),
+                );
+                let old_nudge = before_fields
+                    .as_deref()
+                    .and_then(|f| trigger_nudge(before.as_deref().unwrap_or(""), f));
+                if old_nudge.is_none() {
+                    nudge = trigger_nudge(&content, &fields).map(|(_, m)| m);
+                }
             }
             FileType::Command => {
                 if fields.iter().any(|(k, _)| k == "name") {
@@ -687,7 +850,10 @@ impl Check for ValidateSkillFrontmatter {
         errors.extend(introduced_force_loads(&path, &content));
 
         if errors.is_empty() {
-            CheckResult::allow()
+            match nudge {
+                Some(message) => CheckResult::nudge(message),
+                None => CheckResult::allow(),
+            }
         } else {
             CheckResult::block(format!(
                 "Frontmatter validation failed: {}",
@@ -1861,10 +2027,84 @@ mod tests {
     }
 
     #[test]
-    fn description_without_trigger_clause_blocks() {
+    fn description_without_trigger_clause_nudges_not_blocks() {
         let (o, m) = skill_verdict("description: Liveness-gated reclaim of cruft");
-        assert_eq!(o, cadence_hooks_core::Outcome::Block);
+        assert_eq!(o, cadence_hooks_core::Outcome::Nudge);
         assert!(m.contains("no trigger clause"), "{m}");
+    }
+
+    #[test]
+    fn trigger_matcher_accepts_real_forms_and_rejects_negations() {
+        for yes in [
+            "Use when testing",
+            "Reclaims cruft. Use after a crash.",
+            "Audits usage. USE BEFORE shipping.",
+            "Use this skill when the user asks",
+            "Use proactively whenever code changes",
+            "Invoke when reviewing",
+        ] {
+            assert!(has_trigger_clause(yes), "{yes}");
+        }
+        for no in [
+            "Do not use when offline",
+            "Don't use after merge",
+            "Never use before review",
+            "Fixed because when it broke",
+            "Reclaims cruft",
+            "Misuse when",
+        ] {
+            assert!(!has_trigger_clause(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn quoted_hash_is_content_not_a_comment() {
+        // Length and trigger both read the unquoted text.
+        assert_eq!(
+            scalar_text("\"Parses # headings. Use when x\""),
+            "Parses # headings. Use when x"
+        );
+        assert_eq!(scalar_text("'#12'"), "#12");
+        assert_eq!(scalar_text("'it''s'"), "it's");
+        assert_eq!(scalar_text("\"a\" # comment"), "a");
+        assert_eq!(scalar_text("plain # comment"), "plain");
+        let (o, _) = skill_verdict("description: \"Parses # headings. Use when testing\"");
+        assert_eq!(o, cadence_hooks_core::Outcome::Allow);
+        let (o, _) = skill_verdict("description: 'Tracks #12. Use when testing'");
+        assert_eq!(o, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn block_scalar_when_to_use_supplies_the_trigger() {
+        let (o, _) =
+            skill_verdict("description: Reclaims cruft\nwhen_to_use: >-\n  Use when the lane dies");
+        assert_eq!(o, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn already_violating_skill_stays_editable_but_new_violation_blocks() {
+        let old = "---\nname: my-skill\ndescription: >-\n  Use when testing\n---\nBody line.\n";
+        let (_dir, path) = on_disk_skill(old);
+        let ok =
+            ValidateSkillFrontmatter.run(&make_edit(&path, "Body line.", "Body line, edited."));
+        assert_eq!(ok.outcome, cadence_hooks_core::Outcome::Allow);
+        // Introducing a DIFFERENT violation (length) on top still blocks.
+        let long = "x".repeat(DESCRIPTION_MAX_CHARS + 1);
+        let (_dir2, path2) = on_disk_skill(VALID_SKILL);
+        let bad = ValidateSkillFrontmatter.run(&make_edit(
+            &path2,
+            "description: Use when testing",
+            &format!("description: Use when {long}"),
+        ));
+        assert_eq!(bad.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn already_missing_trigger_is_not_renudged_on_unrelated_edit() {
+        let old = "---\nname: my-skill\ndescription: Reclaims cruft\n---\nBody line.\n";
+        let (_dir, path) = on_disk_skill(old);
+        let r = ValidateSkillFrontmatter.run(&make_edit(&path, "Body line.", "Edited."));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -1872,8 +2112,10 @@ mod tests {
         for fm in [
             "description: Use when testing",
             "description: Reclaims cruft. Use after a crash.",
+            "description: Audits usage. USE BEFORE shipping.",
             "description: \"use WHEN quoted\"",
             "description: Reclaims cruft\nwhen_to_use: Use when the lane dies",
+            "description: Audits usage. USE BEFORE shipping.",
         ] {
             assert_eq!(
                 skill_verdict(fm).0,
@@ -1996,11 +2238,52 @@ mod tests {
     }
 
     #[test]
-    fn plan_fenced_provenance_block_blocks_but_other_fences_pass() {
-        let bad = "---\nstatus: planned\n---\n# Plan\n\n```yaml\nprovenance:\n  date: x\n```\n";
+    fn plan_fenced_provenance_above_first_heading_blocks_but_body_docs_pass() {
+        let bad = "---\nstatus: planned\n---\n\n```yaml\nprovenance:\n  date: x\n```\n\n# Plan\n";
         assert_eq!(plan_verdict(bad).0, cadence_hooks_core::Outcome::Block);
-        let fine = "---\nstatus: planned\n---\n# Plan\n\n```yaml\nother: 1\n```\n";
+        // Below the first heading a plan may document the rule.
+        let doc = "---\nstatus: planned\n---\n# Plan\n\n```yaml\nprovenance:\n  date: x\n```\n";
+        assert_eq!(plan_verdict(doc).0, cadence_hooks_core::Outcome::Allow);
+        let fine = "---\nstatus: planned\n---\n\n```yaml\nother: 1\n```\n# Plan\n";
         assert_eq!(plan_verdict(fine).0, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn already_violating_plan_stays_editable_but_new_violation_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/plans")).unwrap();
+        let path = as_hook_path(&dir.path().join("docs/plans/2026-09-29-x.md"));
+        let legacy = "---\nstatus: planned\n---\n---\ndate: x\n---\n# Plan\n- [ ] task\n";
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(classify_path(&path), FileType::Plan);
+        let tick = ValidateSkillFrontmatter.run(&make_edit(&path, "- [ ] task", "- [x] task"));
+        assert_eq!(tick.outcome, cadence_hooks_core::Outcome::Allow);
+        // Adding a different violation to the same file still blocks.
+        let bad = ValidateSkillFrontmatter.run(&make_edit(
+            &path,
+            "status: planned",
+            "status: planned\nprovenance:\n  date: x",
+        ));
+        assert_eq!(bad.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_load_tokens_lose_trailing_punctuation_and_fences_match_marker_and_length() {
+        assert_eq!(
+            force_load_refs("see (@skills/a/SKILL.md)."),
+            vec!["@skills/a/SKILL.md"]
+        );
+        assert_eq!(
+            force_load_refs("@skills/a, @skills/b;"),
+            vec!["@skills/a", "@skills/b"]
+        );
+        // A ~~~ inside a ``` fence, or a shorter ``` inside a longer one, does not close it.
+        assert!(force_load_refs("```\n~~~\n@skills/x\n```\n").is_empty());
+        assert!(force_load_refs("````\n```\n@skills/x\n````\n").is_empty());
+        // After the fence closes, prose counts again.
+        assert_eq!(force_load_refs("```\nx\n```\n@skills/y"), vec!["@skills/y"]);
+        // Indented code is code.
+        assert!(force_load_refs("    @skills/x\n").is_empty());
     }
 
     #[test]
