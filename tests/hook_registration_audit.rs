@@ -2684,6 +2684,7 @@ fn hook_event_types_match_hooks_json() {
 /// (`<plugin> <subcommand>` -> allowed hooks.json event keys)
 fn multi_event_hooks() -> BTreeMap<String, Vec<String>> {
     let out = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+        .env_remove("CLAUDE_CODE_REMOTE")
         .args(["manifest", "--format", "json"])
         .output()
         .expect("run `cadence-hooks manifest --format json`");

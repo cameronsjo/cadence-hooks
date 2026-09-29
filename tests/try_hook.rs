@@ -15,6 +15,7 @@ fn cadence_hooks() -> Command {
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_REMOTE");
     // A Claude session's own session root and config dir must never reach a
     // hook this suite drives: `persist-plan-approval` resolves its destination
     // from both (cadence-hooks#1021), so inheriting them would let `make ci`

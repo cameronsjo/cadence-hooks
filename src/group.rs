@@ -99,6 +99,12 @@ pub(crate) fn run(specs: &[String]) -> ! {
             ),
             BypassState::Bypassed | BypassState::Enforced => {}
         }
+        // Cloud sessions: a self-disabled member is skipped like a disabled one.
+        // (No hook declares BlockWithReason yet; when one does, a group needs its
+        // own semantics for it rather than this skip.)
+        if crate::registry::remote_gate(name, cadence_hooks_core::remote::is_remote()).is_some() {
+            continue;
+        }
         members.push(GroupMember { hook: name, plan });
     }
     dispatch::run_logged_group(members, notices);

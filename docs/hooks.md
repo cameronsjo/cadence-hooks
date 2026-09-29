@@ -9,6 +9,19 @@ try <namespace> <hook>` to see any hook run against a sample payload (see
 For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 [Hook Protocol](../README.md#hook-protocol) in the README.
 
+## Remote policy (cloud sessions)
+
+Under `CLAUDE_CODE_REMOTE=true` (Claude Code on the web, routines) every hook
+follows the **Remote** column of the tables below: `run` behaves as it does
+locally; `self-disable` exits 0 with no output before reading stdin;
+`block-with-reason` exits 2 (none use it yet). Declared per hook in
+`src/registry.rs`, where each entry carries a one-line rationale; a hook without
+one does not compile. `CADENCE_BYPASS` keeps its meaning. Two hooks also adapt
+while running: `enforcement-status` emits one `cadence-hooks: ARMED vX.Y.Z` or
+`cadence-hooks: INERT (allowed owners not configured)` line at SessionStart
+(keyed on `CADENCE_ALLOWED_OWNERS`), and `warn-commit-provenance` stamps
+`Machine: cloud`. `manifest --format json` exports the policy as `remote`.
+
 ## Wiring prefilters — what a hooks.json `if:` actually does
 
 A plugin's `hooks.json` may gate a hook behind an `if:` filter (`"if": "Bash(*gh pr create*)"`). It is a **cost filter, not a correctness filter**: it decides whether the binary spawns, never what the binary decides. Every precision claim in this catalog belongs to the binary; assume the prefilter is wrong in both directions and write the check so that is safe.
@@ -65,29 +78,29 @@ Rules for wiring:
 
 ## cadence
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations |
-| `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK |
-| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
-| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files |
-| `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits |
-| `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
-| `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
-| `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
-| `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
-| `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
-| `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
-| `warn-instruction-narrative` | PreToolUse (Write, Edit, MultiEdit) | Nudge when an edit to `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` adds narrative: 3+ past-event markers (ISO date, `measured`, `incident`, …), or a paragraph past 8 sentences or 1200 characters (fences and table rows stripped) that carries a marker. A pointer phrase (`commit history`, `see`, …) clears both; length alone never fires. Judges only added lines |
-| `warn-live-memory-write` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a direct write to live auto-memory (`<config dir>/projects/<slug>/memory/`) while no fresh dream run lock (`<config dir>/cadence/dreams/<slug>/.dream-lock`, under 6 hours old) is held |
-| `warn-plugin-root-cruft` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a write under `plugins/<name>/docs/` or `plugins/<name>/scripts/` when the repo's `.claude-plugin/marketplace.json` declares `./plugins/<name>` (skill-nested `scripts/` never match) |
-| `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
-| `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
-| `audit-runner-pool` | PostToolUse (Write, Edit, MultiEdit) | After an edit to `.github/workflows/*.yml`/`*.yaml`, run `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` (newest copy under `<config dir>/plugins/cache/*/cadence-forge/`; 3.5s cap) and return FAIL findings as a nudge. Never blocks: a missing script, no `python3`, a timeout or an unknown exit is silent; the audit's exit 2 ("could not run") becomes a one-line note |
-| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger |
-| `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |
-| `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) |
-| `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations | run |
+| `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK | run |
+| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) | run |
+| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files | run |
+| `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits | run |
+| `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. | run |
+| `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) | run |
+| `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) | run |
+| `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) | run |
+| `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes | run |
+| `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare | run |
+| `warn-instruction-narrative` | PreToolUse (Write, Edit, MultiEdit) | Nudge when an edit to `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` adds narrative: 3+ past-event markers (ISO date, `measured`, `incident`, …), or a paragraph past 8 sentences or 1200 characters (fences and table rows stripped) that carries a marker. A pointer phrase (`commit history`, `see`, …) clears both; length alone never fires. Judges only added lines | run |
+| `warn-live-memory-write` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a direct write to live auto-memory (`<config dir>/projects/<slug>/memory/`) while no fresh dream run lock (`<config dir>/cadence/dreams/<slug>/.dream-lock`, under 6 hours old) is held | run |
+| `warn-plugin-root-cruft` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a write under `plugins/<name>/docs/` or `plugins/<name>/scripts/` when the repo's `.claude-plugin/marketplace.json` declares `./plugins/<name>` (skill-nested `scripts/` never match) | run |
+| `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` | run |
+| `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files | run |
+| `audit-runner-pool` | PostToolUse (Write, Edit, MultiEdit) | After an edit to `.github/workflows/*.yml`/`*.yaml`, run `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` (newest copy under `<config dir>/plugins/cache/*/cadence-forge/`; 3.5s cap) and return FAIL findings as a nudge. Never blocks: a missing script, no `python3`, a timeout or an unknown exit is silent; the audit's exit 2 ("could not run") becomes a one-line note | run |
+| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger | run |
+| `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary | run |
+| `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) | run |
+| `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable | run |
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
@@ -97,42 +110,42 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 
 ## guardrails (git-guardrails)
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own |
-| `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos |
-| `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
-| `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
-| `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
-| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths) |
-| `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
-| `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
-| `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
-| `warn-amend-pushed` | PreToolUse (Bash) | Warn when `git commit --amend` rewrites a commit the remote-tracking refs already carry |
-| `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
-| `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
-| `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |
-| `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker |
-| `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
-| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
-| `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` |
-| `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
-| `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
-| `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) |
-| `warn-stale-pr-body` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since the PR was opened while the branch has gained commits since — the placeholder body is about to become the squash-merge record |
-| `warn-stacked-base-delete` | PreToolUse (Bash) | Warn before `git push <remote> --delete <branch>` / `:<branch>` or `gh pr merge --delete-branch` when open PRs base on the branch (deleting it closes them, never retargets); names the PRs |
-| `warn-entry-posture` | PreToolUse (Write, Edit) | Once per session per linked worktree, at the first write: warn when the branch has no upstream (`git push -u`) or no open PR (`gh pr create --draft`) |
-| `warn-chezmoi-apply` | PreToolUse (Bash) | Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally (`MM`/`MD`), narrowed to the apply's targets and `--include`/`--exclude`; an unscoped apply gets a scoping clause. Silent on a clean tree, a dry run, a relocated source/config, or no `chezmoi` |
-| `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
-| `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
-| `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |
-| `warn-agent-dispatch` | PreToolUse (Agent, Task) | Advisory only. Warn on a non-fork dispatch with no `model`, a `model` on a fork dispatch (ignored by the platform), and a brief that asks the subagent to execute commands without naming a scrubbed/isolated HOME. Never echoes the prompt |
-| `warn-subagent-worktree` | PreToolUse (Agent, Task) | Warn when dispatching a subagent from main while a sibling worktree exists |
-| `enforcement-status` | SessionStart | Report when `CADENCE_BYPASS=1` or `CADENCE_DISABLE` names a protected guard |
-| `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) |
-| `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) |
-| `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content |
-| `warn-inline-body` | PreToolUse (Bash) | Nudge when `gh pr create`/`gh issue create` posts an inline `--body` longer than 200 characters instead of `--body-file` |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own | run |
+| `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos | run |
+| `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) | run |
+| `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` | run |
+| `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch | run |
+| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths) | self-disable |
+| `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base | run |
+| `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs | run |
+| `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit | run |
+| `warn-amend-pushed` | PreToolUse (Bash) | Warn when `git commit --amend` rewrites a commit the remote-tracking refs already carry | run |
+| `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main | self-disable |
+| `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) | run |
+| `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body | run |
+| `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker | run |
+| `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge | run |
+| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed | run |
+| `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` | run |
+| `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers | run |
+| `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) | run |
+| `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) | run |
+| `warn-stale-pr-body` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since the PR was opened while the branch has gained commits since — the placeholder body is about to become the squash-merge record | run |
+| `warn-stacked-base-delete` | PreToolUse (Bash) | Warn before `git push <remote> --delete <branch>` / `:<branch>` or `gh pr merge --delete-branch` when open PRs base on the branch (deleting it closes them, never retargets); names the PRs | run |
+| `warn-entry-posture` | PreToolUse (Write, Edit) | Once per session per linked worktree, at the first write: warn when the branch has no upstream (`git push -u`) or no open PR (`gh pr create --draft`) | run |
+| `warn-chezmoi-apply` | PreToolUse (Bash) | Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally (`MM`/`MD`), narrowed to the apply's targets and `--include`/`--exclude`; an unscoped apply gets a scoping clause. Silent on a clean tree, a dry run, a relocated source/config, or no `chezmoi` | run |
+| `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers | run |
+| `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed | run |
+| `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target | run |
+| `warn-agent-dispatch` | PreToolUse (Agent, Task) | Advisory only. Warn on a non-fork dispatch with no `model`, a `model` on a fork dispatch (ignored by the platform), and a brief that asks the subagent to execute commands without naming a scrubbed/isolated HOME. Never echoes the prompt | run |
+| `warn-subagent-worktree` | PreToolUse (Agent, Task) | Warn when dispatching a subagent from main while a sibling worktree exists | self-disable |
+| `enforcement-status` | SessionStart | Report when `CADENCE_BYPASS=1` or `CADENCE_DISABLE` names a protected guard | run |
+| `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) | run |
+| `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) | run |
+| `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content | run |
+| `warn-inline-body` | PreToolUse (Bash) | Nudge when `gh pr create`/`gh issue create` posts an inline `--body` longer than 200 characters instead of `--body-file` | run |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
 so the browser action would already have hit a device before the context
@@ -143,12 +156,12 @@ advises.
 
 ## rules
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md, command, living-plan, and plugin-agent frontmatter |
-| `security-patterns` | PostToolUse (Write, Edit) | Scan for security anti-patterns |
-| `warn-recommended-option` | PreToolUse (`AskUserQuestion`) | Nudge to label a recommended option "(Recommended)" |
-| `warn-empty-answers` | PostToolUse (`AskUserQuestion`) | Nudge to re-ask when `AskUserQuestion` returns empty auto-approve answers |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md, command, living-plan, and plugin-agent frontmatter | run |
+| `security-patterns` | PostToolUse (Write, Edit) | Scan for security anti-patterns | run |
+| `warn-recommended-option` | PreToolUse (`AskUserQuestion`) | Nudge to label a recommended option "(Recommended)" | run |
+| `warn-empty-answers` | PostToolUse (`AskUserQuestion`) | Nudge to re-ask when `AskUserQuestion` returns empty auto-approve answers | run |
 
 `security-patterns` is a **zero-config, no-API baseline** — a per-edit pattern
 scan with no setup. For configurable patterns plus model-backed diff and commit
@@ -157,10 +170,10 @@ review, install the official `security-guidance` plugin
 
 ## obsidian (cadence-obsidian)
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `trash-guard` | PreToolUse (Bash, Edit, Write, destructive `mcp__*` tools) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, `coproc` of any of those, clobber redirects, and an empty or whitespace-only `Write` over an existing vault file); use `.trash/` instead |
-| `trash-guard-liveness` | SessionStart | Nudge when `OBSIDIAN_VAULT` is set but is not a directory, or a trash-guard route no longer judges as contracted |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `trash-guard` | PreToolUse (Bash, Edit, Write, destructive `mcp__*` tools) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, `coproc` of any of those, clobber redirects, and an empty or whitespace-only `Write` over an existing vault file); use `.trash/` instead | run |
+| `trash-guard-liveness` | SessionStart | Nudge when `OBSIDIAN_VAULT` is set but is not a directory, or a trash-guard route no longer judges as contracted | self-disable |
 
 A verb counts only where the shell runs an executable, and there are two such
 positions: the head of a segment, and a `find` exec-family action
@@ -199,17 +212,17 @@ These are **loggers**, not guards: they append JSONL event records and always
 exit 0. They never block a tool call (see
 [Hook Protocol](../README.md#hook-protocol)).
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed |
-| `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` |
-| `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` |
-| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` |
-| `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` |
-| `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
-| `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
-| `log-skill` | PostToolUse (`Skill`) | Append each Skill invocation to `skills.jsonl` |
-| `warn-stale` | SessionStart | Warn when metrics telemetry has gone stale (a nudge, never a block) |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed | self-disable |
+| `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` | self-disable |
+| `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` | self-disable |
+| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` | self-disable |
+| `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` | self-disable |
+| `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` | self-disable |
+| `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` | self-disable |
+| `log-skill` | PostToolUse (`Skill`) | Append each Skill invocation to `skills.jsonl` | self-disable |
+| `warn-stale` | SessionStart | Warn when metrics telemetry has gone stale (a nudge, never a block) | self-disable |
 
 `metrics grade` is a **CLI action, not a hook** — it has no `hooks.json` wiring,
 reads no stdin payload, and is not subject to `CADENCE_DISABLE`. It grades one
@@ -253,18 +266,18 @@ from git via `.git/info/exclude`). Sessions are displayed by the first 8 charact
 of that id, which is a display convenience — ownership is always decided on the full
 id.
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `start` | SessionStart | Register this session, sweep stale entries, and disclose the live-peer count in one line (`cadence-hooks session status` for the detail) |
-| `heartbeat` | — (unwired) | Touch this session's registry file; refresh the recorded branch so peers see branch drift. The beat now rides `persist-plan-approval`'s PostToolUse process, throttled (#902) |
-| `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
-| `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
-| `warn-branch-intent` | PreToolUse (Edit, Write) | Nudge once per session when new work starts on a stale feature branch whose name shares nothing with the declared intent |
-| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one |
-| `persist-plan-approval` | PostToolUse (every tool) | On `ExitPlanMode`, persist the approved plan into the repo's plans dir, merging its frontmatter and nudging when it carries no settled `Panel:` line (`CADENCE_NO_PERSIST_PLAN` opts out); on every call, refresh this session's liveness heartbeat, throttled |
-| `backstop-warn` | SessionStart | Warn once when the last session left loose ends, then clear the marker |
-| `backstop-record` | SessionEnd | Record loose ends (uncommitted changes, unpushed commits, stashes, other worktrees with unpushed work) for the next `session start` to surface, only when no live peer remains in the checkout |
-| `end` | SessionEnd | Deregister this session's registry file |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `start` | SessionStart | Register this session, sweep stale entries, and disclose the live-peer count in one line (`cadence-hooks session status` for the detail) | self-disable |
+| `heartbeat` | — (unwired) | Touch this session's registry file; refresh the recorded branch so peers see branch drift. The beat now rides `persist-plan-approval`'s PostToolUse process, throttled (#902) | self-disable |
+| `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths | self-disable |
+| `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time | run |
+| `warn-branch-intent` | PreToolUse (Edit, Write) | Nudge once per session when new work starts on a stale feature branch whose name shares nothing with the declared intent | run |
+| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one | run |
+| `persist-plan-approval` | PostToolUse (every tool) | On `ExitPlanMode`, persist the approved plan into the repo's plans dir, merging its frontmatter and nudging when it carries no settled `Panel:` line (`CADENCE_NO_PERSIST_PLAN` opts out); on every call, refresh this session's liveness heartbeat, throttled | self-disable |
+| `backstop-warn` | SessionStart | Warn once when the last session left loose ends, then clear the marker | self-disable |
+| `backstop-record` | SessionEnd | Record loose ends (uncommitted changes, unpushed commits, stashes, other worktrees with unpushed work) for the next `session start` to surface, only when no live peer remains in the checkout | self-disable |
+| `end` | SessionEnd | Deregister this session's registry file | self-disable |
 
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
 and is presumed dead after 30 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
@@ -276,11 +289,11 @@ Three more `session` hooks serve the living-plan lifecycle (ADR-0038) rather tha
 multi-session identity. They are wired by the **cadence** plugin, and all three
 bind to the plan doc for the current branch.
 
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched |
-| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch |
-| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) |
+| Hook | Event | What it does | Remote |
+|------|-------|--------------|--------|
+| `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched | run |
+| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch | run |
+| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) | run |
 
 `nudge-plan-tick` and `warn-plan-ready-flip` only ever warn. `lint-plan-shape` is the
 one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
