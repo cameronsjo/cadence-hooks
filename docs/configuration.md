@@ -259,6 +259,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public |
 | `CADENCE_NO_OUTRO_BACKSTOP` | `backstop-record`, `backstop-warn` | Set to turn off the loose-ends backstop |
 | `CADENCE_NO_PERSIST_PLAN` | `persist-plan-approval` | Set to stop writing approved plans to disk |
+| `CADENCE_PLANS_DIR` | `persist-plan-approval` | Read from a repo's (or a non-repo session root's) `.claude/settings*.json` `env` block, never the process env. A relative path for approved plans, default `docs/plans`; it must stay inside the checkout. Empty stops the persist. A session root outside any repo, a repo with a remote outside `CADENCE_ALLOWED_OWNERS`, or a dir that escapes the checkout sends the plan to `<config_dir>/cadence/plans` instead |
 | `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook; any value that is not an absolute path to an executable makes the wrapper inert (every hook exits 0, one notice per day) — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
 | `CLAUDE_EFFORT` | every hook (latent) | A check can skip itself at a given effort level; no check does today |
 | `CADENCE_FAILOPEN_DISCLOSE_MIN` | `session start` fail-open disclosure | How many fail-open events before the session-start disclosure fires; a large value hides it |

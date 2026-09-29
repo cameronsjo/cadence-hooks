@@ -701,6 +701,39 @@ pub(crate) mod test_metrics_env {
         result
     }
 
+    /// Run `f` with each `(name, value)` pinned (`None` = unset), restoring the
+    /// caller's values afterward. Takes [`METRICS_ENV_LOCK`], the crate's one
+    /// env lock, so these writes serialize against every `with_metrics_dir`
+    /// caller instead of racing them through a second mutex (#446).
+    pub(crate) fn with_env_vars<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _guard = METRICS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
+            .collect();
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK, held until the restore below.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: as above; still under METRICS_ENV_LOCK.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        result.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
     /// Convenience for a test that doesn't inspect `sweeps.jsonl` itself but
     /// still reaps a real file (and so fires `log_sweep`) — a throwaway
     /// tempdir keeps the write off the real metrics dir and off the lock
