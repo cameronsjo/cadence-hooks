@@ -9,10 +9,8 @@
 //! the referenced issues and returns when GitHub has already closed them all;
 //! otherwise it sleeps the rest of the wait and checks again.
 
-use cadence_hooks_core::shell::{git_command, host_and_repo_from_url};
+use cadence_hooks_core::shell::{git_command, host_and_repo_from_url, pr_url_parts};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use regex::Regex;
-use std::sync::LazyLock;
 
 /// Seconds into the merge wait at which referenced issues are first checked.
 ///
@@ -47,13 +45,20 @@ pub fn parse_remote(url: &str) -> Option<(Option<String>, String)> {
     }
 }
 
-/// Extract the PR number from `gh pr create` stdout.
+/// The PR `gh pr create` reports creating: `(host, "owner/repo", number)`,
+/// read from the first whitespace-separated word of its stdout that is a
+/// whole PR URL ([`pr_url_parts`]). `None` when there is none.
 ///
-/// Looks for the first `/pull/<N>` URL in the output (the URL `gh` prints on success).
-pub fn pr_number_from_create_stdout(stdout: &str) -> Option<u64> {
-    static RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"/pull/([0-9]+)").expect("pattern should compile"));
-    RE.captures(stdout)?.get(1)?.as_str().parse().ok()
+/// The repo comes from the URL, never from `origin` (cadence-hooks#759). A PR
+/// opened from a fork with an explicit target lands in the upstream repo, and
+/// its number means a different PR, or nothing, in the fork `origin` points
+/// at. Reading it there reported refs from another PR's body and that repo's
+/// issue states as this PR's.
+pub fn pr_from_create_stdout(stdout: &str) -> Option<(String, String, u64)> {
+    stdout.split_whitespace().find_map(|word| {
+        let (host, owner, repo, number) = pr_url_parts(word)?;
+        Some((host.to_ascii_lowercase(), format!("{owner}/{repo}"), number))
+    })
 }
 
 /// Extract the PR number from a `gh pr merge` command string.
@@ -169,11 +174,21 @@ fn fetch_issue_state(gh: &dyn GhRunner, issue: u64, slug: &str) -> IssueState {
 /// Warn about broken issue references in a newly-created PR.
 ///
 /// Fetches the PR body, extracts closing-keyword refs, and returns a warning
-/// message for any ref that is CLOSED (auto-close can't re-fire) or MISSING
-/// (not found). Returns `None` on the happy path (all refs OPEN, or no refs).
+/// message for any ref that is CLOSED (auto-close can't re-fire) or could not
+/// be read. Returns `None` on the happy path (all refs OPEN, or no refs).
 /// The caller routes the message through `CheckResult::nudge` so Claude sees it.
-pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<String> {
-    let pr_num = pr_number_from_create_stdout(stdout)?;
+///
+/// The PR and its repo come from the URL `gh pr create` printed
+/// ([`pr_from_create_stdout`]). `origin_host` is the host the runner's
+/// requests go to (`None` for github.com). When the URL names another host,
+/// or stdout carries no PR URL, the PR cannot be read with confidence and
+/// this stays silent rather than report on some other PR (cadence-hooks#759).
+pub fn handle_create(origin_host: Option<&str>, stdout: &str, gh: &dyn GhRunner) -> Option<String> {
+    let (host, slug, pr_num) = pr_from_create_stdout(stdout)?;
+    if host != origin_host.unwrap_or("github.com").to_ascii_lowercase() {
+        return None;
+    }
+    let slug = slug.as_str();
 
     // Fetch the PR body as JSON then extract the body field
     let body_json = gh.run(&[
@@ -186,15 +201,14 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
         slug,
     ])?;
 
-    // Parse body from JSON: {"body":"..."} — use serde_json for correctness
-    let body: String = match serde_json::from_str::<serde_json::Value>(&body_json) {
-        Ok(v) => v
-            .get("body")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        Err(_) => body_json, // fall back to raw if not JSON
-    };
+    // Parse body from JSON: {"body":"..."} — use serde_json for correctness.
+    // A response that is not JSON is not a body we can trust: stay silent.
+    let body: String = serde_json::from_str::<serde_json::Value>(&body_json)
+        .ok()?
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     let refs = extract_refs(&body);
     if refs.is_empty() {
@@ -211,7 +225,11 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
                 ));
             }
             IssueState::Missing => {
-                warnings.push(format!("  - #{issue} not found in {slug}"));
+                // `Missing` is also what a failed `gh` call reads as, so the
+                // message says the ref could not be read, not that it is gone.
+                warnings.push(format!(
+                    "  - #{issue} could not be read in {slug} (not found, or the lookup failed)"
+                ));
             }
         }
     }
@@ -423,7 +441,7 @@ impl Check for VerifyPrAutoclose {
 
         let message = if cmd.contains("gh pr create") {
             let stdout = input.tool_response_stdout().unwrap_or("");
-            handle_create(&slug, stdout, &gh)
+            handle_create(gh.gh_host.as_deref(), stdout, &gh)
         } else if cmd.contains("gh pr merge") {
             handle_merge(&slug, cmd, &gh, &clock, wait_secs)
         } else {
@@ -512,11 +530,19 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // Case 8: pr_number_from_create_stdout — extracts from URL
+    // Case 8: pr_from_create_stdout — reads host, repo, and number from the URL
     #[test]
-    fn pr_number_from_create_stdout_extracts_number() {
+    fn pr_from_create_stdout_extracts_the_pr() {
         let stdout = "https://github.com/o/r/pull/42";
-        assert_eq!(pr_number_from_create_stdout(stdout), Some(42));
+        assert_eq!(
+            pr_from_create_stdout(stdout),
+            Some(("github.com".to_string(), "o/r".to_string(), 42))
+        );
+        let noisy = "Creating pull request for me:feat into main in up/proj\n\nhttps://github.com/up/proj/pull/21\n";
+        assert_eq!(
+            pr_from_create_stdout(noisy),
+            Some(("github.com".to_string(), "up/proj".to_string(), 21))
+        );
     }
 
     // Case 9: pr_number_from_merge_cmd — number present
@@ -562,6 +588,8 @@ mod tests {
         close_calls: RefCell<Vec<(u64, String)>>,
         /// Captures `gh pr view <n> --json body` calls
         body_calls: RefCell<Vec<u64>>,
+        /// The `-R` value of every call, in order.
+        repo_args: RefCell<Vec<String>>,
     }
 
     impl FakeGh {
@@ -576,6 +604,7 @@ mod tests {
                 merged_at: Some("2026-09-25T00:00:00Z".to_string()),
                 close_calls: RefCell::new(Vec::new()),
                 body_calls: RefCell::new(Vec::new()),
+                repo_args: RefCell::new(Vec::new()),
             }
         }
 
@@ -612,6 +641,9 @@ mod tests {
 
     impl GhRunner for FakeGh {
         fn run(&self, args: &[&str]) -> Option<String> {
+            if let Some(w) = args.windows(2).find(|w| w[0] == "-R") {
+                self.repo_args.borrow_mut().push(w[1].to_string());
+            }
             // Match: gh issue view <N> --json state -q .state -R <slug>
             if args.len() >= 4
                 && args[0] == "issue"
@@ -717,7 +749,7 @@ mod tests {
             .with_issue(5, "OPEN")
             .with_pr_body("Closes #5");
 
-        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        let msg = handle_create(None, "https://github.com/owner/repo/pull/1", &gh);
 
         assert_eq!(msg, None, "happy path should produce no warning");
         assert!(gh.close_calls.borrow().is_empty());
@@ -731,7 +763,7 @@ mod tests {
             .with_issue(5, "CLOSED")
             .with_pr_body("Closes #5");
 
-        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh)
+        let msg = handle_create(None, "https://github.com/owner/repo/pull/1", &gh)
             .expect("closed ref should produce a warning");
 
         assert!(msg.contains("#5"), "warning should name the issue: {msg}");
@@ -754,7 +786,7 @@ mod tests {
             // issue 99 not in map → gh returns None → Missing state
             .with_pr_body("Closes #99");
 
-        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh)
+        let msg = handle_create(None, "https://github.com/owner/repo/pull/1", &gh)
             .expect("missing ref should produce a warning");
 
         assert!(
@@ -764,12 +796,94 @@ mod tests {
         assert!(gh.close_calls.borrow().is_empty());
     }
 
+    // cadence-hooks#759: a PR opened on the upstream from a fork checkout is
+    // read in the upstream, not in the fork `origin` points at.
+    #[test]
+    fn create_reads_the_pr_and_issues_in_the_repo_the_url_names() {
+        let gh = FakeGh::new()
+            .with_issue(20, "OPEN")
+            .with_pr_body("Closes #20");
+        let msg = handle_create(None, "https://github.com/upstream/proj/pull/22", &gh);
+        assert_eq!(msg, None);
+        assert_eq!(*gh.body_calls.borrow(), vec![22u64]);
+        let repos = gh.repo_args.borrow();
+        assert!(!repos.is_empty());
+        assert!(repos.iter().all(|r| r == "upstream/proj"), "{repos:?}");
+    }
+
+    #[test]
+    fn create_on_another_host_than_origin_is_silent() {
+        let gh = FakeGh::new().with_pr_body("Closes #5");
+        assert_eq!(
+            handle_create(None, "https://ghe.example.com/o/r/pull/1", &gh),
+            None
+        );
+        assert_eq!(
+            handle_create(
+                Some("ghe.example.com"),
+                "https://github.com/o/r/pull/1",
+                &gh
+            ),
+            None
+        );
+        assert!(gh.repo_args.borrow().is_empty(), "no call may be made");
+        // The matching enterprise host is still read.
+        let gh = FakeGh::new()
+            .with_issue(5, "CLOSED")
+            .with_pr_body("Closes #5");
+        assert!(
+            handle_create(
+                Some("ghe.example.com"),
+                "https://ghe.example.com/o/r/pull/1",
+                &gh
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn create_without_a_pr_url_is_silent() {
+        let gh = FakeGh::new().with_pr_body("Closes #5");
+        assert_eq!(handle_create(None, "pull request created", &gh), None);
+        assert!(gh.repo_args.borrow().is_empty(), "no call may be made");
+    }
+
+    #[test]
+    fn create_prose_without_a_closing_keyword_is_not_a_ref() {
+        // "Supersedes #20" is prose: it closes nothing, so it is never checked.
+        let gh = FakeGh::new()
+            .with_issue(20, "CLOSED")
+            .with_pr_body("Supersedes #20");
+        assert_eq!(
+            handle_create(None, "https://github.com/o/r/pull/22", &gh),
+            None
+        );
+    }
+
+    #[test]
+    fn create_with_an_unparseable_body_is_silent() {
+        struct RawGh;
+        impl GhRunner for RawGh {
+            fn run(&self, args: &[&str]) -> Option<String> {
+                match args.first() {
+                    Some(&"pr") => Some("Closes #5".to_string()),
+                    Some(&"issue") => Some("CLOSED".to_string()),
+                    _ => None,
+                }
+            }
+        }
+        assert_eq!(
+            handle_create(None, "https://github.com/o/r/pull/1", &RawGh),
+            None
+        );
+    }
+
     // Case 14: create, body has no refs → no warning, no issue-state calls
     #[test]
     fn create_body_no_refs_returns_early() {
         let gh = FakeGh::new().with_pr_body("This PR is purely cosmetic.");
 
-        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        let msg = handle_create(None, "https://github.com/owner/repo/pull/1", &gh);
 
         assert_eq!(msg, None);
         assert!(gh.close_calls.borrow().is_empty());
@@ -1003,7 +1117,7 @@ mod tests {
         // Instead test the logic path: if cmd doesn't contain "gh pr create" or "gh pr merge",
         // neither handler is invoked. We verify this via pr_number_from_create_stdout
         // and pr_number_from_merge_cmd returning None for unrelated commands.
-        assert_eq!(pr_number_from_create_stdout("git status output"), None);
+        assert_eq!(pr_from_create_stdout("git status output"), None);
         assert_eq!(pr_number_from_merge_cmd("git status"), None);
 
         // Additionally verify the Check returns allow (the guard is the top-level command check)
@@ -1029,8 +1143,8 @@ mod tests {
     }
 
     #[test]
-    fn pr_number_from_create_stdout_no_url_is_none() {
-        assert_eq!(pr_number_from_create_stdout("Created pull request"), None);
+    fn pr_from_create_stdout_no_url_is_none() {
+        assert_eq!(pr_from_create_stdout("Created pull request"), None);
     }
 
     #[test]
