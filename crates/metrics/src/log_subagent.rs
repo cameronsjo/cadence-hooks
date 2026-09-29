@@ -105,11 +105,25 @@ fn agent_transcript_path(input: &MetricsInput) -> Option<PathBuf> {
     )
 }
 
-/// Scan the whole agent transcript for usage. `None` on a missing or
-/// unreadable file, or one with no assistant usage yet (e.g. not flushed at the
-/// hook tick) — the caller then records the cost fields as `null`.
+/// Upper bound on how much of an agent transcript is read. The path is built
+/// from payload fields, so the file behind it is not trusted to be small; a
+/// transcript past this size records `null` cost rather than holding the hook
+/// open on an unbounded read. Read through `core::paths::read_capped`, which
+/// also refuses a FIFO or device without blocking on it.
+const MAX_AGENT_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Scan the whole agent transcript for usage. `None` on a missing, unreadable,
+/// non-regular, or oversized file, or one with no assistant usage yet (e.g. not
+/// flushed at the hook tick) — the caller then records the cost fields as
+/// `null`.
 fn scan_agent_transcript(path: &Path) -> Option<UsageScan> {
-    let transcript = std::fs::read_to_string(path).ok()?;
+    scan_agent_transcript_capped(path, MAX_AGENT_TRANSCRIPT_BYTES)
+}
+
+/// [`scan_agent_transcript`] with the cap as a parameter, so the over-cap arm
+/// is testable without a 256 MiB fixture.
+fn scan_agent_transcript_capped(path: &Path, cap: u64) -> Option<UsageScan> {
+    let transcript = cadence_hooks_core::paths::read_capped(path, cap)?;
     match scan_transcript(&transcript, None) {
         TranscriptScan::Usage(usage) => Some(usage),
         TranscriptScan::Diagnostic(_) | TranscriptScan::Empty => None,
@@ -296,5 +310,43 @@ mod tests {
         )
         .unwrap();
         assert!(scan_agent_transcript(&path).is_none());
+    }
+
+    #[test]
+    fn oversized_agent_transcript_has_null_cost() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("agent-a1.jsonl");
+        std::fs::write(&path, AGENT_TRANSCRIPT).unwrap();
+        let len = AGENT_TRANSCRIPT.len() as u64;
+        assert!(scan_agent_transcript_capped(&path, len).is_some());
+        assert!(scan_agent_transcript_capped(&path, len - 1).is_none());
+    }
+
+    #[test]
+    fn directory_agent_transcript_has_null_cost() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(scan_agent_transcript(tmp.path()).is_none());
+    }
+
+    /// A FIFO at the agent-transcript path has no writer, so a plain open
+    /// would block the hook forever. It must come back `None`, promptly.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_agent_transcript_returns_promptly_with_null_cost() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("agent-a1.jsonl");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan_agent_transcript(&fifo).is_none());
+        });
+        let is_none = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("scanning a FIFO must not block");
+        assert!(is_none);
     }
 }

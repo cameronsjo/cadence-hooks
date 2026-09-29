@@ -95,23 +95,29 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
 /// Rows are privacy-safe by construction, but repo basenames and session ids
 /// are still metadata worth keeping from other local users, and the default
 /// `OpenOptions` mode is world-readable under a permissive umask. A ledger an
-/// older binary already created with group/other bits is tightened to `0600`
-/// through the open handle, so existing installs converge on their next write;
-/// a mode that is already tighter is left alone. Permissions are a Unix
-/// concept; elsewhere this is a plain create-and-append open. A failed
-/// tighten is ignored, so the append still happens (ADR-0001).
+/// older binary already created with group/other bits has exactly those bits
+/// cleared through the open handle (owner bits are kept), so existing installs
+/// converge on their next write; a mode that is already tighter is left alone.
+///
+/// On Unix the final path component is opened with `O_NOFOLLOW`: a ledger
+/// that is a symlink fails to open, so nothing is appended through it and no
+/// chmod lands on whatever it points at. The caller treats that like any other
+/// open failure and skips the row (ADR-0001). Permissions are a Unix concept;
+/// elsewhere this is a plain create-and-append open. A failed tighten is
+/// ignored, so the append still happens.
 pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
-        if let Ok(meta) = file.metadata()
-            && meta.permissions().mode() & 0o077 != 0
-        {
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Ok(meta) = file.metadata() {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+            }
         }
         Ok(file)
     }
@@ -520,6 +526,54 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
         open_ledger(&path).unwrap();
         assert_eq!(mode_of(&path), 0o200);
+    }
+
+    /// Tightening clears only group/other bits; owner bits are not reset to
+    /// a flat 0600.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_clears_only_group_and_other_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("sessions.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o754)).unwrap();
+        open_ledger(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    /// A symlinked ledger fails to open: nothing is appended through it and
+    /// its target's mode is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn open_ledger_refuses_a_symlinked_ledger() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, "keep\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("commits.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            open_ledger(&link).is_err(),
+            "a symlinked ledger must not open"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+        assert_eq!(mode_of(&target), 0o644);
+    }
+
+    /// End to end through a writer: the diagnostic append skips a symlinked
+    /// ledger silently instead of writing through it.
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_append_skips_a_symlinked_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("diagnostics.jsonl")).unwrap();
+        append_transcript_diagnostic_to(tmp.path(), "claude", "jsonl", "code", "main");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
     }
 
     #[test]
