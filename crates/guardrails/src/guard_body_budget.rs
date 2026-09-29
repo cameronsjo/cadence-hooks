@@ -25,7 +25,7 @@ use cadence_hooks_core::gh_bodies::{
     strip_flag_prefix,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, skip_transparent_prefixes,
+    command_segments, command_word, executable_tokens, redirect_targets, skip_transparent_prefixes,
     strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -1276,6 +1276,57 @@ fn body_source(segment: &str) -> (Option<BodySource>, Option<String>) {
     (source, extract_title(segment))
 }
 
+/// Whether `a` and `b` can name the same file: equal after a leading `./`, or
+/// the same final component. The final-component arm over-matches on purpose
+/// (`cd /x && printf > b.md; --body-file /x/b.md` must match) — the price is
+/// a spurious "cannot measure" nudge, never a missed measurement.
+fn same_file_name(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.strip_prefix("./").unwrap_or(p).to_string();
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    norm(a) == norm(b) || (!base(a).is_empty() && base(a) == base(b))
+}
+
+/// Whether one earlier segment writes `path`: a redirect target, a `tee`
+/// operand, or the destination (last operand) of `cp`/`mv`. Pure.
+fn segment_writes_file(segment: &str, path: &str) -> bool {
+    if redirect_targets(segment)
+        .iter()
+        .any(|t| same_file_name(t, path))
+    {
+        return true;
+    }
+    let tokens = executable_tokens(strip_group_wrappers(segment));
+    let rest = skip_transparent_prefixes(&tokens);
+    let Some(head) = rest.first() else {
+        return false;
+    };
+    let operands = || rest[1..].iter().filter(|t| !t.starts_with('-'));
+    match command_word(head).as_ref() {
+        "tee" => operands().any(|t| same_file_name(t, path)),
+        "cp" | "mv" => operands()
+            .next_back()
+            .is_some_and(|t| same_file_name(t, path)),
+        _ => false,
+    }
+}
+
+/// Whether the body file `path` is written by a segment that runs BEFORE the
+/// posting `segment` in the same command. The file on disk at hook time is
+/// then stale: measuring it can call a 500-word body 5 words
+/// (cameronsjo/cadence-hooks#984). Pure.
+fn body_written_earlier(segs: &[String], segment: &str, path: &str) -> bool {
+    // Past this many segments the walk (segments x posting segments) is not
+    // worth its cost: say "cannot measure" instead of scanning (perf bound).
+    const MAX_SEGMENTS: usize = 256;
+    if segs.len() > MAX_SEGMENTS {
+        return true;
+    }
+    let Some(pos) = segs.iter().position(|s| strip_group_wrappers(s) == segment) else {
+        return false;
+    };
+    segs[..pos].iter().any(|s| segment_writes_file(s, path))
+}
+
 /// One segment's verdict, plus the provenance it owes the bypass ledger.
 struct SegmentOutcome {
     verdict: Verdict,
@@ -1290,6 +1341,7 @@ struct SegmentOutcome {
 /// segment must not end the walk for the others.
 fn evaluate_segment(
     surface: Surface,
+    all_segments: &[String],
     segment: &str,
     base_dir: &str,
     budgets: &Budgets,
@@ -1321,6 +1373,21 @@ fn evaluate_segment(
     // An inline body cannot carry an escape line: the hatch has to live in
     // the file, where it is reviewable, not in the command string.
     let (source, mut title) = body_source(segment);
+    // A body file this same command writes first is stale on disk: nudge
+    // rather than measure the wrong bytes (cameronsjo/cadence-hooks#984).
+    if let Some(BodySource::File(p) | BodySource::JsonFile(p)) = &source
+        && body_written_earlier(all_segments, segment, p)
+    {
+        log_unmeasured("body-written-by-same-command");
+        let (soft, hard) = budgets.for_surface(surface);
+        return SegmentOutcome {
+            verdict: Verdict::Nudge(format!(
+                "guard-body-budget: {} not measured: cannot measure the body — it is written by this same command (soft {soft}, hard {hard}). Keep it within budget, or write the file in a separate command first.",
+                surface.label()
+            )),
+            bypass: None,
+        };
+    }
     let (body, escape) = match source {
         None => {
             // Accepted gap: `gh pr create` with no body flag opens an
@@ -1405,11 +1472,12 @@ impl Check for GuardBodyBudget {
         // Every segment is measured. The worst verdict decides the outcome, and
         // every segment that had something to say says it — a command posting
         // two bodies gets both lines.
+        let all_segments = command_segments(command);
         let mut worst = 0u8;
         let mut messages: Vec<String> = Vec::new();
         let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
         for (surface, segment) in &posts {
-            let outcome = evaluate_segment(*surface, segment, &base_dir, &budgets);
+            let outcome = evaluate_segment(*surface, &all_segments, segment, &base_dir, &budgets);
             let sev = severity(&outcome.verdict);
             worst = worst.max(sev);
             match outcome.verdict {
@@ -2947,6 +3015,57 @@ mod tests {
             for cmd in &cases {
                 let result = GuardBodyBudget.run(&make_bash(cmd));
                 assert_eq!(result.outcome, Outcome::Allow, "{cmd}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_body_file_written_by_an_earlier_segment_is_not_measured() {
+        // cameronsjo/cadence-hooks#984: the file on disk is stale.
+        scrubbed_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("body.md");
+            std::fs::write(&path, "five words only here ok").unwrap();
+            let p = path.to_string_lossy();
+            for writer in [
+                format!("printf hi > {p}"),
+                format!("printf hi >> {p}"),
+                format!("echo hi | tee {p}"),
+                format!("echo hi | tee -a {p}"),
+                format!("cp /tmp/other {p}"),
+                format!("mv /tmp/other {p}"),
+                format!("cat > {p} <<'EOF'\nbody\nEOF"),
+            ] {
+                let cmd = format!("{writer} && gh issue create --title x --body-file {p}");
+                let result = GuardBodyBudget.run(&make_bash(&cmd));
+                assert_eq!(result.outcome, Outcome::Nudge, "{cmd}");
+                let msg = result.message.unwrap();
+                assert!(msg.contains("written by this same command"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_body_file_not_written_by_the_command_is_still_measured() {
+        scrubbed_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("body.md");
+            std::fs::write(&path, "word ".repeat(500)).unwrap();
+            let p = path.to_string_lossy();
+            for cmd in [
+                format!("gh issue create --title x --body-file {p}"),
+                // Writes a DIFFERENT file, and reads (not writes) the body file.
+                format!(
+                    "printf hi > /tmp/elsewhere-x.txt && gh issue create --title x --body-file {p}"
+                ),
+                format!("cp {p} /tmp/copy-x.txt && gh issue create --title x --body-file {p}"),
+                // Written AFTER the post: the post reads what is on disk now.
+                format!("gh issue create --title x --body-file {p} && printf hi > {p}"),
+            ] {
+                let result = GuardBodyBudget.run(&make_bash(&cmd));
+                let msg = result.message.unwrap_or_default();
+                assert!(msg.contains("500 words"), "{cmd}: {msg}");
+                assert!(!msg.contains("same command"), "{cmd}: {msg}");
             }
         });
     }

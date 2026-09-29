@@ -600,6 +600,14 @@ fn scan_hooks_json(
                     find_line_number(raw, cmd),
                 ));
 
+                // Check 0b: a command that may block on empty stdin (#616).
+                findings.extend(stdin_hang_findings(
+                    cmd,
+                    plugin,
+                    path,
+                    find_line_number(raw, cmd),
+                ));
+
                 // Check 1: shell-expansion bug (Error).
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
                     findings.push(Finding {
@@ -649,6 +657,141 @@ fn scan_hooks_json(
     }
 
     findings
+}
+
+/// Command words that block reading standard input until it closes.
+const STDIN_READERS: &[&str] = &["cat", "read", "jq"];
+
+/// The first stdin-blocking command word in `command` that nothing feeds, as
+/// a static heuristic (cameronsjo/cadence-hooks#616, option a). NEVER runs the
+/// command. A segment is flagged when it heads its pipeline (no `|` before
+/// it), its command word is `cat`, `read` or `jq`, it carries no stdin
+/// redirect (`<`, `<<`, `<<<`, which includes `</dev/null`), and it names
+/// nothing to read instead: `cat` and `jq` with no file operand (`jq` counts
+/// its first non-option word as the filter, and `-n`/`--null-input` reads
+/// nothing), `read` without `-t` (a timeout), `-N` or `-u` (another fd). A hook is
+/// handed its payload on stdin, so a payload-reading hook is legitimate; the
+/// finding is advisory and names the shape only.
+fn stdin_hang_suspect(command: &str) -> Option<String> {
+    use cadence_hooks_core::shell::{command_word, split_segments_with_ops, tokenize};
+    let mut fed = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        let was_fed = fed;
+        fed = op == Some("|");
+        if was_fed {
+            continue;
+        }
+        let tokens = tokenize(&segment);
+        if tokens
+            .iter()
+            .any(|t| t.starts_with('<') || t.contains("</"))
+            || segment.contains('<')
+        {
+            continue;
+        }
+        let Some(head) = tokens.first() else {
+            continue;
+        };
+        let word = command_word(head);
+        if !STDIN_READERS.contains(&word.as_ref()) {
+            continue;
+        }
+        let args = &tokens[1..];
+        let operands = args.iter().filter(|a| !a.starts_with('-')).count();
+        let hangs = match word.as_ref() {
+            "cat" => operands == 0,
+            "jq" => !args.iter().any(|a| a == "-n" || a == "--null-input") && operands <= 1,
+            _ => !args
+                .iter()
+                .any(|a| a.starts_with("-t") || a == "-N" || a == "-u"),
+        };
+        if hangs {
+            return Some(segment);
+        }
+    }
+    None
+}
+
+/// The advisory for a command hook that may block on empty stdin (#616).
+fn stdin_hang_findings(
+    command: &str,
+    plugin: &str,
+    path: &Path,
+    line: Option<usize>,
+) -> Vec<Finding> {
+    stdin_hang_suspect(command)
+        .map(|segment| Finding {
+            severity: Severity::Warning,
+            blocker: Blocker::No,
+            plugin: plugin.to_string(),
+            file: path.to_path_buf(),
+            line,
+            snippet: segment,
+            diagnosis:
+                "a command hook reads standard input with no input file and no `</dev/null`; \
+                        if the harness ever delivers no stdin, or never closes it, the hook \
+                        hangs the session (static heuristic, nothing was run)"
+                    .to_string(),
+            remediation: "pass an input file or `</dev/null` where the payload is not needed; \
+                          for `read`, add `-t <seconds>`; a hook that consumes its stdin \
+                          payload on purpose can ignore this"
+                .to_string(),
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Why a `permissions.deny` row can never fire, or `None` when this lint has
+/// no complaint (cameronsjo/cadence-hooks#578, cadence-ecosystem#566).
+///
+/// Two classes, both measured on Claude Code 2.1.273 (#566): a `Bash(...)` row
+/// in the legacy `<prefix>:*` form whose prefix carries a `*` of its own is
+/// compared literally, so it matches nothing; and a row that denies an output
+/// redirect (`Bash(> path)`) never sees the redirect, which is checked against
+/// `Edit` rules only. A row this reports is inert; a row it does not report is
+/// NOT thereby known to fire on a compound command (`cd x && rm -rf ~/y`) —
+/// that needs a live-harness probe this lint does not make. Pure.
+fn inert_deny_reason(row: &str) -> Option<&'static str> {
+    let inner = row.strip_prefix("Bash(")?.strip_suffix(')')?;
+    if inner.trim_start().starts_with('>') {
+        return Some(
+            "a redirect target is checked against Edit rules, never Bash rules, so this row never fires",
+        );
+    }
+    let prefix = inner.strip_suffix(":*")?;
+    prefix.contains('*').then_some(
+        "a `*` inside the argument is not a glob in the `:*` prefix form, so this row matches nothing",
+    )
+}
+
+/// One advisory finding per inert `permissions.deny` row in `settings_path`.
+/// Reporting only: nothing is executed and nothing is rewritten.
+fn inert_deny_findings(settings_path: &Path) -> Vec<Finding> {
+    let Ok(text) = std::fs::read_to_string(settings_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(rows) = json.pointer("/permissions/deny").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| row.as_str())
+        .filter_map(|row| inert_deny_reason(row).map(|why| (row, why)))
+        .map(|(row, why)| Finding {
+            severity: Severity::Warning,
+            blocker: Blocker::No,
+            plugin: "permissions.deny".to_string(),
+            file: settings_path.to_path_buf(),
+            line: find_line_number(&text, row),
+            snippet: row.to_string(),
+            diagnosis: format!("inert deny row: {why}"),
+            remediation: "spell out the literal prefixes the matcher compares (one row per \
+                          root or device), or move a redirect rule to an `Edit` deny row"
+                .to_string(),
+        })
+        .collect()
 }
 
 /// Claude Code's plugins directory.
@@ -4064,6 +4207,9 @@ pub fn run(
         ) {
             findings.push(finding);
         }
+        findings.extend(inert_deny_findings(
+            &crate::configure_guardrails::user_settings_path(),
+        ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
             print_platform_drift_status();
@@ -8852,5 +8998,88 @@ mod tests {
         );
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("unavailable"));
+    }
+
+    #[test]
+    fn stdin_hang_heuristic_table() {
+        // (command, flagged) - #616. Static only; nothing is executed.
+        for (cmd, want) in [
+            ("cat", true),
+            ("jq .tool_name", true),
+            ("jq -r '.a'", true),
+            ("read line", true),
+            ("read -r line; echo $line", true),
+            ("cat </dev/null", false),
+            ("cat file.json", false),
+            ("jq .a file.json", false),
+            ("jq -n '{}'", false),
+            ("jq . </dev/null", false),
+            ("read -t 1 line", false),
+            ("read line <<< x", false),
+            ("echo x | jq .a", false),
+            ("echo x | cat", false),
+            ("cadence-hooks cadence guard-foo", false),
+        ] {
+            assert_eq!(stdin_hang_suspect(cmd).is_some(), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn stdin_hang_is_an_advisory_warning_never_a_blocker() {
+        let findings = stdin_hang_findings("cat", "p", Path::new("hooks.json"), Some(3));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].blocker, Blocker::No);
+        assert!(!is_session_start_blocker(&findings[0]));
+        assert!(stdin_hang_findings("cat x", "p", Path::new("h"), None).is_empty());
+    }
+
+    #[test]
+    fn inert_deny_row_table() {
+        // #578 / cadence-ecosystem#566. The six rows #566 measured inert, plus
+        // controls that must stay quiet.
+        for (row, inert) in [
+            ("Bash(dd if=/dev/zero of=/dev/*:*)", true),
+            ("Bash(dd if=/dev/random of=/dev/*:*)", true),
+            ("Bash(chmod -R 777 /*:*)", true),
+            ("Bash(rm /var/log/*:*)", true),
+            ("Bash(rm -rf /var/log/*:*)", true),
+            ("Bash(> /var/log/*:*)", true),
+            ("Bash(> /etc/passwd)", true),
+            ("Bash(rm -rf /)", false),
+            ("Bash(rm -rf ~/.ssh:*)", false),
+            ("Bash(sudo rm:*)", false),
+            ("Bash(mkfs:*)", false),
+            (
+                "Bash(docker run -v /var/run/docker.sock:/var/run/docker.sock:*)",
+                false,
+            ),
+            ("Read(./.env)", false),
+            ("Edit(/var/log/*)", false),
+        ] {
+            assert_eq!(inert_deny_reason(row).is_some(), inert, "{row}");
+        }
+    }
+
+    #[test]
+    fn inert_deny_findings_read_only_the_deny_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"deny":["Bash(rm /var/log/*:*)","Bash(mkfs:*)"],"allow":["Bash(rm /tmp/*:*)"]}}"#,
+        )
+        .unwrap();
+        let findings = inert_deny_findings(&path);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet, "Bash(rm /var/log/*:*)");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].blocker, Blocker::No);
+        // Missing file, bad JSON, no permissions block: quiet.
+        assert!(inert_deny_findings(&dir.path().join("nope.json")).is_empty());
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(inert_deny_findings(&path).is_empty());
+        std::fs::write(&path, "{}").unwrap();
+        assert!(inert_deny_findings(&path).is_empty());
     }
 }

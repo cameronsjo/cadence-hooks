@@ -109,6 +109,8 @@ pub mod guard_body_budget;
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.
 pub mod guard_dotfiles;
+/// Block `tea`/`glab` write operations targeting repos you don't own.
+pub mod guard_forge_write;
 /// Block irreversible `gh` operations (repo delete).
 pub mod guard_gh_dangerous;
 /// Block `gh` write operations targeting repos you don't own.
