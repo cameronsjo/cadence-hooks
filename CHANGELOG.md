@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`warn-unreviewed-ready-flip`'s GraphQL field mapping is now pinned in raw response JSON.** The one-request lookup from cadence-hooks#1024 reads bot logins without REST's `[bot]` suffix and the reviewed commit from `commit.oid`; the existing fixtures reached that shape only through a REST-to-GraphQL conversion in the test double. A table test now feeds the GraphQL shape directly: a bot author's self-approval still nudges, another bot's or a human's approval on head stays silent, and an approval on a stale `commit.oid` nudges. Test-only; no verdict changes. (cameronsjo/cadence-hooks#985)
+
 ### Fixed
 
 - **Every heredoc reader in `core::shell` shares one quote model, so a fake heredoc no longer drops real commands.** `heredoc_introducers` tracked quoting with two private toggles, so the escaped quote in `echo "a\"b <<EOF"` closed the string, the `<<EOF` behind it registered as a heredoc bash never opens, and `strip_heredoc_bodies` dropped every line up to a matching `EOF` from every segmenting guard while bash ran them. It now reads a command line with the shared quote scanner, skips a `"$( … )"` span whole as the splitter does, and recognises comments by the splitter's rule; a `<<` inside `$(( … ))` or `${ … }` is no longer read as a heredoc, and one inside a multi-line quoted string is no longer read as one either. Both heredoc readers now end a body by one terminator model measured against bash 5.2: the line must equal the delimiter exactly (after tab-stripping for `<<-`), so `  EOF`, `EOF ` and `EOF\r` are body text where the top-level reader used to `trim()` them into terminators and read the rest as code. A body line `EOF\r` followed by the payload now reads as body data, as bash reads it; that is the one input class this change allows that was blocked before. (cameronsjo/cadence-hooks#813)

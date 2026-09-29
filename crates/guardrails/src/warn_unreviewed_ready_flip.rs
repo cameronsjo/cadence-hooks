@@ -1429,6 +1429,60 @@ mod tests {
         assert!(eval("gh pr merge 5", &gh).is_some());
     }
 
+    /// Pins the GraphQL field mapping in raw response JSON, bypassing
+    /// [`FakeGh::new`]'s REST-to-GraphQL conversion (cadence-hooks#985): a bot
+    /// login arrives without REST's `[bot]` suffix on both the PR author and
+    /// the review author, so they still compare equal, and the reviewed
+    /// commit is read from `commit.oid`.
+    #[test]
+    fn graphql_bot_login_and_commit_oid_mapping() {
+        const HEAD: &str = "abc1234abcabc1234abcabc1234abcabc1234abc";
+        const STALE: &str = "111aaa111a111aaa111a111aaa111a111aaa111a";
+        // (case, PR author, reviewer, reviewed commit oid, nudges)
+        let cases = [
+            ("bot self-approval", "dependabot", "dependabot", HEAD, true),
+            (
+                "other bot approves head",
+                "dependabot",
+                "coderabbitai",
+                HEAD,
+                false,
+            ),
+            (
+                "human approves bot pr",
+                "dependabot",
+                "cameronsjo",
+                HEAD,
+                false,
+            ),
+            (
+                "approval on stale oid",
+                "cameronsjo",
+                "coderabbitai",
+                STALE,
+                true,
+            ),
+        ];
+        for (case, author, reviewer, oid, nudges) in cases {
+            let mut gh = FakeGh::new(HEAD, author, serde_json::json!([]));
+            gh.state_json = Some(
+                serde_json::json!({"data": {"repository": {"pullRequest": {
+                    "headRefOid": HEAD,
+                    "author": {"login": author},
+                    "reviews": {"nodes": [{
+                        "databaseId": 101,
+                        "author": {"login": reviewer, "databaseId": 7},
+                        "state": "APPROVED",
+                        "commit": {"oid": oid},
+                        "body": ""
+                    }]},
+                }}}})
+                .to_string(),
+            );
+            assert_eq!(eval("gh pr merge 5", &gh).is_some(), nudges, "{case}");
+        }
+    }
+
     #[test]
     fn fetch_error_is_silent() {
         assert_eq!(eval("gh pr merge 5", &ErrGh), None);
