@@ -367,8 +367,9 @@ fn verdict_token(verdict: &Verdict) -> String {
 /// healthy machine.
 fn nudge_message(verdict: &Verdict) -> String {
     format!(
-        "{} Hooks may be mis-wired or the metrics plugin disabled — run \
-         `cadence-hooks doctor` and compare wiring against a healthy machine.",
+        "{} Claude: run `cadence-hooks doctor` and surface its wiring finding to the \
+         user in one line; the likely cause is a mis-wired hook or a disabled metrics \
+         plugin, found by comparing wiring against a healthy machine.",
         verdict_summary(verdict)
     )
 }
@@ -479,6 +480,9 @@ mod tests {
             msg.contains("cadence-hooks doctor"),
             "doctor pointer: {msg}"
         );
+        // The imperative names its actor (cameronsjo/cadence-hooks#358): an
+        // actorless "run doctor" reads as status and is never actioned.
+        assert!(msg.contains("Claude: run `cadence-hooks doctor`"), "{msg}");
     }
 
     // 2. A huge threshold makes a fresh file non-stale → silent.
