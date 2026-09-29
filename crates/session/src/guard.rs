@@ -299,7 +299,6 @@ mod tests {
     fn peer(session_id: &str, touching: &[&str]) -> Peer {
         Peer {
             record: SessionRecord {
-                name: crate::identity::short_id(session_id).into(),
                 session_id: session_id.into(),
                 branch: Some("feat/peer-branch".into()),
                 touching: touching.iter().map(|s| s.to_string()).collect(),

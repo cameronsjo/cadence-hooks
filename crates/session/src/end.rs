@@ -110,9 +110,8 @@ mod tests {
     use crate::identity::SessionRecord;
     use tempfile::TempDir;
 
-    fn record(name: &str, session_id: &str) -> SessionRecord {
+    fn record(_name: &str, session_id: &str) -> SessionRecord {
         SessionRecord {
-            name: name.into(),
             session_id: session_id.into(),
             branch: Some("main".into()),
             declared_branch: Some("main".into()),
