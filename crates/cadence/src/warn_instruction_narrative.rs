@@ -10,18 +10,24 @@
 //! It judges only the text the call **adds** — for Edit/MultiEdit the
 //! `new_string` lines absent from `old_string`, for Write the content lines
 //! absent from the file on disk — so a line a previous session already settled
-//! is never re-flagged. Two independent signals, either sufficient:
+//! is never re-flagged. It fires when either holds, and a pointer phrase
+//! anywhere in the addition (`commit history`, `see`, `memory`, …) clears both,
+//! because a dated pointer is how a legitimate one-line reference reads:
 //!
-//! 1. **Length** — an added paragraph of more than [`MAX_SENTENCES`] sentences
-//!    or more than [`MAX_PARAGRAPH_CHARS`] characters. Fenced code blocks and
+//! 1. **Narrative markers** — [`MIN_MARKERS`] or more markers that the text is
+//!    about a past event (an ISO date, `measured`, `incident`, `turned out`, …).
+//! 2. **Length with a marker** — an added paragraph of more than
+//!    [`MAX_SENTENCES`] sentences or more than [`MAX_PARAGRAPH_CHARS`]
+//!    characters that also carries at least one marker. Fenced code blocks and
 //!    table rows are stripped first, and each list item or heading starts its
-//!    own paragraph, so a long SQL example, a wide table, or a run of short
-//!    bullets does not trip it.
-//! 2. **Narrative markers** — [`MIN_MARKERS`] or more markers that the text is
-//!    about a past event (an ISO date, `measured`, `incident`, …) **and** no
-//!    pointer phrase anywhere in the addition. A pointer (`commit history`,
-//!    `see`, …) clears this signal entirely, because a dated pointer is how a
-//!    legitimate one-line reference reads.
+//!    own paragraph.
+//!
+//! **Length alone never fires, and the thresholds are deliberately high.** A
+//! dense rule-plus-dated-receipt bullet is this estate's house style; at the
+//! issue's proposed 3 sentences / 400 characters / 2 markers the nudge fired on
+//! 42% of the units of cadence-hooks' own `CLAUDE.md` and 24% of
+//! cadence-ecosystem's, so it would be ignored. The shipped limits measure 7%
+//! and 6%; the `measure_false_positive_rate` test harness re-runs the sweep.
 //!
 //! An RFC-2119 keyword is deliberately NOT exculpatory: a paragraph that opens
 //! with `**MUST NOT**` contains a rule, not *only* a rule (cadence-hooks#922).
@@ -40,13 +46,13 @@ use std::sync::LazyLock;
 const INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
 
 /// An added paragraph with more sentences than this trips the length signal.
-pub const MAX_SENTENCES: usize = 3;
+pub const MAX_SENTENCES: usize = 8;
 
 /// An added paragraph with more characters than this trips the length signal.
-pub const MAX_PARAGRAPH_CHARS: usize = 400;
+pub const MAX_PARAGRAPH_CHARS: usize = 1200;
 
-/// This many narrative markers (with no pointer phrase) trip the marker signal.
-pub const MIN_MARKERS: usize = 2;
+/// This many narrative markers (with no pointer phrase) fire on their own.
+pub const MIN_MARKERS: usize = 3;
 
 /// Cap on the on-disk read a Write diffs against. An instruction file past this
 /// is not one this check can usefully judge; the read fails and the check allows.
@@ -175,6 +181,13 @@ pub enum Finding {
 /// line inside an unchanged fence is still code. Only added prose lines feed
 /// paragraphs and markers.
 pub fn judge(fragments: &[Vec<(String, bool)>]) -> Option<Finding> {
+    let (paragraphs, addition) = collect(fragments);
+    decide(&paragraphs, &addition, &Limits::DEFAULT)
+}
+
+/// Split the added prose into paragraphs (for the length signal) and one joined
+/// string (for markers and pointers).
+pub fn collect(fragments: &[Vec<(String, bool)>]) -> (Vec<String>, String) {
     let mut paragraphs: Vec<String> = Vec::new();
     let mut prose: Vec<String> = Vec::new();
 
@@ -223,22 +236,55 @@ pub fn judge(fragments: &[Vec<(String, bool)>]) -> Option<Finding> {
         flush(&mut current, &mut paragraphs);
     }
 
-    for p in &paragraphs {
+    (paragraphs, prose.join("\n"))
+}
+
+/// The tunable thresholds, split out so the measurement harness in the tests
+/// can sweep them without touching the shipped defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_sentences: usize,
+    pub max_chars: usize,
+    pub min_markers: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Limits = Limits {
+        max_sentences: MAX_SENTENCES,
+        max_chars: MAX_PARAGRAPH_CHARS,
+        min_markers: MIN_MARKERS,
+    };
+}
+
+/// The decision over the added paragraphs and the whole added prose.
+///
+/// A pointer phrase anywhere in the addition clears everything. Otherwise it
+/// fires on [`Limits::min_markers`] narrative markers, or on an over-length
+/// paragraph that carries at least one marker. Length alone never fires: a
+/// dense rule-plus-receipt bullet is this estate's house style, and a nudge
+/// that fired on half of it would be ignored (cadence-hooks#922 review).
+pub fn decide(paragraphs: &[String], addition: &str, limits: &Limits) -> Option<Finding> {
+    if POINTER_RE.is_match(addition) {
+        return None;
+    }
+    let count = MARKER_RE.find_iter(addition).count();
+    if count >= limits.min_markers {
+        return Some(Finding::Markers { count });
+    }
+    if count == 0 {
+        return None;
+    }
+    for p in paragraphs {
         let sentences = count_sentences(p);
         let chars = p.chars().count();
-        if sentences > MAX_SENTENCES || chars > MAX_PARAGRAPH_CHARS {
+        if sentences > limits.max_sentences || chars > limits.max_chars {
+            let excerpt = cadence_hooks_core::display::sanitize_field(&p.replace('`', ""), 80);
             return Some(Finding::Length {
                 sentences,
                 chars,
-                excerpt: cadence_hooks_core::display::sanitize_field(p, 80),
+                excerpt,
             });
         }
-    }
-
-    let addition = prose.join("\n");
-    let count = MARKER_RE.find_iter(&addition).count();
-    if count >= MIN_MARKERS && !POINTER_RE.is_match(&addition) {
-        return Some(Finding::Markers { count });
     }
     None
 }
@@ -357,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn two_markers_fire_without_the_length_signal() {
+    fn three_markers_fire_without_the_length_signal() {
         let text = "Pin the toolchain. It used to drift; verified on 2026-02-02.";
         assert!(text.len() < MAX_PARAGRAPH_CHARS);
         assert!(count_sentences(text) <= MAX_SENTENCES);
@@ -368,6 +414,12 @@ mod tests {
     }
 
     #[test]
+    fn two_markers_without_length_are_silent() {
+        let input = make_edit("/repo/CLAUDE.md", "", "It used to drift; verified.");
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
     fn a_single_marker_is_silent() {
         let input = make_edit("/repo/CLAUDE.md", "", "As of v2 the flag is required.");
         assert_eq!(outcome(&input), Outcome::Allow);
@@ -375,7 +427,11 @@ mod tests {
 
     #[test]
     fn wide_table_row_does_not_trip_length() {
-        let row = format!("| `col` | {} |", "wide cell text ".repeat(40));
+        // One marker in the prose line, so only the table row could supply length.
+        let row = format!(
+            "Verified layout.\n\n| `col` | {} |",
+            "wide cell text. ".repeat(100)
+        );
         assert!(row.len() > MAX_PARAGRAPH_CHARS);
         let input = make_edit("/repo/CLAUDE.md", "", &row);
         assert_eq!(outcome(&input), Outcome::Allow);
@@ -384,25 +440,28 @@ mod tests {
     #[test]
     fn fenced_code_does_not_trip_length() {
         let sql = format!(
-            "Run this:\n\n```sql\n{}\n```\n",
-            "SELECT a, b, c FROM t WHERE x = 1. AND y = 2. ".repeat(20)
+            "Verified query:\n\n```sql\n{}\n```\n",
+            "SELECT a, b, c FROM t WHERE x = 1. AND y = 2. ".repeat(40)
         );
         let input = make_edit("/repo/CLAUDE.md", "", &sql);
         assert_eq!(outcome(&input), Outcome::Allow);
     }
 
     #[test]
-    fn four_short_sentences_trip_length() {
-        let text = "Build first. Then test. Then lint. Then ship.";
-        assert_eq!(count_sentences(text), 4);
-        let input = make_edit("/repo/CLAUDE.md", "", text);
-        assert_eq!(outcome(&input), Outcome::Nudge);
+    fn long_paragraph_with_one_marker_trips_length() {
+        let text = format!("{} Verified.", "Build first, then test. ".repeat(10));
+        assert!(count_sentences(&text) > MAX_SENTENCES);
+        let input = make_edit("/repo/CLAUDE.md", "", &text);
+        let result = WarnInstructionNarrative.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(result.message.unwrap().contains("sentences"));
     }
 
     #[test]
     fn a_run_of_short_bullets_is_not_one_paragraph() {
-        let bullets = (0..12)
+        let bullets = (0..30)
             .map(|i| format!("- Rule number {i} applies to every crate in the workspace."))
+            .chain(std::iter::once("- Verified per crate.".to_string()))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(bullets.len() > MAX_PARAGRAPH_CHARS);
@@ -476,5 +535,136 @@ mod tests {
     fn non_payload_tools_allow() {
         let input = cadence_hooks_core::test_builders::make_bash("cat CLAUDE.md");
         assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn dense_one_rule_bullet_with_a_receipt_stays_silent() {
+        // House style: a long rule bullet with a single dated receipt.
+        let bullet = "- **`cargo test` does not build the `cadence-hooks` binary** — pipe-probing \
+            it without `cargo build --bin cadence-hooks` first exits 127, which misreads as a \
+            false ALLOW. Build the binary before any bare pipe-probe, and rebuild after every \
+            edit to a check, because a stale binary answers for the previous code and the \
+            verdict reads as current. The same applies to the integration tests that exec the \
+            binary through CARGO_BIN_EXE. (Bit the #226 verification, 2026-07-06.)";
+        // Past the issue's original 400-character limit, with one dated marker.
+        assert!(bullet.len() > 400);
+        let input = make_edit("/repo/CLAUDE.md", "", bullet);
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn length_alone_never_fires() {
+        let text = "Build first. Then test. Then lint. Then ship. Then tag. ".repeat(40);
+        assert!(count_sentences(&text) > MAX_SENTENCES);
+        assert!(text.len() > MAX_PARAGRAPH_CHARS);
+        let input = make_edit("/repo/CLAUDE.md", "", &text);
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_pointer_clears_the_length_signal_too() {
+        let text = format!("{REJECTED} See commit history.");
+        let input = make_edit("/repo/CLAUDE.md", "", &text);
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn excerpt_carries_no_backticks() {
+        let text = format!("`code` {}", "x ".repeat(700)) + " Verified.";
+        let input = make_edit("/repo/CLAUDE.md", "", &text);
+        let msg = WarnInstructionNarrative.run(&input).message.unwrap();
+        let quoted = msg.split('"').nth(1).unwrap();
+        assert!(!quoted.contains('`'), "{quoted}");
+    }
+
+    /// Split an instruction file into units the way a reviewer feeds them: each
+    /// blank-line block, with every top-level list item its own unit.
+    fn units(doc: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        let mut in_fence = false;
+        for line in doc.lines() {
+            let t = line.trim_start();
+            if t.starts_with("```") {
+                in_fence = !in_fence;
+            }
+            let top_item = !in_fence
+                && (line.starts_with("- ") || line.starts_with("* ") || {
+                    let d = line.chars().take_while(char::is_ascii_digit).count();
+                    d > 0 && line[d..].starts_with(". ")
+                });
+            if (!in_fence && line.trim().is_empty()) || top_item {
+                if !cur.is_empty() {
+                    out.push(cur.join("\n"));
+                    cur.clear();
+                }
+            }
+            if !line.trim().is_empty() || in_fence {
+                cur.push(line);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur.join("\n"));
+        }
+        out.retain(|u| !u.trim_start().starts_with('#'));
+        out
+    }
+
+    /// False-positive measurement over real instruction files: set
+    /// `NARRATIVE_MEASURE_FILES` to a `:`-separated path list and run with
+    /// `--ignored --nocapture`. Prints the firing rate per file at the
+    /// shipped limits and a small threshold sweep.
+    #[test]
+    #[ignore]
+    fn measure_false_positive_rate() {
+        let Ok(files) = std::env::var("NARRATIVE_MEASURE_FILES") else {
+            return;
+        };
+        let sweep = [
+            Limits::DEFAULT,
+            // The issue's proposal, for comparison.
+            Limits {
+                max_sentences: 3,
+                max_chars: 400,
+                min_markers: 2,
+            },
+            Limits {
+                max_sentences: 5,
+                max_chars: 800,
+                min_markers: 3,
+            },
+            Limits {
+                max_sentences: 8,
+                max_chars: 1200,
+                min_markers: 2,
+            },
+        ];
+        for f in files.split(':') {
+            let doc = std::fs::read_to_string(f).unwrap();
+            let us = units(&doc);
+            for l in &sweep {
+                let mut fired = Vec::new();
+                for u in &us {
+                    let (p, a) = collect(&[added_lines(u, "")]);
+                    if let Some(x) = decide(&p, &a, l) {
+                        fired.push((u.chars().take(60).collect::<String>(), x));
+                    }
+                }
+                println!(
+                    "{f} {l:?}: {}/{} = {:.0}%",
+                    fired.len(),
+                    us.len(),
+                    100.0 * fired.len() as f64 / us.len() as f64
+                );
+                if std::env::var("NARRATIVE_MEASURE_VERBOSE").is_ok() {
+                    for (u, x) in &fired {
+                        println!("    {x:?} :: {u}");
+                    }
+                }
+            }
+        }
+        // The rejected fixture must still fire at the shipped limits.
+        let (p, a) = collect(&[added_lines(REJECTED, "")]);
+        assert!(decide(&p, &a, &Limits::DEFAULT).is_some());
     }
 }
