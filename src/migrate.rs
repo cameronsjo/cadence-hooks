@@ -217,31 +217,65 @@ fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
 ///   refuses any existing path, symlink included, and `rename` replaces the
 ///   directory entry at `path` without following a link there.
 ///
-/// An existing file's permissions are carried over. The temp file is removed
-/// on any failure.
+/// An existing file's permissions are carried over, applied to the temp file
+/// before a single byte is written, so the content is never readable under a
+/// wider mode than the file it replaces ([`create_temp`]). The temp name is
+/// unique per process and instant, the parent directory is fsynced after the
+/// rename (unix, best effort), and the temp file is removed on any failure.
 fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.tmp-{}-{nanos}", std::process::id()));
+    let existing = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.permissions());
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = create_temp(&tmp, existing)?;
         file.write_all(contents)?;
         file.sync_all()?;
-        if let Ok(meta) = std::fs::symlink_metadata(path)
-            && meta.is_file()
-        {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
-        }
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // Durability of the rename itself. Best effort: the new file is already
+    // in place, so a failed directory fsync must not report the write failed.
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
     }
     result
+}
+
+/// Create the temp file with `O_EXCL`, already carrying `existing`'s
+/// permissions when there is a file being replaced. On unix it is created
+/// `0600` in that case, so even the instant between `open` and
+/// `set_permissions` exposes nothing wider than owner-only, and it holds no
+/// content yet either way. With no existing file the default mode (umask)
+/// applies, as `fs::write` would have.
+fn create_temp(
+    tmp: &Path,
+    existing: Option<std::fs::Permissions>,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if existing.is_some() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(tmp)?;
+    if let Some(perms) = existing {
+        file.set_permissions(perms)?;
+    }
+    Ok(file)
 }
 
 /// `redaction.json` → `redaction.json.migrated`. Appends the suffix rather than
@@ -682,6 +716,22 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_applies_the_existing_mode_before_any_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".cadence.json.tmp");
+        let file = create_temp(&tmp, Some(std::fs::Permissions::from_mode(0o600))).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            meta.len(),
+            0,
+            "the mode is set while the file is still empty"
         );
     }
 
