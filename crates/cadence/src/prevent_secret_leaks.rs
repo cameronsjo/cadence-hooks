@@ -718,13 +718,19 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// The upgrade trigger is a legitimate new value-free reader being blocked.
 fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
     let exempt = exempt_file_operands(tokens);
-    tokens[1..]
+    tokens
         .iter()
-        // The exemption is matched on the RAW token, before any redirection
-        // peel: `--file .env` exempts the operand `.env`, never a `<.env` that
-        // happens to peel to the same name. A peel-then-compare would let a
-        // shell-opened read inherit the exemption written for a forgectl one.
-        .filter(|t| !exempt.contains(&t.as_str()))
+        .enumerate()
+        .skip(1)
+        // The exemption is matched by ARGV INDEX (#1053), never by value. A
+        // value test exempted every copy of the string: in
+        // `forgectl env keys --file .env .env` the second `.env` sits where
+        // forgectl never audited it, and a `<.env` redirection could inherit
+        // an exemption written for a forgectl-opened file. Only the exact
+        // `--file` value position is skipped, the way `jq_filter_index` does
+        // it for #947.
+        .filter(|(i, _)| !exempt.contains(i))
+        .map(|(_, t)| t)
         // NOT vouched: these operands are a mix of flags and values, and an
         // attached `--file=.env` is a flag, not a file named `.env` — vouching
         // here turned the ordinary `forgectl env keys --file=.env` into a
@@ -743,7 +749,7 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
 /// group, an unaudited `env` subcommand, no subcommand at all, or a redirection
 /// whose target is itself a secret file) exempts nothing and lets the standard
 /// scan judge every operand.
-fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
+fn exempt_file_operands(tokens: &[String]) -> Vec<usize> {
     // A redirection whose TARGET IS A SECRET FILE means the shell, not
     // `forgectl`, decides what is read or written — nothing about the audited
     // subcommand covers that. `set` reads stdin, so
@@ -802,23 +808,24 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
     }
 
     let mut exempt = Vec::new();
-    let mut rest = &tokens[1..];
-    while let Some(token) = rest.first() {
+    for (i, token) in tokens.iter().enumerate().skip(1) {
+        // The index of the token that CARRIES the value: the flag token itself
+        // when attached (`--file=.env`), the next token when separate.
         let value = token
             .strip_prefix("--file=")
             .or_else(|| token.strip_prefix("-f="))
+            .map(|v| (i, v))
             .or_else(|| {
                 if token == "--file" || token == "-f" {
-                    rest.get(1).map(String::as_str)
+                    tokens.get(i + 1).map(|v| (i + 1, v.as_str()))
                 } else {
                     None
                 }
             });
         // The shape gate: only a dotenv-shaped file is one the audit covers.
-        if let Some(value) = value.filter(|v| is_forgectl_env_file(v)) {
-            exempt.push(value);
+        if let Some((index, _)) = value.filter(|(_, v)| is_forgectl_env_file(v)) {
+            exempt.push(index);
         }
-        rest = &rest[1..];
     }
     exempt
 }
@@ -5771,5 +5778,32 @@ mod tests {
         let cwd = dir.path().to_str().unwrap();
         let result = SecretLeaksGuard::default().run(&make_bash_with_cwd("cat .envrc", cwd));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn forgectl_exemption_covers_only_the_file_value_position() {
+        // #1053: the exemption matched by value, so a second copy of the
+        // audited `--file` string anywhere in the call was exempt too.
+        assert_bash(
+            &[
+                "forgectl env keys --file .env .env",
+                "forgectl env keys .env --file .env",
+                "forgectl env keys --file=.env .env",
+                "forgectl env redact -f .env .env",
+                "forgectl env keys --file .env <.env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a copy of the --file value outside its position is not audited",
+        );
+        assert_bash(
+            &[
+                "forgectl env keys --file .env",
+                "forgectl env keys --file=.env",
+                "forgectl env redact -f .env.local",
+                "forgectl env keys --file .env --file .env.prod",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "the audited --file value itself stays exempt",
+        );
     }
 }
