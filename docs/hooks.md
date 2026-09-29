@@ -78,8 +78,12 @@ Rules for wiring:
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
 | `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
+| `warn-instruction-narrative` | PreToolUse (Write, Edit, MultiEdit) | Nudge when an edit to `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` adds narrative: 3+ past-event markers (ISO date, `measured`, `incident`, …), or a paragraph past 8 sentences or 1200 characters (fences and table rows stripped) that carries a marker. A pointer phrase (`commit history`, `see`, …) clears both; length alone never fires. Judges only added lines |
+| `warn-live-memory-write` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a direct write to live auto-memory (`<config dir>/projects/<slug>/memory/`) while no fresh dream run lock (`<config dir>/cadence/dreams/<slug>/.dream-lock`, under 6 hours old) is held |
+| `warn-plugin-root-cruft` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a write under `plugins/<name>/docs/` or `plugins/<name>/scripts/` when the repo's `.claude-plugin/marketplace.json` declares `./plugins/<name>` (skill-nested `scripts/` never match) |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
+| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger |
 | `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable |
@@ -114,6 +118,10 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
 | `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) |
+| `warn-stale-pr-body` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since the PR was opened while the branch has gained commits since — the placeholder body is about to become the squash-merge record |
+| `warn-stacked-base-delete` | PreToolUse (Bash) | Warn before `git push <remote> --delete <branch>` / `:<branch>` or `gh pr merge --delete-branch` when open PRs base on the branch (deleting it closes them, never retargets); names the PRs |
+| `warn-entry-posture` | PreToolUse (Write, Edit) | Once per session per linked worktree, at the first write: warn when the branch has no upstream (`git push -u`) or no open PR (`gh pr create --draft`) |
+| `warn-chezmoi-apply` | PreToolUse (Bash) | Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally (`MM`/`MD`), narrowed to the apply's targets and `--include`/`--exclude`; an unscoped apply gets a scoping clause. Silent on a clean tree, a dry run, a relocated source/config, or no `chezmoi` |
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |
@@ -122,6 +130,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) |
 | `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) |
 | `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content |
+| `warn-inline-body` | PreToolUse (Bash) | Nudge when `gh pr create`/`gh issue create` posts an inline `--body` longer than 200 characters instead of `--body-file` |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
 so the browser action would already have hit a device before the context
@@ -284,7 +293,7 @@ during maintenance.
 | Command | What it does |
 |---------|--------------|
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
-| `session status` | List live and stale sessions registered in this repo (exit 1 outside a git repository) |
+| `session status` | List live and stale sessions registered in this repo: the current checkout and every worktree `git worktree list` names, with a footer counting the worktrees checked (exit 1 outside a git repository) |
 | `session plans` | List every in-flight and blocked plan in `docs/plans/` with its next step, branch, and PR — the detail behind the SessionStart plan pointer, with no cap on the file count. Exit 2 outside a git repository, or when an entry in `docs/plans/` could not be listed or read (each named on stderr) |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
 | `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |

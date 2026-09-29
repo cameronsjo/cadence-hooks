@@ -56,6 +56,7 @@ thread_local! {
     static HOOK_START: Cell<Option<Instant>> = const { Cell::new(None) };
     static DEADLINE_HIT: Cell<bool> = const { Cell::new(false) };
     static SUPPRESSED_BLOCK: Cell<bool> = const { Cell::new(false) };
+    static HIT_TOOL: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 /// What a spawn site should do with its next subprocess.
@@ -131,6 +132,19 @@ fn remaining_at(total: Duration, elapsed: Duration) -> Duration {
 /// layer reads this at exit to emit the loud fail-open row + breadcrumb.
 pub fn note_hit() {
     DEADLINE_HIT.with(|hit| hit.set(true));
+}
+
+/// Record that a spawn of a named non-git tool (`gh`, `chezmoi`) was
+/// abandoned at the deadline, so the exit breadcrumb names that tool rather
+/// than git. Also marks the deadline hit.
+pub fn note_hit_by(tool: &'static str) {
+    note_hit();
+    HIT_TOOL.with(|t| t.set(Some(tool)));
+}
+
+/// The non-git tool recorded by [`note_hit_by`], if any.
+pub fn hit_tool() -> Option<&'static str> {
+    HIT_TOOL.with(Cell::get)
 }
 
 /// Whether any spawn on this thread was abandoned at the deadline.
