@@ -190,6 +190,7 @@ use cadence_hooks_core::worktree::{
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -783,6 +784,7 @@ fn scan_either_path(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Pla
     // Scan the carved text when the raw scan accepted it: a carve-out's body
     // is inert, and its placeholder marks where a substitution's output
     // lands (`cd "$(cat <<'EOF' …)"`), which the union path treats as unreadable.
+    let _work = UnionWork::arm(command.len());
     let carved = plain_carve(command)
         .map(|(text, _)| text)
         .filter(|text| text.contains(CARVED));
@@ -844,6 +846,18 @@ fn scan_either_path(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Pla
             if !out.commits.iter().any(|c| c == cwd) {
                 out.commits.push(cwd.to_string());
             }
+        }
+    }
+    if UnionWork::spent() && command.contains("commit") {
+        // The allowance ran out, so part of the command went unread — and
+        // a hook that runs long fails open. Refuse instead: judge a commit
+        // from the session cwd and block it from a worktree as an unreadable
+        // `cd` would (cadence-hooks#1141, #1137).
+        out.unresolved_cd
+            .get_or_insert_with(|| "… (command too large to read in full)".to_string());
+        let here = normalize_target(cwd);
+        if !out.commits.contains(&here) {
+            out.commits.push(here);
         }
     }
     out
@@ -2807,7 +2821,7 @@ fn git_exports(command: &str) -> GitExports {
                 seen.unreadable = Some(segment.clone());
             }
             if depth < MAX_WRAPPER_DEPTH {
-                for child in child_scripts(argv, &segment) {
+                for child in union_children(argv, &segment) {
                     walk(&child, depth + 1, seen);
                 }
             }
@@ -2898,9 +2912,95 @@ fn union_env<'a>(command: &str, env: CdEnv<'a>) -> CdEnv<'a> {
     }
 }
 
+thread_local! {
+    /// Bytes of script the union path may still hand to the segmenter in one
+    /// [`scan_either_path`] call; `None` when no call has armed a budget.
+    static UNION_WORK_LEFT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Set once a charge was refused.
+    static UNION_WORK_SPENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The work allowance shared by every union walk of one command
+/// (cadence-hooks#1141, #1137).
+///
+/// The union path re-splits and re-tokenizes the command — and every child
+/// script under it — once per walk, per reading (raw, carved, line-joined,
+/// quote-blind). Each pass is linear, but the product is a large constant: a
+/// 200 KB flood of `"$(cat <<E` spans cost 2 s in release, past the hook's
+/// deadline, and a hook that times out fails OPEN. A budget caps the total.
+/// Spending it does NOT drop what was left unread: [`scan_either_path`] then
+/// judges any command that mentions a commit from the session cwd and reports
+/// an unreadable `cd`, so it BLOCKS instead of allowing.
+struct UnionWork;
+
+impl UnionWork {
+    /// `MULTIPLE` passes over the command plus room for short inputs, capped
+    /// so no input can buy more time than the hook can spare.
+    const MULTIPLE: usize = 24;
+    const FLOOR: usize = 64 * 1024;
+    const CEILING: usize = 1024 * 1024;
+
+    fn arm(len: usize) -> UnionWorkGuard {
+        let budget = len
+            .saturating_mul(Self::MULTIPLE)
+            .saturating_add(Self::FLOOR)
+            .min(Self::CEILING);
+        UNION_WORK_LEFT.with(|left| left.set(Some(budget)));
+        UNION_WORK_SPENT.with(|spent| spent.set(false));
+        UnionWorkGuard
+    }
+
+    /// Spend `n`; `false` when the allowance cannot cover it.
+    fn charge(n: usize) -> bool {
+        UNION_WORK_LEFT.with(|left| match left.get() {
+            None => true,
+            Some(have) => match have.checked_sub(n) {
+                Some(rest) => {
+                    left.set(Some(rest));
+                    true
+                }
+                None => {
+                    left.set(Some(0));
+                    UNION_WORK_SPENT.with(|spent| spent.set(true));
+                    false
+                }
+            },
+        })
+    }
+
+    fn spent() -> bool {
+        UNION_WORK_SPENT.with(Cell::get)
+    }
+}
+
+/// Disarms the budget when the scan that armed it ends.
+struct UnionWorkGuard;
+
+impl Drop for UnionWorkGuard {
+    fn drop(&mut self) {
+        UNION_WORK_LEFT.with(|left| left.set(None));
+    }
+}
+
+/// [`child_scripts`] for a union walk, charged to [`UnionWork`] the way
+/// [`union_segments`] is: reading a segment's substitutions and wrapped
+/// scripts costs as much as splitting it.
+fn union_children(argv: &[String], segment: &str) -> Vec<String> {
+    if !UnionWork::charge(segment.len()) {
+        return Vec::new();
+    }
+    child_scripts(argv, segment)
+}
+
 /// The segments of `script` as the union path reads them: cut at every
 /// operator, group punctuation stripped, tokenized.
+///
+/// Charged to [`UnionWork`]: once the allowance is spent this returns nothing,
+/// and [`scan_either_path`] fails closed on the flag it leaves behind.
 fn union_segments(script: &str) -> Vec<(String, Vec<MarkedToken>)> {
+    if !UnionWork::charge(script.len()) {
+        return Vec::new();
+    }
     split_segments_with_ops(script)
         .into_iter()
         .map(|(raw, _)| {
@@ -3025,7 +3125,7 @@ fn union_dirs(
             }
         }
         if depth < MAX_WRAPPER_DEPTH {
-            for child in child_scripts(argv, &segment) {
+            for child in union_children(argv, &segment) {
                 union_dirs(
                     &child,
                     depth + 1,
@@ -3067,7 +3167,7 @@ fn union_commits(
         if depth < MAX_WRAPPER_DEPTH {
             let deferred = installs_trap_action(&words);
             let child_env = CdEnv { home: None, ..env };
-            for child in child_scripts(argv, &segment) {
+            for child in union_children(argv, &segment) {
                 if !deferred {
                     union_commits(
                         &child,
@@ -11423,6 +11523,57 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn union_work_budget_fails_closed_on_adversarial_floods() {
+        // cadence-hooks#1141, #1137: 200 KB floods of substitution heredocs
+        // cost 1-2 s in release — past the hook deadline, which fails OPEN.
+        // The union path now spends a budget; when it runs out, a command that
+        // mentions a commit is judged from the session cwd and reported as an
+        // unreadable `cd` (blocking from a worktree), never allowed.
+        let size = 200 * 1024;
+        let flood = |unit: &str| unit.repeat(size / unit.len());
+        for (name, body) in [
+            ("quoted-subst-heredoc", flood("\"$(cat <<E\nx\\\nE\n)\" ")),
+            ("subst-heredoc-nest", flood("$(cat <<E\n") + &flood("E)\n")),
+            ("eofparen-lines", flood("E)\n")),
+            (
+                "unterminated-backslash-body",
+                format!("cat <<E\n{}", flood("x\\\n")),
+            ),
+        ] {
+            let cmd = format!("{body}\ngit commit -m x");
+            let started = std::time::Instant::now();
+            let scan = scan_targets(&cmd, "/w", false);
+            let took = started.elapsed();
+            assert!(scan.commits.contains(&"/w".to_string()), "{name}");
+            // The two shapes that stay under the allowance read in full.
+            if name.starts_with("quoted") || name.ends_with("nest") {
+                assert!(scan.unresolved_cd.is_some(), "{name}");
+            }
+            // Debug builds get headroom; release is the hook's real budget.
+            let limit =
+                std::time::Duration::from_millis(if cfg!(debug_assertions) { 6000 } else { 500 });
+            assert!(took < limit, "{name}: {took:?}");
+            // Without a commit anywhere there is nothing to refuse.
+            let quiet = scan_targets(&body, "/w", false);
+            assert!(quiet.commits.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn union_work_budget_leaves_ordinary_non_plain_commands_alone() {
+        let script = "for d in a b c; do (cd $d && git status); done\n".repeat(50);
+        let cmd = format!("{script}git commit -m x");
+        let scan = scan_targets(&cmd, "/w", false);
+        assert!(
+            scan.unresolved_cd
+                .as_deref()
+                .is_none_or(|w| !w.contains("too large")),
+            "{:?}",
+            scan.unresolved_cd
+        );
     }
 
     #[test]

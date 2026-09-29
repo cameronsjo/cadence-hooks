@@ -2024,6 +2024,19 @@ mod tests {
                 ("env -iC {other} git push origin main", Block),
                 ("env -C \"$D\" git push origin main", Nudge),
                 ("env -C sub git push origin feat", Allow),
+                // cadence-hooks#1141: a runner option the peel does not model
+                // runs the push where the walk cannot see, so it is refused
+                // (`sudo -D DIR` / `--chdir` changes the directory). The
+                // modelled flags still peel to the push and stay allowed.
+                ("sudo -D {other} git push origin main", Block),
+                ("sudo --chdir={other} git push origin main", Block),
+                ("sudo --chdir {other} git push origin main", Block),
+                ("sudo -u root -D {other} git push origin main", Block),
+                ("sudo -D sub git push origin feat", Block),
+                ("timeout --weird 5 git push origin main", Block),
+                ("sudo -u root git push origin feat", Allow),
+                ("sudo git push origin feat", Allow),
+                ("sudo -D {other} git status", Allow),
                 ("GIT_DIR={other}/.git git push origin main", Block),
                 ("git --git-dir={other}/.git push origin main", Block),
                 // Followed, and judged in the directory the push runs in.
