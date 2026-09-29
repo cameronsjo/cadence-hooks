@@ -78,6 +78,9 @@ Rules for wiring:
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
 | `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
+| `warn-instruction-narrative` | PreToolUse (Write, Edit, MultiEdit) | Nudge when an edit to `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md` adds narrative: 3+ past-event markers (ISO date, `measured`, `incident`, …), or a paragraph past 8 sentences or 1200 characters (fences and table rows stripped) that carries a marker. A pointer phrase (`commit history`, `see`, …) clears both; length alone never fires. Judges only added lines |
+| `warn-live-memory-write` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a direct write to live auto-memory (`<config dir>/projects/<slug>/memory/`) while no fresh dream run lock (`<config dir>/cadence/dreams/<slug>/.dream-lock`, under 6 hours old) is held |
+| `warn-plugin-root-cruft` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a write under `plugins/<name>/docs/` or `plugins/<name>/scripts/` when the repo's `.claude-plugin/marketplace.json` declares `./plugins/<name>` (skill-nested `scripts/` never match) |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
 | `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger |
@@ -127,6 +130,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) |
 | `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) |
 | `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content |
+| `warn-inline-body` | PreToolUse (Bash) | Nudge when `gh pr create`/`gh issue create` posts an inline `--body` longer than 200 characters instead of `--body-file` |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
 so the browser action would already have hit a device before the context

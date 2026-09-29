@@ -101,6 +101,24 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-instruction-narrative",
+        description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-live-memory-write",
+        description: "Nudge on a direct write to live auto-memory outside a dream adoption window",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-plugin-root-cruft",
+        description: "Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "nudge-polish-before-pr",
         description: "Nudge to run `/polish` before creating a PR",
         namespace: "cadence",
@@ -251,6 +269,12 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-going-public",
         description: "Nudge on repo create/publicize when name or description telegraphs sensitive content",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-inline-body",
+        description: "Nudge when gh pr/issue create posts a long body inline instead of via --body-file",
         namespace: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -626,6 +650,16 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // without measuring anything.
         ("guardrails", "guard-body-budget") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
+        ),
+        // warn-inline-body only engages on `gh pr|issue create` with an inline
+        // body past the threshold; the generic sample (`git status`) would allow.
+        ("guardrails", "warn-inline-body") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue create --title test --body \"This sample body is deliberately long enough to cross the inline-body threshold, so that try exercises the nudge path rather than the silent short-body allow. It says nothing else, and it is posted nowhere at all.\""}}"#,
+        ),
+        // warn-instruction-narrative only engages on a CLAUDE.md/AGENTS.md
+        // write; the generic sample is a Bash call and would allow unjudged.
+        ("cadence", "warn-instruction-narrative") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","tool_input":{"file_path":"/tmp/cadence-try/CLAUDE.md","old_string":"","new_string":"Pin the toolchain. It used to drift; verified on 2026-02-02."}}"#,
         ),
         // warn-amend-pushed only engages on an amending `git commit`; the
         // generic PreToolUse sample (`git status`) would never reach the probe.

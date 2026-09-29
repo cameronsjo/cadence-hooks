@@ -153,6 +153,8 @@ pub mod warn_entry_posture;
 pub mod warn_gh_merge_preflight;
 /// Warn when creating/publicizing a repo whose name or description telegraphs sensitive content.
 pub mod warn_going_public;
+/// Nudge when `gh pr create`/`gh issue create` posts a long body inline instead of via `--body-file`.
+pub mod warn_inline_body;
 /// Nudge when `gh issue create` targets an owned repo other than the canonical issue tracker.
 pub mod warn_issue_tracker;
 /// Warn when editing files directly on main/master branch.

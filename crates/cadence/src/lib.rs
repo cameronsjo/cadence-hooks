@@ -43,8 +43,14 @@ pub mod validate_line_endings;
 pub mod warn_changelog_entry;
 /// Nudge to review documentation when creating a pull request.
 pub mod warn_docs_update;
+/// Nudge when an always-loaded instruction file gains narrative.
+pub mod warn_instruction_narrative;
+/// Nudge on a direct write to live auto-memory outside a dream adoption window.
+pub mod warn_live_memory_write;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
+/// Nudge on a write that creates plugin-root `docs/` or `scripts/` content.
+pub mod warn_plugin_root_cruft;
 
 // Tests that write real marker files (#302) sandbox them through
 // `cadence_hooks_core::test_builders::with_marker_dir` — the ONE helper, over

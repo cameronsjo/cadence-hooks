@@ -268,6 +268,12 @@ enum CadenceCommands {
     WarnChangelogEntry,
     /// Nudge to audit about-to-ship content for personal-context overshare
     WarnOvershare,
+    /// Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative
+    WarnInstructionNarrative,
+    /// Nudge on a direct write to live auto-memory outside a dream adoption window
+    WarnLiveMemoryWrite,
+    /// Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace
+    WarnPluginRootCruft,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
@@ -407,6 +413,8 @@ enum GuardrailsCommands {
     WarnIssueTracker,
     /// Nudge on repo create/publicize when name or description telegraphs sensitive content
     WarnGoingPublic,
+    /// Nudge when gh pr/issue create posts a long body inline instead of via --body-file
+    WarnInlineBody,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -587,6 +595,9 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
             CadenceCommands::WarnChangelogEntry => "warn-changelog-entry",
             CadenceCommands::WarnOvershare => "warn-overshare",
+            CadenceCommands::WarnInstructionNarrative => "warn-instruction-narrative",
+            CadenceCommands::WarnLiveMemoryWrite => "warn-live-memory-write",
+            CadenceCommands::WarnPluginRootCruft => "warn-plugin-root-cruft",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::GuardHeldClose { .. } => "guard-held-close",
@@ -625,6 +636,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardBodyBudget { .. } => "guard-body-budget",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
+            GuardrailsCommands::WarnInlineBody => "warn-inline-body",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
@@ -760,6 +772,20 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 Box::new(cadence_hooks_cadence::warn_overshare::WarnOvershare),
                 pre,
             ),
+            CadenceCommands::WarnInstructionNarrative => CheckPlan::new(
+                Box::new(
+                    cadence_hooks_cadence::warn_instruction_narrative::WarnInstructionNarrative,
+                ),
+                pre,
+            ),
+            CadenceCommands::WarnLiveMemoryWrite => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_live_memory_write::WarnLiveMemoryWrite),
+                pre,
+            ),
+            CadenceCommands::WarnPluginRootCruft => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_plugin_root_cruft::WarnPluginRootCruft),
+                pre,
+            ),
             CadenceCommands::NudgePolishBeforePr => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr),
                 pre,
@@ -860,6 +886,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::WarnGoingPublic => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::warn_going_public::GoingPublicGuard),
+                pre,
+            ),
+            GuardrailsCommands::WarnInlineBody => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_inline_body::WarnInlineBody),
                 pre,
             ),
             GuardrailsCommands::VerifyPrAutoclose => CheckPlan::new(
