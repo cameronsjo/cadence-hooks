@@ -351,7 +351,7 @@ pub fn run() -> u8 {
             let cadence_path = claude_dir.join("cadence.json");
 
             for section in &report.written {
-                println!(
+                cadence_hooks_core::outln!(
                     "{}✓{} wrote '{section}' section to {}",
                     p.green,
                     p.reset,
@@ -359,7 +359,12 @@ pub fn run() -> u8 {
                 );
             }
             for path in &report.renamed {
-                println!("{}·{} renamed legacy → {}", p.dim, p.reset, path.display());
+                cadence_hooks_core::outln!(
+                    "{}·{} renamed legacy → {}",
+                    p.dim,
+                    p.reset,
+                    path.display()
+                );
             }
             for (path, err) in &report.rename_failures {
                 eprintln!(
@@ -374,7 +379,7 @@ pub fn run() -> u8 {
                 if matches!(reason, SkipReason::NoLegacy) {
                     continue;
                 }
-                println!(
+                cadence_hooks_core::outln!(
                     "{}⚠{} skipped '{section}': {}",
                     p.yellow,
                     p.reset,
@@ -383,14 +388,14 @@ pub fn run() -> u8 {
             }
 
             if report.is_noop() {
-                println!(
+                cadence_hooks_core::outln!(
                     "{}·{} migrate-config: nothing to migrate — no legacy config found under {}",
                     p.dim,
                     p.reset,
                     claude_dir.display()
                 );
             } else {
-                println!(
+                cadence_hooks_core::outln!(
                     "{}✓{} migrate-config: {} section(s) written, {} legacy file(s) renamed",
                     p.green,
                     p.reset,

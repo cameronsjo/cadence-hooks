@@ -69,7 +69,7 @@ Rules for wiring:
 |------|-------|--------------|
 | `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations |
 | `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK |
-| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check\|redact` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
+| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
 | `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files |
 | `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits |
 | `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
@@ -83,6 +83,7 @@ Rules for wiring:
 | `warn-plugin-root-cruft` | PreToolUse (Write, Edit, MultiEdit) | Nudge on a write under `plugins/<name>/docs/` or `plugins/<name>/scripts/` when the repo's `.claude-plugin/marketplace.json` declares `./plugins/<name>` (skill-nested `scripts/` never match) |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
+| `audit-runner-pool` | PostToolUse (Write, Edit, MultiEdit) | After an edit to `.github/workflows/*.yml`/`*.yaml`, run `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` (newest copy under `<config dir>/plugins/cache/*/cadence-forge/`; 3.5s cap) and return FAIL findings as a nudge. Never blocks: a missing script, no `python3`, a timeout or an unknown exit is silent; the audit's exit 2 ("could not run") becomes a one-line note |
 | `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger |
 | `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) |

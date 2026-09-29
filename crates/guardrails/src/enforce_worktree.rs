@@ -175,10 +175,10 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
-    heredoc_introducers, installs_trap_action, is_assignment_word, is_transparent_prefix_word,
-    looks_absolute, redirect_operator_span, redirect_targets, resolve_cd_target,
-    skip_env_assignment_operands, skip_runner_flags, skip_transparent_prefixes,
+    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, dollar_is_quote_sigil,
+    expand_leading_home, heredoc_introducers, installs_trap_action, is_assignment_word,
+    is_transparent_prefix_word, looks_absolute, redirect_operator_span, redirect_targets,
+    resolve_cd_target, skip_env_assignment_operands, skip_runner_flags, skip_transparent_prefixes,
     split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
     strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
 };
@@ -1734,7 +1734,13 @@ fn has_active_expansion_or_grouping(text: &str) -> bool {
             }
             '`' => return true,
             '$' if matches!(next, Some('(' | '[' | '{')) => return true,
-            '$' if next == Some('\'') && !double => return true,
+            // `$$'` is the PID then a plain quote, not `$'` (bash).
+            '$' if next == Some('\'')
+                && !double
+                && dollar_is_quote_sigil(chars[..i].iter().rev().copied()) =>
+            {
+                return true;
+            }
             '"' => double = !double,
             '\'' if !double => single = true,
             '(' | ')' | '{' | '}' if !double => return true,
@@ -1897,7 +1903,12 @@ fn plain_carve_bodies(command: &str) -> Option<Carve> {
                 continue;
             }
             '$' if matches!(next, Some(b'[' | b'{')) => return None,
-            '$' if next == Some(b'\'') && !double => return None,
+            '$' if next == Some(b'\'')
+                && !double
+                && dollar_is_quote_sigil(command[..i].chars().rev()) =>
+            {
+                return None;
+            }
             '`' => return None,
             '(' | ')' | '{' | '}' if !double => return None,
             '"' => double = !double,
@@ -6442,6 +6453,32 @@ mod tests {
             Outcome::Block,
             "-C redirect into the primary must block"
         );
+    }
+
+    #[test]
+    fn dollar_quote_spellings_follow_bash_and_still_block_in_primary() {
+        // `$$'` is the PID then a plain quote, and `\$'` an escaped dollar
+        // then a plain quote (cadence-hooks#1171): neither is `$'…'`.
+        assert!(!has_active_expansion_or_grouping("echo $$'a'"));
+        assert!(!has_active_expansion_or_grouping("echo \\$'a'"));
+        assert!(has_active_expansion_or_grouping("echo $'a'"));
+        assert!(has_active_expansion_or_grouping("echo $$$'a'"));
+        assert!(has_active_expansion_or_grouping("echo \\$$'a'"));
+
+        let scratch = scratch("dollar-quote");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        for cmd in [
+            "echo $$'x' && git commit -m y",
+            "echo \\$'x' && git commit -m y",
+            "echo $$$'x' && git commit -m y",
+            "echo $'x' && git commit -m y",
+            "git commit -m $$'x'",
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+        }
     }
 
     #[test]
