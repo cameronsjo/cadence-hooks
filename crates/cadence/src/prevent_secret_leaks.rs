@@ -2447,7 +2447,8 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
 }
 
 /// The CLOSED set of `forgectl env` subcommands audited to emit no secret
-/// VALUE on stdout. Anything outside it fails closed: an unknown subcommand is
+/// VALUE on stdout — for `redact`, no `KEY=value` value: it passes `#` comment
+/// lines through verbatim (cadence-hooks#855). Anything outside it fails closed: an unknown subcommand is
 /// an unaudited one, and the exemption is a metadata-only carve-out from an
 /// otherwise-blocking scan, so refusing it costs a false block on a legitimate
 /// new reader and nothing else.
@@ -2487,7 +2488,8 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// [`is_forgectl_env_file`] instead, so the guard's own predicate decides.
 ///
 /// debt: the safe set is CLOSED — the five subcommands named in
-/// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free — so a new `forgectl env`
+/// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free (`redact` for value lines
+/// only, #855) — so a new `forgectl env`
 /// subcommand fails closed and blocks until it is reviewed and added here.
 /// The upgrade trigger is a legitimate new value-free reader being blocked.
 fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
@@ -2534,9 +2536,10 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<usize> {
     // The target is what matters, not the operator (#853), and the argument
     // runs separately for each direction.
     //
-    // OUT: every audited subcommand is value-free on stdout ([`SAFE_ENV_SUBCOMMANDS`]),
-    // so sending that stdout to a file which is not itself a secret cannot
-    // expose a value the transcript would not already have shown. Refusing on
+    // OUT: every audited subcommand is value-free on stdout ([`SAFE_ENV_SUBCOMMANDS`];
+    // `redact` for `KEY=value` lines only — it echoes `#` comments, #855), so
+    // sending that stdout to a file which is not itself a secret cannot expose
+    // a value the transcript would not already have shown. Refusing on
     // `>/dev/null` bought nothing and cost every script that writes one.
     //
     // IN: an input redirection genuinely feeds `set`, so the source file's
