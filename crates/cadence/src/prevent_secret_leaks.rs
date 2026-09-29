@@ -16,8 +16,9 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_word,
-    executable_tokens, is_assignment_word, skip_git_global_options, split_segments,
-    strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    executable_tokens, executable_tokens_marked, is_assignment_word, skip_git_global_options,
+    split_segments, strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked,
+    unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -1181,9 +1182,8 @@ fn segment_direct_reads(
             // A bare `@FILE` body is already an operand (#1078).
             if HTTPIE_COMMANDS.contains(&cmd_word.as_ref())
                 && !t.starts_with('-')
-                && let Some(value) = t
-                    .split_once('@')
-                    .and_then(|(_, value)| dangerous_secret_operand(value, Filename::Known))
+                && let Some(value) =
+                    httpie_file_item(t).and_then(|v| dangerous_secret_operand(v, Filename::Known))
             {
                 return Some(value);
             }
@@ -1214,6 +1214,20 @@ fn segment_direct_reads(
 /// HTTPie's and xh's executables, whose `field@FILE` request items send a file
 /// (#1078).
 const HTTPIE_COMMANDS: &[&str] = &["http", "https", "xh", "xhs"];
+
+/// The FILE an HTTPie request item reads, or `None` for any other item.
+///
+/// HTTPie splits an item at its FIRST separator: `==` is a query parameter,
+/// `=` a data field, `:=` raw JSON, `:` a header, and `@`, `=@`, `:=@` and
+/// `:@` read a file. So `user==me@corp.env` is a query value and
+/// `https://user@host/p` a URL (`:` then `//`), never a file (#1078).
+fn httpie_file_item(item: &str) -> Option<&str> {
+    let at = item.find(['=', ':', '@'])?;
+    let rest = &item[at..];
+    ["@", "=@", ":=@", ":@"]
+        .iter()
+        .find_map(|separator| rest.strip_prefix(separator))
+}
 
 /// Long options whose value is a file the command reads, per command, and
 /// whether the command's parser accepts an abbreviation (GNU `getopt_long`
@@ -2641,37 +2655,98 @@ const PROCESS_ENVIRON_NUDGE: &str = "⚠️  Command would read a process enviro
      (`/proc/<pid>/environ`), which may include secrets. \
      Run programs that use env vars directly instead.";
 
-/// A `/proc` path whose last part is, or may expand to, `environ`.
-static PROC_ENVIRON: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/proc(?:/[^\s;&|<>()]*)?/[^\s;&|<>()/]*(?:environ|[*?\[$`])")
-        .expect("pattern should compile")
-});
+/// Can one path component name `environ` once the shell expands it? A
+/// literal compare, a `*`/`?` glob matched against `environ`, and anything
+/// carrying `[`, `$`, a backtick or a brace — which only the shell resolves —
+/// counts.
+fn component_may_be_environ(component: &str) -> bool {
+    if component.contains(['[', '$', '`', '{']) {
+        return true;
+    }
+    fn glob(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => (0..=text.len()).any(|at| glob(rest, &text[at..])),
+            Some((b'?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
+            Some((c, rest)) => text.first() == Some(c) && glob(rest, &text[1..]),
+        }
+    }
+    // Bounded: a component longer than this cannot match `environ` unless it
+    // is mostly `*`, and a run of stars is collapsed first.
+    let mut collapsed = String::with_capacity(component.len());
+    for c in component.chars() {
+        if !(c == '*' && collapsed.ends_with('*')) {
+            collapsed.push(c);
+        }
+    }
+    collapsed.len() <= 32 && glob(collapsed.as_bytes(), b"environ")
+}
+
+/// Every `/proc/…` path spelled in `text`: each run between characters that
+/// end a shell word or a quoted span, from its first `/proc/` on.
+///
+/// One path per run, and linear: a later `/proc/` in the same run names a
+/// suffix of the same path, with the same last component and fewer parts, so
+/// it can only match when the first one does. Taking every occurrence to the
+/// run's end made `/proc//proc//proc/…` quadratic.
+fn proc_paths(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '(' | ')' | '<' | '>' | '"' | '\'' | '`'
+            )
+    })
+    .filter_map(|run| run.find("/proc/").map(|at| &run[at..]))
+}
 
 /// Does `command` read a process environment through procfs (#1078)?
 ///
 /// `/proc/<pid>/environ` (and `/proc/self/task/<tid>/environ`) holds the
 /// NUL-separated environment the `env` dump nudge exists for, so a read of it
 /// earns the same nudge: that is the verdict an environment dump already has
-/// here, and it keeps the two spellings of one leak consistent. Matched on
-/// the raw text AND the quote-removed words, so `envi''ron` and
-/// `"/proc/self/environ"` are seen; a `/proc` path whose last part carries a
-/// glob or an expansion (`/proc/self/env*`, `/proc/$$/$F`) counts, since it
-/// can land on `environ`. So does a bare `environ` word once the command
-/// names `/proc` anywhere (`cd /proc/self && cat environ`). Anything
-/// reaching procfs without spelling `/proc` (a variable holding the path, a
-/// symlink made in an earlier tool call) is a named miss.
+/// here, and it keeps the two spellings of one leak consistent.
+///
+/// Only the LAST component of a `/proc/…` path is judged
+/// ([`component_may_be_environ`]), so `/proc/$$/fd` and `/proc/$PPID/status`
+/// stay silent while `/proc/$$/environ`, `/proc/*/environ` and
+/// `/proc/self/env*` nudge. Read on the raw text AND the quote-removed words,
+/// so `envi''ron` and `"/proc/self/environ"` are seen. A relative word ending
+/// in `environ` counts once the command `cd`s or `pushd`s under `/proc`
+/// (`cd /proc/self && cat environ`); `grep environ /proc/self/status` does not. Anything reaching procfs without
+/// spelling `/proc` (a variable holding the path, a symlink made in an
+/// earlier tool call) is a named miss.
 fn command_reads_process_environ(command: &str) -> bool {
-    if !command.contains('/') {
+    if !command.contains("/pro") && !command.contains(['\'', '"', '\\']) {
         return false;
     }
     let words = tokenize(command);
-    let unquoted = words.join(" ");
-    let names_proc = words
-        .iter()
-        .any(|w| w.ends_with("/proc") || w.contains("/proc/"));
-    PROC_ENVIRON.is_match(command)
-        || PROC_ENVIRON.is_match(&unquoted)
-        || (names_proc && words.iter().any(|w| w.contains("environ")))
+    let last_is_environ = |path: &str| {
+        // `/proc/<pid>/environ` at the least: `/proc/*` lists pids, not an
+        // environment.
+        let path = path.trim_end_matches('/');
+        path.split('/').count() >= 4
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(component_may_be_environ)
+    };
+    if proc_paths(command).any(last_is_environ)
+        || words
+            .iter()
+            .flat_map(|w| proc_paths(w))
+            .any(last_is_environ)
+    {
+        return true;
+    }
+    let enters_proc = words.windows(2).any(|pair| {
+        matches!(command_word(&pair[0]).as_ref(), "cd" | "pushd")
+            && (pair[1] == "/proc" || pair[1].starts_with("/proc/"))
+    });
+    enters_proc
+        && words
+            .iter()
+            .any(|w| w.rsplit('/').next().is_some_and(component_may_be_environ))
 }
 
 /// Does any segment of `lower` execute an environment **dump**?
@@ -4052,31 +4127,183 @@ fn envrc_bash_read_allowed(
     envrc_carveout_allows(".envrc", read_untrusted_config(&resolved).as_deref())
 }
 
-/// Verbs that can share a command with a carved-out `.envrc` read: none of
-/// them writes, moves or links a file, runs another program, or checks out
-/// content, so none can put different content at the read path first
-/// (#1078). Kept tiny on purpose — this is an exemption, and every entry
-/// narrows what revokes it: `sort -o`, `uniq IN OUT`, `tee`, `sed -i`, `rg
-/// --pre`, `less`'s shell escape and every `git` verb are why those are not
-/// here.
+/// Verbs that can share a command with a carved-out `.envrc` read whatever
+/// their operands: none of them writes, moves or links a file, runs another
+/// program, or checks out content, so none can put different content at the
+/// read path first (#1078). An ALLOWLIST — an exemption, where every entry
+/// narrows what revokes it — so an unknown verb revokes. Verbs that are inert
+/// only for some operands are judged by [`verb_is_inert`]. `tee`, `cp`, `mv`,
+/// `rg` (`--pre` runs a program) and every `git` verb outside the read-only
+/// set stay out.
 ///
 /// `cd`/`pushd`/`popd` move no file; a relative read after one is revoked by
 /// the #308 cd rule instead.
 const ENVRC_INERT_VERBS: &[&str] = &[
     "cat", "head", "tail", "grep", "egrep", "fgrep", "wc", "cut", "tr", "nl", "echo", "printf",
-    "true", "false", ":", "cd", "pushd", "popd",
+    "true", "false", ":", "cd", "pushd", "popd", "ls", "pwd", "which", "type", "test", "[", "stat",
+    "file", "date", "whoami", "id", "uname", "diff", "jq", "more", "bat",
 ];
 
 /// Shells whose `-c` script [`command_segments`] expands into segments of
 /// its own — transparent to [`command_may_replace_envrc`] once it has.
 const ENVRC_TRANSPARENT_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
-/// Output redirections that write no file: `>/dev/null`, `2>&1`, `>&-` — each
-/// ending the word, since `>&1.envrc` writes a file named `1.envrc`.
-static HARMLESS_OUTPUT_REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:\d*|&)>>?[ \t]*(?:/dev/null|&\d+|&-)(?:[ \t]+|$)")
-        .expect("pattern should compile")
-});
+/// `direnv` subcommands that never write `.envrc` or run a program: `edit`
+/// writes it and `exec` runs one.
+const DIRENV_INERT_SUBCOMMANDS: &[&str] = &["allow", "deny", "reload", "status", "version"];
+
+/// A single-dash cluster (not `--long`) carrying the short option `flag`.
+fn short_cluster_has(arg: &str, flag: char) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(flag))
+}
+
+/// Can this resolved command run without replacing a file or running another
+/// program (#1078)? `argv` is the command's words with redirections removed.
+fn verb_is_inert(word: &str, argv: &[String]) -> bool {
+    let args = argv.get(1..).unwrap_or_default();
+    if ENVRC_INERT_VERBS.contains(&word) {
+        return true;
+    }
+    match word {
+        // `sort -o FILE` writes.
+        "sort" => !args
+            .iter()
+            .any(|a| a.starts_with("--o") || short_cluster_has(a, 'o')),
+        // `uniq IN OUT` writes OUT.
+        "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
+        // `less -o`/`-O`/`--log-file` writes a log.
+        "less" => !args.iter().any(|a| {
+            a.to_ascii_lowercase().starts_with("--log-file")
+                || short_cluster_has(a, 'o')
+                || short_cluster_has(a, 'O')
+        }),
+        // Bare `env` prints; `-S` hands it a command line.
+        "env" => args.iter().all(|a| {
+            (a.starts_with('-') || is_assignment_word(a))
+                && !short_cluster_has(a, 'S')
+                && !a.starts_with("--split-string")
+        }),
+        // `-i` edits in place, `-f` loads a program the scan cannot read, and
+        // the program itself may `w` a file or `e` a command.
+        "sed" => {
+            !args.iter().any(|a| {
+                a.starts_with("--in-place")
+                    || a.starts_with("--file")
+                    || short_cluster_has(a, 'i')
+                    || short_cluster_has(a, 'f')
+            }) && program_writes_nothing(word, argv)
+        }
+        // `-i` loads an extension (`-i inplace`), `-f`/`-E` a program file.
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            !args.iter().any(|a| {
+                a.starts_with("--include")
+                    || a.starts_with("--file")
+                    || a.starts_with("--exec")
+                    || a.starts_with("--load")
+                    || short_cluster_has(a, 'i')
+                    || short_cluster_has(a, 'f')
+                    || short_cluster_has(a, 'E')
+                    || short_cluster_has(a, 'l')
+            }) && program_writes_nothing(word, argv)
+        }
+        "direnv" => {
+            args.len() <= 2
+                && args
+                    .first()
+                    .is_some_and(|sub| DIRENV_INERT_SUBCOMMANDS.contains(&sub.as_str()))
+        }
+        "git" => git_is_read_only(args),
+        _ => false,
+    }
+}
+
+/// Does a `sed`/`awk` program open only files it reads?
+fn program_writes_nothing(word: &str, argv: &[String]) -> bool {
+    argv_program_opens(word, argv)
+        .iter()
+        .all(|open| matches!(open, ProgramOpen::Read(_)))
+}
+
+/// A read-only `git` invocation, with no global option in front: a `-c`
+/// (`core.fsmonitor=…`) or `-C` could make any subcommand run a program or
+/// read elsewhere, so a global of any kind revokes.
+fn git_is_read_only(args: &[String]) -> bool {
+    let Some((sub, rest)) = args.split_first() else {
+        return false;
+    };
+    // `--output=FILE` writes the diff for every command that takes it.
+    let writes_output = rest.iter().any(|a| a.starts_with("--output"));
+    match sub.as_str() {
+        "status" | "rev-parse" | "ls-files" => true,
+        "log" | "diff" | "show" => !writes_output,
+        "branch" => rest
+            .iter()
+            .all(|a| matches!(a.as_str(), "--show-current" | "-a" | "-v" | "-vv" | "--all")),
+        "remote" => rest
+            .iter()
+            .all(|a| matches!(a.as_str(), "-v" | "--verbose")),
+        "config" => rest
+            .first()
+            .is_some_and(|flag| matches!(flag.as_str(), "--get" | "--get-all" | "--list" | "-l")),
+        _ => false,
+    }
+}
+
+/// Split one segment into its words with redirections removed, and whether
+/// any output redirection can write a file (#1078).
+///
+/// Quote-aware: [`executable_tokens_marked`] reports how much of each word
+/// was unquoted, so `echo "a>b"` is one quoted word and `echo ">"` a quoted
+/// operator — neither redirects. An unquoted operator counts when it writes
+/// (`>`, `>>`, `>|`, `&>`, `<>`) to anything but `/dev/null` or a descriptor
+/// (`2>&1`, `>&-`); `>&1.envrc` writes a file named `1.envrc`. A trailing
+/// bare operator with no target is the `&`-split `2>&1` (see
+/// [`redirection_file_targets`]), whose target lands in a segment judged on
+/// its own.
+fn segment_words_and_writes(segment: &str) -> (Vec<String>, bool) {
+    let (tokens, unquoted) = executable_tokens_marked(segment);
+    let mut words = Vec::new();
+    let mut writes = false;
+    let mut i = 0;
+    while let Some(token) = tokens.get(i) {
+        let digits = token.len() - token.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let after_fd = &token[digits..];
+        let amp = usize::from(after_fd.starts_with('&'));
+        let body = &after_fd[amp..];
+        let operator_len = body.len() - body.trim_start_matches(['>', '<', '|', '&']).len();
+        let is_redirect =
+            body.starts_with(['>', '<']) && unquoted.get(i).copied().unwrap_or(0) > digits + amp;
+        if !is_redirect {
+            words.push(token.clone());
+            i += 1;
+            continue;
+        }
+        let operator = &body[..operator_len];
+        let attached = &body[operator_len..];
+        let target = if attached.is_empty() {
+            tokens.get(i + 1).map(String::as_str)
+        } else {
+            Some(attached)
+        };
+        let to_descriptor = |t: &str| {
+            let t = if operator.ends_with('&') {
+                t
+            } else {
+                match t.strip_prefix('&') {
+                    Some(rest) => rest,
+                    None => return false,
+                }
+            };
+            t == "-" || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+        };
+        if operator.contains('>') && target.is_some_and(|t| t != "/dev/null" && !to_descriptor(t)) {
+            writes = true;
+        }
+        i += if attached.is_empty() { 2 } else { 1 };
+    }
+    (words, writes)
+}
 
 /// Can a segment of `command` put different content at a `.envrc` path before
 /// a read in the same command runs (#1078)?
@@ -4089,21 +4316,24 @@ static HARMLESS_OUTPUT_REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
 /// every `git` verb that touches the work tree, archive tools, a redirect…)
 /// would be a list that is never finished, so the rule runs the other way:
 /// a lone segment keeps the carve-out, and a command of several keeps it only
-/// when every segment is an [`ENVRC_INERT_VERBS`] verb with no output
-/// redirection that could write a file. Segmented over the wrapper-expanded
-/// [`command_segments`] view, so a substitution or `bash -c` body is a
-/// segment of its own and counts.
+/// when every segment is inert ([`verb_is_inert`]) with no output
+/// redirection that could write a file ([`segment_words_and_writes`]).
+/// Segmented over the wrapper-expanded [`command_segments`] view, so a
+/// substitution or `bash -c` body is a segment of its own and counts.
 ///
 /// Accepted over-blocks, all fail-CLOSED with `direnv allow` named in the
-/// message: `cat .envrc; ls`, `cat .envrc | sed -n 1p`, `cat .envrc >out`.
+/// message: an unlisted verb (`cat .envrc; make`), `cat .envrc >out`.
 fn command_may_replace_envrc(command: &str) -> bool {
     let segments = command_segments(command);
     if segments.len() <= 1 {
         return false;
     }
     !segments.iter().all(|segment| {
-        let tokens = executable_tokens(segment);
-        let Some((word, _)) = resolve_command(&tokens) else {
+        let (words, writes) = segment_words_and_writes(segment);
+        if writes {
+            return false;
+        }
+        let Some((word, argv)) = resolve_command(&words) else {
             return false;
         };
         // A shell running a script the expansion reached is judged by that
@@ -4111,14 +4341,10 @@ fn command_may_replace_envrc(command: &str) -> bool {
         // (`bash -c "$X"`, `bash s.sh`) could do anything, so it is not inert,
         // and neither is one handed an assignment: `BASH_ENV=f bash -c …`
         // sources `f` first.
-        let inert_verb = ENVRC_INERT_VERBS.contains(&word.as_ref())
+        verb_is_inert(&word, argv)
             || (ENVRC_TRANSPARENT_SHELLS.contains(&word.as_ref())
-                && !tokens.iter().any(|t| is_assignment_word(t))
-                && command_segments(segment) != [segment.clone()]);
-        inert_verb
-            && !HARMLESS_OUTPUT_REDIRECT
-                .replace_all(segment, "")
-                .contains('>')
+                && !words.iter().any(|t| is_assignment_word(t))
+                && command_segments(segment) != [segment.clone()])
     })
 }
 
@@ -10281,6 +10507,27 @@ mod tests {
             "bash s.sh; cat .envrc",
             "BASH_ENV=f bash -c 'cat .envrc'",
             "cat .envrc 2>/dev/null | tee .envrc.log",
+            // Inert verbs lose the exemption when their operands write.
+            "direnv edit && cat .envrc",
+            "direnv exec . mv a .envrc; cat .envrc",
+            "sed -i s/a/b/ .envrc && cat .envrc",
+            "sed -n 'w y' x; cat .envrc",
+            "awk '{print > \"y\"}' x; cat .envrc",
+            "awk 'BEGIN{system(\"mv a .envrc\")}'; cat .envrc",
+            "awk -i inplace 1 x; cat .envrc",
+            "sort -o y x; cat .envrc",
+            "uniq x y; cat .envrc",
+            "less -o y x; cat .envrc",
+            "env -S 'mv a .envrc'; cat .envrc",
+            "git -c core.fsmonitor=x status; cat .envrc",
+            "git config user.name x; cat .envrc",
+            "git branch -D x; cat .envrc",
+            "git diff --output=y; cat .envrc",
+            "ls > y; cat .envrc",
+            "echo x 2>y; cat .envrc",
+            "echo x &>y; cat .envrc",
+            "echo x >>y; cat .envrc",
+            "echo x >|y; cat .envrc",
         ] {
             assert_relative_envrc_read(command, cadence_hooks_core::Outcome::Block);
         }
@@ -10307,6 +10554,24 @@ mod tests {
             "echo --- && cat .envrc",
             "bash -c 'cat .envrc'",
             "sh -c 'cat .envrc | wc -l'",
+            // Everyday companions (the #1078 review's over-block rows).
+            "direnv allow && cat .envrc",
+            "direnv allow; cat .envrc",
+            "direnv reload && cat .envrc",
+            "cat .envrc && direnv allow",
+            "git status && cat .envrc",
+            "git log --oneline -3 && cat .envrc",
+            "git branch --show-current && cat .envrc",
+            "git config --get user.name; cat .envrc",
+            "git status 2>/dev/null; cat .envrc",
+            "ls -la && cat .envrc",
+            "pwd && cat .envrc",
+            "cat .envrc | sort | uniq",
+            "cat .envrc | sed -n 1p",
+            "cat .envrc | awk '{print $1}'",
+            // A quoted `>` is data, not a redirect.
+            "echo \"a>b\" && cat .envrc",
+            "echo x '>' y; cat .envrc",
         ] {
             assert_envrc_read_allowed(command);
         }
@@ -10326,6 +10591,8 @@ mod tests {
                 "tr '\\0' '\\n' </proc/thread-self/environ",
                 "strings /proc/$$/environ",
                 "cd /proc/self && cat environ",
+                "cat /proc/*/environ",
+                "x=$(cat /proc/self/environ | tr a b)",
             ],
             cadence_hooks_core::Outcome::Nudge,
             "a procfs environment is the env dump by another name",
@@ -10338,6 +10605,11 @@ mod tests {
                 "echo environment",
                 "cat /tmp/environ",
                 "cat /processes/environ",
+                "ls /proc/$$/fd",
+                "cat /proc/$PPID/status",
+                "ls /proc/*",
+                "grep environ /proc/self/status",
+                "grep -r environ src/",
             ],
             cadence_hooks_core::Outcome::Allow,
             "procfs files other than environ are not an environment",
@@ -10376,6 +10648,8 @@ mod tests {
                 "http https://user@x.example/p",
                 "http x.example f@notes.txt",
                 "http x.example f@.env.example",
+                "http GET example.com/api user==me@corp.env",
+                "http x.example user@example.com",
             ],
             cadence_hooks_core::Outcome::Allow,
             "no secret file in the value",

