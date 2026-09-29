@@ -65,8 +65,9 @@
 //! `enforce-worktree` treats `CADENCE_ALLOW_MAIN`.
 
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, command_word, skip_transparent_prefixes,
-    split_segments_with_ops, strip_group_wrappers, tokenize,
+    MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_word,
+    peel_command_runners, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
+    tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -141,7 +142,12 @@ fn first_unsafe_decrypt(script: &str, depth: usize) -> Option<String> {
     for (index, (segment, op)) in segments.iter().enumerate() {
         let stripped = strip_group_wrappers(segment);
         let tokens = tokenize(stripped);
-        let argv = skip_transparent_prefixes(&tokens);
+        // The shared runner peel, not the bare transparent-prefix skip: the
+        // skip stops at a prefix's first flag, so `nice -n 5 sops -d …`,
+        // `timeout 5 sops -d …`, `env -i sops -d …` and `sudo sops -d …` kept
+        // the runner as the command word and were never examined
+        // (cadence-hooks#1090).
+        let argv = peel_command_runners(&tokens);
 
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, stripped) {
@@ -151,7 +157,7 @@ fn first_unsafe_decrypt(script: &str, depth: usize) -> Option<String> {
             }
         }
 
-        if !decrypts_to_stdout(argv) {
+        if !decrypts_to_stdout(argv) && !hides_a_decrypt_behind_a_prefix(argv) {
             continue;
         }
 
@@ -203,6 +209,34 @@ fn decrypts_to_stdout(argv: &[String]) -> bool {
             .iter()
             .find(|token| !token.starts_with('-'))
             .is_some_and(|word| word == "decrypt")
+}
+
+/// A decrypt sits somewhere AFTER the command word — behind a prefix or runner
+/// whose own flag grammar the peel does not model.
+///
+/// **The peel models a short list, and every word it cannot get past was a
+/// silent allow.** `time -p sops -d …`, `command -p sops -d …`,
+/// `exec -a x sops -d …`, a runner carrying a flag its grammar does not list
+/// (`sudo -C 5 sops -d …`), and every runner nobody listed at all (`ionice`,
+/// `chrt`, `taskset`, `doas`, `ssh host …`) leave that word as `argv[0]`, so
+/// the command-word test above never saw `sops`. Enumerating each prefix's
+/// grammar is the denylist this guard's charter refuses, so this reads the
+/// other way round: a `sops` word at ANY later position, with decrypt-to-stdout
+/// arguments after it, is treated as a decrypt (cadence-hooks#1090) — the same
+/// refuse-rather-than-drop shape as `push.rs`'s `hides_a_push_behind_a_prefix`,
+/// widened from "a known prefix" to "any word in front", because here the
+/// allow side is an explicit two-member consumer list rather than a verb gate.
+///
+/// The decrypt is then judged by the ordinary consumer rule, so a decrypt
+/// behind a prefix still piped to `curl --config -` stays allowed.
+///
+/// **Deliberate over-refusal:** a segment that merely MENTIONS the words
+/// (`echo sops -d x | grep y`, `grep sops -d notes`) is read as a decrypt.
+/// Telling a mention from a run needs the prefix's flag grammar — exactly what
+/// this fallback exists not to parse — and a false block on a contrived line is
+/// the safe side of that trade.
+fn hides_a_decrypt_behind_a_prefix(argv: &[String]) -> bool {
+    (1..argv.len()).any(|index| decrypts_to_stdout(&argv[index..]))
 }
 
 /// This token tells sops to write its output somewhere other than stdout.
@@ -277,7 +311,16 @@ impl Check for SopsDecryptGuard {
             return CheckResult::allow();
         };
 
-        let Some(found) = first_unsafe_decrypt(command, 0) else {
+        // A brace word past the tokenizer's expansion bounds reaches the walk
+        // unexpanded, so a decrypt it builds (`{sops,-d,…}`) is invisible:
+        // refuse rather than judge a command this guard cannot see
+        // (cadence-hooks#1096). No real command comes near the bounds.
+        let found = first_unsafe_decrypt(command, 0).or_else(|| {
+            (command.contains('{') && brace_expansion_overflows(command)).then(|| {
+                "a brace expansion too large to model, which can hide a decrypt".to_string()
+            })
+        });
+        let Some(found) = found else {
             return CheckResult::allow();
         };
 
@@ -689,6 +732,129 @@ mod tests {
                 outcome("echo 'never run sops -d secrets.sops.yaml | grep'"),
                 Outcome::Allow
             )
+        });
+    }
+
+    #[test]
+    fn a_decrypt_behind_a_runner_or_flagged_prefix_blocks() {
+        // cadence-hooks#1090: the guard skipped only unflagged transparent
+        // prefixes, so every row kept its runner/prefix as the command word and
+        // was Allow at the parent commit. Each one runs sops under bash.
+        without_escape(|| {
+            for command in [
+                "nice -n 5 sops -d secrets.yaml | grep x",
+                "timeout 5 sops -d secrets.yaml | grep x",
+                "stdbuf -o0 sops -d secrets.yaml | grep x",
+                "env -i sops -d secrets.yaml | grep x",
+                "env -i FOO=1 sops -d secrets.yaml | grep x",
+                "sudo sops -d secrets.yaml | grep x",
+                "sudo -u me sops -d secrets.yaml | grep x",
+                "setsid sops -d secrets.yaml | grep x",
+                "setsid -w sops -d secrets.yaml | grep x",
+                "time -p sops -d secrets.yaml | grep x",
+                "/usr/bin/time -p sops -d secrets.yaml | grep x",
+                "command -p sops -d secrets.yaml | grep x",
+                "exec -a x sops -d secrets.yaml | grep x",
+                "exec -a sops sops -d secrets.yaml | grep x",
+                // A flag the runner grammar does not model, and a runner nobody
+                // listed: both refuse rather than drop.
+                "sudo -C 5 sops -d secrets.yaml | grep x",
+                "ionice -c3 sops -d secrets.yaml | grep x",
+                "nice -n 5 sops decrypt secrets.yaml",
+                "time -p sops --decrypt secrets.yaml",
+                // Past the runner, a `-o` that belongs to the RUNNER does not
+                // read as sops writing elsewhere.
+                "exec -a -o sops -d secrets.yaml",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_non_stdout_sops_behind_a_runner_stays_allowed() {
+        // Controls for #1090: the peel and the fallback change which word is
+        // judged, not what counts as a decrypt or an allowed consumer.
+        without_escape(|| {
+            for command in [
+                "nice -n 5 sops -d s.yaml | curl --config -",
+                "time -p sops -d s.yaml | curl --config -",
+                "setsid sops -d s.yaml | bash scripts/secret-keys.sh",
+                "nice -n 5 sops -e s.yaml",
+                "time -p sops -e s.yaml",
+                "nice sops -d -i s.yaml",
+                "time -p sops -d -i s.yaml",
+                "timeout 5 sops -d s.yaml -o out.yaml",
+                "sudo sops s.yaml",
+                "time -p ls",
+                "setsid ls",
+            ] {
+                assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_decrypt_built_by_brace_expansion_blocks() {
+        // cadence-hooks#1096: bash brace-expands the command word, so each row
+        // runs `sops -d`; all were Allow at the parent commit.
+        without_escape(|| {
+            for command in [
+                "{sops,-d,secrets.yaml}",
+                "{sops,-d,secrets.yaml} | grep x",
+                "( {sops,-d,secrets.yaml} )",
+                "nice -n 5 {sops,-d,secrets.yaml} | grep x",
+                "sops {-d,secrets.yaml} | grep x",
+                "{sops,'-d',secrets.yaml}",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command:?}");
+            }
+            // Past the expansion bound the word is unseen, so it refuses.
+            let product = "{a,b}".repeat(13);
+            assert_eq!(outcome(&format!("echo {product}")), Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn a_brace_flood_before_a_decrypt_still_blocks_promptly() {
+        // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
+        // re-expanded as the guard re-tokenizes every segment, ran guards past
+        // their hook timeouts (a timeout fails open). The thread brace budget
+        // bounds the work; the dangerous tail must still block, promptly. The
+        // bound is generous for a debug build — release runs in tens of ms.
+        without_escape(|| {
+            let command = format!(
+                "{}sops -d s.yaml | grep x",
+                "echo {1..4096}; ".repeat(200 * 64)
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(outcome(&command), Outcome::Block);
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            // A heredoc body of minified JSON is data, not an overflow.
+            let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
+            assert_eq!(
+                outcome(&format!("cat > x.json <<'EOF'\n{json}\nEOF")),
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn brace_words_that_build_no_decrypt_stay_allowed() {
+        without_escape(|| {
+            for command in [
+                "{sops,-d,s.yaml} | curl --config -",
+                "\"{sops,-d,secrets.yaml}\"",
+                "\\{sops,-d,secrets.yaml\\}",
+                "{sops,-e,s.yaml}",
+                "mkdir -p src/{a,b}",
+                "echo {a,b}",
+                "cp x.{ts,js} out/",
+                "git commit -m \"{a,b}\"",
+                "for i in {1..4096}; do :; done",
+            ] {
+                assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
+            }
         });
     }
 

@@ -774,6 +774,20 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_flood_before_a_reset_still_blocks_promptly() {
+        // cadence-hooks#1096 review: a flood of `{1..4096}` words, each
+        // re-expanded as the guard re-tokenizes every segment, ran guards past
+        // their hook timeouts (a timeout fails open). The thread brace budget
+        // bounds the work; the dangerous tail must still block, promptly. The
+        // bound is generous for a debug build — release runs in tens of ms.
+        let command = format!("{}git reset --hard", "echo {1..4096}; ".repeat(200 * 64));
+        let started = std::time::Instant::now();
+        let result = GitSafetyGuard.run(&make_bash_input(&command));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    #[test]
     fn reset_hard_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git reset --hard"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);

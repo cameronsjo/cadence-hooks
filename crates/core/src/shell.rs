@@ -367,6 +367,47 @@ impl LeadRun {
 /// F25).
 pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
+    // One expansion budget for the whole call, drawn from the thread's
+    // budget, so neither a command of many small exploding words nor a guard
+    // that re-tokenizes every segment can multiply the per-word bound into a
+    // stall that outlives the hook timeout and fails open (see
+    // [`BraceBudget`]).
+    with_brace_budget(|budget| {
+        walk_words(
+            command,
+            &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
+                push_expanded_token(
+                    &mut tokens,
+                    text,
+                    flags,
+                    unquoted_prefix_len,
+                    expanding_prefix_len,
+                    budget,
+                );
+            },
+        );
+    });
+    tokens
+}
+
+/// Every word of `command` as the tokenizer reads it BEFORE brace expansion,
+/// with its per-byte structural flags (see [`walk_words`]).
+fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
+    let mut words = Vec::new();
+    walk_words(command, &mut |text, flags, _, _| {
+        words.push((text, flags.to_vec()));
+    });
+    words
+}
+
+/// Receives one finished word: its text, per-byte structural flags,
+/// `unquoted_prefix_len`, and `expanding_prefix_len`.
+type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) + 'a;
+
+/// The single tokenizer walk behind [`tokenize_marked`] and [`raw_words`]:
+/// calls `emit(text, structural, unquoted_prefix_len, expanding_prefix_len)`
+/// once per finished word, quotes removed.
+fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     let mut current = String::new();
     let mut in_token = false;
     // `None` until this token's first quoting construct; then the byte length
@@ -377,9 +418,21 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     // Set by a decoded `\0` inside `$'…'`: bash ends the string's value there,
     // so everything up to the closing quote is dropped.
     let mut ansi_c_nul = false;
+    // One flag per byte of `current`: was it emitted unquoted and unescaped, so
+    // that bash's brace expansion can treat it as syntax? Only the unquoted arm
+    // below sets it; every other push is backfilled `false` at the end of the
+    // iteration. Read by [`brace_expand_word`] when the token finishes.
+    let mut structural: Vec<bool> = Vec::new();
+    // The previous unquoted character was a backslash that itself was not
+    // escaped, so this one is literal to bash (`\{a,b\}` does not expand).
+    let mut escape_pending = false;
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
+        let escaped = std::mem::take(&mut escape_pending);
+        // Backfill whatever the previous iteration pushed from a quoted arm —
+        // at the TOP, because those arms `continue` past the bottom.
+        structural.resize(current.len(), false);
         match quote {
             Some(Quote::Single) => {
                 if c == '\'' {
@@ -456,35 +509,554 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
                 c if c.is_whitespace() => {
                     if in_token {
+                        structural.resize(current.len(), false);
                         let text = std::mem::take(&mut current);
+                        let flags = std::mem::take(&mut structural);
                         let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
                         let expanding_prefix_len = lead.finish(text.len());
-                        tokens.push(MarkedToken {
-                            text,
-                            unquoted_prefix_len,
-                            expanding_prefix_len,
-                        });
+                        emit(text, &flags, unquoted_prefix_len, expanding_prefix_len);
                         in_token = false;
                     }
                 }
                 _ => {
                     lead.unquoted();
                     current.push(c);
+                    structural.resize(current.len(), !escaped);
+                    escape_pending = c == '\\' && !escaped;
                     in_token = true;
                 }
             },
         }
     }
+    structural.resize(current.len(), false);
     if in_token {
         let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
         let expanding_prefix_len = lead.finish(current.len());
-        tokens.push(MarkedToken {
-            text: current,
+        emit(
+            current,
+            &structural,
             unquoted_prefix_len,
             expanding_prefix_len,
-        });
+        );
     }
-    tokens
+}
+
+/// Push one finished word onto `tokens`, brace-expanded the way bash expands it
+/// before running anything (cadence-hooks#1096).
+///
+/// **Bash brace-expands every unquoted word, the command word included**, so
+/// `{cat,.env}` runs `cat .env` and `{sops,-d,secrets.yaml}` runs sops. Read as
+/// the single word `{cat,.env}`, the command every guard keys on was invisible.
+/// Expanding here, in the one tokenizer every walk shares, hands each guard the
+/// argv bash will actually build, in every position — command word, runner
+/// operand, argument.
+///
+/// Marks: a word with no quoting keeps "unquoted throughout" for each
+/// expansion; a word that carried any quoting reports `0` for both prefixes on
+/// each expansion, which (per [`MarkedToken`]) can only stop a redirect strip or
+/// a `$HOME` expansion, never cause one.
+///
+/// **Over the bound, the word is left whole** — see [`brace_expansion_overflows`],
+/// which the security guards consult so that residual refuses instead of passing.
+fn push_expanded_token(
+    tokens: &mut Vec<MarkedToken>,
+    text: String,
+    structural: &[bool],
+    unquoted_prefix_len: usize,
+    expanding_prefix_len: usize,
+    budget: &mut BraceBudget,
+) {
+    match brace_expand_word(&text, structural, budget) {
+        BraceExpansion::Expanded(words) => {
+            let unquoted = unquoted_prefix_len == text.len();
+            tokens.extend(words.into_iter().map(|word| {
+                let len = if unquoted { word.len() } else { 0 };
+                MarkedToken {
+                    text: word,
+                    unquoted_prefix_len: len,
+                    expanding_prefix_len: len,
+                }
+            }));
+        }
+        BraceExpansion::Unchanged | BraceExpansion::Overflow => tokens.push(MarkedToken {
+            text,
+            unquoted_prefix_len,
+            expanding_prefix_len,
+        }),
+    }
+}
+
+/// Most words one token may brace-expand into before it counts as an overflow.
+/// `for i in {1..4096}` fits; a product of groups built to exhaust it
+/// (`{a,b}{a,b}…`) is adversarial by construction.
+const MAX_BRACE_WORDS: usize = 4096;
+
+/// Most bytes, and most words, the expansions in one tokenizer call may build.
+const MAX_BRACE_CALL_BYTES: usize = 1 << 20;
+const MAX_BRACE_CALL_WORDS: usize = 16 * 1024;
+
+/// Most bytes, and most words, every tokenizer call on one thread may build
+/// together. A hook is one process judging one command, so this bounds a
+/// guard's total expansion work however many times it re-tokenizes the
+/// segments of a command (cadence-hooks#1096 review: `echo {1..4096}` × N
+/// re-expanded per segment ran guards past their timeouts).
+const MAX_BRACE_THREAD_BYTES: usize = 8 << 20;
+const MAX_BRACE_THREAD_WORDS: usize = 256 * 1024;
+
+/// Most unquoted `{` one token may carry before expansion is not attempted —
+/// the bound on recursion depth and on rescans. A `{` opening `${` does not
+/// count.
+const MAX_BRACE_GROUPS: usize = 64;
+
+/// What brace expansion may still build. Every charge that does not fit
+/// spends the whole budget, so once one check fails, every later word in the
+/// call reports [`BraceExpansion::Overflow`] without being expanded.
+#[derive(Debug, Clone, Copy)]
+struct BraceBudget {
+    bytes: usize,
+    words: usize,
+}
+
+impl BraceBudget {
+    fn charge(&mut self, words: usize, bytes: usize) -> Option<()> {
+        match (self.words.checked_sub(words), self.bytes.checked_sub(bytes)) {
+            (Some(w), Some(b)) => {
+                self.words = w;
+                self.bytes = b;
+                Some(())
+            }
+            _ => {
+                self.spend();
+                None
+            }
+        }
+    }
+
+    fn spend(&mut self) {
+        self.words = 0;
+        self.bytes = 0;
+    }
+
+    fn is_spent(&self) -> bool {
+        self.words == 0 || self.bytes == 0
+    }
+}
+
+thread_local! {
+    static THREAD_BRACE_BUDGET: std::cell::Cell<BraceBudget> =
+        const { std::cell::Cell::new(BraceBudget {
+            bytes: MAX_BRACE_THREAD_BYTES,
+            words: MAX_BRACE_THREAD_WORDS,
+        }) };
+}
+
+/// Run `f` with one call's brace budget — the per-call caps, or what is left of
+/// the thread's budget if less — and deduct what it spent from the thread.
+fn with_brace_budget<R>(f: impl FnOnce(&mut BraceBudget) -> R) -> R {
+    let thread = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+    let start = BraceBudget {
+        bytes: thread.bytes.min(MAX_BRACE_CALL_BYTES),
+        words: thread.words.min(MAX_BRACE_CALL_WORDS),
+    };
+    let mut budget = start;
+    let result = f(&mut budget);
+    THREAD_BRACE_BUDGET.with(|cell| {
+        cell.set(BraceBudget {
+            bytes: thread.bytes - (start.bytes - budget.bytes),
+            words: thread.words - (start.words - budget.words),
+        });
+    });
+    result
+}
+
+/// What bash's brace expansion does to one word.
+#[derive(Debug, PartialEq, Eq)]
+enum BraceExpansion {
+    /// No brace group expands: the word stands as written.
+    Unchanged,
+    /// The words bash produces, in bash's order, empty words dropped.
+    Expanded(Vec<String>),
+    /// The word expands, but past [`MAX_BRACE_WORDS`], [`MAX_BRACE_GROUPS`] or
+    /// the call's [`BraceBudget`]. Not modelled; callers that decide safety
+    /// refuse.
+    Overflow,
+}
+
+/// Brace-expand one tokenized word. `structural[i]` says whether byte `i` of
+/// `text` was unquoted and unescaped — only such `{`, `,`, `}` and `..` are
+/// syntax (`"{a,b}"`, `\{a,b\}` and `{a",",b}`'s inner comma are literal,
+/// while `{cat,'.env'}` still expands, because quote removal runs after).
+///
+/// Modelled from bash: a group needs a top-level comma or a valid sequence
+/// expression (`{1..3}`, `{a..e}`, `{01..10..2}`), otherwise its braces are
+/// literal and the scan moves on (`{a}{b,c}` gives `{a}b {a}c`); `${…}`,
+/// `$(…)` and backtick spans are opaque; a word shaped as an assignment
+/// (`NAME=…`) is left alone, since bash does not expand an assignment
+/// statement and in command position that is what it is.
+fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) -> BraceExpansion {
+    let Some(word) = expanding_brace_word(text, structural) else {
+        return BraceExpansion::Unchanged;
+    };
+    if count_brace_opens(&word) > MAX_BRACE_GROUPS || budget.is_spent() {
+        return BraceExpansion::Overflow;
+    }
+    match expand_brace_chars(&word, budget) {
+        Some(words) => {
+            BraceExpansion::Expanded(words.into_iter().filter(|w| !w.is_empty()).collect())
+        }
+        None => {
+            budget.spend();
+            BraceExpansion::Overflow
+        }
+    }
+}
+
+/// `text` as `(char, structural)` pairs when bash would brace-expand it — some
+/// structural group has a top-level comma or a valid sequence, or the word
+/// carries more groups than [`MAX_BRACE_GROUPS`] — and `None` when it stands as
+/// written. Decided without expanding anything, so it costs no budget.
+fn expanding_brace_word(text: &str, structural: &[bool]) -> Option<Vec<(char, bool)>> {
+    if !text.contains('{') {
+        return None;
+    }
+    let word: Vec<(char, bool)> = text
+        .char_indices()
+        .map(|(at, c)| (c, structural.get(at).copied().unwrap_or(false)))
+        .collect();
+    let opens = count_brace_opens(&word);
+    if opens == 0 || is_assignment_shaped(&word) {
+        return None;
+    }
+    (opens > MAX_BRACE_GROUPS || has_expanding_group(&word)).then_some(word)
+}
+
+/// Structural `{` in `word` that could open a brace group — not the `{` of `${`.
+fn count_brace_opens(word: &[(char, bool)]) -> usize {
+    (0..word.len())
+        .filter(|&at| word[at] == ('{', true) && !(at > 0 && word[at - 1] == ('$', true)))
+        .count()
+}
+
+/// Does any structural `{` outside an opaque span open a group bash expands?
+fn has_expanding_group(word: &[(char, bool)]) -> bool {
+    let mut at = 0;
+    while at < word.len() {
+        if let Some(end) = opaque_span_end(word, at) {
+            at = end;
+            continue;
+        }
+        if word[at] == ('{', true)
+            && let Some(close) = matching_brace(word, at)
+        {
+            let body = &word[at + 1..close];
+            if split_brace_body(body).len() > 1 || brace_sequence(body).is_some() {
+                return true;
+            }
+        }
+        at += 1;
+    }
+    false
+}
+
+/// A leading `NAME=` in which every byte is unquoted syntax.
+fn is_assignment_shaped(word: &[(char, bool)]) -> bool {
+    let Some(eq) = word.iter().position(|&(c, _)| c == '=') else {
+        return false;
+    };
+    eq > 0
+        && word[..=eq].iter().all(|&(_, s)| s)
+        && (word[0].0.is_ascii_alphabetic() || word[0].0 == '_')
+        && word[1..eq]
+            .iter()
+            .all(|&(c, _)| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The index just past the opaque span starting at `i` — `${…}`, `$(…)`, or a
+/// backtick run — or `None` when no such span starts there. An unterminated
+/// span runs to the end of the word.
+fn opaque_span_end(word: &[(char, bool)], i: usize) -> Option<usize> {
+    let is = |at: usize, want: char| word.get(at).is_some_and(|&(c, s)| s && c == want);
+    let (open, close) = if is(i, '$') && is(i + 1, '{') {
+        ('{', '}')
+    } else if is(i, '$') && is(i + 1, '(') {
+        ('(', ')')
+    } else if is(i, '`') {
+        let end = (i + 1..word.len()).find(|&at| is(at, '`'));
+        return Some(end.map_or(word.len(), |at| at + 1));
+    } else {
+        return None;
+    };
+    let mut depth = 0usize;
+    for at in i + 1..word.len() {
+        if is(at, open) {
+            depth += 1;
+        } else if is(at, close) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at + 1);
+            }
+        }
+    }
+    Some(word.len())
+}
+
+/// The index of the structural `}` closing the `{` at `open`, skipping opaque
+/// spans, or `None` when it is never closed.
+fn matching_brace(word: &[(char, bool)], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = open;
+    while at < word.len() {
+        if let Some(end) = opaque_span_end(word, at) {
+            at = end;
+            continue;
+        }
+        match word[at] {
+            ('{', true) => depth += 1,
+            ('}', true) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Split a group's body at its top-level structural commas.
+fn split_brace_body(body: &[(char, bool)]) -> Vec<&[(char, bool)]> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut at = 0;
+    while at < body.len() {
+        if let Some(end) = opaque_span_end(body, at) {
+            at = end;
+            continue;
+        }
+        match body[at] {
+            ('{', true) => depth += 1,
+            ('}', true) => depth = depth.saturating_sub(1),
+            (',', true) if depth == 0 => {
+                parts.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
+/// A parsed sequence expression; [`BraceSequence::generate`] builds its words.
+struct BraceSequence {
+    start: i128,
+    end: i128,
+    step: u128,
+    letters: bool,
+    width: Option<usize>,
+    count: u128,
+}
+
+/// A group body as a sequence expression — `x..y` or `x..y..step`, integers or
+/// single ASCII letters — or `None` when it is not one (the braces are then
+/// literal). Parsing only: nothing is generated.
+fn brace_sequence(body: &[(char, bool)]) -> Option<BraceSequence> {
+    if !body.iter().all(|&(_, s)| s) {
+        return None;
+    }
+    let text: String = body.iter().map(|&(c, _)| c).collect();
+    let parts: Vec<&str> = text.split("..").collect();
+    let (from, to, step) = match parts.as_slice() {
+        [from, to] => (*from, *to, None),
+        [from, to, step] => (*from, *to, Some(*step)),
+        _ => return None,
+    };
+    let step = match step {
+        Some(step) => parse_brace_int(step)?.unsigned_abs().max(1),
+        None => 1,
+    };
+    let (start, end, letters) = match (parse_brace_int(from), parse_brace_int(to)) {
+        (Some(a), Some(b)) => (a, b, false),
+        _ => {
+            let single = |s: &str| {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if c.is_ascii_alphabetic() => Some(i128::from(c as u8)),
+                    _ => None,
+                }
+            };
+            (single(from)?, single(to)?, true)
+        }
+    };
+    let count = start.abs_diff(end) / step + 1;
+    let pad = |s: &str| {
+        let digits = s.trim_start_matches(['-', '+']);
+        (digits.len() > 1 && digits.starts_with('0')).then_some(s.len())
+    };
+    let width = if letters {
+        None
+    } else {
+        pad(from)
+            .max(pad(to))
+            .map(|w| w.max(from.len()).max(to.len()))
+    };
+    Some(BraceSequence {
+        start,
+        end,
+        step,
+        letters,
+        width,
+        count,
+    })
+}
+
+impl BraceSequence {
+    /// The sequence's words, or `None` — before allocating any — when it is
+    /// past [`MAX_BRACE_WORDS`] or does not fit `budget`.
+    fn generate(&self, budget: &mut BraceBudget) -> Option<Vec<String>> {
+        let count = usize::try_from(self.count)
+            .ok()
+            .filter(|&count| count <= MAX_BRACE_WORDS)?;
+        // Every word is at least `width` (or one) bytes long.
+        budget.charge(count, count.checked_mul(self.width.unwrap_or(1))?)?;
+        let step = i128::try_from(self.step).unwrap_or(1);
+        let mut out = Vec::with_capacity(count);
+        let mut value = self.start;
+        for _ in 0..count {
+            out.push(if self.letters {
+                char::from(u8::try_from(value).unwrap_or(b'?')).to_string()
+            } else {
+                match self.width {
+                    Some(width) if value < 0 => {
+                        format!("-{:0>1$}", value.unsigned_abs(), width - 1)
+                    }
+                    Some(width) => format!("{value:0>width$}"),
+                    None => value.to_string(),
+                }
+            });
+            value = if self.start <= self.end {
+                value + step
+            } else {
+                value - step
+            };
+        }
+        Some(out)
+    }
+}
+
+/// An optionally signed decimal integer of at most 18 digits.
+fn parse_brace_int(s: &str) -> Option<i128> {
+    let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// The expansions of `word`, left to right in bash's order, or `None` past the
+/// bounds. `budget` is shared across the whole recursion.
+fn expand_brace_chars(word: &[(char, bool)], budget: &mut BraceBudget) -> Option<Vec<String>> {
+    let mut partials = vec![String::new()];
+    let mut at = 0;
+    while at < word.len() {
+        if let Some(end) = opaque_span_end(word, at) {
+            let literal: String = word[at..end].iter().map(|&(c, _)| c).collect();
+            append_to_all(&mut partials, &[literal], budget)?;
+            at = end;
+            continue;
+        }
+        if word[at] == ('{', true)
+            && let Some(close) = matching_brace(word, at)
+        {
+            let body = &word[at + 1..close];
+            let parts = split_brace_body(body);
+            let alternatives = if parts.len() > 1 {
+                let mut alternatives = Vec::new();
+                for part in parts {
+                    alternatives.extend(expand_brace_chars(part, budget)?);
+                    if alternatives.len() > MAX_BRACE_WORDS {
+                        return None;
+                    }
+                }
+                Some(alternatives)
+            } else {
+                match brace_sequence(body) {
+                    Some(sequence) => Some(sequence.generate(budget)?),
+                    None => None,
+                }
+            };
+            if let Some(alternatives) = alternatives {
+                append_to_all(&mut partials, &alternatives, budget)?;
+                at = close + 1;
+                continue;
+            }
+        }
+        append_to_all(&mut partials, &[word[at].0.to_string()], budget)?;
+        at += 1;
+    }
+    Some(partials)
+}
+
+/// Replace `partials` with every partial followed by every suffix, partial-major
+/// (bash's order), or `None` past the bounds.
+fn append_to_all(
+    partials: &mut Vec<String>,
+    suffixes: &[String],
+    budget: &mut BraceBudget,
+) -> Option<()> {
+    if let [suffix] = suffixes {
+        let grow = suffix.len().checked_mul(partials.len())?;
+        budget.charge(0, grow)?;
+        partials.iter_mut().for_each(|p| p.push_str(suffix));
+        return Some(());
+    }
+    let count = partials.len().checked_mul(suffixes.len())?;
+    if count > MAX_BRACE_WORDS {
+        return None;
+    }
+    // Charge the words and their total length BEFORE building any of them.
+    let partial_bytes: usize = partials.iter().map(String::len).sum();
+    let suffix_bytes: usize = suffixes.iter().map(String::len).sum();
+    let bytes = partial_bytes
+        .checked_mul(suffixes.len())?
+        .checked_add(suffix_bytes.checked_mul(partials.len())?)?;
+    budget.charge(count, bytes)?;
+    let mut next = Vec::with_capacity(count);
+    for partial in partials.iter() {
+        for suffix in suffixes {
+            next.push(format!("{partial}{suffix}"));
+        }
+    }
+    *partials = next;
+    Some(())
+}
+
+/// Does any word of `command` brace-expand past the bounds the tokenizer
+/// models ([`MAX_BRACE_WORDS`], [`MAX_BRACE_GROUPS`], the call and thread
+/// [`BraceBudget`])?
+///
+/// Such a word reaches every walk as written, unexpanded — so the command it
+/// names is invisible. A guard that decides safety refuses on this rather than
+/// judging a command it cannot see (cadence-hooks#1096). No real command line
+/// comes near the bounds.
+///
+/// Heredoc bodies are data, not words, and are left out: a minified JSON
+/// document in `cat > x.json <<'EOF'` carries more groups than the cap and is
+/// not a command. A body a shell runs as a script is the residual this skips.
+pub fn brace_expansion_overflows(command: &str) -> bool {
+    if !command.contains('{') {
+        return false;
+    }
+    let command = strip_heredoc_bodies(command);
+    with_brace_budget(|budget| {
+        raw_words(&command)
+            .iter()
+            .any(|(text, flags)| brace_expand_word(text, flags, budget) == BraceExpansion::Overflow)
+    })
 }
 
 /// Decode the body of one `$'…'` run (the text between the quotes) onto
@@ -959,8 +1531,18 @@ pub fn looks_absolute(p: &str) -> bool {
 /// it would glue `)}` onto the last word of the far more common group form.
 pub fn strip_group_wrappers(segment: &str) -> &str {
     let trimmed = segment.trim();
-    let opened_a_brace_group = trimmed.starts_with('{');
-    let mut rest = trimmed.trim_start_matches(['(', '{', ' ', '\t']);
+    let opened_a_brace_group = trimmed.starts_with('{') && !opens_brace_expansion(trimmed);
+    // A `{` that opens a brace EXPANSION is part of the command word, not a
+    // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
+    // `cat,.env}`, a word nothing expands (cadence-hooks#1096).
+    let mut rest = trimmed;
+    loop {
+        rest = rest.trim_start_matches(['(', ' ', '\t']);
+        match rest.strip_prefix('{') {
+            Some(after) if !opens_brace_expansion(rest) => rest = after,
+            _ => break,
+        }
+    }
     loop {
         rest = rest.trim_end_matches([')', ';', ' ', '\t']);
         match rest.strip_suffix('}') {
@@ -968,6 +1550,19 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
             _ => return rest,
         }
     }
+}
+
+/// Does `text` begin with a word whose leading `{` bash brace-expands (or that
+/// expands past the modelled bounds)? Judges only the first word.
+fn opens_brace_expansion(text: &str) -> bool {
+    if !text.starts_with('{') {
+        return false;
+    }
+    raw_words(text).first().is_some_and(|(word, flags)| {
+        word.starts_with('{')
+            && flags.first() == Some(&true)
+            && expanding_brace_word(word, flags).is_some()
+    })
 }
 
 /// Whether a `}` following `before` is a group closer. See
@@ -5781,7 +6376,16 @@ fn shell_c_argument(segment: &str) -> Option<String> {
 /// its own fixed set, so peeling `git`'s globals here would resolve a
 /// subcommand name into an executable position it never occupies. Callers that
 /// want that peel ask for it by name, via [`skip_git_global_options`].
-pub const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
+///
+/// `setsid` runs its operand in a new session with stdout untouched, so
+/// `setsid sops -d secrets.yaml | grep x` prints the plaintext exactly as the
+/// bare decrypt does; outside this list it stayed the command word and hid the
+/// verb from every gate that peels here (cadence-hooks#1090). Its grammar is
+/// three argument-free flags; `-h`/`-V` print and exit, so they stay unlisted
+/// and refuse the peel.
+pub const COMMAND_RUNNERS: &[&str] = &[
+    "sudo", "xargs", "nice", "stdbuf", "timeout", "env", "setsid",
+];
 
 /// Peel transparent prefixes and command runners off the front of an executable
 /// position, returning the slice that begins at the command that will run.
@@ -5933,6 +6537,12 @@ const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
 const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
 const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
 
+/// `setsid`'s options (util-linux): `-c`/`--ctty`, `-f`/`--fork`,
+/// `-w`/`--wait`, none taking a value. `-h`/`--help` and `-V`/`--version` never
+/// run the command, so they are left out and refuse the walk.
+const SETSID_NO_ARGUMENT_SHORT_FLAGS: &str = "cfw";
+const SETSID_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ctty", "--fork", "--wait"];
+
 /// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
 /// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
 /// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
@@ -6013,6 +6623,12 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
             TIMEOUT_NO_ARGUMENT_LONG_FLAGS,
             TIMEOUT_VALUE_LONG_FLAGS,
         ),
+        "setsid" => (
+            SETSID_NO_ARGUMENT_SHORT_FLAGS,
+            "",
+            SETSID_NO_ARGUMENT_LONG_FLAGS,
+            &[] as &[&str],
+        ),
         "env" => (
             ENV_NO_ARGUMENT_SHORT_FLAGS,
             ENV_VALUE_SHORT_FLAGS,
@@ -6040,7 +6656,7 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
 /// Walk a command runner's OWN options, returning the slice that begins at the
 /// command it will run — or `None` when a token cannot be classified, in which
 /// case the caller must not peel further. Modelled runners: `sudo`, `xargs`,
-/// `nice`, `stdbuf`, `timeout`, `env`, and `git` (whose "command" is its
+/// `nice`, `stdbuf`, `timeout`, `env`, `setsid`, and `git` (whose "command" is its
 /// subcommand); any other verb returns `None`.
 ///
 /// **This is now the ONLY runner walk, and the sudo-specific one it replaced is
@@ -6620,6 +7236,174 @@ mod tests {
 
     fn words(command: &str) -> Vec<String> {
         tokenize(command)
+    }
+
+    #[test]
+    fn tokenize_brace_expands_each_word_as_bash_does() {
+        // cadence-hooks#1096. Every row's right side is bash's argv for the
+        // left side (`bash -c "printf '[%s]' <word>"`), in the tokenizer's
+        // raw-escape form: an unquoted backslash stays in the token for
+        // `unescape_word` to remove later, exactly as it did before.
+        for (word, want) in [
+            ("{cat,.env}", &["cat", ".env"][..]),
+            ("{sops,-d,secrets.yaml}", &["sops", "-d", "secrets.yaml"]),
+            ("a{b,c}d{e,f}", &["abde", "abdf", "acde", "acdf"]),
+            ("{{a,b},c}", &["a", "b", "c"]),
+            ("{a}{b,c}", &["{a}b", "{a}c"]),
+            (r#"{a,"b c"}"#, &["a", "b c"]),
+            ("{cat,'.env'}", &["cat", ".env"]),
+            (r#"{a",",b}"#, &["a,", "b"]),
+            (r"{a\,b,c}", &[r"a\,b", "c"]),
+            (r"\\{a,b}", &[r"\\a", r"\\b"]),
+            ("{1..3}", &["1", "2", "3"]),
+            ("{01..3}", &["01", "02", "03"]),
+            ("{1..10..4}", &["1", "5", "9"]),
+            ("{-2..1}", &["-2", "-1", "0", "1"]),
+            ("{3..1}", &["3", "2", "1"]),
+            ("{a..c}", &["a", "b", "c"]),
+            ("x{a..e..2}", &["xa", "xc", "xe"]),
+            ("{,x}", &["x"]),
+            ("{,}", &[]),
+            (".e{n,}v", &[".env", ".ev"]),
+            ("src/{a,b}", &["src/a", "src/b"]),
+            ("x.{ts,js}", &["x.ts", "x.js"]),
+            // Literal: quoted or escaped syntax, no comma or sequence, an
+            // unclosed group, a parameter expansion, an assignment statement.
+            (r#""{a,b}""#, &["{a,b}"]),
+            ("'{a,b}'", &["{a,b}"]),
+            (r"\{a,b\}", &[r"\{a,b\}"]),
+            ("{a..3}", &["{a..3}"]),
+            ("{a}", &["{a}"]),
+            ("{}", &["{}"]),
+            ("HEAD@{1}", &["HEAD@{1}"]),
+            ("{a,b", &["{a,b"]),
+            ("${HOME:+{p,q}}", &["${HOME:+{p,q}}"]),
+            ("${a,b}", &["${a,b}"]),
+            ("x={a,b}", &["x={a,b}"]),
+        ] {
+            assert_eq!(words(word), want, "{word}");
+        }
+        // In a command line, only the brace word changes.
+        assert_eq!(
+            words("mkdir -p src/{a,b} && git commit -m \"{a,b}\""),
+            [
+                "mkdir", "-p", "src/a", "src/b", "&&", "git", "commit", "-m", "{a,b}"
+            ]
+        );
+    }
+
+    #[test]
+    fn brace_expansion_marks_follow_the_source_word_s_quoting() {
+        // An unquoted word's expansions stay unquoted, so `{>a,b}`-shaped
+        // redirect reads and `$HOME` expansion behave as for a plain word; any
+        // quoting reports 0, the direction that only declines.
+        let marked = tokenize_marked("{$HOME/x,y} {'a',b}");
+        let summary: Vec<(&str, usize, usize)> = marked
+            .iter()
+            .map(|t| {
+                (
+                    t.text.as_str(),
+                    t.unquoted_prefix_len,
+                    t.expanding_prefix_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [("$HOME/x", 7, 7), ("y", 1, 1), ("a", 0, 0), ("b", 0, 0)]
+        );
+    }
+
+    #[test]
+    fn brace_expansion_past_its_bounds_is_left_whole_and_reported() {
+        // Over the word cap: a product of groups, and a long sequence.
+        let product = "{a,b}".repeat(13);
+        let sequence = "{1..100000}";
+        let nested = format!("{}x{}", "{a,".repeat(70), "}".repeat(70));
+        for word in [product.as_str(), sequence, nested.as_str()] {
+            assert_eq!(words(word), [word], "{word}");
+            assert!(brace_expansion_overflows(&format!("echo {word}")), "{word}");
+        }
+        // Inside the bounds: expanded, and not an overflow.
+        for command in ["echo {a,b}", "for i in {1..4096}; do :; done", "cat .env"] {
+            assert!(!brace_expansion_overflows(command), "{command}");
+        }
+        // The budget is per call: many words that each fit still cannot
+        // multiply into unbounded work.
+        let many = "{1..4096} ".repeat(200);
+        let started = std::time::Instant::now();
+        let _ = tokenize(&many);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(brace_expansion_overflows(&many));
+    }
+
+    #[test]
+    fn brace_budget_bounds_the_work_of_every_call_on_a_thread() {
+        // cadence-hooks#1096 review: guards re-tokenize each segment, so a
+        // per-call budget alone let `echo {1..4096}` × N expand N times.
+        let spent_words =
+            || MAX_BRACE_THREAD_WORDS - THREAD_BRACE_BUDGET.with(std::cell::Cell::get).words;
+        let segment = "echo {1..4096}";
+        for _ in 0..1000 {
+            let _ = tokenize(segment);
+        }
+        // Once the thread budget is spent, a word is left whole without being
+        // expanded, and reports as an overflow — never as silently literal.
+        assert!(spent_words() <= MAX_BRACE_THREAD_WORDS);
+        assert!(THREAD_BRACE_BUDGET.with(std::cell::Cell::get).is_spent());
+        assert_eq!(words("{sops,-d,x}"), ["{sops,-d,x}"]);
+        assert!(brace_expansion_overflows("{sops,-d,x}"));
+        // A word with no expanding group is still read as it always was.
+        assert_eq!(words("HEAD@{1} {a}"), ["HEAD@{1}", "{a}"]);
+        assert!(!brace_expansion_overflows("echo {a} ${x}"));
+        assert_eq!(strip_group_wrappers("{ cat .env; }"), "cat .env");
+    }
+
+    #[test]
+    fn a_sequence_is_charged_before_it_is_built() {
+        let mut budget = BraceBudget {
+            bytes: 100,
+            words: 100,
+        };
+        let sequence = brace_sequence(&structural_chars("1..4096")).expect("a sequence");
+        assert!(sequence.generate(&mut budget).is_none());
+        // A refused charge spends the budget, so later words are not expanded.
+        assert!(budget.is_spent());
+        assert_eq!(
+            brace_expand_word("{a,b}", &[true; 5], &mut budget),
+            BraceExpansion::Overflow
+        );
+    }
+
+    #[test]
+    fn dollar_brace_does_not_count_toward_the_group_cap() {
+        let word = format!("{}{{x,y}}", "${a}".repeat(80));
+        assert!(!brace_expansion_overflows(&format!("echo {word}")));
+        assert_eq!(words(&format!("echo {word}")).len(), 3);
+        // Heredoc bodies are data: minified JSON past the cap is no overflow.
+        let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
+        assert!(!brace_expansion_overflows(&format!(
+            "cat > x.json <<'EOF'\n{json}\nEOF"
+        )));
+    }
+
+    fn structural_chars(text: &str) -> Vec<(char, bool)> {
+        text.chars().map(|c| (c, true)).collect()
+    }
+
+    #[test]
+    fn strip_group_wrappers_keeps_a_brace_expansion_s_opening_brace() {
+        // cadence-hooks#1096: `{cat,.env}` is a word, not a `{ …; }` group.
+        for (segment, want) in [
+            ("{cat,.env}", "{cat,.env}"),
+            ("( {cat,.env} )", "{cat,.env}"),
+            ("{ {cat,.env}", "{cat,.env}"),
+            ("{ cat .env; }", "cat .env"),
+            ("{cat .env; }", "cat .env"),
+            ("{a}{b,c}", "{a}{b,c}"),
+        ] {
+            assert_eq!(strip_group_wrappers(segment), want, "{segment}");
+        }
     }
 
     #[test]
@@ -10770,6 +11554,13 @@ mod tests {
             ("nice -n 10 env -i sudo -u me rm", Some("rm")),
             ("command nice -n 10 rm", Some("rm")),
             ("FOO=1 nice -n 10 rm", Some("rm")),
+            // cadence-hooks#1090: `setsid` runs its operand; `-h`/`-V` do not,
+            // so they refuse the walk.
+            ("setsid rm", Some("rm")),
+            ("setsid -w -f rm", Some("rm")),
+            ("setsid --wait -- rm", Some("rm")),
+            ("/usr/bin/setsid -c rm", Some("rm")),
+            ("setsid -V rm", Some("setsid")),
             // `git` is NOT a command runner: it runs a subcommand from its own
             // fixed set, so peeling its globals here would drop a subcommand
             // name into an executable position it never occupies.
