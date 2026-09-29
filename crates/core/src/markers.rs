@@ -1770,7 +1770,8 @@ mod tests {
 
     #[test]
     fn decide_host_named_value_matches_an_ssh_alias_remote() {
-        // An SSH config alias names no real host, so only owner/repo counts.
+        // An SSH config alias names no real host; it stands for github.com
+        // (cadence-hooks#999), so a github.com value matches on owner/repo.
         let alias = &[("github-work", "own/repo")];
         assert_eq!(
             decide(
@@ -1786,6 +1787,21 @@ mod tests {
             ),
             local("/cwd")
         );
+    }
+
+    #[test]
+    fn decide_another_forge_does_not_match_an_ssh_alias_remote() {
+        // cadence-hooks#999: the same owner/repo on a different forge is a
+        // different repository, so the resolver cannot check it here.
+        let alias = &[("github-work", "own/repo")];
+        assert!(is_cannot_check(&decide(
+            &target(&["gitlab.example.com/own/repo"], None, ShipHead::Current),
+            alias
+        )));
+        assert!(is_cannot_check(&decide(
+            &target(&["own/repo"], Some("ghe.corp.example"), ShipHead::Current),
+            alias
+        )));
     }
 
     #[test]

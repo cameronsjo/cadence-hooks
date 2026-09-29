@@ -2292,9 +2292,18 @@ pub const GH_DEFAULT_HOST: &str = "github.com";
 /// `-R git@github.com:cameronsjo/cadence-hooks.git` both resolved). The
 /// `owner/repo` slugs must be equal. The host is compared when the value
 /// names one, or else against `implied_host` (the host a bare slug means to
-/// the caller); `None` there compares the slug alone. A remote whose host is
-/// an SSH config alias ([`host_is_unknowable`]) matches on the slug alone,
-/// because the alias names no real host to compare.
+/// the caller); `None` there compares the slug alone.
+///
+/// A remote whose host is an SSH config alias ([`host_is_unknowable`]) names
+/// no real host, so it is taken to stand for [`GH_DEFAULT_HOST`]: it matches
+/// a value that names no host, or names `github.com` (cadence-hooks#999). A
+/// value naming another forge (`-R gitlab.example.com/own/repo`, or a bare
+/// slug under `GH_HOST=ghe.corp.example`) does not match it, even with the
+/// same `owner/repo`, because gh would reach a different repository. The cost
+/// is an alias for a GitHub Enterprise host used with that host spelled out:
+/// it reads as no match, which is the cannot-check advisory in the resolver
+/// and no merge anchor, never a lookup on the wrong forge. This reads no SSH
+/// config. A real dotless host (`localhost`) still matches itself exactly.
 pub fn repo_value_names_remote(
     value: &str,
     implied_host: Option<&str>,
@@ -2310,7 +2319,9 @@ pub fn repo_value_names_remote(
     let host = value_host
         .or_else(|| implied_host.map(str::to_ascii_lowercase))
         .map(forge_host);
-    host.is_none_or(|host| host_is_unknowable(remote_host) || host == remote_host)
+    host.is_none_or(|host| {
+        host == remote_host || (host_is_unknowable(remote_host) && host == GH_DEFAULT_HOST)
+    })
 }
 
 /// A remote URL as `(host, owner/repo)`: the host mapped by [`forge_host`],
@@ -2330,7 +2341,8 @@ pub fn origin_triple(url: &str) -> Option<String> {
 
 /// A remote host that cannot be compared to a forge host: an SSH config alias
 /// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
-/// the `owner/repo` comparison applies to such a remote. A real dotless host
+/// the `owner/repo` comparison applies to such a remote, and only for a value
+/// that means github.com ([`repo_value_names_remote`]). A real dotless host
 /// (`localhost`, a LAN short name) is treated the same way.
 pub fn host_is_unknowable(remote_host: &str) -> bool {
     !remote_host.contains('.')
@@ -6377,6 +6389,43 @@ mod tests {
             "own/repo",
             None,
             "ghe.example.com",
+            "own/repo"
+        ));
+    }
+
+    #[test]
+    fn repo_value_names_remote_takes_an_alias_for_github_only() {
+        // cadence-hooks#999: an SSH-alias remote stands for github.com, so a
+        // value naming another forge with the same owner/repo is not it.
+        let alias = "github-work";
+        for (value, implied) in [
+            ("own/repo", None),
+            ("own/repo", Some(GH_DEFAULT_HOST)),
+            ("github.com/own/repo", None),
+            ("https://github.com/own/repo", None),
+            ("git@github.com:own/repo.git", None),
+        ] {
+            assert!(
+                repo_value_names_remote(value, implied, alias, "own/repo"),
+                "{value} {implied:?}"
+            );
+        }
+        for (value, implied) in [
+            ("gitlab.example.com/own/repo", None),
+            ("https://gitlab.example.com/own/repo", None),
+            ("own/repo", Some("ghe.corp.example")),
+            ("gitlab.example.com/own/repo", Some(GH_DEFAULT_HOST)),
+        ] {
+            assert!(
+                !repo_value_names_remote(value, implied, alias, "own/repo"),
+                "{value} {implied:?}"
+            );
+        }
+        // A real dotless host still matches itself exactly.
+        assert!(repo_value_names_remote(
+            "localhost/own/repo",
+            None,
+            "localhost",
             "own/repo"
         ));
     }
