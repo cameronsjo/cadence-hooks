@@ -100,7 +100,7 @@ impl Quote {
 /// this `$`, so a caller asking once per `$'` stays linear overall. A quote
 /// character always separates this `$` from any earlier quoting context, so
 /// the characters walked are in the same (unquoted) context as the `$`.
-fn dollar_is_quote_sigil(before: impl Iterator<Item = char>) -> bool {
+pub fn dollar_is_quote_sigil(before: impl Iterator<Item = char>) -> bool {
     let mut before = before.peekable();
     let mut dollars = 1usize;
     while before.next_if_eq(&'$').is_some() {

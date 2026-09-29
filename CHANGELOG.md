@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The per-segment directory walk treats a `CDPATH`-searched `cd` as unresolvable.** A relative `cd sub` (or `pushd sub`) with `CDPATH` set lands in the first match on the path, not in `./sub`, so `guard-gh-write` judged `cd sub; gh pr create` in a directory the shell never entered. A relative target that is not `.`, `..`, `./…` or `../…` now adds an unresolvable directory, which `guard-gh-write` blocks on, when `CDPATH` is non-empty in the hook's environment or named anywhere in the command (`CDPATH=…`, `export CDPATH=…`); with it unset, nothing changes. `source FILE` / `. FILE` and shell aliases are deliberately not followed: activation scripts are common and benign. (cameronsjo/cadence-hooks#1171)
 - **`guard-gh-write` reads a variable command word as the `gh` the command assigned it.** `G=gh; $G pr create -t x`, `"$G"`, `${G}`, `export G=gh` and `G=/usr/bin/gh` ran a gh write the guard never recognized as one. When the same command assigns the variable a literal `gh`, the segment is now judged as `gh …`; a variable assigned something unreadable, or never assigned, is left as before (an accepted gap). (cameronsjo/cadence-hooks#1171)
 
+### Fixed
+
+- **`warn-going-public` now sees `gh repo rename`, `\gh`, `sudo`/`env -i`/`env -u` wrappers and `gh repo create -- <name>`.** A rename scans the new name for the same terms on any visibility (it makes no network call to learn whether the repo is public), the head is read through core's `command_word` and `peel_command_runners` (the local duplicate is removed), and the repo name is the first non-flag operand (value flags like `-d`/`-R` skip their value, an unknown flag skips alone, and the token after `--` is the name). `enforce-worktree` no longer reads `$$'` as an ANSI-C `$'` opener (bash: the PID, then a plain quote); commits to a primary checkout still block in those spellings. (cameronsjo/cadence-hooks#1171)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security
