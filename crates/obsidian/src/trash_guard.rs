@@ -652,6 +652,12 @@ mod tests {
             "env -i /bin/rm note.md",
             "env -u FOO rm note.md",
             "env -i FOO=bar rm note.md",
+            // GNU env's bare `-` and signal options (cameronsjo/cadence-hooks#1135).
+            "env - rm note.md",
+            "env --default-signal rm note.md",
+            "env --ignore-signal=INT rm note.md",
+            "env --block-signal=INT rm note.md",
+            "env --list-signal-handling rm note.md",
         ] {
             assert_eq!(
                 outcome_in_vault(command),

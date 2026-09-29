@@ -177,9 +177,10 @@ use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
     heredoc_introducers, installs_trap_action, is_assignment_word, is_transparent_prefix_word,
-    looks_absolute, redirect_operator_span, redirect_targets, resolve_cd_target, skip_runner_flags,
-    skip_transparent_prefixes, split_segments_with_ops, split_segments_with_ops_joining_redirects,
-    strip_compound_heads, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    looks_absolute, redirect_operator_span, redirect_targets, resolve_cd_target,
+    skip_env_assignment_operands, skip_runner_flags, skip_transparent_prefixes,
+    split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
+    strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -478,12 +479,7 @@ fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
     let mut idx = 0;
     while idx + 1 < tokens.len() {
         if is_prefix_word(tokens, idx) {
-            let tok = tokens[idx].as_str();
-            if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
-                work_tree = Some(v);
-            } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
-                git_dir = Some(v);
-            }
+            read_git_assignment(&tokens[idx], &mut work_tree, &mut git_dir);
             idx += 1;
             continue;
         }
@@ -515,8 +511,28 @@ fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
             }
         }
         idx += 1 + flags.consumed;
+        // Every `=` operand after env's options is an assignment to env, a
+        // valid name or not (cameronsjo/cadence-hooks#1135).
+        while idx + 1 < tokens.len() && unescape_word(&tokens[idx]).contains('=') {
+            read_git_assignment(&tokens[idx], &mut work_tree, &mut git_dir);
+            idx += 1;
+        }
     }
     (work_tree, git_dir)
+}
+
+/// Record a `GIT_WORK_TREE=`/`GIT_DIR=` assignment word, raw, for
+/// [`git_env_overrides`].
+fn read_git_assignment<'a>(
+    tok: &'a str,
+    work_tree: &mut Option<&'a str>,
+    git_dir: &mut Option<&'a str>,
+) {
+    if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
+        *work_tree = Some(v);
+    } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
+        *git_dir = Some(v);
+    }
 }
 
 /// Fold `.`, `..`, `//`, and a trailing slash out of a path **lexically** — no
@@ -1517,7 +1533,9 @@ fn peel_heads(words: &[String], runners: bool) -> (&[String], Vec<String>) {
                 let Some(flags) = parse_env_flags(&argv[1..]) else {
                     return (argv, chdirs);
                 };
-                argv = &argv[1 + flags.consumed..];
+                // Every `=` operand after env's options is an assignment to
+                // env (cameronsjo/cadence-hooks#1135).
+                argv = skip_env_assignment_operands(&argv[1 + flags.consumed..]);
                 chdirs.extend(flags.chdirs);
             }
             word if runners && RUNNERS.contains(&command_word(word).as_ref()) => {
@@ -5632,6 +5650,33 @@ mod tests {
             git_commit_targets("GIT_AUTHOR_NAME=x git commit -m x", "/cwd"),
             vec!["/cwd".to_string()]
         );
+    }
+
+    /// cameronsjo/cadence-hooks#1135: `env` reads every leading operand with
+    /// `=` as an assignment, a valid shell name or not, so the commit behind
+    /// one is found — and a `GIT_DIR` after one is still read.
+    #[test]
+    fn env_assignment_operands_by_env_rule_commit_detected() {
+        for cmd in [
+            "env A-B=1 git commit -m x",
+            "env 'A B=1' git commit -m x",
+            "env A\\=1 git commit -m x",
+            "env -i -- A-B=1 git commit -m x",
+            "env -u X A-B=1 git commit -m x",
+            "env - A-B=1 git commit -m x",
+            "nice env A-B=1 git commit -m x",
+        ] {
+            assert_eq!(git_commit_targets(cmd, "/cwd"), vec!["/cwd"], "{cmd}");
+        }
+        for cmd in [
+            "env A-B=1 GIT_DIR=/p/.git git commit -m x",
+            "env -i A-B=1 GIT_DIR=/p/.git git commit -m x",
+        ] {
+            assert_eq!(git_commit_targets(cmd, "/cwd"), vec!["/p"], "{cmd}");
+        }
+        // Control: outside env the shell's rule stands — `A-B=1` is the
+        // command word, not an assignment.
+        assert!(git_commit_targets("A-B=1 git commit -m x", "/cwd").is_empty());
     }
 
     #[test]

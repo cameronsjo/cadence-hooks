@@ -1423,11 +1423,19 @@ pub(crate) fn curl_write_targets(argv: &[String]) -> Vec<String> {
 /// `--config` parses it and quotes its lines in errors; `-O`/
 /// `--output-document`, `-o`/`--output-file` and `-a`/`--append-output`
 /// write one; `-P`/`--directory-prefix` is where a download lands.
+/// `--certificate`, `--private-key`, `--ca-certificate` and `--load-cookies`
+/// load a file into the request, the way curl's `--cert`/`-b` do, and
+/// `--save-cookies` writes one (cameronsjo/cadence-hooks#1134).
 const WGET_FILE_OPTIONS: &[(&str, Option<char>, FileUse)] = &[
     ("post-file", None, FileUse::Read),
     ("body-file", None, FileUse::Read),
     ("input-file", Some('i'), FileUse::Read),
     ("config", None, FileUse::Read),
+    ("certificate", None, FileUse::Read),
+    ("private-key", None, FileUse::Read),
+    ("ca-certificate", None, FileUse::Read),
+    ("load-cookies", None, FileUse::Read),
+    ("save-cookies", None, FileUse::Write),
     ("output-document", Some('O'), FileUse::Write),
     ("output-file", Some('o'), FileUse::Write),
     ("append-output", Some('a'), FileUse::Write),
@@ -1444,6 +1452,11 @@ const WGET_RC_FILES: &[(&str, &str)] = &[
     ("outputdocument", "output-document"),
     ("logfile", "output-file"),
     ("dirprefix", "directory-prefix"),
+    ("certificate", "certificate"),
+    ("privatekey", "private-key"),
+    ("cacertificate", "ca-certificate"),
+    ("loadcookies", "load-cookies"),
+    ("savecookies", "save-cookies"),
 ];
 
 /// The [`WGET_FILE_OPTIONS`] entry for a long name.

@@ -2035,6 +2035,8 @@ mod tests {
             "wget -o .env https://x",
             "wget -a .env https://x",
             "wget -e output_document=.env https://x",
+            "wget --save-cookies=.env https://x",
+            "wget --save-cookies .env https://x",
             "wget https://x/.env",
             "wget -P ~/.ssh https://x/id_rsa",
             "wget --directory-prefix=~/.aws https://x/credentials",

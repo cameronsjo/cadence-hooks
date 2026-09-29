@@ -10,30 +10,38 @@ use std::sync::LazyLock;
 
 /// Strip quoted strings from a shell command to expose its structure.
 ///
-/// Removes content between matching `'` or `"` delimiters (including the
+/// Removes content between matching `'`, `"` or `$'` delimiters (including the
 /// delimiters themselves). Unmatched quotes consume the rest of the string.
+///
+/// Quote boundaries come from the shared [`scan_quote_syntax`] model, so an
+/// escaped `\"` inside `"…"` (or `\'` inside `$'…'`) does not close the run,
+/// and a backslash-escaped quote outside quotes opens nothing. The private
+/// two-toggle scan this replaced ended `"a\"b"` at the escaped quote: the
+/// quoted text after it leaked into the structure every consumer scans, and the
+/// real closing quote reopened a phantom run that hid the command after it
+/// (cameronsjo/cadence-hooks#1035). Unquoted text, escapes included, is kept
+/// verbatim; the `$` of a `$'…'` run is kept, as before.
 pub fn strip_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '"' {
-                        break;
-                    }
+    let mut quote: Option<Quote> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let was_quoted = quote.is_some();
+        match scan_quote_syntax(&chars, i, &mut quote) {
+            Some(next) => {
+                if !was_quoted && quote.is_none() {
+                    // A backslash escape outside quotes: ordinary text.
+                    result.extend(&chars[i..next]);
+                } else if !was_quoted && chars[i] == '$' {
+                    result.push('$');
                 }
+                i = next;
             }
-            '\'' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '\'' {
-                        break;
-                    }
-                }
+            None => {
+                result.push(chars[i]);
+                i += 1;
             }
-            _ => result.push(c),
         }
     }
     result
@@ -2183,6 +2191,19 @@ pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
     (names_transparent_prefix(tok) && runs_the_next_word)
         || ends_a_prefix_s_options
         || is_assignment_word(tok)
+        || is_env_assignment_operand(tokens, idx)
+}
+
+/// `tokens[idx]` is an assignment to `env` by `env`'s own rule — any word
+/// containing `=` in its operand position ([`skip_env_assignment_operands`]) —
+/// with a command after it. The shell's rule ([`is_assignment_word`]) wants a
+/// valid name, so `env A-B=1 git commit` stopped the leading-word walk at
+/// `A-B=1` and the commit behind it reached no verb gate
+/// (cameronsjo/cadence-hooks#1135).
+fn is_env_assignment_operand(tokens: &[String], idx: usize) -> bool {
+    idx + 1 < tokens.len()
+        && unescape_word(&tokens[idx]).contains('=')
+        && follows_an_env_verb(tokens, idx)
 }
 
 /// Skip transparent command prefixes that run their argument as the command, so
@@ -7387,6 +7408,16 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
                 k = (e + 1).min(chars.len());
             }
             '$' if chars.get(k + 1) == Some(&'"') => k += 1,
+            '$' if matches!(chars.get(k + 1), Some('(' | '{')) => {
+                let end = delimiter_expansion_end(chars, k)?;
+                word.extend(&chars[k..end]);
+                k = end;
+            }
+            '`' => {
+                let end = delimiter_expansion_end(chars, k)?;
+                word.extend(&chars[k..end]);
+                k = end;
+            }
             '\'' => {
                 quoted = true;
                 k += 1;
@@ -7434,6 +7465,45 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
         end: k.min(chars.len()),
     })
 }
+
+/// Char index just past an expansion (`$(…)`, `${…}` or `` `…` ``) that starts
+/// at `chars[k]` inside a heredoc delimiter, or `None` when its end cannot be
+/// read confidently.
+///
+/// Bash never expands a delimiter: it takes the whole expansion as literal
+/// text, so `<<$(x)` ends its body at a line reading `$(x)`. Reading only up to
+/// the `(` gave the delimiter `$`, and a later line reading `$` then ended the
+/// body where bash had not, hiding the commands between the two from every
+/// guard (cameronsjo/cadence-hooks#1137). An expansion whose end is in doubt —
+/// unbalanced, spanning a line, or (for `${…}`) carrying quotes, escapes or a
+/// nested expansion — makes the whole delimiter unreadable, and the caller then
+/// reads the text after `<<` as ordinary code rather than as a body. So does
+/// one longer than [`MAX_DELIMITER_EXPANSION`]: the read is bounded so a flood
+/// of `<<$(` openers stays linear.
+fn delimiter_expansion_end(chars: &[char], k: usize) -> Option<usize> {
+    let window = &chars[..chars.len().min(k + MAX_DELIMITER_EXPANSION)];
+    let after = |from: usize| window.get(from..).unwrap_or_default().iter().copied();
+    match (chars[k], chars.get(k + 1)) {
+        ('$', Some('(')) => unquoted_substitution_len('$', after(k + 1))
+            .ok()
+            .map(|len| k + 1 + len),
+        ('$', Some('{')) => {
+            let close = k
+                + 2
+                + after(k + 2)
+                    .position(|c| matches!(c, '}' | '{' | '\n' | '\'' | '"' | '\\' | '$' | '`'))?;
+            (chars[close] == '}').then_some(close + 1)
+        }
+        ('`', _) => unquoted_substitution_len('`', after(k + 1))
+            .ok()
+            .map(|len| k + 1 + len),
+        _ => None,
+    }
+}
+
+/// Longest expansion [`delimiter_expansion_end`] reads inside a heredoc
+/// delimiter, in chars.
+const MAX_DELIMITER_EXPANSION: usize = 64;
 
 /// A heredoc whose body is still to be read.
 struct PendingHeredoc {
@@ -8371,7 +8441,7 @@ pub fn peel_command_runners(tokens: &[String]) -> &[String] {
 /// assignments to `env` as well, which is why the word is unescaped first.
 ///
 /// At least one word is always left, as [`skip_transparent_prefixes`] does.
-fn skip_env_assignment_operands(argv: &[String]) -> &[String] {
+pub fn skip_env_assignment_operands(argv: &[String]) -> &[String] {
     let mut start = 0;
     while start + 1 < argv.len() && unescape_word(&argv[start]).contains('=') {
         start += 1;
@@ -8489,6 +8559,8 @@ struct RunnerGrammar {
     /// Positional words the runner consumes before the command, after its
     /// options: `timeout 5 rm x` runs `rm`, not `5`.
     operands_before_command: usize,
+    /// A lone `-` is an option, not the command: `env -` is `env -i`.
+    bare_dash_is_flag: bool,
 }
 
 /// `nice`'s only command-relevant option. The adjustment is also spelled with
@@ -8526,11 +8598,25 @@ const SETSID_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ctty", "--fork", "--wait"];
 ///
 /// `-S`/`--split-string` is deliberately absent: it re-splits its value into
 /// the command line, so resolving a head word past it would be a guess. A bare
-/// `-` (an alias for `-i`) is likewise unmodelled — the walk refuses an empty
-/// short cluster.
+/// `-` is GNU's alias for `-i` and is read as one (`bare_dash_is_flag`).
+///
+/// GNU's signal options — `--default-signal`, `--ignore-signal` and
+/// `--block-signal`, each taking an OPTIONAL value that must be glued with `=`,
+/// and `--list-signal-handling` — never consume the next word, so they are
+/// argument-free here, and the walk's `=` split reads their glued form. Left
+/// out, each one stopped the peel, so `env --default-signal rm note.md` hid
+/// its `rm` from every verb gate (cameronsjo/cadence-hooks#1135).
 const ENV_NO_ARGUMENT_SHORT_FLAGS: &str = "i0v";
 const ENV_VALUE_SHORT_FLAGS: &str = "uCP";
-const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
+const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--ignore-environment",
+    "--null",
+    "--debug",
+    "--default-signal",
+    "--ignore-signal",
+    "--block-signal",
+    "--list-signal-handling",
+];
 const ENV_VALUE_LONG_FLAGS: &[&str] = &["--unset", "--chdir"];
 
 /// `git`'s global options — the ones that sit between `git` and its
@@ -8625,6 +8711,7 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
         value_long,
         numeric_short_cluster: verb == "nice",
         operands_before_command: usize::from(verb == "timeout"),
+        bare_dash_is_flag: verb == "env",
     })
 }
 
@@ -8717,6 +8804,10 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
         // (`-n1`), and an empty remainder means the next word is (`-n 1`).
         let cluster = &tok[1..];
         if cluster.is_empty() {
+            if grammar.bare_dash_is_flag {
+                i += 1;
+                continue;
+            }
             return None;
         }
         let mut takes_next_word = false;
@@ -12357,6 +12448,30 @@ mod tests {
         assert_eq!(strip_quotes("echo \"\" world"), "echo  world");
     }
 
+    /// cameronsjo/cadence-hooks#1035: quote boundaries follow bash, via the
+    /// shared quote model. Each row pairs the input with what bash leaves
+    /// unquoted.
+    #[test]
+    fn strip_quotes_honors_escapes_the_way_bash_does() {
+        for (input, want) in [
+            // An escaped `"` inside `"…"` does not close the run, so the
+            // command after the real closer stays visible.
+            ("echo \"a\\\"b\" ; cat f | jq .", "echo  ; cat f | jq ."),
+            // …and quoted prose after an escaped quote stays hidden.
+            ("echo \"a\\\"b ; cat f | jq . ; \\\"c\"", "echo "),
+            // An escaped backslash before the closer: the closer closes.
+            ("echo \"a\\\\\" ; cat f | jq .", "echo  ; cat f | jq ."),
+            // `$'…'` honors `\'`; the `$` stays as before.
+            ("echo $'it\\'s' ; cat f | jq .", "echo $ ; cat f | jq ."),
+            // `\'` inside `'…'` does not escape: the first `'` closes.
+            ("echo 'a\\' ; cat f | jq .", "echo  ; cat f | jq ."),
+            // A backslash-escaped quote outside quotes opens nothing.
+            ("echo \\\"x ; cat f | jq .", "echo \\\"x ; cat f | jq ."),
+        ] {
+            assert_eq!(strip_quotes(input), want, "{input:?}");
+        }
+    }
+
     #[test]
     fn strips_mixed_quotes() {
         assert_eq!(
@@ -12933,11 +13048,47 @@ mod tests {
             ("cat <<''", "", false),
             ("cat <<EO\\\nF", "EOF", true),
             ("cat <<EOF.x", "EOF.x", true),
+            // An expansion is taken literally, whole (cameronsjo/cadence-hooks#1137).
+            ("cat <<$(x)", "$(x)", true),
+            ("cat <<$(x y)", "$(x y)", true),
+            ("cat <<$(echo \")\")", "$(echo \")\")", true),
+            ("cat <<$((1+2))", "$((1+2))", true),
+            ("cat <<`x y`", "`x y`", true),
+            ("cat <<${x:- a}", "${x:- a}", true),
+            ("cat <<${x}", "${x}", true),
         ] {
             let found = heredoc_introducers(line);
             assert_eq!(found.len(), 1, "{line:?}");
             assert_eq!(found[0].word, word, "{line:?}");
             assert_eq!(found[0].expands, expands, "{line:?}");
+        }
+        // An expansion whose end cannot be read makes the delimiter unreadable:
+        // no heredoc is recorded, so the text after it stays code.
+        let long = format!("cat <<$({})", "x".repeat(MAX_DELIMITER_EXPANSION));
+        for line in [
+            "cat <<$(x",
+            "cat <<`x",
+            "cat <<${x",
+            "cat <<${x:-\"a\"}",
+            &long,
+        ] {
+            assert!(heredoc_introducers(line).is_empty(), "{line:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1137: bash ends a `<<$(x)` body at the line
+    /// `$(x)`, not at a line `$`, and runs what follows.
+    #[test]
+    fn an_expansion_delimiter_ends_its_body_where_bash_does() {
+        for (command, runs) in [
+            ("cat <<$(x)\nfoo\n$(x)\ncat .env\n$\n", true),
+            ("cat <<`x`\nfoo\n`x`\ncat .env\n`\n", true),
+            ("cat <<${x:- a}\nfoo\n${x:- a}\ncat .env\n${x:-\n", true),
+            // Control: inside the body, the read stays data.
+            ("cat <<$(x)\nfoo\ncat .env\n$(x)\n", false),
+        ] {
+            let code = strip_heredoc_bodies(command);
+            assert_eq!(code.contains("cat .env"), runs, "{command:?} -> {code:?}");
         }
     }
 
@@ -15209,6 +15360,34 @@ mod tests {
             ("nohup A${Y}B=1 bash", Some("A${Y}B=1")),
             // Assignments only: the last word is left, as the shell leaves it.
             ("env A${Y}B=1", Some("A${Y}B=1")),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                peel_command_runners(&tokens).first().map(String::as_str),
+                want_head,
+                "{command}"
+            );
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1135: GNU `env`'s bare `-` and its signal
+    /// options never take the next word, so the peel reaches the command.
+    #[test]
+    fn peel_command_runners_reads_env_dash_and_signal_options() {
+        for (command, want_head) in [
+            ("env - rm note.md", Some("rm")),
+            ("env - -u X rm note.md", Some("rm")),
+            ("env --default-signal rm note.md", Some("rm")),
+            ("env --default-signal=INT rm note.md", Some("rm")),
+            ("env --ignore-signal=PIPE,INT rm note.md", Some("rm")),
+            ("env --block-signal=INT rm note.md", Some("rm")),
+            ("env --block-signal rm note.md", Some("rm")),
+            ("env --list-signal-handling rm note.md", Some("rm")),
+            ("env - A-B=1 rm note.md", Some("rm")),
+            // Controls: an unmodelled option still refuses the peel, and a
+            // lone `-` is not an option for other runners.
+            ("env --weird rm note.md", Some("env")),
+            ("nice - rm note.md", Some("nice")),
         ] {
             let tokens = words(command);
             assert_eq!(
