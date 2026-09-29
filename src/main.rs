@@ -270,6 +270,8 @@ enum CadenceCommands {
     WarnOvershare,
     /// Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative
     WarnInstructionNarrative,
+    /// Nudge on a direct write to live auto-memory outside a dream adoption window
+    WarnLiveMemoryWrite,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
@@ -575,6 +577,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnChangelogEntry => "warn-changelog-entry",
             CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::WarnInstructionNarrative => "warn-instruction-narrative",
+            CadenceCommands::WarnLiveMemoryWrite => "warn-live-memory-write",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
@@ -747,6 +750,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 Box::new(
                     cadence_hooks_cadence::warn_instruction_narrative::WarnInstructionNarrative,
                 ),
+                pre,
+            ),
+            CadenceCommands::WarnLiveMemoryWrite => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::warn_live_memory_write::WarnLiveMemoryWrite),
                 pre,
             ),
             CadenceCommands::NudgePolishBeforePr => CheckPlan::new(

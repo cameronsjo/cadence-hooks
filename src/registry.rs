@@ -103,6 +103,12 @@ pub const HOOKS: &[HookEntry] = &[
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "warn-live-memory-write",
+        description: "Nudge on a direct write to live auto-memory outside a dream adoption window",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },

@@ -43,6 +43,8 @@ pub mod warn_changelog_entry;
 pub mod warn_docs_update;
 /// Nudge when an always-loaded instruction file gains narrative.
 pub mod warn_instruction_narrative;
+/// Nudge on a direct write to live auto-memory outside a dream adoption window.
+pub mod warn_live_memory_write;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
 
