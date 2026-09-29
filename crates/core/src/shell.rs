@@ -2824,6 +2824,81 @@ pub fn redirect_operator_span(word: &str) -> Option<(usize, bool)> {
     Some((word.len() - after.len(), after.is_empty()))
 }
 
+/// One redirection found by [`token_redirects`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRedirect {
+    /// Index of the token the operator sits in.
+    pub index: usize,
+    /// The operator as written, with any leading `&`: `>`, `>>`, `>|`, `&>`,
+    /// `>&`, `<`, `<>`, `<<`, … (a descriptor number before it is not
+    /// included).
+    pub operator: String,
+    /// The target: the text glued after the operator, else the next token.
+    /// `None` when the operator ends the segment.
+    pub target: Option<String>,
+    /// The operator lies in the token's unquoted prefix, so it is certainly
+    /// a redirection. `false` when the `<`/`>` comes after the token's first
+    /// quoting construct (`a"b">f`): the marks cannot tell `a"b">f`, which
+    /// redirects, from `a">"f`, which does not, so a consumer deciding a
+    /// safety question should treat it as a possible redirection.
+    pub certain: bool,
+}
+
+/// Every redirection in a token list, wherever it sits in its token.
+///
+/// [`redirect_operator_span`] only reads an operator at a token's START, but
+/// the tokenizer keeps `x>>.git/config` as one word while bash reads the word
+/// `x` and the redirection `>>.git/config` (measured). This finds the first
+/// `<`/`>` in each token and reads the operator and its target from there.
+///
+/// `unquoted_prefix_lens` is in lockstep with `tokens`, as
+/// [`executable_tokens_marked`] returns them; a missing entry reads as `0`. An
+/// operator inside the unquoted prefix is `certain`; one after it is reported
+/// uncertain rather than dropped, so a quoted `"a>b"` — whose whole text is
+/// quoted — is reported (uncertain) and a caller that needs certainty skips
+/// it.
+pub fn token_redirects(tokens: &[String], unquoted_prefix_lens: &[usize]) -> Vec<TokenRedirect> {
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        let Some(at) = token.find(['<', '>']) else {
+            idx += 1;
+            continue;
+        };
+        let bytes = token.as_bytes();
+        // `&>`/`&>>` write both streams; the `&` belongs to the operator.
+        let start = if at > 0 && bytes[at - 1] == b'&' {
+            at - 1
+        } else {
+            at
+        };
+        let mut end = at;
+        while end < bytes.len() && matches!(bytes[end], b'<' | b'>') {
+            end += 1;
+        }
+        // `>&`, `>|`, `<&`: one trailing duplication or clobber mark.
+        if end < bytes.len() && matches!(bytes[end], b'&' | b'|') {
+            end += 1;
+        }
+        let certain = end <= unquoted_prefix_lens.get(idx).copied().unwrap_or(0);
+        let glued = &token[end..];
+        let target = if glued.is_empty() {
+            tokens.get(idx + 1).cloned()
+        } else {
+            Some(glued.to_string())
+        };
+        out.push(TokenRedirect {
+            index: idx,
+            operator: token[start..end].to_string(),
+            target,
+            certain,
+        });
+        // A target standing as its own token is consumed with the operator.
+        idx += if glued.is_empty() { 2 } else { 1 };
+    }
+    out
+}
+
 /// `rest` after a leading `{ident}` descriptor name, or `None` when it has
 /// none.
 fn strip_named_fd(rest: &str) -> Option<&str> {
@@ -17115,5 +17190,39 @@ mod tests {
         let kept = strip_group_wrappers(&glued);
         assert!(kept.ends_with('x') && !kept.is_empty());
         assert!(FIRST_WORD_WALKS.with(std::cell::Cell::get) <= MAX_GLUED_BRACE_WALKS + 1);
+    }
+
+    /// `(command, [(operator, target, certain)])` for [`token_redirects`].
+    #[test]
+    fn token_redirects_finds_operators_anywhere_in_a_token() {
+        for (command, want) in [
+            (
+                "echo x>>.git/config",
+                vec![(">>", Some(".git/config"), true)],
+            ),
+            ("echo x>f", vec![(">", Some("f"), true)]),
+            ("echo x > f", vec![(">", Some("f"), true)]),
+            ("git push 2>&1", vec![(">&", Some("1"), true)]),
+            ("echo x &>f", vec![("&>", Some("f"), true)]),
+            (
+                "cat <in >|out",
+                vec![("<", Some("in"), true), (">|", Some("out"), true)],
+            ),
+            ("echo x >", vec![(">", None, true)]),
+            ("echo \"a>b\"", vec![(">", Some("b"), false)]),
+            ("echo 'a'>f", vec![(">", Some("f"), false)]),
+            ("echo plain words", vec![]),
+        ] {
+            let (tokens, marks) = executable_tokens_marked(command);
+            let got: Vec<(String, Option<String>, bool)> = token_redirects(&tokens, &marks)
+                .into_iter()
+                .map(|r| (r.operator, r.target, r.certain))
+                .collect();
+            let want: Vec<(String, Option<String>, bool)> = want
+                .into_iter()
+                .map(|(op, target, certain)| (op.to_string(), target.map(String::from), certain))
+                .collect();
+            assert_eq!(got, want, "{command}");
+        }
     }
 }
