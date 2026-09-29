@@ -276,6 +276,67 @@ pub struct MarkedToken {
     /// stop a strip, never cause one, so it can only leave more operands in
     /// view.
     pub unquoted_prefix_len: usize,
+    /// How many bytes at the start of `text` were emitted inside ONE
+    /// parameter-expanding quoting context — unquoted, or a single `"…"` run —
+    /// before the first change of quoting context. `0` when the token opens in
+    /// `'…'` or `$'…'`, or with an escaped quote (all literal to bash).
+    ///
+    /// **This is what tells `"$HOME/x"` from `'$HOME/x'`.** Both arrive as the
+    /// byte-identical text `$HOME/x`, but bash expands only the first; the
+    /// second is a literal directory named `$HOME`. A consumer that expands a
+    /// leading `$HOME` must check the reference lies wholly inside this prefix
+    /// — which also rejects `"$"HOME`, where the `$` is a literal because its
+    /// quoted run closes before the name (cadence-hooks#1018).
+    ///
+    /// Safety direction: a shorter prefix only ever declines an expansion.
+    pub expanding_prefix_len: usize,
+}
+
+/// Where a token's leading quoting-context run stands while
+/// [`tokenize_marked`] walks it — the state behind
+/// [`MarkedToken::expanding_prefix_len`].
+#[derive(Default)]
+struct LeadRun {
+    /// `None` until the token's first context is known; then whether that
+    /// context expands parameters (unquoted or `"…"`).
+    expands: Option<bool>,
+    /// `None` while the first run is still open; then its byte length.
+    end: Option<usize>,
+}
+
+impl LeadRun {
+    /// A quoting context (or an escaped quote) begins at byte `at`.
+    fn boundary(&mut self, at: usize, next_expands: bool) {
+        if self.expands.is_none() {
+            self.expands = Some(next_expands);
+        } else if self.end.is_none() {
+            self.end = Some(at);
+        }
+    }
+
+    /// An unquoted character is emitted.
+    fn unquoted(&mut self) {
+        if self.expands.is_none() {
+            self.expands = Some(true);
+        }
+    }
+
+    /// A quoted run closes at byte `at`.
+    fn close(&mut self, at: usize) {
+        if self.end.is_none() {
+            self.end = Some(at);
+        }
+    }
+
+    /// The final prefix length for a token whose text is `len` bytes, resetting
+    /// the state for the next token.
+    fn finish(&mut self, len: usize) -> usize {
+        let run = std::mem::take(self);
+        match run.expands {
+            Some(true) => run.end.unwrap_or(len),
+            _ => 0,
+        }
+    }
 }
 
 /// [`tokenize`], additionally reporting which tokens carried quoting.
@@ -291,6 +352,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     // `current` had reached at that moment.
     let mut unquoted_prefix: Option<usize> = None;
     let mut quote: Option<Quote> = None;
+    let mut lead = LeadRun::default();
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -298,6 +360,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
             Some(Quote::Single) => {
                 if c == '\'' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -314,6 +377,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
                 if c == '\'' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -327,6 +391,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
                 if c == '"' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -337,6 +402,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                     current.push(chars.next().expect("peeked"));
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
@@ -347,29 +413,35 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                     quote = Some(Quote::AnsiC);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                 }
                 '"' => {
                     quote = Some(Quote::Double);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), true);
                 }
                 c if c.is_whitespace() => {
                     if in_token {
                         let text = std::mem::take(&mut current);
                         let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
+                        let expanding_prefix_len = lead.finish(text.len());
                         tokens.push(MarkedToken {
                             text,
                             unquoted_prefix_len,
+                            expanding_prefix_len,
                         });
                         in_token = false;
                     }
                 }
                 _ => {
+                    lead.unquoted();
                     current.push(c);
                     in_token = true;
                 }
@@ -378,12 +450,48 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     }
     if in_token {
         let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
+        let expanding_prefix_len = lead.finish(current.len());
         tokens.push(MarkedToken {
             text: current,
             unquoted_prefix_len,
+            expanding_prefix_len,
         });
     }
     tokens
+}
+
+/// Expand a leading `$HOME` or `${HOME}` in a token against `home`, the way
+/// bash would — or `None` when the token does not open with one the shell
+/// actually expands.
+///
+/// The reference must lie wholly inside the token's
+/// [`MarkedToken::expanding_prefix_len`], so `'$HOME/x'` (literal in bash) and
+/// `"$"HOME/x` are declined, while `"$HOME/x"`, `$HOME/x`, and `"${HOME}"/x`
+/// expand. It must also be the whole name: followed by `/` or the end of the
+/// token, so `$HOMEDIR/x` and `${HOME:-/y}/x` are declined rather than guessed.
+/// An empty `home` declines too — a caller cannot tell an unset HOME from a
+/// root path.
+///
+/// This expands against a HOME the CALLER supplies. It does not know whether
+/// the command being modelled reassigned `HOME` before this word — deciding
+/// that is the caller's job, and a caller that cannot rule it out must not
+/// call this (cadence-hooks#1018).
+pub fn expand_leading_home(token: &MarkedToken, home: &str) -> Option<String> {
+    if home.is_empty() {
+        return None;
+    }
+    let text = token.text.as_str();
+    let reference = ["${HOME}", "$HOME"]
+        .into_iter()
+        .find(|r| text.starts_with(r))?;
+    let rest = &text[reference.len()..];
+    if reference.len() > token.expanding_prefix_len {
+        return None;
+    }
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    Some(format!("{home}{rest}"))
 }
 
 /// Last path segment of a token — `/usr/bin/rm` → `rm`, `rm` → `rm`.
@@ -5426,6 +5534,60 @@ mod tests {
         let marked = tokenize_marked("'a' b");
         assert_eq!(marked[0].unquoted_prefix_len, 0);
         assert_eq!(marked[1].unquoted_prefix_len, 1);
+    }
+
+    #[test]
+    fn tokenize_marked_reports_the_leading_expanding_run() {
+        // `expanding_prefix_len` is the byte length of the token's first run
+        // in ONE parameter-expanding context (unquoted or a single `"…"`).
+        for (command, want) in [
+            ("$HOME/x", 7),
+            ("\"$HOME/x\"", 7),
+            ("\"$HOME\"/x", 5),
+            ("$HOME\"/x\"", 5),
+            ("'$HOME/x'", 0),
+            ("$'$HOME/x'", 0),
+            ("\"$\"HOME/x", 1),
+            ("\\\"$HOME", 0),
+            ("''$HOME", 0),
+            ("", 0),
+        ] {
+            let marked = tokenize_marked(command);
+            let got = marked.first().map_or(0, |t| t.expanding_prefix_len);
+            assert_eq!(got, want, "{command:?} → {marked:?}");
+        }
+        // The state resets per token.
+        let marked = tokenize_marked("'$a' $HOME");
+        assert_eq!(marked[0].expanding_prefix_len, 0);
+        assert_eq!(marked[1].expanding_prefix_len, 5);
+    }
+
+    #[test]
+    fn expand_leading_home_expands_only_what_bash_would() {
+        let expand = |command: &str| {
+            let marked = tokenize_marked(command);
+            expand_leading_home(&marked[0], "/home/u")
+        };
+        assert_eq!(expand("\"$HOME/src/x\"").as_deref(), Some("/home/u/src/x"));
+        assert_eq!(expand("$HOME/src/x").as_deref(), Some("/home/u/src/x"));
+        assert_eq!(expand("\"${HOME}\"/x").as_deref(), Some("/home/u/x"));
+        assert_eq!(expand("$HOME").as_deref(), Some("/home/u"));
+        // Literal to bash, another name, or an operator form: declined.
+        for command in [
+            "'$HOME/x'",
+            "$'$HOME/x'",
+            "\"$\"HOME/x",
+            "$HOMEDIR/x",
+            "${HOME:-/y}/x",
+            "$HOME.bak",
+            "~/x",
+            "$OTHER/x",
+        ] {
+            assert_eq!(expand(command), None, "{command}");
+        }
+        // An empty home declines rather than producing a root-relative path.
+        let marked = tokenize_marked("$HOME/x");
+        assert_eq!(expand_leading_home(&marked[0], ""), None);
     }
 
     #[test]

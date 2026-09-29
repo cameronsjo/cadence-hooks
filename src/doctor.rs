@@ -3066,15 +3066,41 @@ fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
 /// Fails open on an unreadable or malformed settings file: this is a config
 /// health check, not a JSON validator, and a false finding about a file the
 /// binary could not read would be worse than silence (ADR-0001).
-fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
+///
+/// The allowlist is resolved the way the guards will see it
+/// (cameronsjo/cadence-hooks#987). The guards read `CADENCE_ALLOWED_OWNERS`
+/// from their *process env* only (`env_allow_entries`), and Claude Code builds
+/// that env from its inherited environment (e.g. a shell rc `export`) with the
+/// settings.json `env` block layered on top. So:
+///
+/// - a settings.json that carries the key as a string is authoritative — it
+///   overrides whatever the shell exported, even when it is empty;
+/// - otherwise `process_owners_set` decides: whether *this* process's env
+///   names at least one owner.
+///
+/// When doctor runs as the SessionStart preflight its env is the hooks' env
+/// exactly, so the fallback is precise. From a plain terminal it is the
+/// terminal's env, which is the right proxy only when Claude Code is launched
+/// from a shell with the same rc — the settings-first order is what keeps the
+/// terminal run from being fooled by an export that settings.json overrides.
+fn guardrails_identity_finding(settings_path: &Path, process_owners_set: bool) -> Option<Finding> {
     let content = cadence_hooks_core::paths::read_untrusted_config(settings_path)?;
     let root = match serde_json::from_str::<serde_json::Value>(&content) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => return None,
     };
     let current = crate::configure_guardrails::current_from(&root);
+    let settings_declares_owners = root
+        .get("env")
+        .and_then(|env| env.get(crate::configure_guardrails::OWNERS_KEY))
+        .is_some_and(serde_json::Value::is_string);
+    let owners_unset = if settings_declares_owners {
+        current.owners.is_empty()
+    } else {
+        !process_owners_set
+    };
 
-    let diagnosis = match (current.owners.is_empty(), current.has_legacy()) {
+    let diagnosis = match (owners_unset, current.has_legacy()) {
         (false, false) => return None,
         (false, true) => format!(
             "`{}` is set, but the retired `{}`/`{}` keys are still present in the \
@@ -3317,9 +3343,17 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         // `configure guardrails` writes. Live-machine read, so it is gated with
         // the rest of this block; under `--root` there is no user config to
         // inspect.
-        if let Some(finding) =
-            guardrails_identity_finding(&crate::configure_guardrails::user_settings_path())
-        {
+        //
+        // The process-env half goes through the guards' own resolver
+        // (`env_allow_entries`), so doctor and the guards cannot disagree on
+        // what counts as "set" (#987).
+        let process_owners_set =
+            !cadence_hooks_core::config::env_allow_entries(crate::configure_guardrails::OWNERS_KEY)
+                .is_empty();
+        if let Some(finding) = guardrails_identity_finding(
+            &crate::configure_guardrails::user_settings_path(),
+            process_owners_set,
+        ) {
             findings.push(finding);
         }
         if !quiet {
@@ -7110,14 +7144,14 @@ mod tests {
     fn guardrails_identity_configured_machine_is_clean() {
         let (_dir, path) = seed_user_settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
 
-        assert!(guardrails_identity_finding(&path).is_none());
+        assert!(guardrails_identity_finding(&path, false).is_none());
     }
 
     #[test]
     fn guardrails_identity_unset_owners_warns_about_blocked_pushes() {
         let (_dir, path) = seed_user_settings(r#"{"env":{"SOMETHING_ELSE":"x"}}"#);
 
-        let finding = guardrails_identity_finding(&path).expect("unset owners warns");
+        let finding = guardrails_identity_finding(&path, false).expect("unset owners warns");
 
         assert_eq!(finding.severity, Severity::Warning);
         assert!(
@@ -7137,7 +7171,7 @@ mod tests {
         let (_dir, path) =
             seed_user_settings(r#"{"env":{"GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"}}"#);
 
-        let finding = guardrails_identity_finding(&path).expect("legacy-only warns");
+        let finding = guardrails_identity_finding(&path, false).expect("legacy-only warns");
 
         assert!(
             finding.diagnosis.contains("is blocked"),
@@ -7160,7 +7194,7 @@ mod tests {
                }}"#,
         );
 
-        let finding = guardrails_identity_finding(&path).expect("lingering legacy warns");
+        let finding = guardrails_identity_finding(&path, false).expect("lingering legacy warns");
 
         assert!(
             finding.diagnosis.contains("no longer read"),
@@ -7172,10 +7206,69 @@ mod tests {
     #[test]
     fn guardrails_identity_fails_open_on_missing_or_malformed_settings() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(guardrails_identity_finding(&dir.path().join("absent.json")).is_none());
+        assert!(guardrails_identity_finding(&dir.path().join("absent.json"), false).is_none());
 
         let (_dir, path) = seed_user_settings("{ not json");
-        assert!(guardrails_identity_finding(&path).is_none());
+        assert!(guardrails_identity_finding(&path, false).is_none());
+    }
+
+    #[test]
+    fn guardrails_identity_process_env_owners_silence_warning_when_settings_lacks_key() {
+        // #987: exported from a shell rc, absent from settings.json — the
+        // guards read it from their process env and allow, so doctor must too.
+        let (_dir, path) = seed_user_settings(r#"{"env":{"SOMETHING_ELSE":"x"}}"#);
+
+        assert!(guardrails_identity_finding(&path, true).is_none());
+    }
+
+    #[test]
+    fn guardrails_identity_settings_owners_silence_warning_when_process_env_unset() {
+        // Plain-terminal doctor: settings env is not applied to this process,
+        // but Claude Code will apply it to the hooks.
+        let (_dir, path) = seed_user_settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        assert!(guardrails_identity_finding(&path, false).is_none());
+    }
+
+    #[test]
+    fn guardrails_identity_warns_when_neither_process_env_nor_settings_sets_owners() {
+        let (_dir, path) = seed_user_settings(r#"{"env":{}}"#);
+
+        let finding = guardrails_identity_finding(&path, false).expect("both absent warns");
+        assert!(
+            finding.diagnosis.contains("unset or empty"),
+            "{}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_explicit_empty_settings_value_overrides_process_env() {
+        // Claude Code layers settings env over the inherited env, so an
+        // explicit empty string wins over a shell export and the guards block.
+        let (_dir, path) = seed_user_settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":""}}"#);
+
+        let finding = guardrails_identity_finding(&path, true).expect("explicit empty warns");
+        assert!(
+            finding.diagnosis.contains("unset or empty"),
+            "{}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_legacy_with_process_env_owners_reports_lingering_keys() {
+        // Owners resolved from process env: legacy keys are merely stale, not
+        // the cause of a block.
+        let (_dir, path) =
+            seed_user_settings(r#"{"env":{"GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        let finding = guardrails_identity_finding(&path, true).expect("lingering legacy warns");
+        assert!(
+            finding.diagnosis.contains("no longer read"),
+            "{}",
+            finding.diagnosis
+        );
     }
 
     // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────

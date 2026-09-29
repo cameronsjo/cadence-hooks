@@ -166,9 +166,10 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, command_word, is_transparent_prefix_word,
-    looks_absolute, redirect_targets, resolve_cd_target, skip_transparent_prefixes,
-    split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, expand_leading_home,
+    is_transparent_prefix_word, looks_absolute, redirect_targets, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, strip_heredoc_bodies, tokenize,
+    tokenize_marked,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -657,7 +658,16 @@ fn is_shell_absolute(path: &str) -> bool {
 fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
     let mut commits = Vec::new();
     let mut mutations = Vec::new();
-    collect_targets(command, cwd, 0, &mut commits, &mut mutations, (None, None));
+    let home = dollar_home(command);
+    collect_targets(
+        command,
+        cwd,
+        0,
+        &mut commits,
+        &mut mutations,
+        (None, None),
+        home.as_deref(),
+    );
     (commits, mutations)
 }
 
@@ -846,6 +856,7 @@ fn collect_targets(
     targets: &mut Vec<CommitTarget>,
     mutations: &mut Vec<MutationTarget>,
     inherited_env: (Option<&str>, Option<&str>),
+    home: Option<&str>,
 ) {
     let mut effective_dir = cwd.to_string();
 
@@ -892,6 +903,9 @@ fn collect_targets(
                     targets,
                     mutations,
                     (env_work_tree, env_git_dir),
+                    // A child shell's HOME is whatever its launcher left it
+                    // (`env -i bash -c`, `sudo`, `ssh`): never the process home.
+                    None,
                 );
             }
         }
@@ -899,28 +913,11 @@ fn collect_targets(
         if tokens.first().map(String::as_str) == Some("cd") {
             // Always assume the cd succeeds — see the doc comment above for
             // why this path cannot reuse parse_work_dir's `|| means no-op`
-            // heuristic. But only trust a target this resolver can actually
-            // read: skip cd's own option flags (`-P`, `-L`, `--`) to find the
-            // real path argument, and treat a bare `-` (go to $OLDPWD), an
-            // unexpanded shell variable (`$VAR`), or no path argument at all
-            // (bare `cd`, or all flags with nothing after) as unresolvable —
-            // keep the pre-cd directory for subsequent segments rather than
-            // building a bogus path string that resolves to no repo and
-            // fails open downstream (`assess_dir`'s ADR-0001 Allow is correct
-            // for "not a repo", not for "the cd's real target was never
-            // examined").
-            let mut idx = 1;
-            while tokens
-                .get(idx)
-                .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
-            {
-                idx += 1;
-            }
-            if let Some(target) = tokens.get(idx)
-                && target != "-"
-                && !target.starts_with('$')
-            {
-                effective_dir = resolve_cd_target(target, &effective_dir);
+            // heuristic. What the cd resolves to (and when it is left
+            // unresolved) is [`resolve_cd_segment`]'s job, shared with the
+            // in-chain dismiss scan so the two walks cannot drift.
+            if let Some(dir) = resolve_cd_segment(segment, &effective_dir, home) {
+                effective_dir = dir;
             }
             continue;
         }
@@ -946,6 +943,165 @@ fn collect_targets(
             env_git_dir,
         ));
     }
+}
+
+/// Resolve one `cd` segment (already group-stripped, as every caller's
+/// segment is) against `effective_dir` for the scoped walk — the
+/// directory the shell lands in, or `None` when this resolver cannot read the
+/// target and the caller must keep the pre-cd directory.
+///
+/// Skips cd's own option flags (`-P`, `-L`, `--`) to find the real path
+/// argument. Unresolvable, and so left as `None`: a bare `-` (go to
+/// `$OLDPWD`), no path argument at all (bare `cd`, or all flags with nothing
+/// after), any shell variable other than a leading `$HOME`/`${HOME}`, a
+/// `$HOME` target when `dollar_home` is `None` (see [`dollar_home`]), a
+/// `~user`/`~+`/`~-` tilde form, and a quoted `"~/…"`. Keeping the pre-cd
+/// directory is the fail-CLOSED direction from a primary: building a bogus
+/// path string instead would resolve to no repo and fail open downstream
+/// (`assess_dir`'s ADR-0001 Allow is correct for "not a repo", not for "the
+/// cd's real target was never examined").
+///
+/// A leading `$HOME` / `${HOME}` expands against `dollar_home` — only when
+/// bash would expand it (`'$HOME/x'` is a literal directory, and
+/// [`expand_leading_home`] declines it). Before this, a
+/// `cd "$HOME/…/worktree" && git commit` from another repo's primary was judged
+/// against that primary and blocked, while the same target spelled `~/…`
+/// passed (cadence-hooks#1018).
+///
+/// An unquoted `~` / `~/…` keeps its long-standing resolution against the
+/// process home, unconditionally — the allowlist gating `$HOME` is NOT applied
+/// to it, because withholding it would change verdicts the tilde form has
+/// always had. A quoted `"~/…"` is a cwd-relative `./~/…` to bash; it is left
+/// unresolved rather than joined, because that directory almost never exists
+/// (so the cd fails and the commit runs in the pre-cd directory anyway), and a
+/// joined nonexistent path would fail open where the pre-cd directory blocks.
+fn resolve_cd_segment(
+    segment: &str,
+    effective_dir: &str,
+    dollar_home: Option<&str>,
+) -> Option<String> {
+    let tokens = tokenize_marked(segment);
+    let mut idx = 1;
+    while tokens
+        .get(idx)
+        .is_some_and(|t| t.text == "--" || (t.text.starts_with('-') && t.text != "-"))
+    {
+        idx += 1;
+    }
+    let target: &MarkedToken = tokens.get(idx)?;
+    let text = target.text.as_str();
+    if text == "-" {
+        return None;
+    }
+    if text.starts_with('$') {
+        let expanded = expand_leading_home(target, dollar_home?)?;
+        return Some(resolve_cd_target(&expanded, effective_dir));
+    }
+    if let Some(after_tilde) = text.strip_prefix('~') {
+        // Only `~` and `~/…`, with the tilde (and its slash) unquoted, mean
+        // "HOME" to bash. `~user` names another account's home, which the
+        // plain HOME substitution in `resolve_cd_target` would mangle into
+        // `<home>user/…`: a path that names no repo and fails open.
+        let unquoted_tilde = if after_tilde.is_empty() {
+            target.unquoted_prefix_len >= 1
+        } else {
+            after_tilde.starts_with('/') && target.unquoted_prefix_len >= 2
+        };
+        if !unquoted_tilde {
+            return None;
+        }
+    }
+    Some(resolve_cd_target(text, effective_dir))
+}
+
+/// Command words that cannot rebind HOME in the shell running the command —
+/// the allowlist behind [`dollar_home`]. Kept deliberately small: every entry
+/// is a builtin or external command that takes no variable NAME as an operand
+/// and evaluates no argument arithmetically.
+///
+/// - `cd`, `pwd`: take a path and `-L`/`-P`/`-e`/`-@` flags only (a `CDPATH`
+///   lookup changes where cd lands, never HOME).
+/// - `echo`, `true`: print or ignore their arguments.
+/// - `git`, `ls`: external processes, which cannot write the parent shell's
+///   variables (`git -c alias.x='!…'` runs in git's own child).
+///
+/// `test` and `[` are deliberately ABSENT: `test -v 'a[HOME=7]'` makes bash
+/// evaluate the array subscript arithmetically, which assigns HOME in the
+/// running shell (gate-2 delta review).
+const HOME_SAFE_WORDS: &[&str] = &["cd", "git", "ls", "echo", "pwd", "true"];
+
+/// The home a `$HOME` cd target in this top-level `command` expands against,
+/// or `None` when the guard cannot show the command leaves HOME alone.
+///
+/// Bash expands `$HOME` against whatever HOME holds when the cd runs, and a
+/// command can rebind it first in more ways than any denylist enumerates —
+/// brace expansion (`export {HO,}ME=…`), a function body, `read`/`mapfile`,
+/// arithmetic, `eval`, a child shell that starts with no HOME at all (`env -i
+/// bash -c …`). Judging `<process home>/…` for such a command would let it
+/// steer the guard onto a directory it never enters. So this is an ALLOWLIST:
+/// the process home is used only when
+///
+/// - every top-level segment (heredoc bodies aside) starts with a
+///   [`HOME_SAFE_WORDS`] command word — so no assignment word, `export`,
+///   `read`, `eval`, `source`, wrapper shell, or function call;
+/// - nothing outside quotes is a `(`, `)`, `{`, or `}` — no subshell,
+///   function definition, brace expansion, or arithmetic command;
+/// - nowhere, quoted or not and heredoc bodies included, is there a `$(`, a
+///   backtick, a `$[`, a `${` other than a plain `${HOME}`, or a `$'…'`
+///   string — each expands (or, for `$'…'`, quotes) in ways this scan does not
+///   model.
+///
+/// Anything else leaves every `$HOME` target unresolved: the pre-cd directory
+/// is kept, which is the behavior before `$HOME` expansion existed. Child
+/// scripts never get a home at all — [`collect_targets`] passes `None` down —
+/// since a child shell's HOME is whatever its launcher left it (cadence-hooks#1018).
+fn dollar_home(command: &str) -> Option<String> {
+    if !command_leaves_home_alone(command) {
+        return None;
+    }
+    let home = cadence_hooks_core::paths::user_home_lossy_or_default();
+    (!home.is_empty()).then_some(home)
+}
+
+/// The allowlist test behind [`dollar_home`].
+fn command_leaves_home_alone(command: &str) -> bool {
+    let rest = command.replace("${HOME}", "");
+    if ["$(", "`", "$[", "${", "$'"]
+        .iter()
+        .any(|needle| rest.contains(needle))
+    {
+        return false;
+    }
+    let script = strip_heredoc_bodies(&rest);
+    if has_unquoted_grouping(&script) {
+        return false;
+    }
+    split_segments_with_ops(&script)
+        .iter()
+        .map(|(segment, _)| tokenize(segment))
+        .filter(|tokens| !tokens.is_empty())
+        .all(|tokens| HOME_SAFE_WORDS.contains(&tokens[0].as_str()))
+}
+
+/// Does `script` carry a `(`, `)`, `{`, or `}` outside quotes? An unterminated
+/// quote counts as yes. Only `'…'` and `"…"` are tracked — the caller has
+/// already refused any `$'…'`, the one quoting form whose escapes differ.
+fn has_unquoted_grouping(script: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut chars = script.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '\\' if !single => {
+                chars.next();
+            }
+            '(' | ')' | '{' | '}' if !single && !double => return true,
+            _ => {}
+        }
+    }
+    single || double
 }
 
 /// Resolve a git path operand against a base directory, with the same shell
@@ -1131,6 +1287,7 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
     // breaks the chain.
     let mut active: HashMap<CommitTarget, Option<String>> = HashMap::new();
     let mut effective_dir = cwd.to_string();
+    let home = dollar_home(command);
 
     for (segment, next_op) in split_segments_with_ops(command) {
         let segment = strip_group_wrappers(&segment);
@@ -1138,20 +1295,10 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
         let argv = skip_transparent_prefixes(&tokens);
 
         if tokens.first().map(String::as_str) == Some("cd") {
-            // `cd` accumulation, tracked exactly as [`collect_targets`] does
-            // (bare `cd`, flag-only, `-`, or `$VAR` targets left unresolved).
-            let mut idx = 1;
-            while tokens
-                .get(idx)
-                .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
-            {
-                idx += 1;
-            }
-            if let Some(target) = tokens.get(idx)
-                && target != "-"
-                && !target.starts_with('$')
-            {
-                effective_dir = resolve_cd_target(target, &effective_dir);
+            // `cd` accumulation through the SAME resolver [`collect_targets`]
+            // uses — the dismiss map is keyed by the resolved target string.
+            if let Some(dir) = resolve_cd_segment(segment, &effective_dir, home.as_deref()) {
+                effective_dir = dir;
             }
         } else if is_dismiss_enforce_segment(argv) {
             active.insert(
@@ -1183,6 +1330,7 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
                 &mut seg_targets,
                 &mut discarded,
                 (None, None),
+                home.as_deref(),
             );
             for target in seg_targets {
                 if let Some(reason) = active.get(&target) {
@@ -1281,6 +1429,45 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
         ));
     }
     msg
+}
+
+/// Append a hint to a Bash-arm block when the command carried a top-level `cd`
+/// whose target [`resolve_cd_segment`] could not read — so the block, judged
+/// from the directory before that cd, says why instead of looking like it
+/// ignored the cd (cadence-hooks#1018). Message-only: the verdict is untouched,
+/// and an unreadable cd keeps blocking — letting it through would be a bypass.
+fn with_unresolved_cd_hint(mut result: CheckResult, command: &str, cwd: &str) -> CheckResult {
+    let home = dollar_home(command);
+    let mut effective_dir = cwd.to_string();
+    let mut unresolved: Option<String> = None;
+    for (segment, _) in split_segments_with_ops(command) {
+        let segment = strip_group_wrappers(&segment);
+        let tokens = tokenize(segment);
+        if tokens.first().map(String::as_str) != Some("cd") {
+            continue;
+        }
+        match resolve_cd_segment(segment, &effective_dir, home.as_deref()) {
+            Some(dir) => effective_dir = dir,
+            None => {
+                if unresolved.is_none() {
+                    unresolved = Some(tokens[1..].join(" "));
+                }
+            }
+        }
+    }
+    if let (Some(target), Some(message)) = (
+        unresolved.filter(|t| !t.is_empty()),
+        result.message.as_mut(),
+    ) {
+        let target = sanitize_field(&target, MAX_PATH_DISPLAY);
+        message.push_str(&format!(
+            "\nNote: `cd {target}` could not be resolved (a shell variable, `cd -`, or \
+             `$HOME` in a command the guard cannot confirm leaves HOME alone), so the commit \
+             was judged from the directory before that cd. If it really lands elsewhere, name \
+             the path literally or use `git -C <path> commit`."
+        ));
+    }
+    result
 }
 
 /// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
@@ -1685,7 +1872,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                         }
                         continue;
                     }
-                    return result;
+                    return with_unresolved_cd_hint(result, command, cwd);
                 }
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
@@ -2631,6 +2818,241 @@ mod tests {
         );
     }
 
+    // --- #1018: `$HOME` in a cd target ---
+
+    /// The process home, raw. Compare resolved targets against
+    /// `normalize_target` of a path built from it: on Windows the resolver
+    /// lowercases the drive and folds separators (`C:\Users\x` → `c:/users/x`).
+    fn process_home() -> String {
+        cadence_hooks_core::paths::user_home_lossy_or_default()
+    }
+
+    #[test]
+    fn cd_dollar_home_expands_like_tilde() {
+        // Issue #1018 row 1: `cd "$HOME/…"` fell back to the starting cwd while
+        // the same target spelled `~/…` resolved. Every spelling bash expands
+        // must land on the same directory the tilde form does.
+        let home = process_home();
+        let tilde = git_commit_targets("cd ~/src/repo-b && git commit -m x", "/cwd");
+        assert_eq!(tilde, vec![normalize_target(&format!("{home}/src/repo-b"))]);
+        for cmd in [
+            r#"cd "$HOME/src/repo-b" && git commit -m x"#,
+            "cd $HOME/src/repo-b && git commit -m x",
+            r#"cd "${HOME}/src/repo-b" && git commit -m x"#,
+            r#"cd "${HOME}"/src/repo-b && git commit -m x"#,
+            r#"cd -P "$HOME/src/repo-b" && git commit -m x"#,
+        ] {
+            assert_eq!(git_commit_targets(cmd, "/cwd"), tilde, "{cmd}");
+        }
+        assert_eq!(
+            git_commit_targets(r#"cd "$HOME" && git commit -m x"#, "/cwd"),
+            vec![normalize_target(&home)],
+        );
+    }
+
+    #[test]
+    fn cd_single_quoted_dollar_home_is_literal_and_stays_unresolved() {
+        // `'$HOME/x'` is a literal directory named `$HOME` to bash — it must
+        // never expand. The quote-stripped token text is byte-identical to the
+        // double-quoted form, so this pins the quoting-context check.
+        for cmd in [
+            "cd '$HOME/src/repo-b' && git commit -m x",
+            "cd $'$HOME/src/repo-b' && git commit -m x",
+            r#"cd "$"HOME/src/repo-b && git commit -m x"#,
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn cd_dollar_home_lookalikes_stay_unresolved() {
+        // Only the whole name `HOME` followed by `/` or the end is expanded;
+        // anything else is another variable or an operator form this resolver
+        // does not model, and keeps the pre-cd directory.
+        for cmd in [
+            "cd $HOMEDIR/x && git commit -m x",
+            r#"cd "${HOME:-/y}/x" && git commit -m x"#,
+            r#"cd "$HOME.bak" && git commit -m x"#,
+            r#"cd "$SOMEVAR/x" && git commit -m x"#,
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{cmd}"
+            );
+        }
+    }
+
+    /// Every command in this list could leave HOME holding something other
+    /// than the process home when its cd runs — or hands the cd to a child
+    /// shell with its own HOME — so `$HOME` there must stay unresolved.
+    const HOME_UNSAFE_PREFIXES: &[&str] = &[
+        "HOME=/elsewhere; ",
+        "HOME=/elsewhere && ",
+        "export HOME=/elsewhere && ",
+        "declare -x HOME=/elsewhere; ",
+        "read -r HOME < f; ",
+        "unset HOME; ",
+        r#"export "H"OME=/elsewhere; "#,
+        r"HO\ME=/elsewhere; ",
+        r#"eval "HO""ME=/elsewhere"; "#,
+        r#"n=HO; declare "${n}ME=/elsewhere"; "#,
+        r#"n=HO; (( ${n}ME = 1 )); "#,
+        "source ./env.sh && ",
+        ". ./env.sh && ",
+        // Gate-2 review Criticals: brace expansion builds the name `HOME`
+        // with no `HOME` substring and no `$` anywhere in the segment.
+        "export {HO,}ME=/elsewhere && ",
+        "declare -x {HO,}ME=/elsewhere; ",
+        "read {HO,}ME <<< /elsewhere; ",
+        "mapfile -t {HO,}ME <<< /elsewhere; ",
+        "f(){ export {HO,}ME=/elsewhere; }; f && ",
+        "export FOO=1 && ",
+        "MY_HOME=/x; ",
+        "echo $(true) && ",
+        "echo `true` && ",
+        "echo ${X:=1} && ",
+        "echo $[1] && ",
+        "echo $'x' && ",
+        "(true) && ",
+        "{ true; } && ",
+        "echo {a,b} && ",
+        // Gate-2 delta review Critical: `test -v` evaluates an array
+        // subscript arithmetically, assigning HOME in the running shell.
+        "test -v 'a[HOME=7]'; ",
+        "test -v a[HOME=7]; ",
+        "[ -v 'a[HOME=7]' ]; ",
+        "test -v 'a[HOME=7]' || ",
+        "test -v 'a[HOME=7]' && ",
+        "test -d .git && ",
+    ];
+
+    #[test]
+    fn dollar_home_outside_the_allowlist_stays_unresolved() {
+        // `$HOME` expands against the process home only for a command the
+        // allowlist can show leaves HOME alone. Anything else keeps the pre-cd
+        // directory — the pre-#1018 fail-closed fallback — so no rebinding
+        // spelling, known or not, can steer the guard onto a directory the
+        // command never enters.
+        for prefix in HOME_UNSAFE_PREFIXES {
+            for target in [r#""$HOME/wt""#, "${HOME}/wt"] {
+                let cmd = format!("{prefix}cd {target} && git commit -m x");
+                assert_eq!(
+                    git_commit_targets(&cmd, "/cwd"),
+                    vec!["/cwd".to_string()],
+                    "{cmd}"
+                );
+            }
+        }
+        // A prefix assignment on the cd itself: bash expands `$HOME` BEFORE the
+        // assignment applies, and this walk does not treat an assignment-led
+        // segment as a cd at all — either way the process home is never
+        // substituted for the rebound one.
+        assert_eq!(
+            git_commit_targets(
+                r#"HOME=/elsewhere cd "$HOME/wt" && git commit -m x"#,
+                "/cwd"
+            ),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn dollar_home_in_a_child_shell_stays_unresolved() {
+        // A child shell's HOME is whatever its launcher left it: `env -i`
+        // clears it (bash then lands in `/wt`), `sudo`/`su` swap it. The child
+        // never inherits the process home, even though the child's own script
+        // would pass the allowlist on its own; the child starts from the
+        // directory in effect at the wrapper, as every wrapped cd does.
+        for cmd in [
+            r#"env -i bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"sudo bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"bash -c 'cd "$HOME/wt" && git commit -m x'"#,
+            r#"sh -c 'cd ${HOME}/wt && git commit -m x'"#,
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_keeps_its_process_home_resolution_outside_the_allowlist() {
+        // Deliberate asymmetry: the allowlist gates `$HOME` only. `~/…` keeps
+        // the resolution it always had, so no verdict main already gave a
+        // tilde spelling changes (withholding it could only flip ALLOW→BLOCK,
+        // but a behavior change there is not this fix's to make).
+        let want = vec![normalize_target(&format!("{}/wt", process_home()))];
+        for prefix in ["export FOO=1 && ", "HOME=/elsewhere; "] {
+            let cmd = format!("{prefix}cd ~/wt && git commit -m x");
+            assert_eq!(git_commit_targets(&cmd, "/cwd"), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn home_allowlist_accepts_the_ordinary_shapes() {
+        // Positive controls: the ordinary shapes the fix exists for must
+        // resolve, or the allowlist silently undoes it — a conventional-commit
+        // message's quoted parens and a heredoc body's included.
+        let want = vec![normalize_target(&format!("{}/wt", process_home()))];
+        for cmd in [
+            r#"cd "$HOME/wt" && git add . && git commit -m x"#,
+            r#"cd "$HOME/wt" && git commit -m "fix(scope): thing {1}""#,
+            r#"cd "${HOME}/wt" && echo "$HOME" && pwd && ls && git commit -m x"#,
+            r#"cd $HOME/wt && true && git commit -m x"#,
+            "cd \"$HOME/wt\" && git commit -F - <<'EOF'\nfix(scope): body (with parens)\nEOF",
+        ] {
+            assert!(command_leaves_home_alone(cmd), "{cmd}");
+            assert_eq!(git_commit_targets(cmd, "/cwd"), want, "{cmd}");
+        }
+        // An unquoted heredoc body still expands `$((…))` in the current shell,
+        // so a substitution there disqualifies even though the body is data.
+        assert!(!command_leaves_home_alone(
+            "cd \"$HOME/wt\" && git commit -F - <<EOF\n$((HOME=1))\nEOF"
+        ));
+    }
+
+    #[test]
+    fn cd_tilde_other_user_and_quoted_tilde_stay_unresolved() {
+        // `~user/…` names another account's home: substituting the process
+        // home would build a path that names no repo (fail-open). A quoted
+        // `"~/…"` is a cwd-relative `./~/…` to bash — a directory that almost
+        // never exists, so the cd fails and the commit runs in the pre-cd
+        // directory; joining it instead would fail open on the nonexistent
+        // path. Both keep the pre-cd directory (fail-closed from a primary).
+        for cmd in [
+            "cd ~bob/src/repo && git commit -m x",
+            "cd ~+/x && git commit -m x",
+            r#"cd "~/src/repo" && git commit -m x"#,
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn inchain_dismiss_resolves_dollar_home_cd_like_the_commit_walk() {
+        // Parity: the dismiss map is keyed by the resolved target string, so
+        // the in-chain scan's cd must resolve `$HOME` exactly as the commit
+        // walk does, or `cd "$HOME/…" && dismiss && git commit` half-matches.
+        // `cadence-hooks` is outside the HOME allowlist, so here both walks
+        // must agree on leaving the `$HOME` cd unresolved.
+        let cmd = r#"cd "$HOME/src/repo" && cadence-hooks guardrails dismiss-enforce-worktree --for 30m && git commit -m x"#;
+        let dismissed = inchain_dismissed_commits(cmd, "/cwd");
+        let targets = git_commit_targets(cmd, "/cwd");
+        assert_eq!(targets, vec!["/cwd".to_string()]);
+        assert!(dismissed.contains_key(&targets[0]), "{dismissed:?}");
+    }
+
     #[test]
     fn bare_cd_keeps_pre_cd_dir() {
         assert_eq!(
@@ -3028,6 +3450,139 @@ mod tests {
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block);
+    }
+
+    /// `path` spelled through `$HOME` (`$HOME/../..<path>`), so a live fixture
+    /// anywhere on disk can be reached by a `$HOME`-led cd target.
+    #[cfg(unix)]
+    fn via_dollar_home(path: &Path) -> String {
+        let home = process_home();
+        let ups = Path::new(&home)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count();
+        format!("$HOME{}{}", "/..".repeat(ups), path.to_string_lossy())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_dollar_home_into_worktree_from_other_primary_allows() {
+        // Issue #1018 row 1, live: the session starts in repo A's primary and
+        // commits into repo B's worktree through a `$HOME`-led cd. Pre-fix the
+        // cd was unresolved, repo A's primary was judged, and it blocked.
+        let scratch = scratch("home-cd-wt");
+        let (_primary, wt) = primary_and_worktree(&scratch);
+        let other_primary = scratch.path().join("other-repo");
+        std::fs::create_dir(&other_primary).unwrap();
+        init_repo(&other_primary);
+
+        for cmd in [
+            format!(r#"cd "{}" && git commit -m x"#, via_dollar_home(&wt)),
+            format!(
+                "cd {} && git commit -m x",
+                via_dollar_home(&wt).replacen("$HOME", "${HOME}", 1)
+            ),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(other_primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, Outcome::Allow, "{cmd}: {:?}", r.message);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_dollar_home_into_primary_from_worktree_blocks() {
+        // The other direction, and the one that matters for the guard: before
+        // #1018 a `$HOME`-led cd from a worktree cwd was unresolved, so the
+        // worktree was judged and a commit into a primary slipped through.
+        let scratch = scratch("home-cd-primary");
+        let (primary, wt) = primary_and_worktree(&scratch);
+
+        let cmd = format!(r#"cd "{}" && git commit -m x"#, via_dollar_home(&primary));
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_single_quoted_dollar_home_blocks_from_primary() {
+        // `'$HOME/…'` is literal to bash; it must not expand into the worktree
+        // and allow. It stays unresolved, so the primary is judged.
+        let scratch = scratch("home-cd-squote");
+        let (primary, wt) = primary_and_worktree(&scratch);
+
+        let cmd = format!("cd '{}' && git commit -m x", via_dollar_home(&wt));
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_dollar_home_after_home_rebind_blocks_from_primary() {
+        // Live form of the allowlist: a command that could rebind HOME — or
+        // hands the cd to a child shell — gets no process-home expansion, so the
+        // `$HOME` cd stays unresolved and the primary it started in is judged.
+        // Includes the gate-2 review Criticals (brace-built names, a function
+        // body, `env -i`/`sudo` child shells), each of which committed into the
+        // primary before the allowlist replaced the rebind denylist.
+        let scratch = scratch("home-cd-rebind");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let target = via_dollar_home(&wt);
+
+        for cmd in [
+            format!(r#"HOME=/elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"export HOME=/elsewhere && cd "{target}" && git commit -m x"#),
+            format!(r#"HOME=/elsewhere cd "{target}" && git commit -m x"#),
+            format!(r#"export {{HO,}}ME=/elsewhere && cd "{target}" && git commit -m x"#),
+            format!(r#"declare -x {{HO,}}ME=/elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"read {{HO,}}ME <<< /elsewhere; cd "{target}" && git commit -m x"#),
+            format!(r#"mapfile -t {{HO,}}ME <<< /elsewhere; cd "{target}" && git commit -m x"#),
+            format!(
+                r#"f(){{ export {{HO,}}ME=/elsewhere; }}; f && cd "{target}" && git commit -m x"#
+            ),
+            format!(r#"env -i bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"sudo bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"test -v 'a[HOME=7]'; cd "{target}" && git commit -m x"#),
+            format!(r#"test -v a[HOME=7]; cd "{target}" && git commit -m x"#),
+            format!(r#"[ -v 'a[HOME=7]' ]; cd "{target}" && git commit -m x"#),
+            format!(r#"test -v 'a[HOME=7]' || cd "{target}" && git commit -m x"#),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn unresolved_cd_block_names_the_target_and_the_literal_path_remedy() {
+        // An unreadable cd keeps blocking (letting it through would be a
+        // bypass), but the block says which cd it could not read instead of
+        // looking like it ignored it.
+        let scratch = scratch("cd-unresolved-hint");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash(r#"cd "$SOMEVAR/x" && git commit -m x"#);
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("`cd $SOMEVAR/x` could not be resolved"),
+            "{msg}"
+        );
+        assert!(msg.contains("git -C <path> commit"), "{msg}");
+
+        // A block with no unreadable cd carries no such note.
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert!(!r.message.unwrap().contains("could not be resolved"));
     }
 
     #[test]
