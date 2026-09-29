@@ -8,7 +8,8 @@
 
 use cadence_hooks_core::shell::{
     carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
-    executable_tokens, looks_absolute, peel_command_runners, skip_git_global_options, tokenize,
+    executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
+    redirect_operator_span, redirect_targets, skip_git_global_options, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -140,6 +141,16 @@ pub trait FileMeta {
     /// True iff `path` names an existing file (symlinks resolved by the real
     /// impl; the fake decides its own semantics).
     fn exists(&self, path: &str) -> bool;
+
+    /// The physical location of an absolute, `..`-free `path`: its longest
+    /// existing ancestor with every symlink resolved, plus the not-yet-existing
+    /// tail. `None` when nothing can be resolved. Only ever used to ADD a
+    /// block — an operand that looks outside the vault but physically lands
+    /// in it (`/tmp/link-to-vault/note.md`) — so the default of "no physical
+    /// view" keeps the lexical verdict (cadence-hooks#839).
+    fn physical(&self, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Production impl over `std::fs`. Uses `symlink_metadata(...).is_ok()` — a
@@ -149,6 +160,42 @@ impl FileMeta for RealFs {
     fn exists(&self, path: &str) -> bool {
         std::fs::symlink_metadata(path).is_ok()
     }
+
+    fn physical(&self, path: &str) -> Option<String> {
+        let path = std::path::Path::new(path);
+        if let Ok(resolved) = std::fs::canonicalize(path) {
+            return Some(normalize_path(&resolved.to_string_lossy()));
+        }
+        // Find the longest existing prefix by binary search — existence is
+        // monotone along the prefix chain — and resolve it once. A per-step
+        // walk costs a full-path lookup per component, quadratic in depth:
+        // 64 operands 1000 directories deep took 4.6 s that way.
+        let components: Vec<_> = path.components().collect();
+        let prefix = |n: usize| components[..n].iter().collect::<std::path::PathBuf>();
+        let (mut lo, mut hi) = (0, components.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if std::fs::symlink_metadata(prefix(mid)).is_ok() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let mut resolved = canonicalize_or_parent(&prefix(lo))?;
+        resolved.extend(&components[lo..]);
+        Some(normalize_path(&resolved.to_string_lossy()))
+    }
+}
+
+/// Canonicalize an existing path; a dangling symlink, which does not, resolves
+/// through its parent and keeps its own name.
+fn canonicalize_or_parent(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let mut parent = std::fs::canonicalize(path.parent()?).ok()?;
+    parent.push(path.file_name()?);
+    Some(parent)
 }
 
 /// Split an absolute path into its root prefix (`"/"` or a Windows drive
@@ -213,6 +260,179 @@ fn resolve_in_vault(target: &str, cwd: &str, vault: &str, vault_prefix: &str) ->
     }
 }
 
+/// Most operands one destructive command may carry and still be judged
+/// operand by operand. Each one can cost a `canonicalize` walk, and the hook
+/// deadline fails OPEN, so a command past this keeps the cwd verdict (block)
+/// instead of racing the clock.
+const MAX_JUDGED_OPERANDS: usize = 64;
+
+/// Longest operand judged, `PATH_MAX`: the kernel refuses a longer path, and
+/// the physical walk costs a lookup per component, so anything past this is
+/// read as possibly inside the vault.
+const MAX_OPERAND_LEN: usize = 4096;
+
+/// Deepest operand judged. Resolving a path through symlinks (`realpath`)
+/// costs a lookup of every prefix, quadratic in depth, and an existing tree
+/// 1000 directories deep took 0.57 s for 8 operands; anything deeper than this
+/// is read as possibly inside the vault.
+const MAX_OPERAND_DEPTH: usize = 64;
+
+/// Longest command judged operand by operand. A deletion anyone types is far
+/// shorter; past this the cwd verdict (block) stands without a second
+/// segmentation pass over the input.
+const MAX_JUDGED_COMMAND_LEN: usize = 16 * 1024;
+
+/// Most segments a command may carry and still be judged operand by operand,
+/// for the same reason: every `eval`/`find` segment is re-scanned, and a
+/// 200 KB chain of them came within 0.05 s of the hook deadline.
+const MAX_JUDGED_SEGMENTS: usize = 256;
+
+/// Characters that make an operand's target unknowable from its text: a
+/// parameter, substitution, glob, brace, extglob, or escape the shell
+/// expands before `rm` sees the word. The tokenizer has already removed
+/// quoting, so a quoted `'*'` lands here too — an over-block, never a miss.
+/// (A tilde needs no entry: only an absolute word is judged, and a word that
+/// starts with `/` is never tilde-expanded.)
+const UNRESOLVABLE_OPERAND_CHARS: &[char] =
+    &['$', '`', '*', '?', '[', ']', '{', '}', '(', ')', '\\'];
+
+/// True when `path` (normalized, absolute) is the vault, sits inside it, or
+/// is one of its ancestors — `rm -r /home/me` deletes a vault under it just
+/// as surely as `rm /vault/note.md` does.
+fn touches_vault(path: &str, vault: &str) -> bool {
+    let vault_prefix = format!("{vault}/");
+    path == vault
+        || path.starts_with(&vault_prefix)
+        || path.ends_with('/')
+        || vault.starts_with(&format!("{path}/"))
+}
+
+/// Judge one operand of a deletion issued from inside the vault: `true` only
+/// when it provably names a path outside it (cadence-hooks#839). Anything the
+/// text cannot settle — a relative name (it resolves under the vault cwd), an
+/// expansion, a `..` climb a symlink could redirect, a control character —
+/// reads as inside.
+fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> bool {
+    if operand.len() > MAX_OPERAND_LEN
+        || !looks_absolute(operand)
+        || operand.contains(UNRESOLVABLE_OPERAND_CHARS)
+        || operand.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let path = normalize_path(operand);
+    if path.split('/').count() > MAX_OPERAND_DEPTH + 1
+        || path.split('/').any(|segment| segment == "..")
+    {
+        return false;
+    }
+    let lexical = collapse_dots(&path);
+    if touches_vault(&lexical, vault) {
+        return false;
+    }
+    // A symlink outside the vault can point into it. Resolve both sides
+    // physically, so neither a linked operand nor a vault reached through a
+    // symlinked parent (`/var` → `/private/var`) slips past the prefix test.
+    let physical_vault = meta.physical(vault);
+    let vaults = std::iter::once(vault).chain(physical_vault.as_deref());
+    match meta.physical(&lexical) {
+        Some(physical) => !vaults
+            .into_iter()
+            .any(|v| touches_vault(&physical, v) || touches_vault(&lexical, v)),
+        None => true,
+    }
+}
+
+/// Verbs that neither touch the filesystem nor run another command, so a
+/// segment made of one (with no output redirect) cannot change what a
+/// sibling deletion's operand resolves to.
+const INERT_VERBS: &[&str] = &[
+    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[",
+];
+
+/// Is this non-deleting segment one that cannot reshape the filesystem before
+/// a sibling deletion runs? An [`INERT_VERBS`] head with no output redirect.
+/// Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a shell wrapper,
+/// `find`, `eval`, a function call, an unknown command — is not.
+fn is_inert_segment(argv: &[String], segment: &str) -> bool {
+    argv.first()
+        .is_some_and(|first| INERT_VERBS.contains(&command_word(first).as_ref()))
+        && redirect_targets(segment).is_empty()
+}
+
+/// With the shell standing inside the vault, is every deletion the command
+/// makes provably aimed outside it (cadence-hooks#839)? The cwd names where
+/// the shell stands, not what `rm` is handed, so `rm /tmp/scratch.py` issued
+/// from the vault is not the trash guard's business.
+///
+/// Only a plain deletion verb (`rm`, `unlink`, `shred`, `truncate`) at a
+/// segment head is judged operand by operand. Every other destructive shape
+/// keeps the cwd verdict: `git rm` (pathspecs, `--pathspec-from-file`),
+/// `xargs` (operands arrive on stdin), and every command that sits beside the
+/// deletion unless it is inert ([`is_inert_segment`]) — so `find`, `eval`, a
+/// shell wrapper, and anything that could re-point an operand (`ln`, `mv`,
+/// `cd`) keep the block. Options are skipped only before the
+/// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
+/// is judged as one. A redirection is skipped only when its operator is
+/// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
+fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) -> bool {
+    if command.len() > MAX_JUDGED_COMMAND_LEN {
+        return false;
+    }
+    let segments = command_segments(command);
+    if segments.len() > MAX_JUDGED_SEGMENTS {
+        return false;
+    }
+    let mut judged = 0;
+    for segment in segments {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+        let argv = peel_command_runners(&tokens);
+        if !head_deletes(argv) {
+            // Every other segment must be provably inert. The physical check
+            // reads the disk at hook time, so a sibling that reshapes it first
+            // — `ln -s <vault> /tmp/l; rm -rf /tmp/l/`, a `mv`, a `cd` — would
+            // walk an operand into the vault after the check passed it.
+            if !is_inert_segment(argv, &segment) {
+                return false;
+            }
+            continue;
+        }
+        let runners = &tokens[..tokens.len() - argv.len()];
+        if command_word(&argv[0]) == "git" || runners.iter().any(|t| command_word(t) == "xargs") {
+            return false;
+        }
+        let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
+        let mut options_done = false;
+        let mut i = 1;
+        while let Some(arg) = argv.get(i) {
+            if let Some((operator_len, bare)) = redirect_operator_span(arg)
+                && lens.get(i).is_some_and(|&len| len >= operator_len)
+            {
+                i += if bare { 2 } else { 1 };
+                continue;
+            }
+            if !options_done {
+                if arg == "--" {
+                    options_done = true;
+                    i += 1;
+                    continue;
+                }
+                if arg.len() > 1 && arg.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+            }
+            options_done = true;
+            judged += 1;
+            if judged > MAX_JUDGED_OPERANDS || !operand_outside_vault(arg, vault, meta) {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
 /// Check if a destructive command targets the Obsidian vault, or if a
 /// clobber (`>`, `>|`) redirect would truncate an existing vault file.
 fn check_destructive_in_vault(
@@ -230,9 +450,10 @@ fn check_destructive_in_vault(
     let vault_prefix = format!("{vault}/");
 
     if is_destructive(command) {
-        let mut in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
+        let cwd_in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
+        let mut in_vault = cwd_in_vault && !deletions_all_outside_vault(command, &vault, meta);
 
-        if !in_vault {
+        if !cwd_in_vault {
             // Quote-aware tokenize (not split_whitespace): a vault path with
             // spaces must be quoted (`"…/Field Reports/old.md"`), and
             // split_whitespace both shreds it across tokens and leaves a
@@ -409,6 +630,238 @@ mod tests {
     impl FileMeta for FakeFs {
         fn exists(&self, path: &str) -> bool {
             self.0.contains(path)
+        }
+    }
+
+    /// cadence-hooks#839: with the shell standing in the vault, a deletion is
+    /// judged by where its operands point, not where the shell stands. Every
+    /// row that allows names only absolute paths outside `/vault`; every row
+    /// that blocks carries at least one operand the text cannot place outside
+    /// it, or a destructive shape that is never judged operand by operand.
+    #[test]
+    fn deletion_from_vault_cwd_is_judged_by_its_operands() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // The report, verbatim.
+            ("command rm /tmp/l5probe/probe.py /tmp/b652/cases.py", Allow),
+            ("rm -rf /tmp/build", Allow),
+            ("rm -f -- /tmp/a /home/user/b", Allow),
+            ("rm /tmp/a 2>/dev/null", Allow),
+            ("rm /tmp/a > /dev/null", Allow),
+            ("unlink /tmp/a", Allow),
+            ("shred -u /tmp/secret", Allow),
+            ("truncate -s0 /tmp/log", Allow),
+            ("sudo rm /tmp/a", Allow),
+            ("rm /tmp/a && rm /tmp/b", Allow),
+            ("rm '/tmp/My File.md'", Allow),
+            ("rm /tmp/./a", Allow),
+            // A sibling that merely shares the vault's name prefix.
+            ("rm /vault2/x", Allow),
+            // Controls: the operand is, or may be, in the vault.
+            ("rm note.md", Block),
+            ("rm ./note.md", Block),
+            ("rm /vault/note.md", Block),
+            ("rm /vault", Block),
+            ("rm -rf /", Block),
+            ("rm /tmp/a note.md", Block),
+            ("rm /tmp/a /vault/x", Block),
+            ("rm /tmp/../vault/note.md", Block),
+            (r"rm /tmp/\.\./vault/note.md", Block),
+            ("rm /tmp/$X", Block),
+            ("rm $X", Block),
+            ("rm \"$X\"", Block),
+            ("rm /tmp/*", Block),
+            ("rm /va*/note.md", Block),
+            ("rm /v?ult/note.md", Block),
+            ("rm /[v]ault/note.md", Block),
+            ("rm /{tmp/a,vault/x}", Block),
+            ("rm /tmp/$(echo x)", Block),
+            ("rm /tmp/a $(echo note.md)", Block),
+            ("rm /tmp/a `echo note.md`", Block),
+            ("rm \" /tmp/a\"", Block),
+            ("rm ''", Block),
+            ("rm ~/x", Block),
+            // An option after an operand is a file under strict POSIX.
+            ("rm /tmp/a -f", Block),
+            ("rm -- -f", Block),
+            // A quoted redirect-shaped word is a file `rm` deletes.
+            ("rm /tmp/a '>note.md'", Block),
+            // `-s 0`'s size reads as a relative operand: a known over-block.
+            ("truncate -s 0 /tmp/log", Block),
+            ("rm /tmp/a; rm note.md", Block),
+            // Shapes never judged operand by operand keep the cwd verdict.
+            ("git rm /tmp/a", Block),
+            ("echo note.md | xargs rm", Block),
+            ("xargs rm /tmp/a", Block),
+            ("find /tmp/x -delete", Block),
+            (r"find /tmp/x -exec rm {} \;", Block),
+            ("eval rm /tmp/a", Block),
+            ("sh -c 'eval rm /tmp/a'", Block),
+            (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
+            // A wrapper is not inert, whatever its script says.
+            ("sh -c 'rm /tmp/a'", Block),
+            ("sh -c 'rm note.md'", Block),
+            ("bash -c 'rm \"$1\"' _ note.md", Block),
+            ("bash -c 'cd /tmp && rm a'", Block),
+            // A sibling that could re-point an operand before the deletion
+            // runs keeps the block; only inert siblings pass.
+            ("ln -s /vault /tmp/l; rm -rf /tmp/l/", Block),
+            ("ln -s /vault /tmp/l && rm -rf /tmp/l/note.md", Block),
+            ("mv /vault/note.md /tmp/y; rm /tmp/y", Block),
+            ("cd /tmp && rm -rf x", Block),
+            ("cd /tmp && rm -rf /tmp/x", Block),
+            ("pushd /tmp; rm /tmp/x", Block),
+            ("mkdir -p /tmp/d && rm -r /tmp/d", Block),
+            ("cp -r /vault /tmp/v; rm -r /tmp/v", Block),
+            ("my_func; rm /tmp/x", Block),
+            ("echo $(ln -s /vault /tmp/l); rm -rf /tmp/l/", Block),
+            ("echo x > /tmp/f; rm /tmp/a", Block),
+            ("ls /tmp; rm /tmp/x.txt", Allow),
+            ("echo done && rm /tmp/a", Allow),
+            ("test -e /tmp/a && rm /tmp/a", Allow),
+            ("[ -e /tmp/a ] && rm /tmp/a", Allow),
+            ("cat /tmp/list | rm /tmp/a", Allow),
+            ("pwd; printf 'x'; true; :; rm /tmp/a", Allow),
+        ];
+        for &(command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::default());
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
+        }
+        // The same allowed shapes from a vault SUBDIRECTORY.
+        let result =
+            check_destructive_in_vault("rm /tmp/a", "/vault/notes", "/vault", &FakeFs::default());
+        assert_eq!(result.outcome, Allow);
+    }
+
+    #[test]
+    fn deletion_from_vault_cwd_blocks_an_ancestor_of_the_vault() {
+        for command in ["rm -rf /home/me", "rm -rf /home", "rm -rf /home/me/"] {
+            let result = check_destructive_in_vault(
+                command,
+                "/home/me/Vault",
+                "/home/me/Vault",
+                &FakeFs::default(),
+            );
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let result = check_destructive_in_vault(
+            "rm -rf /home/me/other",
+            "/home/me/Vault",
+            "/home/me/Vault",
+            &FakeFs::default(),
+        );
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn deletion_from_vault_cwd_past_a_size_cap_keeps_blocking() {
+        let at_cap = format!("rm {}", vec!["/tmp/a"; MAX_JUDGED_OPERANDS].join(" "));
+        let past_cap = format!("{at_cap} /tmp/a");
+        let long_operand = format!("rm /{}", "a/".repeat(MAX_OPERAND_LEN / 2));
+        assert_eq!(
+            check_destructive_in_vault(&long_operand, "/vault", "/vault", &FakeFs::default())
+                .outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let too_deep = format!("rm /{}x", "a/".repeat(MAX_OPERAND_DEPTH));
+        assert_eq!(
+            check_destructive_in_vault(&too_deep, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let at_depth = format!("rm /{}x", "a/".repeat(MAX_OPERAND_DEPTH - 1));
+        assert_eq!(
+            check_destructive_in_vault(&at_depth, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        let at_len = format!("rm /{}", "a".repeat(MAX_OPERAND_LEN - 1));
+        assert_eq!(
+            check_destructive_in_vault(&at_len, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        let too_long = format!("rm {}", vec!["/tmp/abcdefghij"; 1200].join(" "));
+        assert!(too_long.len() > MAX_JUDGED_COMMAND_LEN);
+        assert_eq!(
+            check_destructive_in_vault(&too_long, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let many_segments = "echo x; ".repeat(MAX_JUDGED_SEGMENTS) + "rm /tmp/a";
+        assert_eq!(
+            check_destructive_in_vault(&many_segments, "/vault", "/vault", &FakeFs::default())
+                .outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let fs = FakeFs::default();
+        assert_eq!(
+            check_destructive_in_vault(&at_cap, "/vault", "/vault", &fs).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        assert_eq!(
+            check_destructive_in_vault(&past_cap, "/vault", "/vault", &fs).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    /// A symlink outside the vault that points into it is judged by where it
+    /// lands, on real disk: the lexical path says "outside", the physical one
+    /// says "vault".
+    #[test]
+    fn deletion_from_vault_cwd_through_a_symlink_into_the_vault_blocks() {
+        use cadence_hooks_core::git_fixtures::Scratch;
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures");
+        let scratch = Scratch::new(&root, "trash-guard-839");
+        let base = scratch
+            .path()
+            .canonicalize()
+            .expect("scratch canonicalizes");
+        let vault = base.join("vault");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(vault.join("notes")).expect("vault dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&vault, outside.join("link")).expect("symlink");
+            std::os::unix::fs::symlink(&vault, base.join("vault-alias")).expect("alias");
+        }
+        let vault_s = vault.to_string_lossy().into_owned();
+        let outside_s = outside.to_string_lossy().into_owned();
+        let alias_s = base.join("vault-alias").to_string_lossy().into_owned();
+        let judge = |command: &str, vault: &str| {
+            check_destructive_in_vault(command, vault, vault, &RealFs).outcome
+        };
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_eq!(judge(&format!("rm {outside_s}/plain.txt"), &vault_s), Allow);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                judge(&format!("rm {outside_s}/link/note.md"), &vault_s),
+                Block
+            );
+            // A link the same command creates does not exist at hook time.
+            assert_eq!(
+                judge(
+                    &format!("ln -s {vault_s} {outside_s}/new; rm -rf {outside_s}/new/"),
+                    &vault_s
+                ),
+                Block
+            );
+            // A dangling link resolves through its parent, not to nothing.
+            std::os::unix::fs::symlink(base.join("gone"), outside.join("dangling"))
+                .expect("dangling");
+            assert_eq!(judge(&format!("rm {outside_s}/dangling"), &vault_s), Allow);
+            assert_eq!(
+                judge(&format!("rm -r {outside_s}/link/notes"), &vault_s),
+                Block
+            );
+            // The vault named through a symlinked path, the operand spelled
+            // physically.
+            assert_eq!(judge(&format!("rm {vault_s}/note.md"), &alias_s), Block);
+            assert_eq!(judge(&format!("rm {outside_s}/plain.txt"), &alias_s), Allow);
         }
     }
 
