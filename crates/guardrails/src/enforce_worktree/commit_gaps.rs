@@ -27,7 +27,6 @@ use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_word,
     split_segments_with_ops, strip_compound_heads, tokenize_marked, unescape_word,
 };
-use std::path::Path;
 
 /// What one command creates, as far as the guard can read it.
 #[derive(Debug, Default)]
