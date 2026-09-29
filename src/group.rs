@@ -178,7 +178,7 @@ mod tests {
         let loggers = ["snapshot"];
         for hook in crate::registry::HOOKS {
             if !matches!(
-                hook.event,
+                hook.event(),
                 Some(HookEvent::PreToolUse | HookEvent::PostToolUse)
             ) || loggers.contains(&hook.name)
             {
