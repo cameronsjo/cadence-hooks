@@ -58,7 +58,7 @@ pub fn run(
                 return 1;
             }
         },
-        None => sample_payload_with_cwd(namespace, subcommand, entry.event),
+        None => sample_payload_with_cwd(namespace, subcommand, entry.event()),
     };
 
     let exe = match std::env::current_exe() {
@@ -69,9 +69,10 @@ pub fn run(
         }
     };
 
-    let event_label = match entry.event {
-        Some(e) => e.name(),
-        None => "logger (reacts to hook_event_name in the payload)",
+    let event_label = if entry.events.is_empty() {
+        "logger (reacts to hook_event_name in the payload)".to_string()
+    } else {
+        entry.events_label()
     };
     println!("Hook:     {namespace} {subcommand} — {}", entry.description);
     println!("Event:    {event_label}");

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`cadence audit-runner-pool` — a PostToolUse check that runs the runner-pool audit after a workflow edit.** On a Write, Edit or MultiEdit of `.github/workflows/*.yml` or `*.yaml` (directly under `.github/workflows/`), it runs `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` against the repo root and returns the findings as a nudge. The script is found only under `<config dir>/plugins/cache/*/cadence-forge/` (newest wins; never an env var or repo path, since it is executed). It never blocks: a missing script, no `python3`, a spawn failure, a 3.5s timeout or an unknown exit code is silent, exit 1 (FAIL findings) nudges with the sanitized, clamped output, and exit 2 ("could not run") nudges a one-line note. Built unwired: the hooks.json entry lands in a follow-up cadence monorepo PR (cameronsjo/cadence-hooks#1072)
+
+### Changed
+
+- **The registry carries every event a hook is wired on.** `HookEntry.event` is now `events: &[HookEvent]` (first entry primary), so `list` prints `SessionStart,PostModelSwitch` for `model-posture`, `try` labels it the same way, and `manifest --format json` gains an additive `events` array beside the unchanged `event` primary. The registration audit's `MULTI_EVENT_HOOKS` table is gone: it derives the multi-event set from the binary's manifest, so a new multi-event hook needs only its registry row (cameronsjo/cadence-hooks#957)
+
 ## [0.113.0] - 2026-09-29
 
 ### Security

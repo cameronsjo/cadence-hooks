@@ -311,6 +311,9 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // PostToolUse on Write/Edit/MultiEdit with `if: Write(*/.github/workflows/*)`
+    // style single rules; the wiring lands in the cadence monorepo follow-up.
+    ("cadence audit-runner-pool", "cameronsjo/cadence-hooks#1072"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -2661,11 +2664,52 @@ fn hook_event_types_match_hooks_json() {
 /// mismatch the binary does not have. Each entry lists every event the
 /// subcommand models, and the wiring is checked against that set instead.
 ///
-/// (`<plugin> <subcommand>`, allowed hooks.json event keys)
-const MULTI_EVENT_HOOKS: &[(&str, &[&str])] = &[(
-    "cadence model-posture",
-    &["SessionStart", "PostModelSwitch"],
-)];
+/// Derived from the binary's own registry (`manifest --format json`, the
+/// `events` array), so a second multi-event hook needs only its `events:` row
+/// in `src/registry.rs` — there is no table here to keep in step
+/// (cameronsjo/cadence-hooks#957).
+///
+/// (`<plugin> <subcommand>` -> allowed hooks.json event keys)
+fn multi_event_hooks() -> BTreeMap<String, Vec<String>> {
+    let out = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+        .args(["manifest", "--format", "json"])
+        .output()
+        .expect("run `cadence-hooks manifest --format json`");
+    assert!(out.status.success(), "manifest exited non-zero");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("manifest is JSON");
+    let mut map = BTreeMap::new();
+    for hook in doc["hooks"].as_array().expect("hooks array") {
+        let events: Vec<String> = hook["events"]
+            .as_array()
+            .expect("every manifest row carries `events`")
+            .iter()
+            .map(|e| e.as_str().expect("event name").to_string())
+            .collect();
+        if events.len() > 1 {
+            map.insert(
+                format!(
+                    "{} {}",
+                    hook["plugin"].as_str().expect("plugin"),
+                    hook["name"].as_str().expect("name")
+                ),
+                events,
+            );
+        }
+    }
+    map
+}
+
+/// The derivation is live: `model-posture` is the multi-event hook today and a
+/// single-event hook must not appear (cameronsjo/cadence-hooks#957).
+#[test]
+fn multi_event_hooks_derive_from_the_registry() {
+    let derived = multi_event_hooks();
+    assert_eq!(
+        derived.get("cadence model-posture").map(Vec::as_slice),
+        Some(&["SessionStart".to_string(), "PostModelSwitch".to_string()][..])
+    );
+    assert!(!derived.contains_key("cadence terminology"));
+}
 
 fn check_hook_event_types_match_hooks_json(
     subject: &AuditSubject,
@@ -2678,6 +2722,7 @@ fn check_hook_event_types_match_hooks_json(
         ..
     } = subject;
 
+    let multi_event = multi_event_hooks();
     let mut mismatches = Vec::new();
     // Events actually wired for each multi-event command in this subject. A
     // half-wiring — the subcommand on one of its two events — is the failure
@@ -2690,11 +2735,8 @@ fn check_hook_event_types_match_hooks_json(
             // the one event main.rs passes is a fallback and equality would
             // report a mismatch the binary does not have. Its wiring is still
             // checked — against the set of events it models.
-            if let Some((command, allowed)) = MULTI_EVENT_HOOKS
-                .iter()
-                .find(|(command, _)| *command == r.command)
-            {
-                if !allowed.contains(&r.event_type.as_str()) {
+            if let Some((command, allowed)) = multi_event.get_key_value(&r.command) {
+                if !allowed.contains(&r.event_type) {
                     mismatches.push(format!(
                         "  `{}`: hooks.json wires it on {} but the subcommand models only {}",
                         r.command,
@@ -2703,7 +2745,7 @@ fn check_hook_event_types_match_hooks_json(
                     ));
                 }
                 multi_event_seen
-                    .entry(command)
+                    .entry(command.as_str())
                     .or_default()
                     .insert(r.event_type.clone());
                 continue;
@@ -2724,13 +2766,13 @@ fn check_hook_event_types_match_hooks_json(
     // command appears in no hooks.json at all — that state is
     // `PENDING_WIRING_HOOKS`' to police, and `pending_wiring_hooks_are_still_unwired`
     // forces the row out the moment any wiring lands.
-    for (command, allowed) in MULTI_EVENT_HOOKS {
-        let Some(seen) = multi_event_seen.get(command) else {
+    for (command, allowed) in &multi_event {
+        let Some(seen) = multi_event_seen.get(command.as_str()) else {
             continue;
         };
         let missing: Vec<&str> = allowed
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|event| !seen.contains(*event))
             .collect();
         if !missing.is_empty() {

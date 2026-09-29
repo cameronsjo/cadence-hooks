@@ -278,6 +278,8 @@ enum CadenceCommands {
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
     MarkdownLint,
+    /// Run the runner-pool workflow audit after a `.github/workflows/*.y{a,}ml` edit (PostToolUse)
+    AuditRunnerPool,
     /// Block `gh issue close` against the HELD-issue ledger
     GuardHeldClose {
         /// Ledger file: whitespace-separated `owner/repo#N` entries
@@ -600,6 +602,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnPluginRootCruft => "warn-plugin-root-cruft",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
+            CadenceCommands::AuditRunnerPool => "audit-runner-pool",
             CadenceCommands::GuardHeldClose { .. } => "guard-held-close",
             CadenceCommands::RedactExternalContent => "redact-external-content",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
@@ -793,6 +796,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             CadenceCommands::MarkdownLint => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::markdown_lint::MarkdownLint),
                 pre,
+            ),
+            CadenceCommands::AuditRunnerPool => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::audit_runner_pool::AuditRunnerPool),
+                post,
             ),
             CadenceCommands::GuardHeldClose { ledger } => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::guard_held_close::GuardHeldClose {
@@ -1069,10 +1076,7 @@ fn print_hook_list() {
             current_namespace = hook.namespace;
         }
 
-        let event = match hook.event {
-            Some(e) => e.name(),
-            None => "logger",
-        };
+        let event = hook.events_label();
 
         println!(
             "  {:<28} {:<13} {}{}",
@@ -1106,10 +1110,12 @@ fn print_hook_manifest(format: ManifestFormat) {
                         "name": hook.name,
                         "description": hook.description,
                         "plugin": hook.namespace,
-                        "event": hook.event.map(|event| event.name()).unwrap_or("logger"),
+                        "event": hook.event().map(|event| event.name()).unwrap_or("logger"),
+                        // Additive: every event the hook is wired on, primary first.
+                        "events": hook.events.iter().map(|e| e.name()).collect::<Vec<_>>(),
                         "criticality": if registry::is_security_critical(hook.name) {
                             "security-critical"
-                        } else if hook.event.is_none() {
+                        } else if hook.events.is_empty() {
                             "telemetry"
                         } else {
                             "workflow"
@@ -1948,12 +1954,12 @@ mod tests {
             };
             assert_eq!(
                 Some(plan.event()),
-                hook.event,
+                hook.event(),
                 "{} {}: check_plan dispatches under {:?}, registry says {:?}",
                 hook.namespace,
                 hook.name,
                 plan.event(),
-                hook.event
+                hook.event()
             );
             checked += 1;
         }
