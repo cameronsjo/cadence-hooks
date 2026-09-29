@@ -194,6 +194,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+mod commit_gaps;
+
 /// Environment inputs resolved once per invocation, injected into the
 /// assessment so tests can pin them without touching process env.
 struct EnvConfig {
@@ -733,6 +735,15 @@ fn scan_targets(command: &str, cwd: &str, on_disk: bool) -> Scan {
 /// segmenter's cost grows with the command's line continuations.
 fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>) -> Scan {
     let mut out = scan_either_path(command, cwd, env, plain);
+    // A brace expansion past core's bounds reaches every walk unexpanded, so
+    // the command it names is unseen: when that could be a commit, it is
+    // unreadable (cadence-hooks#1115).
+    if out.unreadable.is_none() && commit_gaps::brace_overflow_hides_commit(command) {
+        out.unreadable = Some(unreadable_commit_message(
+            "a brace expansion",
+            "expands past the bounds the guard models, and may be a git commit",
+        ));
+    }
     // A commit whose checkout cannot be read may land anywhere, the session
     // cwd included: judge it there too, as an unreadable `cd` is judged.
     if out.unreadable.is_some() {
@@ -3209,7 +3220,20 @@ fn strip_group_punctuation(raw: &str) -> &str {
         }
         rest = trimmed;
     }
-    rest.trim_end_matches([')', '}', ';', ' ', '\t'])
+    // A `}` closes a group only as a word of its own: the last one of
+    // `{git,commit,-m,x}` closes a brace expansion, and dropping it left
+    // `{git,commit,-m,x`, which no longer expands (cadence-hooks#1115).
+    loop {
+        let trimmed = rest.trim_end_matches([')', ';', ' ', '\t']);
+        let trimmed = match trimmed.strip_suffix('}') {
+            Some(before) if before.is_empty() || before.ends_with([' ', '\t', ';', ')']) => before,
+            _ => trimmed,
+        };
+        if trimmed.len() == rest.len() {
+            return rest;
+        }
+        rest = trimmed;
+    }
 }
 
 /// Variables whose value a `cd` reads: an assignment to one in front of the
@@ -4298,7 +4322,12 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
          .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1.\n\
          If the change must stay on this checkout's current branch (peer-coordinated work on a \
          shared branch), a worktree cannot duplicate it — the dismiss above is the sanctioned \
-         path, not a workaround."
+         path, not a workaround.\n\
+         Live-state or release-style repo (an auto-memory store, a config dir that IS the live \
+         copy)? In an auto-mode session the settings edit and the dismiss may both be refused \
+         by the permission classifier. The sanctioned route is then to edit and commit in a \
+         worktree, and `git merge --ff-only <branch>` on this checkout — the guard does not \
+         intercept that ref update."
     );
     if let Some(origin) = origin_repo
         && origin != repo_root
@@ -4321,6 +4350,16 @@ fn unresolved_cd_block_message(target: &str) -> String {
          Name the path literally in a plain `cd <path> && git commit`, or use \
          `git -C <path> commit`."
     )
+}
+
+/// The block message for a commit at or beneath a symlink the same command
+/// creates: the link can point into any checkout, a primary included.
+fn created_symlink_block_message() -> String {
+    "Blocked: this command creates a symlink (`ln -s`) and commits beneath it, so \
+     enforce-worktree cannot tell which checkout the commit lands in — the link may point \
+     into a primary checkout.\n\
+     Create the link in its own command first, or commit with `git -C <real path> commit`."
+        .to_string()
 }
 
 /// The block message for a non-plain command from a linked worktree whose
@@ -4825,6 +4864,9 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // [`inchain_dismissed_commits`]); the map is keyed by the same
             // resolved target strings the commit channel produces.
             let dismissed = inchain_dismissed_prepared(command, cwd, env, plain.as_ref());
+            // What the command itself creates (cadence-hooks#1083): a target
+            // that does not exist yet is not "no repo".
+            let creations = commit_gaps::creations_of(command, cwd, env, plain.as_ref());
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -4834,7 +4876,18 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 if !seen.insert(target.clone()) {
                     continue;
                 }
+                if creations.link_hit(&target, cwd) && !cfg.kill_switch && !cfg.allow_main {
+                    return CheckResult::block(created_symlink_block_message());
+                }
                 let dir = PathBuf::from(&target);
+                // A target the command has yet to create is judged by its
+                // nearest existing ancestor, unless the same command makes a
+                // new repository there (cadence-hooks#1083).
+                let dir = if creations.covers(&target) || std::fs::symlink_metadata(&dir).is_ok() {
+                    dir
+                } else {
+                    nearest_existing_ancestor(&dir)
+                };
                 let result = assess_dir(
                     &dir,
                     cfg,
@@ -9581,7 +9634,14 @@ mod tests {
             r#"source /dev/stdin <<<"cd(){ :; }"; cd /wt && git commit -m x"#,
             ". ./env.sh; cd /wt && git commit -m x",
         ] {
-            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd", "/wt"], "{cmd}");
+            // The brace word now expands (`c{d,x}` is `cd cx`, #1115), so
+            // its second word reads as a `cd` argument too: one more
+            // directory judged, never fewer.
+            let mut want = vec!["/cwd", "/wt"];
+            if cmd.contains("c{d,x}") {
+                want = vec!["/cwd", "/cwd/cx", "/wt"];
+            }
+            assert_eq!(sorted_targets(cmd, "/cwd"), want, "{cmd}");
         }
         assert_eq!(
             sorted_targets("git add .; cd /wt && git commit -m x", "/cwd"),
@@ -10512,9 +10572,12 @@ mod tests {
         ] {
             assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
         }
+        // Behind `&&` the commit never runs, but a directory the command may
+        // create is judged by its nearest existing ancestor (#1083), so the
+        // primary it would sit in blocks.
         assert_eq!(
             outcome_from(&primary, "cd nonexist && git commit -m x"),
-            Outcome::Allow
+            Outcome::Block
         );
         // From the worktree, into the primary and then a failed cd.
         for cmd in [

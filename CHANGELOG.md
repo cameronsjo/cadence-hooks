@@ -6,11 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`enforce-worktree` judges a commit target the command itself creates by its nearest existing ancestor.** `mkdir -p <primary>/x && cd <primary>/x && git commit` and `mkdir -p 2'>'x; git -C 2'>'x commit` named a directory that did not exist when the hook fired, so it read as "no repo" and failed open. The target now resolves to the closest ancestor that exists, so a commit inside a primary checkout blocks. A path the same command makes with `git worktree add`, `git clone` or `git init` is still exempt (a new repository), and a commit beneath a symlink the command creates with `ln -s` is unknown and blocks, since the link can point into a primary. A relative creation path is trusted only when the command is walked in order (cameronsjo/cadence-hooks#1083)
+- **`enforce-worktree` sees a whole `git commit` written as one brace word.** `{git,commit,-m,x}` and `{git,-C,<primary>,commit,-m,x}` exit 0: the segment cleaner dropped the word's closing `}` as group syntax, so it never expanded. A `}` now closes a group only as a word of its own. A brace expansion past core's bounds in a command that mentions `git` or `commit`, or that has a brace word in command position, is unreadable and blocks from a linked worktree too (cameronsjo/cadence-hooks#1115)
+- **`enforce-worktree` pins that an unresolvable `cd` target blocks a commit from a linked worktree.** `cd "$VAR"`, `cd $(…)`, `cd <glob>` and `cd ~user/…` before a commit already block with the `git -C <path>` guidance, from a primary and from a worktree; the 2026-09-28 comment describing a worktree allow does not reproduce on current main, so this adds table tests and no behavior change (cameronsjo/cadence-hooks#346)
+
 ### Added
 
 - **`ToolInput` models the Agent/Task `prompt`, `description` and `model`.** A live PreToolUse probe (claude-code 2.1.271) showed the dispatch prompt and label are on the wire; they were landing unread in `extra`. Accessors `agent_prompt()`, `agent_description()` and `agent_model()` sit beside `subagent_type()`. (cameronsjo/cadence-hooks#374)
 - **`guardrails warn-agent-dispatch` warns on an Agent/Task dispatch with no `model`, or a `model` on a fork.** A non-fork dispatch that omits `model` inherits the session's most expensive tier; a `model` on a fork dispatch (`subagent_type` `fork` or omitted) is ignored by the platform. Advisory only. Built unwired: the hooks.json entry lands in a follow-up cadence monorepo PR. The `SendMessage` arm is not built. (cameronsjo/cadence-hooks#606)
 - **`warn-agent-dispatch` nudges when a brief asks a subagent to execute commands without naming a scrubbed or isolated HOME.** A narrow phrase match ("execution oracle", "run the corpus", "run each command", "in a real shell", ...) with no containment wording ("scratch home", "sandbox", `HOME=`, `env -i`, `bash -n`, "do not run", ...) names the requirement; the prompt is never echoed. This is the nudge tier only, not the structural control the issue asks for. (cameronsjo/cadence-hooks#837)
+
+### Changed
+
+- **The `enforce-worktree` block message names the ff-merge path for live-state and release-style repos.** In an auto-mode session both the settings edit and the dismiss can be refused by the permission classifier; the message now says the sanctioned route is to edit and commit in a worktree, then `git merge --ff-only <branch>` on the primary. Message only, no verdict change (cameronsjo/cadence-hooks#717)
 
 ### Fixed
 
