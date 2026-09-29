@@ -56,7 +56,10 @@
 //! nudge mode, silent failure beats false positives.
 
 use cadence_hooks_core::gh_bodies::extract_bodies;
-use cadence_hooks_core::shell::{command_segments, strip_quotes};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
+    skip_git_global_options, strip_quotes, unescape_word,
+};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 mod identity;
 
@@ -165,6 +168,60 @@ pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("external-post pattern should compile")
 });
+
+/// `gh` command groups and verbs the posting gate covers — the same set
+/// [`EXTERNAL_POST`] spells as text, read here from the parsed argv.
+const GH_POST_GROUPS: &[&str] = &["pr", "issue", "release", "gist", "discussion"];
+const GH_POST_VERBS: &[&str] = &["create", "comment", "edit", "review", "reopen"];
+const TEA_POST_GROUPS: &[&str] = &["pr", "issue"];
+const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
+
+/// Does this ONE segment publish content? The single posting gate for the
+/// leak scan and the overshare nudge.
+///
+/// Two readings, unioned, so the gate can only see MORE posts than either
+/// alone (cadence-hooks#817):
+///
+/// 1. [`EXTERNAL_POST`] over the quote-stripped segment — the historical text
+///    gate, kept so nothing it matched before stops matching.
+/// 2. The argv the shell actually runs — [`executable_tokens`] (quote- and
+///    escape-aware, the reader the body extractor uses) with runner prefixes
+///    peeled — tested structurally. This is what sees `git "commit"`,
+///    `git $'commit'`, `gh pr "create"`, `gh -R o/r issue create` and
+///    `git -C . commit`, each of which the stripping reader deleted or split,
+///    so the identity tier never ran on a real post.
+///
+/// Mention immunity holds on both arms: a quoted `"gh pr create"` is one
+/// token, never a command word, and an `echo gh pr create` resolves to `echo`.
+pub(crate) fn is_external_post(segment: &str) -> bool {
+    if EXTERNAL_POST.is_match(&strip_quotes(segment)) {
+        return true;
+    }
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    let Some(head) = argv.first() else {
+        return false;
+    };
+    // `tokenize` keeps an unquoted word's backslashes; the shell drops them,
+    // so `c\ommit` runs `commit` and must read as it.
+    let in_set = |word: Option<&&str>, set: &[&str]| {
+        word.is_some_and(|w| set.contains(&unescape_word(w).as_ref()))
+    };
+    match command_word(head).as_ref() {
+        "gh" => {
+            let path = gh_command_path(argv, 2);
+            in_set(path.first(), GH_POST_GROUPS) && in_set(path.get(1), GH_POST_VERBS)
+        }
+        "git" => skip_git_global_options(&argv[1..])
+            .first()
+            .is_some_and(|sub| unescape_word(sub) == "commit"),
+        "tea" => {
+            let words: Vec<&str> = argv[1..].iter().take(2).map(String::as_str).collect();
+            in_set(words.first(), TEA_POST_GROUPS) && in_set(words.get(1), TEA_POST_VERBS)
+        }
+        _ => false,
+    }
+}
 
 /// Category 1 — skill/plugin IDs (`<ns>:<name>`). Derived from [`NAMESPACES`],
 /// longest-first so the most specific namespace wins regardless of the regex
@@ -375,7 +432,7 @@ impl Check for RedactExternalContent {
         let base_dir = resolve_base_dir(input);
         let mut bodies: Vec<String> = Vec::new();
         for segment in command_segments(command) {
-            if EXTERNAL_POST.is_match(&strip_quotes(&segment)) {
+            if is_external_post(&segment) {
                 bodies.extend(extract_bodies(&segment, &base_dir));
             }
         }
@@ -589,7 +646,13 @@ fn build_identity_message(
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for hit in hits {
         if seen.insert((hit.id.as_str(), hit.snippet.as_str())) {
-            out.push_str(&format!("  [{}] {}\n", hit.id, hit.snippet));
+            // The block message reaches the transcript: strip control
+            // characters and cap length, as the scan's stderr lines do (#828).
+            out.push_str(&format!(
+                "  [{}] {}\n",
+                stderr_safe(&hit.id),
+                stderr_safe(&hit.snippet)
+            ));
         }
     }
     out.push_str(
@@ -885,9 +948,30 @@ fn identity_scan_lines(
         let lineno = text
             .get(..hit.offset)
             .map_or(1, |prefix| prefix.matches('\n').count() + 1);
-        out.push(format!("[identity:{}]:{}:{}", hit.id, lineno, hit.snippet));
+        out.push(format!(
+            "[identity:{}]:{}:{}",
+            stderr_safe(&hit.id),
+            lineno,
+            stderr_safe(&hit.snippet)
+        ));
     }
     out
+}
+
+/// Cap on one operator- or config-sourced field printed to `redact-scan`'s
+/// stderr, in characters.
+const STDERR_FIELD_CAP: usize = 120;
+
+/// Make one config- or term-source-derived field safe for a stderr line:
+/// strip every control character (C0, DEL, C1 — `char::is_control`) and cap
+/// the length. Everything else stays verbatim, so an identity term still
+/// names what tripped it (cadence-hooks#828). Shared by the `custom`
+/// replacement and the identity lines so the two cannot drift apart.
+fn stderr_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(STDERR_FIELD_CAP)
+        .collect()
 }
 
 /// Render the nudge: one `[category] snippet` line per hit, then a one-line
@@ -1132,11 +1216,7 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
                 // surface the model reads — strip control chars, cap length.
                 let repl = match hit.replacement.as_deref() {
                     Some("") | None => "[redacted]".to_string(),
-                    Some(r) => r
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(120)
-                        .collect::<String>(),
+                    Some(r) => stderr_safe(r),
                 };
                 eprintln!("[custom]:{lineno}:{} (suggest: {repl})", hit.snippet);
             } else {
@@ -2494,6 +2574,59 @@ term = "acmecorp"
 "#;
 
     #[test]
+    fn quoted_or_escaped_posting_subcommand_still_reaches_identity_block() {
+        // cadence-hooks#817: the gate read `strip_quotes` while the extractor
+        // read `tokenize`, so quoting the subcommand deleted it from the gate's
+        // view and the fail-closed identity tier never ran. Every row is a real
+        // post the shell executes; each must block.
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "git commit -m \"acmecorp\"",
+                "git \"commit\" -m \"acmecorp\"",
+                "git 'commit' -m acmecorp",
+                "git $'commit' -m \"acmecorp\"",
+                "git c\\ommit -m acmecorp",
+                "git -C . commit -m acmecorp",
+                "git -C . \"commit\" -m acmecorp",
+                "git --no-pager \"commit\" -m acmecorp",
+                "FOO=1 git \"commit\" -m acmecorp",
+                "env FOO=1 git \"commit\" -m acmecorp",
+                "sudo -u gh gh \"pr\" \"create\" --body acmecorp",
+                "gh pr \"create\" --body \"acmecorp\"",
+                "gh \"pr\" 'create' --body acmecorp",
+                "gh $'issue' comment 3 --body acmecorp",
+                "gh -R o/r \"issue\" create --body acmecorp",
+                "gh -R o/r issue create --body acmecorp",
+                "GH \"pr\" create --body acmecorp",
+                "tea \"pr\" create --body acmecorp",
+                "cd sub && gh \"pr\" comment 1 --body acmecorp",
+                "(git \"commit\" -m acmecorp)",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Block, "must block: {cmd}");
+            }
+        });
+    }
+
+    #[test]
+    fn posting_gate_keeps_mention_immunity() {
+        // The tokenized arm must not turn a quoted mention, or a non-posting
+        // verb, into a post. Each row runs no posting command.
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "echo \"gh pr create --body acmecorp\"",
+                "echo 'git commit -m acmecorp'",
+                "grep -m1 \"git commit\" acmecorp.txt",
+                "git log -m acmecorp",
+                "gh pr view --body acmecorp",
+                "gh \"pr create\" --body acmecorp",
+                "tea pr list --body acmecorp",
+            ] {
+                assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd}");
+            }
+        });
+    }
+
+    #[test]
     fn identity_term_in_a_commit_message_blocks() {
         with_terms(FIXTURE, || {
             let r = run("git commit -m \"fix the acmecorp integration\"");
@@ -2646,6 +2779,22 @@ term = "acmecorp"
     }
 
     #[test]
+    fn identity_block_message_strips_control_characters() {
+        let hits = [identity::IdentityHit {
+            id: "T\u{1b}1".to_string(),
+            snippet: "acme\u{1b}[2J\u{9b}corp\r\u{7}".to_string(),
+            offset: 0,
+        }];
+        let msg = build_identity_message(&hits, identity::Mode::Enforce, false);
+        let hit_line = msg.lines().nth(1).expect("one hit line");
+        assert!(!hit_line.chars().any(char::is_control), "{hit_line:?}");
+        assert!(
+            hit_line.contains("acme") && hit_line.contains("corp"),
+            "{hit_line:?}"
+        );
+    }
+
+    #[test]
     fn identity_scan_lines_numbers_from_offset() {
         // Pure — no env, no lock. The offset is the real byte index of
         // "acmecorp" on the third line.
@@ -2663,6 +2812,49 @@ term = "acmecorp"
             lines[1], "[identity:T1]:3:acmecorp",
             "line number derives from the byte offset, not a loop index"
         );
+    }
+
+    #[test]
+    fn identity_scan_lines_sanitize_id_and_snippet() {
+        // cadence-hooks#828: the term source is operator-owned, but a control
+        // byte or an overlong term must not reach the terminal raw. Table:
+        // (id, snippet, expected rendered hit line).
+        let long = "a".repeat(STDERR_FIELD_CAP + 50);
+        let capped = "a".repeat(STDERR_FIELD_CAP);
+        let cases: Vec<(&str, String, String)> = vec![
+            (
+                "T1",
+                "acme\x1b[2Jcorp".into(),
+                "[identity:T1]:1:acme[2Jcorp".into(),
+            ),
+            (
+                "T1",
+                "acme\u{9b}corp".into(),
+                "[identity:T1]:1:acmecorp".into(),
+            ),
+            (
+                "T1",
+                "acme\rcorp\x07".into(),
+                "[identity:T1]:1:acmecorp".into(),
+            ),
+            (
+                "T\x1b1",
+                "acmecorp".into(),
+                "[identity:T1]:1:acmecorp".into(),
+            ),
+            ("T1", long, format!("[identity:T1]:1:{capped}")),
+            ("T1", "Acme Corp".into(), "[identity:T1]:1:Acme Corp".into()),
+        ];
+        for (id, snippet, want) in cases {
+            let hits = [identity::IdentityHit {
+                id: id.to_string(),
+                snippet: snippet.clone(),
+                offset: 0,
+            }];
+            let lines = identity_scan_lines("x", &hits, identity::Mode::Enforce, false);
+            assert_eq!(lines[1], want, "id={id:?} snippet={snippet:?}");
+            assert!(!lines[1].chars().any(char::is_control));
+        }
     }
 
     #[test]
