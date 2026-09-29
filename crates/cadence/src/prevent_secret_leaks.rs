@@ -958,10 +958,102 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 /// firewall described on [`segment_env_reads`]: quoted prose stays glued into
 /// one token by [`tokenize`] and is skipped, while a quoted filename stays a
 /// clean single token and is caught.
+///
+/// **A command substitution is the one whitespace-bearing token that is
+/// resolved rather than skipped** (#815). `cat "$(echo .env)"` keeps the
+/// substitution one token, so the firewall skipped it, and the inner
+/// `echo .env` segment is metadata-safe — two safe rules composed into an
+/// allow of a real read. [`substitution_operand_is_secret`] classifies what
+/// the substitution can be shown to produce; anything else keeps the firewall.
 fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
     let value = attached_input_redirection_target(token).unwrap_or(token);
-    (!value.chars().any(char::is_whitespace) && is_dangerous_secret_token_at(value, position))
-        .then_some(value)
+    if value.chars().any(char::is_whitespace) {
+        return substitution_operand_is_secret(value, position, 0).then_some(value);
+    }
+    is_dangerous_secret_token_at(value, position).then_some(value)
+}
+
+/// Byte ranges of each top-level `$(…)` / backtick substitution in `word`, as
+/// `(open, body_start, body_end, close_end)`, or `None` when one never closes.
+/// Scanned as bytes, and every boundary it reports sits on an ASCII delimiter,
+/// so slicing `word` at one can never split a multi-byte character.
+fn substitution_spans(word: &str) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let bytes = word.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let close = i + 1 + bytes[i + 1..].iter().position(|&b| b == b'`')?;
+            spans.push((i, i + 1, close, close + 1));
+            i = close + 1;
+        } else if bytes[i..].starts_with(b"$(") {
+            let mut depth = 1;
+            let mut j = i + 2;
+            while depth > 0 {
+                match bytes.get(j)? {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            spans.push((i, i + 2, j - 1, j));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Some(spans)
+}
+
+/// Does a whitespace-bearing operand holding a command substitution resolve to
+/// a secret file? Two shapes are provable from the text alone:
+///
+/// - **The text after the LAST substitution** decides the basename:
+///   `"$(git rev-parse --show-toplevel)/.env"` ends in `/.env` whatever the
+///   substitution prints. That tail is classified behind a placeholder
+///   directory when it carries no whitespace of its own.
+/// - **An `echo`/`printf` substitution with nothing after it** prints its own
+///   arguments, so `"$(echo .env)"` and `"$(printf %s .env)"` are classified
+///   argument by argument, joined to whatever text precedes the substitution.
+///
+/// Everything else — `"$(cat <<'EOF' … EOF)"` PR bodies, prose quoting a
+/// filename after a space, an unterminated substitution — keeps the
+/// whitespace firewall's skip, which is the pre-#815 verdict, not a new allow.
+fn substitution_operand_is_secret(word: &str, position: Filename, depth: usize) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let Some(spans) = substitution_spans(word) else {
+        return false;
+    };
+    let Some(&(open, body_start, body_end, close_end)) = spans.last() else {
+        return false;
+    };
+    let tail = &word[close_end..];
+    if !tail.is_empty() {
+        return !tail.chars().any(char::is_whitespace)
+            && is_dangerous_secret_token_at(&format!("sub{tail}"), position);
+    }
+    if spans.len() != 1 {
+        return false;
+    }
+    let body = tokenize(&word[body_start..body_end]);
+    let Some((head, args)) = body.split_first() else {
+        return false;
+    };
+    if !matches!(command_word(head).as_ref(), "echo" | "printf") {
+        return false;
+    }
+    let prefix = &word[..open];
+    args.iter().filter(|arg| !arg.starts_with('-')).any(|arg| {
+        let candidate = format!("{prefix}{arg}");
+        if candidate.chars().any(char::is_whitespace) {
+            substitution_operand_is_secret(&candidate, position, depth + 1)
+        } else {
+            is_dangerous_secret_token_at(&candidate, position)
+        }
+    })
 }
 
 /// Commands whose every non-flag operand is a FILE THEY READ — nothing else.
@@ -5489,6 +5581,47 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "only content-emitting git subcommands lose the exemption",
+        );
+    }
+
+    #[test]
+    fn substitution_operand_resolving_to_a_secret_blocks() {
+        // #815: a double-quoted substitution stays one whitespace-bearing
+        // token, which the prose firewall skipped, while bash ran `cat .env`.
+        assert_bash(
+            &[
+                "cat \"$(echo .env)\"",
+                "cat \"$(printf %s .env)\"",
+                "cat \"`echo .env`\"",
+                "cat \"$(echo -n .env)\"",
+                "cat \"./$(echo .env)\"",
+                "cat \"$(git rev-parse --show-toplevel)/.env\"",
+                "cat \"$(dirname \"$0\")/config/.env.production\"",
+                "cat \"$(echo $(echo .env))\"",
+                "base64 \"$(echo ~/.ssh/id_rsa)\"",
+                "cat <\"$(echo .env)\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a substitution provably producing a secret path is a read",
+        );
+    }
+
+    #[test]
+    fn substitution_operands_not_provably_secret_stay_allowed() {
+        // Controls: the firewall still skips prose and unresolvable output.
+        assert_bash(
+            &[
+                "cat \"$(git rev-parse --show-toplevel)/README.md\"",
+                "cat \"$(echo README.md)\"",
+                "gh pr create --body \"$(cat <<'EOF'\nfixes the .env loader\nEOF\n)\"",
+                "gh pr create --title \"fix $(date) .env handling\"",
+                "cat \"$(echo .env.example)\"",
+                "cat \"$(echo .env\"",
+                "wc -l \"$(echo .env)\"",
+                "cat \"$(echo é .env.example)\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "only a provable secret path blocks",
         );
     }
 }
