@@ -176,11 +176,24 @@ pub(crate) fn checkbox_present(body: &str) -> bool {
     unticked + ticked > 0
 }
 
+/// Reasons that satisfy the `Panel: none — <reason>` shape without saying
+/// anything (cameronsjo/cadence-hooks#761): after trimming and ASCII case
+/// folding, empty or exactly one of these. Any other text is a real reason —
+/// the gate's threat is model drift, not an adversary, and the human still
+/// reads the line at approval.
+const TRIVIAL_NONE_REASONS: &[&str] = &["n/a", "na", "none", "-", ".", "tbd"];
+
+fn trivial_none_reason(reason: &str) -> bool {
+    let reason = reason.trim().to_ascii_lowercase();
+    reason.is_empty() || TRIVIAL_NONE_REASONS.contains(&reason.as_str())
+}
+
 /// True when the plan body carries a settled `Panel:` line — anchored at line
 /// start, in exactly one of the plan template's two settled forms:
 ///
 /// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
-/// - `Panel: none — <reason>` (the absence assertion; non-empty reason)
+/// - `Panel: none — <reason>` (the absence assertion; a non-trivial reason —
+///   not empty, `n/a`, `na`, `none`, `-`, `.`, or `tbd`, case-insensitive)
 ///
 /// The separator tolerates what a human actually types: em dash (the
 /// template's canonical form), en dash, `--`, or a plain hyphen — a
@@ -220,7 +233,7 @@ pub(crate) fn panel_line_settled(body: &str) -> bool {
         ["—", "–", "--", "-"].iter().find_map(|d| s.strip_prefix(d))
     }
     if let Some(after_none) = rest.strip_prefix("none") {
-        return strip_dash(after_none).is_some_and(|reason| !reason.trim().is_empty());
+        return strip_dash(after_none).is_some_and(|reason| !trivial_none_reason(reason));
     }
     if let Some((seats, tail)) = rest.split_once(" ran ") {
         return !seats.trim().is_empty()
@@ -1684,6 +1697,33 @@ mod tests {
         assert!(checkbox_present("# T\n\n  - [x] done\n"));
         assert!(!checkbox_present("# T\n\nprose only\n"));
         assert!(!checkbox_present("# T\n\n```\n- [ ] fenced example\n```\n"));
+    }
+
+    /// cameronsjo/cadence-hooks#761: a trivial `Panel: none` reason is unsettled.
+    #[test]
+    fn panel_none_rejects_trivial_reasons_only() {
+        for (reason, settled) in [
+            ("n/a", false),
+            ("N/A", false),
+            ("  na  ", false),
+            ("None", false),
+            ("-", false),
+            (".", false),
+            ("TBD", false),
+            ("", false),
+            ("   ", false),
+            // Real reasons, including ones that merely contain a trivial word.
+            ("raw-draft bypass per operator ask", true),
+            ("none needed for a typo fix", true),
+            ("n/a for docs", true),
+            ("tbd later", true),
+            ("x", true),
+        ] {
+            for dash in ["—", "–", "--", "-"] {
+                let plan = format!("# T\n\nPanel: none {dash} {reason}\n\nbody\n");
+                assert_eq!(panel_line_settled(&plan), settled, "{plan:?}");
+            }
+        }
     }
 
     #[test]
