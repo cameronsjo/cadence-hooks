@@ -115,11 +115,7 @@ impl Logger for LogCommit {
             &prices,
         );
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&commits_path)
-        {
+        if let Ok(mut file) = common::open_ledger(&commits_path) {
             // Build the whole line (record + newline) and write it in a single
             // `write_all`, so concurrent appends from other sessions can't
             // interleave a record with its trailing newline. `record` is compact

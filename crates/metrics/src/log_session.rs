@@ -118,11 +118,7 @@ impl Logger for LogSession {
 
         let sessions_path = dir.join("sessions.jsonl");
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&sessions_path)
-        {
+        if let Ok(mut file) = common::open_ledger(&sessions_path) {
             // Build the whole line (record + newline) and hand it to one
             // `write_all`, so a concurrent append from another session is
             // unlikely to interleave. `record` is compact JSON, so this is one

@@ -47,6 +47,19 @@ use std::io::{IsTerminal, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
 
+// Every panic guard in the workspace — the binary's `src/dispatch.rs` seam,
+// the logger wrapper below, and the per-check ones (`persist-plan-approval`,
+// `lint-plan-shape`, the guardrails wrapper) — relies on panics unwinding. Under
+// `panic = "abort"` (a common binary-size setting) each `catch_unwind` stops
+// catching and a guard's own bug kills the hook instead of failing open
+// (ADR-0001), with no test going red: cargo builds tests with unwind
+// regardless of the profile. Refuse to compile that configuration instead
+// (cameronsjo/cadence-hooks#762).
+#[cfg(panic = "abort")]
+compile_error!(
+    "cadence-hooks requires panic = \"unwind\": its fail-open panic guards use catch_unwind, which abort disables"
+);
+
 /// The hook event type determines output format for nudges.
 ///
 /// PreToolUse and PostToolUse use different JSON structures in the
@@ -304,6 +317,12 @@ pub struct HookInput {
     /// every other event. Deserializes to `None` when absent, so existing
     /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
     pub prompt: Option<String>,
+    /// Payload keys whose value was a JSON *object* that still failed its typed
+    /// shape, and so degraded to `None` through `lenient_option`. Derived by
+    /// [`schema_drift`], never deserialized — see that function for why this is
+    /// the drift-shaped half of the degradation (cadence-hooks#364).
+    #[serde(skip)]
+    pub schema_drift: Vec<&'static str>,
 }
 
 /// Tool-specific fields from the hook input.
@@ -455,13 +474,11 @@ pub struct ToolResponse {
 /// for `Bash` — and one mismatched field must not blind an enforcement guard or
 /// silently drop a metrics row for the rest of the payload (cadence-hooks#356).
 ///
-/// The degradation is **deliberately silent**: the common case is expected
-/// per-tool variance, and logging it would reintroduce the ~242/week failopen
-/// noise this fix removes (it fires on every non-Bash tool call). The tradeoff
-/// is that a *genuine* future schema drift in these fields also degrades
-/// unobserved; distinguishing expected variance from real drift (log only an
-/// object whose typed fields mismatch, not a non-object shape) is tracked in
-/// cadence-hooks#364.
+/// The degradation itself is **silent**: the common case is expected per-tool
+/// variance, and logging it would reintroduce the ~242/week failopen noise this
+/// fix removes (it fires on every non-Bash tool call). The drift-shaped subset
+/// — an *object* whose declared fields mismatch — is surfaced separately by
+/// [`schema_drift`] (cadence-hooks#364).
 fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -469,6 +486,38 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Payload keys whose value is a JSON object that fails its typed shape —
+/// the drift-shaped half of `lenient_option`'s degradation (cadence-hooks#364).
+///
+/// A non-object `tool_input`/`tool_response` (a `Read` string, a `Glob` array)
+/// is expected per-tool variance and is not reported. An object only fails on
+/// a wrong-typed *declared* field, since neither struct denies unknown fields,
+/// so that case is what a Claude Code rename or reshape looks like. MCP tools
+/// (`mcp__*`) are skipped: their input and response shapes belong to
+/// third-party servers, not to Claude Code's schema, so a mismatch there says
+/// nothing about drift. Only key names are returned, never values.
+fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
+    let is_mcp = value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name.starts_with("mcp__"));
+    if is_mcp {
+        return Vec::new();
+    }
+    let mut drift = Vec::new();
+    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_input")
+        && ToolInput::deserialize(v).is_err()
+    {
+        drift.push("tool_input");
+    }
+    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_response")
+        && ToolResponse::deserialize(v).is_err()
+    {
+        drift.push("tool_response");
+    }
+    drift
 }
 
 /// Describe a hook-payload parse failure without echoing any of the payload.
@@ -620,6 +669,7 @@ impl HookInput {
                 value["tool_input"] = serde_json::json!({"patch": patch});
             }
         }
+        let drift = schema_drift(&value);
         let mut input: HookInput = serde_json::from_value(value).map_err(|e| {
             plain(json_parse_failure(&e, raw, || {
                 serde_json::from_str::<HookInput>(raw)
@@ -627,6 +677,7 @@ impl HookInput {
                     .map(|e| (e.line(), e.column()))
             }))
         })?;
+        input.schema_drift = drift;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1099,6 +1150,10 @@ pub struct MetricsInput {
     /// surfaces schema additions across Claude Code releases.
     #[serde(skip)]
     pub raw_keys: Vec<String>,
+    /// Mirrors [`HookInput::schema_drift`]: keys whose object value failed its
+    /// typed shape. Populated by [`Self::from_json`], not deserialized.
+    #[serde(skip)]
+    pub schema_drift: Vec<&'static str>,
 }
 
 impl MetricsInput {
@@ -1125,6 +1180,7 @@ impl MetricsInput {
         if let Some(obj) = value.as_object() {
             input.raw_keys = obj.keys().cloned().collect();
         }
+        input.schema_drift = schema_drift(&value);
         Ok(input)
     }
 
@@ -3407,6 +3463,57 @@ mod tests {
             input.tool_input.and_then(|ti| ti.file_path).as_deref(),
             Some("src/main.rs")
         );
+    }
+
+    #[test]
+    fn schema_drift_ignores_expected_non_object_variance() {
+        // #364: a string / array / null shape is per-tool variance, not drift.
+        for json in [
+            r#"{"tool_name":"Read","tool_response":"file contents"}"#,
+            r#"{"tool_name":"Glob","tool_response":["a.txt"]}"#,
+            r#"{"tool_name":"Read","tool_response":null}"#,
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"x","stderr":"","interrupted":false}}"#,
+        ] {
+            assert!(
+                MetricsInput::from_json(json)
+                    .unwrap()
+                    .schema_drift
+                    .is_empty(),
+                "{json}"
+            );
+            assert!(
+                HookInput::from_json(json).unwrap().schema_drift.is_empty(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_flags_an_object_whose_declared_field_mismatches() {
+        // #364: `stdout` renamed to a non-string is the drift shape.
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":["ls"]},"tool_response":{"stdout":{"text":"x"}}}"#;
+        let metrics = MetricsInput::from_json(json).unwrap();
+        assert_eq!(metrics.schema_drift, ["tool_input", "tool_response"]);
+        assert!(
+            metrics.tool_response.is_none(),
+            "degradation itself is unchanged"
+        );
+        let hook = HookInput::from_json(json).unwrap();
+        assert_eq!(hook.schema_drift, ["tool_input", "tool_response"]);
+        assert!(hook.tool_input.is_none());
+    }
+
+    #[test]
+    fn schema_drift_skips_mcp_tools() {
+        // Third-party MCP shapes are not Claude Code's schema.
+        let json = r#"{"tool_name":"mcp__srv__do","tool_input":{"content":[1,2]},"tool_response":{"stdout":7}}"#;
+        assert!(
+            MetricsInput::from_json(json)
+                .unwrap()
+                .schema_drift
+                .is_empty()
+        );
+        assert!(HookInput::from_json(json).unwrap().schema_drift.is_empty());
     }
 
     #[test]

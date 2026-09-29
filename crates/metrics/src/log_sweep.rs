@@ -85,11 +85,7 @@ fn append_row(file: &str, record: &Value) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    if let Ok(mut handle) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(file))
-    {
+    if let Ok(mut handle) = common::open_ledger(dir.join(file)) {
         // One `write_all` of the record + newline, so a concurrent append from
         // another session can't interleave a record with its trailing newline.
         let mut line = record.to_string();
