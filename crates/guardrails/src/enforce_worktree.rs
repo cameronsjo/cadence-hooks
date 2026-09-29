@@ -9634,7 +9634,14 @@ mod tests {
             r#"source /dev/stdin <<<"cd(){ :; }"; cd /wt && git commit -m x"#,
             ". ./env.sh; cd /wt && git commit -m x",
         ] {
-            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd", "/wt"], "{cmd}");
+            // The brace word now expands (`c{d,x}` is `cd cx`, #1115), so
+            // its second word reads as a `cd` argument too: one more
+            // directory judged, never fewer.
+            let mut want = vec!["/cwd", "/wt"];
+            if cmd.contains("c{d,x}") {
+                want = vec!["/cwd", "/cwd/cx", "/wt"];
+            }
+            assert_eq!(sorted_targets(cmd, "/cwd"), want, "{cmd}");
         }
         assert_eq!(
             sorted_targets("git add .; cd /wt && git commit -m x", "/cwd"),
@@ -10565,9 +10572,12 @@ mod tests {
         ] {
             assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
         }
+        // Behind `&&` the commit never runs, but a directory the command may
+        // create is judged by its nearest existing ancestor (#1083), so the
+        // primary it would sit in blocks.
         assert_eq!(
             outcome_from(&primary, "cd nonexist && git commit -m x"),
-            Outcome::Allow
+            Outcome::Block
         );
         // From the worktree, into the primary and then a failed cd.
         for cmd in [
