@@ -250,7 +250,7 @@ bind to the plan doc for the current branch.
 | Hook | Event | What it does |
 |------|-------|--------------|
 | `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched |
-| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip |
+| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch |
 | `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) |
 
 `nudge-plan-tick` and `warn-plan-ready-flip` only ever warn. `lint-plan-shape` is the

@@ -48,8 +48,8 @@
 //!   telemetry-driven).
 
 use crate::plan_scan::{self, InFlightPlan};
-use cadence_hooks_core::markers;
-use cadence_hooks_core::shell::pr_flip_segments;
+use cadence_hooks_core::markers::{self, MarkerTarget, resolve_ship_target};
+use cadence_hooks_core::shell::{PrSelector, pr_flip_segments, pr_selector, ship_target};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 
@@ -278,7 +278,8 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    if pr_flip_segments(command).is_empty() {
+    let flips = pr_flip_segments(command);
+    if flips.is_empty() {
         return CheckResult::allow();
     }
     let Some(cwd) = input.cwd.as_deref() else {
@@ -290,6 +291,15 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(plan) = plan_for_current_branch(&repo_root) else {
         return CheckResult::allow();
     };
+    // The plan speaks for the cwd's branch only, so a flip aimed anywhere
+    // else says nothing about it (cadence-hooks#972).
+    let branch = plan.branch.as_deref().unwrap_or_default();
+    if !flips
+        .iter()
+        .any(|tokens| flips_the_cwd_branch(tokens, cwd, branch))
+    {
+        return CheckResult::allow();
+    }
 
     let unticked = unticked_boxes(&plan.path);
     let in_flight = plan.status == "in-flight";
@@ -308,6 +318,43 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
          reconcile point (ADR-0038): tick what shipped, set status:/next:, commit the plan, \
          then flip. Advisory only."
     ))
+}
+
+/// Does this flip segment act on the PR of the branch checked out in `cwd`
+/// (named `branch`)? The plan guard binds to that branch, so it speaks only
+/// for a flip of that branch's PR (cadence-hooks#972). The tokens come from
+/// [`pr_flip_segments`], the matcher the ready-flip guards share
+/// (cadence-hooks#778).
+///
+/// The target is read from the command text, the way the polish gate reads a
+/// ship's ([`resolve_ship_target`]): every `-R`/`--repo`/`GH_REPO=` value
+/// must name one of the cwd repo's remotes. A PR URL names its own repo, so
+/// it joins that comparison. A branch selector must be `branch` itself.
+///
+/// Anything this cannot read stays quiet: an unreadable selector, a repo
+/// value that is no remote here, or a branch selector naming another branch.
+/// A PR **number** in the cwd's own repo still counts as a flip of this
+/// branch, as it always has: telling which branch a number belongs to needs
+/// a network call this local guard does not make. An exported `GH_REPO`
+/// leaves no token behind and is not seen.
+fn flips_the_cwd_branch(tokens: &[String], cwd: &str, branch: &str) -> bool {
+    let mut target = ship_target(tokens);
+    match pr_selector(tokens) {
+        PrSelector::None | PrSelector::Number(_) => {}
+        PrSelector::Url {
+            host, owner, repo, ..
+        } => target.repos.push(format!("{host}/{owner}/{repo}")),
+        PrSelector::Other(selector) => {
+            if selector != branch {
+                return false;
+            }
+        }
+        PrSelector::Unreadable => return false,
+    }
+    matches!(
+        resolve_ship_target(&target, Some(cwd)),
+        MarkerTarget::Local { .. }
+    )
 }
 
 /// Atomically claim `path` with `create_new`: `true` means this invocation
@@ -913,6 +960,49 @@ mod tests {
     }
 
     #[test]
+    fn ready_flip_stays_quiet_for_a_pr_in_another_repo() {
+        // cadence-hooks#972: every one of these flips a PR the cwd's plan has
+        // nothing to do with.
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh pr ready 16 -R other/repo",
+            "gh pr merge 16 --repo=other/repo --squash",
+            "gh -R other/repo pr merge 16",
+            "GH_REPO=other/repo gh pr merge 16",
+            "gh pr merge https://github.com/other/repo/pull/16",
+            "gh pr ready feat/elsewhere",
+        ] {
+            let input = bash_input("flip-972", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cmd} targets another repo or branch"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_still_warns_for_the_cwd_repos_own_pr() {
+        let tmp = repo_with_plan_and_origin();
+        for cmd in [
+            "gh pr ready 16",
+            "gh pr ready",
+            "gh pr merge 16 -R me/plans",
+            "gh pr merge 16 -R github.com/me/plans",
+            "gh pr merge https://github.com/me/plans/pull/16",
+            "gh pr ready main",
+            "gh pr ready 16 -R other/repo && gh pr ready 17",
+        ] {
+            let input = bash_input("flip-972-own", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} flips this checkout's PR"
+            );
+        }
+    }
+
+    #[test]
     fn ready_flip_sees_retargeted_and_prefixed_spellings() {
         // cadence-hooks#778: the old matcher demanded `gh pr` adjacent, so a
         // global `-R` or a keyword-led segment never nudged.
@@ -930,6 +1020,26 @@ mod tests {
                 "{cmd} is a ready flip of this checkout's PR"
             );
         }
+    }
+
+    #[test]
+    fn ready_flip_with_no_matching_remote_stays_quiet() {
+        // No remotes at all: a repo value can name nothing here.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-20-work.md",
+            "in-flight",
+            "main",
+            "# W\n\n- [ ] build\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        let input = bash_input("flip-972-none", tmp.path(), "gh pr ready 1 -R o/r", "");
+        assert_eq!(
+            run_warn_plan_ready_flip(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
     }
 
     #[test]
