@@ -559,27 +559,48 @@ pub struct TermMatch {
 /// list can soften a match. Empty when the source is absent, unreadable, or
 /// unarmed (fail-open, ADR-0001).
 pub fn identity_matches(text: &str) -> Vec<TermMatch> {
-    let (list, _) = identity::load();
-    to_term_matches(text, &list)
+    IdentityScanner::load().scan(text)
 }
 
-/// [`identity_matches`] against an explicit term-source file. For tests in
-/// other crates, which cannot reach this crate's `cfg(test)` path override;
-/// production callers use [`identity_matches`].
+/// The identity term source, read and compiled ONCE, for a caller that scans
+/// many texts in one hook run — a command of thousands of segments must not
+/// re-read `redaction.toml` and recompile every term per segment.
+pub struct IdentityScanner(identity::CompiledList);
+
+impl IdentityScanner {
+    /// Load the real term source. Inert (scans nothing) when it is absent,
+    /// unreadable, malformed, or unarmed (fail-open, ADR-0001).
+    pub fn load() -> Self {
+        IdentityScanner(identity::CompiledList::new(identity::load().0))
+    }
+
+    /// Load an explicit term-source file. For tests in other crates, which
+    /// cannot reach this crate's `cfg(test)` path override; production callers
+    /// use [`IdentityScanner::load`].
+    #[doc(hidden)]
+    pub fn load_from(source: &std::path::Path) -> Self {
+        IdentityScanner(identity::CompiledList::new(identity::load_from(source).0))
+    }
+
+    /// Every identity match in `text`, with the term's own `allow` entries
+    /// applied.
+    pub fn scan(&self, text: &str) -> Vec<TermMatch> {
+        self.0
+            .scan(text, None)
+            .into_iter()
+            .map(|h| TermMatch {
+                id: h.id,
+                snippet: h.snippet,
+            })
+            .collect()
+    }
+}
+
+/// [`identity_matches`] against an explicit term-source file (see
+/// [`IdentityScanner::load_from`]).
 #[doc(hidden)]
 pub fn identity_matches_from(text: &str, source: &std::path::Path) -> Vec<TermMatch> {
-    let (list, _) = identity::load_from(source);
-    to_term_matches(text, &list)
-}
-
-fn to_term_matches(text: &str, list: &identity::IdentityList) -> Vec<TermMatch> {
-    identity::scan_identity(text, list, None)
-        .into_iter()
-        .map(|h| TermMatch {
-            id: h.id,
-            snippet: h.snippet,
-        })
-        .collect()
+    IdentityScanner::load_from(source).scan(text)
 }
 
 /// Read the identity-tier bypass switch.

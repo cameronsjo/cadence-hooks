@@ -166,12 +166,18 @@ impl Status {
 /// committed file can pull is not an escape hatch, it is a hole. If a genuine
 /// need appears, it must come from a source no repo can write.
 pub(crate) fn terms_path() -> Option<PathBuf> {
+    // A test build never falls back to `HOME`: a test that installs no fixture
+    // resolves no term source (Absent), so no test's verdict depends on the
+    // operator's own `redaction.toml` — a hostile or merely populated one
+    // flipped a dozen shaped-tier tests into identity blocks.
     #[cfg(test)]
-    if let Ok(p) = std::env::var("CADENCE_REDACTION_TERMS")
-        && !p.is_empty()
     {
-        return Some(PathBuf::from(p));
+        std::env::var("CADENCE_REDACTION_TERMS")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
     }
+    #[cfg(not(test))]
     std::env::var("HOME")
         .ok()
         .filter(|h| !h.is_empty())
@@ -356,6 +362,55 @@ pub(crate) fn scan_identity(
     }
     hits.sort_by_key(|h| h.offset);
     hits
+}
+
+/// A term list with every term's regex compiled once, for a caller that scans
+/// many texts in one hook run. Same matching and `allow` rules as
+/// [`scan_identity`], without recompiling each term per text.
+pub(crate) struct CompiledList {
+    list: IdentityList,
+    regexes: Vec<Option<Regex>>,
+}
+
+impl CompiledList {
+    pub(crate) fn new(list: IdentityList) -> Self {
+        let regexes = list.terms.iter().map(|t| term_regex(&t.term)).collect();
+        CompiledList { list, regexes }
+    }
+
+    /// [`scan_identity`] over the precompiled regexes.
+    pub(crate) fn scan(&self, text: &str, file_path: Option<&str>) -> Vec<IdentityHit> {
+        if !self.list.is_armed() {
+            return Vec::new();
+        }
+        let mut hits: Vec<IdentityHit> = Vec::new();
+        for (term, re) in self.list.terms.iter().zip(&self.regexes) {
+            let Some(re) = re else {
+                continue;
+            };
+            let mut found = re.find_iter(text).peekable();
+            if found.peek().is_none() {
+                continue;
+            }
+            let excused = term
+                .allow
+                .iter()
+                .chain(self.list.allow.iter())
+                .any(|a| is_allowed(a, text, file_path));
+            if excused {
+                continue;
+            }
+            for m in found {
+                hits.push(IdentityHit {
+                    id: term.id.clone(),
+                    snippet: m.as_str().to_string(),
+                    offset: m.start(),
+                });
+            }
+        }
+        hits.sort_by_key(|h| h.offset);
+        hits
+    }
 }
 
 #[cfg(test)]

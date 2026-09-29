@@ -25,9 +25,7 @@
 //! `CADENCE_GOING_PUBLIC_IGNORE` cannot relieve those — only the term source's
 //! own `allow` entries can.
 
-use cadence_hooks_cadence::redact_external_content::TermMatch;
-#[cfg(not(test))]
-use cadence_hooks_cadence::redact_external_content::identity_matches;
+use cadence_hooks_cadence::redact_external_content::{IdentityScanner, TermMatch};
 use cadence_hooks_core::config::env_list;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
@@ -36,6 +34,7 @@ use cadence_hooks_core::shell::{
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// Publicly-known OSS app names that read as a home-media / piracy stack.
@@ -82,13 +81,18 @@ fn effective_terms() -> Vec<String> {
     terms
 }
 
-/// True when `word` (lowercased) matches a `\b<word>\b` boundary in `haystack`
-/// (already lowercased). `word` is regex-escaped, so app-name terms with no
-/// special chars match literally.
-fn word_boundary_match(haystack: &str, word: &str) -> bool {
-    Regex::new(&format!(r"\b{}\b", regex::escape(word)))
-        .map(|re| re.is_match(haystack))
-        .unwrap_or(false)
+/// Compile each term (lowercased) to its `\b<term>\b` matcher ONCE per hook
+/// run. `term` is regex-escaped, so app-name terms with no special chars match
+/// literally. Compiling per segment made a many-segment command pay one regex
+/// build per term per segment.
+fn compile_terms(terms: Vec<String>) -> Vec<(String, Option<Regex>)> {
+    terms
+        .into_iter()
+        .map(|t| {
+            let re = Regex::new(&format!(r"\b{}\b", regex::escape(&t))).ok();
+            (t, re)
+        })
+        .collect()
 }
 
 /// Scan `haystack` (repo name + description) for a matching term. Returns the
@@ -98,13 +102,17 @@ fn word_boundary_match(haystack: &str, word: &str) -> bool {
 /// applied AFTER matching — so an ignored surname (`starr`) suppresses the
 /// regex hit, and an ignored app name suppresses both its concrete and its
 /// regex hit.
-fn find_match(haystack: &str, terms: &[String], ignore: &[String]) -> Option<String> {
+fn find_match(
+    haystack: &str,
+    terms: &[(String, Option<Regex>)],
+    ignore: &[String],
+) -> Option<String> {
     let haystack = haystack.to_lowercase();
     let ignored = |w: &str| ignore.iter().any(|i| i.eq_ignore_ascii_case(w));
 
     // Concrete terms first.
-    for term in terms {
-        if !ignored(term) && word_boundary_match(&haystack, term) {
+    for (term, re) in terms {
+        if !ignored(term) && re.as_ref().is_some_and(|re| re.is_match(&haystack)) {
             return Some(term.clone());
         }
     }
@@ -196,7 +204,12 @@ impl Check for GoingPublicGuard {
             return CheckResult::allow();
         }
 
-        let terms = effective_terms();
+        let terms = compile_terms(effective_terms());
+        // The identity term source is read and compiled at most once per run,
+        // on the first segment that needs it, and each distinct (name,
+        // description) text is judged once.
+        let mut identity: Option<IdentityScanner> = None;
+        let mut seen: HashSet<String> = HashSet::new();
         let ignore = env_list("CADENCE_GOING_PUBLIC_IGNORE");
 
         // Judge each executable segment independently so a quoted `gh repo
@@ -224,6 +237,9 @@ impl Check for GoingPublicGuard {
             let name = positional_name(&tokens).unwrap_or("");
             let description = description_value(&tokens).unwrap_or_default();
             let haystack = format!("{name} {description}");
+            if !seen.insert(haystack.clone()) {
+                continue;
+            }
 
             if let Some(term) = find_match(&haystack, &terms, &ignore) {
                 return CheckResult::nudge(nudge_message(&term));
@@ -233,7 +249,8 @@ impl Check for GoingPublicGuard {
             // `CADENCE_GOING_PUBLIC_IGNORE`: softening authority follows
             // term-source authority, so only `redaction.toml`'s own `allow`
             // entries can excuse one of its terms.
-            if let Some(hit) = identity_matches_for(&haystack).into_iter().next() {
+            let scanner = identity.get_or_insert_with(load_identity);
+            if let Some(hit) = scanner.scan(&haystack).into_iter().next() {
                 return CheckResult::nudge(identity_nudge_message(&hit));
             }
         }
@@ -242,12 +259,12 @@ impl Check for GoingPublicGuard {
     }
 }
 
-/// Identity-tier matches for `haystack`. Production reads the real term
-/// source; a test build reads only the fixture a test installed, so no test
+/// The identity term source. Production reads the real one; a test build
+/// reads only the fixture a test installed (no fixture is inert), so no test
 /// ever depends on the operator's own `redaction.toml`.
 #[cfg(not(test))]
-fn identity_matches_for(haystack: &str) -> Vec<TermMatch> {
-    identity_matches(haystack)
+fn load_identity() -> IdentityScanner {
+    IdentityScanner::load()
 }
 
 #[cfg(test)]
@@ -257,12 +274,10 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn identity_matches_for(haystack: &str) -> Vec<TermMatch> {
+fn load_identity() -> IdentityScanner {
     IDENTITY_SOURCE.with(|s| match s.borrow().as_deref() {
-        Some(path) => {
-            cadence_hooks_cadence::redact_external_content::identity_matches_from(haystack, path)
-        }
-        None => Vec::new(),
+        Some(path) => IdentityScanner::load_from(path),
+        None => IdentityScanner::load_from(std::path::Path::new("")),
     })
 }
 
@@ -633,6 +648,27 @@ allow = [{ pattern = "zorblax corp fan club" }]
                 cadence_hooks_core::Outcome::Allow,
                 "{toml:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_hit_after_many_repeated_clean_segments_still_nudges() {
+        // The term set is compiled once and repeated texts are judged once;
+        // neither may cost a distinct later segment its verdict.
+        let clean = "gh repo create x --public -d y;".repeat(500);
+        let cases: &[(String, cadence_hooks_core::Outcome)] = &[
+            (clean.clone(), cadence_hooks_core::Outcome::Allow),
+            (
+                format!("{clean}gh repo create zorblax-corp --public"),
+                cadence_hooks_core::Outcome::Nudge,
+            ),
+            (
+                format!("{clean}gh repo create sonarr-cfg"),
+                cadence_hooks_core::Outcome::Nudge,
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(with_identity_source(TERMS, cmd).outcome, *want);
         }
     }
 }
