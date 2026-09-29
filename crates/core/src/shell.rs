@@ -4831,96 +4831,67 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    // Group 1: separator (&&, ;, ||, or empty for start-of-string)
-    // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
-    //
-    // The bare-path class excludes ASCII whitespace, not just a space: a
-    // newline has to TERMINATE the path. Swallowing it produced a target with
-    // the next line's command glued on — a directory that cannot exist — which
-    // is the cadence-hooks#394/#368 false-nudge.
-    //
-    // The class names bash's default IFS literally — space, tab, newline —
-    // rather than `\s`. This crate takes `regex` with default features, so a
-    // bare `\s` means `\p{White_Space}`: U+00A0, U+2028, U+3000 and friends.
-    // Every one of those is an ORDINARY character in an unquoted bash word, so
-    // a Unicode-aware class truncates a path bash keeps whole. That divergence
-    // runs in the fail-open direction: a truncated prefix can name a DIFFERENT
-    // real checkout than the one the command runs in, and `guard-push-remote`
-    // allows when it cannot resolve a git dir. Matching bash's own splitting
-    // set is the only spelling that cannot invent a target (security review,
-    // PR #414). Spelled as a literal class rather than `(?-u:…)`, which would
-    // let the pattern match invalid UTF-8 and is rejected by the `&str` API.
-    //
-    // A newline is deliberately NOT a separator: adding one would recognize a
-    // `cd` on its own line after an earlier command, but it would also match
-    // every line-initial `cd` in prose this tool routinely composes — a
-    // heredoc PR body carrying a shell snippet — and `\s*` would match an
-    // indented one inside a fenced block. That is a much wider accidental
-    // trigger surface for a primitive three block-capable guards resolve
-    // through, bought for a shape neither issue reports.
-    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ \t\n&;|]+))"#)
-        .expect("pattern should compile")
-});
-
 /// Extract the effective working directory from `cd` chains in a command.
 ///
-/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`),
-/// and accumulates directory changes:
+/// Walks the command's top-level segments left-to-right
+/// ([`split_segments_with_ops`]) and accumulates directory changes:
 /// - `cd a && cd b` → `cwd/a/b` (both apply on success path)
 /// - `cd /abs && cd rel` → `/abs/rel`
-/// - `cd a || cmd` → `cwd` (cd before `||` only runs on failure path)
+/// - `cd a || cmd` → `cwd/a` (assume-success; see below)
 /// - `cd /wt` ⏎ `gh pr create` → `/wt` (the newline ends the path)
 /// - `~` expanded via `$HOME`
 /// - No `cd` found returns `cwd` unchanged
 ///
-/// A newline **ends** a `cd` target but does not **separate** commands here, so
-/// a `cd` on its own line *after* an earlier command is still not recognized —
-/// unchanged behavior, and deliberate (see [`CD_PATTERN`]).
+/// **A `cd` counts only where bash would run it.** The
+/// segments come from the shared splitter, which is quote-, escape-,
+/// comment-, and heredoc-aware, so a `cd` inside a string (`echo "; cd /x"`),
+/// behind an escaped separator (`echo \; cd /x`), in a `#` comment, or in a
+/// heredoc body is text, not a directory change. This used to be a raw-text
+/// regex that matched all four, and a guard judging "the repo this command
+/// runs in" was then pointed at a repo the command never enters: from an
+/// unowned checkout, `echo "; cd <owned>" && gh pr create` was judged in the
+/// owned repo and allowed.
 ///
-/// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]), the same way
-/// [`split_segments_with_ops`] does and for the same reason: a heredoc body is
-/// DATA bash never executes, so a `cd` written in prose there must not re-point
-/// the resolver. Without this, `git commit -F - <<'EOF'` carrying the ordinary
-/// `mkdir -p <dir> && cd <dir>` idiom re-pointed every guard that resolves
-/// through here — and once the target resolves to a real checkout, the two
-/// consumers that treat "unresolvable" as a deliberate fail-CLOSED block
-/// (`git_safety`'s bare-HEAD force-push check, `guard_gh_write`'s ownership
-/// check) silently judge the wrong directory instead of blocking. The
-/// segmenter already stripped; this resolver did not, and that asymmetry was
-/// the bug (security review, PR #414).
+/// The segment is a `cd` when its first word is the literal `cd` and the
+/// segment follows the start of the command, `&&`, `;`, or `||` — exactly
+/// the positions the old pattern recognized. The narrowing is deliberate, so
+/// that for every unquoted `cd` the old resolver applied this one applies
+/// the same target:
+/// - a `cd` on a line after an earlier command (a newline separator) is not
+///   recognized — unchanged;
+/// - a `cd` after `|` or `&` (its own process) is not recognized — unchanged;
+/// - a `cd` glued to a group opener (`(cd x`, `{ cd x`) is not recognized —
+///   unchanged. The segment is tokenized raw, NOT through
+///   [`executable_tokens`], which strips a `(` and would newly apply a
+///   subshell's `cd` to the parent shell.
 ///
-/// This is otherwise a **raw-string scan, not a shell parse**, and it does not
-/// model subshells, pipelines, or backgrounding: a `cd` in any of those
-/// resolves as though it applied to the parent, even though bash would give it
-/// its own process and discard it. Long-standing behavior — stated here so a
-/// reader does not mistake the newline handling for a general shell-grammar
-/// model.
+/// Assumes every recognized `cd` succeeds — aligns with `git_commit_targets`
+/// (issue #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+/// left-associative, so a succeeding `cd` before `||` still changes the
+/// directory for what follows (`cd x || exit; git push` pushes from `x`
+/// whenever the cd works).
+///
+/// This does not model subshells, pipelines, or backgrounding beyond the
+/// positions above: a recognized `cd` inside a `( … )` that an earlier
+/// segment opened still resolves as though it applied to the parent.
+/// Long-standing behavior — stated so a reader does not mistake this for a
+/// general shell-grammar model.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
-
-    // Prose in a heredoc body is data, not commands — see the doc comment.
-    let command = strip_heredoc_bodies(command);
-
-    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
-    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
-    // left-associative, so a succeeding `cd` before `||` still changes the
-    // directory for what follows (`cd x || exit; git push` pushes from `x`
-    // whenever the cd works). The earlier "cd before `||` is a no-op"
-    // heuristic misjudged that common `|| exit` idiom; both resolvers now
-    // apply every `cd` the pattern finds, in order.
-    for caps in CD_PATTERN.captures_iter(&command) {
-        let target = caps
-            .get(2)
-            .or(caps.get(3))
-            .or(caps.get(4))
-            .map(|m| m.as_str().to_string());
-
-        let Some(target) = target else { continue };
-
-        effective = resolve_cd_target(&target, &effective);
+    let mut previous_op: Option<&str> = None;
+    for (segment, op) in split_segments_with_ops(command) {
+        let after_chain = matches!(previous_op, None | Some("&&" | ";" | "||"));
+        previous_op = op;
+        if !after_chain || !segment.starts_with("cd") {
+            continue;
+        }
+        let words = tokenize(&segment);
+        if words.first().map(String::as_str) == Some("cd")
+            && let Some(target) = words.get(1)
+        {
+            effective = resolve_cd_target(target, &effective);
+        }
     }
-
     effective
 }
 
@@ -16137,6 +16108,83 @@ mod tests {
             parse_work_dir("echo hi\ncd /wt\ngh pr create --title x", "/home"),
             "/home"
         );
+    }
+
+    #[test]
+    fn cd_bash_never_runs_does_not_repoint_the_resolver() {
+        // A `cd` in a string, a comment, or behind an escaped separator is
+        // text. The raw-text regex took each as a directory change, so from
+        // an unowned checkout `echo "; cd <owned>" && gh pr create` was judged
+        // in the owned repo and allowed.
+        for command in [
+            "echo \"; cd /owned \" && gh pr create -t x -b y",
+            "echo '; cd /owned' && gh pr create -t x -b y",
+            "echo \"a && cd /owned\"; gh pr create -t x -b y",
+            "echo $'x\\'; cd /owned' && gh pr create -t x -b y",
+            "echo x # ; cd /owned\ngh pr create -t x -b y",
+            "echo x #; cd /owned && gh pr create -t x -b y",
+            "# cd /owned\ngh pr create -t x -b y",
+            "echo x \\; cd /owned && gh pr create -t x -b y",
+            "echo x \\&\\& cd /owned && gh pr create -t x -b y",
+            "gh pr create -t x -b \"see; cd /owned\"",
+            "gh pr create -t x -b \"$(printf '%s' '; cd /owned')\"",
+            "git commit -m \"x || cd /owned\" && git push",
+        ] {
+            assert_eq!(parse_work_dir(command, "/unowned"), "/unowned", "{command}");
+        }
+    }
+
+    #[test]
+    fn cd_bash_runs_resolves_exactly_as_before() {
+        // Every real, unquoted `cd` the regex applied applies the same target,
+        // so no guard loses a verdict it reached on a real directory change.
+        for (command, expected) in [
+            ("cd /owned && gh pr create", "/owned"),
+            ("cd /owned; gh pr create", "/owned"),
+            ("cd /owned;gh pr create", "/owned"),
+            ("cd /owned || exit; gh pr create", "/owned"),
+            ("  cd /owned && gh pr create", "/owned"),
+            ("\ncd /owned && gh pr create", "/owned"),
+            ("echo hi; cd /owned && gh pr create", "/owned"),
+            ("echo hi;\ncd /owned && gh pr create", "/owned"),
+            ("echo \"a; b\" && cd /owned && gh pr create", "/owned"),
+            ("cd \"/owned dir\" && gh pr create", "/owned dir"),
+            ("cd '/owned dir' && gh pr create", "/owned dir"),
+            ("cd /owned 2>&1 && gh pr create", "/owned"),
+            ("cd /owned &>/dev/null && gh pr create", "/owned"),
+            ("cd /owned | cat; gh pr create", "/owned"),
+            ("cd /owned # comment\ngh pr create", "/owned"),
+            ("cd - && gh pr create", "/unowned/-"),
+            (
+                "cd $(git rev-parse --show-toplevel) && gh pr create",
+                "/unowned/$(git rev-parse --show-toplevel)",
+            ),
+            // Positions the old pattern never recognized stay unrecognized.
+            ("echo hi | cd /owned; gh pr create", "/unowned"),
+            ("sleep 1 & cd /owned; gh pr create", "/unowned"),
+            ("(cd /owned) ; gh pr create", "/unowned"),
+            ("{ cd /owned; } ; gh pr create", "/unowned"),
+        ] {
+            assert_eq!(parse_work_dir(command, "/unowned"), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn parse_work_dir_stays_fast_on_adversarial_input() {
+        let quoted = format!("echo \"{}\" && gh pr create", "; cd /owned ".repeat(20_000));
+        let chained = "cd /a && ".repeat(25_000);
+        let relative = "cd a;".repeat(40_000);
+        let commented = format!("echo x #{}\ngh pr create", "; cd /owned".repeat(20_000));
+        for command in [quoted, chained, relative, commented] {
+            assert!(command.len() >= 200_000);
+            let start = std::time::Instant::now();
+            let _ = parse_work_dir(&command, "/unowned");
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(500),
+                "{:?}",
+                start.elapsed()
+            );
+        }
     }
 
     // --- LOOP_PATTERN ---
