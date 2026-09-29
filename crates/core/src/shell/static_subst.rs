@@ -38,7 +38,8 @@ pub(super) struct Rewrite {
 ///
 /// Refused (`None`): any expansion, backslash, glob, brace, redirect, or
 /// operator in the body, an `echo`/`printf` flag beyond `-n`/`-e`/`-E`, and a
-/// `printf` format other than `%s` or one with no conversion.
+/// `printf` format with a conversion other than `%s` or an escape other than
+/// `\n`.
 pub(super) fn static_output(body: &str) -> Option<String> {
     let body = body.trim();
     let split = body.find([' ', '\t']).unwrap_or(body.len());
@@ -49,16 +50,41 @@ pub(super) fn static_output(body: &str) -> Option<String> {
         _ => return None,
     };
     let words = literal_words(rest)?;
-    if words.iter().any(|w| w.contains('\\')) {
+    // A printf FORMAT may carry `\n`; every other word is printed as written,
+    // and an `echo` backslash is an escape only under `-e`, which is refused.
+    if words
+        .iter()
+        .skip(usize::from(printf))
+        .any(|w| w.contains('\\'))
+    {
         return None;
     }
     if printf {
         let (format, args) = words.split_first()?;
-        return match format.as_str() {
-            "%s" => Some(args.concat()),
-            f if !f.contains('%') => Some(f.to_string()),
-            _ => None,
+        let format = format.replace("\\n", "\n");
+        if format.contains('\\') || format.replace("%s", "").contains('%') {
+            return None;
+        }
+        // `%s` conversions consume one argument each and the format is reused
+        // until the arguments run out; a format with none prints once.
+        let specs = format.matches("%s").count();
+        let rounds = if specs == 0 || args.is_empty() {
+            1
+        } else {
+            args.len().div_ceil(specs)
         };
+        let mut given = args.iter();
+        let mut out = String::new();
+        for _ in 0..rounds {
+            for (i, piece) in format.split("%s").enumerate() {
+                if i > 0 {
+                    out.push_str(given.next().map_or("", String::as_str));
+                }
+                out.push_str(piece);
+            }
+        }
+        // A substitution's value loses its trailing newlines.
+        return Some(out.trim_end_matches('\n').to_string());
     }
     let flags = words
         .iter()
@@ -318,6 +344,13 @@ mod tests {
             ("printf git", Some("git")),
             ("printf 'cat .env'", Some("cat .env")),
             ("printf %s git", Some("git")),
+            ("printf '%s\\n' git", Some("git")),
+            ("printf '%s%s' git ' push'", Some("git push")),
+            ("printf '%s %s\\n' a b c", Some("a b\nc ")),
+            ("printf '%s'", Some("")),
+            ("printf '%d' 1", None),
+            ("printf '%%' x", None),
+            ("printf 'a\\tb'", None),
             ("/bin/echo git", Some("git")),
             ("echo $HOME", None),
             ("echo $(x)", None),
@@ -327,7 +360,8 @@ mod tests {
             ("echo a; rm b", None),
             ("echo a | b", None),
             ("echo 'a\\nb'", None),
-            ("printf '%s %s' a b", None),
+            ("printf '%s %s' a b", Some("a b")),
+            ("printf '%5s' a", None),
             ("printf", None),
             ("cat .env", None),
             ("which python", None),
@@ -391,6 +425,8 @@ mod tests {
             "f a$(echo '')b",
             "f \"$(printf %s a b)\"",
             "f $(printf 'a b')",
+            "f $(printf '%s\\n' a b)",
+            "f \"$(printf '%s %s\\n' a b c)\"",
             "f $(echo -n hi)",
             "f $(echo -e hi)",
             "f $(echo '#x' y)",
