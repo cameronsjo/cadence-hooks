@@ -244,6 +244,35 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
     }
 }
 
+/// The request fields whose values are prose someone reads: what the overshare
+/// nudge judges on a `gh api` write (cadence-hooks#1172).
+const API_PROSE_FIELDS: &[&str] = &["body", "title", "description", "text", "message"];
+
+/// Is this segment a `gh api` request that posts no prose — a render-only
+/// `/markdown` call, or a write whose fields are all state (`-f state=closed`)?
+/// Only the overshare nudge asks: the leak scan's gate ([`is_external_post`])
+/// keeps reading every field. A GraphQL call, an `--input` file, and anything
+/// that is not `gh api` are not judged here.
+pub(crate) fn api_posts_no_prose(segment: &str) -> bool {
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    let Some(req) = parse_gh_api(argv) else {
+        return false;
+    };
+    if matches!(req.endpoint_path(), "markdown" | "markdown/raw") {
+        return true;
+    }
+    if req.endpoint_path() == "graphql" || req.input.is_some() {
+        return false;
+    }
+    let is_prose = |key: &str| {
+        let leaf = key.trim_end_matches("[]").trim_end_matches(']');
+        API_PROSE_FIELDS.contains(&leaf.rsplit('[').next().unwrap_or(leaf))
+    };
+    !req.fields.iter().any(|(key, _)| is_prose(key))
+        && !req.query_pairs().iter().any(|(key, _)| is_prose(key))
+}
+
 /// Does this `gh api` request publish text? It must send
 /// a payload (a literal `GET`/`HEAD` sends its fields as a query string) and
 /// carry one — a field or an `--input` file. Every endpoint counts, not only

@@ -4956,6 +4956,8 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
     let mut previous_op: Option<&str> = None;
+    let mut root_lookups = 0;
+    let mut trusted = None;
     for (segment, op) in split_segments_with_ops(command) {
         let after_chain = matches!(previous_op, None | Some("&&" | ";" | "||"));
         previous_op = op;
@@ -4971,7 +4973,12 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
             let root = (words.len() >= 2)
                 .then(|| toplevel_substitution(&words[1..].join(" ")))
                 .flatten()
-                .filter(|_| toplevel_reading_is_live(command, &segment))
+                .filter(|_| toplevel_segment_is_live(&segment))
+                .filter(|_| *trusted.get_or_insert_with(|| known_commands_are_trusted(command)))
+                .filter(|_| {
+                    root_lookups += 1;
+                    root_lookups <= MAX_ROOT_LOOKUPS
+                })
                 .and_then(|git_dir| repo_root_of(&effective, git_dir.as_deref()));
             match root {
                 Some(root) => effective = root,
@@ -4996,14 +5003,20 @@ fn repo_root_of(dir: &str, git_dir: Option<&str>) -> Option<String> {
         .map(|state| state.repo_root.to_string_lossy().into_owned())
 }
 
-/// May `cd "$(git rev-parse --show-toplevel)"` in `segment` of `command` be
-/// read as the checkout root? Not when the substitution is single-quoted or
-/// escaped (a directory's name then), when the command or its environment may
-/// point git elsewhere (`GIT_DIR`, `GIT_WORK_TREE`), or when it may have
-/// replaced `git` itself.
-fn toplevel_reading_is_live(command: &str, segment: &str) -> bool {
+/// May `cd "$(git rev-parse --show-toplevel)"` in this segment be read as the
+/// checkout root? Not when the substitution is single-quoted or escaped (a
+/// directory's name then).
+fn toplevel_segment_is_live(segment: &str) -> bool {
     !segment.contains(['\'', '\\'])
-        && !command.contains("GIT_")
+}
+
+/// Can the tools a command names by name be trusted to be what they are named?
+/// Not when the command or its environment may point git elsewhere (`GIT_DIR`,
+/// `GIT_WORK_TREE`), or may have replaced `git`, `ssh-agent` or another
+/// known tool ([`crate::push::may_redefine_known_commands`]). Scans the whole
+/// command, so a walk asks once ([`DirWalk::known_commands_trusted`]).
+fn known_commands_are_trusted(command: &str) -> bool {
+    !command.contains("GIT_")
         && std::env::var_os("GIT_DIR").is_none()
         && std::env::var_os("GIT_WORK_TREE").is_none()
         && !crate::push::may_redefine_known_commands(command)
@@ -5143,10 +5156,15 @@ impl DirSet {
     /// <dir>`): each directory becomes the root of the checkout it is in. A
     /// directory that is not inside one, that is not absolute, or that is
     /// already unresolvable stays [`UNRESOLVABLE_DIR`].
-    fn move_to_repo_root(&mut self, git_dir: Option<&str>, keep: bool) {
+    fn move_to_repo_root(&mut self, git_dir: Option<&str>, keep: bool, lookups: &mut usize) {
         let mut next = if keep { self.dirs.clone() } else { Vec::new() };
         for dir in &self.dirs {
-            next.push(repo_root_of(dir, git_dir).unwrap_or_else(|| UNRESOLVABLE_DIR.to_string()));
+            // Each lookup reads the disk: a flood of them is refused, not run.
+            *lookups += 1;
+            let root = (*lookups <= MAX_ROOT_LOOKUPS)
+                .then(|| repo_root_of(dir, git_dir))
+                .flatten();
+            next.push(root.unwrap_or_else(|| UNRESOLVABLE_DIR.to_string()));
         }
         self.set(next);
     }
@@ -5262,7 +5280,17 @@ struct DirWalk {
     /// walk does not record (`f() if …; fi`).
     functions: std::collections::HashMap<String, Option<Script>>,
     replayed: usize,
+    /// `git rev-parse --show-toplevel` lookups made so far, against
+    /// [`MAX_ROOT_LOOKUPS`].
+    root_lookups: usize,
+    /// [`known_commands_are_trusted`] for the whole command, asked at the first
+    /// segment that needs it: each ask scans the command.
+    known_commands: std::cell::OnceCell<bool>,
 }
+
+/// Most checkout-root lookups one walk makes (each reads the disk); past it a
+/// `cd "$(git rev-parse --show-toplevel)"` is unresolvable.
+const MAX_ROOT_LOOKUPS: usize = 64;
 
 /// What a command sets one variable to ([`literal_values_of`]).
 #[derive(Clone)]
@@ -6057,6 +6085,12 @@ impl DirWalk {
             .contains_key("CDPATH")
     }
 
+    fn known_commands_trusted(&self) -> bool {
+        *self
+            .known_commands
+            .get_or_init(|| known_commands_are_trusted(&self.command))
+    }
+
     fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
         for dir in dirs.snapshot() {
             self.located.push(LocatedSegment {
@@ -6199,7 +6233,7 @@ impl DirWalk {
                     .collect();
                 if !body.contains(['\'', '\\'])
                     && eval_is_tool_init(&operands)
-                    && !crate::push::may_redefine_known_commands(&self.command)
+                    && self.known_commands_trusted()
                 {
                     // Prints exports and hooks; it changes no directory.
                     return;
@@ -6227,7 +6261,8 @@ impl DirWalk {
                 // single quotes or escaped it is a directory's name, and a
                 // `git` the command may have replaced names anything.
                 if matches!(target, VerbTarget::RepoRoot(_))
-                    && (!toplevel_reading_is_live(&self.command, body)
+                    && (!toplevel_segment_is_live(body)
+                        || !self.known_commands_trusted()
                         || self.functions.contains_key("git"))
                 {
                     target = VerbTarget::Unreadable;
@@ -6262,7 +6297,7 @@ impl DirWalk {
                         if remembers {
                             dirs.stack.entries.push(dirs.dirs.clone());
                         }
-                        dirs.move_to_repo_root(git_dir.as_deref(), maybe);
+                        dirs.move_to_repo_root(git_dir.as_deref(), maybe, &mut self.root_lookups);
                         if context.looped {
                             dirs.add_unresolvable();
                         }
@@ -18493,6 +18528,180 @@ mod tests {
         ] {
             assert_eq!(segment_shape(segment), want, "{segment}");
         }
+    }
+
+    /// `popd` returns to the directory before the `pushd` it matches, when that
+    /// `pushd` was read in the same command (cameronsjo/cadence-hooks#1172).
+    /// Everything the walk cannot pair keeps the unresolvable verdict.
+    #[test]
+    fn segment_work_dirs_pairs_popd_with_its_pushd() {
+        const X: &str = UNRESOLVABLE_DIR;
+        for (command, want) in [
+            ("pushd sub && make && popd && gh pr create", &["/cwd"][..]),
+            ("pushd /u; popd; gh pr create", &["/cwd"]),
+            ("pushd /u; cd v; popd; gh pr create", &["/cwd"]),
+            ("cd a; pushd /u; popd; gh pr create", &["/cwd/a"]),
+            ("pushd /u; pushd /v; popd; gh pr create", &["/u"]),
+            ("pushd /u; pushd /v; popd; popd; gh pr create", &["/cwd"]),
+            (
+                "pushd /u >/dev/null; popd >/dev/null; gh pr create",
+                &["/cwd"],
+            ),
+            ("builtin pushd /u; builtin popd; gh pr create", &["/cwd"]),
+            // A pipeline stage or a subshell has a stack of its own.
+            ("pushd /u; (popd); gh pr create", &["/u"]),
+            ("pushd /u; (pushd /v; popd); popd; gh pr create", &["/cwd"]),
+            ("(pushd /u; popd); gh pr create", &["/cwd"]),
+            // Unmatched, unreadable or maybe-run: unresolvable, as before.
+            ("popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; popd; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; popd -n; gh pr create", &["/u", X]),
+            ("pushd /u; popd +1; gh pr create", &["/u", X]),
+            ("pushd /u; pushd; popd; gh pr create", &["/u", X]),
+            ("pushd -n /u; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u; dirs -c; popd; gh pr create", &["/u", X]),
+            ("command pushd /u; popd; gh pr create", &["/cwd", "/u", X]),
+            ("pushd /u | cat; popd; gh pr create", &["/cwd", X]),
+            ("pushd /u & popd; gh pr create", &["/cwd", X]),
+            (
+                "if x; then pushd /u; fi; popd; gh pr create",
+                &["/cwd", "/u", X],
+            ),
+            (
+                "pushd /u; if x; then popd; fi; gh pr create",
+                &["/cwd", "/u"],
+            ),
+            (
+                "for d in a b; do pushd $d; popd; done; gh pr create",
+                &["/cwd", X],
+            ),
+            ("f() { pushd /u; }; f; popd; gh pr create", &["/cwd"]),
+        ] {
+            let got = last_dirs(command);
+            let mut want: Vec<String> = want.iter().map(|d| (*d).to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{command}");
+        }
+    }
+
+    /// A flood of `pushd`, `popd` and checkout-root `cd`s is bounded: each
+    /// lookup past the budget is unresolvable rather than a disk read.
+    #[test]
+    fn a_flood_of_stack_and_toplevel_moves_is_bounded() {
+        let started = std::time::Instant::now();
+        for unit in [
+            "pushd /u; ",
+            "pushd a; popd; ",
+            "popd; ",
+            "cd \"$(git rev-parse --show-toplevel)\"; ",
+            "eval \"$(ssh-agent -s)\"; ",
+            "eval \"$(direnv hook bash)\"; ",
+        ] {
+            let command = format!("{}gh pr create", unit.repeat(200_000 / unit.len()));
+            let located = segment_work_dirs_with_cdpath(&command, "/nonexistent-cwd", false);
+            assert!(located.last().is_some(), "{unit}");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// `cd "$(git rev-parse --show-toplevel)"` lands on the root of the
+    /// checkout it runs in, and only that exact substitution
+    /// (cameronsjo/cadence-hooks#1172).
+    #[test]
+    fn segment_work_dirs_resolves_the_toplevel_substitution() {
+        const X: &str = UNRESOLVABLE_DIR;
+        let repo = tempfile::tempdir().expect("create repo");
+        crate::git_fixtures::init_repo(repo.path());
+        let sub = repo.path().join("a/b");
+        std::fs::create_dir_all(&sub).expect("create subdirectory");
+        let root = std::fs::canonicalize(repo.path())
+            .expect("canonicalize repo")
+            .to_string_lossy()
+            .into_owned();
+        let sub = sub.to_string_lossy().into_owned();
+        for (command, want) in [
+            (
+                "cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd $(git rev-parse --show-toplevel); gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd `git rev-parse --show-toplevel`; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd -P \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "cd \"$(git -C /nonexistent rev-parse --show-toplevel)\"; gh pr create",
+                vec![X],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)/x\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd \"$(git rev-parse --git-dir)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd '$(git rev-parse --show-toplevel)'; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)\" x; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "git() { :; }; cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "PATH=/x:$PATH; cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![sub.as_str(), X],
+            ),
+            (
+                "(cd \"$(git rev-parse --show-toplevel)\"); gh pr create",
+                vec![sub.as_str()],
+            ),
+            (
+                "cd \"$(git rev-parse --show-toplevel)\" || true; gh pr create",
+                vec![root.as_str()],
+            ),
+            (
+                "true && cd \"$(git rev-parse --show-toplevel)\"; gh pr create",
+                vec![root.as_str()],
+            ),
+        ] {
+            let located = segment_work_dirs_with_cdpath(command, &sub, false);
+            let last = located.last().map(|segment| segment.raw.clone());
+            let mut got: Vec<String> = located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect();
+            got.sort();
+            got.dedup();
+            let mut want: Vec<String> = want.iter().map(|d| (*d).to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{command}");
+        }
+        // The whole-command reading agrees.
+        assert_eq!(
+            parse_work_dir(
+                "cd \"$(git rev-parse --show-toplevel)\" && gh pr create",
+                &sub
+            ),
+            root
+        );
+        assert_eq!(
+            parse_work_dir("cd \"$(git rev-parse --show-toplevel)/x\"", &sub),
+            format!("{sub}/$(git rev-parse --show-toplevel)/x")
+        );
     }
 
     /// A relative `cd`/`pushd` target searches `CDPATH` (bash: `cd sub` with

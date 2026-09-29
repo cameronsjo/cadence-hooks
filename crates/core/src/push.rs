@@ -332,6 +332,24 @@ struct GhHosts {
     /// account than the one its config file names: a token variable, or a
     /// `gh auth` command. A bare `gh repo clone REPO` is then unreadable.
     account_unreadable: bool,
+    /// [`signed_in_user`] per host, read once: a flood of clones costs one
+    /// file read.
+    users: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl GhHosts {
+    /// The account gh is signed in to on `host`, or `None` when it cannot be
+    /// told ([`Self::account_unreadable`], or no readable config).
+    fn signed_in_user(&self, host: &str) -> Option<String> {
+        if self.account_unreadable {
+            return None;
+        }
+        self.users
+            .borrow_mut()
+            .entry(host.to_string())
+            .or_insert_with(|| signed_in_user(host))
+            .clone()
+    }
 }
 
 impl GhHosts {
@@ -340,6 +358,7 @@ impl GhHosts {
             hosts: vec![crate::config::default_host()],
             unreadable: false,
             account_unreadable: false,
+            users: Default::default(),
         };
         // Only a `gh repo clone` reads this; skip the scan for anything else.
         if !command.contains("clone") {
@@ -2531,11 +2550,7 @@ fn config_writes_of(
                     Ok(gh_hosts.hosts.clone())
                 }
             });
-            let user_of = |host: &str| {
-                (!gh_hosts.account_unreadable)
-                    .then(|| signed_in_user(host))
-                    .flatten()
-            };
+            let user_of = |host: &str| gh_hosts.signed_in_user(host);
             writes.extend(gh_clone_write(
                 &words[2..],
                 dir,

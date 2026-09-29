@@ -842,6 +842,9 @@ struct GhHostEnv {
     /// The whole command, raw — heredoc bodies included, which the segment
     /// list strips. Read only for a `source`/`.` fed by a heredoc.
     raw_command: String,
+    /// Whether nothing in [`Self::raw_command`] can have replaced a known
+    /// tool, asked at the first tool-init `eval` (each ask scans the command).
+    tools_trusted: std::cell::OnceCell<bool>,
 }
 
 impl GhHostEnv {
@@ -864,6 +867,7 @@ impl GhHostEnv {
             allexport: false,
             inherited,
             raw_command: String::new(),
+            tools_trusted: std::cell::OnceCell::new(),
         }
     }
 
@@ -1110,7 +1114,9 @@ impl GhHostEnv {
                 .collect();
             let plain_tool_init = !segment.contains(['\'', '\\'])
                 && cadence_hooks_core::shell::eval_is_tool_init(&operands)
-                && !cadence_hooks_core::push::may_redefine_known_commands(&self.raw_command);
+                && *self.tools_trusted.get_or_init(|| {
+                    !cadence_hooks_core::push::may_redefine_known_commands(&self.raw_command)
+                });
             if !plain_tool_init {
                 self.observe_nested(&rest[1..].join(" "), depth);
             }
