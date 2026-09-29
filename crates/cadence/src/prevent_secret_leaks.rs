@@ -17,6 +17,7 @@ use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, command_segments, command_word, executable_tokens,
     is_assignment_word, skip_git_global_options, split_segments, strip_heredoc_bodies, tokenize,
+    tokenize_marked,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -588,7 +589,10 @@ fn segment_env_reads_at(
     // stripping already drops these bodies outside double quotes.
     let segment = strip_quoted_heredoc_bodies(segment);
     let segment = segment.as_ref();
-    let tokens = tokenize(segment);
+    let (tokens, globs): (Vec<String>, Vec<bool>) = tokenize_marked(segment)
+        .into_iter()
+        .map(|t| (t.text, t.unquoted_glob))
+        .unzip();
     let Some(first) = tokens.first() else {
         return Vec::new();
     };
@@ -597,7 +601,7 @@ fn segment_env_reads_at(
     }
     let mut found = {
         let _live = LiveScope::set(substitutions_live(segment));
-        segment_direct_reads(&tokens, context)
+        segment_direct_reads(&tokens, &globs, context)
     };
     if depth < NESTED_SCAN_DEPTH {
         for script in nested_command_strings(&tokens) {
@@ -782,7 +786,16 @@ fn git_command_option_value<'a>(
 
 /// One segment's own operands — [`segment_env_reads`] without the nested
 /// re-scan.
-fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String, String)> {
+///
+/// `globs[i]` marks a `tokens[i]` carrying an unquoted pathname-expansion
+/// character (`MarkedToken::unquoted_glob`): the shell may expand that word
+/// into file operands, so it never gets the pattern-operand exemption
+/// (#1114).
+fn segment_direct_reads(
+    tokens: &[String],
+    globs: &[bool],
+    context: ScanContext,
+) -> Vec<(String, String)> {
     let plain_jq_pipeline = context.plain_jq_pipeline;
     let Some((cmd_word, argv)) = resolve_command(tokens) else {
         return Vec::new();
@@ -873,6 +886,8 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
     // glob judgment alone — a literal secret name there still counts. Same
     // byte-exact head rule as the jq filter above.
     let exact_head = tokens.first().is_some_and(|head| *head == cmd_word);
+    // `argv` is a suffix of `tokens` (the prefix peel only advances).
+    let argv_at = tokens.len() - argv.len();
     let pattern = exact_head
         .then(|| pattern_operand_index(&cmd_word, argv))
         .flatten();
@@ -882,6 +897,11 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
     } else {
         HashMap::new()
     };
+    // The file a pattern command loads its pattern or program from (#1114).
+    let mut pattern_files: HashMap<usize, Vec<&str>> = HashMap::new();
+    for (at, file) in pattern_file_values(&cmd_word, argv) {
+        pattern_files.entry(at).or_default().push(file);
+    }
     // Files `curl` uploads through an option's value (#1098).
     let mut uploads: HashMap<usize, Vec<&str>> = HashMap::new();
     if cmd_word == "curl" {
@@ -901,8 +921,20 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
         .enumerate()
         .filter(|(i, _)| Some(*i) != jq_filter && !consumed.contains(i))
         .filter_map(|(i, t)| {
-            if Some(i) == pattern {
+            // An unquoted glob in the pattern slot is expanded by the shell
+            // before the command runs (`grep .env* x` runs
+            // `grep .env .env.local x`), so it is judged like any operand.
+            let expands = globs.get(argv_at + i).copied().unwrap_or(true);
+            if Some(i) == pattern && !expands {
                 return pattern_word_secret(t, position);
+            }
+            if let Some(value) = pattern_files
+                .get(&i)
+                .into_iter()
+                .flatten()
+                .find_map(|file| dangerous_secret_operand(file, Filename::Known))
+            {
+                return Some(value);
             }
             if let Some(value) = uploads
                 .get(&i)
@@ -912,7 +944,7 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
             {
                 return Some(value);
             }
-            if let Some(text) = pattern_texts.get(&i) {
+            if let Some(text) = pattern_texts.get(&i).filter(|_| !expands) {
                 return pattern_word_secret(text, position);
             }
             // `dd` names its input as `if=FILE` — one token whose basename
@@ -1348,6 +1380,73 @@ fn pattern_text_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<(usize, &'a str
                     consumed = 2;
                 }
                 break;
+            }
+        }
+        i += consumed;
+    }
+    out
+}
+
+/// The FILE a regex or filter command loads its pattern or program from —
+/// `grep -f FILE`, `-fFILE`, `--file FILE`, `--file=FILE`, any abbreviation
+/// of `--file`/`--from-file` (`--fil=FILE`), and awk's `-E`/`--exec` — as
+/// `(argv index, value)`. The file is read, so its value is judged as a known
+/// filename: `grep --file=.env x` blocks like `grep -f .env x` (#1114). The
+/// walk covers the whole argv (GNU permutes options past operands), and a
+/// long name read generously can only add blocks.
+fn pattern_file_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<(usize, &'a str)> {
+    let Some((short_valued, _)) = pattern_option_table(cmd) else {
+        return Vec::new();
+    };
+    let awk = matches!(cmd, "awk" | "gawk" | "mawk" | "nawk");
+    let file_long: &[&str] = if awk {
+        &["file", "from-file", "exec"]
+    } else {
+        &["file", "from-file"]
+    };
+    let file_short: &[char] = if awk { &['f', 'E'] } else { &['f'] };
+    let mut out = Vec::new();
+    let mut i = 1;
+    while let Some(t) = argv.get(i) {
+        if t == "--" {
+            break;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if !name.is_empty() && file_long.iter().any(|l| l.starts_with(name)) {
+                match value {
+                    Some(value) => out.push((i, value)),
+                    None => {
+                        if let Some(next) = argv.get(i + 1) {
+                            out.push((i + 1, next.as_str()));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        let mut consumed = 1;
+        if t.len() > 1 && t.starts_with('-') {
+            let cluster = &t[1..];
+            for (at, c) in cluster.char_indices() {
+                let rest = &cluster[at + c.len_utf8()..];
+                let file = file_short.contains(&c);
+                if file || c == 'e' || short_valued.contains(c) {
+                    if rest.is_empty() {
+                        if file && let Some(next) = argv.get(i + 1) {
+                            out.push((i + 1, next.as_str()));
+                        }
+                        consumed = 2;
+                    } else if file {
+                        out.push((i, rest));
+                    }
+                    break;
+                }
             }
         }
         i += consumed;
@@ -8255,6 +8354,77 @@ mod tests {
             let args = argv(command);
             assert_eq!(pattern_text_values(&args[0], &args), expected, "{command}");
         }
+    }
+
+    #[test]
+    fn pattern_file_values_finds_the_loaded_file() {
+        // #1114: the file a pattern command loads is read.
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (command, expected) in [
+            ("grep -f p x", vec![(2, "p")]),
+            ("grep -fp x", vec![(1, "p")]),
+            ("grep -ivf p x", vec![(2, "p")]),
+            ("grep --file p x", vec![(2, "p")]),
+            ("grep --file=p x", vec![(1, "p")]),
+            ("grep --fil=p x", vec![(1, "p")]),
+            ("grep x y -f p", vec![(4, "p")]),
+            ("grep -A f x", vec![]),
+            ("grep -ef x", vec![]),
+            ("grep -e f x", vec![]),
+            ("grep -- -f p", vec![]),
+            ("sed --file=p x", vec![(1, "p")]),
+            ("awk -E p x", vec![(2, "p")]),
+            ("awk --exec=p x", vec![(1, "p")]),
+            ("cat -f p", vec![]),
+        ] {
+            let args = argv(command);
+            assert_eq!(pattern_file_values(&args[0], &args), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn unquoted_glob_in_a_pattern_slot_is_judged_as_files() {
+        // #1114: bash expands an unquoted glob before the command runs —
+        // `grep .env* x` runs `grep .env .env.local x` — so only a quoted or
+        // escaped pattern keeps the regex exemption.
+        assert_bash(
+            &[
+                "grep .env* x",
+                "grep -e .env* x",
+                "grep secret* x.txt",
+                "grep '.e'* x",
+                "bash -c 'grep .env* x'",
+                "grep --file=.env x",
+                "grep --fil=.env x",
+                "grep --file prod.env x",
+                "grep -fprod.env x",
+                "grep -f prod.env x",
+                "grep -ivf .env x",
+                "sed --file=.env x",
+                "awk --exec=.env x",
+                "awk -E .env x",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "an unquoted glob, or a loaded pattern file, is a read",
+        );
+        assert_bash(
+            &[
+                "grep '.env*' x",
+                "grep -e '.env*' x",
+                "grep \".env*\" x",
+                "grep .e\\* x",
+                "grep '.*TODO' .",
+                "grep -e 'secret*' x.txt",
+                "rg '.*TODO'",
+                "yq '.*' x.yaml",
+                "grep .*TODO x",
+                "bash -c \"grep '.env*' x\"",
+                "grep -f pats.txt x",
+                "grep --file=pats.txt x",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a quoted or escaped regex, or a non-secret pattern file",
+        );
     }
 
     #[test]
