@@ -33,6 +33,20 @@
 //! (`homelab/scripts/check-runner-status-pat.sh`,
 //! `homelab/hosts/m1max/reprovision/gh-app-token.sh`).
 //!
+//! **Per-repo vouched scripts (opt-in, cameronsjo/cadence-hooks#983).** A repo
+//! may check in [`REPO_CONSUMERS_FILE`] (`.cadence/sops-consumers`, at the
+//! repo root): one repo-relative script path per line, `#` comments and blank
+//! lines ignored. A consumer whose script operand (`bash <path>`, or `<path>`
+//! run directly) is **exactly** one of those strings is allowed, like
+//! `secret-keys.sh`. Entries are exact paths, never globs; an entry that is
+//! absolute, contains `..`, or contains a glob character is ignored. The
+//! operand is compared as typed (one leading `./` tolerated), so a different
+//! spelling of the same file does not match. The repo is vouching for that
+//! script's output contract (it must never print the secret); the guard does
+//! not verify it. This is deliberately NOT composition: nothing widens beyond
+//! the listed literals, and the trust model is the same as running the repo's
+//! own scripts. No file means no change in behavior.
+//!
 //! **Every other disposition of the plaintext is refused**, including a bare
 //! decrypt (stdout *is* the transcript) and a redirect to a file.
 //!
@@ -64,6 +78,7 @@
 //! (truthy), which allows *and* records a bypass row, exactly as
 //! `enforce-worktree` treats `CADENCE_ALLOW_MAIN`.
 
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_word,
     peel_command_runners, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
@@ -86,6 +101,44 @@ const ESCAPE_ENV: &str = "CADENCE_ALLOW_SOPS_DECRYPT";
 /// security guard never moves).
 const KEY_NAME_TOOLS: &[&str] = &["secret-keys.sh"];
 
+/// The opt-in per-repo list of vouched consumer scripts, relative to the repo root.
+pub const REPO_CONSUMERS_FILE: &str = ".cadence/sops-consumers";
+
+/// Upper bound on the list file; a larger one is treated as absent (fail open on
+/// the *list*, so the guard keeps its default, stricter behavior).
+const MAX_CONSUMERS_FILE_BYTES: u64 = 64 * 1024;
+
+/// Parse the consumers list: exact repo-relative paths only. Pure.
+fn parse_repo_consumers(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| {
+            !l.starts_with('/')
+                && !l.starts_with('-')
+                && !l.split('/').any(|part| part == ".." || part.is_empty())
+                && !l.contains(['*', '?', '[', ']', '{', '}', '\\', '~', '$', '`'])
+                && !l.chars().any(char::is_whitespace)
+        })
+        .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+        .collect()
+}
+
+/// Read the vouched-consumer list for the repo enclosing `cwd`, or empty.
+fn load_repo_consumers(cwd: Option<&str>) -> Vec<String> {
+    let Some(state) = cwd.and_then(|c| GitState::resolve(std::path::Path::new(c))) else {
+        return Vec::new();
+    };
+    let path = state.repo_root.join(REPO_CONSUMERS_FILE);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_CONSUMERS_FILE_BYTES => {}
+        _ => return Vec::new(),
+    }
+    std::fs::read_to_string(&path)
+        .map(|t| parse_repo_consumers(&t))
+        .unwrap_or_default()
+}
+
 /// Shell command words that run their `-c`/script argument as the real command.
 /// Used to see through `bash scripts/secret-keys.sh` to the script being run.
 const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
@@ -97,6 +150,12 @@ fn block_message(found: &str) -> String {
     format!(
         "🚫 guard-sops-decrypt: decrypted secret would reach the transcript\n   \
          Found: `{found}`\n   \
+         Why the allowlist is exact: the only consumers vouched for are exact literals \
+         (`secret-keys.sh`, `curl --config -`, and script paths a repo lists in \
+         `.cadence/sops-consumers`); nothing composes, so `sed`/`grep`/a new script name \
+         will not pass however it redacts. If your task needs a credentialed check the \
+         allowlist cannot express, run it from the operator's own terminal instead of \
+         working around this guard.\n   \
          What happens: `sops -d` writes the secret VALUES to stdout, and anything \
          that prints them — grep, cat, head, jq, a redirect — puts a live credential \
          into this session's transcript, where it must then be rotated.\n   \
@@ -136,7 +195,7 @@ fn render_found(segment: &str, consumer: Option<&str>) -> String {
 /// own segment list, on the shared [`MAX_WRAPPER_DEPTH`] budget — so a decrypt
 /// hidden inside a substitution or a wrapper is still seen, and a `&&`/`;`
 /// chain is walked to its end rather than judged on its first command.
-fn first_unsafe_decrypt(script: &str, depth: usize) -> Option<String> {
+fn first_unsafe_decrypt(script: &str, depth: usize, vouched: &[String]) -> Option<String> {
     let segments = split_segments_with_ops(script);
 
     for (index, (segment, op)) in segments.iter().enumerate() {
@@ -151,7 +210,7 @@ fn first_unsafe_decrypt(script: &str, depth: usize) -> Option<String> {
 
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, stripped) {
-                if let Some(found) = first_unsafe_decrypt(&child, depth + 1) {
+                if let Some(found) = first_unsafe_decrypt(&child, depth + 1, vouched) {
                     return Some(found);
                 }
             }
@@ -169,7 +228,7 @@ fn first_unsafe_decrypt(script: &str, depth: usize) -> Option<String> {
             _ => None,
         };
         match consumer {
-            Some(next) if consumer_is_allowed(next) => continue,
+            Some(next) if consumer_is_allowed(next, vouched) => continue,
             other => return Some(render_found(stripped, other)),
         }
     }
@@ -250,10 +309,10 @@ fn writes_elsewhere(token: &str) -> bool {
 /// `segment` is a consumer this guard can vouch for with a decrypted stream on
 /// its stdin.
 ///
-/// Exactly two members, and an unrecognized consumer is refused — that is the
+/// Exactly two built-in members (plus the repo's own vouched scripts), and an unrecognized consumer is refused — that is the
 /// allowlist property, and it is what makes a tool nobody anticipated
 /// (`xxd`, `bat`, a future pager) refuse by default rather than by enumeration.
-fn consumer_is_allowed(segment: &str) -> bool {
+fn consumer_is_allowed(segment: &str, vouched: &[String]) -> bool {
     let stripped = strip_group_wrappers(segment);
     let tokens = tokenize(stripped);
     let argv = skip_transparent_prefixes(&tokens);
@@ -273,7 +332,12 @@ fn consumer_is_allowed(segment: &str) -> bool {
     } else {
         Some(first)
     };
-    target.is_some_and(|path| KEY_NAME_TOOLS.contains(&basename(path)))
+    target.is_some_and(|path| {
+        KEY_NAME_TOOLS.contains(&basename(path))
+            || vouched
+                .iter()
+                .any(|v| v == path.strip_prefix("./").unwrap_or(path))
+    })
 }
 
 /// This `curl` reads its configuration — and therefore the secret — from
@@ -315,7 +379,8 @@ impl Check for SopsDecryptGuard {
         // unexpanded, so a decrypt it builds (`{sops,-d,…}`) is invisible:
         // refuse rather than judge a command this guard cannot see
         // (cadence-hooks#1096). No real command comes near the bounds.
-        let found = first_unsafe_decrypt(command, 0).or_else(|| {
+        let vouched = load_repo_consumers(input.cwd.as_deref());
+        let found = first_unsafe_decrypt(command, 0, &vouched).or_else(|| {
             (command.contains('{') && brace_expansion_overflows(command)).then(|| {
                 "a brace expansion too large to model, which can hide a decrypt".to_string()
             })
@@ -946,5 +1011,88 @@ mod tests {
                 );
             }
         });
+    }
+
+    // --- per-repo vouched scripts (#983) ---
+
+    #[test]
+    fn repo_consumer_list_parses_exact_paths_only() {
+        let text = "# c\n\nscripts/a.sh\n./scripts/b.sh\n/abs/c.sh\nscripts/*.sh\n../up.sh\n\
+                    scripts/../x.sh\n-flag\nscripts/d e.sh\n  scripts/f.sh  \nscripts/g$X.sh\nscripts//h.sh\n";
+        assert_eq!(
+            parse_repo_consumers(text),
+            ["scripts/a.sh", "scripts/b.sh", "scripts/f.sh"]
+        );
+    }
+
+    fn repo_with_list(list: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        if let Some(list) = list {
+            std::fs::create_dir_all(dir.path().join(".cadence")).unwrap();
+            std::fs::write(dir.path().join(REPO_CONSUMERS_FILE), list).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_repo_listed_script_is_a_vouched_consumer_and_nothing_else_is() {
+        let listed = repo_with_list(Some("scripts/check.sh\n"));
+        let unlisted = repo_with_list(None);
+        // (repo, command, blocks)
+        let table = [
+            (&listed, "sops -d s.yaml | bash scripts/check.sh", false),
+            (&listed, "sops -d s.yaml | bash ./scripts/check.sh", false),
+            (&listed, "sops -d s.yaml | bash -x scripts/check.sh", false),
+            (&listed, "sops -d s.yaml | scripts/check.sh", false),
+            // Exact literal: neighbours, prefixes, other spellings, globs.
+            (&listed, "sops -d s.yaml | bash scripts/check.sh.bak", true),
+            (&listed, "sops -d s.yaml | bash scripts/other.sh", true),
+            (
+                &listed,
+                "sops -d s.yaml | bash scripts/../scripts/check.sh",
+                true,
+            ),
+            (&listed, "sops -d s.yaml | bash /abs/scripts/check.sh", true),
+            (&listed, "sops -d s.yaml | bash -c 'cat'", true),
+            (&listed, "sops -d s.yaml | grep x", true),
+            // No list file: no change in behavior.
+            (&unlisted, "sops -d s.yaml | bash scripts/check.sh", true),
+        ];
+        without_escape(|| {
+            for (repo, command, blocks) in table {
+                let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
+                    command,
+                    repo.path().to_str().unwrap(),
+                );
+                let want = if blocks {
+                    Outcome::Block
+                } else {
+                    Outcome::Allow
+                };
+                assert_eq!(SopsDecryptGuard.run(&input).outcome, want, "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_glob_entry_vouches_for_nothing() {
+        let repo = repo_with_list(Some("scripts/*.sh\n"));
+        without_escape(|| {
+            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
+                "sops -d s.yaml | bash scripts/a.sh",
+                repo.path().to_str().unwrap(),
+            );
+            assert_eq!(SopsDecryptGuard.run(&input).outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn block_message_says_the_allowlist_is_exact_and_points_to_the_terminal() {
+        let msg = block_message("sops -d x | cat");
+        assert!(msg.contains("exact literal"), "{msg}");
+        assert!(msg.contains("operator's own terminal"), "{msg}");
+        assert!(msg.contains(".cadence/sops-consumers"), "{msg}");
     }
 }
