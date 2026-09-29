@@ -992,40 +992,47 @@ impl Check for ObsidianTrashGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let vault = match std::env::var("OBSIDIAN_VAULT") {
-            Ok(v) if !v.is_empty() => v,
-            _ => return CheckResult::allow(),
-        };
-
-        let cwd = input.cwd.as_deref().unwrap_or("/");
-        if input.operation() == Some("delete")
-            && let Some(path) = input.file_path()
-        {
-            let result = check_delete_in_vault(&path, cwd, &vault);
-            if result.outcome == cadence_hooks_core::Outcome::Block {
-                return result;
-            }
+        match std::env::var("OBSIDIAN_VAULT") {
+            Ok(vault) if !vault.is_empty() => judge(input, &vault, &RealFs),
+            _ => CheckResult::allow(),
         }
-
-        if input.normalized_tool_name() == Some("Write")
-            && let (Some(path), Some(content)) = (input.file_path(), input.content())
-        {
-            return check_truncate_in_vault(&path, content, cwd, &vault, &RealFs);
-        }
-
-        input.command().map_or_else(CheckResult::allow, |command| {
-            check_destructive_in_vault(command, cwd, &vault, &RealFs)
-        })
     }
 }
+
+/// The guard's whole judgement for `vault`, with existence answered by `meta`.
+/// [`ObsidianTrashGuard::run`] is this over the process environment and the
+/// real filesystem; the liveness check drives it over a fake one so every route
+/// is probed through the same dispatch a hook call takes.
+pub(crate) fn judge(input: &HookInput, vault: &str, meta: &dyn FileMeta) -> CheckResult {
+    let cwd = input.cwd.as_deref().unwrap_or("/");
+    if input.operation() == Some("delete")
+        && let Some(path) = input.file_path()
+    {
+        let result = check_delete_in_vault(&path, cwd, vault);
+        if result.outcome == cadence_hooks_core::Outcome::Block {
+            return result;
+        }
+    }
+
+    if input.normalized_tool_name() == Some("Write")
+        && let (Some(path), Some(content)) = (input.file_path(), input.content())
+    {
+        return check_truncate_in_vault(&path, content, cwd, vault, meta);
+    }
+
+    input.command().map_or_else(CheckResult::allow, |command| {
+        check_destructive_in_vault(command, cwd, vault, meta)
+    })
+}
+
+/// The one lock for every test that sets `OBSIDIAN_VAULT` in this crate.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_vault_env(f: impl FnOnce()) {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
