@@ -8,3 +8,6 @@ description = "Cadence Obsidian plugin hooks: vault trash guard"
 [dependencies]
 cadence-hooks-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }
