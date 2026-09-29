@@ -915,4 +915,36 @@ mod tests {
             )
         });
     }
+
+    /// PR #1118 review: 5000 levels (~50 KB) of `{ (` around `inner`, in the
+    /// three spellings bash runs as groups.
+    fn deep_nests_1118(inner: &str) -> Vec<String> {
+        let k = 5000;
+        vec![
+            format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+            format!("{}{inner}{}", "{(".repeat(k), ")}".repeat(k)),
+            format!("{}{inner}{}", "{ ".repeat(k), "; }".repeat(k)),
+        ]
+    }
+
+    /// Release is the shipped profile; the debug bound only catches a return
+    /// to quadratic work (seconds per shape), not normal debug slowness.
+    fn nest_time_limit_1118() -> std::time::Duration {
+        std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 })
+    }
+
+    #[test]
+    fn deep_group_nesting_decrypt_blocks_in_time() {
+        without_escape(|| {
+            for command in deep_nests_1118("sops -d x | grep y") {
+                let start = std::time::Instant::now();
+                assert_eq!(outcome(&command), Outcome::Block);
+                assert!(
+                    start.elapsed() < nest_time_limit_1118(),
+                    "{:?}",
+                    start.elapsed()
+                );
+            }
+        });
+    }
 }

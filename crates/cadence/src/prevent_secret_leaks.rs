@@ -16,8 +16,8 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, command_segments, command_word, executable_tokens,
-    is_assignment_word, skip_git_global_options, split_segments, strip_heredoc_bodies, tokenize,
-    tokenize_marked,
+    is_assignment_word, skip_git_global_options, split_segments, strip_group_wrappers,
+    strip_heredoc_bodies, tokenize, tokenize_marked,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -603,6 +603,20 @@ fn segment_env_reads_at(
         let _live = LiveScope::set(substitutions_live(segment));
         segment_direct_reads(&tokens, &globs, context)
     };
+    // A group closer glued to the last word — `{ (cat .env)}` — tokenizes as
+    // `.env)}`, a name no secret pattern matches, while bash reads `.env`
+    // (cameronsjo/cadence-hooks#1103). Judge the wrapper-stripped view too; the
+    // union only adds operands, so the raw view's findings all stand.
+    let trimmed = segment.trim();
+    let unwrapped = strip_group_wrappers(trimmed);
+    if trimmed.starts_with(['(', '{']) && unwrapped != trimmed {
+        let _live = LiveScope::set(substitutions_live(unwrapped));
+        for read in segment_direct_reads(&tokenize(unwrapped), context) {
+            if !found.contains(&read) {
+                found.push(read);
+            }
+        }
+    }
     if depth < NESTED_SCAN_DEPTH {
         for script in nested_command_strings(&tokens) {
             if !budget.spend(&script) {
@@ -9351,6 +9365,102 @@ mod tests {
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,
                 "{command:?} must allow"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_c_group_glued_and_escaped_reads_block() {
+        // cadence-hooks#1103 rows, re-verified after #1097.
+        let blocked = [
+            r"cat $'.en\x76'",
+            r"cat $'\056env'",
+            r"cat $'\x2eenv'",
+            "cat $'.e'nv",
+            r#"cat $'\x2e'"env""#,
+            r"sh -c $'cat \x2eenv'",
+            "{ (cat .env)}",
+            "( (cat .env))",
+            r"cat .e\nv",
+        ];
+        for command in blocked {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let allowed = [
+            "{ (cat notes.txt)}",
+            "{ cat .env.example;}",
+            r"cat notes\ file.txt",
+        ];
+        for command in allowed {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_read() {
+        let long = format!("D={}.env; cat $D", "./".repeat(2100));
+        for prefix in padded_prefixes_1118() {
+            for tail in ["D=.env; cat $D", long.as_str()] {
+                let command = format!("{prefix}{tail}");
+                let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Block,
+                    "{}",
+                    &command[command.len().saturating_sub(60)..]
+                );
+            }
+        }
+    }
+
+    /// PR #1118 review: 5000 levels (~50 KB) of `{ (` around `inner`, in the
+    /// three spellings bash runs as groups.
+    fn deep_nests_1118(inner: &str) -> Vec<String> {
+        let k = 5000;
+        vec![
+            format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+            format!("{}{inner}{}", "{(".repeat(k), ")}".repeat(k)),
+            format!("{}{inner}{}", "{ ".repeat(k), "; }".repeat(k)),
+        ]
+    }
+
+    /// Release is the shipped profile; the debug bound only catches a return
+    /// to quadratic work (seconds per shape), not normal debug slowness.
+    fn nest_time_limit_1118() -> std::time::Duration {
+        std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 })
+    }
+
+    #[test]
+    fn deep_group_nesting_read_blocks_in_time() {
+        for command in deep_nests_1118("cat .env") {
+            let start = std::time::Instant::now();
+            let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            assert!(
+                start.elapsed() < nest_time_limit_1118(),
+                "{:?}",
+                start.elapsed()
             );
         }
     }
