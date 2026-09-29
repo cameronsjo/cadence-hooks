@@ -10,9 +10,10 @@ use cadence_hooks_core::config::{
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
-    carries_substitution, command_segments, command_word, contains_ignoring_ascii_case,
-    gh_canonical_verb, gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word,
-    parse_gh_repo_value, parse_work_dir, requote_words, strip_quotes, tokenize,
+    carries_substitution, command_segments, command_segments_with_dirs, command_word,
+    contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
+    host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -987,6 +988,9 @@ impl GhHostEnv {
     }
 
     fn observe_depth(&mut self, segment: &str, depth: usize) {
+        if observes_nothing(segment, self.var) {
+            return;
+        }
         let tokens = tokenize(segment);
         let normalized = strip_compound_openers(&tokens);
         let mut words: &[String] = &normalized;
@@ -1356,6 +1360,33 @@ fn mentions_gh_host(word: &str) -> bool {
 }
 
 /// [`mentions_gh_host`] for any variable name.
+/// Can [`GhHostEnv::observe_depth`] skip `segment` outright? Only when it is
+/// plain words — no quoting, escape, expansion, `=` or brace expansion that
+/// could spell something else once tokenized — none of which mentions `var`
+/// or names a builtin the observation reads. Every arm of the observation
+/// needs one of those, so such a segment leaves the state as it was; skipping
+/// its tokenization keeps a flood of plain commands cheap.
+fn observes_nothing(segment: &str, var: &str) -> bool {
+    if segment.contains(var)
+        || !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" \t\n_./:@%+-;|&(){}".contains(&b))
+    {
+        return false;
+    }
+    !segment
+        .split(|c: char| !(c.is_ascii_alphanumeric() || "_.-".contains(c)))
+        .any(|word| {
+            DECLARING_BUILTINS.contains(&word)
+                || NAME_OPERAND_BUILTINS.contains(&word)
+                || VAR_SETTING_BUILTINS.contains(&word)
+                || matches!(
+                    word,
+                    "unset" | "set" | "source" | "." | "eval" | "trap" | "builtin" | "command"
+                )
+        })
+}
+
 fn mentions_var(word: &str, name: &str) -> bool {
     let bytes = word.as_bytes();
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -2397,6 +2428,16 @@ pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
 const MAX_EVAL_DEPTH: usize = 3;
 
 fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
+    // Plain words only — no quoting, escape, expansion or brace group that
+    // could spell `gh` once tokenized — and no `gh` in any case: no token,
+    // and no `eval`/`env -S` script inside it, can resolve to `gh`.
+    if segment
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b" \t\n_./:@%+-;|&()".contains(&b))
+        && !contains_ignoring_ascii_case(segment, "gh")
+    {
+        return false;
+    }
     let tokens = tokenize(segment);
     if tokens_contain_gh(&tokens) {
         return true;
@@ -3201,8 +3242,22 @@ impl Check for GhWriteGuard {
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
 
-        // AST-based loop detection with regex fallback
-        match loop_analysis::analyze_gh_loops(command) {
+        // AST-based loop detection with regex fallback. A loop needs one of
+        // its reserved words spelled out in the text — they cannot come from
+        // an expansion — and so does the fallback pattern, so a command with
+        // none of them skips the parse: every answer it could give is
+        // `NoLoops` or a fallback that does not match.
+        static LOOP_WORD: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?:^|[^A-Za-z0-9_])(?:for|while|until|select)(?:[^A-Za-z0-9_]|$)")
+                .expect("pattern should compile")
+        });
+        let may_loop = LOOP_WORD.is_match(command);
+        let analysis = if may_loop {
+            loop_analysis::analyze_gh_loops(command)
+        } else {
+            LoopAnalysis::NoLoops
+        };
+        match analysis {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 // Only writes are ownership-gated; reads (gh pr view, issue list) are
                 // owner-independent and safe against any repo — mirror the MissingTargets
@@ -3333,119 +3388,236 @@ impl Check for GhWriteGuard {
         // gh write (with its own -R) can't shield an unowned write later in the
         // chain, and a write hidden in `sh -c '…'` is still seen. The first
         // disallowed / unresolvable write segment blocks.
+        //
+        // Each write is judged in two directories and the sharpest verdict
+        // wins: the whole-command `parse_work_dir` one this guard always used,
+        // and the one its own segment runs in (`segment_work_dirs`). The
+        // whole-command scan cannot see a `cd` on a later line
+        // (`echo hi⏎cd <unowned>⏎gh pr create`), after a backgrounded
+        // command, or in a `{ …; }` group, and it lets a subshell's `cd`
+        // leak into the parent; the per-segment walk follows each of those.
+        // Judging both means neither reading can lose a block the other
+        // finds.
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
-        let mut gh_host_env = GhHostEnv::for_command(command);
-        let mut gh_repo_env = GhHostEnv::for_repo(command);
-        for segment in command_segments(command) {
-            // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
-            // it decides which host every later gh write reaches (#548). A gh
-            // segment is a child process and cannot change it.
-            // A shell started with `BASH_ENV=`/`ENV=` sources that file first,
-            // so anything it runs may inherit a GH_HOST this guard never sees.
-            if tokenize(&segment)
-                .iter()
-                .any(|t| t.starts_with("BASH_ENV=") || t.starts_with("ENV="))
-            {
-                gh_host_env.add_unresolved();
-                gh_repo_env.add_unresolved();
-            }
-            if !segment_invokes_gh(&segment) {
-                gh_host_env.observe_wrapper_prefix(&segment);
-                gh_host_env.observe(&segment);
-                gh_repo_env.observe_wrapper_prefix(&segment);
-                gh_repo_env.observe(&segment);
-                continue;
-            }
-
-            // The write patterns are raw-text regexes, so the decoded words
-            // are judged too: `gh $'issue' create` and `'gh' issue create` run
-            // the write while no raw `gh issue create` exists (#1103).
-            if !is_write_command(&segment) && !is_write_command(&requote_words(&segment)) {
-                continue;
-            }
-
-            // Fail-safe: block when unconfigured.
-            if allowed_owners.is_empty() {
-                return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
-            }
-
-            // Gists are user-scoped; a fork creates under your account.
-            if gh_write_is_user_scoped(&segment) {
-                continue;
-            }
-
-            // #78: `gh api` writes can't all be resolved from the cwd remote.
-            // graphql reads are exempt; any non-`repos/<owner>/<repo>` api write
-            // is unverifiable — block it rather than trusting the owned checkout.
-            if let Some(endpoint) = gh_api_endpoint(&segment) {
-                if is_graphql_endpoint(&endpoint) {
-                    match graphql_mutation_status(&segment) {
-                        // Inline read query — no ownership to check, allow.
-                        Some(false) => continue,
-                        // Bounded, content-free thread-metadata mutation
-                        // (resolve/unresolveReviewThread) — allow like a read.
-                        _ if graphql_is_safe_mutation(&segment) => continue,
-                        // Mutation (`Some(true)`) or non-inline/undeterminable
-                        // (`None`) — both block; the message names the latter.
-                        status => {
-                            return api_unverifiable_block(
-                                &segment,
-                                status.is_none(),
-                                &allowed_owners,
-                                &allowed_repos,
-                            );
-                        }
-                    }
-                }
-                // Non-graphql api write that isn't `repos/<owner>/<repo>`
-                // (graphql is handled above) can't be owner-checked.
-                //
-                // Read the parsed ENDPOINT, not the raw segment, for the same
-                // reason `resolve_target_repo`'s arm 3 does — and this gate is
-                // the one that actually decides. Matching the raw text let a
-                // `repos/<owner>/<repo>` string in any argument value suppress
-                // the block: `gh api orgs/evil/repos -X POST -H "ref:
-                // repos/owner/allowed for docs"` writes to an org endpoint no
-                // owner check can reach, yet the header's path satisfied the
-                // pattern, so the segment fell through to the cwd remote and
-                // was allowed from any owned checkout (#463 review).
-                if api_repos_target(&endpoint).is_none() {
-                    return api_unverifiable_block(
-                        &segment,
-                        false,
-                        &allowed_owners,
-                        &allowed_repos,
-                    );
-                }
-                // `repos/<owner>/<repo>` api write — fall through to the
-                // existing per-segment ownership check below.
-            }
-
-            // Judged once per host gh may have inherited: an earlier export
-            // that might not have run (`false && export …`) leaves more than
-            // one, and the write must be owned on every one of them (#548).
-            // The same for an inherited `GH_REPO` (cadence-hooks#1129).
-            for env_host in gh_host_env.candidates() {
-                for env_repo in gh_repo_env.candidates() {
-                    if let Some(block) = judge_write_segment(
-                        &segment,
-                        &work_dir,
-                        &allowed_owners,
-                        &allowed_repos,
-                        &extra_hosts,
-                        env_host,
-                        env_repo,
-                    ) {
-                        return block;
-                    }
-                }
+        let whole = || {
+            let dir: std::rc::Rc<str> = std::rc::Rc::from(work_dir.as_str());
+            command_segments(command)
+                .into_iter()
+                .map(|segment| (segment, dir.clone()))
+                .collect()
+        };
+        let own = || command_segments_with_dirs(command, cwd);
+        let mut judged = WriteJudgments::default();
+        let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
+        for reading in readings {
+            if let Some(block) = judge_write_segments(
+                command,
+                reading(),
+                &work_dir,
+                &allowed_owners,
+                &allowed_repos,
+                &extra_hosts,
+                &mut judged,
+            ) {
+                return block;
             }
         }
 
         // No write segments, or every write segment targets an owned repo.
         CheckResult::allow()
     }
+}
+
+/// Most distinct directories besides the whole-command one that
+/// [`judge_write_segments`] judges writes in. Each costs git probes, and a
+/// hook that runs past its deadline fails open, so a flood of `cd`s to
+/// distinct directories each followed by a write would otherwise buy an
+/// allow. Past the cap the command blocks: no legitimate command writes
+/// from this many checkouts at once.
+const MAX_SEGMENT_DIRS: usize = 16;
+
+/// One reading of a command: each segment with the directory it is judged in.
+type Reading = Vec<(String, std::rc::Rc<str>)>;
+
+/// What [`judge_write_segments`] has already judged across both readings.
+#[derive(Default)]
+struct WriteJudgments {
+    /// (segment, directory, inherited host, inherited repo) already judged.
+    seen: std::collections::HashSet<[String; 4]>,
+    /// Distinct directories besides the whole-command one judged so far.
+    dirs: Vec<std::rc::Rc<str>>,
+}
+
+/// The block for a command whose writes run in more than
+/// [`MAX_SEGMENT_DIRS`] directories.
+fn too_many_dirs_block(
+    segment: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> CheckResult {
+    CheckResult::block_structured(
+        format!(
+            "🚫 git-guardrails: gh writes run in more than {MAX_SEGMENT_DIRS} directories\n   \
+             Command: {segment}\n   \
+             Each directory's repo is looked up to check ownership, and this many cannot be \
+             checked in time.\n   \
+             Fix: run the gh writes in fewer commands, or name each target with `-R owner/repo`"
+        ),
+        BlockMetadata {
+            rule_id: "gh-write-target-unresolvable".to_string(),
+            fix: "run the gh writes in fewer commands".to_string(),
+            allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+            severity: "error",
+        },
+    )
+}
+
+/// Judge every write among `segments`, each in the directory paired with it,
+/// in order; the first disallowed or unresolvable write blocks.
+///
+/// `segments` is one reading of `command`: every [`command_segments`] segment
+/// in the whole-command directory, or each in the directory its own segment
+/// runs in ([`command_segments_with_dirs`]). The `GH_HOST`/`GH_REPO` a write
+/// inherits is tracked along the reading's own order.
+fn judge_write_segments(
+    command: &str,
+    segments: Reading,
+    whole_dir: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+    judged: &mut WriteJudgments,
+) -> Option<CheckResult> {
+    let mut gh_host_env = GhHostEnv::for_command(command);
+    let mut gh_repo_env = GhHostEnv::for_repo(command);
+    // The segment observed last. Observation only ever adds a candidate or
+    // sets a flag, so observing the same text again at once changes nothing —
+    // and a segment that may run in several directories arrives once per
+    // directory, back to back, as does every `f` of an `f; f; …` flood.
+    let mut observed: Option<String> = None;
+    for (segment, dir) in segments {
+        // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
+        // it decides which host every later gh write reaches (#548). A gh
+        // segment is a child process and cannot change it.
+        // A shell started with `BASH_ENV=`/`ENV=` sources that file first,
+        // so anything it runs may inherit a GH_HOST this guard never sees.
+        if tokenize(&segment)
+            .iter()
+            .any(|t| t.starts_with("BASH_ENV=") || t.starts_with("ENV="))
+        {
+            gh_host_env.add_unresolved();
+            gh_repo_env.add_unresolved();
+        }
+        if !segment_invokes_gh(&segment) {
+            if observed.as_deref() != Some(segment.as_str()) {
+                gh_host_env.observe_wrapper_prefix(&segment);
+                gh_host_env.observe(&segment);
+                gh_repo_env.observe_wrapper_prefix(&segment);
+                gh_repo_env.observe(&segment);
+                observed = Some(segment);
+            }
+            continue;
+        }
+        observed = None;
+
+        // The write patterns are raw-text regexes, so the decoded words
+        // are judged too: `gh $'issue' create` and `'gh' issue create` run
+        // the write while no raw `gh issue create` exists (#1103).
+        if !is_write_command(&segment) && !is_write_command(&requote_words(&segment)) {
+            continue;
+        }
+
+        // Fail-safe: block when unconfigured.
+        if allowed_owners.is_empty() {
+            return Some(CheckResult::block(crate::messages::NOT_CONFIGURED_MSG));
+        }
+
+        // Gists are user-scoped; a fork creates under your account.
+        if gh_write_is_user_scoped(&segment) {
+            continue;
+        }
+
+        // #78: `gh api` writes can't all be resolved from the cwd remote.
+        // graphql reads are exempt; any non-`repos/<owner>/<repo>` api write
+        // is unverifiable — block it rather than trusting the owned checkout.
+        if let Some(endpoint) = gh_api_endpoint(&segment) {
+            if is_graphql_endpoint(&endpoint) {
+                match graphql_mutation_status(&segment) {
+                    // Inline read query — no ownership to check, allow.
+                    Some(false) => continue,
+                    // Bounded, content-free thread-metadata mutation
+                    // (resolve/unresolveReviewThread) — allow like a read.
+                    _ if graphql_is_safe_mutation(&segment) => continue,
+                    // Mutation (`Some(true)`) or non-inline/undeterminable
+                    // (`None`) — both block; the message names the latter.
+                    status => {
+                        return Some(api_unverifiable_block(
+                            &segment,
+                            status.is_none(),
+                            allowed_owners,
+                            allowed_repos,
+                        ));
+                    }
+                }
+            }
+            // Non-graphql api write that isn't `repos/<owner>/<repo>`
+            // (graphql is handled above) can't be owner-checked.
+            //
+            // Read the parsed ENDPOINT, not the raw segment, for the same
+            // reason `resolve_target_repo`'s arm 3 does — and this gate is
+            // the one that actually decides. Matching the raw text let a
+            // `repos/<owner>/<repo>` string in any argument value suppress
+            // the block: `gh api orgs/evil/repos -X POST -H "ref:
+            // repos/owner/allowed for docs"` writes to an org endpoint no
+            // owner check can reach, yet the header's path satisfied the
+            // pattern, so the segment fell through to the cwd remote and
+            // was allowed from any owned checkout (#463 review).
+            if api_repos_target(&endpoint).is_none() {
+                return Some(api_unverifiable_block(
+                    &segment,
+                    false,
+                    allowed_owners,
+                    allowed_repos,
+                ));
+            }
+            // `repos/<owner>/<repo>` api write — fall through to the
+            // existing per-segment ownership check below.
+        }
+
+        // Judged once per host gh may have inherited: an earlier export
+        // that might not have run (`false && export …`) leaves more than
+        // one, and the write must be owned on every one of them (#548).
+        // The same for an inherited `GH_REPO` (cadence-hooks#1129).
+        if &*dir != whole_dir && !judged.dirs.contains(&dir) {
+            if judged.dirs.len() == MAX_SEGMENT_DIRS {
+                return Some(too_many_dirs_block(&segment, allowed_owners, allowed_repos));
+            }
+            judged.dirs.push(dir.clone());
+        }
+        for env_host in gh_host_env.candidates() {
+            for env_repo in gh_repo_env.candidates() {
+                // A repeat of a judged (segment, directory, host, repo) can
+                // only repeat its verdict; skip its git probes.
+                let key = [&segment, &*dir, env_host, env_repo].map(str::to_string);
+                if !judged.seen.insert(key) {
+                    continue;
+                }
+                if let Some(block) = judge_write_segment(
+                    &segment,
+                    &dir,
+                    allowed_owners,
+                    allowed_repos,
+                    extra_hosts,
+                    env_host,
+                    env_repo,
+                ) {
+                    return Some(block);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -8171,6 +8343,251 @@ mod tests {
                     start.elapsed()
                 );
             }
+        });
+    }
+
+    /// Each gh write is judged in the whole-command `parse_work_dir`
+    /// directory AND the directory its own segment runs in, and the sharpest
+    /// verdict wins. Every row is `(command, run from the owned checkout?,
+    /// blocks?)`; `{O}`/`{U}` are the owned/unowned checkouts. The bash
+    /// behavior each bypass row relies on was checked with a `pwd` canary.
+    #[test]
+    fn gh_write_is_judged_where_its_own_segment_runs() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, in_owned, blocks) in [
+                // Allowed on the base: `parse_work_dir` sees no `cd` on a
+                // later line, after a background `&`, or in a brace group.
+                ("echo hi\ncd {U}\ngh pr create -t x", true, true),
+                ("true & cd {U}; gh pr create -t x", true, true),
+                ("{ cd {U}; }; gh pr create -t x", true, true),
+                ("echo hi\ncd {U}\ngh issue comment 1 -b x", true, true),
+                (
+                    "echo hi\ncd {U}\nfor i in 1; do gh pr create -t x; done",
+                    true,
+                    true,
+                ),
+                // Allowed on the base: the subshell's `cd` leaked into the
+                // parent, so the write was judged in the owned checkout.
+                ("(true; cd {O} ); gh pr create -t x", false, true),
+                ("(true; cd {O}; true); gh pr create -t x", false, true),
+                // Blocked on the base, and still: the whole-command reading
+                // is kept, so no block is lost.
+                ("cd {U} && gh pr create -t x", true, true),
+                ("cd {U} | cat; gh pr create -t x", true, true),
+                ("true || cd {U}\ngh pr create -t x", true, true),
+                ("gh pr create -t x", false, true),
+                // Controls.
+                ("cd {O} && gh pr create -t x", false, false),
+                ("cd {O} && gh pr create -t x", true, false),
+                ("cd {O}\ngh pr create -t x", false, false),
+                ("gh pr create -t x", true, false),
+                ("(cd {U} && gh pr view 1); gh pr create -t x", true, false),
+                ("(cd {U}); gh pr create -t x", true, false),
+                ("echo x | { cd {U}; }; gh pr create -t x", true, false),
+                ("{ cd {U}; } & gh pr create -t x", true, false),
+                (
+                    "echo hi\ncd {U}\ngh pr create -R cameronsjo/x -t x",
+                    true,
+                    false,
+                ),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
+                let cwd = if in_owned { o } else { u };
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// The fast paths decline only segments the full reading declines too.
+    #[test]
+    fn plain_segment_fast_paths_agree_with_the_full_reading() {
+        for (segment, invokes_gh) in [
+            ("f", false),
+            ("cd /a/b && make -j4", false),
+            ("GH pr create", true),
+            ("/usr/bin/gh pr create", true),
+            ("eval gh pr create", true),
+            ("env -S gh pr create", true),
+            ("g\\h pr create", true),
+            ("'g'h pr create", true),
+            ("{g,x}h pr create", true),
+            ("echo gh", true),
+        ] {
+            assert_eq!(segment_invokes_gh(segment), invokes_gh, "{segment}");
+        }
+        for (segment, skipped) in [
+            ("f", true),
+            ("cd /a && make", true),
+            ("export GH_HOST=x", false),
+            ("GH_HOST=x", false),
+            ("set -a", false),
+            ("source ./env", false),
+            (". ./env", false),
+            ("read h", false),
+            ("ex\\port GH_HOST=x", false),
+            ("'export' X", false),
+            ("eval x", false),
+            ("trap x EXIT", false),
+            ("builtin export X", false),
+        ] {
+            assert_eq!(observes_nothing(segment, "GH_HOST"), skipped, "{segment}");
+        }
+    }
+
+    /// A 200 KB flood of plain function calls before a write is judged well
+    /// inside the hook deadline, which fails open.
+    #[test]
+    fn a_function_call_flood_before_a_write_blocks_promptly() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            let command = format!(
+                "f() {{ cd {u}; }}; {}gh pr create -t x",
+                "f; ".repeat(70_000)
+            );
+            let started = std::time::Instant::now();
+            let result = GhWriteGuard.run(&input_with(&command, o));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+            assert!(
+                started.elapsed().as_secs_f64() < limit,
+                "{:?}",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// Directory changes neither reading followed: a function body, `pushd`,
+    /// `eval`, `builtin cd`, and a `cd` inside a compound. From an owned
+    /// checkout each ran the write in the unowned one (checked with a real
+    /// `bash` `pwd` canary) and was allowed.
+    #[test]
+    fn gh_write_follows_every_directory_change_form() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                // Allowed on the base.
+                ("f() { cd {U}; }; f; gh pr create -t x", true),
+                ("f() {\ncd {U}\n}\nf\ngh pr create -t x", true),
+                ("function f { cd {U}; }; f; gh pr create -t x", true),
+                ("f() { cd {U}; }; f && gh pr create -t x", true),
+                ("g() { f; }; f() { cd {U}; }; g; gh pr create -t x", true),
+                ("cd() { builtin cd {U}; }; cd {O}; gh pr create -t x", true),
+                ("f() { gh pr create -t x; }; (cd {U}; f)", true),
+                ("pushd {U}; gh pr create -t x", true),
+                ("pushd {U} >/dev/null; gh pr create -t x", true),
+                ("eval 'cd {U}'; gh pr create -t x", true),
+                ("eval cd {U}; gh pr create -t x", true),
+                ("builtin cd {U}; gh pr create -t x", true),
+                ("command cd {U}; gh pr create -t x", true),
+                ("\\cd {U}; gh pr create -t x", true),
+                ("X=1 cd {U}; gh pr create -t x", true),
+                ("! cd {U}; gh pr create -t x", true),
+                ("time cd {U}; gh pr create -t x", true),
+                ("if true; then cd {U}; fi; gh pr create -t x", true),
+                ("if cd {U}; then true; fi; gh pr create -t x", true),
+                ("{ if true; then cd {U}; fi; }; gh pr create -t x", true),
+                (
+                    "while true; do cd {U}; break; done; gh pr create -t x",
+                    true,
+                ),
+                ("for d in {U}; do cd $d; done; gh pr create -t x", true),
+                ("case x in x) cd {U};; esac; gh pr create -t x", true),
+                ("c=cd; $c {U}; gh pr create -t x", true),
+                ("trap 'cd {U}' DEBUG; gh pr create -t x", true),
+                // Unreadable: the shell is somewhere this walk cannot name.
+                ("cd {U}; popd; gh pr create -t x", true),
+                ("eval \"$S\"; gh pr create -t x", true),
+                // Controls: the same forms into the owned checkout, or
+                // forms that move nothing.
+                ("cd {O} && gh pr create -t x", false),
+                ("f() { echo; }; f; gh pr create -t x", false),
+                ("if true; then echo; fi; gh pr create -t x", false),
+                ("f() { cd {O}; }; f; gh pr create -t x", false),
+                ("pushd {O} >/dev/null && gh pr create -t x && popd", false),
+                ("eval 'cd {O}'; gh pr create -t x", false),
+                ("builtin cd {O}; gh pr create -t x", false),
+                ("if true; then cd {O}; fi; gh pr create -t x", false),
+                (
+                    "while true; do cd {O}; break; done; gh pr create -t x",
+                    false,
+                ),
+                ("f() (cd {U}); f; gh pr create -t x", false),
+                ("f() { cd {U}; }; f | cat; gh pr create -t x", false),
+                ("(f() { cd {U}; }; f); gh pr create -t x", false),
+                ("f() { cd {U}; gh pr create -t x; }; echo", false),
+                ("for f in a b; do echo $f; done; gh pr create -t x", false),
+                (
+                    "case x in y) echo;; *) echo;; esac; gh pr create -t x",
+                    false,
+                ),
+                ("eval 'echo hi'; gh pr create -t x", false),
+                ("trap 'rm -f x' EXIT; gh pr create -t x", false),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
+                let result = GhWriteGuard.run(&input_with(&command, o));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A flood of writes, each after a `cd` to a distinct directory, blocks
+    /// past [`MAX_SEGMENT_DIRS`] rather than spending a git lookup on each
+    /// and running past the hook deadline.
+    #[test]
+    fn writes_in_too_many_directories_block() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let o = owned.path().to_str().unwrap();
+        for i in 0..=MAX_SEGMENT_DIRS {
+            std::fs::create_dir(owned.path().join(format!("d{i}"))).unwrap();
+        }
+        with_env(&owners_env(), || {
+            // Every directory is inside the owned checkout, so each write
+            // alone is allowed: only the count blocks.
+            let within: String = (0..MAX_SEGMENT_DIRS)
+                .map(|i| format!("echo\ncd {o}/d{i}\ngh pr create -t x\n"))
+                .collect();
+            let allowed = GhWriteGuard.run(&input_with(&within, o));
+            assert!(
+                !matches!(allowed.outcome, cadence_hooks_core::Outcome::Block),
+                "{:?}",
+                allowed.message
+            );
+            let past = format!("{within}echo\ncd {o}/d{MAX_SEGMENT_DIRS}\ngh pr create -t x");
+            let result = GhWriteGuard.run(&input_with(&past, o));
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "{:?}",
+                result.message
+            );
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("directories")),
+                "{:?}",
+                result.message
+            );
         });
     }
 }
