@@ -73,12 +73,25 @@ fn context_of(output: &Output) -> String {
         .to_string()
 }
 
-#[test]
-fn a_clean_environment_prints_nothing() {
-    let output = run(None, None);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+/// The run's own `CADENCE_METRICS_DIR` is an armed allow-switch too (#963), so
+/// "nothing to report" here means no bypass or refusal row — at most the
+/// armed-switch line naming that one variable.
+fn assert_no_enforcement_row(output: &Output) {
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.trim().is_empty(), "expected silence, got: {stdout}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return;
+    }
+    let context = context_of(output);
+    assert!(context.contains("armed allow-switch"), "{context}");
+    assert!(context.contains("CADENCE_METRICS_DIR"), "{context}");
+    assert!(!context.contains("switched off"), "{context}");
+    assert!(!context.contains("refused"), "{context}");
+}
+
+#[test]
+fn a_clean_environment_reports_no_enforcement_row() {
+    assert_no_enforcement_row(&run(None, None));
 }
 
 #[test]
@@ -102,17 +115,19 @@ fn disabling_the_report_itself_is_refused_and_it_still_reports_a_bypass() {
 }
 
 #[test]
-fn a_disable_naming_only_retired_hooks_prints_nothing() {
-    let output = run(None, Some("retired-hook,retired-check"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.trim().is_empty(), "expected silence, got: {stdout}");
+fn a_disable_naming_only_retired_hooks_reports_no_enforcement_row() {
+    assert_no_enforcement_row(&run(None, Some("retired-hook,retired-check")));
 }
 
+/// #963: an unprotected disable is not a refusal, but it is an armed switch a
+/// repo may have set, so the armed-switch line names it with its value.
 #[test]
-fn a_disable_naming_only_unprotected_hooks_prints_nothing() {
+fn a_disable_naming_only_unprotected_hooks_is_named_as_an_armed_switch() {
     let output = run(None, Some("warn-main-branch"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.trim().is_empty(), "expected silence, got: {stdout}");
+    let context = context_of(&output);
+    assert!(
+        context.contains("CADENCE_DISABLE=warn-main-branch"),
+        "{context}"
+    );
+    assert!(!context.contains("refused"), "{context}");
 }

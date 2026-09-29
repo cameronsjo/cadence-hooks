@@ -5,6 +5,12 @@
 //! the same GitHub closing keywords. One regex serves both so the pattern
 //! cannot drift between checks.
 
+use cadence_hooks_core::display::sanitize_field;
+use cadence_hooks_core::gh_bodies::extract_bodies;
+use cadence_hooks_core::shell::{
+    GhRepoFlag, command_segments, command_word, gh_command_path, gh_repo_flags,
+    host_and_repo_from_url, parse_gh_repo_value, tokenize,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -41,6 +47,101 @@ pub fn extract_refs(text: &str) -> Vec<u64> {
     nums.sort_unstable();
     nums.dedup();
     nums
+}
+
+/// Code that is not prose: fenced blocks and inline code spans, where a `#N`
+/// is text, not a reference.
+static CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```.*?```|`[^`\n]*`").expect("pattern should compile"));
+
+/// A bare `#N`: not glued to a word, path, `#`, `&` (an HTML entity), `.` or `-`
+/// before it, so `owner/repo#N` never matches. One to five digits, so a
+/// six-digit hex colour (`#123456`) is not read as an issue number.
+static BARE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^\w/#&.\-])#(?P<num>[0-9]{1,5})\b").expect("pattern should compile")
+});
+
+/// Sorted, deduplicated bare `#N` references in the prose of `body`
+/// (cameronsjo/cadence-hooks#150).
+pub fn bare_refs(body: &str) -> Vec<u64> {
+    let prose = CODE_RE.replace_all(body, " ");
+    let mut nums: Vec<u64> = BARE_REF_RE
+        .captures_iter(&prose)
+        .filter_map(|cap| cap.name("num")?.as_str().parse().ok())
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    nums
+}
+
+/// Nudge text when a `gh` issue/PR write is retargeted with `-R <repo>` at a
+/// repo other than the checkout's own, and its body carries a bare `#N`.
+///
+/// A bare `#N` resolves against the repo the body is posted to, so a
+/// reference typed for the checkout's repo dangles or, worse, points at an
+/// unrelated issue there. Local only (cameronsjo/cadence-hooks#150, option
+/// b): no network, no `gh api` — the only outside reading is the checkout's
+/// `origin` slug, handed in as `origin_slug` and asked for lazily, so a
+/// command with no bare ref pays nothing. An unreadable origin, an unreadable
+/// or ambiguous `-R` value, and a `-R` naming the checkout's own repo are all
+/// silent: advisory only, and never a guess.
+pub fn cross_repo_bare_ref_nudge(
+    command: &str,
+    base_dir: &str,
+    origin_slug: &dyn Fn() -> Option<String>,
+) -> Option<String> {
+    for segment in command_segments(command) {
+        let tokens = tokenize(&segment);
+        let Some(start) = tokens.iter().position(|t| command_word(t) == "gh") else {
+            continue;
+        };
+        let argv = &tokens[start..];
+        let is_posting = matches!(
+            gh_command_path(argv, 2).as_slice(),
+            ["issue", "create" | "edit" | "comment"]
+                | ["pr", "create" | "edit" | "comment" | "review"]
+        );
+        if !is_posting {
+            continue;
+        }
+        let GhRepoFlag::Target(value) = gh_repo_flags(argv).resolve() else {
+            continue;
+        };
+        let Some(spec) = parse_gh_repo_value(&value) else {
+            continue;
+        };
+        let target = format!("{}/{}", spec.owner, spec.name);
+        let mut refs: Vec<u64> = extract_bodies(&segment, base_dir)
+            .iter()
+            .flat_map(|body| bare_refs(body))
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        if refs.is_empty() {
+            continue;
+        }
+        let Some(origin) = origin_slug() else {
+            continue;
+        };
+        if origin.eq_ignore_ascii_case(&target) {
+            continue;
+        }
+        let shown: Vec<String> = refs.iter().take(5).map(|n| format!("#{n}")).collect();
+        let target = sanitize_field(&target, 80);
+        return Some(format!(
+            "This body is posted to {target}, not to this checkout's repo, but it contains a bare {refs}. \
+             A bare `#N` resolves against {target}. If you mean an issue in another repo, write \
+             `owner/repo#N` so the reference survives.",
+            refs = shown.join(", "),
+        ));
+    }
+    None
+}
+
+/// The `owner/repo` slug of `dir`'s `origin` remote, from local git config.
+pub fn origin_slug_of(dir: &str) -> Option<String> {
+    let url = cadence_hooks_core::shell::git_command(dir, &["remote", "get-url", "origin"])?;
+    host_and_repo_from_url(&url).map(|(_host, slug)| slug)
 }
 
 #[cfg(test)]

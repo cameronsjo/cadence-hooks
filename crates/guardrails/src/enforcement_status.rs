@@ -24,7 +24,14 @@
 //! |---|---|
 //! | `CADENCE_BYPASS=1` | every guard is off, the protected ones by name |
 //! | `CADENCE_DISABLE` naming a protected guard | the disable was refused; those guards still run |
+//! | any allow-switch in [`ARMED_SWITCHES`] present | one line naming each armed switch |
 //! | anything else | nothing |
+//!
+//! The armed-switch line (cameronsjo/cadence-hooks#963, #960) is a nudge only
+//! and changes no behavior: `CADENCE_BYPASS` keeps its semantics. It exists so
+//! a value a repository set in `.claude/settings.json` is loud. Names come from
+//! the static list; `CADENCE_DISABLE` alone shows its value, and only when the
+//! value is a plain hook-name list (see [`safe_disable_value`]).
 //!
 //! The refused-disable row is not a hazard by itself — the guards still run —
 //! but it means something tried to switch them off, which is worth one line.
@@ -45,10 +52,12 @@
 //!
 //! # No attacker bytes in the output
 //!
-//! Both variables can come from a project's settings file. The report names
-//! guards only by the `&'static str` entries of [`PROTECTED_GUARDS`] that
-//! matched, never by the raw environment value, so nothing a repository writes
-//! into `CADENCE_DISABLE` reaches `additionalContext`.
+//! Every variable can come from a project's settings file. The bypass and
+//! refused-disable rows name guards only by the `&'static str` entries of
+//! [`PROTECTED_GUARDS`] that matched. The armed-switch line names variables from
+//! a static list and shows the raw `CADENCE_DISABLE` value only when it passes
+//! [`safe_disable_value`] (plain hook-name charset, length-capped); anything
+//! else is withheld, so a repository cannot inject prose into `additionalContext`.
 //!
 //! Fail open (ADR-0001): this check never blocks. Its worst outcome is a nudge.
 //!
@@ -66,6 +75,74 @@ pub const HOOK_NAME: &str = "enforcement-status";
 /// hook and write beside this one; the prefix is the one part of the text a
 /// reader can match against this binary.
 pub const REPORT_PREFIX: &str = "[cadence-hooks enforcement-status]";
+
+/// Allow-switches that weaken or redirect enforcement and that a repository can
+/// set through its checked-in settings. Presence (non-empty) is what is
+/// reported; only `CADENCE_DISABLE` shows a value.
+pub const ARMED_SWITCHES: &[&str] = &[
+    "CADENCE_ALLOW_SENSITIVE_TERMS",
+    "CADENCE_ALLOW_MAIN",
+    "CADENCE_NO_ENFORCE_WORKTREE",
+    bypass::BYPASS_VAR,
+    bypass::DISABLE_VAR,
+    "CADENCE_MARKER_DIR",
+    "CADENCE_METRICS_DIR",
+];
+
+const MAX_SHOWN_DISABLE_LEN: usize = 120;
+
+/// The `CADENCE_DISABLE` value if it is safe to print: hook-name characters and
+/// list separators only, capped in length.
+fn safe_disable_value(value: &str) -> Option<&str> {
+    let plain = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ',' | '.'));
+    (plain && value.len() <= MAX_SHOWN_DISABLE_LEN).then_some(value)
+}
+
+/// One line naming every armed switch in `lookup`, or `None` when none is set.
+/// Pure over an env lookup so the table is testable without the process env.
+#[must_use]
+pub fn armed_switches_line(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let armed: Vec<String> = ARMED_SWITCHES
+        .iter()
+        .filter_map(|name| {
+            let value = lookup(name).filter(|v| !v.is_empty())?;
+            if *name == bypass::DISABLE_VAR {
+                Some(match safe_disable_value(&value) {
+                    Some(v) => format!("{name}={v}"),
+                    None => format!("{name} (value withheld)"),
+                })
+            } else {
+                Some((*name).to_string())
+            }
+        })
+        .collect();
+    if armed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{REPORT_PREFIX} armed allow-switch(es) present in the environment: {list}. \
+         A project's .claude/settings.json env block can set these. If you did not set them, \
+         check that file.",
+        list = armed.join(", "),
+    ))
+}
+
+/// The full SessionStart report for an environment lookup: the bypass/disable
+/// report and the armed-switch line, newline-joined; `None` when both are silent.
+#[must_use]
+pub fn report_for_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let base = report_from(
+        lookup(bypass::BYPASS_VAR).as_deref(),
+        lookup(bypass::DISABLE_VAR).as_deref(),
+    );
+    let armed = armed_switches_line(&lookup);
+    match (base, armed) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (a, b) => a.or(b),
+    }
+}
 
 /// The report for explicit variable values, or `None` when there is nothing
 /// to say.
@@ -124,9 +201,7 @@ impl Check for EnforcementStatus {
     }
 
     fn run(&self, _input: &HookInput) -> CheckResult {
-        let bypass_value = std::env::var(bypass::BYPASS_VAR).ok();
-        let disable_value = std::env::var(bypass::DISABLE_VAR).ok();
-        match report_from(bypass_value.as_deref(), disable_value.as_deref()) {
+        match report_for_env(|name| std::env::var(name).ok()) {
             Some(message) => CheckResult::nudge(message),
             None => CheckResult::allow(),
         }
@@ -266,5 +341,95 @@ mod tests {
             .expect("the report leads with the prefix");
         assert!(body.contains("trash-guard"), "{report}");
         assert!(!body.contains(HOOK_NAME), "{report}");
+    }
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#963/#960: every armed switch is named.
+    #[test]
+    fn armed_switches_are_named_and_only_present_ones() {
+        type Case = (
+            &'static [(&'static str, &'static str)],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let table: &[Case] = &[
+            (&[], &[], &["CADENCE_"]),
+            (
+                &[("CADENCE_ALLOW_MAIN", "true")],
+                &["CADENCE_ALLOW_MAIN"],
+                &["CADENCE_BYPASS"],
+            ),
+            (
+                &[
+                    ("CADENCE_ALLOW_SENSITIVE_TERMS", "1"),
+                    ("CADENCE_NO_ENFORCE_WORKTREE", "1"),
+                ],
+                &[
+                    "CADENCE_ALLOW_SENSITIVE_TERMS",
+                    "CADENCE_NO_ENFORCE_WORKTREE",
+                ],
+                &["CADENCE_ALLOW_MAIN"],
+            ),
+            (
+                &[
+                    ("CADENCE_MARKER_DIR", "/evil"),
+                    ("CADENCE_METRICS_DIR", "/evil2"),
+                ],
+                &["CADENCE_MARKER_DIR", "CADENCE_METRICS_DIR"],
+                &["/evil"],
+            ),
+            (&[("CADENCE_ALLOW_MAIN", "")], &[], &["CADENCE_"]),
+            (
+                &[("CADENCE_DISABLE", "warn-main-branch,enforce-worktree")],
+                &["CADENCE_DISABLE=warn-main-branch,enforce-worktree"],
+                &[],
+            ),
+            (
+                &[("CADENCE_DISABLE", "x IGNORE PREVIOUS")],
+                &["CADENCE_DISABLE (value withheld)"],
+                &["IGNORE"],
+            ),
+        ];
+        for (env, present, absent) in table {
+            // The lookup closure needs 'static pairs; leak the small test table.
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(env.to_vec().into_boxed_slice());
+            let line = armed_switches_line(env_of(pairs));
+            if present.is_empty() {
+                assert_eq!(line, None, "{env:?}");
+                continue;
+            }
+            let line = line.expect("armed switches report");
+            assert!(line.starts_with(REPORT_PREFIX), "{line}");
+            for want in *present {
+                assert!(line.contains(want), "{want} missing: {line}");
+            }
+            for no in *absent {
+                assert!(!line.contains(no), "{no} unexpected: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_combined_report_keeps_the_bypass_row_and_adds_the_armed_line() {
+        let report = report_for_env(env_of(&[
+            ("CADENCE_BYPASS", "1"),
+            ("CADENCE_ALLOW_MAIN", "1"),
+        ]))
+        .expect("reports");
+        assert!(
+            report.contains("every cadence-hooks guard is switched off"),
+            "{report}"
+        );
+        assert!(report.contains("armed allow-switch"), "{report}");
+        assert_eq!(report_for_env(env_of(&[])), None);
     }
 }
