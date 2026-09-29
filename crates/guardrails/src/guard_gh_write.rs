@@ -3397,7 +3397,7 @@ impl Check for GhWriteGuard {
         // command, or in a `{ …; }` group, and it lets a subshell's `cd`
         // leak into the parent; the per-segment walk follows each of those.
         // Judging both means neither reading can lose a block the other
-        // finds.
+        // finds (cameronsjo/cadence-hooks#1137).
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
         let whole = || {
