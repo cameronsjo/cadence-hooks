@@ -175,6 +175,13 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
 /// quoted parens that a raw count sees as balanced. An escaped `\(` outside
 /// quotes is likewise not grouping syntax and is not counted.
 pub fn has_unbalanced_groups(segment: &str) -> bool {
+    let (opens, closes, backticks) = unquoted_group_counts(segment);
+    opens != closes || backticks % 2 == 1
+}
+
+/// Unquoted `(`, `)` and backtick counts — the one scan behind
+/// [`has_unbalanced_groups`] and [`unquoted_paren_counts`].
+fn unquoted_group_counts(segment: &str) -> (usize, usize, usize) {
     let chars: Vec<char> = segment.chars().collect();
     let mut quote: Option<Quote> = None;
     let mut opens = 0usize;
@@ -196,7 +203,7 @@ pub fn has_unbalanced_groups(segment: &str) -> bool {
         }
         i += 1;
     }
-    opens != closes || backticks % 2 == 1
+    (opens, closes, backticks)
 }
 
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
@@ -353,6 +360,9 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     let mut unquoted_prefix: Option<usize> = None;
     let mut quote: Option<Quote> = None;
     let mut lead = LeadRun::default();
+    // Set by a decoded `\0` inside `$'…'`: bash ends the string's value there,
+    // so everything up to the closing quote is dropped.
+    let mut ansi_c_nul = false;
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -366,19 +376,22 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
             }
             Some(Quote::AnsiC) => {
-                // The escape is consumed and the next character kept verbatim.
-                // Only the boundary matters here: decoding `\n` to a newline
-                // would be modelling bash's escape table, which this is not.
+                // bash DECODES `$'…'` escapes, and the decoded bytes are what a
+                // wrapped script is parsed from: `bash -c $'echo a\ncat .env'`
+                // and `trap $'echo a\ncat .env' EXIT` run the read on its own
+                // line. Keeping `\n` as a bare `n` joined the two commands into
+                // one harmless `echo` (cadence-hooks#1089 review).
                 if c == '\\' {
                     if let Some(escaped) = chars.next() {
-                        current.push(escaped);
+                        decode_ansi_c_escape(escaped, &mut chars, &mut current, &mut ansi_c_nul);
                     }
                     continue;
                 }
                 if c == '\'' {
                     quote = None;
+                    ansi_c_nul = false;
                     lead.close(current.len());
-                } else {
+                } else if !ansi_c_nul {
                     current.push(c);
                 }
             }
@@ -458,6 +471,87 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
         });
     }
     tokens
+}
+
+/// Decode one `$'…'` escape — the character after the backslash is `escaped`
+/// — onto `out`, reading any further digits from `chars`, the way bash does.
+///
+/// The table is bash's: `\a \b \e \E \f \n \r \t \v \\ \' \" \?`, octal
+/// `\NNN` (one to three digits), `\xHH` (one or two hex digits), `\uHHHH` and
+/// `\UHHHHHHHH`, and `\cX` (control character). An escape bash does not know
+/// keeps its backslash, as bash does (`$'\q'` is `\q`). A decoded NUL ends the
+/// string's value — bash truncates there — which `nul` records so the caller
+/// drops the rest of the run.
+fn decode_ansi_c_escape(
+    escaped: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    nul: &mut bool,
+) {
+    let mut push = |c: char, out: &mut String| {
+        if c == '\0' {
+            *nul = true;
+        }
+        if !*nul {
+            out.push(c);
+        }
+    };
+    let mut digits = |first: Option<u32>, radix: u32, max: usize| -> Option<u32> {
+        let mut value = first;
+        let mut taken = usize::from(first.is_some());
+        while taken < max {
+            let Some(d) = chars.peek().and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            chars.next();
+            value = Some(value.unwrap_or(0) * radix + d);
+            taken += 1;
+        }
+        value
+    };
+    let simple = match escaped {
+        'a' => Some('\u{07}'),
+        'b' => Some('\u{08}'),
+        'e' | 'E' => Some('\u{1b}'),
+        'f' => Some('\u{0c}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{0b}'),
+        '\\' | '\'' | '"' | '?' => Some(escaped),
+        _ => None,
+    };
+    if let Some(c) = simple {
+        push(c, out);
+        return;
+    }
+    let numeric = match escaped {
+        '0'..='7' => digits(escaped.to_digit(8), 8, 3).map(|v| v & 0xff),
+        'x' => digits(None, 16, 2),
+        'u' => digits(None, 16, 4),
+        'U' => digits(None, 16, 8),
+        'c' => match chars.next() {
+            Some(x) => Some(u32::from(x) & 0x1f),
+            None => {
+                push('\\', out);
+                push('c', out);
+                return;
+            }
+        },
+        _ => {
+            push('\\', out);
+            push(escaped, out);
+            return;
+        }
+    };
+    match numeric.and_then(char::from_u32) {
+        Some(c) => push(c, out),
+        // `\x` with no hex digit, or an invalid code point: bash keeps it.
+        None => {
+            push('\\', out);
+            push(escaped, out);
+        }
+    }
 }
 
 /// Expand a leading `$HOME` or `${HOME}` in a token against `home`, the way
@@ -757,11 +851,59 @@ pub fn looks_absolute(p: &str) -> bool {
 /// rather than a bare `(`/`{` token. [`tokenize`] treats the punctuation as
 /// part of the adjacent word (`(gh` is one token), so a caller that gates on
 /// the leading word MUST strip first or the gate never fires (#239 F4).
+///
+/// **A trailing `}` is trimmed only where the shell would read it as a group
+/// closer** (cadence-hooks#889). The earlier unconditional trim ate real word
+/// bytes: `git push origin secret}` publishes `secret}` (bash prints the `}` in
+/// `echo main}`, and `git check-ref-format` accepts it), `cd /other}` moves to
+/// `/other}`, and `rm {a,b}` / `echo ${HOME}` end in a brace that belongs to
+/// the word. `}` is a reserved word, so it closes a group only as its own word:
+/// `{ echo hi }` is a syntax error while `{ echo hi;}` and `{ (echo hi)}` run
+/// (measured under bash). So a `}` counts as a closer when nothing precedes it
+/// in the segment or `;`, `&`, `|` or `)` does, and after whitespace only when
+/// the segment opened a `{` group — `mycmd }` and `cd }` pass `}` as an
+/// argument. Anything else keeps it as a word byte. Opener matching is not the test: the segmenter
+/// splits on `;`, so `{ echo hi; }` puts its opener and closer in different
+/// segments and a per-segment count would keep correct closers.
+///
+/// `)` is still trimmed unconditionally. Outside a `case` label an unquoted `)`
+/// is always an operator — `bash -c 'echo hi)'` is a syntax error — so a
+/// segment-trailing `)` glued to a word cannot occur in a command that runs.
+/// That also settles the one ambiguous brace: after `)` a `}` is a closer in
+/// `{ (cd x)}` and a word byte in `echo $(echo a)}`, and it is trimmed — keeping
+/// it would glue `)}` onto the last word of the far more common group form.
 pub fn strip_group_wrappers(segment: &str) -> &str {
-    segment
-        .trim()
-        .trim_start_matches(['(', '{', ' ', '\t'])
-        .trim_end_matches([')', '}', ';', ' ', '\t'])
+    let trimmed = segment.trim();
+    let opened_a_brace_group = trimmed.starts_with('{');
+    let mut rest = trimmed.trim_start_matches(['(', '{', ' ', '\t']);
+    loop {
+        rest = rest.trim_end_matches([')', ';', ' ', '\t']);
+        match rest.strip_suffix('}') {
+            Some(before) if closes_a_group(before, opened_a_brace_group) => rest = before,
+            _ => return rest,
+        }
+    }
+}
+
+/// Whether a `}` following `before` is a group closer. See
+/// [`strip_group_wrappers`].
+///
+/// After an operator (`;`, `&`, `|`, `)`) or with nothing before it, the `}`
+/// stands in command position and closes. After plain whitespace it is only a
+/// closer when the segment itself opened a `{` group (`{ (cd x) }`); otherwise
+/// it is an ARGUMENT — `mycmd }` passes `}`, and `cd }` changes into a
+/// directory named `}` rather than running a bare `cd`.
+fn closes_a_group(before: &str, opened_a_brace_group: bool) -> bool {
+    match before.chars().next_back() {
+        None => true,
+        Some(';' | '&' | '|' | ')') => true,
+        Some(c) if c.is_whitespace() => {
+            opened_a_brace_group
+                || before.trim_end().ends_with([';', '&', '|', ')'])
+                || before.trim().is_empty()
+        }
+        Some(_) => false,
+    }
 }
 
 /// Reserved words that occupy the head position of a segment without being the
@@ -1040,8 +1182,16 @@ pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice",
 /// every gate downstream. `env` and `nice` escaped that only because they are
 /// ALSO in [`COMMAND_RUNNERS`], whose peel resolves through [`command_word`],
 /// which does unescape (cadence-hooks#237 security review, F13).
+///
+/// **The word resolves through [`command_word`], so a path spelling counts.**
+/// The earlier unescape-and-fold did not basename, so `/usr/bin/nohup sops -d
+/// secrets.yaml`, `/usr/bin/time -p …` and `/usr/bin/env GIT_DIR=/x git …` kept
+/// the prefix as the command word and hid the verb behind it from every guard
+/// that peels through here (cadence-hooks#888). Skipping more prefixes only
+/// exposes more verbs to the gates downstream — it can add blocks and never
+/// subtract one (the cadence-hooks#488 argument).
 pub fn names_transparent_prefix(word: &str) -> bool {
-    TRANSPARENT.contains(&fold_verb(unescape_word(word).as_ref()).as_ref())
+    TRANSPARENT.contains(&command_word(word).as_ref())
 }
 
 /// Is `tokens[idx]` a leading word the real command runs *through* — a
@@ -1077,14 +1227,33 @@ pub fn names_transparent_prefix(word: &str) -> bool {
 /// with nothing after it is not a prefix word — there is no command for it to
 /// run through. A panic in a guard is a hard block by another name, which
 /// ADR-0001's fail-open posture forbids.
+///
+/// **A `--` straight after a prefix is part of the prefix.** Every
+/// [`TRANSPARENT`] word reads it as the end of its own options and runs the
+/// word after it (measured under bash for all seven, and for the `/usr/bin`
+/// spellings of `nohup` and `env`), so `nohup -- sops -d secrets.yaml` runs sops.
+/// Read as a flag, it stopped the skip and left `nohup` as the command word,
+/// hiding the verb from every gate (cadence-hooks#888). The `--` is itself a
+/// prefix word only when the word before it is a prefix and something follows
+/// it to run.
 pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
     let Some(tok) = tokens.get(idx).map(String::as_str) else {
         return false;
     };
-    let runs_the_next_word = tokens
-        .get(idx + 1)
-        .is_some_and(|next| !unescape_word(next).starts_with('-'));
-    (names_transparent_prefix(tok) && runs_the_next_word) || is_assignment_word(tok)
+    let is_end_of_options = |word: &str| unescape_word(word).as_ref() == "--";
+    let runs_the_next_word = tokens.get(idx + 1).is_some_and(|next| {
+        !unescape_word(next).starts_with('-')
+            || (is_end_of_options(next) && tokens.get(idx + 2).is_some())
+    });
+    let ends_a_prefix_s_options = is_end_of_options(tok)
+        && idx
+            .checked_sub(1)
+            .and_then(|before| tokens.get(before))
+            .is_some_and(|before| names_transparent_prefix(before))
+        && tokens.get(idx + 1).is_some();
+    (names_transparent_prefix(tok) && runs_the_next_word)
+        || ends_a_prefix_s_options
+        || is_assignment_word(tok)
 }
 
 /// Skip transparent command prefixes that run their argument as the command, so
@@ -1651,10 +1820,47 @@ fn skip_redirect(operands: &[String], i: usize) -> Option<usize> {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
-pub(crate) fn is_redirect_token(token: &str) -> bool {
+///
+/// A named-descriptor prefix (`{fd}>/dev/null`, bash's `{varname}` form) is
+/// stripped the same way as a digit one.
+pub fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
+    let rest = strip_named_fd(rest).unwrap_or(rest);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The byte length of `word`'s redirect OPERATOR — leading `&`s, a
+/// descriptor (digits or `{name}`), and the `>`/`<` run — and whether the
+/// operator is the whole word (its target is then the next word). `None` when
+/// `word` is not redirect-shaped ([`is_redirect_token`]).
+///
+/// A caller holding a [`MarkedToken`] must require the token's
+/// `unquoted_prefix_len` to reach this length: quote removal makes `2'>'x`
+/// (a literal file name) byte-identical to `2>x`, and only the operator's own
+/// quoting tells them apart (cadence-hooks#1058 review I-c).
+pub fn redirect_operator_span(word: &str) -> Option<(usize, bool)> {
+    if !is_redirect_token(word) {
+        return None;
+    }
+    let rest = word.trim_start_matches('&');
+    let rest = strip_named_fd(rest)
+        .unwrap_or_else(|| rest.trim_start_matches(|c: char| c.is_ascii_digit()));
+    let after = rest.trim_start_matches(['>', '<']);
+    Some((word.len() - after.len(), after.is_empty()))
+}
+
+/// `rest` after a leading `{ident}` descriptor name, or `None` when it has
+/// none.
+fn strip_named_fd(rest: &str) -> Option<&str> {
+    let inner = rest.strip_prefix('{')?;
+    let (name, after) = inner.split_once('}')?;
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(after)
 }
 
 /// The `gh pr <sub>` invocation in `tokens`, or `None`.
@@ -3611,6 +3817,33 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, false)
+}
+
+/// [`split_segments_with_ops`], except that an `&` belonging to a redirection
+/// operator — `>&`/`<&` (`2>&1`, `>&2`, `<&-`) or `&>`/`&>>` — stays inside
+/// its segment instead of cutting it as a background `&`.
+///
+/// The default splitter cuts `cd /wt 2>&1 & git commit` into `cd /wt 2>`,
+/// `1`, and `git commit`, so a caller cannot tell a real background `&` from
+/// half of a redirection. A walk that scopes a backgrounded `cd` to its
+/// subshell needs exactly that distinction (cadence-hooks#1058). Decided
+/// lexically, the way the shell does: `&` right after an unescaped `>`/`<`, or
+/// right before `>`, is part of the operator; `cd /wt & >/dev/null git commit`
+/// (space before `>`) still backgrounds the cd.
+///
+/// Opt-in rather than a change to [`split_segments_with_ops`], whose many
+/// callers were written against its current segments.
+pub fn split_segments_with_ops_joining_redirects(
+    command: &str,
+) -> Vec<(String, Option<&'static str>)> {
+    split_segments_impl(command, true)
+}
+
+fn split_segments_impl(
+    command: &str,
+    join_redirect_amp: bool,
+) -> Vec<(String, Option<&'static str>)> {
     // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
     // with the body scan, because the shell reads one logical line and only
     // then begins a heredoc body on the line after it (#475).
@@ -3716,6 +3949,13 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
                 quote = Some(Quote::Double);
                 current.push(c);
             }
+            '&' if join_redirect_amp
+                && chars.peek() != Some(&'&')
+                && (ends_with_unescaped_redirect_op(current.as_str())
+                    || chars.peek() == Some(&'>')) =>
+            {
+                current.push(c);
+            }
             '&' => {
                 // `&&` and `&` are both separators; consume the second `&`.
                 let op = if chars.peek() == Some(&'&') {
@@ -3752,6 +3992,15 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
         segments.push((trimmed.to_string(), None));
     }
     segments
+}
+
+/// Whether `text` ends, with no space before the next character, in an
+/// unescaped `>` or `<` — the first half of a `>&`/`<&` operator.
+fn ends_with_unescaped_redirect_op(text: &str) -> bool {
+    let Some(before) = text.strip_suffix(['>', '<']) else {
+        return false;
+    };
+    before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
 }
 
 /// Whether `text` ends in a `>` that the shell reads as a redirect operator
@@ -5580,13 +5829,21 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
 /// `for f in a; do bash -c 'rm note.md'; done` and `(bash -c 'rm note.md')` all
 /// deleted a real file while the bare `rm` one position over blocked (#528
 /// review E). Idempotent, so a caller that already stripped loses nothing.
+///
+/// **`eval` and `trap` are the two builtins that hand a WORD back to the parser
+/// as a script, so they are answered here too** — see [`eval_script`] and
+/// [`trap_action`]. Both were opaque operands before: `eval 'git push origin
+/// main'` returned zero invocations to every walker (cadence-hooks#886), and
+/// `trap 'cat .env' EXIT` read the file while the leak guard allowed it
+/// (cadence-hooks#1059). Answering them here, rather than per guard, is what
+/// makes `command_segments` and [`child_scripts`] gain them together.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let tokens = peel_command_runners(strip_compound_heads(tokens));
-    if !matches!(
-        command_word(tokens.first()?).as_ref(),
-        "sh" | "bash" | "zsh" | "dash"
-    ) {
-        return None;
+    match command_word(tokens.first()?).as_ref() {
+        "sh" | "bash" | "zsh" | "dash" => {}
+        "eval" => return eval_script(&tokens[1..]),
+        "trap" => return trap_action(&tokens[1..]),
+        _ => return None,
     }
     for (i, raw) in tokens.iter().enumerate().skip(1) {
         // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
@@ -5622,6 +5879,130 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// How many directly nested `eval`s [`eval_script`] unwraps in place, without
+/// charging the caller's [`MAX_WRAPPER_DEPTH`].
+///
+/// `eval eval eval eval sops -d x` runs the sops, and charging each `eval` a
+/// wrapper level exhausted the shared budget of 3 before the command was
+/// reached, so the guard saw nothing. Each unwrap strictly shortens the text
+/// (it drops at least the word `eval`), so the loop is bounded by the input as
+/// well as by this cap. Past the cap the partly unwrapped script is returned
+/// as-is — still visible to the caller's own recursion, never dropped.
+const MAX_EVAL_UNWRAP: usize = 16;
+
+/// The script `eval` runs: its operands, each with the shell's backslash
+/// removal applied, joined with single spaces.
+///
+/// [`tokenize`] removes quotes but leaves backslashes outside a quoted-quote in
+/// place, so its tokens are NOT what bash hands `eval`. `eval "echo \$(cat
+/// .env)"` and `eval echo \$\(cat .env\)` both run the substitution, and read
+/// raw the `\$(` hid it from every scanner. [`unescape_word`] per operand
+/// closes that. It also unescapes a backslash inside SINGLE quotes, where bash
+/// keeps it literal — so `eval 'echo \$(cat .env)'` is over-inspected, which
+/// can only add a block.
+///
+/// A leading `--` is skipped: bash and zsh treat it as the end of `eval`'s
+/// options. dash runs it as a command named `--`, which fails, so surfacing the
+/// rest there over-inspects a script that never runs — the detector direction,
+/// a possible false block and never a miss.
+///
+/// A script that is itself a single `eval` is unwrapped here, up to
+/// [`MAX_EVAL_UNWRAP`] times, so a chain of `eval`s does not spend the
+/// caller's wrapper budget.
+///
+/// **An operand that is not statically known stays visible, it is not
+/// resolved.** `eval "$CMD"` yields the script `$CMD`, whose segment names no
+/// verb a guard knows, so the command it runs is not judged — the same
+/// deliberate miss as a command word behind a variable anywhere else
+/// ([`command_word`]). The `eval` segment itself still reaches every guard, and
+/// a walker that tracks state across segments must still refuse on `eval`
+/// (`push::directory_verb` does), because an `eval`'d `cd` moves the PARENT
+/// shell while a child script is walked in its own scope.
+fn eval_script(operands: &[String]) -> Option<String> {
+    let mut script = join_eval_operands(operands)?;
+    for _ in 0..MAX_EVAL_UNWRAP {
+        let segments = split_segments(&script);
+        let [only] = segments.as_slice() else {
+            break;
+        };
+        let tokens = tokenize(only);
+        let argv = peel_command_runners(strip_compound_heads(&tokens));
+        if argv
+            .first()
+            .is_none_or(|first| command_word(first) != "eval")
+        {
+            break;
+        }
+        match join_eval_operands(&argv[1..]) {
+            Some(inner) if inner.len() < script.len() => script = inner,
+            _ => break,
+        }
+    }
+    Some(script)
+}
+
+/// One `eval`'s operands as the script it hands the parser. See
+/// [`eval_script`].
+fn join_eval_operands(operands: &[String]) -> Option<String> {
+    let operands = match operands.first() {
+        Some(first) if unescape_word(first).as_ref() == "--" => &operands[1..],
+        _ => operands,
+    };
+    let script = operands
+        .iter()
+        .map(|operand| unescape_word(operand))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!script.trim().is_empty()).then_some(script)
+}
+
+/// The command string `trap` installs, when the invocation installs one:
+/// `trap [--] ACTION SIGSPEC...`. Bash runs ACTION as a script when the signal
+/// fires — and `EXIT` fires when the Bash tool's own shell ends, so
+/// `trap 'cat .env' EXIT` reads the file as surely as `cat .env`
+/// (cadence-hooks#1059). The action is returned with the shell's backslash
+/// removal applied, for the reason [`eval_script`] gives.
+///
+/// `None` for the shapes that install nothing: `-l`/`-p` (print), a lone
+/// operand (bash reads it as a signal to reset, or a usage error), an ACTION of
+/// exactly `-` (reset) or the empty string (ignore), and — only when no `--`
+/// came first — a `-`-leading word, which bash parses as an option. After `--`
+/// a `-`-leading action is installed: `trap -- '-x; cat .env' EXIT` runs the
+/// read (measured). A numeric first operand is POSIX's reset spelling; it is
+/// surfaced anyway, since a script of `1` names no command and costs nothing to
+/// inspect.
+///
+/// A trap action runs LATER, in the parent shell, with whatever directory and
+/// environment are current when the signal arrives — not the ones in force at
+/// the `trap` segment. A walker that recurses into child scripts with the
+/// segment's own state therefore cannot vouch for WHERE the action runs; ask
+/// [`installs_trap_action`] and refuse on it.
+fn trap_action(operands: &[String]) -> Option<String> {
+    let (operands, ended_options) = match operands.first() {
+        Some(first) if unescape_word(first).as_ref() == "--" => (&operands[1..], true),
+        _ => (operands, false),
+    };
+    let action = unescape_word(operands.first()?).into_owned();
+    // Everything after the action is a signal spec; with none, bash resets or
+    // refuses rather than installing.
+    operands.get(1)?;
+    if action == "-" || (!ended_options && action.starts_with('-')) || action.trim().is_empty() {
+        return None;
+    }
+    Some(action)
+}
+
+/// Whether this token view is a `trap` that installs an action — the one child
+/// script [`child_scripts`] returns whose state (directory, environment) is not
+/// the segment's own. See [`trap_action`].
+pub fn installs_trap_action(tokens: &[String]) -> bool {
+    let tokens = peel_command_runners(strip_compound_heads(tokens));
+    tokens
+        .first()
+        .is_some_and(|first| command_word(first) == "trap")
+        && trap_action(&tokens[1..]).is_some()
 }
 
 /// Regex pattern for detecting shell loops (`for ... in` / `while ... do`).
@@ -10516,5 +10897,252 @@ mod tests {
             d.repo_flag.as_deref(),
             Some("https://github.com/evil/x.git")
         );
+    }
+
+    // --- eval / trap child scripts (cadence-hooks#886, #1059) ---
+
+    #[test]
+    fn child_scripts_surfaces_the_script_eval_and_trap_run() {
+        for (command, want) in [
+            ("eval 'git push origin main'", Some("git push origin main")),
+            (
+                "eval \"git push origin main\"",
+                Some("git push origin main"),
+            ),
+            // Operands are joined with single spaces, as the shell does.
+            ("eval git push origin main", Some("git push origin main")),
+            ("eval -- 'cat .env'", Some("cat .env")),
+            ("GIT_DIR=/x eval 'git push'", Some("git push")),
+            ("sudo eval 'cat .env'", Some("cat .env")),
+            ("\\eval 'cat .env'", Some("cat .env")),
+            // Not statically known: surfaced as written, never resolved.
+            ("eval \"$CMD\"", Some("$CMD")),
+            ("trap 'cat .env' EXIT", Some("cat .env")),
+            ("trap -- 'cat .env' EXIT INT", Some("cat .env")),
+            ("trap 'cat .env' 0", Some("cat .env")),
+            // Backslash removal: bash hands `eval` and `trap` the unescaped
+            // word (cadence-hooks#1089 review, finding 1).
+            ("eval \"echo \\$(cat .env)\"", Some("echo $(cat .env)")),
+            ("eval echo \\$\\(cat .env\\)", Some("echo $(cat .env)")),
+            ("eval \"echo \\`cat .env\\`\"", Some("echo `cat .env`")),
+            ("eval echo a\\; sops -d x", Some("echo a; sops -d x")),
+            ("eval echo a \\&\\& sops -d x", Some("echo a && sops -d x")),
+            ("trap \"echo \\$(cat .env)\" EXIT", Some("echo $(cat .env)")),
+            // After `--` a `-`-leading action is installed (finding 2).
+            ("trap -- '-x; cat .env' EXIT", Some("-x; cat .env")),
+            ("trap -- - EXIT", None),
+            ("trap -x EXIT", None),
+            // A chain of `eval`s unwraps without spending wrapper depth
+            // (finding 3).
+            ("eval eval eval eval sops -d x", Some("sops -d x")),
+            ("eval 'eval \"eval cat .env\"'", Some("cat .env")),
+            // ANSI-C escapes are decoded (finding 4).
+            ("eval $'echo a\\ncat .env'", Some("echo a\ncat .env")),
+            ("trap $'echo a\\ncat .env' EXIT", Some("echo a\ncat .env")),
+            // Installs nothing: print, reset, ignore, or a lone operand.
+            ("trap -p", None),
+            ("trap -l", None),
+            ("trap - EXIT", None),
+            ("trap '' INT", None),
+            ("trap 'cat .env'", None),
+            ("eval", None),
+            ("eval ''", None),
+            // Not the builtin at all.
+            ("echo eval 'cat .env'", None),
+            ("evaluate 'cat .env'", None),
+        ] {
+            let tokens = tokenize(command);
+            let argv = skip_transparent_prefixes(&tokens);
+            let got = child_scripts(argv, command);
+            assert_eq!(
+                got.first().map(String::as_str),
+                want,
+                "{command:?} yielded {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_expands_eval_and_trap_scripts() {
+        for (command, inner) in [
+            ("eval 'cat .env'", "cat .env"),
+            ("trap 'cat .env' EXIT", "cat .env"),
+            ("trap 'cat .env' DEBUG; true", "cat .env"),
+            ("if true; then eval 'rm note.md'; fi", "rm note.md"),
+            ("bash -c \"eval 'rm note.md'\"", "rm note.md"),
+            ("bash -c $'echo a\\nrm note.md'", "rm note.md"),
+            ("eval $'echo a\\x0arm note.md'", "rm note.md"),
+            ("eval $'echo a\\012rm note.md'", "rm note.md"),
+            ("eval eval eval eval eval eval rm note.md", "rm note.md"),
+            ("eval 'echo a; rm note.md'", "rm note.md"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn installs_trap_action_names_only_a_trap_that_installs() {
+        for (command, want) in [
+            ("trap 'git push' EXIT", true),
+            ("command trap 'git push' EXIT", true),
+            ("trap - EXIT", false),
+            ("trap -p", false),
+            ("eval 'git push'", false),
+            ("git push", false),
+        ] {
+            assert_eq!(
+                installs_trap_action(&tokenize(command)),
+                want,
+                "{command:?}"
+            );
+        }
+    }
+
+    // --- transparent prefix basename and `--` (cadence-hooks#888) ---
+
+    #[test]
+    fn skip_transparent_prefixes_reads_a_path_spelling_and_end_of_options() {
+        for (command, want_head) in [
+            ("/usr/bin/nohup sops -d x", "sops"),
+            ("/usr/bin/nohup -- sops -d x", "sops"),
+            ("nohup -- sops -d x", "sops"),
+            ("/usr/bin/time sops -d x", "sops"),
+            ("command -- git push", "git"),
+            ("exec -- git push", "git"),
+            ("\\nohup -- git push", "git"),
+            ("/usr/bin/env GIT_DIR=/x git commit", "git"),
+            // Unchanged: a real flag still stops the skip, so a prefix with no
+            // runner grammar survives into argv[0] for a caller to refuse on.
+            ("/usr/bin/time -p sops -d x", "/usr/bin/time"),
+            ("nohup --help", "nohup"),
+            // A `--` with nothing after it runs nothing.
+            ("nohup --", "nohup"),
+            // A `--` that no prefix owns is an ordinary word.
+            ("git -- push", "git"),
+            ("-- git push", "--"),
+            // Not a prefix, whatever the directory.
+            ("/usr/bin/nohupx git push", "/usr/bin/nohupx"),
+        ] {
+            let tokens = tokenize(command);
+            let head = skip_transparent_prefixes(&tokens).first().cloned();
+            assert_eq!(head.as_deref(), Some(want_head), "{command:?}");
+        }
+    }
+
+    // --- strip_group_wrappers keeps a `}` that is a word byte (cadence-hooks#889) ---
+
+    #[test]
+    fn strip_group_wrappers_trims_a_brace_only_where_it_closes_a_group() {
+        for (segment, want) in [
+            // Word bytes: glued to the word, the shell keeps them.
+            ("git push origin secret}", "git push origin secret}"),
+            ("git push origin secret}}", "git push origin secret}}"),
+            ("cd /other}", "cd /other}"),
+            ("rm {a,b}", "rm {a,b}"),
+            ("echo ${HOME}", "echo ${HOME}"),
+            ("git push origin ${BRANCH}", "git push origin ${BRANCH}"),
+            ("rm 'x'}", "rm 'x'}"),
+            ("rm x\\}", "rm x\\}"),
+            ("find . -exec rm {}", "find . -exec rm {}"),
+            // Closers: standing as their own word, or after an operator.
+            ("{ git commit;}", "git commit"),
+            ("{ git commit; }", "git commit"),
+            ("{ git commit }", "git commit"),
+            ("}", ""),
+            ("(git commit)", "git commit"),
+            ("( gh pr create )", "gh pr create"),
+            ("{ (cd x)}", "cd x"),
+            ("{ ( rm x ) }", "rm x"),
+            ("{ echo a &}", "echo a &"),
+            ("git push origin main;", "git push origin main"),
+            // A group closer after a kept word brace still goes.
+            ("{ rm {a,b}; }", "rm {a,b}"),
+            // A whitespace-preceded `}` in argument position is an argument
+            // unless the segment opened a `{` group.
+            ("mycmd }", "mycmd }"),
+            ("cd }", "cd }"),
+            ("rm -rf }", "rm -rf }"),
+            ("{ (cd x) }", "cd x"),
+            ("{ echo ${X} }", "echo ${X}"),
+        ] {
+            assert_eq!(strip_group_wrappers(segment), want, "{segment:?}");
+        }
+    }
+
+    #[test]
+    fn tokenize_decodes_ansi_c_escapes_like_bash() {
+        // Each expected value is what `bash -c 'printf %s $'"'"'…'"'"''` emits.
+        for (word, want) in [
+            (r"$'a\nb'", "a\nb"),
+            (r"$'a\tb'", "a\tb"),
+            (r"$'a\\b'", "a\\b"),
+            (r"$'a\'b'", "a'b"),
+            (r#"$'a\"b'"#, "a\"b"),
+            (r"$'a\x41b'", "aAb"),
+            (r"$'a\x4'", "a\u{4}"),
+            (r"$'a\101b'", "aAb"),
+            (r"$'a\12b'", "a\nb"),
+            (r"$'a\ea'", "a\u{1b}a"),
+            (r"$'a\cAb'", "a\u{1}b"),
+            (r"$'aAb'", "aAb"),
+            // Unknown escapes keep their backslash; `\x` with no digit too.
+            (r"$'a\qb'", "a\\qb"),
+            (r"$'a\xg'", "a\\xg"),
+            // A NUL ends the value.
+            (r"$'ab\0cd'", "ab"),
+            (r"$'ab\x00cd'e", "abe"),
+            // Plain single quotes stay literal.
+            (r"'a\nb'", "a\\nb"),
+        ] {
+            assert_eq!(tokenize(word), [want], "{word:?}");
+        }
+    }
+
+    #[test]
+    fn joining_splitter_keeps_redirection_ampersands_in_the_segment() {
+        let ops = |c: &str| split_segments_with_ops_joining_redirects(c);
+        assert_eq!(
+            ops("cd /wt 2>&1 & git x"),
+            vec![
+                ("cd /wt 2>&1".to_string(), Some("&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        assert_eq!(
+            ops("cd /wt &>/dev/null && git x"),
+            vec![
+                ("cd /wt &>/dev/null".to_string(), Some("&&")),
+                ("git x".to_string(), None)
+            ]
+        );
+        // A space before `>` makes the `&` a real background operator.
+        assert_eq!(
+            ops("cd /wt & >/dev/null git x"),
+            vec![
+                ("cd /wt".to_string(), Some("&")),
+                (">/dev/null git x".to_string(), None)
+            ]
+        );
+        // The default splitter is unchanged.
+        assert_eq!(split_segments_with_ops("a 2>&1").len(), 2);
+    }
+
+    #[test]
+    fn a_redirect_operator_spans_its_descriptor_and_angle_brackets() {
+        assert_eq!(redirect_operator_span("2>x"), Some((2, false)));
+        assert_eq!(redirect_operator_span("2>"), Some((2, true)));
+        assert_eq!(redirect_operator_span("&>>log"), Some((3, false)));
+        assert_eq!(redirect_operator_span("{fd}>/dev/null"), Some((5, false)));
+        assert_eq!(redirect_operator_span("2>&1"), Some((2, false)));
+        assert_eq!(redirect_operator_span("x>y"), None);
+        // `2'>'x` tokenizes to `2>x` with only `2` unquoted: the operator is
+        // quoted, so it is a word, not a redirection.
+        let marked = tokenize_marked("2'>'x");
+        let (len, _) = redirect_operator_span(&marked[0].text).unwrap();
+        assert!(marked[0].unquoted_prefix_len < len);
     }
 }

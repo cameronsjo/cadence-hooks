@@ -270,6 +270,16 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
             process::exit(0);
         }
     };
+    // One payload, one set of drift rows: a `group` fan-out shares the parse,
+    // so the rows are attributed to its first member rather than repeated per
+    // member.
+    if let Some(first) = hook_names.first() {
+        log_schema_drift(
+            &input.schema_drift,
+            crate::registry::namespace_of(first),
+            Some(first),
+        );
+    }
     let normalized_inputs = match input.normalized_inputs() {
         Ok(inputs) => inputs,
         Err(error) => {
@@ -853,6 +863,7 @@ pub fn run_logged_logger(
     match MetricsInput::from_stdin() {
         Ok(input) => {
             session_id = input.session_id.clone();
+            log_schema_drift(&input.schema_drift, namespace, hook);
             // A panicking logger must not skip the timing write or the exit-0
             // below. Catch the unwind so the contract holds even on a buggy
             // implementation. `AssertUnwindSafe` is required because
@@ -899,6 +910,31 @@ pub fn run_logged_logger(
         session_id.as_deref(),
     );
     process::exit(0);
+}
+
+/// One `schema_drift` row in `failopen.jsonl` per payload key whose object
+/// value failed its typed shape (cadence-hooks#364). The degradation to `None`
+/// already happened and is unchanged; this only makes a drift-shaped mismatch
+/// observable. `drift` holds static key names from `core::schema_drift`, so the
+/// row carries no payload content. Silent on stderr: nothing failed for the
+/// user, and a real drift fires on every matching call.
+///
+/// At most once per process: every dispatch path parses stdin once, and the
+/// latch keeps a second caller from repeating the same rows.
+fn log_schema_drift(drift: &[&'static str], namespace: Option<&str>, hook: Option<&str>) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if drift.is_empty() || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    for key in drift {
+        cadence_hooks_metrics::log_failopen(
+            "schema_drift",
+            namespace,
+            hook,
+            env!("CARGO_PKG_VERSION"),
+            Some(&format!("{key}: object did not match its typed shape")),
+        );
+    }
 }
 
 /// Emit the loud fail-open row + stderr breadcrumb when this process's git
