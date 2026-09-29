@@ -3356,6 +3356,28 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
 pub fn strip_heredoc_bodies(command: &str) -> String {
+    strip_heredoc_bodies_bounded(command, MAX_HEREDOC_SPAN_DEPTH)
+}
+
+/// How many levels of heredoc-inside-a-carried-span [`strip_heredoc_bodies`]
+/// resolves before splicing a span raw, so nesting cannot exhaust the stack.
+const MAX_HEREDOC_SPAN_DEPTH: usize = 8;
+
+/// Carry one substitution span onto the introducing line. The span is shell
+/// code the outer heredoc's body will run, and it may introduce a heredoc of
+/// its own — `$(cat <<'X'⏎it's⏎X⏎cat .env)` — whose body is data again.
+/// Splicing it raw handed that inner body to the segment splitter as code, so
+/// the apostrophe opened a phantom quote that swallowed the `cat .env` bash
+/// runs. Resolving the span's own heredocs first reads it the way bash does.
+/// Past the depth budget the span is spliced raw (the prior behavior).
+fn carried_span(span: &str, budget: usize) -> String {
+    match budget.checked_sub(1) {
+        Some(rest) if span.contains("<<") => strip_heredoc_bodies_bounded(span, rest),
+        _ => span.to_string(),
+    }
+}
+
+fn strip_heredoc_bodies_bounded(command: &str, budget: usize) -> String {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -3428,7 +3450,7 @@ pub fn strip_heredoc_bodies(command: &str) -> String {
                     // `substitution_bodies` and `child_scripts` unchanged.
                     for span in substitution_spans(&body_lines.join("\n")) {
                         line.push('\n');
-                        line.push_str(&span);
+                        line.push_str(&carried_span(&span, budget));
                     }
                 }
             } else {
@@ -3446,7 +3468,11 @@ pub fn strip_heredoc_bodies(command: &str) -> String {
                 // Carrying the spans separately means the payload survives
                 // whatever happens to the prose around it.
                 let rest = lines[body_start..].join("\n");
-                out.extend(substitution_spans(&rest));
+                out.extend(
+                    substitution_spans(&rest)
+                        .iter()
+                        .map(|span| carried_span(span, budget)),
+                );
                 return out.join("\n");
             }
         }
@@ -3862,6 +3888,12 @@ fn split_segments_impl(
     let mut quote: Option<Quote> = None;
     let all: Vec<char> = command.chars().collect();
     let mut chars = all.iter().copied().peekable();
+    // Latched once a double-quoted substitution cannot be bounded: that scan
+    // ran to the end of the input, and so would every later one, so the rest
+    // of the pass keeps the old character-by-character reading instead of
+    // paying O(n) per opener — a flood of them was quadratic, seconds long,
+    // and a hook timeout fails open.
+    let mut scan_exhausted = false;
 
     while let Some(c) = chars.next() {
         // A substitution inside `"…"` is copied whole: its own quoting belongs
@@ -3879,14 +3911,20 @@ fn split_segments_impl(
             current.push(chars.next().expect("peeked"));
             continue;
         }
-        if quote == Some(Quote::Double) && matches!(c, '$' | '`') {
+        if quote == Some(Quote::Double)
+            && !scan_exhausted
+            && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
+        {
             let i = all.len() - chars.len() - 1;
-            if let Some(end) = quoted_substitution_end(&all, i) {
-                current.extend(&all[i..end]);
-                for _ in i + 1..end {
-                    chars.next();
+            match quoted_substitution_end(&all, i) {
+                Some(end) => {
+                    current.extend(&all[i..end]);
+                    for _ in i + 1..end {
+                        chars.next();
+                    }
+                    continue;
                 }
-                continue;
+                None => scan_exhausted = true,
             }
         }
         if let Some(q) = quote {
@@ -4035,8 +4073,13 @@ fn ends_with_unescaped_gt(text: &str) -> bool {
 enum Opener {
     /// `${…}` — a parameter expansion, closed by `}`.
     Brace,
-    /// `$(…)` and `$((…))` — command substitution or arithmetic, closed by `)`.
+    /// `$((…))` arithmetic, and a bare `(` nested inside an open expansion —
+    /// closed by `)`.
     Paren,
+    /// `$(…)` command substitution, closed by `)`. Kept apart from `Paren`
+    /// because bash starts `#` comments inside a command substitution — its
+    /// body is ordinary shell code — but not inside arithmetic.
+    Subst,
 }
 
 /// Byte ranges of `#` comments in `text` — from the `#` up to (not including)
@@ -4048,9 +4091,17 @@ enum Opener {
 /// fix, so each clause below is load-bearing:
 ///
 /// - **Not inside a quote.** `'…'`, `"…"` and `$'…'` all make `#` data.
-/// - **Not inside an expansion.** `${…}`, `$(…)`, `$((…))` and `` `…` `` are
-///   tracked on a STACK of [`Opener`] kinds, because bash does not start a
-///   comment inside any of them. Without this, `echo ${x:- # } ; rm -rf ~`
+/// - **Not inside an expansion — except directly inside `$(…)`.** `${…}`,
+///   `$(…)`, `$((…))` and `` `…` `` are tracked on a STACK of [`Opener`]
+///   kinds. Bash starts no comment inside `${…}`, `$((…))` or backticks.
+///   A command substitution is the exception: its body is shell code, so a
+///   `#` at a word boundary there IS a comment and runs to the newline
+///   (measured: `echo $(echo hi # it's⏎)⏎cat .env` runs the read). Refusing
+///   it left the apostrophe to open a phantom quote downstream that swallowed
+///   the next line. Only the innermost opener counts, and a `(` nested
+///   inside the substitution pushes [`Opener::Paren`], so `$( (#c` is not
+///   recognised — narrower than bash, which keeps more text under inspection.
+///   Without the stack, `echo ${x:- # } ; rm -rf ~`
 ///   collapsed to `["echo ${x:-"]` — the `;` and the deletion behind it
 ///   vanished from every guard, while bash ran them (#490 follow-up). The
 ///   stack rather than a counter, because a `)` inside `${…}` is data: sharing
@@ -4080,6 +4131,9 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     // Char view + byte offsets, built only if a double-quoted substitution
     // needs bounding — most inputs never pay for it.
     let mut table: Option<(Vec<char>, Vec<usize>)> = None;
+    // Same latch as [`split_segments_with_ops`]: after one unboundable scan,
+    // stop scanning so an opener flood stays linear.
+    let mut scan_exhausted = false;
 
     while let Some((i, c)) = chars.next() {
         // A substitution inside `"…"` is skipped whole, the same way
@@ -4094,7 +4148,9 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 chars.next();
                 continue;
             }
-            if matches!(c, '$' | '`') {
+            if !scan_exhausted
+                && (c == '`' || (c == '$' && chars.peek().map(|&(_, n)| n) == Some('(')))
+            {
                 let (all, byte_of) = table.get_or_insert_with(|| {
                     let all: Vec<char> = text.chars().collect();
                     let byte_of = text
@@ -4113,6 +4169,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     boundary = false;
                     continue;
                 }
+                scan_exhausted = true;
             }
         }
         if let Some(q) = quote {
@@ -4150,12 +4207,16 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
             }
             '$' if matches!(chars.peek().map(|&(_, n)| n), Some('{' | '(')) => {
                 let opener = chars.next().expect("peeked").1;
-                open.push(if opener == '{' {
-                    Opener::Brace
-                } else {
-                    Opener::Paren
+                // `$((` is arithmetic: push `Paren` here and let the `(` arm
+                // below push the second level. `$(` alone is a substitution,
+                // and a word begins right after it (`$(#c⏎…)` is a comment).
+                let arithmetic = opener == '(' && chars.peek().map(|&(_, n)| n) == Some('(');
+                open.push(match opener {
+                    '{' => Opener::Brace,
+                    _ if arithmetic => Opener::Paren,
+                    _ => Opener::Subst,
                 });
-                boundary = false;
+                boundary = open.last() == Some(&Opener::Subst);
             }
             '\'' => {
                 quote = Some(Quote::Single);
@@ -4191,7 +4252,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
             // the stack keeps the scan inside an expansion, which DISABLES
             // comment stripping and over-inspects. Every unbalanced-opener
             // shape already fails that way and is measured to do so.
-            ')' if open.last() == Some(&Opener::Paren) => {
+            ')' if matches!(open.last(), Some(Opener::Paren | Opener::Subst)) => {
                 open.pop();
                 boundary = false;
             }
@@ -4199,7 +4260,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 open.pop();
                 boundary = false;
             }
-            '#' if boundary && open.is_empty() && !backticks => {
+            '#' if boundary && matches!(open.last(), None | Some(Opener::Subst)) && !backticks => {
                 let end = text[i..].find('\n').map_or(text.len(), |off| i + off);
                 spans.push((i, end));
                 while chars.peek().is_some_and(|&(j, _)| j < end) {
@@ -4629,8 +4690,14 @@ enum ScanStop {
     /// brace lexing: anything else is [`ScanStop::LexUnresolved`].
     Unterminated,
     /// Input ran out with MORE than one paren level open, or after the scan
-    /// skipped a `#` comment, a `` `…` `` span or a `${…}` expansion it lexed
-    /// itself — or one of those three never closed.
+    /// skipped a `#` comment, a `` `…` `` span, a `${…}` expansion or a
+    /// heredoc body it lexed itself — or one of those never closed.
+    ///
+    /// It fires on the lexing having happened at all, even when every lexed
+    /// construct closed cleanly: the terminator is what went missing, and the
+    /// scanner cannot tell whether its own lexing is why. Widening on that is
+    /// deliberate; the cost is splicing an unterminated heredoc's prose in the
+    /// rare case such prose also carries one of these constructs.
     ///
     /// cadence-hooks#831's other face. A `(` the scanner counts and the shells
     /// do not — any shape this scanner has no arm for — ends the scan with
@@ -4638,7 +4705,8 @@ enum ScanStop {
     /// `depth > 1` at end of input widens instead of deleting. The comment,
     /// backtick and brace arms are this scanner's own model of bash's lexer;
     /// when one of them was used and no terminator followed, the model may be
-    /// what is wrong, so that widens too.
+    /// what is wrong, so that widens too. The heredoc arm (added after review
+    /// of #1093) is the same kind of model and reports the same way.
     LexUnresolved,
     /// Input ran out inside a quoted run this scanner opened. The shell often
     /// disagrees that a quote was open at all — a `#` comment's apostrophe is
@@ -4715,6 +4783,12 @@ fn scan_substitution_body_bounded(
     // Whether the scan leaned on its own comment/backtick/brace lexing, so running
     // off the end afterwards is reported as the scanner limit it may be.
     let mut lexed = false;
+    // `$((` is arithmetic: no word grammar, so neither a `#` comment nor a
+    // `<<` heredoc exists there (`$(( 1 << 2 ))` is a shift).
+    let arithmetic = chars.get(start) == Some(&'(');
+    // Heredocs introduced on the current line, in order, waiting for the
+    // newline that starts their bodies: (delimiter word, `<<-` tab strip).
+    let mut pending: Vec<(String, bool)> = Vec::new();
     while j < chars.len() {
         if quote_aware {
             // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
@@ -4735,6 +4809,40 @@ fn scan_substitution_body_bounded(
             if quote.is_none() && chars[j] == '\\' && chars.get(j + 1) == Some(&'\n') {
                 body.extend(&chars[j..j + 2]);
                 j += 2;
+                continue;
+            }
+            // A heredoc body is data to this level, however many quotes and
+            // parens its prose carries. Without this arm the apostrophe in
+            // `$(cat <<'EOF'⏎It's done⏎EOF⏎)` opened a phantom quote, a later
+            // `)` became the terminator, and the command bash runs after the
+            // substitution was copied inside it where no guard saw it.
+            // Unterminated → a scanner limit, so the caller widens.
+            if quote.is_none() && chars[j] == '\n' && !pending.is_empty() {
+                body.push('\n');
+                j += 1;
+                match skip_heredoc_bodies(chars, j, &mut pending) {
+                    Some(end) => {
+                        body.extend(&chars[j..end]);
+                        j = end;
+                    }
+                    None => return Err(ScanStop::LexUnresolved),
+                }
+                boundary = true;
+                continue;
+            }
+            if quote.is_none()
+                && !arithmetic
+                && chars[j] == '<'
+                && chars.get(j + 1) == Some(&'<')
+                && chars.get(j + 2) != Some(&'<')
+                && (j == 0 || chars[j - 1] != '<')
+                && let Some((word, strip_tabs, end)) = heredoc_delimiter(chars, j + 2)
+            {
+                body.extend(&chars[j..end]);
+                j = end;
+                pending.push((word, strip_tabs));
+                lexed = true;
+                boundary = false;
                 continue;
             }
             // A `` `…` `` span, unquoted or inside `"…"`, is opaque to this
@@ -4781,7 +4889,7 @@ fn scan_substitution_body_bounded(
             // second command fell outside the span (cameronsjo/cadence-hooks#831).
             // The comment text is kept in the body verbatim; the comment pass
             // downstream removes it when the body is re-split.
-            if quote.is_none() && boundary && chars[j] == '#' {
+            if quote.is_none() && boundary && !arithmetic && chars[j] == '#' {
                 let end = chars[j..]
                     .iter()
                     .position(|&c| c == '\n')
@@ -4874,6 +4982,106 @@ fn scan_substitution_body_bounded(
     Err(ScanStop::Unterminated)
 }
 
+/// Parse the delimiter of a `<<`/`<<-` heredoc whose operator ends just before
+/// `k`: returns the delimiter word with quoting removed, whether `<<-` strips
+/// leading tabs, and the index just past the word. `None` when no word
+/// follows (bash rejects that, so the caller reads the text as ordinary).
+fn heredoc_delimiter(chars: &[char], mut k: usize) -> Option<(String, bool, usize)> {
+    let strip_tabs = chars.get(k) == Some(&'-');
+    if strip_tabs {
+        k += 1;
+    }
+    while matches!(chars.get(k), Some(' ' | '\t')) {
+        k += 1;
+    }
+    let mut word = String::new();
+    let mut quoted = false;
+    while let Some(&c) = chars.get(k) {
+        match c {
+            c if c.is_whitespace() || ";&|()<>".contains(c) => break,
+            '\'' | '"' => {
+                quoted = true;
+                k += 1;
+                while let Some(&q) = chars.get(k) {
+                    k += 1;
+                    if q == c {
+                        break;
+                    }
+                    if c == '"'
+                        && q == '\\'
+                        && let Some(&n) = chars.get(k)
+                    {
+                        word.push(n);
+                        k += 1;
+                        continue;
+                    }
+                    word.push(q);
+                }
+            }
+            '\\' => {
+                quoted = true;
+                if let Some(&n) = chars.get(k + 1) {
+                    word.push(n);
+                }
+                k += 2;
+            }
+            _ => {
+                word.push(c);
+                k += 1;
+            }
+        }
+    }
+    (!word.is_empty() || quoted).then_some((word, strip_tabs, k.min(chars.len())))
+}
+
+/// Skip the bodies of every heredoc in `pending` (in order), starting at `j`,
+/// the first character after the newline that ends the introducing line.
+/// Returns where scanning resumes, or `None` when a body never ends.
+///
+/// A body ends at a line equal to its delimiter (leading tabs removed for
+/// `<<-`), and scanning resumes on the next line. Inside a command
+/// substitution bash 5.2 ALSO ends it at a line that starts with the delimiter
+/// and contains a `)` — `EOF)`, `EOF )`, `EOF ; echo "a)"` all measured, each
+/// with a "delimited by end-of-file" warning — and parses the rest of that
+/// line as code, so scanning resumes right after the delimiter there. A line
+/// merely starting with the delimiter (`EOFx`, `EOF ; x`) does not end it.
+/// Missing that second form would let a later exact delimiter line end the
+/// body too LATE, swallowing commands bash runs, so both are modelled.
+fn skip_heredoc_bodies(
+    chars: &[char],
+    mut j: usize,
+    pending: &mut Vec<(String, bool)>,
+) -> Option<usize> {
+    for (word, strip_tabs) in pending.drain(..) {
+        loop {
+            if j >= chars.len() {
+                return None;
+            }
+            let eol = chars[j..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(chars.len(), |off| j + off);
+            let mut from = j;
+            if strip_tabs {
+                while from < eol && chars[from] == '\t' {
+                    from += 1;
+                }
+            }
+            let line: String = chars[from..eol].iter().collect();
+            if line == word {
+                j = (eol + 1).min(chars.len());
+                break;
+            }
+            if line.starts_with(word.as_str()) && line.contains(')') {
+                j = from + word.chars().count();
+                break;
+            }
+            j = (eol + 1).min(chars.len());
+        }
+    }
+    Some(j)
+}
+
 /// Index just past the backtick that closes the `` `…` `` span opening at
 /// `chars[i]`, or `None` when no unescaped backtick follows.
 ///
@@ -4899,6 +5107,9 @@ fn backtick_span_end(chars: &[char], i: usize) -> Option<usize> {
 /// one expansion), a quoted run or escaped character inside is data, and a
 /// nested substitution is skipped whole — within the caller's remaining
 /// nesting `budget`, so this cannot recurse past [`MAX_SUBSTITUTION_DEPTH`].
+///
+/// A `'` inside `"${…}"` is read as quoting too, intentionally: bash 5.2
+/// treats it as quote-like there (`"${x:-'}'}"` is one expansion).
 fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize> {
     let mut depth = 1usize;
     let mut quote: Option<Quote> = None;
@@ -9424,6 +9635,129 @@ mod tests {
                 "flood #{idx} ({len} chars) dropped the trailing payload"
             );
         }
+    }
+
+    #[test]
+    fn command_segments_opener_floods_inside_double_quotes_stay_linear() {
+        // Review of #1093: every `$(` inside `"…"` asked the scanner for its
+        // terminator, and each unboundable scan ran to the end of the input —
+        // O(n²), 5.7 s for a 100 KB `"$(#…` flood where the base took 2.6 ms.
+        // A hook timeout fails open, so slow is a bypass. The splitter and the
+        // comment pass now stop scanning once one scan runs off the end.
+        //
+        // The bound is generous for a debug build on a loaded runner; the
+        // quadratic form is tens of seconds here.
+        for (opener, n) in [
+            ("$(#", 33_000),
+            ("$(a #", 20_000),
+            ("`", 30_001),
+            ("$(a", 30_000),
+        ] {
+            for input in [
+                format!("echo \"{}\" ; cat .env", opener.repeat(n)),
+                format!("{} ; cat .env", opener.repeat(n)),
+            ] {
+                let started = std::time::Instant::now();
+                let segs = command_segments(&input);
+                let took = started.elapsed();
+                assert!(
+                    took < std::time::Duration::from_secs(5),
+                    "{opener:?}x{n}: command_segments took {took:?}"
+                );
+                // With a `#` opener the payload sits inside a comment that
+                // runs to end of input — bash runs none of it — so only the
+                // comment-free floods must still carry it.
+                assert!(
+                    opener.contains('#') || segs.iter().any(|s| s.contains("cat .env")),
+                    "{opener:?}x{n}: the trailing payload was dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_segments_heredoc_inside_a_substitution_is_data() {
+        // Review of #1093. A heredoc body inside `$( )` is data to the
+        // substitution scanner; without a heredoc model the apostrophe in
+        // `It's` opened a phantom quote, `ok)` became the terminator, and the
+        // double-quote arm copied the commands bash runs INTO the span. Every
+        // row runs the payload under bash 5.2 (harmless twins measured).
+        let rows: &[(&str, &str)] = &[
+            (
+                "git commit -m \"$(cat <<'EOF'\nIt's done\nEOF\n)\" ; cat .env ; echo 'ok)'",
+                "cat .env",
+            ),
+            (
+                "git commit -m \"$(cat <<'EOF'\nIt's done\nEOF\n)\"\ncat .env\necho 'ok)'",
+                "cat .env",
+            ),
+            (
+                "git commit -m \"$(cat <<'EOF'\nIt's done\nEOF\n)\" ; git reset --hard HEAD~3 ; echo 'ok)'",
+                "git reset --hard HEAD~3",
+            ),
+            // Pre-existing misses the heredoc model closes: a `)` in the body,
+            // and a heredoc inside a span carried out of an outer heredoc.
+            ("echo \"$(cat <<X\n)\nX\ncat .env)\"", "cat .env"),
+            (
+                "cat <<EOF\n$(cat <<'X'\nit's\nX\ncat .env)\nEOF",
+                "cat .env",
+            ),
+            // `<<-` strips leading tabs from the terminator line.
+            (
+                "echo \"$(cat <<-EOF\n\tit's\n\tEOF\n)\" ; cat .env",
+                "cat .env",
+            ),
+            // bash 5.2 ends a heredoc inside `$( )` at a line starting with the
+            // delimiter and holding a `)`; a later exact `EOF` must not win.
+            (
+                "echo \"$(cat <<EOF\nhi\nEOF)\" ; cat .env ; echo \"\nEOF\n)\"",
+                "cat .env",
+            ),
+        ];
+        for (input, payload) in rows {
+            let out = command_segments(input);
+            assert!(
+                out.iter().any(|s| s.trim_end_matches(')') == *payload),
+                "{input:?}: {payload:?} reached no segment: {out:?}"
+            );
+        }
+        // Controls: `<<` in arithmetic is a shift, and a `<<<` here-string
+        // introduces no body.
+        assert_eq!(
+            substitution_bodies("echo $(( 1 << 2 )) ; x"),
+            vec!["( 1 << 2 )".to_string()]
+        );
+        assert_eq!(
+            substitution_bodies("echo $(cat <<< 'it)' ; echo b) ; x"),
+            vec!["cat <<< 'it)' ; echo b".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_segments_comment_directly_inside_a_substitution_is_a_comment() {
+        // Review of #1093. Bash starts a `#` comment inside `$( )` — its body
+        // is shell code — so `# it's` there is a comment, not an apostrophe.
+        // The comment pass refused comments inside any expansion, and the
+        // apostrophe then opened a phantom quote in the splitter that
+        // swallowed the next line.
+        for input in [
+            "echo $(echo hi # it's\n)\ncat .env",
+            "cat <<EOF\n$(echo hi # it's\n)\nEOF\ncat .env",
+        ] {
+            let out = command_segments(input);
+            assert!(
+                out.iter().any(|s| s == "cat .env"),
+                "{input:?}: the next line reached no segment: {out:?}"
+            );
+        }
+        // Arithmetic starts no comment: this stays visible.
+        let out = command_segments("echo $(( 1 #)) ; cat .env");
+        assert!(out.iter().any(|s| s == "cat .env"), "{out:?}");
+        // `${…}` still starts none either (#490 follow-up).
+        assert_eq!(
+            split_segments("echo ${x:- # } ; cat .env"),
+            vec!["echo ${x:- # }".to_string(), "cat .env".to_string()]
+        );
     }
 
     #[test]
