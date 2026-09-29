@@ -1788,6 +1788,17 @@ pub fn looks_absolute(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// Strip the Windows verbatim prefix `canonicalize` emits, so its output
+/// compares against the plain paths a hook payload carries: `\\?\C:\x`
+/// becomes `C:\x` and `\\?\UNC\srv\share` becomes `\\srv\share`. Pure string
+/// logic, so it is exercised on every platform.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
 /// Strip shell grouping (`(`/`{` … `)`/`}`) from a segment so `(git commit)`,
 /// `{ git commit; }`, and `( gh pr create )` surface their real command word
 /// rather than a bare `(`/`{` token. [`tokenize`] treats the punctuation as
@@ -11633,7 +11644,7 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
-fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
+pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
