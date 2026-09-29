@@ -82,8 +82,22 @@ fn looks_random(s: &str) -> bool {
         && s.chars().any(|c| c.is_ascii_lowercase())
 }
 
-/// Copy of `text` with joiner runs removed where a token-charset character sits
-/// on both sides. Returns the copy and, per copy byte, the original offset.
+/// Known token prefixes, for the one plain-space join (see [`normalize`]).
+static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|[sr]k_live_|sk-|AIza)")
+        .expect("prefix regex is valid")
+});
+
+/// Copy of `text` with shell-concatenation seams removed, so a split token
+/// rejoins. Returns the copy and, per copy byte, the original offset.
+///
+/// A joiner run between two token-charset characters is dropped only when it
+/// is an explicit seam: it contains `+` (spaces around it allowed), contains a
+/// backslash (line continuation), or is adjacent quotes with no whitespace
+/// (`"a""b"`). A run of plain whitespace is dropped only when the word to its
+/// left already starts with a known prefix and both sides are pure token
+/// chunks (`ghp_ABC… DEF…`) — never when the join would *create* the prefix.
+/// Everything else keeps one space, so prose never fuses into one long run.
 fn normalize(text: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(text.len());
     let mut map: Vec<usize> = Vec::with_capacity(text.len());
@@ -96,11 +110,24 @@ fn normalize(text: &str) -> (String, Vec<usize>) {
             while j < chars.len() && is_joiner(chars[j].1) {
                 j += 1;
             }
+            let run = &chars[i..j];
             let before = out.chars().next_back().is_some_and(is_token_char);
             let after = j < chars.len() && is_token_char(chars[j].1);
-            if !(before && after) {
-                // Not between token runs: keep one separator so words do not
-                // fuse across punctuation.
+            let has = |f: fn(char) -> bool| run.iter().any(|&(_, c)| f(c));
+            let seam = has(|c| c == '+')
+                || has(|c| c == '\\')
+                || (!has(char::is_whitespace) && has(|c| matches!(c, '"' | '\'' | '`')));
+            let plain_space = run.iter().all(|&(_, c)| c.is_whitespace());
+            let prefixed_left = plain_space && before && after && {
+                // The whitespace-delimited word to the left, in the original.
+                let word_start = text[..off]
+                    .rfind(|c: char| !is_token_char(c))
+                    .map_or(0, |k| {
+                        k + text[k..].chars().next().map_or(1, char::len_utf8)
+                    });
+                PREFIX_RE.is_match(&text[word_start..off])
+            };
+            if !(before && after && (seam || prefixed_left)) {
                 out.push(' ');
                 map.push(off);
             }
@@ -134,22 +161,18 @@ fn scan_one(scan: &str, orig: &str, map: Option<&[usize]>, out: &mut Vec<CredHit
             continue;
         };
         let s = m.as_str();
-        // sk-: needs a token boundary before it (direct pass only — the
-        // normalized copy fuses prose onto it) and a random-looking body.
-        if idx == 5 {
-            if map.is_none()
-                && scan[..m.start()]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_ascii_alphanumeric())
-            {
-                continue;
-            }
-            if !looks_random(&s[3..]) {
-                continue;
-            }
-        }
         let offset = map.map_or(m.start(), |mp| mp[m.start()]);
+        // Left boundary, judged in the ORIGINAL text so a token fused onto a
+        // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
+        if let Some(prev) = orig[..offset].chars().next_back()
+            && (prev.is_ascii_alphanumeric() || prev == '_' || (idx == 5 && prev == '-'))
+        {
+            continue;
+        }
+        // sk- also needs a random-looking body: prose can resemble it.
+        if idx == 5 && !looks_random(&s[3..]) {
+            continue;
+        }
         let hit = CredHit {
             kind: KINDS[idx],
             line: line_of(orig, offset),
@@ -274,7 +297,7 @@ mod tests {
             format!("\"{a}{b}\" + \"{rest}\""),
             format!("'{a}{b}''{r1}''{r2}'"),
             format!("{a}{b}\\\n{rest}"),
-            format!("{a} {b}{rest}"),
+            format!("{a}\"\"{b}{rest}"),
             format!("{a}\"{b}{r1}\"+\"{r2}\""),
             format!("{a}{b}{r1}\n  {r2}"),
         ];
@@ -286,8 +309,15 @@ mod tests {
     }
 
     #[test]
+    fn sk_prefix_then_random_chunk_is_a_split() {
+        // Left chunk already starts with a known prefix: ambiguity blocks.
+        let body = "sk- Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8 later words";
+        assert_eq!(kinds(body), vec!["API key (sk- shape)"]);
+    }
+
+    #[test]
     fn split_pem_and_slack() {
-        let pem = "-----BEGIN RSA PRIVATE\" \"KEY-----";
+        let pem = "-----BEGIN RSA PRIVATE\"\"KEY-----";
         assert_eq!(kinds(pem), vec!["Private key PEM header"]);
         let slack = ["xo", "xb-"].concat() + "1234567890\" + \"-abcdefghij";
         assert_eq!(kinds(&slack), vec!["Slack token"]);
@@ -308,6 +338,14 @@ mod tests {
             "a ghp_ prefix is what GitHub PATs start with",
             "AKIA is the AWS prefix",
             "write -----BEGIN and -----END markers",
+            "Finish the task-Management Plan for Q3 2024 Rollout",
+            "we ask-Around Team42 Members Today",
+            "risk-Assessment for AWS Region Us1East",
+            "desk-Booking System V2 Launch Notes",
+            "the Big-Picture Review-Board Action-Items List 2024 Follow-Ups Now",
+            "Q3 2024 AKIA-free prose",
+            "| Name | Owner |\n|---|---|\n| Alpha Beta | Carol Dan |\n| Eve Frank | Gina Hal2 |",
+            "gh p_ Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3",
             "plain prose with + signs and \"quotes\" and 12345 numbers",
         ];
         for c in cases {
