@@ -5399,6 +5399,31 @@ fn assignment_end(words: &[MarkedToken], start: usize) -> Option<usize> {
     (!uncertain).then_some(index)
 }
 
+/// Split a redirection glued to the end of the word at `index`
+/// (`cd>/dev/null`) into a word of its own, so the verb before it reads as
+/// the verb. Only an unquoted `<`/`>` splits.
+fn split_glued_redirection(words: &mut Vec<MarkedToken>, index: usize) {
+    let Some(word) = words.get(index) else {
+        return;
+    };
+    let split = word
+        .text
+        .char_indices()
+        .find(|&(at, c)| at > 0 && at < word.unquoted_prefix_len && matches!(c, '<' | '>'))
+        .map(|(at, _)| at);
+    if let Some(at) = split {
+        let mut rest = word.clone();
+        rest.text = word.text[at..].to_string();
+        rest.unquoted_prefix_len = word.unquoted_prefix_len - at;
+        rest.expanding_prefix_len = word.expanding_prefix_len.saturating_sub(at);
+        let first = &mut words[index];
+        first.text.truncate(at);
+        first.unquoted_prefix_len = at;
+        first.expanding_prefix_len = first.expanding_prefix_len.min(at);
+        words.insert(index + 1, rest);
+    }
+}
+
 /// Where a directory verb's target leaves the shell.
 enum VerbTarget {
     /// A literal target.
@@ -5599,9 +5624,17 @@ impl DirWalk {
             previous_op = op;
         }
         if let Some(definition) = defining {
-            // Never closed: the shell rejects it, but record what there is.
-            self.functions
-                .insert(definition.name, Some(std::rc::Rc::from(definition.body)));
+            // Never closed, by this walk's reading: the shell rejects an
+            // unclosed body, but a misread close would have swallowed every
+            // later segment unwalked. Walk them again as maybe-run, which can
+            // only add directories.
+            let body: Script = std::rc::Rc::from(definition.body);
+            self.functions.insert(definition.name, Some(body.clone()));
+            let maybe = DirContext {
+                conditional: true,
+                looped: context.looped,
+            };
+            self.replay(Some(body), dirs, depth, maybe, false);
         }
     }
 
@@ -5713,6 +5746,8 @@ impl DirWalk {
             .filter(|word| !word.is_empty())
             .find(|word| !is_assignment_word(word) || special(word))
             .unwrap_or("");
+        // `cd>/dev/null /u` is `cd` with a redirection glued on.
+        let first_word = first_word.split(['<', '>']).next().unwrap_or("");
         let plain = !special(first_word) && !first_word.contains('=');
         if first_word.is_empty()
             || plain
@@ -5724,7 +5759,7 @@ impl DirWalk {
         {
             return;
         }
-        let words = tokenize_marked(body);
+        let mut words = tokenize_marked(body);
         let mut start = 0;
         let mut ambiguous = false;
         let mut builtin = false;
@@ -5786,6 +5821,7 @@ impl DirWalk {
             }
             break;
         }
+        split_glued_redirection(&mut words, start);
         let Some(first) = words.get(start) else {
             return;
         };
@@ -17456,6 +17492,9 @@ mod tests {
             ("g() { f; }; f() { cd /u; }; g; gh pr create", &["/u"]),
             ("cd() { builtin cd /u; }; cd /o; gh pr create", &["/u"]),
             ("f() { cd /u; }; gh pr create", &["/cwd"]),
+            // A body whose close this walk misses is walked as maybe-run.
+            ("f() { true\ncd /u\ngh pr create", &["/cwd", "/u"]),
+            ("cd>/dev/null /u; gh pr create", &["/u"]),
             ("f() (cd /u); f; gh pr create", &["/cwd"]),
             ("f() { cd /u; }; f | cat; gh pr create", &["/cwd"]),
             ("f() { cd /u; }; (f); gh pr create", &["/cwd"]),
