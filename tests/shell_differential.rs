@@ -187,6 +187,28 @@ const CASES: &[Case] = &[
         "#813 indented terminator is body text",
         "cat <<EOF\n  EOF\n: <<EOG\nEOF\nPAYLOAD\nEOG",
     ),
+    // A skipped `"$( … )"` span's quoted-delimiter body joins nothing, and
+    // backtick text is joined before its heredoc is read (PR #1136 review).
+    Case::executes(
+        "quoted delimiter in a double-quoted substitution joins nothing",
+        "echo \"$(cat <<'EOF'\nx\\\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "escaped delimiter in a double-quoted substitution joins nothing",
+        "echo \"$(cat <<\\EOF\nx\\\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "a backslash before a CR is no continuation",
+        "echo \"$(cat <<'EOF'\nx\\\r\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "backtick heredoc ends at a joined terminator",
+        "x=`cat <<\\EOF\nEO\\\nF\nPAYLOAD\nEOF\n`",
+    ),
+    Case::does_not_execute(
+        "backtick heredoc joins through its terminator",
+        "x=`cat <<\\EOF\nx\\\nEOF\nPAYLOAD\nEOF\n`",
+    ),
     Case::does_not_execute(
         "#813 terminator with a CR is body text",
         "cat <<EOF\nEOF\r\nPAYLOAD\nEOF",

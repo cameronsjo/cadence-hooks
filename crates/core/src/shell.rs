@@ -4791,7 +4791,29 @@ fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudg
         let scan = scan_command_line(&chars, pos, &mut lex, true);
         // Emitted as LOGICAL lines — backslash-newline continuations joined —
         // which is the shape every consumer of this function has always seen.
-        let mut line = logical_lines(&command[byte_of[pos]..byte_of[scan.end]]).join("\n");
+        //
+        // Except a line that carries a heredoc inside a `"$( … )"` or
+        // `` "`…`" `` span this scan skipped: its body is still in the text,
+        // and joining there rewrote it. `x\` ⏎ `EOF` became `xEOF` inside a
+        // quoted-delimiter body bash never joins, the body then ran past
+        // bash's terminator, and the command after it was read as body
+        // (a `\` before a CR likewise, which bash does not join either).
+        // Such a line joins only the continuations this scan read outside
+        // the skipped spans; the spans reach the substitution scanner — which
+        // applies each delimiter's own rule — as bash wrote them.
+        let text = &command[byte_of[pos]..byte_of[scan.end]];
+        let mut line = if scan.skipped_heredoc {
+            let mut joined = String::with_capacity(text.len());
+            let mut from = pos;
+            for &(at, len) in &scan.joins {
+                joined.push_str(&command[byte_of[from]..byte_of[at]]);
+                from = at + len;
+            }
+            joined.push_str(&command[byte_of[from]..byte_of[scan.end]]);
+            joined
+        } else {
+            logical_lines(text).join("\n")
+        };
         if scan.end >= chars.len() {
             // Input ends on this command line, possibly inside a quote opened
             // on it: no body follows, so nothing is dropped.
@@ -4802,7 +4824,11 @@ fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudg
         let mut at_eof = false;
         let count = scan.introducers.len();
         for (n, intro) in scan.introducers.iter().enumerate() {
-            let heredoc = PendingHeredoc::from(&intro.delimiter);
+            let mut heredoc = PendingHeredoc::from(&intro.delimiter);
+            // `` `cat <<\EOF` `` ⏎ `EO\` ⏎ `F`: bash removes the continuation
+            // from the backtick text first, so even a quoted delimiter's body
+            // ends at the joined `EOF`.
+            heredoc.joins |= intro.in_backticks;
             // Scan ahead for the terminator without committing the drop. Only
             // if it is found do we replace the body with the carried-forward
             // substitution lines; otherwise the lines are restored untouched.
@@ -5227,6 +5253,9 @@ struct FoundIntroducer {
     /// Inside an unquoted `$( … )`, where bash 5.2 also ends a body at a line
     /// that starts with the delimiter and carries a `)`.
     in_subst: bool,
+    /// Inside a `` `…` `` span, whose text bash reads with every
+    /// backslash-newline removed before it parses the heredoc.
+    in_backticks: bool,
 }
 
 /// One command line: where it ends and the heredocs it opens.
@@ -5235,6 +5264,11 @@ struct CommandLine {
     /// length when none does.
     end: usize,
     introducers: Vec<FoundIntroducer>,
+    /// A `"$( … )"` or `` "`…`" `` span skipped whole carries a `<<`.
+    skipped_heredoc: bool,
+    /// The continuations this scan read as bash does — outside every quote
+    /// but `"…"` and outside every skipped span — as (char index, length).
+    joins: Vec<(usize, usize)>,
 }
 
 /// Read one command line of `chars` from `start` the way bash reads it, and
@@ -5265,16 +5299,25 @@ fn scan_command_line(
     let mut quote: Option<Quote> = None;
     let mut boundary = true;
     let mut introducers = Vec::new();
+    let mut skipped_heredoc = false;
+    let mut joins = Vec::new();
     let mut j = start;
     while j < chars.len() {
         let c = chars[j];
         if quote == Some(Quote::Double) {
+            // bash removes a backslash-newline inside `"…"` as well.
+            if c == '\\' && chars.get(j + 1) == Some(&'\n') {
+                joins.push((j, 2));
+                j += 2;
+                continue;
+            }
             if c == '\\' && matches!(chars.get(j + 1), Some('$' | '`')) {
                 j += 2;
                 continue;
             }
             if !lex.exhausted && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'('))) {
                 if let Some(end) = quoted_substitution_end(chars, j) {
+                    skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
                     j = end;
                     continue;
                 }
@@ -5289,6 +5332,7 @@ fn scan_command_line(
             && chars.get(j + 1) == Some(&'\r')
             && chars.get(j + 2) == Some(&'\n')
         {
+            joins.push((j, 3));
             j += 3;
             continue;
         }
@@ -5302,6 +5346,9 @@ fn scan_command_line(
             // A continuation: both characters vanish, so it neither ends the
             // line nor a word.
             '\\' => {
+                if chars.get(j + 1) == Some(&'\n') {
+                    joins.push((j, 2));
+                }
                 j += 2;
                 continue;
             }
@@ -5346,6 +5393,7 @@ fn scan_command_line(
                         introducers.push(FoundIntroducer {
                             start: j,
                             in_subst: lex.open.contains(&Opener::Subst),
+                            in_backticks: lex.backticks,
                             delimiter,
                         });
                         j = introducers.last().expect("just pushed").delimiter.end;
@@ -5359,6 +5407,8 @@ fn scan_command_line(
                 return CommandLine {
                     end: j,
                     introducers,
+                    skipped_heredoc,
+                    joins,
                 };
             }
             _ => {}
@@ -5369,6 +5419,8 @@ fn scan_command_line(
     CommandLine {
         end: chars.len(),
         introducers,
+        skipped_heredoc,
+        joins,
     }
 }
 
@@ -6594,6 +6646,66 @@ fn scan_substitution_body_bounded(
     // The `case` statements open at this level, innermost last.
     let mut cases: Vec<CaseState> = Vec::new();
     while j < chars.len() {
+        // A `case` statement's pattern list closes each pattern with a
+        // bare `)`, which this scanner counted as the terminator:
+        // `$(case a in a) cat .env;; esac)` ended at `a)`, and inside a
+        // heredoc body the span dropped the read bash runs
+        // (cameronsjo/cadence-hooks#1094). So `case … esac` is modelled:
+        // the keyword where a command can start opens one, `in` starts its
+        // patterns, a pattern's `)` opens a clause without closing any
+        // level, `;;`/`;&`/`;;&` return to the patterns, and `esac` closes
+        // it. A statement still open at end of input is this scanner's own
+        // lexing, so it widens like the other lexed constructs.
+        //
+        // The quote-blind reading runs this too. It exists for a quote this
+        // scanner may have misread, which a case pattern's `)` is not; ending
+        // it at that `)` handed callers a second, spurious body at every
+        // nesting level, and a 200 KB `$(case a in a) ` flood cost 4x main.
+        if quote.is_none()
+            && !arithmetic
+            && boundary
+            && !is_word_break(chars[j])
+            && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'\n'))
+        {
+            let top = cases.last().copied();
+            if command_position
+                || matches!(top, Some(CaseState::Subject | CaseState::Pattern { .. }))
+            {
+                let word_end = chars[j..]
+                    .iter()
+                    .position(|&c| is_word_break(c))
+                    .map_or(chars.len(), |off| j + off);
+                let word = &chars[j..word_end];
+                let is = |keyword: &str| word.iter().copied().eq(keyword.chars());
+                match top {
+                    Some(CaseState::Subject) => {
+                        if is("in") {
+                            *cases.last_mut().expect("top") = CaseState::pattern();
+                        }
+                    }
+                    Some(CaseState::Pattern { fresh: true, .. }) if is("esac") => {
+                        cases.pop();
+                    }
+                    Some(CaseState::Pattern { parens, .. }) => {
+                        *cases.last_mut().expect("top") = CaseState::Pattern {
+                            fresh: false,
+                            parens,
+                        };
+                    }
+                    Some(CaseState::Body) if command_position && is("esac") => {
+                        cases.pop();
+                    }
+                    _ if is("case") => {
+                        cases.push(CaseState::Subject);
+                        lexed = true;
+                    }
+                    _ => {}
+                }
+                command_position = COMMAND_LEADING_RESERVED_WORDS
+                    .iter()
+                    .any(|reserved| is(reserved));
+            }
+        }
         if quote_aware {
             // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
             // `Quote::Double::escapes_next` only covers `"` and `\`, so without
@@ -6634,56 +6746,6 @@ fn scan_substitution_body_bounded(
                 boundary = true;
                 command_position = true;
                 continue;
-            }
-            // A `case` statement's pattern list closes each pattern with a
-            // bare `)`, which this scanner counted as the terminator:
-            // `$(case a in a) cat .env;; esac)` ended at `a)`, and inside a
-            // heredoc body the span dropped the read bash runs
-            // (cameronsjo/cadence-hooks#1094). So `case … esac` is modelled:
-            // the keyword where a command can start opens one, `in` starts its
-            // patterns, a pattern's `)` opens a clause without closing any
-            // level, `;;`/`;&`/`;;&` return to the patterns, and `esac` closes
-            // it. A statement still open at end of input is this scanner's own
-            // lexing, so it widens like the other lexed constructs.
-            if quote.is_none() && !arithmetic && boundary && !is_word_break(chars[j]) {
-                let top = cases.last().copied();
-                if command_position
-                    || matches!(top, Some(CaseState::Subject | CaseState::Pattern { .. }))
-                {
-                    let word_end = chars[j..]
-                        .iter()
-                        .position(|&c| is_word_break(c))
-                        .map_or(chars.len(), |off| j + off);
-                    let word = &chars[j..word_end];
-                    let is = |keyword: &str| word.iter().copied().eq(keyword.chars());
-                    match top {
-                        Some(CaseState::Subject) => {
-                            if is("in") {
-                                *cases.last_mut().expect("top") = CaseState::pattern();
-                            }
-                        }
-                        Some(CaseState::Pattern { fresh: true, .. }) if is("esac") => {
-                            cases.pop();
-                        }
-                        Some(CaseState::Pattern { parens, .. }) => {
-                            *cases.last_mut().expect("top") = CaseState::Pattern {
-                                fresh: false,
-                                parens,
-                            };
-                        }
-                        Some(CaseState::Body) if command_position && is("esac") => {
-                            cases.pop();
-                        }
-                        _ if is("case") => {
-                            cases.push(CaseState::Subject);
-                            lexed = true;
-                        }
-                        _ => {}
-                    }
-                    command_position = COMMAND_LEADING_RESERVED_WORDS
-                        .iter()
-                        .any(|reserved| is(reserved));
-                }
             }
             if quote.is_none() && !arithmetic && chars[j] == '<' && (j == 0 || chars[j - 1] != '<')
             {
@@ -7034,9 +7096,13 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
 struct PendingHeredoc {
     word: Vec<char>,
     strip_tabs: bool,
-    /// Unquoted delimiter: the body expands, and a backslash-newline in it
-    /// joins two lines before bash compares the result with the delimiter.
+    /// Unquoted delimiter: the body expands.
     expands: bool,
+    /// A backslash-newline in the body joins two lines before bash compares
+    /// the result with the delimiter: in an expanding body, and in ANY body
+    /// inside a `` `…` `` span, whose text bash reads with backslash-newlines
+    /// already removed.
+    joins: bool,
 }
 
 impl From<&HeredocDelimiter> for PendingHeredoc {
@@ -7045,6 +7111,7 @@ impl From<&HeredocDelimiter> for PendingHeredoc {
             word: delimiter.word.chars().collect(),
             strip_tabs: delimiter.strip_tabs,
             expands: !delimiter.quoted,
+            joins: !delimiter.quoted,
         }
     }
 }
@@ -7115,7 +7182,7 @@ fn heredoc_body_end(
             .rev()
             .take_while(|&&c| c == '\\')
             .count();
-        let continued = heredoc.expands && trailing % 2 == 1;
+        let continued = heredoc.joins && trailing % 2 == 1;
         // Compared in place: one allocation per body line made a long heredoc
         // cost an allocator round-trip per line on every rescan.
         let piece = &chars[from..if continued { eol - 1 } else { eol }];
@@ -11838,6 +11905,7 @@ mod tests {
                 word: delim.chars().collect(),
                 strip_tabs: dash,
                 expands: !quoted,
+                joins: !quoted,
             };
             let chars: Vec<char> = body.chars().collect();
             heredoc_body_end(&chars, 0, &heredoc, in_subst)
@@ -11903,6 +11971,20 @@ mod tests {
             "echo $(( 1 << 2 ))\ncat .env\n2",
             // bash 5.2 ends a body inside `$( … )` at `EOF)`.
             "x=$(cat <<EOF\nit's\nEOF)\ncat .env",
+            // A quoted-delimiter body inside a `"$( … )"` span joins nothing:
+            // `x\` ⏎ `EOF` ends it, and so does a `\` before a CR. Joining
+            // the skipped span's lines rewrote the body so it ran past bash's
+            // terminator, in every quoted spelling of the delimiter.
+            "echo \"$(cat <<'EOF'\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "echo \"$(cat <<\\EOF\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "x=\"$(cat <<$'E\\x4fF'\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<E'O'F\nx\\\nEOF\ncat .env\nEOF\n)\"",
+            "echo \"$(cat <<'EOF'\nx\\\r\nEOF\ncat .env\nEOF\n)\"",
+            // Backtick text loses its backslash-newlines BEFORE the heredoc is
+            // read, so even a quoted delimiter's body ends at a joined `EOF`.
+            "x=`cat <<\\EOF\nEO\\\nF\ncat .env\nEOF\n`",
+            "x=`cat <<'EOF'\nEO\\\nF\ncat .env\nEOF\n`",
+            "echo \"`cat <<\\EOF\nEO\\\nF\ncat .env\nEOF\n`\"",
         ] {
             let out = command_segments(input);
             assert!(
@@ -11930,6 +12012,8 @@ mod tests {
             "cat <<EOF\nEOF\r\ncat .env\nEOF",
             "cat <<EOF\nx\\\nEOF\ncat .env\nEOF",
             "cat <<-EOF\n\tEO\\\n\tF\ncat .env\nEOF",
+            // In backticks `x\` ⏎ `EOF` joins to `xEOF`, whatever the quoting.
+            "x=`cat <<\\EOF\nx\\\nEOF\ncat .env\nEOF\n`",
         ] {
             let out = command_segments(input);
             assert!(
@@ -12028,6 +12112,25 @@ mod tests {
                 out.iter().any(|s| s.contains("cat .env")),
                 "{input:?}: the read reached no segment: {out:?}"
             );
+        }
+    }
+
+    #[test]
+    fn case_opener_floods_stay_fast() {
+        // A 200 KB `$(case a in a) ` flood: the quote-blind reading ended at
+        // each pattern's `)` while the quote-aware one could not, so every
+        // nesting level surfaced two near-whole bodies and the wrapper
+        // recursion re-read both (1.4 s in enforce-worktree, 4x main). The
+        // blind reading models `case` too now, and surfaces one.
+        for unit in ["$(case a in a) ", "\"$(case a in a) "] {
+            let input = format!("echo {} ; cat .env", unit.repeat(200_000 / unit.len()));
+            let chars: Vec<char> = input.chars().collect();
+            assert!(scan_substitution_body(&chars, 7, false).is_err(), "{unit}");
+            let started = std::time::Instant::now();
+            let segs = command_segments(&input);
+            let took = started.elapsed();
+            assert!(segs.iter().any(|s| s.contains("cat .env")), "{unit}");
+            assert!(took < std::time::Duration::from_secs(5), "{unit}: {took:?}");
         }
     }
 
