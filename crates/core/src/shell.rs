@@ -175,6 +175,26 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
 /// quoted parens that a raw count sees as balanced. An escaped `\(` outside
 /// quotes is likewise not grouping syntax and is not counted.
 pub fn has_unbalanced_groups(segment: &str) -> bool {
+    let (opens, closes, backticks) = unquoted_group_counts(segment);
+    opens != closes || backticks % 2 == 1
+}
+
+/// How many `(` and `)` in `segment` sit OUTSIDE quotes, as `(opens, closes)`.
+///
+/// The same count [`has_unbalanced_groups`] makes, exposed for a caller that
+/// needs the direction of the imbalance and not just its presence: a walk that
+/// scopes a subshell's `cd` to the subshell has to know how many levels a
+/// segment opens and how many it closes (cadence-hooks#1058). Quoted parens
+/// (`-m "done :)"`) and escaped ones (`\(`) are not grouping and are not
+/// counted.
+pub fn unquoted_paren_counts(segment: &str) -> (usize, usize) {
+    let (opens, closes, _) = unquoted_group_counts(segment);
+    (opens, closes)
+}
+
+/// Unquoted `(`, `)` and backtick counts — the one scan behind
+/// [`has_unbalanced_groups`] and [`unquoted_paren_counts`].
+fn unquoted_group_counts(segment: &str) -> (usize, usize, usize) {
     let chars: Vec<char> = segment.chars().collect();
     let mut quote: Option<Quote> = None;
     let mut opens = 0usize;
@@ -196,7 +216,7 @@ pub fn has_unbalanced_groups(segment: &str) -> bool {
         }
         i += 1;
     }
-    opens != closes || backticks % 2 == 1
+    (opens, closes, backticks)
 }
 
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
@@ -1579,7 +1599,7 @@ fn skip_redirect(operands: &[String], i: usize) -> Option<usize> {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
-pub(crate) fn is_redirect_token(token: &str) -> bool {
+pub fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
