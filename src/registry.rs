@@ -23,11 +23,34 @@ pub struct HookEntry {
     /// mapping and the `INTENTIONAL_CROSS_PLUGIN_HOOKS` table — which is
     /// checked against the real `hooks.json` manifests.
     pub namespace: &'static str,
-    /// Hook event this command serves — drives `try`'s sample-payload shape.
-    /// `None` for fire-and-forget loggers, which react to `hook_event_name`
-    /// in the payload rather than a fixed event. Keep in sync with the
-    /// dispatch in main.rs (the event passed to `run_check_from_stdin`).
-    pub event: Option<HookEvent>,
+    /// Every hook event this command is wired on. The first entry is the
+    /// primary event — the one `try` builds its sample payload from and the one
+    /// main.rs's dispatch passes as the fallback. More than one entry marks a
+    /// multi-event hook (`model-posture`), whose dispatch resolves the reported
+    /// event from the payload's `hook_event_name`. Empty for fire-and-forget
+    /// loggers, which react to `hook_event_name` in the payload rather than a
+    /// fixed event. Keep the primary in sync with the dispatch in main.rs.
+    pub events: &'static [HookEvent],
+}
+
+impl HookEntry {
+    /// The primary event (`events[0]`); `None` for a logger.
+    pub fn event(&self) -> Option<HookEvent> {
+        self.events.first().copied()
+    }
+
+    /// Every event, comma-joined, or `logger` when there is none — the label
+    /// `list` and `try` print.
+    pub fn events_label(&self) -> String {
+        if self.events.is_empty() {
+            return "logger".to_string();
+        }
+        self.events
+            .iter()
+            .map(HookEvent::name)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Complete catalog of all hooks. Single source of truth for `list` output
@@ -38,410 +61,415 @@ pub const HOOKS: &[HookEntry] = &[
         name: "terminology",
         description: "Block inclusive terminology violations",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "orphaned-todos",
         description: "Block orphaned code markers without issue references",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "prevent-secret-leaks",
         description: "Guard against reading/ingesting secrets",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "prevent-secret-writes",
         description: "Guard against writing/editing/deleting secrets",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "memory-guard",
         description: "Enforce MEMORY.md line limits",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "git-safety",
         description: "Block dangerous git operations",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "line-endings",
         description: "Validate shell script line endings",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "env-vars",
         description: "Warn about generic environment variable names",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-docs-update",
         description: "Nudge to review docs when creating a PR",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-changelog-entry",
         description: "Nudge to add a CHANGELOG.md entry when shipping code changes",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-instruction-narrative",
         description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-live-memory-write",
         description: "Nudge on a direct write to live auto-memory outside a dream adoption window",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-plugin-root-cruft",
         description: "Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "nudge-polish-before-pr",
         description: "Nudge to run `/polish` before creating a PR",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "markdown-lint",
         description: "Run markdownlint on markdown files",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
+    },
+    HookEntry {
+        name: "audit-runner-pool",
+        description: "Run the runner-pool workflow audit after a workflow file is edited; findings return as a nudge",
+        namespace: "cadence",
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "redact-external-content",
         description: "Nudge when an external post mentions internal harness vocabulary",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-held-close",
         description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
         namespace: "cadence",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "platform-drift",
         description: "Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline",
         namespace: "cadence",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart],
     },
     HookEntry {
-        // Wired on SessionStart *and* PostModelSwitch. The registry records one
-        // event per hook, so it names the entry point that fires first; the
-        // subcommand itself picks its half from the payload's `hook_event_name`.
+        // Wired on SessionStart *and* PostModelSwitch; the subcommand picks its
+        // half from the payload's `hook_event_name`. The first event is primary.
         name: "model-posture",
         description: "Inject the Fable seat posture at session start and on a switch onto Fable",
         namespace: "cadence",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart, HookEvent::PostModelSwitch],
     },
     // guardrails
     HookEntry {
         name: "guard-push-remote",
         description: "Block git push to non-owned remotes",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-gh-dangerous",
         description: "Block irreversible gh operations (repo delete)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-gh-write",
         description: "Block gh write operations to non-owned repos",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-git-init",
         description: "Nudge to scaffold and confirm license after git init or gh repo create",
         namespace: "guardrails",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "warn-main-branch",
         description: "Warn when editing on main/master branch",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "enforce-worktree",
         description: "Block mutations in a primary checkout of a branch-mode repo",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-subagent-worktree",
         description: "Warn when dispatching a subagent from main while a sibling worktree exists",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-branch-base",
         description: "Warn when creating a branch from a non-main base",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-cron-datetime",
         description: "Remind to check datetime before scheduling cron jobs",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "nudge-upgrade-after-push",
         description: "Nudge to schedule a brew upgrade after pushing cadence-hooks to main",
         namespace: "guardrails",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "warn-untracked",
         description: "Warn about untracked files during git commit operations",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-amend-pushed",
         description: "Warn when git commit --amend rewrites a commit a remote already has",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-dotfiles",
         description: "Block direct edits to production dotfiles (opt-in)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "enforcement-status",
         description: "Report at SessionStart when CADENCE_BYPASS=1 or CADENCE_DISABLE names a protected guard",
         namespace: "guardrails",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart],
     },
     HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-pr-issue-link",
         description: "Nudge when gh pr create has no closing issue keyword",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-body-budget",
         description: "Measure gh pr/issue bodies against a per-surface word budget",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-issue-tracker",
         description: "Nudge when gh issue create targets a repo other than the canonical tracker",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-going-public",
         description: "Nudge on repo create/publicize when name or description telegraphs sensitive content",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-inline-body",
         description: "Nudge when gh pr/issue create posts a long body inline instead of via --body-file",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         namespace: "guardrails",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "guard-sops-decrypt",
         description: "Block a sops decrypt whose plaintext is not consumed by an allowed tool",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-op-vault-scan",
         description: "Block uninvited 1Password vault enumeration (op item list)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-curl-alias",
         description: "Warn when bare curl (aliased to curlie) is used with custom headers",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-gh-merge-preflight",
         description: "Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-unreviewed-ready-flip",
         description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-chezmoi-apply",
         description: "Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally; the nudge flags an unscoped apply",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-entry-posture",
         description: "Warn on a session's first write in a linked worktree whose branch has no upstream or no open PR",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-stacked-base-delete",
         description: "Warn before deleting a branch (`git push --delete`, `gh pr merge --delete-branch`) that open PRs use as their base",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-stale-pr-body",
         description: "Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since creation while the branch gained commits",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-alias-parsing",
         description: "Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "guard-browser-device",
         description: "Block the first Claude-in-Chrome action per session until the device is confirmed",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "inject-gh-write-context",
         description: "Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write",
         namespace: "guardrails",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     // rules
     HookEntry {
         name: "validate-frontmatter",
         description: "Validate SKILL.md, command, living-plan, and plugin-agent frontmatter",
         namespace: "rules",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "security-patterns",
         description: "Scan for security anti-patterns",
         namespace: "rules",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "warn-recommended-option",
         description: "Nudge to label a recommended AskUserQuestion option \"(Recommended)\"",
         namespace: "rules",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-empty-answers",
         description: "Nudge to re-ask when AskUserQuestion returns empty auto-approve answers",
         namespace: "rules",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     // obsidian
     HookEntry {
         name: "trash-guard",
         description: "Block rm in Obsidian vault (use .trash/ instead)",
         namespace: "obsidian",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     // metrics
     HookEntry {
         name: "snapshot",
         description: "Snapshot HEAD before a git commit (PreToolUse)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-commit",
         description: "Log cost-per-commit after a git commit (PostToolUse)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-subagent",
         description: "Log subagent lifecycle (SubagentStart / SubagentStop)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-session",
         description: "Log per-session cost at SessionEnd (SessionEnd)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-session-start",
         description: "Capture session start timestamp (SessionStart)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-ask-user-question",
         description: "Log AskUserQuestion asked (PreToolUse) + answered (PostToolUse) events",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "log-skill",
         description: "Log skill invocations (PostToolUse:Skill)",
         namespace: "metrics",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "warn-stale",
         description: "Warn at SessionStart when metrics telemetry has gone stale",
         namespace: "metrics",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart],
     },
     // session — the clap namespace for plan and session state. Wired by the
     // always-on `cadence` plugin, not by a plugin of its own: `cadence-canon`
@@ -451,79 +479,79 @@ pub const HOOKS: &[HookEntry] = &[
         name: "start",
         description: "Register this session, disclose live peers, and surface in-flight plans",
         namespace: "session",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart],
     },
     HookEntry {
         name: "heartbeat",
         description: "Touch this session's registry file (mtime is the liveness signal)",
         namespace: "session",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "guard",
         description: "Warn when an action intersects a live peer session's lane",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-branch-drift",
         description: "Warn when HEAD drifted from the session's recorded branch at git commit",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-branch-intent",
         description: "Nudge when new work starts on a stale, unrelated feature branch",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "warn-commit-provenance",
         description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         namespace: "session",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "backstop-record",
         description: "Record loose ends at session end for the next start to surface (SessionEnd)",
         namespace: "session",
-        event: None,
+        events: &[],
     },
     HookEntry {
         name: "backstop-warn",
         description: "Warn at session start when the last session left loose ends",
         namespace: "session",
-        event: Some(HookEvent::SessionStart),
+        events: &[HookEvent::SessionStart],
     },
     HookEntry {
         name: "persist-plan-approval",
         description: "Persist an approved plan at approval, merging into its own frontmatter and nudging when it carries no settled Panel: line; CADENCE_NO_PERSIST_PLAN opts out (PostToolUse:ExitPlanMode)",
         namespace: "session",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "nudge-plan-tick",
         description: "Nudge once per session when successful commits keep skipping the branch's in-flight plan doc (PostToolUse:Bash)",
         namespace: "session",
-        event: Some(HookEvent::PostToolUse),
+        events: &[HookEvent::PostToolUse],
     },
     HookEntry {
         name: "warn-plan-ready-flip",
         description: "Warn on gh pr ready/merge while the branch's plan is still in-flight or carries unticked boxes (PreToolUse:Bash)",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
     HookEntry {
         name: "lint-plan-shape",
         description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every outcome carries the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
         namespace: "session",
-        event: Some(HookEvent::PreToolUse),
+        events: &[HookEvent::PreToolUse],
     },
 ];
 
@@ -579,6 +607,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // would report silence and prove nothing about the hook.
         ("cadence", "model-posture") => Some(
             r#"{"session_id":"test","hook_event_name":"PostModelSwitch","from_model":"claude-opus-5","to_model":"claude-fable-5-1","source":"command"}"#,
+        ),
+        // audit-runner-pool gates on a write to `.github/workflows/*.y{a,}ml`;
+        // the generic PostToolUse sample names no file and would no-op.
+        ("cadence", "audit-runner-pool") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"Write","cwd":"/tmp","tool_input":{"file_path":"/tmp/repo/.github/workflows/ci.yml","content":"name: ci\n"}}"#,
         ),
         // snapshot gates on a `git commit` command (PreToolUse partner of log-commit)
         ("metrics", "snapshot") => Some(
@@ -814,7 +847,7 @@ mod tests {
     #[test]
     fn entry_returns_event_for_sample_payload_selection() {
         let e = entry("session", "start").expect("start registered");
-        assert_eq!(e.event, Some(HookEvent::SessionStart));
+        assert_eq!(e.event(), Some(HookEvent::SessionStart));
     }
 
     #[test]
@@ -897,13 +930,13 @@ mod tests {
         for hook in HOOKS {
             if loggers.contains(&hook.name) {
                 assert!(
-                    hook.event.is_none(),
-                    "{} is a logger and should have event: None",
+                    hook.events.is_empty(),
+                    "{} is a logger and should have no events",
                     hook.name
                 );
             } else {
                 assert!(
-                    hook.event.is_some(),
+                    !hook.events.is_empty(),
                     "{} is a check and must declare its event",
                     hook.name
                 );
