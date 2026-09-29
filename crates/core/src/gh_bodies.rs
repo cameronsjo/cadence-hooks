@@ -337,7 +337,12 @@ pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
         i += 1;
     }
     // The shell drops an unquoted word's backslashes, so `a\pi` runs `api`.
-    if argv.get(i).map(|w| crate::shell::unescape_word(w)).as_deref() != Some("api") {
+    if argv
+        .get(i)
+        .map(|w| crate::shell::unescape_word(w))
+        .as_deref()
+        != Some("api")
+    {
         return None;
     }
     i += 1;
@@ -708,6 +713,40 @@ mod tests {
 
         for not_api in ["gh pr create --body x", "gh repo view api", "echo api"] {
             assert_eq!(parse_gh_api(&argv(not_api)), None, "{not_api}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_keeps_every_field_in_order() {
+        use ApiField::*;
+        let req = parse_gh_api(&argv(
+            "gh a\\pi repos/o/r/labels -f name=n --field=description=@d.md -Fcolor=@- -H x=y",
+        ))
+        .expect("an escaped `api` is `api`");
+        assert_eq!(
+            req.fields,
+            vec![
+                ("name".to_string(), Literal("n".into())),
+                ("description".to_string(), File("d.md".into())),
+                ("color".to_string(), Stdin),
+            ]
+        );
+    }
+
+    #[test]
+    fn flag_values_reads_every_spelling_and_occurrence() {
+        let cases: &[(&str, &[&str])] = &[
+            ("gh gist create -d a f", &["a"]),
+            ("gh gist create -da f", &["a"]),
+            ("gh gist create --desc a f", &["a"]),
+            ("gh gist create --desc=a f", &["a"]),
+            ("gh gist create -d a --desc b", &["a", "b"]),
+            ("gh gist create --descx a", &[]),
+            ("gh gist create -- --desc a", &[]),
+            ("gh gist create -d", &[]),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(flag_values(&argv(cmd), "--desc", Some('d')), *want, "{cmd}");
         }
     }
 }

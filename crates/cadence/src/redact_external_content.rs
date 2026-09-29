@@ -1,9 +1,10 @@
 //! Catch internal vocabulary and work-identifiable terms before they leak into
 //! an external post.
 //!
-//! A PreToolUse check over the *body text* of external-posting Bash commands —
-//! `gh pr/issue/release/gist/discussion` create/comment/edit, `git commit`,
-//! `tea pr/issue` — running **two type-separated tiers with opposite
+//! A PreToolUse check over the *text* external-posting Bash commands publish —
+//! bodies, titles, descriptions and notes of `gh pr/issue/release/gist/discussion`
+//! create/comment/edit, `gh pr merge`, `gh repo create/edit`, `git commit`,
+//! `tea pr/issue`, and every field of a `gh api` write — running **two type-separated tiers with opposite
 //! outcomes** (ADR-0041):
 //!
 //! - The **shaped** tier **nudges, never blocks**. It matches vocabulary that
@@ -176,7 +177,7 @@ pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
 const GH_POST_GROUPS: &[&str] = &["pr", "issue", "release", "gist", "discussion"];
 const GH_POST_VERBS: &[&str] = &["create", "comment", "edit", "review", "reopen"];
 /// Posting `gh` commands outside the group × verb grid above: a merge commit's
-/// subject and body, and a repository's description (cadence-hooks#1164).
+/// subject and body, and a repository's description.
 const GH_EXTRA_POSTS: &[(&str, &[&str])] = &[("pr", &["merge"]), ("repo", &["create", "edit"])];
 const TEA_POST_GROUPS: &[&str] = &["pr", "issue"];
 const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
@@ -234,7 +235,7 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
     }
 }
 
-/// Does this `gh api` request publish text (cadence-hooks#1164)? It must send
+/// Does this `gh api` request publish text? It must send
 /// a payload (a literal `GET`/`HEAD` sends its fields as a query string) and
 /// carry one — a field or an `--input` file. Every endpoint counts, not only
 /// `repos/…`: `gists`, `user`, `orgs/…/repos` publish text too, and a write
@@ -278,7 +279,7 @@ fn posted_texts(segment: &str, base_dir: &str) -> Vec<String> {
 }
 
 /// Literal- and file-valued flags a posting command publishes beyond the body
-/// flags [`extract_bodies`] reads (cadence-hooks#1164). Keyed by command,
+/// flags [`extract_bodies`] reads. Keyed by command,
 /// because a letter means different things per command: `gh repo create -t`
 /// is a team and `git commit -t` a template file, neither of them text.
 fn headline_texts(argv: &[String], base_dir: &str) -> Vec<String> {
@@ -1045,7 +1046,7 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
     // per entry (default owned-internal); a whole pattern is skipped when the
     // gate closes (d <= c).
     for ap in &config.additional_patterns {
-        let Ok(re) = Regex::new(&ap.pattern) else {
+        let Some(re) = identity::cached_regex(&ap.pattern) else {
             continue;
         };
         let c = ceiling_ord(ap.ceiling.as_deref().unwrap_or("owned-internal"));
@@ -2851,6 +2852,172 @@ term = "acmecorp"
                 assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd}");
             }
         });
+    }
+
+    /// Run `cmd` from `dir`, so relative `@file`/`--input`/`--file` paths
+    /// resolve against a fixture directory.
+    fn run_in(cmd: &str, dir: &std::path::Path) -> CheckResult {
+        RedactExternalContent.run(&make_bash_with_cwd(cmd, dir.to_str().unwrap()))
+    }
+
+    /// A fixture directory holding a term-bearing body file, a JSON `--input`
+    /// payload that hides the term behind a `\u` escape, and a non-JSON one.
+    fn post_fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "about acmecorp\n").unwrap();
+        std::fs::write(dir.path().join("clean.md"), "about the parser\n").unwrap();
+        std::fs::write(
+            dir.path().join("p.json"),
+            r#"{"title":"fine","labels":["x"],"body":"acmecorp"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("raw.txt"), "not json: acmecorp").unwrap();
+        std::fs::write(dir.path().join("q.graphql"), "query { viewer { login } }").unwrap();
+        dir
+    }
+
+    #[test]
+    fn titles_descriptions_and_notes_reach_the_identity_block() {
+        // The identity tier read body flags only, so a term
+        // in a title, a description, release notes or a merge subject posted
+        // unseen. Every row publishes the term; each must block.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh issue create --title 'acmecorp thing' --body hi",
+                "gh issue create -t acmecorp --body hi",
+                "gh issue edit 3 --title=acmecorp",
+                "gh pr create -tacmecorp --body hi",
+                "gh pr edit 3 --title acmecorp",
+                "gh pr new --title acmecorp --body hi",
+                "gh release create v1 --title acmecorp",
+                "gh release create v1 --notes acmecorp",
+                "gh release edit v1 -n acmecorp",
+                "gh release create v1 --notes-file b.md",
+                "gh gist create -d acmecorp f.txt",
+                "gh gist create --desc=acmecorp f.txt",
+                "gh gist edit abc --desc acmecorp",
+                "gh repo create o/r -d acmecorp --private",
+                "gh repo edit o/r --description acmecorp",
+                "gh pr merge 3 --subject acmecorp",
+                "gh pr merge 3 -t acmecorp",
+                "gh pr merge 3 --body acmecorp",
+                "tea pr create --title acmecorp",
+                "tea issue create --description acmecorp",
+                "git commit -am acmecorp",
+                "git commit -vmacmecorp",
+                "git commit -aF b.md",
+                "git commit --file=b.md",
+                "git commit --file b.md",
+                "git commit -m 'acmecorp subject' -m body",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(
+                    msg.contains("BLOCKED") && msg.contains("[T1]"),
+                    "{cmd}: {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn gh_api_fields_and_input_reach_the_identity_block() {
+        // `gh api` was outside the posting gate, so any
+        // field of a write request — not only body/title — posted unseen.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api repos/o/r/issues -f body=acmecorp",
+                "gh api repos/o/r/issues -f title=acmecorp -f body=hi",
+                "gh api repos/o/r/issues -F body=@b.md",
+                "gh api repos/o/r/issues --input p.json",
+                "gh api repos/o/r/issues --input=raw.txt",
+                "gh api -X PATCH repos/o/r/issues/3 --raw-field=title=acmecorp",
+                "gh api -XPOST /repos/o/r/issues -fbody=acmecorp",
+                "gh api --method=PATCH repos/o/r/pulls/2 --field body=acmecorp",
+                "gh api repos/o/r/labels -f name=acmecorp",
+                "gh api repos/o/r/labels -f name=x -f description=acmecorp",
+                "gh api repos/o/r/git/commits -f message=acmecorp -f tree=t",
+                "gh api repos/o/r/issues/3/labels -f 'labels[]=acmecorp'",
+                "gh api -X PUT repos/o/r/contents/f -f message=acmecorp -f content=eA==",
+                "gh api gists -f description=acmecorp",
+                "gh api -X PATCH user -f bio=acmecorp",
+                "gh api repos/o/r/issues -f acmecorp=1",
+                "gh api graphql -f query='mutation { addComment(input:{body:\"acmecorp\"}) { x } }'",
+                "gh api graphql -f query='mutation($b:String!){ x(body:$b) }' -f b=acmecorp",
+                "gh api graphql -F query=@q.graphql -f b=acmecorp",
+                "gh \"api\" repos/o/r/issues -f body=acmecorp",
+                "gh a\\pi repos/o/r/issues -f body=acmecorp",
+                "env A=1 gh api repos/o/r/issues -f body=acmecorp",
+                "cd x && gh api repos/o/r/issues -f body=acmecorp",
+            ] {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, Outcome::Block, "must block: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert!(
+                    msg.contains("BLOCKED") && msg.contains("[T1]"),
+                    "{cmd}: {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn title_and_api_controls_stay_allowed() {
+        // Reads, clean posts and quoted mentions publish no term.
+        let dir = post_fixture_dir();
+        with_terms(FIXTURE, || {
+            for cmd in [
+                "gh api repos/o/r",
+                "gh api repos/acmecorp/r",
+                "gh api -X GET repos/o/r/issues -f q=acmecorp",
+                "gh api --method HEAD repos/o/r -f q=acmecorp",
+                "gh api graphql -f query='query { search(query:\"acmecorp\") { x } }'",
+                "gh api graphql -f query='{ viewer { login } }' -f acmecorp=1",
+                "gh api repos/o/r/issues -f body=clean -f title='fix bug'",
+                "gh api repos/o/r/issues -F body=@clean.md",
+                "gh issue create --title 'fix bug' --body hi",
+                "gh gist create -d notes f.txt",
+                "gh repo create o/r -t acmecorp",
+                "git commit -t acmecorp.txt -m clean",
+                "git commit -C acmecorp",
+                "echo \"gh issue create --title acmecorp\"",
+                "echo \"gh api repos/o/r/issues -f body=acmecorp\"",
+                "gh issue list --search acmecorp",
+                "gh pr view --title acmecorp",
+            ] {
+                assert_eq!(
+                    run_in(cmd, dir.path()).outcome,
+                    Outcome::Allow,
+                    "must allow: {cmd}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn posting_gate_reads_gh_api_writes() {
+        // The shared gate (warn-overshare reads it too) sees a `gh api` write
+        // carrying text, and nothing else of `gh api`.
+        let cases: &[(&str, bool)] = &[
+            ("gh api repos/o/r/issues -f body=x", true),
+            ("gh api -X PATCH repos/o/r/issues/1 --input p.json", true),
+            ("gh api graphql -f query='mutation { x }'", true),
+            ("gh api graphql -F query=@q.graphql", true),
+            ("gh api graphql -f query='query { x }'", false),
+            ("gh api repos/o/r", false),
+            ("gh api -X DELETE repos/o/r/labels/x", false),
+            ("gh api -X GET repos/o/r/issues -f q=x", false),
+            ("gh repo create o/r -d x", true),
+            ("gh pr merge 3 --squash", true),
+            ("gh repo view o/r", false),
+            ("echo gh api repos/o/r/issues -f body=x", false),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(is_external_post(cmd), *want, "{cmd}");
+        }
     }
 
     #[test]

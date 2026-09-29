@@ -294,7 +294,28 @@ fn term_regex(term: &str) -> Option<Regex> {
         body,
         if ends_word { r"\b" } else { "" }
     );
-    Regex::new(&pattern).ok()
+    cached_regex(&pattern)
+}
+
+/// Compile `pattern` once per process. A scan runs once per posted text, and
+/// one command can post tens of thousands of texts (every `gh api` field,
+/// every repeated flag); recompiling each term and allow pattern per text
+/// took a 200 KB command past the hook deadline, where the guard fails open.
+/// The cache is bounded by the term source and repo config, which a command
+/// cannot grow. An invalid pattern caches as `None`.
+pub(super) fn cached_regex(pattern: &str) -> Option<Regex> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<Regex>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| Regex::new(pattern).ok())
+            .clone()
+    })
 }
 
 /// Does an allow entry excuse this match?
@@ -310,7 +331,7 @@ fn is_allowed(entry: &AllowEntry, text: &str, file_path: Option<&str>) -> bool {
         return true;
     }
     if let Some(pat) = entry.pattern.as_deref().filter(|p| !p.is_empty())
-        && Regex::new(pat).is_ok_and(|re| re.is_match(text))
+        && cached_regex(pat).is_some_and(|re| re.is_match(text))
     {
         return true;
     }
