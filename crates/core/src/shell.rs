@@ -3952,14 +3952,43 @@ pub fn forge_host(host: String) -> String {
 /// - `ssh://git@github.com/owner/repo.git`
 /// - `git@github.com:owner/repo.git` (SCP-style)
 /// - URLs with ports, credentials, trailing slashes, and subpaths
+///
+/// **`None` wherever this parser cannot promise to agree with the transport**,
+/// which every caller reads as "not owned" (cadence-hooks#1066):
+///
+/// - a scheme URL carrying `#`, `?`, `[`, a backslash, whitespace or a
+///   control character, or a `%` outside its userinfo —
+///   `https://evil.com#@github.com/o/r` used to read as host `github.com`
+///   through the last `@`, while git and curl end the authority at the `#`
+///   and contact `evil.com`. [`parse_gh_repo_value`]'s URL arm refuses the
+///   same set;
+/// - a scheme URL whose authority holds more than one `@`, where "which `@`
+///   ends the userinfo" is a question transports have answered differently;
+/// - any `.` or `..` path segment, in either form: curl resolves
+///   `https://github.com/own/x/../../other/y` to `other/y`, so the first two
+///   segments are not the repository contacted.
 pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
     let trimmed = url.trim();
 
     let (host, path) = if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        if after_scheme.contains(['#', '?', '[', '\\'])
+            || after_scheme.contains(|c: char| c.is_whitespace() || c.is_control())
+        {
+            return None;
+        }
         // Has scheme (https://, ssh://) — extract host, then path after first /
         let (host_part, path) = after_scheme.split_once('/')?;
+        if host_part.matches('@').count() > 1 {
+            return None;
+        }
         // Strip credentials: user@host or token:x-oauth@host
         let host_part = host_part.rsplit('@').next().unwrap_or(host_part);
+        // A percent-escape is refused past the userinfo only: an escaped
+        // credential is ordinary, while an escaped host or path (`%2e%2e`)
+        // is decoded by the transport and not by this parser.
+        if host_part.contains('%') || path.contains('%') {
+            return None;
+        }
         // Strip port: host:22
         let host_part = host_part.split(':').next().unwrap_or(host_part);
         (host_part, path)
@@ -3977,6 +4006,14 @@ pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
     };
 
     if host.is_empty() {
+        return None;
+    }
+
+    // A dot segment moves the path the transport resolves (cadence-hooks#1066).
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
         return None;
     }
 
@@ -6125,6 +6162,52 @@ impl<'a> AssignmentScope<'a> {
         self.values.insert(name, value);
     }
 
+    /// Record one [`Assignment`]: `+=` concatenates onto the visible value,
+    /// and an array stores each element under `NAME[i]` and the joined value
+    /// under `NAME[@]`/`NAME[*]` beside `NAME` itself (element 0), and the
+    /// element count under `NAME[#]` — keys no real variable name can collide
+    /// with, and no reference reads `NAME[#]` (cadence-hooks#1124).
+    fn assign(&mut self, assignment: Assignment) {
+        let Assignment {
+            name,
+            value,
+            elements,
+            append,
+        } = assignment;
+        let Some(elements) = elements else {
+            let value = match self.get(&name).filter(|_| append) {
+                Some(old) => format!("{old}{value}"),
+                None => value,
+            };
+            self.set(format!("{name}[0]"), value.clone());
+            self.set(name, value);
+            return;
+        };
+        let key = |k: usize| format!("{name}[{k}]");
+        let (first, joined): (usize, String) =
+            match self.get(&format!("{name}[@]")).filter(|_| append) {
+                Some(old) => (
+                    self.get(&format!("{name}[#]"))
+                        .and_then(|count| count.parse().ok())
+                        .unwrap_or(0),
+                    format!("{old} {value}"),
+                ),
+                None => (0, value),
+            };
+        let count = first.saturating_add(elements.len());
+        for (k, element) in elements.into_iter().enumerate() {
+            if first + k < MAX_ARRAY_ELEMENTS {
+                self.set(key(first + k), element);
+            }
+        }
+        self.set(format!("{name}[#]"), count.to_string());
+        if let Some(zero) = self.get(&key(0)).map(str::to_string) {
+            self.set(name.clone(), zero);
+        }
+        self.set(format!("{name}[*]"), joined.clone());
+        self.set(format!("{name}[@]"), joined);
+    }
+
     fn get(&self, name: &str) -> Option<&str> {
         let mut scope = Some(self);
         while let Some(s) = scope {
@@ -6149,10 +6232,6 @@ impl<'a> AssignmentScope<'a> {
         let half = SHORT_SUBSTITUTION_LEN / 2;
         Some(clip_value(value, half, half))
     }
-
-    fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.parent.is_none_or(AssignmentScope::is_empty)
-    }
 }
 
 /// Recursive worker for [`command_segments`]. `assignments` accumulates in
@@ -6165,48 +6244,82 @@ fn expand_segments(
     out: &mut Vec<String>,
 ) {
     for segment in split_segments(command) {
-        let segment = apply_assignments(&segment, assignments);
+        let mut defaults = Vec::new();
+        let mut ambiguous = false;
+        let expanded =
+            apply_assignments(&segment, assignments, &mut defaults, false, &mut ambiguous);
+        // `${D:=word}` assigns `D` while it expands (cadence-hooks#1124). The
+        // segment as written is kept beside its expansion: the expansion
+        // erases the assignment, and a guard tracking one by its spelling
+        // (`guard-gh-write`'s `${GH_HOST:=…}`) must still see it.
+        if !defaults.is_empty() && expanded != segment {
+            out.push(segment.clone());
+        }
+        // A `${D:-word}` choice that turned on `D` being set is emitted both
+        // ways (see [`apply_assignments`]): `C=echo; C=; ${C:-cat} .env` runs
+        // `cat`, while the walk still holds `C=echo`.
+        if ambiguous {
+            let alternate =
+                apply_assignments(&segment, assignments, &mut Vec::new(), true, &mut false);
+            if alternate != expanded {
+                emit_segment(alternate, assignments, depth, out);
+            }
+        }
+        for (name, value) in defaults {
+            assignments.set(name, value);
+        }
         // Recorded AFTER this segment is expanded: a shell expands a word
         // before the assignment on that same line takes effect, so `F=new cmd
         // $F` passes the OLD `$F`.
-        if let Some((name, value)) = segment_assignment(&segment) {
-            assignments.set(name, value);
+        for assignment in segment_assignments(&expanded) {
+            assignments.assign(assignment);
         }
-        // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
-        // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
-        // substitution in the PARENT before it spawns bash at all, so a segment
-        // that is a wrapper still owes its substitution bodies. Selecting
-        // between them dropped those bodies from every wrapper segment, and the
-        // drop was invisible until the wrapper hunt widened: `bash -c 'echo hi'
-        // "$(rm note.md)"` deletes the file and reached no guard, and every
-        // runner spelling the peel newly sees would have inherited the same hole
-        // (#528 review C-D1). [`child_scripts`] already unions the two for the
-        // same reason (#228 review finding 2); this is `expand_segments`
-        // agreeing with it.
-        //
-        // Substitution recursion shares the wrapper-nesting budget, so three
-        // levels of `sh -c` nesting can exhaust it before a substitution is
-        // surfaced as its own segment. Accepted: the substitution text still
-        // appears as a substring of the pushed segment, and three levels is
-        // already generous.
-        if depth < MAX_WRAPPER_DEPTH {
-            for body in substitution_bodies(&segment) {
-                // A substitution is its own subshell too — a child scope.
-                let mut scope = assignments.child();
-                expand_segments(&body, &mut scope, depth + 1, out);
-            }
+        emit_segment(expanded, assignments, depth, out);
+    }
+}
+
+/// Push one expanded segment of [`expand_segments`], with the substitution
+/// bodies and `-c` script it runs expanded after it.
+fn emit_segment(
+    segment: String,
+    assignments: &AssignmentScope<'_>,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
+    // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
+    // substitution in the PARENT before it spawns bash at all, so a segment
+    // that is a wrapper still owes its substitution bodies. Selecting between
+    // them dropped those bodies from every wrapper segment, and the drop was
+    // invisible until the wrapper hunt widened: `bash -c 'echo hi'
+    // "$(rm note.md)"` deletes the file and reached no guard, and every runner
+    // spelling the peel newly sees would have inherited the same hole (#528
+    // review C-D1). [`child_scripts`] already unions the two for the same
+    // reason (#228 review finding 2); this is `expand_segments` agreeing with
+    // it.
+    //
+    // Substitution recursion shares the wrapper-nesting budget, so three
+    // levels of `sh -c` nesting can exhaust it before a substitution is
+    // surfaced as its own segment. Accepted: the substitution text still
+    // appears as a substring of the pushed segment, and three levels is
+    // already generous.
+    if depth < MAX_WRAPPER_DEPTH {
+        for body in substitution_bodies(&segment) {
+            // A substitution is its own subshell too — a child scope.
+            let mut scope = assignments.child();
+            expand_segments(&body, &mut scope, depth + 1, out);
         }
-        match shell_c_argument(&segment) {
-            Some(inner) if depth < MAX_WRAPPER_DEPTH => {
-                out.push(segment);
-                // A child shell inherits what is set so far, but its own
-                // assignments die with the subshell — recurse on a snapshot so
-                // they cannot reach the parent's later segments.
-                let mut scope = assignments.child();
-                expand_segments(&inner, &mut scope, depth + 1, out);
-            }
-            _ => out.push(segment),
+    }
+    match shell_c_argument(&segment) {
+        Some(inner) if depth < MAX_WRAPPER_DEPTH => {
+            out.push(segment);
+            // A child shell inherits what is set so far, but its own
+            // assignments die with the subshell — recurse on a snapshot so
+            // they cannot reach the parent's later segments.
+            let mut scope = assignments.child();
+            expand_segments(&inner, &mut scope, depth + 1, out);
         }
+        _ => out.push(segment),
     }
 }
 
@@ -7286,31 +7399,122 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     bodies
 }
 
-/// The `VAR=value` / `export VAR=value` assignment ONE segment makes — either a
-/// standalone segment or the leading assignment of a command (`VAR=value cmd
-/// …`). The value's surrounding quotes are stripped via [`tokenize`].
-/// [`expand_segments`] walks segments in order and feeds these to
-/// [`apply_assignments`], so an assignment is visible only downstream of itself.
-fn segment_assignment(segment: &str) -> Option<(String, String)> {
+/// One assignment a segment makes, as [`segment_assignments`] reads it.
+#[derive(Debug, PartialEq, Eq)]
+struct Assignment {
+    name: String,
+    /// The scalar value, or an array's elements joined by a space.
+    value: String,
+    /// `NAME=(a b …)`: the elements, one per word.
+    elements: Option<Vec<String>>,
+    /// `NAME+=value`: concatenate onto the current value (or append the
+    /// elements) instead of replacing it.
+    append: bool,
+}
+
+/// Builtins whose operands are assignments (cadence-hooks#1124): `local
+/// D=.env` sets `D` exactly as `D=.env` does.
+const DECLARATION_BUILTINS: &[&str] = &["export", "local", "declare", "typeset", "readonly"];
+
+/// Array elements [`AssignmentScope`] stores one by one; past it only the
+/// joined value (`${NAME[@]}`) is kept.
+const MAX_ARRAY_ELEMENTS: usize = 64;
+
+/// The assignments ONE segment makes — every leading `VAR=value` word of a
+/// standalone assignment or a command (`VAR=value cmd …`), or every operand of
+/// a declaration builtin (`export`/`local`/`declare`/`typeset`/`readonly`,
+/// past their `-x`/`+r` options). `NAME+=value` is an append, and
+/// `NAME=(a b)` an array (cadence-hooks#1124). The value's surrounding quotes
+/// are stripped via [`tokenize`]. [`expand_segments`] walks segments in order
+/// and feeds these to [`apply_assignments`], so an assignment is visible only
+/// downstream of itself.
+fn segment_assignments(segment: &str) -> Vec<Assignment> {
     let tokens = tokenize(segment);
-    let idx = usize::from(tokens.first().map(String::as_str) == Some("export"));
-    let (name, value) = tokens.get(idx)?.split_once('=')?;
-    if name.is_empty() || value.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
-    {
-        return None;
+    let declaration = tokens
+        .first()
+        .is_some_and(|t| DECLARATION_BUILTINS.contains(&t.as_str()));
+    let mut i = usize::from(declaration);
+    if declaration {
+        while tokens
+            .get(i)
+            .is_some_and(|t| t.len() > 1 && (t.starts_with('-') || t.starts_with('+')))
+        {
+            i += 1;
+        }
     }
-    // An unquoted `D=$(mktemp -d /x.XXXX)` tokenizes on the spaces inside the
-    // substitution, so the token's value is the fragment `$(mktemp`, and every
-    // later `$D` became a broken span (cadence-hooks#970).
-    // Only a plain value is re-read; anything else keeps the fragment, as
-    // before, so no other value's expansion changes.
-    if value.contains("$(")
-        && value.matches('(').count() > value.matches(')').count()
-        && let Some(whole) = unquoted_substitution_value(segment, idx, name)
-    {
-        return Some((name.to_string(), whole));
+    let mut out = Vec::new();
+    while let Some(token) = tokens.get(i) {
+        i += 1;
+        let Some((name, value)) = token.split_once('=') else {
+            // `declare -r A B=x`: a bare name declares without assigning.
+            if declaration {
+                continue;
+            }
+            break;
+        };
+        let (name, append) = match name.strip_suffix('+') {
+            Some(base) => (base, true),
+            None => (name, false),
+        };
+        if name.is_empty()
+            || name.starts_with(|c: char| c.is_ascii_digit())
+            || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            if declaration {
+                continue;
+            }
+            break;
+        }
+        // `arr=(a b)` tokenizes as `arr=(a` and `b)`.
+        if let Some(first) = value.strip_prefix('(') {
+            let mut elements = Vec::new();
+            let mut word = first;
+            loop {
+                if let Some(last) = word.strip_suffix(')') {
+                    if !last.is_empty() {
+                        elements.push(last.to_string());
+                    }
+                    break;
+                }
+                if !word.is_empty() {
+                    elements.push(word.to_string());
+                }
+                let Some(next) = tokens.get(i) else { break };
+                i += 1;
+                word = next;
+            }
+            out.push(Assignment {
+                name: name.to_string(),
+                value: elements.join(" "),
+                elements: Some(elements),
+                append,
+            });
+            continue;
+        }
+        if value.is_empty() && !append {
+            continue;
+        }
+        // An unquoted `D=$(mktemp -d /x.XXXX)` tokenizes on the spaces inside
+        // the substitution, so the token's value is the fragment `$(mktemp`,
+        // and every later `$D` became a broken span (cadence-hooks#970).
+        // Only a plain value is re-read; anything else keeps the fragment, as
+        // before, so no other value's expansion changes.
+        let value = if value.contains("$(")
+            && value.matches('(').count() > value.matches(')').count()
+            && let Some(whole) = unquoted_substitution_value(segment, token)
+        {
+            whole
+        } else {
+            value.to_string()
+        };
+        out.push(Assignment {
+            name: name.to_string(),
+            value,
+            elements: None,
+            append,
+        });
     }
-    Some((name.to_string(), value.to_string()))
+    out
 }
 
 /// The whole value of an unquoted `NAME=$(…)` word in `segment` — the text the
@@ -7320,13 +7524,17 @@ fn segment_assignment(segment: &str) -> Option<(String, String)> {
 /// Confident means plain: outside the substitution no quote, backslash, or
 /// backtick; inside it none of those and no `(` or `)` but the closing one. A
 /// value outside that shape, `D=$(mktemp -d "$T/x")` say, is unchanged by
-/// cadence-hooks#970. `export_idx` is 1 when the word follows `export`.
-fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> Option<String> {
-    let mut rest = segment.trim_start();
-    if export_idx == 1 {
-        rest = rest.strip_prefix("export")?.trim_start();
-    }
-    let value = rest.strip_prefix(name)?.strip_prefix('=')?;
+/// cadence-hooks#970. `token` is the assignment word's tokenized fragment.
+fn unquoted_substitution_value(segment: &str, token: &str) -> Option<String> {
+    // The raw word begins where its `NAME=$(` fragment does, at a word start.
+    let head = &token[..token.find("$(")? + 2];
+    let start = segment.match_indices(head).map(|(at, _)| at).find(|&at| {
+        segment[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+    })?;
+    let value = &segment[start + token.find('=')? + 1..];
     let mut depth = 0usize;
     let mut end = value.len();
     let mut chars = value.char_indices().peekable();
@@ -7353,76 +7561,276 @@ fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> 
     (depth == 0).then(|| value[..end].to_string())
 }
 
+/// How deep [`apply_assignments`] expands a `${NAME:-word}` whose `word`
+/// holds another reference; deeper words go in as written.
+const MAX_DEFAULT_WORD_DEPTH: usize = 4;
+
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
 /// outside single quotes. Only names present in `assignments` are touched; an
 /// unknown (environment-sourced) variable is left as-is (fail open).
-fn apply_assignments(segment: &str, assignments: &AssignmentScope<'_>) -> String {
-    if assignments.is_empty() || !segment.contains('$') {
+///
+/// The parameter operators that name a word are modelled (cadence-hooks#1124):
+/// `${NAME:-word}`/`${NAME-word}`, `${NAME:=word}`/`${NAME=word}` and
+/// `${NAME:?word}`/`${NAME?word}` give the value when `NAME` is assigned and
+/// `word` otherwise — an unassigned name may be unset, and then bash reads
+/// `word`, so it is the candidate a guard judges; `:=` also records
+/// `NAME=word` in `defaults` for later segments. `${NAME:+word}`/
+/// `${NAME+word}` give `word`. `${NAME[i]}` gives element `i` of an array
+/// assignment (`@`/`*` all of them); an index it cannot evaluate gives every
+/// element, and a reference to no assigned element stays as written.
+///
+/// With `alternate`, each choice that turned on `NAME` being set is taken the
+/// other way: the default word for an assigned name, the empty string for
+/// `+`. The walk cannot prove an assignment it saw is still in force at that
+/// point (`D=`, `unset D`, `false && D=x`, a prefix-only `D=x cmd`), so
+/// [`expand_segments`] emits both expansions; `ambiguous` reports whether the
+/// alternate differs in any choice.
+fn apply_assignments(
+    segment: &str,
+    assignments: &AssignmentScope<'_>,
+    defaults: &mut Vec<(String, String)>,
+    alternate: bool,
+    ambiguous: &mut bool,
+) -> String {
+    if !segment.contains('$') {
         return segment.to_string();
     }
     let chars: Vec<char> = segment.chars().collect();
-    let mut out = String::with_capacity(segment.len());
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < chars.len() {
-        let c = chars[i];
-        // Outside single quotes a backslash consumes the next character, so an
-        // escaped `"` opens and closes nothing, `\\"` still closes a string,
-        // and `\$D` stays unexpanded, as in bash.
-        if c == '\\' && !in_single {
-            out.push(c);
-            if let Some(&next) = chars.get(i + 1) {
-                out.push(next);
-            }
-            i += 2;
-            continue;
-        }
-        if c == '"' && !in_single {
-            in_double = !in_double;
-        }
-        // An apostrophe inside `"…"` is a literal, not a single quote.
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '$' && !in_single {
-            let braced = chars.get(i + 1) == Some(&'{');
-            let mut j = if braced { i + 2 } else { i + 1 };
-            let start = j;
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
-                j += 1;
-            }
-            let name: String = chars[start..j].iter().collect();
-            if braced && chars.get(j) == Some(&'}') {
-                j += 1;
-            }
-            // Newest wins: a re-assignment replaced the value in the scope.
-            if !name.is_empty()
-                && let Some(value) = assignments.take(&name)
-            {
-                // A whole `$(…)` value carrying whitespace (#970) is one word
-                // only inside `"…"`. Unquoted, the tokenizers downstream would
-                // split it at its spaces and a `$D/.env` write target would
-                // read as `-d)/.env`, hiding it from the writes guard, so it
-                // goes in quoted: the word boundaries stay where bash's are.
-                if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
-                    out.push('"');
-                    out.push_str(&value);
-                    out.push('"');
-                } else {
-                    out.push_str(&value);
+    // Bytes the `}` searches may walk across the whole segment, so a flood
+    // of unclosed `${D:-` stays linear; past it the operators go unmodelled.
+    let mut walk = ReferenceWalk {
+        assignments,
+        defaults,
+        scan_budget: chars.len().saturating_mul(8).saturating_add(1 << 16),
+        alternate,
+        ambiguous,
+    };
+    walk.expand(&chars, 0)
+}
+
+/// The state of one [`apply_assignments`] walk.
+struct ReferenceWalk<'w, 'a> {
+    assignments: &'w AssignmentScope<'a>,
+    defaults: &'w mut Vec<(String, String)>,
+    scan_budget: usize,
+    alternate: bool,
+    ambiguous: &'w mut bool,
+}
+
+impl ReferenceWalk<'_, '_> {
+    /// The walk over one run of text at a `${…:-word}` nesting depth.
+    fn expand(&mut self, chars: &[char], depth: usize) -> String {
+        let mut out = String::with_capacity(chars.len());
+        let mut i = 0;
+        let mut in_single = false;
+        let mut in_double = false;
+        while i < chars.len() {
+            let c = chars[i];
+            // Outside single quotes a backslash consumes the next character, so
+            // an escaped `"` opens and closes nothing, `\\"` still closes a
+            // string, and `\$D` stays unexpanded, as in bash.
+            if c == '\\' && !in_single {
+                out.push(c);
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
                 }
-                i = j;
+                i += 2;
                 continue;
             }
+            if c == '"' && !in_single {
+                in_double = !in_double;
+            }
+            // An apostrophe inside `"…"` is a literal, not a single quote.
+            if c == '\'' && !in_double {
+                in_single = !in_single;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '$' && !in_single {
+                let braced = chars.get(i + 1) == Some(&'{');
+                let mut j = if braced { i + 2 } else { i + 1 };
+                let start = j;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let name: String = chars[start..j].iter().collect();
+                if braced
+                    && !name.is_empty()
+                    && let Some((text, end)) =
+                        self.braced_operator(chars, i, j, &name, in_double, depth)
+                {
+                    out.push_str(&text);
+                    i = end;
+                    continue;
+                }
+                if braced && chars.get(j) == Some(&'}') {
+                    j += 1;
+                }
+                // Newest wins: a re-assignment replaced the value in the scope.
+                if !name.is_empty()
+                    && let Some(value) = self.assignments.take(&name)
+                {
+                    push_value(&mut out, &value, in_double);
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
         }
-        out.push(c);
-        i += 1;
+        out
     }
-    out
+
+    /// The expansion of a `${NAME[i]}` or `${NAME<op>word}` reference opening
+    /// at `open` (its `$`), whose name ends at `after_name`, as `(text, index
+    /// past the closing brace)`; `None` for every other shape, which the
+    /// caller expands as before. See [`apply_assignments`].
+    fn braced_operator(
+        &mut self,
+        chars: &[char],
+        open: usize,
+        after_name: usize,
+        name: &str,
+        in_double: bool,
+        depth: usize,
+    ) -> Option<(String, usize)> {
+        let literal = |end: usize| chars[open..end].iter().collect::<String>();
+        let assignments = self.assignments;
+        if chars.get(after_name) == Some(&'[') {
+            let close =
+                (after_name + 1..chars.len().min(after_name + 64)).find(|&k| chars[k] == ']')?;
+            if chars.get(close + 1) != Some(&'}') {
+                return None;
+            }
+            let index: String = chars[after_name + 1..close].iter().collect();
+            // bash evaluates the index, so a substitution in it runs: expanded
+            // as before, the text stays in the segment for the walk to find.
+            if runs_commands(&index) {
+                return None;
+            }
+            let end = close + 2;
+            let resolvable = index == "@"
+                || index == "*"
+                || (!index.is_empty() && index.chars().all(|c| c.is_ascii_digit()));
+            // An index the walk cannot evaluate (`${arr[$i]}`) may pick any
+            // element, so all of them are the candidates.
+            let key = if resolvable {
+                format!("{name}[{index}]")
+            } else {
+                format!("{name}[@]")
+            };
+            let mut text = String::new();
+            match assignments.take(&key) {
+                Some(value) => push_value(&mut text, &value, in_double),
+                None => text = literal(end),
+            }
+            return Some((text, end));
+        }
+        let colon = usize::from(chars.get(after_name) == Some(&':'));
+        let op = *chars.get(after_name + colon)?;
+        if !matches!(op, '-' | '=' | '+' | '?') {
+            return None;
+        }
+        let word_start = after_name + colon + 1;
+        let close = parameter_word_end(chars, word_start, in_double, &mut self.scan_budget)?;
+        let end = close + 1;
+        let raw = &chars[word_start..close];
+        let assigned = assignments.get(name).is_some();
+        let word = if depth < MAX_DEFAULT_WORD_DEPTH {
+            self.expand(raw, depth + 1)
+        } else {
+            raw.iter().collect()
+        };
+        let mut text = String::new();
+        match op {
+            // Set or not, the name may be unset here, and then `+` gives
+            // nothing: the alternate takes that branch.
+            '+' => {
+                *self.ambiguous = true;
+                if !self.alternate {
+                    text = word;
+                }
+            }
+            '?' if !assigned => text = literal(end),
+            _ if assigned => {
+                *self.ambiguous = true;
+                if self.alternate {
+                    text = word;
+                } else {
+                    let value = assignments.take(name)?;
+                    push_value(&mut text, &value, in_double);
+                }
+            }
+            _ => {
+                if op == '=' {
+                    let unquoted = tokenize(&word);
+                    self.defaults.push((
+                        name.to_string(),
+                        if unquoted.len() == 1 {
+                            unquoted.into_iter().next().unwrap_or_default()
+                        } else {
+                            word.clone()
+                        },
+                    ));
+                }
+                text = word;
+            }
+        }
+        Some((text, end))
+    }
+}
+
+/// Push a substituted value. A whole `$(…)` value carrying whitespace (#970)
+/// is one word only inside `"…"`. Unquoted, the tokenizers downstream would
+/// split it at its spaces and a `$D/.env` write target would read as
+/// `-d)/.env`, hiding it from the writes guard, so it goes in quoted: the word
+/// boundaries stay where bash's are.
+fn push_value(out: &mut String, value: &str, in_double: bool) {
+    if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
+        out.push('"');
+        out.push_str(value);
+        out.push('"');
+    } else {
+        out.push_str(value);
+    }
+}
+
+/// Does this text hold a command substitution or process substitution?
+fn runs_commands(text: &str) -> bool {
+    text.contains("$(") || text.contains('`') || text.contains("<(") || text.contains(">(")
+}
+
+/// Index of the `}` closing a `${…` whose word starts at `from`, counting
+/// nested braces and skipping escapes and (outside `"…"`) single-quoted text,
+/// or `None` when it never closes or `scan_budget` runs out.
+fn parameter_word_end(
+    chars: &[char],
+    from: usize,
+    in_double: bool,
+    scan_budget: &mut usize,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut k = from;
+    while k < chars.len() {
+        *scan_budget = scan_budget.checked_sub(1)?;
+        match chars[k] {
+            '\\' => k += 1,
+            '\'' if !in_double => {
+                k += 1;
+                while k < chars.len() && chars[k] != '\'' {
+                    *scan_budget = scan_budget.checked_sub(1)?;
+                    k += 1;
+                }
+            }
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(k),
+            '}' => depth -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 /// If `segment` is a `sh`/`bash`/`zsh`/`dash` invocation carrying a `-c
@@ -7501,7 +7909,7 @@ pub const COMMAND_RUNNERS: &[&str] = &[
 /// expanding a script the shell would NOT run can manufacture a false block, so
 /// the cost of over-eagerness is bounded, not zero.
 pub fn peel_command_runners(tokens: &[String]) -> &[String] {
-    let mut argv = skip_transparent_prefixes(tokens);
+    let mut argv = skip_prefixes_and_env_operands(tokens, tokens);
     while let Some(first) = argv.first() {
         let runner = command_word(first).into_owned();
         if !COMMAND_RUNNERS.contains(&runner.as_str()) {
@@ -7510,10 +7918,67 @@ pub fn peel_command_runners(tokens: &[String]) -> &[String] {
         let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
             break;
         };
+        let rest = if runner == "env" {
+            skip_env_assignment_operands(rest)
+        } else {
+            rest
+        };
         // Each pass consumes at least the runner itself, so this ends.
-        argv = skip_transparent_prefixes(rest);
+        argv = skip_prefixes_and_env_operands(tokens, rest);
     }
     argv
+}
+
+/// Skip the assignment operands at the front of an `env` command, by `env`'s
+/// rule rather than the shell's: **every** leading operand containing `=` is an
+/// assignment to `env` (GNU and BSD both test `strchr(arg, '=')`), whatever
+/// precedes the `=`. [`is_assignment_word`] asks the shell's question — a valid
+/// name — so `env A${Y}B=1 bash -c '…'` stopped the peel at `A${Y}B=1`, the
+/// `bash -c` script was never surfaced, and every guard missed the command it
+/// runs (cadence-hooks#1129). A quoted `'A B=1'` and an escaped `A\=1` are
+/// assignments to `env` as well, which is why the word is unescaped first.
+///
+/// At least one word is always left, as [`skip_transparent_prefixes`] does.
+fn skip_env_assignment_operands(argv: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < argv.len() && unescape_word(&argv[start]).contains('=') {
+        start += 1;
+    }
+    &argv[start..]
+}
+
+/// [`skip_transparent_prefixes`] from `from` (a tail of `tokens`), then, while
+/// the words just skipped end in an `env` verb, its `=` operands too
+/// ([`skip_env_assignment_operands`]). `env` with no options of its own is
+/// peeled as a [`TRANSPARENT`] prefix, whose walk stops at the first word that
+/// is not a valid shell assignment — so the `env` rule has to be applied where
+/// that walk stopped, by looking back at what it skipped.
+fn skip_prefixes_and_env_operands<'a>(tokens: &'a [String], from: &'a [String]) -> &'a [String] {
+    let mut argv = skip_transparent_prefixes(from);
+    loop {
+        let start = tokens.len() - argv.len();
+        if !follows_an_env_verb(tokens, start) {
+            return argv;
+        }
+        let rest = skip_env_assignment_operands(argv);
+        if rest.len() == argv.len() {
+            return argv;
+        }
+        argv = skip_transparent_prefixes(rest);
+    }
+}
+
+/// Is `tokens[start]` in `env`'s operand position — preceded by `env`, an
+/// optional `--`, and any number of `=` operands?
+fn follows_an_env_verb(tokens: &[String], start: usize) -> bool {
+    let mut at = start;
+    while at > 0 && unescape_word(&tokens[at - 1]).contains('=') {
+        at -= 1;
+    }
+    if at > 0 && unescape_word(&tokens[at - 1]).as_ref() == "--" {
+        at -= 1;
+    }
+    at > 0 && command_word(&tokens[at - 1]).as_ref() == "env"
 }
 
 /// `sudo`'s short options that take NO argument of their own AND still run the
@@ -10541,6 +11006,60 @@ mod tests {
     }
 
     #[test]
+    fn host_and_repo_from_url_refuses_what_the_transport_reads_differently() {
+        // cadence-hooks#1066: each of these names a different host or path to
+        // git/curl than a naive split does, so it must read as not owned.
+        for url in [
+            "https://evil.com#@github.com/cameronsjo/x",
+            "https://evil.com?@github.com/cameronsjo/x",
+            "https://evil.com\\@github.com/cameronsjo/x",
+            "https://a@evil.com@github.com/cameronsjo/x",
+            "https://github.com/cameronsjo/x#frag",
+            "https://github.com/cameronsjo/x?x=1",
+            "https://github.com/cameronsjo/x/../../other/y",
+            "https://github.com/cameronsjo/./x",
+            "https://github.com/cameronsjo/x/..",
+            "https://github.com/cameronsjo/%2e%2e/other/y",
+            "https://github%2ecom/cameronsjo/x",
+            "https://[::1]/cameronsjo/x",
+            "https://github.com /cameronsjo/x",
+            "git@github.com:cameronsjo/x/../../other/y",
+            "git@github.com:./cameronsjo/x",
+        ] {
+            assert_eq!(host_and_repo_from_url(url), None, "{url}");
+        }
+        // Controls: an escaped credential and a subpath still parse.
+        for (url, host, slug) in [
+            (
+                "https://u:p%40ss@github.com/cameronsjo/x.git",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "https://github.com/cameronsjo/x/tree/main",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "git@github.com:cameronsjo/x.git",
+                "github.com",
+                "cameronsjo/x",
+            ),
+            (
+                "https://github.com/cameronsjo/x..y",
+                "github.com",
+                "cameronsjo/x..y",
+            ),
+        ] {
+            assert_eq!(
+                host_and_repo_from_url(url),
+                Some((host.to_string(), slug.to_string())),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn host_and_repo_from_url_strips_git_before_a_trailing_slash() {
         assert_eq!(
             host_and_repo_from_url("https://github.com/own/repo.git/"),
@@ -13278,6 +13797,62 @@ mod tests {
         }
     }
 
+    /// cadence-hooks#1129: `env` takes EVERY leading operand containing `=` as
+    /// an assignment, not only a valid shell name, so the peel does too.
+    #[test]
+    fn peel_command_runners_skips_every_env_assignment_operand() {
+        for (command, want_head) in [
+            ("env A${Y}B=1 bash", Some("bash")),
+            ("env A-B=1 bash", Some("bash")),
+            ("env 'A B=1' bash", Some("bash")),
+            ("env A\\=1 bash", Some("bash")),
+            ("env A${Y}=1 B${Z}=2 sh", Some("sh")),
+            ("env -- A${Y}B=1 bash", Some("bash")),
+            ("env -i A${Y}B=1 bash", Some("bash")),
+            ("env -u X A${Y}B=1 bash", Some("bash")),
+            ("/usr/bin/env A${Y}B=1 bash", Some("bash")),
+            ("FOO=1 env A${Y}B=1 bash", Some("bash")),
+            ("nice env A${Y}B=1 bash", Some("bash")),
+            ("env A${Y}B=1 env C${Z}=2 bash", Some("bash")),
+            // Controls. Outside `env`, the shell's rule: a word that is not a
+            // valid assignment is the command.
+            ("A${Y}B=1 bash", Some("A${Y}B=1")),
+            ("FOO=1 A${Y}B=1 bash", Some("A${Y}B=1")),
+            ("nohup A${Y}B=1 bash", Some("A${Y}B=1")),
+            // Assignments only: the last word is left, as the shell leaves it.
+            ("env A${Y}B=1", Some("A${Y}B=1")),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                peel_command_runners(&tokens).first().map(String::as_str),
+                want_head,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_script_behind_an_env_non_name_assignment() {
+        // cadence-hooks#1129, measured: bash runs the inner gh with a canary.
+        for (command, inner) in [
+            (
+                "env A${Y}B=1 bash -c 'gh pr create -R evil/x'",
+                "gh pr create -R evil/x",
+            ),
+            (
+                "env -i A-B=1 sh -c 'git push --force origin main'",
+                "git push --force origin main",
+            ),
+            ("env 'A B=1' bash -c 'cat .env'", "cat .env"),
+        ] {
+            assert!(
+                command_segments(command).contains(&inner.to_string()),
+                "{command}: {:?}",
+                command_segments(command)
+            );
+        }
+    }
+
     #[test]
     fn command_segments_keeps_substitutions_on_a_wrapper_segment() {
         // A `$(…)` runs in the PARENT before the wrapper is spawned, so the two
@@ -13524,6 +14099,111 @@ mod tests {
         // Append-ordered lookup must find the replacement, not the original.
         let out = command_segments("F=first; F=second; cat $F");
         assert!(out.contains(&"cat second".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_models_declarations_appends_defaults_and_arrays() {
+        // cadence-hooks#1124: each of these reads `.env` in bash.
+        for (command, expected) in [
+            ("local D=.env; cat $D", "cat .env"),
+            ("declare D=.env; cat $D", "cat .env"),
+            ("declare -r D=.env; cat $D", "cat .env"),
+            ("typeset -x D=.env; cat $D", "cat .env"),
+            ("readonly D=.env; cat $D", "cat .env"),
+            ("export D=.env; cat $D", "cat .env"),
+            ("local A=1 D=.env; cat $D", "cat .env"),
+            ("declare -r A D=.env; cat $D", "cat .env"),
+            ("A=1 D=.env; cat $D", "cat .env"),
+            ("D=.en; D+=v; cat $D", "cat .env"),
+            ("D+=.env; cat $D", "cat .env"),
+            ("cat ${D:-.env}", "cat .env"),
+            ("cat ${D-.env}", "cat .env"),
+            ("cat ${D:=.env}", "cat .env"),
+            ("cat ${D=.env}", "cat .env"),
+            ("cat ${D:+.env}", "cat .env"),
+            ("D=x; cat ${D:+.env}", "cat .env"),
+            ("E=.env; cat ${D:-$E}", "cat .env"),
+            ("cat ${D:-${E:-.env}}", "cat .env"),
+            ("cat \"${D:-.env}\"", "cat \".env\""),
+            ("arr=(.env); cat ${arr[0]}", "cat .env"),
+            ("arr=(a .env); cat ${arr[1]}", "cat .env"),
+            ("arr=(a .env); cat ${arr[@]}", "cat a .env"),
+            ("arr=(a .env); cat ${arr[$i]}", "cat a .env"),
+            ("arr=(.env a); cat $arr", "cat .env"),
+            ("declare -a arr=(a .env); cat ${arr[1]}", "cat .env"),
+            ("arr=(a); arr+=(.env); cat ${arr[1]}", "cat .env"),
+            ("arr=(a); arr+=(.env); cat ${arr[*]}", "cat a .env"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
+        // `:=` assigns the default for the segments after it.
+        let out = command_segments("echo ${D:=.env}; cat $D");
+        assert!(out.contains(&"cat .env".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_parameter_operators_keep_an_assigned_value() {
+        // Controls: an assigned name wins over its default, and a shape the
+        // walk does not model stays as written.
+        for (command, expected) in [
+            ("D=x; cat ${D:-.env}", "cat x"),
+            ("D=x; cat ${D:=.env}", "cat x"),
+            ("D=x; cat ${D:?.env}", "cat x"),
+            ("cat ${D:?.env}", "cat ${D:?.env}"),
+            ("arr=(.env a); cat ${arr[1]}", "cat a"),
+            ("cat ${arr[0]}", "cat ${arr[0]}"),
+            ("cat ${D:-.env", "cat ${D:-.env"),
+            ("cat '${D:-.env}'", "cat '${D:-.env}'"),
+            ("cat \\${D:-.env}", "cat \\${D:-.env}"),
+            ("D=x; cat $D", "cat x"),
+            // A word or index that runs a command stays in the segment, so
+            // its substitution is still walked.
+            ("D=x; cat ${D:-$(cat .env)}", "cat .env"),
+            ("arr=(a); cat ${arr[$(cat .env)]}", "cat a[$(cat .env)]}"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn command_segments_emit_a_set_name_both_ways() {
+        // The walk cannot prove a tracked assignment still holds (`D=`,
+        // `unset D`, `false && D=x`, a prefix-only `D=x cmd`), so a choice
+        // that turns on it is emitted both ways.
+        for (command, both) in [
+            ("C=echo; C=; ${C:-cat} .env", ["echo .env", "cat .env"]),
+            ("C=echo; unset C; ${C:-cat} .env", ["echo .env", "cat .env"]),
+            ("false && C=echo; ${C:-cat} .env", ["echo .env", "cat .env"]),
+            ("C=echo cat foo; ${C:-cat} .env", ["echo .env", "cat .env"]),
+            ("C=echo; ${C=cat} .env", ["echo .env", "cat .env"]),
+            ("C=echo; ${C-cat} .env", ["echo .env", "cat .env"]),
+            (
+                "C=echo; \"${C:-cat}\" .env",
+                ["\"echo\" .env", "\"cat\" .env"],
+            ),
+            ("C=echo; ${C:=cat} .env", ["echo .env", "cat .env"]),
+            ("C=echo; ${C:?cat} .env", ["echo .env", "cat .env"]),
+            ("D=x; cat ${D:-.env}", ["cat x", "cat .env"]),
+            ("cat ${D:+.env}", ["cat .env", "cat "]),
+        ] {
+            let out = command_segments(command);
+            for expected in both {
+                assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+            }
+        }
+        // No set name, nothing to emit twice.
+        let out = command_segments("cat ${D:-.env}");
+        assert_eq!(out, vec!["cat .env".to_string()]);
+    }
+
+    #[test]
+    fn command_segments_unclosed_parameter_flood_stays_fast() {
+        let command = format!("{}cat ${{D:-.env}}", "${D:-x ".repeat(40_000));
+        let start = std::time::Instant::now();
+        let _ = command_segments(&command);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -13925,16 +14605,19 @@ mod tests {
 
     #[test]
     fn url_with_query_string() {
-        // Query string is part of the path after splitn — repo extracts cleanly
-        // because splitn(3, '/') captures at most 3 segments
-        let result = repo_from_url("https://github.com/owner/repo?tab=readme");
-        assert_eq!(result, Some("owner/repo?tab=readme".to_string()));
+        // A query or fragment is refused rather than folded into the slug: the
+        // transport stops the path at it, and a `#`/`?` before the `@` moves
+        // the host (cadence-hooks#1066). The old answer here was the garbage
+        // slug `owner/repo?tab=readme`.
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo?tab=readme"),
+            None
+        );
     }
 
     #[test]
     fn url_with_fragment() {
-        let result = repo_from_url("https://github.com/owner/repo#section");
-        assert_eq!(result, Some("owner/repo#section".to_string()));
+        assert_eq!(repo_from_url("https://github.com/owner/repo#section"), None);
     }
 
     #[test]
