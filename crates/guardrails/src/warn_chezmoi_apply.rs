@@ -398,7 +398,6 @@ impl Check for WarnChezmoiApply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::Outcome;
 
     const DRIFTED: &str =
         " M .zshrc\nMM .gitconfig\nMD .config/app/a.toml\nM  .vimrc\n R .chezmoiscripts/run.sh\n";
@@ -435,11 +434,20 @@ mod tests {
     #[test]
     fn chezmoi_unavailable_is_silent_not_no_drift() {
         assert_eq!(eval("chezmoi apply", None), None);
-        crate::with_env(&[("PATH", Some("/nonexistent-cadence-path"))], || {
-            let input =
-                cadence_hooks_core::test_builders::make_bash_with_cwd("chezmoi apply", "/tmp");
-            assert_eq!(WarnChezmoiApply.run(&input).outcome, Outcome::Allow);
-        });
+        // A tool that cannot be spawned yields no status. Exercised with a
+        // binary name that resolves nowhere rather than by emptying `PATH`:
+        // `PATH` is process-global, and every concurrent fixture `git` child
+        // would inherit the emptied value and fail to spawn (#1112).
+        let status = || {
+            crate::bounded_tool::run_tool(
+                "cadence-hooks-no-such-tool-1112",
+                &["status"],
+                Path::new("/tmp"),
+                &[],
+            )
+        };
+        let call = &apply_calls("chezmoi apply")[0];
+        assert_eq!(evaluate(call, Path::new("/tmp"), &home(), status), None);
     }
 
     #[test]

@@ -107,6 +107,13 @@ fn branch_and_root(dir: &Path) -> Option<(String, String)> {
 ///   and the `dismiss-main-branch-warn` snooze (written from git's form), so a
 ///   different spelling of the same root would silently ignore a snooze.
 fn read_from_disk(dir: &Path) -> DiskRead {
+    read_from_disk_with_env(dir, |v| std::env::var_os(v).is_some())
+}
+
+/// [`read_from_disk`] with the env lookup injected, so a test can exercise the
+/// discovery-env deferral without mutating process env that every concurrent
+/// test's `git` child would inherit (cameronsjo/cadence-hooks#1112).
+fn read_from_disk_with_env(dir: &Path, env_is_set: impl Fn(&str) -> bool) -> DiskRead {
     if cfg!(windows) {
         return DiskRead::Uncertain;
     }
@@ -117,7 +124,7 @@ fn read_from_disk(dir: &Path) -> DiskRead {
         "GIT_CEILING_DIRECTORIES",
         "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     ];
-    if DISCOVERY_ENV.iter().any(|v| std::env::var_os(v).is_some()) {
+    if DISCOVERY_ENV.iter().any(|v| env_is_set(v)) {
         return DiskRead::Uncertain;
     }
     // A directory that does not exist fails `git -C` too.
@@ -1214,27 +1221,23 @@ mod tests {
 
     #[test]
     fn git_discovery_env_defers_to_git() {
-        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // Env is injected, never set on the process: a process-wide
+        // GIT_CEILING_DIRECTORIES leaks into every concurrently running
+        // test's git child, which does not hold this lock (#1112).
         let (tmp, _root) = init_repo_on_main();
-        let prev = std::env::var_os("GIT_CEILING_DIRECTORIES");
-        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below.
-        unsafe {
-            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path());
-        }
         let sub = tmp.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let fast = matches!(read_from_disk(&sub), DiskRead::Uncertain);
-        let agrees = branch_and_root(&sub) == ask_git(&sub);
-        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("GIT_CEILING_DIRECTORIES", v),
-                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
-            }
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            let fast = read_from_disk_with_env(&sub, |v| v == var);
+            assert!(
+                matches!(fast, DiskRead::Uncertain),
+                "{var} redirects discovery, so the disk read must defer to git"
+            );
         }
-        assert!(fast, "a discovery-redirecting env var must defer to git");
-        assert!(agrees);
     }
 }
