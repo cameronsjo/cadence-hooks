@@ -1571,17 +1571,25 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{rest}\n", lines.join("\n"))
 }
 
-/// The model-check directive, verbatim from the plan doc — the ONLY text
-/// [`Tier`] contributes to it is [`Tier::as_str`]'s canonical name. Shared by
-/// [`persist_and_nudge`] and the dir-scan-skip repair so the two nudge sites
-/// can never drift onto different wording for the same instruction.
+/// The model-check directive — the ONLY text [`Tier`] contributes to it is
+/// [`Tier::as_str`]'s canonical name.
+///
+/// The compare-and-ask comes first and is unconditional
+/// (cameronsjo/cadence-hooks#823, matching cameronsjo/cadence#1212's skill
+/// wording): equal is the only pass, a stronger running model is a mismatch
+/// exactly as a weaker one is, and dispatching workers at the target tier or
+/// handing the session down is something to offer IN the ask, never a way
+/// around it. The earlier copy led with "dispatch workers at {t} or hand the
+/// session down" and gated the compare on "about to execute inline", which a
+/// session read as permission to skip the ask.
 fn model_check_directive(tier: Tier) -> String {
     let t = tier.as_str();
     format!(
-        "This plan's recommended driver is {t}: dispatch workers at {t} or hand the session \
-         down; if you are about to execute inline, compare {t} against your running model \
-         (the \"You are powered by\" line) and on a tier mismatch pause and ask before the \
-         first implementation step."
+        "This plan's recommended driver is {t}. Before the first implementation step, compare \
+         {t} against your running model (the \"You are powered by\" line): equal is the only \
+         pass. On any difference, a stronger running model included, pause and ask the \
+         operator how to proceed. Dispatching workers at {t} or handing the session down is an \
+         option to offer in that ask, not a way to skip it."
     )
 }
 
@@ -2961,6 +2969,23 @@ mod tests {
         assert!(
             persisted_idx < directive_idx && directive_idx < verify_idx,
             "directive must land between the persist sentence and the format gates: {msg}"
+        );
+    }
+
+    #[test]
+    fn model_check_directive_puts_the_unconditional_ask_before_any_alternative() {
+        // cadence-hooks#823: the ask must lead, fire on ANY tier difference,
+        // and never be offered an out ahead of it.
+        let d = model_check_directive(Tier::Opus);
+        let ask = d.find("pause and ask").expect("the ask is present");
+        let dispatch = d.find("Dispatching workers at opus").expect("alternative");
+        assert!(ask < dispatch, "the ask precedes the alternatives: {d}");
+        assert!(d.contains("equal is the only pass"), "{d}");
+        assert!(d.contains("a stronger running model included"), "{d}");
+        assert!(d.contains("not a way to skip it"), "{d}");
+        assert!(
+            !d.contains("about to execute inline"),
+            "the compare is not gated on inline execution: {d}"
         );
     }
 
