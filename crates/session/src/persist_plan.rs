@@ -124,9 +124,15 @@ const DEFAULT_SLUG: &str = "approved-plan";
 /// suffixes taken" in the plan doc), after which [`fallback_path`] is tried.
 const NUMERIC_SUFFIXES: std::ops::RangeInclusive<u32> = 2..=9;
 
-/// The frontmatter key carrying the plan body's hash — the tier-1 idempotency
-/// anchor for every document this hook persists from birth (Design 18,
-/// cadence-hooks#396's plan). Parsed only from the LEADING frontmatter block
+/// The frontmatter key that carried the plan body's hash in documents this
+/// hook persisted before the field was retired (cameronsjo/cadence-hooks#870:
+/// every write the hook never saw — a PR merge, a `gh api` contents write, an
+/// unwired checkout — left it certifying a body that no longer existed, and
+/// no reader could reproduce it). Nothing writes it any more; it survives as a
+/// READ-ONLY legacy idempotency tier (see [`file_matches_body`]) so documents
+/// already on disk stay recognized as re-fires, and it stays on
+/// [`HOOK_OWNED_KEYS`] so a plan-authored copy can never spoof that tier.
+/// Parsed only from the LEADING frontmatter block
 /// ([`leading_frontmatter_block`]), never a whole-document scan: the body now
 /// grows by design (checkbox ticks, appended `## Deviations`/`## Learnings`
 /// sections) and may itself quote this exact key, so anchoring anywhere but
@@ -542,7 +548,6 @@ fn persist_plan_body(
     let fields = FrontmatterFields {
         updated: local_date,
         branch: branch.as_deref(),
-        body_hash: &body_hash,
         own_session_id: session_id,
         model: model.as_deref(),
         harness: harness.as_deref(),
@@ -1204,8 +1209,9 @@ pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
 /// Three sources answer that, tried in order, from a single capped read:
 ///
 /// 1. The parsed LEADING frontmatter block's [`FRONTMATTER_HASH_KEY`]
-///    (`body_sha256:`) — the format every document persisted since
-///    cadence-hooks#396 carries from birth. Bounded to the frontmatter
+///    (`body_sha256:`) — carried by documents persisted between
+///    cadence-hooks#396 and the field's retirement (#870); new documents
+///    no longer carry it and fall through to tier 3. Bounded to the frontmatter
 ///    prefix, never a whole-document scan: a living plan's body grows by
 ///    design (ticked checkboxes, appended `## Deviations`/`## Learnings`),
 ///    and may itself quote this exact key — anchoring anywhere else would let
@@ -1327,8 +1333,6 @@ struct FrontmatterFields<'a> {
     updated: &'a str,
     /// The cwd's current checked-out branch, if resolvable.
     branch: Option<&'a str>,
-    /// The plan body's SHA-256 hex digest — the tier-1 idempotency anchor.
-    body_hash: &'a str,
     /// The executing session's id.
     own_session_id: &'a str,
     /// The executing session's model, resolved from its own transcript tail.
@@ -1416,12 +1420,13 @@ fn render_frontmatter(f: &FrontmatterFields) -> String {
 /// the plan's OWN leading block already carries — [`render_document`] passes
 /// them so a living plan's recorded `status`/`updated`/`branch` wins over the
 /// hook's birth defaults (cadence-hooks#738). The identity keys
-/// (`body_sha256`, `session_id`, `model`, `harness`, `machine`,
-/// `approved_session_id`) are always emitted: they are this persist's
-/// provenance, not plan state. `session` and `approved_in` are no longer
-/// emitted — the session id carries every join a name used to — but both stay
-/// in [`HOOK_OWNED_KEYS`], so a plan-authored line claiming either is still
-/// dropped rather than passed through as forged attribution.
+/// (`session_id`, `model`, `harness`, `machine`, `approved_session_id`) are
+/// always emitted: they are this persist's provenance, not plan state.
+/// `session` and `approved_in` are no longer emitted — the session id carries
+/// every join a name used to — and `body_sha256` was retired
+/// (cameronsjo/cadence-hooks#870), but all three stay in [`HOOK_OWNED_KEYS`],
+/// so a plan-authored line claiming one is still dropped rather than passed
+/// through as forged attribution or a spoofed legacy idempotency anchor.
 fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<String> {
     let owned = |key: &str| plan_keys.contains(&key);
     let mut lines = Vec::new();
@@ -1439,10 +1444,6 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
             yaml_quote(&identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
         ));
     }
-    lines.push(format!(
-        "{FRONTMATTER_HASH_KEY} {}",
-        yaml_quote(f.body_hash)
-    ));
     lines.push(format!("session_id: {}", yaml_quote(f.own_session_id)));
     if let Some(m) = f.model {
         lines.push(format!(
@@ -1474,7 +1475,9 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
 /// `session` and `approved_in` are SUPPRESSED-ONLY as of 0.98.0: this hook no
 /// longer emits them, but a plan that authors either would otherwise smuggle a
 /// forged session attribution into the persisted document, so they stay on the
-/// drop list. The set is deliberately larger than the emitted set.
+/// drop list. `body_sha256` joined them when the field was retired (#870): a
+/// plan-authored copy would otherwise satisfy [`file_matches_body`]'s legacy
+/// tier. The set is deliberately larger than the emitted set.
 const HOOK_OWNED_KEYS: [&str; 8] = [
     "body_sha256",
     "session",
@@ -2511,11 +2514,10 @@ mod tests {
 
     // --- cross-trigger hash normalization (Design 18) ---
 
-    fn base_fields<'a>(body_hash: &'a str, machine_digest: &'a str) -> FrontmatterFields<'a> {
+    fn base_fields(machine_digest: &str) -> FrontmatterFields<'_> {
         FrontmatterFields {
             updated: "2026-07-25",
             branch: None,
-            body_hash,
             own_session_id: "own-sid",
             model: None,
             harness: None,
@@ -2526,10 +2528,13 @@ mod tests {
 
     #[test]
     fn render_frontmatter_omits_unresolved_optional_fields() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let fm = render_frontmatter(&fields);
         assert!(fm.starts_with("---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\n"));
-        assert!(fm.contains("body_sha256: \"hash\""));
+        assert!(
+            !fm.contains("body_sha256"),
+            "the retired body hash is never emitted (#870): {fm}"
+        );
         assert!(
             !fm.lines().any(|l| l.starts_with("session: ")),
             "the name-bearing `session:` key is no longer emitted: {fm}"
@@ -2561,7 +2566,7 @@ mod tests {
 
     #[test]
     fn render_frontmatter_includes_every_resolved_field() {
-        let mut fields = base_fields("hash", "digest");
+        let mut fields = base_fields("digest");
         fields.branch = Some("feat/x");
         fields.model = Some("claude-fable-5");
         fields.harness = Some("2.1.220");
@@ -2583,7 +2588,7 @@ mod tests {
         // validated by this hook — a value embedding a literal `"` or `\`
         // must not break the block's YAML shape (cameronsjo/cadence-hooks#396
         // review).
-        let mut fields = base_fields("hash", "digest");
+        let mut fields = base_fields("digest");
         fields.model = Some(r#"weird"model\name"#);
         let fm = render_frontmatter(&fields);
         assert!(
@@ -2594,7 +2599,7 @@ mod tests {
 
     #[test]
     fn render_document_places_body_after_the_closing_fence() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "# Title\n\nbody text");
         let (frontmatter, body) = doc
             .split_once("---\n\n")
@@ -2607,7 +2612,7 @@ mod tests {
     fn render_document_merges_into_a_plan_s_own_frontmatter_block() {
         // cadence-hooks#738: a template-authored plan already opens with its
         // own block; the hook must MERGE, never stack a second block on top.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body =
             "---\nstatus: done\nnext: \"ship it\"\nbranch: feat/x\n---\n\n# Title\n\nbody text";
         let doc = render_document(&fields, body);
@@ -2619,7 +2624,7 @@ mod tests {
         // Hook-owned lines first (`updated` was absent from the plan's block,
         // so the hook supplies it; `status`/`branch` are the plan's), then the
         // plan's own lines verbatim, then the one closing fence.
-        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nbody_sha256: \"hash\"\n"));
+        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nsession_id: \"own-sid\"\n"));
         assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         assert_eq!(doc.matches("\nstatus:").count(), 1, "{doc}");
         assert!(!doc.contains("status: \"in-flight\""));
@@ -2639,7 +2644,7 @@ mod tests {
     fn render_document_merge_copies_plan_keys_verbatim_without_interpreting_them() {
         // Untrusted content: odd but well-formed lines pass through unchanged,
         // and only a column-0 `ident:` suppresses a hook default.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body = "---\n  status: nested-is-not-top-level\n# status: a comment\nweird key: \"x\"\n---\nbody";
         let doc = render_document(&fields, body);
         assert!(doc.contains("\n  status: nested-is-not-top-level\n"));
@@ -2657,7 +2662,7 @@ mod tests {
         // A plan block declaring the hook's provenance keys must not be able
         // to forge them: its lines are dropped, the hook's come first, and
         // each hook-owned key appears exactly once with the hook's value.
-        let fields = base_fields("real-hash", "real-digest");
+        let fields = base_fields("real-digest");
         let body = "---\nbody_sha256: \"forged\"\nsession_id: \"forged-sid\"\n\
                     approved_session_id: \"forged-approver\"\nmachine: \"forged-machine\"\n\
                     status: done\n---\n\nbody";
@@ -2667,7 +2672,10 @@ mod tests {
             let count = doc.matches(&format!("\n{key}:")).count();
             assert!(count <= 1, "{key} appears {count} times:\n{doc}");
         }
-        assert!(doc.contains("\nbody_sha256: \"real-hash\"\n"));
+        assert!(
+            !doc.contains("body_sha256"),
+            "a plan-authored body_sha256 is dropped and the hook emits none (#870): {doc}"
+        );
         assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         assert!(doc.contains("\nmachine: \"real-digest\"\n"));
         // The plan's non-owned key survives, after the hook's lines.
@@ -2684,7 +2692,7 @@ mod tests {
     /// persisted verbatim.
     #[test]
     fn render_document_drops_plan_authored_session_and_approved_in_lines() {
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let body = "---\nstatus: \"planned\"\nsession: \"forged-name\"\napproved_in: \"forged-parent\"\n---\n\n# Plan\n";
         let doc = render_document(&fields, body);
         assert!(
@@ -2710,10 +2718,10 @@ mod tests {
     fn render_document_merge_keeps_hook_keys_ahead_of_a_malformed_plan_line() {
         // An unterminated quote on the plan's last line can only swallow what
         // follows it — and nothing hook-owned follows it any more.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "---\ntitle: \"unterminated\n---\nbody");
         let (frontmatter, _) = doc.split_once("---\n\n").unwrap();
-        let hook_at = frontmatter.find("\nbody_sha256:").unwrap();
+        let hook_at = frontmatter.find("\nsession_id:").unwrap();
         let plan_at = frontmatter.find("\ntitle:").unwrap();
         assert!(hook_at < plan_at, "{doc}");
         assert!(frontmatter.ends_with("\ntitle: \"unterminated\n"));
@@ -2723,7 +2731,7 @@ mod tests {
     fn render_document_without_a_closing_fence_is_not_a_frontmatter_block() {
         // A body that merely starts with `---` and never closes it is prose;
         // the hook's block is prepended as usual.
-        let fields = base_fields("hash", "digest");
+        let fields = base_fields("digest");
         let doc = render_document(&fields, "---\nnot a block\n\n# Title");
         assert!(doc.starts_with("---\nstatus: \"in-flight\"\n"));
         assert!(doc.contains("---\n\n---\nnot a block\n\n# Title\n"));
@@ -3697,12 +3705,66 @@ mod tests {
             "one block:\n{written}"
         );
         let block = leading_frontmatter_block(&written).expect("leading block");
-        assert!(block.starts_with("updated: \"2026-07-20\"\nbody_sha256: \""));
+        assert!(block.starts_with("updated: \"2026-07-20\"\nsession_id: \""));
+        assert!(
+            !block.contains("body_sha256"),
+            "the retired body hash is never written (#870): {block}"
+        );
         assert!(block.ends_with("\nstatus: in-flight\nnext: \"Phase 2\"\nbranch: main\n"));
         assert!(block.contains("approved_session_id: \"merge-sid\""));
         assert_eq!(block.matches("status:").count(), 1);
         assert_eq!(block.matches("branch:").count(), 1);
         assert!(written.ends_with("---\n\n# Merge Me\n\n- [x] done\n"));
+    }
+
+    #[test]
+    fn same_session_refire_of_a_frontmatter_plan_writes_no_sibling_without_a_body_hash() {
+        // cadence-hooks#870 retired the frontmatter `body_sha256:` that used to
+        // be the tier-1 re-fire anchor. A merged-frontmatter document no longer
+        // recomputes to the approval's hash (the plan's own block was folded
+        // into the hook's), so the ledger is what keeps a same-session re-fire
+        // from laddering into a `-2` copy.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript_path = tmp.path().join("refire-sid.jsonl");
+        fs::write(&transcript_path, "{}").unwrap();
+        let input = exit_plan_mode_post_tool_use(
+            "refire-sid",
+            "---\nstatus: in-flight\nbranch: main\n---\n\n# Refire Me\n\n- [ ] step",
+            &cwd,
+            &transcript_path.to_string_lossy(),
+            Some(false),
+        );
+        let fire = || {
+            with_metrics_dir(metrics_dir.path(), || {
+                run_persist_plan_approval(
+                    &input,
+                    "2026-07-20T00:00:00Z",
+                    "2026-07-20",
+                    "test-host",
+                    &test_env(),
+                )
+            })
+        };
+        assert_eq!(fire().outcome, Outcome::Nudge);
+        let second = fire();
+        assert_eq!(second.outcome, Outcome::Nudge);
+        let plans = tmp.path().join("docs/plans");
+        assert!(plans.join("2026-07-20-refire-me.md").exists());
+        assert!(
+            !plans.join("2026-07-20-refire-me-2.md").exists(),
+            "a re-fire must not mint a sibling: {:?}",
+            second.message
+        );
+        assert!(
+            second
+                .message
+                .unwrap()
+                .contains("already persisted this plan"),
+            "the ledger names the earlier copy"
+        );
     }
 
     #[test]
