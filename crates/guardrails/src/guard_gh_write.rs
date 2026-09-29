@@ -10,7 +10,7 @@ use cadence_hooks_core::config::{
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, command_segments, command_word, contains_ignoring_ascii_case,
-    host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
+    host_and_repo_from_url, parse_work_dir, split_segments_with_ops, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -616,11 +616,6 @@ const SEGMENT_KEYWORDS: &[&str] = &[
 /// than through a plain `export NAME=value`. A `GH_HOST` mention under any of
 /// them is not modeled, so it resolves to [`UNRESOLVED_GH_HOST`].
 const VAR_SETTING_BUILTINS: &[&str] = &[
-    "declare",
-    "typeset",
-    "local",
-    "readonly",
-    "eval",
     "read",
     "printf",
     "source",
@@ -631,10 +626,23 @@ const VAR_SETTING_BUILTINS: &[&str] = &[
     "let",
     "getopts",
     ":",
-    "builtin",
-    "command",
     "exec",
 ];
+
+/// Builtins that declare a variable from `NAME[=value]` arguments. Each argument
+/// is judged by its NAME, not by whether the text mentions `GH_HOST`: the shell
+/// expands the word before the builtin reads it, so `export GH_HOS${X}T=evil`
+/// sets `GH_HOST` while never spelling it (#548 review).
+const DECLARING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
+
+/// An assignment to `GH_HOST` inside a parameter or arithmetic expansion —
+/// `${GH_HOST=…}`, `${GH_HOST:=…}`, `$(( GH_HOST = … ))`, `(( GH_HOST += … ))`.
+/// The only way a command that is not a declaring builtin can leave `GH_HOST`
+/// changed behind it; a mere mention (`rg GH_HOST`, a commit message) cannot.
+static GH_HOST_EXPANSION_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{GH_HOST:?=|\(\([^)]*\bGH_HOST\s*(?:<<|>>|[-+*/%&|^])?=(?:[^=]|$)")
+        .expect("pattern should compile")
+});
 
 /// The `GH_HOST` values a gh process may inherit at a point in one command,
 /// tracked across its segments (#548).
@@ -655,9 +663,17 @@ const VAR_SETTING_BUILTINS: &[&str] = &[
 /// GH_HOST` (when the hook process had no `GH_HOST` to fall back to), and a
 /// bare `GH_HOST=<literal>` — which reaches gh only once the variable is
 /// exported (an earlier `export`, `set -a`, or a `GH_HOST` the shell already
-/// inherited), so `GH_HOST=x; gh …` alone stays exactly as before. Any other
-/// write-shaped mention (`declare -x`, `eval`, `${GH_HOST:=…}`, an expansion
-/// in the value, `export -n`, …) adds [`UNRESOLVED_GH_HOST`].
+/// inherited), so `GH_HOST=x; gh …` alone stays exactly as before. Anything
+/// else that can set it adds [`UNRESOLVED_GH_HOST`]: a declaring builtin
+/// (`declare -x`, `readonly`, …) naming it, or naming ANY variable whose name
+/// is not a plain literal (`export GH_HOS${X}T=…`, `GH_HOS{T,}`); an expansion
+/// in the value; `export -n`; a `GH_HOST` mention under `eval`, `read`,
+/// `printf` and the like; and an assignment inside `${…}` or `$((…))`.
+///
+/// A segment that invokes gh is never observed — a child process cannot change
+/// the parent shell's environment, and its arguments are prose as often as not
+/// (`--title "fix GH_HOST export"`). A plain mention by any other command
+/// (`rg GH_HOST`, `git commit -m "…GH_HOST…"`) changes nothing either.
 ///
 /// Not modeled, and so unchanged: a file that is `source`d, whose contents
 /// this guard never sees.
@@ -708,6 +724,10 @@ impl GhHostEnv {
     }
 
     fn observe(&mut self, segment: &str) {
+        self.observe_depth(segment, 0);
+    }
+
+    fn observe_depth(&mut self, segment: &str, depth: usize) {
         let tokens = tokenize(segment);
         let mut words: &[String] = &tokens;
         while words
@@ -717,7 +737,15 @@ impl GhHostEnv {
             words = &words[1..];
         }
         let assignments = words.iter().take_while(|w| is_shell_assignment(w)).count();
-        let (prefix, rest) = words.split_at(assignments);
+        let (prefix, mut rest) = words.split_at(assignments);
+        // `builtin export …` / `command export …` run the same builtin.
+        while rest
+            .first()
+            .is_some_and(|w| w == "builtin" || w == "command")
+            && rest.get(1).is_some_and(|w| !w.starts_with('-'))
+        {
+            rest = &rest[1..];
+        }
         let command = rest.first().map(|w| w.rsplit('/').next().unwrap_or(w));
 
         if command == Some("set")
@@ -727,46 +755,43 @@ impl GhHostEnv {
         {
             self.allexport = true;
         }
-        if !tokens.iter().any(|t| mentions_gh_host(t)) {
+
+        if let Some(name) = command.filter(|c| DECLARING_BUILTINS.contains(c)) {
+            if prefix.iter().any(|w| mentions_gh_host(w)) {
+                self.add_unresolved();
+            }
+            self.observe_declaration(name, &rest[1..]);
             return;
+        }
+        // `eval` runs its words in THIS shell, so an export inside it counts.
+        if command == Some("eval") && depth < MAX_EVAL_DEPTH {
+            for inner in command_segments(&rest[1..].join(" ")) {
+                if !segment_invokes_gh(&inner) {
+                    self.observe_depth(&inner, depth + 1);
+                }
+            }
         }
 
         match command {
             // Assignments only: shell variables, which reach gh only once
             // exported.
             None => {
+                if !(self.exported || self.allexport) {
+                    return;
+                }
                 for word in prefix {
                     if let Some(value) = word.strip_prefix("GH_HOST=") {
-                        if self.exported || self.allexport {
-                            self.add_assigned(value);
-                        }
-                    } else if mentions_gh_host(word) && (self.exported || self.allexport) {
-                        self.add_unresolved();
-                    }
-                }
-            }
-            Some("export") => {
-                if prefix.iter().any(|w| mentions_gh_host(w)) {
-                    self.add_unresolved();
-                }
-                for word in &rest[1..] {
-                    if word.starts_with('-') {
-                        // `-n` un-exports, `-f` names functions, `-p` prints —
-                        // none is modeled.
-                        self.add_unresolved();
-                    } else if let Some(value) = word.strip_prefix("GH_HOST=") {
-                        self.exported = true;
                         self.add_assigned(value);
                     } else if mentions_gh_host(word) {
-                        // `export GH_HOST` exports whatever the shell variable
-                        // holds; `GH_HOST+=…` appends to it.
-                        self.exported = true;
                         self.add_unresolved();
                     }
                 }
             }
             Some("unset") => {
                 let args = &rest[1..];
+                if !tokens.iter().any(|t| mentions_gh_host(t)) {
+                    return;
+                }
                 let unsets = args.iter().any(|w| w == "GH_HOST");
                 if prefix.iter().any(|w| mentions_gh_host(w))
                     || args.iter().any(|w| w.starts_with('-') && w != "-v")
@@ -784,27 +809,77 @@ impl GhHostEnv {
                     }
                 }
             }
-            Some(name) if VAR_SETTING_BUILTINS.contains(&name) => self.add_unresolved(),
+            Some(name) if name == "eval" || VAR_SETTING_BUILTINS.contains(&name) => {
+                if tokens.iter().any(|t| mentions_gh_host(t)) {
+                    self.add_unresolved();
+                }
+            }
             // Any other command: a prefix assignment lives only for that
-            // command, so only a mention in its words (`${GH_HOST:=…}`) can
-            // leave something behind.
+            // command, and a mention is only a mention — just an assignment
+            // inside an expansion can leave something behind.
             Some(_) => {
-                if rest.iter().any(|w| mentions_gh_host(w)) {
+                if GH_HOST_EXPANSION_ASSIGNMENT.is_match(segment) {
                     self.add_unresolved();
                 }
             }
         }
     }
+
+    /// One `export`/`declare`/`typeset`/`readonly`/`local` invocation's
+    /// arguments. See [`DECLARING_BUILTINS`].
+    fn observe_declaration(&mut self, builtin: &str, args: &[String]) {
+        let unexport = builtin == "export" && args.iter().any(|w| w == "-n");
+        for word in args {
+            if word.starts_with('-') || word.starts_with('+') {
+                continue;
+            }
+            let name = word.split_once('=').map_or(word.as_str(), |(n, _)| n);
+            if !is_literal_identifier(name) {
+                // `GH_HOS${X}T`, `GH_HOS{T,}`, a backtick, a stray quote: the
+                // name is only known once the shell expands it.
+                self.add_unresolved();
+                continue;
+            }
+            if name != "GH_HOST" && name != "GH_HOST+" {
+                continue;
+            }
+            if builtin != "export" || unexport {
+                // Not modeled: declare/typeset/readonly/local attributes and
+                // `export -n` un-exporting.
+                self.add_unresolved();
+                continue;
+            }
+            self.exported = true;
+            match word.strip_prefix("GH_HOST=") {
+                Some(value) => self.add_assigned(value),
+                // `export GH_HOST` exports whatever the shell variable holds;
+                // `GH_HOST+=…` appends to it.
+                None => self.add_unresolved(),
+            }
+        }
+    }
+}
+
+/// A plain shell identifier (`[A-Za-z_][A-Za-z0-9_]*`), optionally with the
+/// trailing `+` of a `NAME+=` append. Anything else — `$`, a backslash, `{`, a
+/// backtick, a quote — means the shell decides the name, not the text.
+fn is_literal_identifier(name: &str) -> bool {
+    let name = name.strip_suffix('+').unwrap_or(name);
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `NAME=value` with a plain literal `NAME` (no `+=`) — the only prefix a pure
+/// help segment may carry ([`segment_is_pure_help`]).
+fn is_plain_assignment(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(name, _)| !name.ends_with('+') && is_literal_identifier(name))
 }
 
 /// `NAME=value` / `NAME+=value` in command-word position.
 fn is_shell_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let name = name.strip_suffix('+').unwrap_or(name);
-    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    word.split_once('=')
+        .is_some_and(|(name, _)| is_literal_identifier(name))
 }
 
 /// True when `word` names the `GH_HOST` variable in any way other than a plain
@@ -854,11 +929,22 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
     };
     let table = host_scan_flags(&tokens[gh_index..]);
 
-    let inline_host = tokens[..gh_index]
-        .iter()
-        .filter_map(|token| token.strip_prefix("GH_HOST="))
-        .rfind(|host| !host.is_empty())
-        .map(str::to_ascii_lowercase);
+    // A prefix word whose NAME is not a plain literal (`env GH_HOS${X}T=h gh`)
+    // may expand to `GH_HOST=h`, so it resolves to no known host (#548).
+    let obfuscated_prefix = tokens[..gh_index].iter().any(|token| {
+        token
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.starts_with('-') && !is_literal_identifier(name))
+    });
+    let inline_host = if obfuscated_prefix {
+        Some(UNRESOLVED_GH_HOST.to_string())
+    } else {
+        tokens[..gh_index]
+            .iter()
+            .filter_map(|token| token.strip_prefix("GH_HOST="))
+            .rfind(|host| !host.is_empty())
+            .map(str::to_ascii_lowercase)
+    };
 
     let mut flag_host = None;
     let mut index = gh_index + 1;
@@ -1191,9 +1277,10 @@ fn disallowed_message(
     // guard_push_remote's hint.
     let default = default_host();
     let host_hint = if host == UNRESOLVED_GH_HOST {
-        "\n   Host: `GH_HOST` is changed earlier in this command in a way this guard cannot \
-         resolve — name the host on the gh command itself (`--hostname <host>` or \
-         `GH_HOST=<host> gh …`)"
+        "\n   Host: this command may set `GH_HOST` to a value this guard cannot read (a \
+         declaring builtin such as `declare -x`, an expanded variable name or value, or an \
+         assignment inside `${…}`/`$((…))`) — name the host on the gh command itself \
+         (`--hostname <host>`)"
             .to_string()
     } else if host != default && !extra_hosts.iter().any(|e| e == host) {
         format!(
@@ -2070,24 +2157,70 @@ fn api_unverifiable_block(
 }
 
 /// True when the arguments after `gh` are a PURE help request: exactly a
-/// literal `<noun> <verb>` followed only by `--help`/`-h` tokens (#868).
+/// literal `<noun> <verb>` followed only by literal `--help` tokens (#868).
 ///
 /// gh prints help and exits for that shape without contacting GitHub, so it is
 /// a read whatever the verb. The shape is deliberately this narrow, because a
 /// help token anywhere else is not proof: pflag hands the token after a
 /// value-taking flag to that flag, so `gh issue create --title --help` creates
-/// an issue titled `--help`. Requiring every token past the verb to be a help
-/// flag means nothing can consume one. The noun and verb must be plain
-/// lowercase words — an expansion there (`gh issue create $ARGS --help`) could
-/// splice a value-taking flag in front of the help token, so it does not count.
+/// an issue titled `--help`. Requiring every token past the verb to be `--help`
+/// means nothing can consume one. The noun and verb must be plain lowercase
+/// words — an expansion there (`gh issue create $ARGS --help`) could splice a
+/// value-taking flag in front of the help token, so it does not count.
+///
+/// `-h` is NOT a help token: under `gh repo edit` and `gh repo create` it is
+/// `--homepage`, which takes a value, so `gh repo edit -h -h` is a write.
+///
+/// The argv shape alone is not enough either — see [`segment_is_pure_help`] for
+/// the conditions on where the invocation sits.
 fn gh_args_are_pure_help(args: &[String]) -> bool {
     let is_word = |w: &String| {
         w.starts_with(|c: char| c.is_ascii_lowercase())
             && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
     };
-    args.len() > 2
-        && args[..2].iter().all(is_word)
-        && args[2..].iter().all(|a| a == "--help" || a == "-h")
+    args.len() > 2 && args[..2].iter().all(is_word) && args[2..].iter().all(|a| a == "--help")
+}
+
+/// True when `segment` is a bare, pure help invocation: optional shell keywords
+/// and plain `NAME=value` assignments, then the literal command word `gh`,
+/// then exactly [`gh_args_are_pure_help`]'s shape (#868).
+///
+/// The command word must be `gh` itself. Behind any wrapper the help token is
+/// no longer the last word gh sees: `xargs gh issue create --help` appends
+/// stdin, and `--help=false --title t` arriving there turns help off again
+/// (pflag's last value wins) and creates the issue. `find -exec`, `parallel`,
+/// `env`, `sudo` and the rest are refused for the same reason, without
+/// enumerating them.
+fn segment_is_pure_help(segment: &str) -> bool {
+    let tokens = tokenize(segment);
+    let mut words: &[String] = &tokens;
+    while words
+        .first()
+        .is_some_and(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
+    {
+        words = &words[1..];
+    }
+    while words.first().is_some_and(|w| is_plain_assignment(w)) {
+        words = &words[1..];
+    }
+    words.first().map(String::as_str) == Some("gh") && gh_args_are_pure_help(&words[1..])
+}
+
+/// The top-level segments of `command` that are pure help invocations and do
+/// NOT sit on the right-hand side of a pipe — the only segments the per-segment
+/// gate may skip as help (#868). A pipe hands the command stdin, which is how
+/// `xargs` turns data into arguments; refusing every pipe right-hand side keeps
+/// that door shut even for spellings this check does not model.
+fn pure_help_segments(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut after_pipe = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        if !after_pipe && segment_is_pure_help(&segment) {
+            out.push(segment.trim().to_string());
+        }
+        after_pipe = op == Some("|");
+    }
+    out
 }
 
 /// [`looped_write_kind`] for one loop-analysis command, with a pure help
@@ -2482,13 +2615,14 @@ impl Check for GhWriteGuard {
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
         let mut gh_host_env = GhHostEnv::from_process();
+        let pure_help = pure_help_segments(command);
 
         for segment in command_segments(command) {
             // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
-            // it decides which host every later gh write reaches (#548).
-            gh_host_env.observe(&segment);
-
+            // it decides which host every later gh write reaches (#548). A gh
+            // segment is a child process and cannot change it.
             if !segment_invokes_gh(&segment) {
+                gh_host_env.observe(&segment);
                 continue;
             }
 
@@ -2497,7 +2631,8 @@ impl Check for GhWriteGuard {
             }
 
             // `gh <noun> <verb> --help` prints help and writes nothing (#868).
-            if gh_argv(&segment).is_some_and(|argv| gh_args_are_pure_help(&argv[1..])) {
+            // Only a top-level, bare, non-pipe-fed invocation qualifies.
+            if pure_help.iter().any(|p| p == segment.trim()) && segment_is_pure_help(&segment) {
                 continue;
             }
 
@@ -6359,7 +6494,11 @@ mod tests {
     #[test]
     fn pure_help_shape_is_exactly_noun_verb_then_help_flags() {
         let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
-        for yes in ["issue create --help", "pr merge -h", "secret set --help -h"] {
+        for yes in [
+            "issue create --help",
+            "pr merge --help",
+            "secret set --help --help",
+        ] {
             assert!(gh_args_are_pure_help(&args(yes)), "{yes}");
         }
         for no in [
@@ -6375,6 +6514,10 @@ mod tests {
             "issue create",
             "-R evil/x issue create --help",
             "issue --help",
+            // `-h` is `--homepage` under `gh repo edit`/`create` (#868 review).
+            "repo edit -h -h",
+            "pr merge -h",
+            "issue create --help -h",
         ] {
             assert!(!gh_args_are_pure_help(&args(no)), "{no}");
         }
@@ -6385,7 +6528,8 @@ mod tests {
         with_env(&owners_env(), || {
             for command in [
                 "for i in $(seq 1 30); do gh issue create --help | grep -q -- '--parent' || fails=$((fails+1)); done",
-                "for i in 1 2; do gh pr create -h; done",
+                "for i in 1 2; do gh pr create --help; done",
+                "X=1 gh issue create --help",
                 "gh issue create --help",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
@@ -6406,6 +6550,18 @@ mod tests {
                 "gh issue create --help; gh issue create --title x",
                 "for i in 1 2; do gh issue create --title --help; done",
                 "gh issue create --title --help",
+                // #868 review C1: xargs appends stdin after the help token, and
+                // pflag's last `--help=false` wins.
+                "echo --help=false --title t | xargs gh issue create --help",
+                "xargs -a /tmp/args gh issue create --help",
+                "for i in 1 2; do echo --help=false --title t | xargs gh issue create --help; done",
+                // Any wrapper, and any pipe right-hand side, is refused.
+                "echo x | gh issue create --help",
+                "env gh issue create --help",
+                "find . -exec gh issue create --help ;",
+                // #868 review C2: `-h` is `--homepage` for `gh repo edit`.
+                "gh repo edit -h -h",
+                "for i in 1 2; do gh repo edit -h -h; done",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 assert!(
@@ -6437,6 +6593,9 @@ mod tests {
                 // Exported, so a later bare assignment reaches gh too.
                 "export GH_HOST=a.example; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
                 "set -a; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                // `eval` runs its words in this shell.
+                "eval 'export GH_HOST=evil.example.com'; gh pr create -R cameronsjo/x --title t",
+                "command export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 let meta = result
@@ -6456,9 +6615,19 @@ mod tests {
                 "export GH_HOST=; gh pr create -R cameronsjo/x --title t",
                 "export -n GH_HOST; gh pr create -R cameronsjo/x --title t",
                 "declare -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "eval 'export GH_HOST=evil.example.com'; gh pr create -R cameronsjo/x --title t",
                 ": ${GH_HOST:=evil.example.com}; gh pr create -R cameronsjo/x --title t",
                 "export GH_HOST+=.evil; gh pr create -R cameronsjo/x --title t",
+                ": $((GH_HOST=1)); gh pr create -R cameronsjo/x --title t",
+                "(( GH_HOST += 1 )); gh pr create -R cameronsjo/x --title t",
+                // #548 review I2: a name the shell builds at expansion time.
+                "export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "export GH_HOS{T,}=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                r#"export GH_HOS$"T"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
+                "export GH_HOS`printf T`=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "declare -x GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "typeset -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "builtin export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                "env GH_HOS${X}T=evil.example.com gh pr create -R cameronsjo/x --title t",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 let message = result.message.clone().unwrap_or_default();
@@ -6489,6 +6658,15 @@ mod tests {
                 "GH_HOST=evil.example.com make docs; gh pr create -R cameronsjo/x --title t",
                 // A read is not a write, whatever the host.
                 "export GH_HOST=evil.example.com && gh pr view 1 -R cameronsjo/x",
+                // #548 review I1: a mention is only a mention. A gh segment is
+                // a child process, and prose names the variable all the time.
+                r#"gh pr create -R cameronsjo/x --title "fix GH_HOST export""#,
+                r#"gh issue comment 1 -R cameronsjo/x --body "export GH_HOST=evil" && gh pr create -R cameronsjo/x --title t"#,
+                "rg GH_HOST && gh pr create -R cameronsjo/x --title t",
+                r#"git commit -m "document GH_HOST"; gh pr create -R cameronsjo/x --title t"#,
+                "grep -rn 'GH_HOST=' docs; gh pr create -R cameronsjo/x --title t",
+                "declare -x OTHER=1; readonly LIMIT=3; gh pr create -R cameronsjo/x --title t",
+                "export -p; gh pr create -R cameronsjo/x --title t",
             ] {
                 let result = GhWriteGuard.run(&input_with(command, "/tmp"));
                 assert!(
@@ -6536,5 +6714,26 @@ mod tests {
         ] {
             assert!(!mentions_gh_host(no), "{no}");
         }
+    }
+
+    #[test]
+    fn escaped_gh_host_names_still_block() {
+        // #548 review I2. Quote removal turns `GH_\HOST` into `GH_HOST`, as the
+        // shell does before `export` reads it — so these resolve either to
+        // `evil.example.com` or to the unresolved host. Both block.
+        with_env(&owners_env(), || {
+            for command in [
+                r"export GH_\HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                r"export GH_HOS\T=evil.example.com; gh pr create -R cameronsjo/x --title t",
+                r#"export "GH_HOST"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
+                r"env GH_\HOST=evil.example.com gh pr create -R cameronsjo/x --title t",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                let meta = result
+                    .block_metadata
+                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
     }
 }

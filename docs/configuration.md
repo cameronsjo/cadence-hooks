@@ -321,10 +321,20 @@ the default host back as a candidate rather than removing the exported one. A ba
 `GH_HOST=...; gh ...` changes nothing: without `export` it stays a shell variable
 that gh never sees. It does count once the variable is exported: after an earlier
 `export GH_HOST`, after `set -a`, or when the hook process already carries
-`GH_HOST`. Any other write-shaped mention of `GH_HOST` resolves to an unknown host
-that matches no allowlist entry, so the write blocks. That covers `declare -x`,
-`eval`, `${GH_HOST:=...}`, `export -n`, and a value that is still a `$` expansion.
-A `source`d file is not read.
+`GH_HOST`. An `export` inside `eval` counts like one outside it. Other forms that
+can set the variable resolve to an unknown host that matches no allowlist entry,
+so the write blocks:
+
+- `declare`, `typeset`, `readonly`, or `local` naming `GH_HOST`, and `export -n`.
+- Any of those builtins, `export` included, or an `env`-style prefix before gh,
+  naming a variable whose name the shell builds at expansion time
+  (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).
+- A value that is still a `$` expansion.
+- An assignment inside `${GH_HOST:=...}` or `$((GH_HOST=...))`.
+
+A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
+command's own `--title` or `--body`. A gh segment runs as a child process, so it
+is never read for changes. A `source`d file is not read.
 
 **Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 
