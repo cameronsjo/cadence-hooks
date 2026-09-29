@@ -16,9 +16,9 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_word,
-    executable_tokens, executable_tokens_marked, is_assignment_word, skip_git_global_options,
-    split_segments, strip_group_wrappers, strip_heredoc_bodies, su_command_value, tokenize,
-    tokenize_marked, unescape_word,
+    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, is_assignment_word,
+    skip_git_global_options, split_segments, strip_group_wrappers, strip_heredoc_bodies,
+    su_command_value, tokenize, tokenize_marked, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -4297,8 +4297,11 @@ fn segment_writes_a_file(segment: &str) -> bool {
         match bytes[i] {
             b'\\' => i += 2,
             b'\'' => {
-                // `$'…'` honours backslash escapes; `'…'` does not.
-                let ansi = i > 0 && bytes[i - 1] == b'$';
+                // `$'…'` honours backslash escapes; `'…'` does not. An
+                // escaped `\$` or the second `$` of `$$` is text, and the `'`
+                // after it opens a plain string.
+                let ansi =
+                    i > 0 && bytes[i - 1] == b'$' && dollar_opens_quote_after(&segment[..i - 1]);
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'\'' {
                     i += if ansi && bytes[i] == b'\\' { 2 } else { 1 };

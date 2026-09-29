@@ -85,6 +85,44 @@ impl Quote {
     }
 }
 
+/// Is an unquoted `$`, preceded by `before` (the characters before it, nearest
+/// first), bash's quoting sigil — so a `'` after it opens `$'…'` and a `"`
+/// after it opens `$"…"`? Only when the `$` is itself unescaped and is not the
+/// second half of a `$$` (the PID parameter): the run of `$` ending here, less
+/// a first one a backslash escapes, must be of odd length. `\$'a\'b'` and
+/// `$$'a\'b'` open a PLAIN single-quoted string in bash, where `\` is literal
+/// and the second `'` closes it; reading either as `$'…'` honoured the `\'`,
+/// reopened a phantom quote at the real closer, and handed guards the wrong
+/// words and segments for everything after it (the class of
+/// cameronsjo/cadence-hooks#463).
+///
+/// Walks back over one `$` run and one backslash run, both of which end at
+/// this `$`, so a caller asking once per `$'` stays linear overall. A quote
+/// character always separates this `$` from any earlier quoting context, so
+/// the characters walked are in the same (unquoted) context as the `$`.
+fn dollar_is_quote_sigil(before: impl Iterator<Item = char>) -> bool {
+    let mut before = before.peekable();
+    let mut dollars = 1usize;
+    while before.next_if_eq(&'$').is_some() {
+        dollars += 1;
+    }
+    let mut backslashes = 0usize;
+    while before.next_if_eq(&'\\').is_some() {
+        backslashes += 1;
+    }
+    if backslashes % 2 == 1 {
+        dollars -= 1;
+    }
+    dollars % 2 == 1
+}
+
+/// [`dollar_is_quote_sigil`] for a `$` that follows `before` in unquoted text:
+/// does a `'` after that `$` open `$'…'`? For byte scanners outside this module
+/// that track quotes themselves.
+pub fn dollar_opens_quote_after(before: &str) -> bool {
+    dollar_is_quote_sigil(before.chars().rev())
+}
+
 /// Advance `quote` across whatever quoting syntax sits at `chars[i]`, returning
 /// the index just past what was consumed — or `None` when the character is
 /// ordinary text the caller must interpret itself (an operator, a filename
@@ -112,7 +150,9 @@ fn scan_quote_syntax(chars: &[char], i: usize, quote: &mut Option<Quote>) -> Opt
         // `\"` open nothing. A backslash-newline is a line continuation and is
         // left to the caller.
         '\\' if chars.get(i + 1).is_some_and(|&n| n != '\n') => Some(i + 2),
-        '$' if chars.get(i + 1) == Some(&'\'') => {
+        '$' if chars.get(i + 1) == Some(&'\'')
+            && dollar_is_quote_sigil(chars[..i].iter().rev().copied()) =>
+        {
             *quote = Some(Quote::AnsiC);
             Some(i + 2)
         }
@@ -139,7 +179,11 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
     let (mode, mut j) = match chars[i] {
         '\'' => (Quote::Single, i + 1),
         '"' => (Quote::Double, i + 1),
-        '$' if chars.get(i + 1) == Some(&'\'') => (Quote::AnsiC, i + 2),
+        '$' if chars.get(i + 1) == Some(&'\'')
+            && dollar_is_quote_sigil(chars[..i].iter().rev().copied()) =>
+        {
+            (Quote::AnsiC, i + 2)
+        }
         _ => return None,
     };
     if matches!(mode, Quote::AnsiC) {
@@ -565,8 +609,10 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
                 // the word, so it is consumed like the quote itself. A `$`
-                // before anything else (`$VAR`, `$(…)`) is ordinary text.
-                '$' if chars.peek() == Some(&'\'') => {
+                // before anything else (`$VAR`, `$(…)`) is ordinary text, and so
+                // is an escaped `\$` or the second `$` of `$$`: the `'` after
+                // either opens a plain single-quoted string.
+                '$' if chars.peek() == Some(&'\'') && !escaped && !after_dollar => {
                     chars.next();
                     quote = Some(Quote::AnsiC);
                     in_token = true;
@@ -5927,8 +5973,13 @@ fn split_segments_impl(
             // `$'` opens ANSI-C quoting. The `$` is part of the syntax, but
             // unlike [`tokenize`] — which is building a token VALUE — segments
             // keep their text verbatim, so both characters are pushed. A `$`
-            // before anything else (`$VAR`, `$(…)`) is ordinary text.
-            '$' if chars.peek() == Some(&'\'') => {
+            // before anything else (`$VAR`, `$(…)`) is ordinary text, and so
+            // is the second `$` of `$$` (an escaped `\$` never reaches here).
+            '$' if chars.peek() == Some(&'\'') && {
+                let i = all.len() - chars.len() - 1;
+                dollar_is_quote_sigil(all[..i].iter().rev().copied())
+            } =>
+            {
                 current.push(c);
                 current.push(chars.next().expect("peeked"));
                 quote = Some(Quote::AnsiC);
@@ -6162,7 +6213,9 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 chars.next();
                 boundary = false;
             }
-            '$' if chars.peek().map(|&(_, n)| n) == Some('\'') => {
+            '$' if chars.peek().map(|&(_, n)| n) == Some('\'')
+                && dollar_is_quote_sigil(text[..i].chars().rev()) =>
+            {
                 chars.next();
                 quote = Some(Quote::AnsiC);
                 boundary = false;
@@ -7491,6 +7544,13 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
         match c {
             '\\' if chars.get(k + 1) == Some(&'\n') => k += 2,
             c if c.is_whitespace() || ";&|()<>".contains(c) => break,
+            // `$$` is the PID parameter, kept as text: the `'` or `"` after it
+            // opens a plain string (`<<$$'E'` ends at `$$E`, as in bash). An
+            // escaped `\$` is taken by the backslash arm below.
+            '$' if chars.get(k + 1) == Some(&'$') => {
+                word.push_str("$$");
+                k += 2;
+            }
             '$' if chars.get(k + 1) == Some(&'\'') => {
                 quoted = true;
                 let start = k + 2;
