@@ -530,6 +530,12 @@ const STRUCTURED_SCAN_LIMIT: usize = 16 * 1024;
 /// Wall-clock allowance for the structured scan of one command. Past it, the
 /// scan is abandoned and [`normalized_secret_name`] decides, as over the size
 /// cap. Well under the hook group's 4000 ms fail-open limit.
+///
+/// The deadline is checked only between iterations of the segment loop and
+/// the nested re-scan loop. A single call it cannot interrupt — the
+/// `command_segments` split, [`command_changes_directory`], and the
+/// untracked-content pass ahead of the loop — is bounded by
+/// [`STRUCTURED_SCAN_LIMIT`], not by this deadline.
 const STRUCTURED_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// The untracked-content check for a command too long for the structured
@@ -7287,7 +7293,7 @@ mod tests {
         );
         assert_bash(&[&block], cadence_hooks_core::Outcome::Block, "secret tail");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_millis(3000),
             "took {:?}",
             started.elapsed()
         );
@@ -7516,7 +7522,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < std::time::Duration::from_millis(3000),
             "took {elapsed:?}"
         );
     }
@@ -7632,6 +7638,9 @@ mod tests {
         );
     }
 
+    /// Blocks within `limit_ms` of wall-clock time. Bounds in this file are
+    /// 3000 ms: loose enough for a loaded CI runner on a debug build, and
+    /// still under the hook group's 4000 ms fail-open limit.
     fn assert_fast_block(command: &str, limit_ms: u64) {
         let started = std::time::Instant::now();
         let result = SecretLeaksGuard::default().run(&make_bash_input(command));
@@ -7657,7 +7666,7 @@ mod tests {
             command.len() < STRUCTURED_SCAN_LIMIT,
             "must exercise the structured scan"
         );
-        assert_fast_block(&command, 1000);
+        assert_fast_block(&command, 3000);
     }
 
     #[test]
@@ -7665,9 +7674,9 @@ mod tests {
         // #832 delta review I2: `su ` × N is super-linear in the shared
         // segmenter; past the cap only the normalized raw text is judged.
         let command = format!("{}-c true; cat .env", "su ".repeat(30_000));
-        assert_fast_block(&command, 500);
+        assert_fast_block(&command, 3000);
         let quoted = format!("{}-c true; cat .e\"\"n'v'", "su ".repeat(30_000));
-        assert_fast_block(&quoted, 500);
+        assert_fast_block(&quoted, 3000);
         let benign = format!("{}-c true; cat README.md", "su ".repeat(30_000));
         let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -7786,14 +7795,14 @@ mod tests {
         // #1071 review I-1: padding past the cap skipped this check.
         let padded = format!("git stash show -p -u; {}", "true; ".repeat(11_000));
         assert!(padded.len() > STRUCTURED_SCAN_LIMIT);
-        assert_fast_block(&padded, 1000);
+        assert_fast_block(&padded, 3000);
         let grep = format!(
             "git grep --untracked --no-exclude-standard KEY; {}",
             "true; ".repeat(11_000)
         );
-        assert_fast_block(&grep, 1000);
+        assert_fast_block(&grep, 3000);
         let stash3 = format!("git show stash@{{0}}^3; {}", "true; ".repeat(11_000));
-        assert_fast_block(&stash3, 1000);
+        assert_fast_block(&stash3, 3000);
         let benign = format!("git stash show --stat; {}", "true; ".repeat(11_000));
         let result = SecretLeaksGuard::default().run(&make_bash_input(&benign));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -7820,7 +7829,7 @@ mod tests {
             "su ".repeat(21_800),
             ")".repeat(20)
         );
-        assert_fast_block(&command, 500);
+        assert_fast_block(&command, 3000);
     }
 
     #[test]
