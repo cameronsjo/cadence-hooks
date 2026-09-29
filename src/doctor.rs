@@ -741,6 +741,59 @@ fn stdin_hang_findings(
         .collect()
 }
 
+/// Why a `permissions.deny` row can never fire, or `None` when this lint has
+/// no complaint (cameronsjo/cadence-hooks#578, cadence-ecosystem#566).
+///
+/// Two classes, both measured on Claude Code 2.1.273 (#566): a `Bash(...)` row
+/// in the legacy `<prefix>:*` form whose prefix carries a `*` of its own is
+/// compared literally, so it matches nothing; and a row that denies an output
+/// redirect (`Bash(> path)`) never sees the redirect, which is checked against
+/// `Edit` rules only. A row this reports is inert; a row it does not report is
+/// NOT thereby known to fire on a compound command (`cd x && rm -rf ~/y`) —
+/// that needs a live-harness probe this lint does not make. Pure.
+fn inert_deny_reason(row: &str) -> Option<&'static str> {
+    let inner = row.strip_prefix("Bash(")?.strip_suffix(')')?;
+    if inner.trim_start().starts_with('>') {
+        return Some(
+            "a redirect target is checked against Edit rules, never Bash rules, so this row never fires",
+        );
+    }
+    let prefix = inner.strip_suffix(":*")?;
+    prefix.contains('*').then_some(
+        "a `*` inside the argument is not a glob in the `:*` prefix form, so this row matches nothing",
+    )
+}
+
+/// One advisory finding per inert `permissions.deny` row in `settings_path`.
+/// Reporting only: nothing is executed and nothing is rewritten.
+fn inert_deny_findings(settings_path: &Path) -> Vec<Finding> {
+    let Ok(text) = std::fs::read_to_string(settings_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(rows) = json.pointer("/permissions/deny").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| row.as_str())
+        .filter_map(|row| inert_deny_reason(row).map(|why| (row, why)))
+        .map(|(row, why)| Finding {
+            severity: Severity::Warning,
+            blocker: Blocker::No,
+            plugin: "permissions.deny".to_string(),
+            file: settings_path.to_path_buf(),
+            line: find_line_number(&text, row),
+            snippet: row.to_string(),
+            diagnosis: format!("inert deny row: {why}"),
+            remediation: "spell out the literal prefixes the matcher compares (one row per \
+                          root or device), or move a redirect rule to an `Edit` deny row"
+                .to_string(),
+        })
+        .collect()
+}
+
 /// Claude Code's plugins directory.
 ///
 /// Prefers `<config_dir>/plugins` (honoring `CLAUDE_CONFIG_DIR`), but it is
@@ -4154,6 +4207,9 @@ pub fn run(
         ) {
             findings.push(finding);
         }
+        findings.extend(inert_deny_findings(
+            &crate::configure_guardrails::user_settings_path(),
+        ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
             print_platform_drift_status();
@@ -8976,5 +9032,54 @@ mod tests {
         assert_eq!(findings[0].blocker, Blocker::No);
         assert!(!is_session_start_blocker(&findings[0]));
         assert!(stdin_hang_findings("cat x", "p", Path::new("h"), None).is_empty());
+    }
+
+    #[test]
+    fn inert_deny_row_table() {
+        // #578 / cadence-ecosystem#566. The six rows #566 measured inert, plus
+        // controls that must stay quiet.
+        for (row, inert) in [
+            ("Bash(dd if=/dev/zero of=/dev/*:*)", true),
+            ("Bash(dd if=/dev/random of=/dev/*:*)", true),
+            ("Bash(chmod -R 777 /*:*)", true),
+            ("Bash(rm /var/log/*:*)", true),
+            ("Bash(rm -rf /var/log/*:*)", true),
+            ("Bash(> /var/log/*:*)", true),
+            ("Bash(> /etc/passwd)", true),
+            ("Bash(rm -rf /)", false),
+            ("Bash(rm -rf ~/.ssh:*)", false),
+            ("Bash(sudo rm:*)", false),
+            ("Bash(mkfs:*)", false),
+            (
+                "Bash(docker run -v /var/run/docker.sock:/var/run/docker.sock:*)",
+                false,
+            ),
+            ("Read(./.env)", false),
+            ("Edit(/var/log/*)", false),
+        ] {
+            assert_eq!(inert_deny_reason(row).is_some(), inert, "{row}");
+        }
+    }
+
+    #[test]
+    fn inert_deny_findings_read_only_the_deny_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"deny":["Bash(rm /var/log/*:*)","Bash(mkfs:*)"],"allow":["Bash(rm /tmp/*:*)"]}}"#,
+        )
+        .unwrap();
+        let findings = inert_deny_findings(&path);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet, "Bash(rm /var/log/*:*)");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].blocker, Blocker::No);
+        // Missing file, bad JSON, no permissions block: quiet.
+        assert!(inert_deny_findings(&dir.path().join("nope.json")).is_empty());
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(inert_deny_findings(&path).is_empty());
+        std::fs::write(&path, "{}").unwrap();
+        assert!(inert_deny_findings(&path).is_empty());
     }
 }
