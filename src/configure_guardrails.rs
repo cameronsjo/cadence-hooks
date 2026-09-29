@@ -401,11 +401,11 @@ fn detection_failure_note() -> String {
 
 /// Print the current allowlist state and exit 0.
 fn show(path: &Path, current: &Current) -> ! {
-    println!("Settings: {}", path.display());
-    println!("  {OWNERS_KEY:<30} {}", render_list(&current.owners));
-    println!("  {REPOS_KEY:<30} {}", render_list(&current.repos));
+    cadence_hooks_core::outln!("Settings: {}", path.display());
+    cadence_hooks_core::outln!("  {OWNERS_KEY:<30} {}", render_list(&current.owners));
+    cadence_hooks_core::outln!("  {REPOS_KEY:<30} {}", render_list(&current.repos));
     if current.has_legacy() {
-        println!(
+        cadence_hooks_core::outln!(
             "\nLegacy keys still present (no longer read by this binary):\n  \
              {LEGACY_OWNERS_KEY} {}\n  {LEGACY_REPOS_KEY} {}",
             render_list(&current.legacy_owners),
@@ -413,7 +413,7 @@ fn show(path: &Path, current: &Current) -> ! {
         );
     }
     if current.owners.is_empty() {
-        println!(
+        cadence_hooks_core::outln!(
             "\n{OWNERS_KEY} is unset — the push and gh-write guards block every \
              operation until it is set."
         );
@@ -505,7 +505,7 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
     // second-account token the answer is a different person than the operator
     // assumes — and under --yes nothing else would ever show it.
     if let Some(login) = &detected {
-        println!("Detected GitHub identity via `gh api user`: {login}");
+        cadence_hooks_core::outln!("Detected GitHub identity via `gh api user`: {login}");
     }
 
     let mut owners = seed_owners(&owner_flags, &current, detected.as_deref());
@@ -514,9 +514,9 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
     if !yes {
         // Already-configured re-run: report and offer to stop before prompting.
         if !current.owners.is_empty() {
-            println!("Already configured in {}", path.display());
-            println!("  {OWNERS_KEY:<30} {}", render_list(&current.owners));
-            println!("  {REPOS_KEY:<30} {}", render_list(&current.repos));
+            cadence_hooks_core::outln!("Already configured in {}", path.display());
+            cadence_hooks_core::outln!("  {OWNERS_KEY:<30} {}", render_list(&current.owners));
+            cadence_hooks_core::outln!("  {REPOS_KEY:<30} {}", render_list(&current.repos));
             let reconfigure = Confirm::new()
                 .with_prompt("Reconfigure?")
                 .default(false)
@@ -524,16 +524,16 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
                 .unwrap_or(None);
             if reconfigure != Some(true) {
                 if current.has_legacy() {
-                    println!(
+                    cadence_hooks_core::outln!(
                         "\nNote: legacy {LEGACY_OWNERS_KEY}/{LEGACY_REPOS_KEY} keys are still \
                          present and no longer read. Re-run and choose Reconfigure to remove them."
                     );
                 }
-                println!("No changes.");
+                cadence_hooks_core::outln!("No changes.");
                 process::exit(0);
             }
         } else if detected.is_none() && owners.is_empty() {
-            println!("{} Enter it below.", detection_failure_note());
+            cadence_hooks_core::outln!("{} Enter it below.", detection_failure_note());
         }
 
         match prompt_list(
@@ -591,12 +591,12 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
     };
 
     if changes.is_empty() {
-        println!(
+        cadence_hooks_core::outln!(
             "Already configured: {OWNERS_KEY}={}, {REPOS_KEY}={}",
             render_list(&owners),
             render_list(&repos)
         );
-        println!("Nothing to write ({}).", path.display());
+        cadence_hooks_core::outln!("Nothing to write ({}).", path.display());
         process::exit(0);
     }
 
@@ -605,11 +605,11 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
         process::exit(1);
     }
 
-    println!("Wrote {}", path.display());
+    cadence_hooks_core::outln!("Wrote {}", path.display());
     for change in &changes {
-        println!("  {change}");
+        cadence_hooks_core::outln!("  {change}");
     }
-    println!("\nRestart Claude Code for the new env values to take effect.");
+    cadence_hooks_core::outln!("\nRestart Claude Code for the new env values to take effect.");
     process::exit(0);
 }
 

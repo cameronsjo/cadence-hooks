@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **The Windows plan-store reader verifies the opened handle by identity, not by length and times.** `persist-plan` now compares the volume serial number and file index from `GetFileInformationByHandle` against a second handle on the canonical path, requires a link count of 1 (an NTFS hardlink is refused) and a non-directory, and prefix-checks `GetFinalPathNameByHandleW` against the canonical store root; `windows-sys` becomes a `cfg(windows)`-only direct dependency. The Unix path is unchanged. Compile-checked for `x86_64-pc-windows-gnu`, not run on Windows. (cameronsjo/cadence-hooks#1147)
+- **A closed stdout pipe on Windows no longer reports an internal error.** Every stdout write now goes through `cadence_hooks_core::out!`/`outln!`, which drop a `BrokenPipe` (the reader left) and still panic on any other write failure; `tests/no_bare_println.rs` fails if a bare `println!`/`print!` reappears in shipped source. (cameronsjo/cadence-hooks#980)
 - **`prevent-secret-writes` judges the file operands of an in-place `sed` or `perl` as write targets.** `sed -i d .env`, `sed -ni`, `sed --in-place=.bak`, `gsed -i "" d .env` and `perl -pi -e … .env` rewrote a secret file and were allowed; the script operand (first positional unless `-e`/`-f` supplies it) is skipped and each remaining operand is judged like a redirect target. (cameronsjo/cadence-hooks#1165)
 
 ### Changed

@@ -116,12 +116,12 @@ fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
     let env_raw = std::env::var(bypass::DISABLE_VAR).ok();
     let bypass_raw = std::env::var(bypass::BYPASS_VAR).ok();
 
-    println!("Settings: {}", settings_path.display());
+    cadence_hooks_core::outln!("Settings: {}", settings_path.display());
 
     let settings_empty = settings_raw.as_deref().is_none_or(str::is_empty);
     let env_empty = env_raw.as_deref().is_none_or(str::is_empty);
     if !bypass::bypass_engaged_from(bypass_raw.as_deref()) && settings_empty && env_empty {
-        println!("\nAll hooks enabled (no overrides).");
+        cadence_hooks_core::outln!("\nAll hooks enabled (no overrides).");
         return;
     }
 
@@ -135,13 +135,13 @@ fn print_config(settings_path: &Path, hooks: &[HookEntry]) {
         // A heading opens its own block; an indented row stays with the heading
         // above it.
         if line.starts_with("  ") {
-            println!("{line}");
+            cadence_hooks_core::outln!("{line}");
         } else {
-            println!("\n{line}");
+            cadence_hooks_core::outln!("\n{line}");
         }
     }
 
-    println!("\n{} of {} hooks active.", active, hooks.len());
+    cadence_hooks_core::outln!("\n{} of {} hooks active.", active, hooks.len());
 }
 
 /// Run the configure wizard (or --list mode).
@@ -178,8 +178,8 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
         hook_names.push(hook.name);
     }
 
-    println!("Configure cadence-hooks for: {}", settings_path.display());
-    println!("Select hooks to DISABLE (space to toggle, enter to confirm):\n");
+    cadence_hooks_core::outln!("Configure cadence-hooks for: {}", settings_path.display());
+    cadence_hooks_core::outln!("Select hooks to DISABLE (space to toggle, enter to confirm):\n");
 
     let selections = match MultiSelect::new()
         .items(&items)
@@ -188,7 +188,7 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
     {
         Ok(Some(sel)) => sel,
         Ok(None) | Err(_) => {
-            println!("Cancelled.");
+            cadence_hooks_core::outln!("Cancelled.");
             process::exit(0);
         }
     };
@@ -202,14 +202,16 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
     match write_disabled_hooks(&settings_path, &new_disabled) {
         Ok(()) => {
             if new_disabled.is_empty() {
-                println!("\nAll hooks enabled. Removed CADENCE_DISABLE from settings.");
+                cadence_hooks_core::outln!(
+                    "\nAll hooks enabled. Removed CADENCE_DISABLE from settings."
+                );
             } else {
-                println!(
+                cadence_hooks_core::outln!(
                     "\nDisabled {} hook(s): {}",
                     new_disabled.len(),
                     new_disabled.join(", ")
                 );
-                println!("Written to: {}", settings_path.display());
+                cadence_hooks_core::outln!("Written to: {}", settings_path.display());
                 // The wizard offers every registered hook, protected ones
                 // included, and persists whatever was picked. CADENCE_DISABLE
                 // cannot switch a protected guard off, so without this line the
@@ -228,7 +230,7 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
                     } else {
                         ("are", "they", "run")
                     };
-                    println!(
+                    cadence_hooks_core::outln!(
                         "Note: {} {is_are} protected — CADENCE_DISABLE is refused there, so \
                          {it_they} still {runs}.",
                         refused.join(", ")

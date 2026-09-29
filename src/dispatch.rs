@@ -623,7 +623,7 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
     }
     let output = merge_group_output(event, &decided, &degraded);
     if let Some(out) = output.stdout {
-        println!("{out}");
+        cadence_hooks_core::outln!("{out}");
     }
     if let Some(err) = output.stderr {
         eprint!("{err}");
