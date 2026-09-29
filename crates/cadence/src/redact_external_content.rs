@@ -57,7 +57,8 @@
 //! nudge mode, silent failure beats false positives.
 
 use cadence_hooks_core::gh_bodies::{
-    ApiField, ApiRequest, extract_bodies, flag_values, parse_gh_api, read_body_file,
+    ApiField, ApiRequest, BodySource, extract_bodies_sourced, flag_values, parse_gh_api,
+    read_body_file,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, peel_command_runners,
@@ -68,6 +69,7 @@ mod identity;
 
 use regex::Regex;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -264,25 +266,50 @@ fn api_posts(req: &ApiRequest) -> bool {
 static GRAPHQL_MUTATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bmutation\b").expect("mutation pattern should compile"));
 
+/// One text a segment publishes, tagged with where it came from.
+type Posted = (String, BodySource);
+
 /// Every text ONE gate-passing segment publishes: body flags, titles and
 /// descriptions, or a `gh api` request's fields. Callers gate first (#424) —
 /// file-valued flags are read here.
-fn posted_texts(segment: &str, base_dir: &str) -> Vec<String> {
+fn posted_texts(segment: &str, base_dir: &str) -> Vec<Posted> {
     let tokens = executable_tokens(segment);
     let argv = peel_command_runners(&tokens);
     if let Some(req) = parse_gh_api(argv) {
         return api_texts(&req, base_dir);
     }
-    let mut texts = extract_bodies(segment, base_dir);
+    let mut texts = extract_bodies_sourced(segment, base_dir);
     texts.extend(headline_texts(argv, base_dir));
     texts
+}
+
+/// The value the shell passes for one posted text, when it differs from the
+/// text as extracted — the second spelling the identity tier scans.
+///
+/// A file's bytes are posted as they are. A command-line word arrives from the
+/// tokenizer with its quotes removed and any `$'…'` escapes decoded, but with
+/// an unquoted backslash still in place — and the shell removes that
+/// backslash before `gh` or `git` sees the value: `--body zorbl\axcorp` posts
+/// `zorblaxcorp`. So a word is scanned both as written and with the shell's
+/// backslash removal applied ([`unescape_word`]). The tokenizer text no longer
+/// says which backslashes were quoted, so the union also reads a backslash
+/// bash keeps (`'zorbl\axcorp'` posts that, backslash and all) as removed —
+/// the see-more direction, and the text it then flags still spells the term.
+fn shell_passed_value((text, source): &Posted) -> Option<String> {
+    if *source == BodySource::File {
+        return None;
+    }
+    match unescape_word(text) {
+        Cow::Owned(v) if v != *text => Some(v),
+        _ => None,
+    }
 }
 
 /// Literal- and file-valued flags a posting command publishes beyond the body
 /// flags [`extract_bodies`] reads. Keyed by command,
 /// because a letter means different things per command: `gh repo create -t`
 /// is a team and `git commit -t` a template file, neither of them text.
-fn headline_texts(argv: &[String], base_dir: &str) -> Vec<String> {
+fn headline_texts(argv: &[String], base_dir: &str) -> Vec<Posted> {
     let Some(head) = argv.first() else {
         return Vec::new();
     };
@@ -313,30 +340,42 @@ fn headline_texts(argv: &[String], base_dir: &str) -> Vec<String> {
         }
         _ => {}
     }
-    let mut texts: Vec<String> = Vec::new();
+    let mut texts: Vec<Posted> = Vec::new();
     for (long, short) in literal {
-        texts.extend(flag_values(rest, long, short));
+        texts.extend(words(flag_values(rest, long, short)));
     }
     for (long, short) in file {
         for path in flag_values(rest, long, short) {
-            texts.extend(read_body_file(&path, base_dir).ok());
+            texts.extend(read_file_text(&path, base_dir));
         }
     }
     texts
+}
+
+/// Command-line values, tagged as words.
+fn words(values: Vec<String>) -> impl Iterator<Item = Posted> {
+    values.into_iter().map(|v| (v, BodySource::Word))
+}
+
+/// A file-valued flag's contents, tagged as a file; nothing when unreadable.
+fn read_file_text(path: &str, base_dir: &str) -> Option<Posted> {
+    read_body_file(path, base_dir)
+        .ok()
+        .map(|t| (t, BodySource::File))
 }
 
 /// `git commit`'s messages beyond `-m`/`-F`: `--file`, and `-m`/`-F` bundled
 /// behind git's boolean short flags (`-am msg`, `-vmmsg`, `-aF path`), which
 /// git parses as the flags one by one and [`extract_bodies`] reads as a word
 /// that is neither.
-fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>)]) -> Vec<String> {
+fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>)]) -> Vec<Posted> {
     /// git commit's short flags that take no value, so a bundle can continue
     /// past them.
     const BOOLEAN_SHORTS: &str = "aeinopqsvz";
-    let mut texts: Vec<String> = Vec::new();
+    let mut texts: Vec<Posted> = Vec::new();
     for (long, short) in file {
         for path in flag_values(rest, long, *short) {
-            texts.extend(read_body_file(&path, base_dir).ok());
+            texts.extend(read_file_text(&path, base_dir));
         }
     }
     for (i, tok) in rest.iter().enumerate() {
@@ -360,8 +399,8 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
             Some(glued)
         };
         match (value, &bundle[at..=at]) {
-            (Some(v), "m") => texts.push(v.to_string()),
-            (Some(p), _) => texts.extend(read_body_file(p, base_dir).ok()),
+            (Some(v), "m") => texts.push((v.to_string(), BodySource::Word)),
+            (Some(p), _) => texts.extend(read_file_text(p, base_dir)),
             (None, _) => {}
         }
     }
@@ -373,13 +412,13 @@ fn git_commit_texts(rest: &[String], base_dir: &str, file: &[(&str, Option<char>
 /// its JSON strings, keys included, or its raw text when it is not JSON, since
 /// gh sends the bytes as they are. `@-` and `--input -` are standard input,
 /// which the hook cannot see.
-fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<String> {
-    let mut texts: Vec<String> = Vec::new();
+fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<Posted> {
+    let mut texts: Vec<Posted> = Vec::new();
     for (key, field) in &req.fields {
-        texts.push(key.clone());
+        texts.push((key.clone(), BodySource::Word));
         match field {
-            ApiField::Literal(v) => texts.push(v.clone()),
-            ApiField::File(p) => texts.extend(read_body_file(p, base_dir).ok()),
+            ApiField::Literal(v) => texts.push((v.clone(), BodySource::Word)),
+            ApiField::File(p) => texts.extend(read_file_text(p, base_dir)),
             ApiField::Stdin => {}
         }
     }
@@ -387,8 +426,12 @@ fn api_texts(req: &ApiRequest, base_dir: &str) -> Vec<String> {
         && let Ok(raw) = read_body_file(p, base_dir)
     {
         match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(value) => json_strings(&value, &mut texts),
-            Err(_) => texts.push(raw),
+            Ok(value) => {
+                let mut strings = Vec::new();
+                json_strings(&value, &mut strings);
+                texts.extend(strings.into_iter().map(|t| (t, BodySource::File)));
+            }
+            Err(_) => texts.push((raw, BodySource::File)),
         }
     }
     texts
@@ -617,7 +660,7 @@ impl Check for RedactExternalContent {
         // Quote-strip each segment first so a body merely mentioning `gh pr
         // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
-        let mut bodies: Vec<String> = Vec::new();
+        let mut bodies: Vec<Posted> = Vec::new();
         for segment in command_segments(command) {
             if is_external_post(&segment) {
                 bodies.extend(posted_texts(&segment, &base_dir));
@@ -646,9 +689,17 @@ impl Check for RedactExternalContent {
         // retry.
         let mut hits: Vec<Hit> = Vec::new();
         let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
-        for body in &bodies {
+        for posted in &bodies {
+            let body = posted.0.as_str();
             // Config-blind by signature — no config, no tier, no allowlist.
             identity_hits.extend(identity::scan_identity(body, &identity_list, None));
+            // The value the shell actually passes, when it differs. Identity
+            // dedups by (id, snippet), so a term both spellings carry reports
+            // once. The shaped tiers read the text as written only: they list
+            // every occurrence, and a second spelling would repeat them.
+            if let Some(passed) = shell_passed_value(posted) {
+                identity_hits.extend(identity::scan_identity(&passed, &identity_list, None));
+            }
             hits.extend(scan_body(body, &config, d));
         }
 

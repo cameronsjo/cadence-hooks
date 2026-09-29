@@ -48,6 +48,29 @@ const VALUE_FLAGS: &[&str] = &[
 /// value intact. `--title`/`-t` is deliberately out of scope here (bodies only);
 /// [`extract_title`] handles it separately.
 pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
+    extract_bodies_sourced(segment, base_dir)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// Where one extracted body came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodySource {
+    /// A command-line word, as [`tokenize`] returns it: quotes removed, but an
+    /// unquoted backslash still in place (`zorbl\axcorp`), where the shell
+    /// removes it before the program ever sees the value.
+    Word,
+    /// A file's contents, read from disk: the bytes are posted as they are, so
+    /// no shell quote removal applies to them.
+    File,
+}
+
+/// [`extract_bodies`], with each body tagged by where it came from. A caller
+/// that must read a literal value the way the shell passes it (a backslash
+/// removed) needs to know which bodies are words, since doing the same to a
+/// file's contents would scan text nobody posts.
+pub fn extract_bodies_sourced(segment: &str, base_dir: &str) -> Vec<(String, BodySource)> {
     let tokens = tokenize(segment);
     let mut bodies = Vec::new();
     let mut i = 0;
@@ -57,7 +80,7 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
         if matches!(tok, "--body" | "-b" | "-m" | "--message")
             && let Some(v) = tokens.get(i + 1)
         {
-            bodies.push(v.clone());
+            bodies.push((v.clone(), BodySource::Word));
             i += 2;
             continue;
         }
@@ -68,7 +91,7 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
             && let Some(p) = tokens.get(i + 1)
         {
             if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
+                bodies.push((content, BodySource::File));
             }
             i += 2;
             continue;
@@ -78,13 +101,13 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
             .strip_prefix("--body=")
             .or_else(|| tok.strip_prefix("--message="))
         {
-            bodies.push(v.to_string());
+            bodies.push((v.to_string(), BodySource::Word));
             i += 1;
             continue;
         }
         if let Some(p) = tok.strip_prefix("--body-file=") {
             if let Ok(content) = read_body_file(p, base_dir) {
-                bodies.push(content);
+                bodies.push((content, BodySource::File));
             }
             i += 1;
             continue;
@@ -92,13 +115,13 @@ pub fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
         // Glued short forms: `-mMSG`, `-bBODY` (literal), `-FPATH` (file).
         if !tok.starts_with("--") && tok.len() > 2 {
             if let Some(v) = tok.strip_prefix("-m").or_else(|| tok.strip_prefix("-b")) {
-                bodies.push(v.to_string());
+                bodies.push((v.to_string(), BodySource::Word));
                 i += 1;
                 continue;
             }
             if let Some(p) = tok.strip_prefix("-F") {
                 if let Ok(content) = read_body_file(p, base_dir) {
-                    bodies.push(content);
+                    bodies.push((content, BodySource::File));
                 }
                 i += 1;
                 continue;
