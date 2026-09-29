@@ -15,10 +15,11 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
-    brace_expansion_overflows, carries_substitution, command_segments, command_word,
-    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, is_assignment_word,
-    skip_git_global_options, split_segments, strip_group_wrappers, strip_heredoc_bodies,
-    su_command_value, tokenize, tokenize_marked, unescape_word,
+    brace_expansion_overflows, carries_substitution, child_scripts, command_segments, command_word,
+    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, heredoc_introducers,
+    is_assignment_word, skip_git_global_options, skip_transparent_prefixes, split_segments,
+    split_segments_with_ops, strip_group_wrappers, strip_heredoc_bodies, su_command_value,
+    tokenize, tokenize_marked, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -914,7 +915,11 @@ fn nested_command_strings(tokens: &[String]) -> Vec<String> {
         let next = tokens.get(i + 1).map(String::as_str);
         if is_assignment_word(token)
             && let Some((name, value)) = token.split_once('=')
-            && name.starts_with("GIT_")
+            && (name.starts_with("GIT_")
+                // `EDITOR=… git commit` runs the value as a command (#1082);
+                // the bare assignment runs nothing, so it needs a `git` after.
+                || (matches!(name, "EDITOR" | "VISUAL")
+                    && tokens[i + 1..].iter().any(|t| command_word(t) == "git")))
         {
             push(value);
         }
@@ -952,9 +957,11 @@ fn nested_command_strings(tokens: &[String]) -> Vec<String> {
             }
             "git" if !git_seen => {
                 git_seen = true;
-                git_sub = skip_git_global_options(&tokens[i + 1..])
-                    .first()
-                    .map(String::as_str);
+                let operands = skip_git_global_options(&tokens[i + 1..]);
+                git_sub = operands.first().map(String::as_str);
+                for value in git_command_operands(operands) {
+                    push(&value);
+                }
             }
             _ => {}
         }
@@ -993,7 +1000,7 @@ fn git_command_option_value<'a>(
             None => (long, None),
         };
         let runs = name.len() >= 3
-            && ["exec", "upload-pack", "receive-pack"]
+            && ["exec", "extcmd", "upload-pack", "receive-pack"]
                 .iter()
                 .any(|f| f.starts_with(name));
         return runs.then(|| value.or(next)).flatten();
@@ -1002,6 +1009,7 @@ fn git_command_option_value<'a>(
     let target = match sub? {
         "rebase" => 'x',
         "clone" => 'u',
+        "difftool" => 'x',
         _ => return None,
     };
     for (at, c) in cluster.char_indices() {
@@ -1014,6 +1022,54 @@ fn git_command_option_value<'a>(
         }
     }
     None
+}
+
+/// `git config` keys whose VALUE git runs as a command (#1082).
+const GIT_COMMAND_CONFIG_KEYS: &[&str] = &[
+    "core.editor",
+    "sequence.editor",
+    "core.pager",
+    "core.sshcommand",
+    "core.askpass",
+    "core.fsmonitor",
+    "diff.external",
+    "gpg.program",
+    "credential.helper",
+];
+
+/// Command strings a `git` SUBCOMMAND's operands carry (#1082): the value of a
+/// command-valued `git config` key (`git config core.editor 'cat .env'`, or an
+/// `alias.*` whose value is a `!` shell alias), and the command `git submodule
+/// foreach` runs in each submodule. `operands` is the `git` argv past its
+/// global options, subcommand first.
+fn git_command_operands(operands: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    match operands.first().map(String::as_str) {
+        Some("config") => {
+            for pair in operands[1..].windows(2) {
+                let key = pair[0].to_ascii_lowercase();
+                if GIT_COMMAND_CONFIG_KEYS.contains(&key.as_str())
+                    || (key.starts_with("alias.") && pair[1].starts_with('!'))
+                {
+                    out.push(pair[1].clone());
+                }
+            }
+        }
+        Some("submodule") => {
+            if let Some(at) = operands.iter().position(|t| t == "foreach") {
+                let command: Vec<&str> = operands[at + 1..]
+                    .iter()
+                    .skip_while(|t| t.starts_with('-'))
+                    .map(String::as_str)
+                    .collect();
+                if !command.is_empty() {
+                    out.push(command.join(" "));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// One segment's own operands — [`segment_env_reads`] without the nested
@@ -4595,6 +4651,378 @@ fn echo_or_printf_leaks_secret_var(lower: &str) -> bool {
     false
 }
 
+/// Shell interpreters that read a script from stdin or `-c`.
+const SHELL_HEADS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"];
+
+/// `xargs` options that take the NEXT word as their value.
+const XARGS_VALUED_SHORT: &[char] = &['I', 'n', 'P', 'L', 's', 'E', 'd', 'a', 'R', 'S'];
+const XARGS_VALUED_LONG: &[&str] = &[
+    "--max-args",
+    "--max-procs",
+    "--max-lines",
+    "--max-chars",
+    "--delimiter",
+    "--arg-file",
+    "--eof",
+    "--process-slot-var",
+];
+
+/// The command `xargs` runs, given the resolved argv (`xargs` first), or
+/// `None` when it runs the default `echo`.
+fn xargs_command(argv: &[String]) -> Option<&[String]> {
+    let mut i = 1;
+    while let Some(t) = argv.get(i) {
+        if t == "--" {
+            i += 1;
+            break;
+        }
+        if !t.starts_with('-') || t == "-" {
+            break;
+        }
+        i += 1;
+        if let Some(long) = t.strip_prefix("--") {
+            if !long.contains('=') && XARGS_VALUED_LONG.contains(&t.as_str()) {
+                i += 1;
+            }
+            continue;
+        }
+        for (at, c) in t.char_indices().skip(1) {
+            if XARGS_VALUED_SHORT.contains(&c) {
+                if at + c.len_utf8() >= t.len() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+    }
+    argv.get(i..).filter(|rest| !rest.is_empty())
+}
+
+/// The verb `xargs` would run over its stdin, when that verb can print what it
+/// is handed: anything outside the metadata-only set, or a `git` subcommand
+/// without the metadata exemption. `xargs ls`/`wc`/`rm` name or count, so a
+/// secret NAME through them leaks nothing (#1081).
+fn xargs_reader(argv: &[String]) -> Option<String> {
+    let sub = xargs_command(argv)?;
+    let (word, sub_argv) = resolve_command(sub)?;
+    let exempt = if word == "git" {
+        git_keeps_exemption(&sub_argv[1..])
+    } else {
+        METADATA_SAFE_COMMANDS.contains(&word.as_ref())
+    };
+    (!exempt).then(|| word.into_owned())
+}
+
+/// A secret-shaped name a `find`'s `-name`/`-iname`/`-path`/`-regex` selects,
+/// or `None`. Regex spellings are read with their escapes and anchors
+/// removed (`.*\.env$`).
+fn find_selected_secret(argv: &[String]) -> Option<String> {
+    const SELECTORS: &[&str] = &[
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-regex",
+        "-iregex",
+    ];
+    argv.windows(2)
+        .filter(|pair| SELECTORS.contains(&pair[0].as_str()))
+        .find_map(|pair| {
+            let value = pair[1].as_str();
+            let cleaned: String = value.chars().filter(|c| *c != '\\').collect();
+            let trimmed = cleaned
+                .trim_start_matches(".*")
+                .trim_end_matches('$')
+                .trim_start_matches('^');
+            [value, cleaned.as_str(), trimmed]
+                .into_iter()
+                .find_map(|v| dangerous_secret_operand(v, Filename::Known))
+                .map(str::to_string)
+        })
+}
+
+/// The literal text an `echo`/`printf` segment emits, or `None` when any of
+/// its arguments is (or may expand to) something the guard cannot read.
+fn literal_output(word: &str, argv: &[String]) -> Option<String> {
+    let mut args = argv.iter().skip(1).peekable();
+    while args.peek().is_some_and(|a| {
+        a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
+    }) {
+        args.next();
+    }
+    let parts: Vec<&str> = args.map(String::as_str).collect();
+    if parts.iter().any(|a| a.contains('$') || a.contains('`')) {
+        return None;
+    }
+    let text = parts.join(" ");
+    Some(if word == "printf" {
+        text.replace("\\n", "\n")
+    } else {
+        text
+    })
+}
+
+/// Does this shell invocation read its script from stdin — no `-c`, no script
+/// file operand (or an explicit `-s`)?
+fn shell_reads_stdin(argv: &[String]) -> bool {
+    let mut i = 1;
+    while let Some(t) = argv.get(i) {
+        if t == "--" {
+            return argv.get(i + 1).is_none();
+        }
+        if !(t.starts_with('-') || t.starts_with('+')) || t.len() < 2 {
+            return false;
+        }
+        if SHELL_VALUED_OPTIONS.contains(&t.as_str()) {
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') && !t.starts_with("--") {
+            if t.contains('c') {
+                return false;
+            }
+            if t.contains('s') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Is `script` a command string that is nothing but an expansion — text the
+/// guard cannot read statically (`$(cat f)`, `` `cat f` ``, `$cmd`)?
+fn script_is_opaque(script: &str) -> bool {
+    let t = script.trim_start();
+    t.starts_with("$(")
+        || t.starts_with('`')
+        || t.strip_prefix('$').is_some_and(|r| {
+            r.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '{')
+        })
+}
+
+/// An `eval` operand that is an expansion the guard cannot read AND is not a
+/// tool's own init output: `eval "$(cat f)"`, `eval "$(curl …)"` and `eval
+/// "$cmd"` nudge, while `eval "$(ssh-agent -s)"` or `eval "$(direnv export
+/// bash)"` — everyday shell setup — stay quiet.
+fn eval_operand_is_opaque(operand: &str) -> bool {
+    if !script_is_opaque(operand) {
+        return false;
+    }
+    let t = operand.trim_start();
+    let Some(body) = t.strip_prefix("$(").or_else(|| t.strip_prefix('`')) else {
+        return true;
+    };
+    let head = body.split_whitespace().next().unwrap_or("");
+    let word = command_word(head);
+    PURE_FILE_READERS.contains(&word.as_ref())
+        || matches!(
+            word.as_ref(),
+            "curl" | "wget" | "printf" | "echo" | "base64" | "openssl" | "gpg" | "sops"
+        )
+}
+
+/// Bodies of heredocs a SHELL reads on stdin (#1082): `bash <<EOF`, `sh -s
+/// <<'X'`, `source /dev/stdin <<EOF`, `cat <<EOF | bash`, also inside `$( … )`
+/// or backticks. Every heredoc on a shell-fed line is collected — an
+/// over-collection only adds text to judge. An unterminated body runs to the
+/// end of the command, as bash runs it.
+fn shell_fed_heredoc_bodies(command: &str) -> Vec<String> {
+    static SHELL_FED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?:^|[\s;&|(`{}])(?:(?:\S*/)?(?:bash|sh|zsh|dash|ksh|mksh|ash)(?:\s+[-+]\S+)*\s*(?:[0-9]*<<|[|;&)`}]|$)|(?:source|\.)\s+(?:/dev/stdin|/dev/fd/0|/proc/self/fd/0)\b)",
+        )
+        .expect("shell-fed heredoc regex compiles")
+    });
+    if !command.contains("<<") {
+        return Vec::new();
+    }
+    let physical: Vec<&str> = command.split('\n').collect();
+    let mut bodies = Vec::new();
+    let mut i = 0;
+    while i < physical.len() {
+        // Join backslash-newline continuations the way the shell does.
+        let mut line = physical[i].to_string();
+        i += 1;
+        while i < physical.len() && (line.len() - line.trim_end_matches('\\').len()) % 2 == 1 {
+            line.pop();
+            line.push_str(physical[i]);
+            i += 1;
+        }
+        if !line.contains("<<") {
+            continue;
+        }
+        let intros = heredoc_introducers(&line);
+        if intros.is_empty() {
+            continue;
+        }
+        let fed = SHELL_FED.is_match(&line);
+        for intro in intros {
+            let dash = line[intro.start..].starts_with("<<-");
+            let mut body: Vec<&str> = Vec::new();
+            while i < physical.len() {
+                let candidate = physical[i];
+                i += 1;
+                let end = if dash {
+                    candidate.trim_start_matches('\t') == intro.word
+                } else {
+                    candidate == intro.word
+                };
+                if end {
+                    break;
+                }
+                body.push(candidate);
+            }
+            if fed && !body.is_empty() {
+                bodies.push(body.join("\n"));
+            }
+        }
+    }
+    bodies
+}
+
+/// Findings of [`command_level_reads`].
+#[derive(Default)]
+struct CommandLevel {
+    /// `(verb, operand, envrc carve-out may apply)`.
+    reads: Vec<(String, String, bool)>,
+    /// Some construct runs text this guard cannot read statically.
+    opaque: bool,
+}
+
+const OPAQUE_EXEC_NUDGE: &str = "⚠️  Command executes text the secret guard cannot see \
+(an `eval`, a `| bash` from a non-literal producer, `bash <(…)`, or a `-c` script built \
+by a substitution). The guard does not read that text, so a secret file it names would \
+not be caught. Run the reads directly instead of through a generated script.";
+
+/// The command-level constructs a per-segment scan cannot see (#1081, #1082):
+///
+/// - a pipeline `find … | xargs <reader>` whose `find` selects a secret-shaped
+///   name, and `echo`/`printf` literals piped into `xargs <reader>`;
+/// - heredoc bodies fed to a shell, and `echo`/`printf` literals piped into
+///   one, judged as the commands they are;
+/// - opaque executed text, recorded for a nudge (never a block).
+///
+/// Recurses through [`child_scripts`] (`bash -c`, `find -exec`, substitution
+/// bodies) within the shared [`RescanBudget`].
+fn command_level_reads(
+    command: &str,
+    context: ScanContext,
+    budget: &mut RescanBudget,
+    depth: usize,
+    out: &mut CommandLevel,
+) {
+    if depth > NESTED_SCAN_DEPTH || budget.out_of_time() {
+        return;
+    }
+    let mut judged: Vec<String> = shell_fed_heredoc_bodies(command);
+    let mut children: Vec<String> = Vec::new();
+    // Upstream of the current pipeline: a secret name a `find` selects or an
+    // `echo`/`printf` literal names, and the immediate producer's literal text.
+    let mut upstream: Option<(bool, String)> = None;
+    let mut previous_text: Option<String> = None;
+    let mut piped_in = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        if !piped_in {
+            upstream = None;
+            previous_text = None;
+        }
+        let tokens = tokenize(&segment);
+        let mut text: Option<String> = segment.contains("<<").then(String::new);
+        if let Some((word, argv)) = resolve_command(&tokens) {
+            match word.as_ref() {
+                "find" => {
+                    if let Some(name) = find_selected_secret(argv) {
+                        upstream.get_or_insert((false, name));
+                    }
+                }
+                "echo" | "printf" => {
+                    text = literal_output(&word, argv);
+                    if let Some(name) = text.as_deref().and_then(|t| {
+                        t.split(|c: char| c.is_whitespace() || c == '\\')
+                            .find_map(|w| dangerous_secret_operand(w, Filename::Known))
+                    }) {
+                        upstream.get_or_insert((true, name.to_string()));
+                    }
+                }
+                "xargs" if piped_in => {
+                    if let (Some((carve, name)), Some(reader)) = (&upstream, xargs_reader(argv)) {
+                        out.reads.push((reader, name.clone(), *carve));
+                    }
+                }
+                w if SHELL_HEADS.contains(&w) && piped_in && shell_reads_stdin(argv) => {
+                    match previous_text.take() {
+                        Some(script) => judged.push(script),
+                        None => out.opaque = true,
+                    }
+                }
+                "eval" => {
+                    out.opaque |= argv[1..].iter().any(|a| eval_operand_is_opaque(a));
+                }
+                _ => {}
+            }
+            if (SHELL_HEADS.contains(&word.as_ref()) || matches!(word.as_ref(), "source" | "."))
+                && segment.contains("<(")
+            {
+                out.opaque = true;
+            }
+        }
+        if nested_command_strings(&tokens)
+            .iter()
+            .any(|script| script_is_opaque(script))
+        {
+            out.opaque = true;
+        }
+        let words = executable_tokens(&segment);
+        children.extend(child_scripts(skip_transparent_prefixes(&words), &segment));
+        previous_text = text;
+        piped_in = op == Some("|");
+    }
+    for script in judged {
+        if script.trim().is_empty() {
+            continue;
+        }
+        if !budget.spend(&script) {
+            return;
+        }
+        for inner in command_segments(&script) {
+            for (word, token) in segment_env_reads_at(&inner, context, budget, depth + 1) {
+                out.reads.push((word, token, true));
+            }
+            if budget.exhausted {
+                return;
+            }
+        }
+        command_level_reads(&script, context, budget, depth + 1, out);
+    }
+    for script in children {
+        if !budget.spend(&script) {
+            return;
+        }
+        command_level_reads(&script, context, budget, depth + 1, out);
+    }
+}
+
+/// The block for a secret `token` read through `cmd_word`.
+fn read_block(cmd_word: &str, token: &str, detect: fn() -> bool) -> CheckResult {
+    CheckResult::block(with_forgectl_hint(
+        format!(
+            "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
+             Found: `{token}` as an operand of `{cmd_word}`\n\
+             Fix: secrets are available to programs via direnv (`direnv allow`) — \
+             run the program directly instead of reading its secret file.\n\
+             Allowed: metadata-only commands (ls, stat, wc, rm, touch, …) and \
+             safe templates (.env.example, id_rsa.pub, .aws/credentials.example, …)."
+        ),
+        HintKind::Read,
+        None,
+        token,
+        detect,
+    ))
+}
+
 /// Check if a bash command would dump secrets to stdout.
 ///
 /// `cwd` is the tool call's working directory, used only to resolve a relative
@@ -4617,6 +5045,7 @@ fn bash_leaks_secrets_within(
     time_limit: std::time::Duration,
 ) -> Option<CheckResult> {
     let deadline = std::time::Instant::now() + time_limit;
+    let mut opaque_exec = false;
     let lower = command.to_lowercase();
     let oversized = command.len() > STRUCTURED_SCAN_LIMIT;
 
@@ -4766,6 +5195,18 @@ fn bash_leaks_secrets_within(
                 )));
             }
         }
+        // #1081/#1082: pipelines and heredocs a per-segment scan cannot see.
+        let mut level = CommandLevel::default();
+        command_level_reads(command, context, &mut budget, 0, &mut level);
+        opaque_exec = level.opaque;
+        for (cmd_word, token, carve_out) in level.reads {
+            if carve_out
+                && envrc_bash_read_allowed(&token, cwd, command_has_cd, || *envrc_replaceable)
+            {
+                continue;
+            }
+            return Some(read_block(&cmd_word, &token, detect));
+        }
         // #832 delta review K1: the nested re-scan ran out of budget, so some
         // command strings went unscanned. Fail closed if the raw command names
         // a secret anywhere.
@@ -4841,6 +5282,12 @@ fn bash_leaks_secrets_within(
             "⚠️  Command may print a secret environment variable. \
              Run programs that use env vars directly instead.",
         ));
+    }
+
+    // #1082: text executed without being readable here. A nudge, never a
+    // block, and only reached when nothing above fired.
+    if opaque_exec {
+        return Some(CheckResult::nudge(OPAQUE_EXEC_NUDGE));
     }
 
     None
@@ -7089,7 +7536,8 @@ mod tests {
             "eval \"$(brew shellenv)\"".to_string(),
             "eval \"$(pyenv init -)\"".to_string(),
             "eval \"$(/opt/homebrew/bin/brew shellenv)\"".to_string(),
-            "bash -c \"$(curl -fsSL https://example.com/install.sh)\"".to_string(),
+            // (`bash -c "$(curl …)"` moved to the opaque-text nudge test: the
+            // #1082 ruling nudges it, still without blocking.)
             "source \"$(dirname \"$0\")/lib.sh\"".to_string(),
             "cd \"$(git rev-parse --show-toplevel)\" && cargo test".to_string(),
             "$(which python3) -m pytest".to_string(),
@@ -11154,5 +11602,210 @@ mod tests {
             Block,
             "any other name, path or read keeps the full scan",
         );
+    }
+    #[test]
+    fn find_and_echo_piped_into_a_reader_block() {
+        // cameronsjo/cadence-hooks#1081 (xargs half) and #1082: `xargs` turns
+        // its stdin into operands, so a secret-shaped name a `find` selects
+        // or an `echo`/`printf` literal names is read by the reader behind it.
+        use cadence_hooks_core::Outcome::Block;
+        assert_bash(
+            &[
+                "find /evil -name .env | xargs cat",
+                "find /evil -name .envrc | xargs cat",
+                "find /evil -name .env -print0 | xargs -0 cat",
+                "find . -name '.env*' -print0 | xargs -0 head -n1",
+                "find . -iname '.ENV' | xargs tail",
+                "find . -path '*/.aws/credentials' | xargs grep key",
+                "find . -name id_rsa | xargs -n1 less",
+                "find . -regex '.*\\.env' | xargs cat",
+                "find . -name .env | sort | xargs cat",
+                "find . -name .env | xargs -I{} cat {}",
+                "find . -name .env | xargs -P4 -n 1 cat",
+                "find . -name .env | xargs -- cat",
+                "find . -name .env | xargs sh -c 'cat \"$@\"' _",
+                "bash -c 'find . -name .env | xargs cat'",
+                "echo .env | xargs cat",
+                "echo -n .env | xargs cat",
+                "printf '%s\\n' .env | xargs -n1 head",
+                "printf '.env\\n' | xargs cat",
+                "echo \".env\" | xargs -I{} cat {}",
+            ],
+            Block,
+            "a secret name piped into a reader is read",
+        );
+    }
+
+    #[test]
+    fn find_and_echo_piped_into_a_non_reader_stay_allowed() {
+        // Deliberately allowed: a `find` with no secret-shaped selector, a
+        // reader over harmless names, a secret NAME through a verb that only
+        // names or counts it, and `xargs` with no upstream secret.
+        use cadence_hooks_core::Outcome::Allow;
+        assert_bash(
+            &[
+                "find . -name '*.rs' | xargs wc -l",
+                "find . -name '*.rs' | xargs cat",
+                "find . -type f | xargs grep -l TODO",
+                "find . -name .env | xargs ls -l",
+                "find . -name .env | xargs wc -l",
+                "find . -name .env | xargs rm",
+                "find . -name .env | xargs",
+                "echo hi | xargs cat",
+                "echo .env | xargs ls",
+                "printf '%s\\n' a b | xargs -n1 echo",
+                "cat list.txt | xargs cat",
+            ],
+            Allow,
+            "no secret-shaped name reaches a content-printing verb",
+        );
+    }
+
+    #[test]
+    fn heredoc_bodies_fed_to_a_shell_are_judged_as_commands() {
+        // cameronsjo/cadence-hooks#1082 items 1 and 2: the body is a script.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_bash(
+            &[
+                "bash <<EOF\ncat .env\nEOF",
+                "bash <<'EOF'\ncat .env\nEOF",
+                "sh <<'X'\ncat .env\nX",
+                "bash -s <<'EOF'\ncat .env\nEOF",
+                "bash <<-EOF\n\tcat .env\n\tEOF",
+                "source /dev/stdin <<EOF\ncat .env\nEOF",
+                ". /dev/stdin <<EOF\ncat .env\nEOF",
+                "cat <<EOF | bash\ncat .env\nEOF",
+                "x=$(bash <<EOF\ncat .env\nEOF\n)",
+                "echo \"$(bash <<EOF\ncat .env\nEOF\n)\"",
+                "bash <<EOF\nls\ncat .env\nEOF",
+                "bash <<< 'cat .env'",
+                "sh -s <<<'cat .env'",
+                "echo 'cat .env' | bash",
+                "printf 'cat .env\\n' | sh",
+            ],
+            Block,
+            "the shell runs the body",
+        );
+        assert_bash(
+            &[
+                "bash <<EOF\nls -l\nEOF",
+                "bash x.sh <<EOF\n.env\nEOF",
+                "cat > notes.txt <<EOF\ncat .env\nEOF",
+                "cat <<EOF\ncat .env\nEOF",
+                "echo 'ls' | bash",
+            ],
+            Allow,
+            "data heredocs and harmless scripts stay allowed",
+        );
+    }
+
+    #[test]
+    fn editor_and_command_valued_git_options_are_judged_as_commands() {
+        // cameronsjo/cadence-hooks#1082 item 5 and the git wrappers of item 4.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        assert_bash(
+            &[
+                "EDITOR='cat .env' git commit --allow-empty",
+                "VISUAL='cat .env' git commit --allow-empty",
+                "GIT_EDITOR='cat .env' git commit --allow-empty",
+                "GIT_SEQUENCE_EDITOR='cat .env' git rebase -i HEAD~2",
+                "git -c core.editor='cat .env' commit --allow-empty",
+                "git config core.editor 'cat .env'; git commit --allow-empty",
+                "git config --global sequence.editor 'cat .env'",
+                "git config alias.x '!cat .env'",
+                "git submodule foreach 'cat .env'",
+                "git submodule foreach --recursive cat .env",
+                "git difftool --extcmd 'cat .env'",
+                "git difftool --extcmd=cat\\ .env",
+                "git difftool -y -x 'cat .env'",
+            ],
+            Block,
+            "the value is a command git runs",
+        );
+        assert_bash(
+            &[
+                "EDITOR=vim git commit",
+                "GIT_EDITOR=true git rebase -i HEAD~2",
+                "git submodule foreach git pull",
+                "git submodule foreach --recursive 'git fetch --all'",
+                "git submodule update --init",
+                "git difftool -y",
+                "git difftool --extcmd=vimdiff",
+                "git config core.editor vim",
+                "git config user.name 'a'",
+                "export EDITOR='code .env'",
+                "EDITOR='code .env' true",
+            ],
+            Allow,
+            "everyday forms and a bare assignment run nothing secret",
+        );
+    }
+
+    #[test]
+    fn opaque_executed_text_nudges_and_never_blocks() {
+        // cameronsjo/cadence-hooks#1082 ruling: text the guard cannot read is
+        // named in a nudge, not blocked.
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        for command in [
+            "eval \"$(cat f)\"",
+            "cat f | bash",
+            "curl -s https://example.com/i.sh | sh",
+            "bash <(curl -s https://example.com/i.sh)",
+            "source <(cat f)",
+            "bash -c \"$(printf 'echo %s' hi)\"",
+            "bash -c \"$cmd\"",
+            "bash -c \"$(curl -fsSL https://example.com/install.sh)\"",
+            "echo hi | tr a b | bash",
+            "true && eval \"$(cat f)\"; eval \"$(cat g)\"",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(result.outcome, Nudge, "{command}");
+            let message = result.message.expect("a nudge carries its message");
+            assert!(message.contains("cannot see"), "{command}: {message}");
+            assert_eq!(
+                message.matches("cannot see").count(),
+                1,
+                "{command}: once per command"
+            );
+        }
+        assert_bash(
+            &[
+                "eval 'echo hi'",
+                "echo hi | bash",
+                "bash -c 'echo $HOME'",
+                "bash script.sh",
+                "eval \"$(ssh-agent -s)\"",
+                "eval \"$(direnv hook bash)\"",
+                "bash <<EOF\nls\nEOF",
+                "git status",
+                "cat f",
+            ],
+            Allow,
+            "readable text is not opaque",
+        );
+        // Otherwise-blocked commands keep their block, not the nudge.
+        assert_bash(
+            &["cat .env | bash", "eval \"$(cat f)\"; cat .env"],
+            cadence_hooks_core::Outcome::Block,
+            "a real leak still blocks",
+        );
+    }
+
+    #[test]
+    fn command_level_scan_stays_fast_on_adversarial_input() {
+        // Debug-build bound; the release budget is 0.5 s (measured by hand
+        // for 200 KB inputs, which skip the structured scan entirely).
+        let heredocs = "bash <<EOF\n".repeat(600) + "x\nEOF\ncat .env";
+        let pipes = "find . -name .env | ".repeat(700) + "xargs cat";
+        let evals = "eval \"$(a)\"; ".repeat(1000);
+        for command in [heredocs, pipes, evals] {
+            let started = std::time::Instant::now();
+            let _ = SecretLeaksGuard::default().run(&make_bash_input(&command));
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(3000),
+                "took {:?}",
+                started.elapsed()
+            );
+        }
     }
 }
