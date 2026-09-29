@@ -223,6 +223,7 @@ version = "0.108.0"
 dependencies = [
  "brush-parser",
  "jiff",
+ "libc",
  "regex",
  "serde",
  "serde_ignored",

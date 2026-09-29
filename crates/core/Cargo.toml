@@ -17,5 +17,10 @@ brush-parser.workspace = true
 jiff.workspace = true
 sha2.workspace = true
 
+# `O_NONBLOCK` for the capped untrusted-file reader (`paths::read_capped`).
+# Already in the lock file, so this adds no new code to the build.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
