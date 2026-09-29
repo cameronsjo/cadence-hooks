@@ -8,6 +8,9 @@ use std::borrow::Cow;
 use std::process::Command;
 use std::sync::LazyLock;
 
+mod static_subst;
+pub use static_subst::names_command_by_unknown_substitution;
+
 /// Strip quoted strings from a shell command to expose its structure.
 ///
 /// Removes content between matching `'`, `"` or `$'` delimiters (including the
@@ -8060,6 +8063,16 @@ fn expand_segments(
         for (name, value) in defaults {
             assignments.set(name, value);
         }
+        // Command substitutions a guard can read without running them
+        // (cadence-hooks#1142): `$(echo git) push` is judged as `git push`,
+        // and a substitution glued into a word (`.env$(true)`) as the glob it
+        // may expand to. Both readings sit beside the segment as written.
+        if let Some(read) = static_subst::rewrite(&expanded) {
+            let globbed = read.globbed.filter(|g| Some(g) != read.evaluated.as_ref());
+            for reading in read.evaluated.into_iter().chain(globbed) {
+                emit_reading(reading, &expanded, assignments, depth, out, dedupe);
+            }
+        }
         // Recorded AFTER this segment is expanded: a shell expands a word
         // before the assignment on that same line takes effect, so `F=new cmd
         // $F` passes the OLD `$F`.
@@ -8068,6 +8081,36 @@ fn expand_segments(
         }
         emit_segment(expanded, assignments, depth, out, dedupe);
     }
+}
+
+/// Push one [`static_subst::rewrite`] reading of `original`. Its substitution
+/// bodies are the ones `original` already surfaces (a substitution it could
+/// not read stays as written), so only the `-c`/`eval` scripts the rewrite
+/// newly exposes are expanded: a second walk of every body per reading would
+/// double the work at each nesting level.
+fn emit_reading(
+    reading: String,
+    original: &str,
+    assignments: &AssignmentScope<'_>,
+    depth: usize,
+    out: &mut Vec<String>,
+    dedupe: bool,
+) {
+    if !ExpansionWork::charge(reading.len()) {
+        out.push(unmark(reading));
+        return;
+    }
+    if depth < MAX_WRAPPER_DEPTH {
+        let known = wrapped_scripts(&executable_tokens(original));
+        for script in wrapped_scripts(&executable_tokens(&reading)) {
+            if known.contains(&script) {
+                continue;
+            }
+            let mut scope = assignments.child();
+            expand_segments(&script, &mut scope, depth + 1, out, dedupe);
+        }
+    }
+    out.push(unmark(reading));
 }
 
 /// Push one expanded segment of [`expand_segments`], with the substitution
