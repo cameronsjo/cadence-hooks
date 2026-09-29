@@ -6001,7 +6001,9 @@ fn group_depth_change(raw: &str) -> isize {
 
 /// Every top-level segment of `command`, in command order, each with the
 /// directory it runs in — the per-segment counterpart of
-/// [`parse_work_dir`]'s one whole-command directory (cadence-hooks#997).
+/// [`parse_work_dir`]'s one whole-command directory. The walk was built for
+/// the polish gate (cadence-hooks#997); every guard that locates a write reads
+/// it since cameronsjo/cadence-hooks#1137.
 ///
 /// - a `cd` (the segment's command word) applies to the segments after it,
 ///   whatever separator follows it — a newline, `;`, `&&`, `||`;

@@ -156,9 +156,12 @@ const POSTING_SUBCOMMANDS: &[(&str, &str, Surface)] = &[
 /// hand-rolled peel of the literal `command` saw none of those
 /// (cadence-hooks#930 security review, Critical 2).
 ///
-/// Only then is the head matched — case-folded, as `gh` itself is invoked —
-/// against the [`POSTING_SUBCOMMANDS`] table. Each returned string is the
-/// segment, ready to hand to the flag extractors.
+/// Only then is the head matched. The command word is case-folded (through
+/// [`command_word`], because a case-insensitive volume runs `GH` as `gh`);
+/// the noun and verb are unescaped but compared EXACTLY against the
+/// [`POSTING_SUBCOMMANDS`] table, because gh's own subcommand lookup is
+/// case-sensitive and `gh PR create` posts nothing. Each returned string is
+/// the segment, ready to hand to the flag extractors.
 ///
 /// Pure: no I/O.
 pub fn detect_surfaces(command: &str) -> Vec<(Surface, String)> {

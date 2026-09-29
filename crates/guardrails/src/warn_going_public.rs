@@ -31,7 +31,8 @@ use cadence_hooks_cadence::redact_external_content::identity_matches;
 use cadence_hooks_core::config::env_list;
 use cadence_hooks_core::display::sanitize_field;
 use cadence_hooks_core::shell::{
-    command_segments, contains_ignoring_ascii_case, fold_verb, tokenize,
+    command_segments, contains_ignoring_ascii_case, executable_tokens, fold_verb,
+    skip_transparent_prefixes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -202,9 +203,24 @@ impl Check for GoingPublicGuard {
         // Judge each executable segment independently so a quoted `gh repo
         // create …` inside an `echo` (command word ≠ gh) never fires, while a
         // real invocation later in a chain still does.
+        //
+        // The head is read through the shared pre-processing model: group
+        // punctuation and reserved words go (`executable_tokens`), then
+        // leading `NAME=value` assignment words and transparent prefixes
+        // (`skip_transparent_prefixes`). Bash runs `X=1 gh repo create …` as
+        // `gh`, and reading the assignment as the command word silenced the
+        // check (cameronsjo/cadence-hooks#1171). Skipping more prefixes only
+        // exposes more `gh` invocations, the forgiving direction for a nudge.
+        //
+        // An inline `CADENCE_GOING_PUBLIC_IGNORE=…` prefix is peeled like any
+        // other assignment and deliberately NOT read as relief: it reaches the
+        // `gh` process, never this hook, and it only "worked" before because
+        // it hid the whole segment — the redaction terms the list may never
+        // relieve (#793) included. The relief list is the session environment.
         for segment in command_segments(command) {
-            let tokens = tokenize(&segment);
-            if command_word(&tokens).as_deref() != Some("gh") {
+            let all_tokens = executable_tokens(&segment);
+            let tokens = skip_transparent_prefixes(&all_tokens);
+            if command_word(tokens).as_deref() != Some("gh") {
                 continue;
             }
             if tokens.get(1).map(String::as_str) != Some("repo") {
@@ -216,13 +232,13 @@ impl Check for GoingPublicGuard {
                 // be flipped public, and the name/description are the tell.
                 Some("create") => {}
                 // `edit` fires only when the command publicizes the repo.
-                Some("edit") if has_public_visibility(&tokens) => {}
+                Some("edit") if has_public_visibility(tokens) => {}
                 _ => continue,
             }
 
             // Content-scan the repo name + description.
-            let name = positional_name(&tokens).unwrap_or("");
-            let description = description_value(&tokens).unwrap_or_default();
+            let name = positional_name(tokens).unwrap_or("");
+            let description = description_value(tokens).unwrap_or_default();
             let haystack = format!("{name} {description}");
 
             if let Some(term) = find_match(&haystack, &terms, &ignore) {
@@ -282,7 +298,8 @@ fn nudge_message(term: &str) -> String {
         "warn-going-public: this repo's name or description contains `{term}`, which may \
          telegraph sensitive content on a public or soon-public repo.\n\
          Consider a neutral name/description, or confirm this exposure is intended.\n\
-         If `{term}` is a false positive, add it to CADENCE_GOING_PUBLIC_IGNORE."
+         If `{term}` is a false positive, add it to CADENCE_GOING_PUBLIC_IGNORE in the \
+         session environment (an inline prefix on the command does not reach this hook)."
     )
 }
 
@@ -459,6 +476,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_leading_prefix_does_not_hide_the_create() {
+        // cameronsjo/cadence-hooks#1171: bash runs `gh` behind an assignment
+        // word or a transparent prefix, so the verdict must match the bare
+        // spelling. An assignment word as the command word silenced the guard.
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("X=1 gh repo create sonarr-cfg --public", Nudge),
+            ("X=1 Y=2 gh repo create sonarr-cfg --public", Nudge),
+            (
+                "GH_HOST=github.com gh repo edit o/sonarr --visibility public",
+                Nudge,
+            ),
+            ("env X=1 gh repo create sonarr-cfg --private", Nudge),
+            ("command gh repo create sonarr-cfg --private", Nudge),
+            ("nohup gh repo create sonarr-cfg --private", Nudge),
+            ("if true; then gh repo create sonarr-cfg; fi", Nudge),
+            ("{ gh repo create sonarr-cfg; }", Nudge),
+            // Controls: the prefix changes nothing about a clean name or a
+            // private edit, and an assignment with no command runs no gh.
+            ("X=1 gh repo create my-widget --public", Allow),
+            ("X=1 gh repo edit o/sonarr --visibility private", Allow),
+            ("X='gh repo create sonarr-cfg'", Allow),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(outcome(cmd), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn an_inline_ignore_prefix_does_not_relieve_the_nudge() {
+        // The relief list is the hook process's environment, which the
+        // operator sets for the session. An inline `CADENCE_GOING_PUBLIC_IGNORE=`
+        // reaches only the `gh` process, never this hook, and it used to
+        // "work" only because the assignment word hid the whole segment —
+        // including the redaction terms the list may never relieve (#793).
+        with_env(
+            &[
+                ("CADENCE_GOING_PUBLIC_TERMS", None),
+                ("CADENCE_GOING_PUBLIC_IGNORE", None),
+            ],
+            || {
+                assert_eq!(
+                    outcome_unlocked(
+                        "CADENCE_GOING_PUBLIC_IGNORE=sonarr gh repo create sonarr-cfg --public"
+                    ),
+                    cadence_hooks_core::Outcome::Nudge
+                );
+            },
+        );
+        // The documented form — the session environment — still relieves a
+        // prefixed command.
+        with_env(
+            &[
+                ("CADENCE_GOING_PUBLIC_TERMS", None),
+                ("CADENCE_GOING_PUBLIC_IGNORE", Some("sonarr")),
+            ],
+            || {
+                assert_eq!(
+                    outcome_unlocked("X=1 gh repo create sonarr-cfg --public"),
+                    cadence_hooks_core::Outcome::Allow
+                );
+            },
+        );
+    }
+
     // --- *arr family regex ---
 
     #[test]
@@ -583,6 +666,11 @@ allow = [{ pattern = "zorblax corp fan club" }]
             ("gh repo create zorblax-corp-tools --private", Nudge),
             ("gh repo create tools --public -d 'for Zorblax Corp'", Nudge),
             ("gh repo edit o/zorblax_corp --visibility public", Nudge),
+            ("X=1 gh repo create zorblax-corp-x --public", Nudge),
+            (
+                "CADENCE_GOING_PUBLIC_IGNORE=zorblax gh repo create zorblax-corp-x",
+                Nudge,
+            ),
             // Controls: an edit that does not publicize, an unrelated name,
             // the term source's own allow entry, and a mention in prose.
             ("gh repo edit o/zorblax-corp --description x", Allow),
