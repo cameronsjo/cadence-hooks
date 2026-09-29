@@ -197,7 +197,140 @@ fn status_row(peer: &registry::Peer, own_session_id: Option<&str>) -> String {
     out
 }
 
-/// `session status` — list live and stale sessions in this repo's registry.
+/// How the sibling-worktree enumeration behind `session status` went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeList {
+    /// `git worktree list` answered; every worktree it names was checked.
+    Listed,
+    /// git ran out of its deadline before answering.
+    TimedOut,
+    /// git could not answer (no git, a broken repository).
+    Failed,
+}
+
+/// One registry `session status` read: the directory, whether it exists, and
+/// every record in it.
+struct Registry {
+    dir: std::path::PathBuf,
+    exists: bool,
+    peers: Vec<registry::Peer>,
+}
+
+/// Every per-checkout registry belonging to the repository `cwd` is in: the
+/// checkout `cwd` resolves to FIRST, then each other worktree `git worktree
+/// list` names, in its order (cameronsjo/cadence-hooks#845).
+///
+/// A worktree has its own `.claude/sessions`, so reading only the cwd's one
+/// shows a branch-mode repo exactly the sessions that are, by policy, not doing
+/// the work. When the worktree list could not be read, only the own directory
+/// comes back and the [`WorktreeList`] says why: the caller must then say it
+/// checked only this checkout, never let a short list pass for a complete one.
+/// Bare entries have no checkout and are skipped; duplicates (the same
+/// directory reached by two spellings) collapse on the canonical path. A
+/// worktree whose directory is gone is still returned — its registry simply
+/// does not exist, which the footer counts separately.
+fn repo_registries(
+    cwd: &str,
+    own_dir: std::path::PathBuf,
+) -> (Vec<std::path::PathBuf>, WorktreeList) {
+    use cadence_hooks_core::shell::{GitOutput, git_output_detailed};
+    let key = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own_root = registry::repo_root_of_registry(&own_dir);
+    let mut dirs = vec![own_dir];
+    let mut seen: Vec<std::path::PathBuf> = own_root.iter().map(|r| key(r)).collect();
+    let porcelain = match git_output_detailed(cwd, &["worktree", "list", "--porcelain", "-z"]) {
+        GitOutput::Ok(text) => text,
+        GitOutput::TimedOut => return (dirs, WorktreeList::TimedOut),
+        GitOutput::Failed | GitOutput::Unavailable => return (dirs, WorktreeList::Failed),
+    };
+    for entry in crate::unpushed_worktrees::parse_worktree_list(&porcelain) {
+        if entry.bare || entry.path.is_empty() {
+            continue;
+        }
+        let root = std::path::PathBuf::from(&entry.path);
+        let k = key(&root);
+        if seen.contains(&k) {
+            continue;
+        }
+        seen.push(k);
+        dirs.push(root.join(".claude").join("sessions"));
+    }
+    (dirs, WorktreeList::Listed)
+}
+
+/// Longest path rendered before truncation: PATH_MAX on Linux, so a real path
+/// is never cut, while a pathological one still cannot flood the terminal.
+const MAX_PATH_DISPLAY: usize = 4096;
+
+/// A registry path made safe for a line a human reads. Sibling worktree paths
+/// come from `git worktree list`, and any process in the repo can `git worktree
+/// add` a directory whose name carries ESC, `\r` or `\n` — a terminal escape or
+/// a forged extra line. Control and invisible-format characters become spaces,
+/// exactly as peer-written registry fields already are.
+fn display_path(dir: &std::path::Path) -> String {
+    identity::sanitize_field(&dir.to_string_lossy(), MAX_PATH_DISPLAY)
+}
+
+/// Pure: the stdout text `session status` prints for already-read registries.
+///
+/// `registries` is every registry checked, the caller's own checkout first.
+/// Only registries holding a record get a heading — ten empty worktree
+/// registries would bury the one that matters — but the footer counts every
+/// worktree checked and how many had a registry at all, so an empty or short
+/// list reads as "none in these N worktrees" rather than "none anywhere"
+/// (cameronsjo/cadence-hooks#845). Anything other than
+/// [`WorktreeList::Listed`] means sibling worktrees could not be enumerated,
+/// and the footer says so and why. Every path is rendered through
+/// [`display_path`].
+fn status_text(
+    registries: &[Registry],
+    own_session_id: Option<&str>,
+    list: WorktreeList,
+) -> String {
+    let mut out = String::new();
+    for reg in registries.iter().filter(|r| !r.peers.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("Sessions in {}:\n\n", display_path(&reg.dir)));
+        for peer in &reg.peers {
+            out.push_str(&status_row(peer, own_session_id));
+            out.push('\n');
+        }
+    }
+    let own_dir = registries
+        .first()
+        .map(|r| display_path(&r.dir))
+        .unwrap_or_default();
+    if out.is_empty() {
+        out.push_str(&format!("No sessions registered in {own_dir}\n"));
+    } else {
+        out.push('\n');
+    }
+    let checked = registries.len();
+    let siblings = checked.saturating_sub(1);
+    let present = registries.iter().filter(|r| r.exists).count();
+    let why = match list {
+        WorktreeList::Listed => {
+            out.push_str(&format!(
+                "Checked {checked} worktree{} (this checkout and {siblings} sibling{}); {present} {} a session registry.",
+                if checked == 1 { "" } else { "s" },
+                if siblings == 1 { "" } else { "s" },
+                if present == 1 { "has" } else { "have" },
+            ));
+            return out;
+        }
+        WorktreeList::TimedOut => "`git worktree list` timed out",
+        WorktreeList::Failed => "`git worktree list` could not be read",
+    };
+    out.push_str(&format!(
+        "Checked only this checkout's registry ({own_dir}): {why}, so sessions in sibling worktrees are not shown."
+    ));
+    out
+}
+
+/// `session status` — list live and stale sessions in every registry of this
+/// repository: the checkout you are in and each of its worktrees (#845).
 /// Returns the process exit code.
 ///
 /// Exit 1 with the message on STDERR when there is no registry to read (not a
@@ -213,17 +346,18 @@ pub fn run_status() -> u8 {
         return 1;
     };
     let stale_secs = registry::stale_minutes() * 60;
+    let (dirs, list) = repo_registries(&cwd, dir);
     // Pass an id no real session can have so every entry is listed.
-    let all = registry::read_peers(&dir, "", stale_secs);
-    if all.is_empty() {
-        println!("No sessions registered in {}", dir.display());
-        return 0;
-    }
+    let registries: Vec<Registry> = dirs
+        .into_iter()
+        .map(|dir| Registry {
+            exists: dir.is_dir(),
+            peers: registry::read_peers(&dir, "", stale_secs),
+            dir,
+        })
+        .collect();
     let own = resolve_session_id(None);
-    println!("Sessions in {}:\n", dir.display());
-    for peer in &all {
-        println!("{}", status_row(peer, own.as_deref()));
-    }
+    println!("{}", status_text(&registries, own.as_deref(), list));
     0
 }
 
@@ -297,6 +431,7 @@ pub fn run_plans() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // --- session plans: the tier-2 view of the SessionStart plan pointer ---
 
@@ -464,6 +599,262 @@ mod tests {
             age_secs: 2400,
             stale: false,
         }
+    }
+
+    // --- status across worktrees (#845) ---
+
+    fn reg(dir: &str, exists: bool, peers: Vec<registry::Peer>) -> Registry {
+        Registry {
+            dir: PathBuf::from(dir),
+            exists,
+            peers,
+        }
+    }
+
+    #[test]
+    fn status_text_lists_a_sibling_worktree_session_and_counts_every_worktree() {
+        let registries = vec![
+            reg(
+                "/repo/.claude/sessions",
+                true,
+                vec![status_peer("aaaaaaaa-1", Some("main"))],
+            ),
+            reg("/repo/wt/a/.claude/sessions", false, vec![]),
+            reg(
+                "/repo/wt/b/.claude/sessions",
+                true,
+                vec![status_peer("bbbbbbbb-2", Some("feat/b"))],
+            ),
+        ];
+        let text = status_text(&registries, None, WorktreeList::Listed);
+        assert!(
+            text.contains("Sessions in /repo/.claude/sessions:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Sessions in /repo/wt/b/.claude/sessions:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("bbbbbbbb"),
+            "the worktree session must be listed: {text}"
+        );
+        assert!(
+            !text.contains("/repo/wt/a/"),
+            "an empty registry gets no heading: {text}"
+        );
+        assert!(
+            text.contains(
+                "Checked 3 worktrees (this checkout and 2 siblings); 2 have a session registry."
+            ),
+            "a missing registry is not counted as read: {text}"
+        );
+    }
+
+    #[test]
+    fn status_text_names_what_it_did_not_scan_when_the_worktree_list_failed() {
+        let registries = vec![reg("/repo/.claude/sessions", false, vec![])];
+        let text = status_text(&registries, None, WorktreeList::Failed);
+        assert!(
+            text.starts_with("No sessions registered in /repo/.claude/sessions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Checked only this checkout's registry"),
+            "{text}"
+        );
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains("sibling worktrees are not shown"), "{text}");
+    }
+
+    #[test]
+    fn status_text_says_the_worktree_list_timed_out() {
+        let registries = vec![reg("/repo/.claude/sessions", true, vec![])];
+        let text = status_text(&registries, None, WorktreeList::TimedOut);
+        assert!(text.contains("`git worktree list` timed out"), "{text}");
+        assert!(!text.contains("could not be read"), "{text}");
+    }
+
+    #[test]
+    fn status_text_empty_everywhere_still_says_how_many_worktrees_it_checked() {
+        let registries = vec![
+            reg("/repo/.claude/sessions", true, vec![]),
+            reg("/repo/wt/a/.claude/sessions", true, vec![]),
+        ];
+        let text = status_text(&registries, None, WorktreeList::Listed);
+        assert!(
+            text.starts_with("No sessions registered in /repo/.claude/sessions"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Checked 2 worktrees (this checkout and 1 sibling); 2 have a session registry."
+            ),
+            "{text}"
+        );
+    }
+
+    /// A peer can `git worktree add` a directory whose name carries ESC, `\r`
+    /// or `\n`. Every path the listing prints — heading, empty answer, and
+    /// the unlisted footer — must reach the terminal with none of them.
+    #[test]
+    fn status_text_renders_no_control_byte_from_a_crafted_worktree_path() {
+        let crafted = "/repo/wt/x\u{1b}[2J\nSessions in /forged\r/.claude/sessions";
+        let registries = vec![
+            reg(crafted, true, vec![]),
+            reg(
+                crafted,
+                true,
+                vec![status_peer("bbbbbbbb-2", Some("feat/b"))],
+            ),
+        ];
+        for list in [WorktreeList::Listed, WorktreeList::Failed] {
+            let text = status_text(&registries, None, list);
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains('\r'), "{text:?}");
+            assert!(
+                !text.lines().any(|l| l.starts_with("Sessions in /forged")),
+                "a path must not forge its own line: {text:?}"
+            );
+        }
+        let empty = status_text(&[reg(crafted, true, vec![])], None, WorktreeList::Failed);
+        assert!(
+            !empty.contains('\u{1b}') && !empty.contains('\r'),
+            "{empty:?}"
+        );
+        assert_eq!(empty.lines().count(), 2, "{empty:?}");
+    }
+
+    #[test]
+    fn display_path_keeps_a_long_ordinary_path_whole() {
+        let long = format!("/{}/.claude/sessions", "a".repeat(1000));
+        assert_eq!(display_path(std::path::Path::new(&long)), long);
+    }
+
+    fn registries_scratch_root() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/status-registries-scratch")
+    }
+
+    fn canon(p: &std::path::Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    fn roots(dirs: &[PathBuf]) -> Vec<PathBuf> {
+        dirs.iter()
+            .map(|d| canon(d.parent().unwrap().parent().unwrap()))
+            .collect()
+    }
+
+    /// The #845 shape end to end: a primary checkout and a linked worktree, each
+    /// with its own registry. From EITHER side, both registries are scanned,
+    /// the caller's own first, and no directory appears twice.
+    #[test]
+    fn repo_registries_unions_the_primary_checkout_and_every_worktree() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let scratch = Scratch::new(&registries_scratch_root(), "union");
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = scratch.path().join("wt-a");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/a",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+
+        let from_primary = repo.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&from_primary).unwrap();
+        let (dirs, list) = repo_registries(&from_primary, own);
+        assert_eq!(list, WorktreeList::Listed);
+        assert_eq!(roots(&dirs), vec![canon(&repo), canon(&wt)]);
+
+        let from_wt = wt.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&from_wt).unwrap();
+        let (dirs, list) = repo_registries(&from_wt, own);
+        assert_eq!(list, WorktreeList::Listed);
+        assert_eq!(
+            roots(&dirs),
+            vec![canon(&wt), canon(&repo)],
+            "own checkout first, sibling next"
+        );
+    }
+
+    /// A worktree whose directory was deleted (still listed, `prunable`) and
+    /// one whose path holds a space: both come back, the space intact, and the
+    /// deleted one reads as a registry that does not exist rather than
+    /// breaking the scan.
+    #[test]
+    fn repo_registries_keeps_a_spaced_path_and_a_deleted_worktree() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let scratch = Scratch::new(&registries_scratch_root(), "odd-paths");
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let spaced = scratch.path().join("wt with space");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/s",
+                &spaced.to_string_lossy(),
+                "main",
+            ],
+        );
+        let gone = scratch.path().join("wt-gone");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/g",
+                &gone.to_string_lossy(),
+                "main",
+            ],
+        );
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        let own = registry::sessions_dir(&cwd).unwrap();
+        let (dirs, list) = repo_registries(&cwd, own);
+        assert_eq!(list, WorktreeList::Listed);
+        let got = roots(&dirs);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(got.contains(&canon(&spaced)), "{got:?}");
+        assert!(
+            dirs.iter().any(|d| d.to_string_lossy().contains("wt-gone")),
+            "{dirs:?}"
+        );
+        let gone_dir = dirs
+            .iter()
+            .find(|d| d.to_string_lossy().contains("wt-gone"))
+            .unwrap();
+        assert!(!gone_dir.is_dir());
+    }
+
+    #[test]
+    fn repo_registries_reports_an_unlisted_scan_outside_a_repo() {
+        let dir = std::env::temp_dir();
+        let own = PathBuf::from("/nowhere/.claude/sessions");
+        // `git worktree list` fails outside a repository: only the own dir, flagged.
+        let (dirs, list) = repo_registries(
+            &dir.join("definitely-not-a-dir-845").to_string_lossy(),
+            own.clone(),
+        );
+        assert_eq!(dirs, vec![own]);
+        assert_eq!(list, WorktreeList::Failed);
     }
 
     #[test]

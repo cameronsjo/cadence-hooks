@@ -101,6 +101,24 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-instruction-narrative",
+        description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-live-memory-write",
+        description: "Nudge on a direct write to live auto-memory outside a dream adoption window",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-plugin-root-cruft",
+        description: "Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "nudge-polish-before-pr",
         description: "Nudge to run `/polish` before creating a PR",
         namespace: "cadence",
@@ -115,6 +133,12 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "redact-external-content",
         description: "Nudge when an external post mentions internal harness vocabulary",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "guard-held-close",
+        description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
         namespace: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
@@ -249,6 +273,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-inline-body",
+        description: "Nudge when gh pr/issue create posts a long body inline instead of via --body-file",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         namespace: "guardrails",
@@ -281,6 +311,30 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-unreviewed-ready-flip",
         description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-chezmoi-apply",
+        description: "Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally; the nudge flags an unscoped apply",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-entry-posture",
+        description: "Warn on a session's first write in a linked worktree whose branch has no upstream or no open PR",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-stacked-base-delete",
+        description: "Warn before deleting a branch (`git push --delete`, `gh pr merge --delete-branch`) that open PRs use as their base",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-stale-pr-body",
+        description: "Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since creation while the branch gained commits",
         namespace: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -571,11 +625,41 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("guardrails", "warn-unreviewed-ready-flip") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
         ),
+        // The five nudges-b hooks each gate on one command shape the generic
+        // `git status` sample never reaches. guard-held-close allows here
+        // unless `CADENCE_DRAIN_HELD` holds the named issue (`try` passes no
+        // `--ledger`). warn-chezmoi-apply's sample is a dry run on purpose:
+        // `try` must never execute `chezmoi status`, which runs templates.
+        ("cadence", "guard-held-close") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue close 354 -R cameronsjo/cadence-ecosystem"}}"#,
+        ),
+        ("guardrails", "warn-chezmoi-apply") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"chezmoi apply --dry-run"}}"#,
+        ),
+        ("guardrails", "warn-entry-posture") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
+        ),
+        ("guardrails", "warn-stacked-base-delete") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git push origin --delete feat/sample"}}"#,
+        ),
+        ("guardrails", "warn-stale-pr-body") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr ready 5"}}"#,
+        ),
         // guard-body-budget only engages on a gh posting subcommand carrying a
         // body flag; the generic PreToolUse sample (`git status`) would allow
         // without measuring anything.
         ("guardrails", "guard-body-budget") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
+        ),
+        // warn-inline-body only engages on `gh pr|issue create` with an inline
+        // body past the threshold; the generic sample (`git status`) would allow.
+        ("guardrails", "warn-inline-body") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue create --title test --body \"This sample body is deliberately long enough to cross the inline-body threshold, so that try exercises the nudge path rather than the silent short-body allow. It says nothing else, and it is posted nowhere at all.\""}}"#,
+        ),
+        // warn-instruction-narrative only engages on a CLAUDE.md/AGENTS.md
+        // write; the generic sample is a Bash call and would allow unjudged.
+        ("cadence", "warn-instruction-narrative") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","tool_input":{"file_path":"/tmp/cadence-try/CLAUDE.md","old_string":"","new_string":"Pin the toolchain. It used to drift; verified on 2026-02-02."}}"#,
         ),
         // warn-amend-pushed only engages on an amending `git commit`; the
         // generic PreToolUse sample (`git status`) would never reach the probe.
