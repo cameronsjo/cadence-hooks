@@ -6,14 +6,14 @@
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
-use crate::prevent_secret_leaks::argv_program_opens;
+use crate::prevent_secret_leaks::{argv_program_opens, unquoted_substitution_bodies};
 use crate::secret_patterns::{
     Filename, ProgramOpen, curl_write_targets, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token_at, is_safe_template, is_secret_scan_exempt, scan_secret_values,
     wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, is_assignment_word, redirect_targets,
+    carries_substitution, command_segments, command_word, redirect_targets,
     skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -180,29 +180,42 @@ fn program_commands(segment: &str) -> Vec<String> {
         .collect()
 }
 
-/// The text a segment's substitution-bearing COMMAND WORD would hand the
+/// The text each substitution-bearing word in a segment would hand the
 /// parser, when `eval` or a shell's `-c` runs it: `bash -c "$(echo echo x \>
 /// .env)"` writes `.env`, because the substitution prints `echo x > .env` and
 /// the shell parses that as code. [`command_segments`] surfaces the `-c` or
-/// `eval` script as a segment whose command word is the substitution, kept
-/// whole by the tokenizer (cadence-hooks#1106), so no redirect was ever seen.
+/// `eval` script as a segment holding the substitution, kept whole by the
+/// tokenizer (cadence-hooks#1106), so no redirect was ever seen.
 ///
-/// Re-read the same way `prevent-secret-leaks` and `trash-guard` re-read such a
-/// word: grouping syntax blanked out, and one level of backslash removal for
-/// the `echo`/`printf` that prints it. At the top level bash does NOT parse a
-/// substitution's output (`$(echo echo x \> .env)` just echoes), and after
-/// segmentation the two are indistinguishable, so that spelling blocks too —
-/// the over-block direction, for a command nobody writes.
-fn substituted_command_text(segment: &str) -> Option<String> {
+/// Every substitution outside quotes is read, whatever its
+/// position — a wrapper's flags or a reserved word in front of it decide
+/// nothing — the way `prevent-secret-leaks` and `trash-guard` re-read them:
+/// grouping syntax blanked out, quotes dropped, and one level of backslash
+/// removal for the `echo`/`printf` that prints it. Where bash does NOT parse the output
+/// (`x $(echo echo x \> .env)` only echoes), a redirect it spells blocks too
+/// — the over-block direction, for a command nobody writes.
+fn substituted_texts(segment: &str) -> Vec<String> {
     if !carries_substitution(segment) {
-        return None;
+        return Vec::new();
     }
-    let tokens = tokenize(segment);
-    let head = tokens.iter().find(|t| {
-        !is_assignment_word(t) && !COMMAND_WRAPPERS.contains(&command_word(t).as_ref())
-    })?;
-    carries_substitution(head)
-        .then(|| unescape_word(&head.replace(['(', ')', '`'], " ")).into_owned())
+    // Quote characters are dropped too: `$(printf 'echo x > .env')` prints a
+    // redirect its own quotes hid from the parser.
+    let reread = |text: &str| {
+        let text = text.replace(['\'', '"'], "").replace(['(', ')', '`'], " ");
+        unescape_word(&text).into_owned()
+    };
+    // Only a substitution outside quotes: a quoted one is a single word of
+    // prose (`--body "$(cat <<'EOF' … EOF)"`) whose output no shell re-parses.
+    // An `eval` or `-c` script arrives here with its quotes already removed.
+    // Quoting that cannot be read re-reads every substitution-bearing word.
+    match unquoted_substitution_bodies(segment) {
+        Some(bodies) => bodies.into_iter().map(reread).collect(),
+        None => tokenize(segment)
+            .iter()
+            .filter(|t| carries_substitution(t))
+            .map(|t| reread(t))
+            .collect(),
+    }
 }
 
 /// How deep [`matched_secret_write_target`] follows a command a sed/awk
@@ -273,7 +286,7 @@ fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String>
         let unwrapped = strip_group_wrappers(trimmed);
         let unwrapped = (trimmed.starts_with(['(', '{']) && unwrapped != trimmed)
             .then(|| unwrapped.to_string());
-        let substituted = substituted_command_text(&segment);
+        let substituted = substituted_texts(&segment);
         let candidates: Vec<String> = std::iter::once(&segment)
             .chain(unwrapped.as_ref())
             .flat_map(|view| {
@@ -588,10 +601,24 @@ mod tests {
         ] {
             assert!(bash_targets_env_file(command), "{command}");
         }
+        // Every substitution-bearing word is read, wherever it sits: a
+        // wrapper's flags or a reserved word in front decide nothing.
+        for command in [
+            "sudo -u root bash -c \"$(echo echo x \\> .env)\"",
+            "if true; then eval \"$(echo echo x \\> .env)\"; fi",
+            "bash -c \"$(printf 'echo x > .env')\"",
+            // Accepted over-blocks: bash only echoes these, writing nothing.
+            "''$(echo echo x \\> .env)",
+            "x $(echo echo x \\> .env)",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
         for command in [
             "bash -c \"$(echo echo x \\> out.txt)\"",
             "eval \"$(ssh-agent -s)\"",
-            "x $(echo echo x \\> .env)",
+            "echo $(date) > out.txt",
+            // A quoted substitution is prose, never re-parsed.
+            "gh pr create --body \"$(cat <<'EOF'\nredirect with > .env here\nEOF\n)\"",
         ] {
             assert!(!bash_targets_env_file(command), "{command}");
         }

@@ -621,7 +621,11 @@ fn segment_env_reads_at(
             }
         }
     }
-    for read in substituted_command_word_reads(&tokens, context) {
+    let reread = {
+        let _live = LiveScope::set(substitutions_live(segment));
+        substituted_word_reads(segment, &tokens, &globs, context)
+    };
+    for read in reread {
         if !found.contains(&read) {
             found.push(read);
         }
@@ -651,45 +655,117 @@ fn segment_env_reads_at(
     found
 }
 
-/// Reads for a segment whose COMMAND WORD carries a substitution, where bash
-/// runs the substitution's output as the command: `$(echo cat .env)` reads
-/// `.env`, and so does every `eval "$(…)"` and `bash -c "$(…)"` whose script
-/// [`command_segments`] surfaces as such a segment.
+/// Reads for a segment with a substitution-bearing word, judged with every
+/// such word re-read as the words of its source — the reading this guard had
+/// before cadence-hooks#1106, restored on purpose.
 ///
-/// The tokenizer keeps `$(echo cat .env)` as one word (cadence-hooks#1106),
-/// and a whitespace-bearing word is never judged as an operand, so the read
-/// went unseen. Before #1106 the split at the inner blanks handed `.env)` to
-/// the operand scan by accident. This restores that reading on purpose: the
-/// word's text is re-read as blank-split words with the grouping syntax
-/// blanked out — the same re-read `trash-guard` applies — and those words,
-/// followed by the segment's own arguments, are judged as the argv of a
-/// command this guard does not know. What the substitution prints is only
-/// known to the running shell, so any secret-shaped word in its source counts.
+/// The tokenizer keeps `$(echo cat .env)` as one word (#1106), and a
+/// whitespace-bearing word is never judged as an operand, so a substitution
+/// whose OUTPUT bash runs went unseen: as the command word
+/// (`$(echo cat .env)`), behind a wrapper whose flags the prefix peel does not
+/// parse (`sudo -u root $(…)`, `timeout 5 $(…)`), after a reserved word
+/// (`if $(…)`, `! $(…)`), or as an `eval` / `sh -c` script, which
+/// [`command_segments`] surfaces as such a segment. Before #1106 the split at
+/// the inner blanks handed `.env)` to the operand scan by accident.
 ///
-/// Only the command word: `x $(echo cat .env)` hands the output to `x` as
-/// arguments, which bash never runs.
-fn substituted_command_word_reads(
+/// Every word carrying an unquoted substitution is replaced IN PLACE by an
+/// unknown placeholder head `$(` followed by its substitutions' blank-split
+/// words, grouping syntax blanked out (the re-read `trash-guard` applies) and
+/// quote characters dropped. The segment is then judged
+/// as usual, so a substitution at the head reads as an unknown command whose
+/// operands are the body's words, and one in an argument position is judged
+/// under the segment's real head, exactly as the old split was: `cat $(…)` and
+/// `x $(echo cat .env)` block, while a metadata-safe head (`echo $(…)`,
+/// `ls $(…)`) keeps its exemption. No wrapper grammar or reserved word
+/// decides whether a substitution is looked at. Every re-read word is marked as glob-expanding, so none keeps a
+/// pattern-operand exemption.
+///
+/// Only an UNQUOTED substitution is re-read — one
+/// [`unquoted_substitution_bodies`] finds outside quotes in the raw segment.
+/// That is the old split's reach too: bash word-splits an unquoted
+/// substitution's output (`""$(echo cat .env)` runs `cat .env`), while
+/// `"$(echo see .env docs)"` is one word of prose and `'$(…)'` literal text.
+/// An `eval` or `-c` script reaches here with its quotes already removed, so
+/// its substitution is unquoted. The tokenizer's text and the raw body are
+/// matched quote-blind ([`quote_blind`]), so a quoted and an unquoted
+/// substitution that differ only in quoting are both re-read.
+fn substituted_word_reads(
+    segment: &str,
     tokens: &[String],
+    globs: &[bool],
     context: ScanContext,
 ) -> Vec<(String, String)> {
-    let Some((_, argv)) = resolve_command(tokens) else {
-        return Vec::new();
-    };
-    let Some(at) = argv.iter().position(|t| !is_assignment_word(t)) else {
-        return Vec::new();
-    };
-    let head = &argv[at];
-    if !carries_substitution(head) {
+    if !tokens.iter().any(|t| carries_substitution(t)) {
         return Vec::new();
     }
-    let reread: Vec<String> = std::iter::once("$(".to_string())
-        .chain(tokenize(&head.replace(['(', ')', '`'], " ")))
-        .chain(argv[at + 1..].iter().cloned())
-        .collect();
-    // Every word came through a substitution's output or sits beside one, so
-    // none keeps a pattern-operand exemption.
-    let globs = vec![true; reread.len()];
-    segment_direct_reads(&reread, &globs, context)
+    // `None` re-reads every substitution: the quoting could not be read.
+    let unquoted: Option<HashSet<String>> = unquoted_substitution_bodies(segment)
+        .map(|bodies| bodies.into_iter().map(quote_blind).collect());
+    let is_unquoted = |body: &str| {
+        unquoted
+            .as_ref()
+            .is_none_or(|set| set.contains(&quote_blind(body)))
+    };
+    let mut reread = Vec::with_capacity(tokens.len());
+    let mut reread_globs = Vec::with_capacity(tokens.len());
+    let mut any_reread = false;
+    for (i, token) in tokens.iter().enumerate() {
+        // Only the unquoted substitutions' own bodies: the literal text
+        // around them is one word of prose or path (`--title "fix $(date)
+        // .env handling"`), which the whitespace firewall already judges. An
+        // unbalanced word is re-read whole unless every substitution in the
+        // segment is quoted.
+        // Quote characters are dropped before the split: `$(printf 'cat
+        // .env')` prints two words its own quotes kept together.
+        let blank =
+            |text: &str| tokenize(&text.replace(['\'', '"'], "").replace(['(', ')', '`'], " "));
+        let words: Option<Vec<String>> = if !carries_substitution(token) {
+            None
+        } else {
+            match substitution_spans(token) {
+                Some(spans) => {
+                    let mut spans = spans
+                        .into_iter()
+                        .filter(|&(_, start, end, _)| is_unquoted(&token[start..end]))
+                        .peekable();
+                    spans.peek().is_some().then(|| {
+                        spans
+                            .flat_map(|span| blank(&span_body(token, span)))
+                            .collect()
+                    })
+                }
+                None => unquoted
+                    .as_ref()
+                    .is_none_or(|set| !set.is_empty())
+                    .then(|| blank(token)),
+            }
+        };
+        match words {
+            Some(words) => {
+                any_reread = true;
+                reread_globs.extend(std::iter::repeat_n(true, words.len() + 1));
+                reread.push("$(".to_string());
+                reread.extend(words);
+            }
+            None => {
+                reread.push(token.clone());
+                reread_globs.push(globs.get(i).copied().unwrap_or(true));
+            }
+        }
+    }
+    if !any_reread {
+        return Vec::new();
+    }
+    segment_direct_reads(&reread, &reread_globs, context)
+}
+
+/// `text` without quote characters or backslashes, for matching a
+/// substitution body the tokenizer may have quote-removed against its raw
+/// spelling. Collisions only widen what counts as unquoted.
+fn quote_blind(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect()
 }
 
 /// Shell options whose VALUE is the next token, so it is not the script.
@@ -2780,6 +2856,30 @@ fn substitution_spans(word: &str) -> Option<Vec<(usize, usize, usize, usize)>> {
 /// modes, and a backtick span closes only at an UNESCAPED backtick.
 fn scan_substitutions(word: &str, quote_aware: bool) -> Option<Vec<(usize, usize, usize, usize)>> {
     let bytes = word.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == b'`' || bytes[i..].starts_with(b"$(") {
+            let span = substitution_span_at(bytes, i, quote_aware)?;
+            spans.push(span);
+            i = span.3;
+        } else {
+            i += 1;
+        }
+    }
+    Some(spans)
+}
+
+/// The span of the substitution opening at `bytes[i]` (a backtick, or the `$`
+/// of `$(`), as `(open, body_start, body_end, close_end)`, or `None` when it
+/// never closes. See [`scan_substitutions`] for the two modes.
+fn substitution_span_at(
+    bytes: &[u8],
+    i: usize,
+    quote_aware: bool,
+) -> Option<(usize, usize, usize, usize)> {
     let skip_backtick = |from: usize| -> Option<usize> {
         let mut j = from;
         loop {
@@ -2790,55 +2890,102 @@ fn scan_substitutions(word: &str, quote_aware: bool) -> Option<Vec<(usize, usize
             }
         }
     };
-    let mut spans = Vec::new();
+    if bytes[i] == b'`' {
+        let close = skip_backtick(i + 1)?;
+        return Some((i, i + 1, close, close + 1));
+    }
+    // One `in_dq` flag per open paren: a `$(` inside double quotes starts a
+    // fresh, unquoted context, as in bash.
+    let mut levels = vec![false];
+    let mut j = i + 2;
+    while let Some(&in_dq) = levels.last() {
+        match *bytes.get(j)? {
+            b'\\' => {
+                j += 2;
+                continue;
+            }
+            b'`' => j = skip_backtick(j + 1)?,
+            b'\'' if quote_aware && !in_dq => {
+                j += 1 + bytes[j + 1..].iter().position(|&b| b == b'\'')?;
+            }
+            b'"' if quote_aware => {
+                if let Some(level) = levels.last_mut() {
+                    *level = !*level;
+                }
+            }
+            b'$' if bytes.get(j + 1) == Some(&b'(') => {
+                levels.push(false);
+                j += 2;
+                continue;
+            }
+            b'(' if !in_dq => levels.push(false),
+            b')' if !in_dq => {
+                levels.pop();
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    Some((i, i + 2, j - 1, j))
+}
+
+/// The bodies of the top-level `$(…)` / backtick substitutions in `segment`
+/// that sit OUTSIDE quotes, in order — the ones whose output bash word-splits
+/// and, at a command word or in an `eval` / `-c` script, runs. `None` when the
+/// segment's quoting or a span cannot be read confidently; a caller then
+/// treats every substitution as unquoted (fail closed).
+///
+/// Read from the raw text because the tokenizer's quote removal erases the
+/// difference: `""$(echo cat .env)` (runs `cat .env`) and `"$(echo cat .env)"`
+/// (one word) both tokenize to `$(echo cat .env)`. A backtick body keeps its
+/// escapes here; [`span_body`] is for a caller that wants them removed.
+pub(crate) fn unquoted_substitution_bodies(segment: &str) -> Option<Vec<&str>> {
+    let bytes = segment.as_bytes();
+    let span_at = |i: usize| {
+        substitution_span_at(bytes, i, true).or_else(|| substitution_span_at(bytes, i, false))
+    };
+    let mut bodies = Vec::new();
+    let mut in_double = false;
+    let mut sigil = false;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
-        } else if bytes[i] == b'`' {
-            let close = skip_backtick(i + 1)?;
-            spans.push((i, i + 1, close, close + 1));
-            i = close + 1;
-        } else if bytes[i..].starts_with(b"$(") {
-            // One `in_dq` flag per open paren: a `$(` inside double quotes
-            // starts a fresh, unquoted context, as in bash.
-            let mut levels = vec![false];
-            let mut j = i + 2;
-            while let Some(&in_dq) = levels.last() {
-                match *bytes.get(j)? {
-                    b'\\' => {
-                        j += 2;
-                        continue;
-                    }
-                    b'`' => j = skip_backtick(j + 1)?,
-                    b'\'' if quote_aware && !in_dq => {
-                        j += 1 + bytes[j + 1..].iter().position(|&b| b == b'\'')?;
-                    }
-                    b'"' if quote_aware => {
-                        if let Some(level) = levels.last_mut() {
-                            *level = !*level;
-                        }
-                    }
-                    b'$' if bytes.get(j + 1) == Some(&b'(') => {
-                        levels.push(false);
-                        j += 2;
-                        continue;
-                    }
-                    b'(' if !in_dq => levels.push(false),
-                    b')' if !in_dq => {
-                        levels.pop();
-                    }
-                    _ => {}
+        let was_sigil = std::mem::replace(&mut sigil, false);
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'`' => {
+                let span = span_at(i)?;
+                if !in_double {
+                    bodies.push(&segment[span.1..span.2]);
                 }
-                j += 1;
+                i = span.3;
+                continue;
             }
-            spans.push((i, i + 2, j - 1, j));
-            i = j;
-        } else {
-            i += 1;
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                let span = span_at(i)?;
+                if !in_double {
+                    bodies.push(&segment[span.1..span.2]);
+                }
+                i = span.3;
+                continue;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'$') => i += 1,
+            b'$' => sigil = true,
+            b'\'' if !in_double => {
+                // `$'…'` honours `\'`; a plain `'…'` honours nothing.
+                i += 1;
+                while bytes.get(i)? != &b'\'' {
+                    if was_sigil && bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => in_double = !in_double,
+            _ => {}
         }
+        i += 1;
     }
-    Some(spans)
+    (!in_double).then_some(bodies)
 }
 
 /// A span's body as the shell runs it. A backtick body un-escapes `` \` ``
@@ -6233,41 +6380,96 @@ mod tests {
     }
 
     #[test]
-    fn substitution_as_the_command_word_is_read_as_the_command_it_prints() {
-        // cadence-hooks#1106 keeps `$(echo cat .env)` as one word. Where bash
-        // RUNS that word's output — as the command word, or as an `eval` /
-        // `sh -c` script — the body's words are judged as operands of an
-        // unknown command. Each row measured reading a canary `.env` under
-        // bash 5.2.
+    fn every_substitution_is_read_as_the_words_of_its_source() {
+        // cadence-hooks#1106 keeps `$(echo cat .env)` as one word. Every
+        // substitution-bearing word is re-read in place as its source's words
+        // (the pre-#1106 reading), whatever sits in front of it — a wrapper's
+        // flags or a reserved word decide nothing. Every Block row but `x …`
+        // measured reading a canary `.env` under bash 5.2.
         use cadence_hooks_core::Outcome::{Allow, Block};
-        for (command, want) in [
-            ("$(echo cat .env)", Block),
-            ("`echo cat .env`", Block),
-            ("sudo $(echo cat .env)", Block),
-            ("eval \"$(echo cat .env)\"", Block),
-            ("eval `echo cat .env`", Block),
-            ("eval \"`echo cat .env`\"", Block),
-            ("eval $(echo cat .env)", Block),
-            ("bash -c \"$(echo cat .env)\"", Block),
-            ("bash -c \"`echo cat .env`\"", Block),
-            ("sh -c \"$(echo cat .env)\"", Block),
-            ("zsh -c \"$(echo cat .env)\"", Block),
-            ("bash -c \"echo; $(echo cat .env)\"", Block),
-            // The output is `x`'s arguments, never run (measured: no read).
-            ("x $(echo cat .env)", Allow),
-            ("echo $(echo cat .env)", Allow),
-            // Ordinary substitution-headed commands name no secret.
-            ("echo $(date)", Allow),
-            ("$(git rev-parse --show-toplevel)/script.sh --flag", Allow),
-            ("\"$(brew --prefix)/bin/tool\" --version", Allow),
-            ("eval \"$(ssh-agent -s)\"", Allow),
-            ("eval \"$(direnv hook bash)\"", Allow),
-            ("eval \"$(/opt/homebrew/bin/brew shellenv)\"", Allow),
-            (
-                "bash -c \"$(curl -fsSL https://example.com/install.sh)\"",
-                Allow,
-            ),
-        ] {
+        let s = "$(echo cat .env)";
+        let blocks = [
+            s.to_string(),
+            "`echo cat .env`".to_string(),
+            format!("sudo {s}"),
+            format!("sudo -u root {s}"),
+            format!("sudo -E {s}"),
+            format!("sudo -- {s}"),
+            format!("exec -a foo {s}"),
+            format!("timeout 5 {s}"),
+            format!("timeout -s KILL 5 {s}"),
+            format!("nice -n 5 {s}"),
+            format!("nohup nice {s}"),
+            format!("stdbuf -oL {s}"),
+            format!("time -p {s}"),
+            format!("command -p {s}"),
+            format!("! {s}"),
+            format!("if {s}; then :; fi"),
+            format!("while {s}; do break; done"),
+            format!("until {s}; do break; done"),
+            format!("for i in 1; do {s}; done"),
+            format!("if true; then {s}; fi"),
+            format!("case x in x) {s};; esac"),
+            format!("f(){{ {s}; }}; f"),
+            format!("while false; do :; done; ! {s}"),
+            // `touch` is metadata-safe, but the head here is not `touch`.
+            "sudo -u root $(echo touch .env)".to_string(),
+            "if $(echo touch .env); then :; fi".to_string(),
+            format!("eval \"{s}\""),
+            "eval `echo cat .env`".to_string(),
+            "eval \"`echo cat .env`\"".to_string(),
+            format!("eval {s}"),
+            format!("bash -c \"{s}\""),
+            "bash -c \"`echo cat .env`\"".to_string(),
+            format!("sh -c \"{s}\""),
+            format!("zsh -c \"{s}\""),
+            format!("bash -c \"echo; {s}\""),
+            // A quote glued in front does not quote the substitution: bash
+            // word-splits its output, so these run `cat .env` (measured).
+            format!("\"\"{s}"),
+            format!("''{s}"),
+            "\"cat\"$(echo \" \" .env)".to_string(),
+            // The substitution's own quotes hid the words it prints.
+            "$(printf 'cat .env')".to_string(),
+            "eval \"$(printf 'cat .env')\"".to_string(),
+            // Accepted over-block: bash hands the output to `x` as arguments
+            // and reads nothing, but an argument position is judged under the
+            // real head exactly as before #1106, and an unknown head's
+            // secret-shaped operand blocks (fail closed, as main did).
+            format!("x {s}"),
+        ];
+        let allows = [
+            // A metadata-safe head keeps its exemption, as before #1106.
+            format!("echo {s}"),
+            // A QUOTED substitution is one word bash never splits or runs:
+            // the command is named `cat .env` (measured: no read).
+            format!("sudo -u root \"{s}\""),
+            format!("if \"{s}\"; then :; fi"),
+            format!("x '{s}'"),
+            "gh pr create --body \"$(echo see .env docs)\"".to_string(),
+            "echo $(date)".to_string(),
+            "$(git rev-parse --show-toplevel)/x.sh --flag".to_string(),
+            "\"$(npm bin)/eslint\" .".to_string(),
+            "\"$(brew --prefix)/bin/tool\" --version".to_string(),
+            "eval \"$(ssh-agent -s)\"".to_string(),
+            "eval \"$(direnv hook bash)\"".to_string(),
+            "eval \"$(brew shellenv)\"".to_string(),
+            "eval \"$(pyenv init -)\"".to_string(),
+            "eval \"$(/opt/homebrew/bin/brew shellenv)\"".to_string(),
+            "bash -c \"$(curl -fsSL https://example.com/install.sh)\"".to_string(),
+            "source \"$(dirname \"$0\")/lib.sh\"".to_string(),
+            "cd \"$(git rev-parse --show-toplevel)\" && cargo test".to_string(),
+            "$(which python3) -m pytest".to_string(),
+            "timeout 30 $(which node)".to_string(),
+            "if $(git diff --quiet); then :; fi".to_string(),
+            "git commit -m \"$(cat <<'EOF'\nfix: tidy the loader\n\nMore detail.\nEOF\n)\""
+                .to_string(),
+        ];
+        let rows = blocks
+            .iter()
+            .map(|c| (c, Block))
+            .chain(allows.iter().map(|c| (c, Allow)));
+        for (command, want) in rows {
             assert_eq!(
                 SecretLeaksGuard::default()
                     .run(&make_bash_input(command))
@@ -6275,6 +6477,24 @@ mod tests {
                 want,
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn unquoted_substitution_bodies_reads_quoting_from_the_raw_text() {
+        for (segment, want) in [
+            ("$(a b)", Some(vec!["a b"])),
+            ("\"\"$(a b)", Some(vec!["a b"])),
+            ("x \"$(a b)\" `c`", Some(vec!["c"])),
+            ("'$(a)' $'\\'$(b)'", Some(vec![])),
+            ("\"$(echo \")\" )\" $(c)", Some(vec!["c"])),
+            ("$(a $(b) \"$(c)\")", Some(vec!["a $(b) \"$(c)\""])),
+            // Unclosed quoting or span: no confident reading.
+            ("$(a", None),
+            ("'a", None),
+            ("\"a", None),
+        ] {
+            assert_eq!(unquoted_substitution_bodies(segment), want, "{segment}");
         }
     }
 
