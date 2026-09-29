@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **The plan-store reader can no longer be steered out of `<config_dir>/plans` by a concurrent swap, a symlink, or a hardlink.** `persist-plan-approval` and `lint-plan-shape` read the plan named by `planFilePath` only when it sits under the store. The reader used to canonicalize and nesting-check that path and then open it, so a directory inside the store swapped for a symlink between the two was followed at open time (a review reproduced 834 outside reads in 200k attempts). On Unix it now canonicalizes only the store root and walks the path below it with `openat`, opening every directory and the final name `O_NOFOLLOW`, so any symlink below the root, including a directory symlink that stays inside the store, reads as no plan. The opened file must also be a regular file with exactly one link, which rejects a hardlink in the store to a file outside it, and the final open is non-blocking so a FIFO cannot stall the hook. Other platforms keep a best-effort check that compares the opened file's length and timestamps with the path's, and have no link-count check. (cameronsjo/cadence-hooks#763)
+
 ### Changed
 
 - **`warn-unreviewed-ready-flip`'s GraphQL field mapping is now pinned in raw response JSON.** The one-request lookup from cadence-hooks#1024 reads bot logins without REST's `[bot]` suffix and the reviewed commit from `commit.oid`; the existing fixtures reached that shape only through a REST-to-GraphQL conversion in the test double. A table test now feeds the GraphQL shape directly: a bot author's self-approval still nudges, another bot's or a human's approval on head stays silent, and an approval on a stale `commit.oid` nudges. Test-only; no verdict changes. (cameronsjo/cadence-hooks#985)

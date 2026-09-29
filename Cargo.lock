@@ -291,6 +291,7 @@ dependencies = [
  "cadence-hooks-guardrails",
  "cadence-hooks-metrics",
  "gethostname",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
