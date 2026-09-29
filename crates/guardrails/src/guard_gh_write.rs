@@ -15,6 +15,10 @@ use cadence_hooks_core::shell::{
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
     strip_quotes, tokenize,
 };
+use cadence_hooks_core::shell::{
+    UNRESOLVABLE_DIR, apply_cd_target, skip_env_assignment_operands, skip_runner_flags,
+    skip_transparent_prefixes, unescape_word,
+};
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -3535,6 +3539,181 @@ fn too_many_dirs_block(
     )
 }
 
+/// Runner hops [`dir_after_runners`] follows before it gives up.
+const MAX_RUNNER_HOPS: usize = 16;
+
+/// The short options of `env` and `sudo` that take a value (the directory
+/// option included, listed by [`split_runner_chdir`] itself), so the value is
+/// not read as the command while looking for the directory option.
+fn runner_value_letters(runner: &str) -> &'static str {
+    match runner {
+        "env" => "uP",
+        "sudo" => "ughprtCUTR",
+        _ => "",
+    }
+}
+
+/// The long options of the same, taking a value when written without `=`.
+fn runner_value_words(runner: &str) -> &'static [&'static str] {
+    match runner {
+        "env" => &["--unset"],
+        "sudo" => &[
+            "--user", "--group", "--host", "--prompt", "--role", "--type",
+        ],
+        _ => &[],
+    }
+}
+
+/// The directory option of `env` (`-C`, `--chdir`) or `sudo` (`-D`, `--chdir`)
+/// in `argv` (what follows the runner), split out: the operands that remain
+/// for the ordinary peel, and each directory the runner changes to.
+///
+/// A short cluster is read as the runner reads it, letter by letter: the
+/// first option that takes a value takes the rest of the word, or the next
+/// word (`-iC dir`, `-Cdir`, `-uCdir` is user `Cdir`). An option it does not
+/// know ends the scan and stays in the operands, where the peel refuses it.
+fn split_runner_chdir(runner: &str, argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let chdir_letter = if runner == "sudo" { 'D' } else { 'C' };
+    let value_letters = runner_value_letters(runner);
+    let value_words = runner_value_words(runner);
+    let mut kept = Vec::new();
+    let mut dirs = Vec::new();
+    let value_at = |i: usize| {
+        argv.get(i)
+            .map_or(String::new(), |v| unescape_word(v).into_owned())
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        let word = unescape_word(&argv[i]).into_owned();
+        if !word.starts_with('-') || word == "--" || word == "-" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, glued) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            if name == "chdir" {
+                match glued {
+                    Some(value) => {
+                        dirs.push(value.to_string());
+                        i += 1;
+                    }
+                    None => {
+                        dirs.push(value_at(i + 1));
+                        i += 2;
+                    }
+                }
+                continue;
+            }
+            kept.push(argv[i].clone());
+            i += 1;
+            if glued.is_none() && value_words.contains(&word.as_str()) && i < argv.len() {
+                kept.push(argv[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+        let cluster = &word[1..];
+        let first_value = cluster
+            .char_indices()
+            .find(|&(_, c)| c == chdir_letter || value_letters.contains(c));
+        match first_value {
+            Some((at, c)) if c == chdir_letter => {
+                let glued = &cluster[at + c.len_utf8()..];
+                if glued.is_empty() {
+                    dirs.push(value_at(i + 1));
+                    i += 2;
+                } else {
+                    dirs.push(glued.to_string());
+                    i += 1;
+                }
+                if at > 0 {
+                    kept.push(format!("-{}", &cluster[..at]));
+                }
+            }
+            Some((at, c)) if at + c.len_utf8() == cluster.len() => {
+                kept.push(argv[i].clone());
+                i += 1;
+                if i < argv.len() {
+                    kept.push(argv[i].clone());
+                    i += 1;
+                }
+            }
+            _ => {
+                kept.push(argv[i].clone());
+                i += 1;
+            }
+        }
+    }
+    kept.extend(argv[i.min(argv.len())..].iter().cloned());
+    (kept, dirs)
+}
+
+/// Move `dir` to a runner's `chdir` operand the way a `cd` to it would, or to
+/// [`UNRESOLVABLE_DIR`] when the word is not a plain path.
+fn runner_chdir_target(dir: &str, target: &str) -> String {
+    let plain = !target.is_empty()
+        && !target.contains(['$', '`', '*', '?', '[', '{', '\\', '\n'])
+        && !(target.starts_with('~') && !(target == "~" || target.starts_with("~/")));
+    if !plain {
+        return UNRESOLVABLE_DIR.to_string();
+    }
+    let mut moved = dir.to_string();
+    if moved == UNRESOLVABLE_DIR && !target.starts_with('/') && !target.starts_with('~') {
+        return moved;
+    }
+    apply_cd_target(&mut moved, target);
+    moved
+}
+
+/// The directory a write segment's command runs in once the command runners
+/// in front of it have moved it, starting from `dir`.
+///
+/// `env -C DIR` and `sudo -D DIR` (and their `--chdir` spellings) run the
+/// command in DIR, which the segment walk never sees. A runner option the peel
+/// does not model leaves the directory unknown too, so the write is judged in
+/// [`UNRESOLVABLE_DIR`] and blocks, the same refusal
+/// `push.rs`'s `hides_a_push_behind_a_prefix` makes for a push.
+fn dir_after_runners(segment: &str, dir: &str) -> String {
+    let tokens = tokenize(segment);
+    let mut argv: Vec<String> = skip_transparent_prefixes(&tokens).to_vec();
+    let mut dir = dir.to_string();
+    for _ in 0..MAX_RUNNER_HOPS {
+        let Some(first) = argv.first() else {
+            break;
+        };
+        let runner = command_word(first).into_owned();
+        if !COMMAND_RUNNERS.contains(&runner.as_str()) {
+            break;
+        }
+        let (operands, chdirs) = if runner == "env" || runner == "sudo" {
+            split_runner_chdir(&runner, &argv[1..])
+        } else {
+            (argv[1..].to_vec(), Vec::new())
+        };
+        for target in chdirs {
+            dir = runner_chdir_target(&dir, &target);
+        }
+        let Some(rest) = skip_runner_flags(&runner, &operands) else {
+            return UNRESOLVABLE_DIR.to_string();
+        };
+        let rest = if runner == "env" {
+            skip_env_assignment_operands(rest)
+        } else {
+            rest
+        };
+        argv = skip_transparent_prefixes(rest).to_vec();
+    }
+    if argv
+        .first()
+        .is_some_and(|w| COMMAND_RUNNERS.contains(&command_word(w).as_ref()))
+    {
+        // Out of hops with a runner still in front.
+        return UNRESOLVABLE_DIR.to_string();
+    }
+    dir
+}
+
 /// Judge every write among `segments`, each in the directory paired with it,
 /// in order; the first disallowed or unresolvable write blocks.
 ///
@@ -3655,6 +3834,10 @@ fn judge_write_segments(
         // that might not have run (`false && export …`) leaves more than
         // one, and the write must be owned on every one of them (#548).
         // The same for an inherited `GH_REPO` (cadence-hooks#1129).
+        let dir: std::rc::Rc<str> = match dir_after_runners(&segment, &dir) {
+            moved if moved != *dir => std::rc::Rc::from(moved.as_str()),
+            _ => dir,
+        };
         if &*dir != whole_dir && !judged.dirs.contains(&dir) {
             if judged.dirs.len() == MAX_SEGMENT_DIRS {
                 return Some(too_many_dirs_block(&segment, allowed_owners, allowed_repos));
@@ -9028,6 +9211,84 @@ mod tests {
                 ("trap 'rm -f x' EXIT; gh pr create -t x", false),
             ] {
                 let command = command.replace("{O}", o).replace("{U}", u);
+                let result = GhWriteGuard.run(&input_with(&command, o));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A command runner that changes directory itself (`env -C`, `sudo -D`)
+    /// runs the write there, and a runner option the peel does not model
+    /// leaves the write's directory unknown. From an owned checkout each
+    /// unowned row exited 0 before (checked with a real `env`/`sudo` canary
+    /// for the directory forms). `{O}`/`{U}` are the owned/unowned checkouts.
+    #[test]
+    fn gh_write_follows_a_runner_directory_change() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        std::fs::create_dir(owned.path().join("sub")).unwrap();
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                // The directory is unowned.
+                ("env -C {U} gh pr create -t x", true),
+                ("env --chdir={U} gh pr create -t x", true),
+                ("env --chdir {U} gh pr create -t x", true),
+                ("env -C{U} gh pr create -t x", true),
+                ("env -iC {U} gh pr create -t x", true),
+                ("env -C '{U}' gh pr create -t x", true),
+                ("env -C {U} FOO=1 gh pr create -t x", true),
+                ("sudo -D {U} gh pr create -t x", true),
+                ("sudo --chdir={U} gh pr create -t x", true),
+                ("sudo --chdir {U} gh pr create -t x", true),
+                ("sudo -D{U} gh pr create -t x", true),
+                ("sudo -u me -D {U} gh pr create -t x", true),
+                ("sudo -n -D {U} gh pr create -t x", true),
+                ("env -C {U} env -C {O} gh pr create -t x", false),
+                ("env -C {O} env -C {U} gh pr create -t x", true),
+                ("sudo -D {U} env FOO=1 gh pr create -t x", true),
+                ("nice -n 5 env -C {U} gh pr create -t x", true),
+                ("timeout 5 env -C {U} gh pr create -t x", true),
+                // A relative directory resolves against the segment's own.
+                ("env -C ../{UB} gh pr create -t x", true),
+                // The directory cannot be read.
+                ("env -C \"$D\" gh pr create -t x", true),
+                ("env -C $(pwd) gh pr create -t x", true),
+                ("env -C '' gh pr create -t x", true),
+                ("env -C ~root gh pr create -t x", true),
+                ("sudo -D \"$D\" gh pr create -t x", true),
+                // A runner option the peel does not model.
+                ("timeout --weird 5 gh pr create -t x", true),
+                ("sudo --weird gh pr create -t x", true),
+                ("env --weird gh pr create -t x", true),
+                ("xargs --weird gh pr create -t x", true),
+                // Controls: the directory is owned, or nothing moves.
+                ("env -C {O} gh pr create -t x", false),
+                ("env --chdir={O} gh pr create -t x", false),
+                ("env -C {O}/sub gh pr create -t x", false),
+                ("env -C sub gh pr create -t x", false),
+                ("sudo -D {O} gh pr create -t x", false),
+                ("sudo gh pr create -t x", false),
+                ("sudo -n gh pr create -t x", false),
+                ("sudo -u me gh pr create -t x", false),
+                ("env FOO=1 gh pr create -t x", false),
+                ("env -i FOO=1 gh pr create -t x", false),
+                ("env -u FOO gh pr create -t x", false),
+                ("timeout 5 gh pr create -t x", false),
+                ("nice -n 5 gh pr create -t x", false),
+                ("env -C {U} gh pr view 1", false),
+                ("env -C {U} gh pr create -R cameronsjo/x -t x", false),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u).replace(
+                    "{UB}",
+                    unowned.path().file_name().unwrap().to_str().unwrap(),
+                );
                 let result = GhWriteGuard.run(&input_with(&command, o));
                 assert_eq!(
                     matches!(result.outcome, cadence_hooks_core::Outcome::Block),
