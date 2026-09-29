@@ -7871,6 +7871,18 @@ mod tests {
             "if true; then trap 'cat .env' EXIT; fi",
             "bash -c \"trap 'cat .env' EXIT\"",
             "eval \"trap 'cat .env' EXIT\"",
+            // cadence-hooks#1089 review: each row reads the file under bash
+            // 5.2 (verified with a canary) and was Allow at 31998dc.
+            "eval \"echo \\$(cat .env)\"",
+            "eval echo \\$\\(cat .env\\)",
+            "eval \"echo \\`cat .env\\`\"",
+            "trap \"echo \\$(cat .env)\" EXIT",
+            "trap -- '-x; cat .env' EXIT",
+            "trap $'echo a\\ncat .env' EXIT",
+            "eval $'echo a\\ncat .env'",
+            "bash -c $'echo a\\ncat .env'",
+            "eval $'echo a\\x0acat .env'",
+            "eval $'echo a\\012cat .env'",
         ] {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(
@@ -7882,6 +7894,8 @@ mod tests {
         // Controls: a trap that installs nothing, and a harmless action.
         for command in [
             "trap - EXIT",
+            "trap -- - EXIT",
+            "trap '' INT",
             "trap -p",
             "trap 'rm -f /tmp/x' EXIT",
             "eval 'echo hi'",

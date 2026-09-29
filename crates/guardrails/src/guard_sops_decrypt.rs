@@ -343,6 +343,11 @@ mod tests {
                 "exec -- sops -d secrets.yaml",
                 "eval 'sops -d secrets.yaml' | grep x",
                 "trap 'sops -d secrets.yaml | grep x' EXIT",
+                // cadence-hooks#1089 review: an `eval` chain past the wrapper
+                // depth, and backslash-escaped operators inside `eval`.
+                "eval eval eval eval sops -d secrets.yaml",
+                "eval echo a\\; sops -d x",
+                "eval echo a \\&\\& sops -d x",
             ] {
                 assert_eq!(outcome(command), Outcome::Block, "{command:?}");
             }
