@@ -276,6 +276,67 @@ pub struct MarkedToken {
     /// stop a strip, never cause one, so it can only leave more operands in
     /// view.
     pub unquoted_prefix_len: usize,
+    /// How many bytes at the start of `text` were emitted inside ONE
+    /// parameter-expanding quoting context — unquoted, or a single `"…"` run —
+    /// before the first change of quoting context. `0` when the token opens in
+    /// `'…'` or `$'…'`, or with an escaped quote (all literal to bash).
+    ///
+    /// **This is what tells `"$HOME/x"` from `'$HOME/x'`.** Both arrive as the
+    /// byte-identical text `$HOME/x`, but bash expands only the first; the
+    /// second is a literal directory named `$HOME`. A consumer that expands a
+    /// leading `$HOME` must check the reference lies wholly inside this prefix
+    /// — which also rejects `"$"HOME`, where the `$` is a literal because its
+    /// quoted run closes before the name (cadence-hooks#1018).
+    ///
+    /// Safety direction: a shorter prefix only ever declines an expansion.
+    pub expanding_prefix_len: usize,
+}
+
+/// Where a token's leading quoting-context run stands while
+/// [`tokenize_marked`] walks it — the state behind
+/// [`MarkedToken::expanding_prefix_len`].
+#[derive(Default)]
+struct LeadRun {
+    /// `None` until the token's first context is known; then whether that
+    /// context expands parameters (unquoted or `"…"`).
+    expands: Option<bool>,
+    /// `None` while the first run is still open; then its byte length.
+    end: Option<usize>,
+}
+
+impl LeadRun {
+    /// A quoting context (or an escaped quote) begins at byte `at`.
+    fn boundary(&mut self, at: usize, next_expands: bool) {
+        if self.expands.is_none() {
+            self.expands = Some(next_expands);
+        } else if self.end.is_none() {
+            self.end = Some(at);
+        }
+    }
+
+    /// An unquoted character is emitted.
+    fn unquoted(&mut self) {
+        if self.expands.is_none() {
+            self.expands = Some(true);
+        }
+    }
+
+    /// A quoted run closes at byte `at`.
+    fn close(&mut self, at: usize) {
+        if self.end.is_none() {
+            self.end = Some(at);
+        }
+    }
+
+    /// The final prefix length for a token whose text is `len` bytes, resetting
+    /// the state for the next token.
+    fn finish(&mut self, len: usize) -> usize {
+        let run = std::mem::take(self);
+        match run.expands {
+            Some(true) => run.end.unwrap_or(len),
+            _ => 0,
+        }
+    }
 }
 
 /// [`tokenize`], additionally reporting which tokens carried quoting.
@@ -291,6 +352,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     // `current` had reached at that moment.
     let mut unquoted_prefix: Option<usize> = None;
     let mut quote: Option<Quote> = None;
+    let mut lead = LeadRun::default();
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -298,6 +360,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
             Some(Quote::Single) => {
                 if c == '\'' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -314,6 +377,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
                 if c == '\'' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -327,6 +391,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 }
                 if c == '"' {
                     quote = None;
+                    lead.close(current.len());
                 } else {
                     current.push(c);
                 }
@@ -337,6 +402,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                     current.push(chars.next().expect("peeked"));
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
@@ -347,29 +413,35 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                     quote = Some(Quote::AnsiC);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), false);
                 }
                 '"' => {
                     quote = Some(Quote::Double);
                     in_token = true;
                     unquoted_prefix.get_or_insert(current.len());
+                    lead.boundary(current.len(), true);
                 }
                 c if c.is_whitespace() => {
                     if in_token {
                         let text = std::mem::take(&mut current);
                         let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
+                        let expanding_prefix_len = lead.finish(text.len());
                         tokens.push(MarkedToken {
                             text,
                             unquoted_prefix_len,
+                            expanding_prefix_len,
                         });
                         in_token = false;
                     }
                 }
                 _ => {
+                    lead.unquoted();
                     current.push(c);
                     in_token = true;
                 }
@@ -378,12 +450,48 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     }
     if in_token {
         let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
+        let expanding_prefix_len = lead.finish(current.len());
         tokens.push(MarkedToken {
             text: current,
             unquoted_prefix_len,
+            expanding_prefix_len,
         });
     }
     tokens
+}
+
+/// Expand a leading `$HOME` or `${HOME}` in a token against `home`, the way
+/// bash would — or `None` when the token does not open with one the shell
+/// actually expands.
+///
+/// The reference must lie wholly inside the token's
+/// [`MarkedToken::expanding_prefix_len`], so `'$HOME/x'` (literal in bash) and
+/// `"$"HOME/x` are declined, while `"$HOME/x"`, `$HOME/x`, and `"${HOME}"/x`
+/// expand. It must also be the whole name: followed by `/` or the end of the
+/// token, so `$HOMEDIR/x` and `${HOME:-/y}/x` are declined rather than guessed.
+/// An empty `home` declines too — a caller cannot tell an unset HOME from a
+/// root path.
+///
+/// This expands against a HOME the CALLER supplies. It does not know whether
+/// the command being modelled reassigned `HOME` before this word — deciding
+/// that is the caller's job, and a caller that cannot rule it out must not
+/// call this (cadence-hooks#1018).
+pub fn expand_leading_home(token: &MarkedToken, home: &str) -> Option<String> {
+    if home.is_empty() {
+        return None;
+    }
+    let text = token.text.as_str();
+    let reference = ["${HOME}", "$HOME"]
+        .into_iter()
+        .find(|r| text.starts_with(r))?;
+    let rest = &text[reference.len()..];
+    if reference.len() > token.expanding_prefix_len {
+        return None;
+    }
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    Some(format!("{home}{rest}"))
 }
 
 /// Last path segment of a token — `/usr/bin/rm` → `rm`, `rm` → `rm`.
@@ -1112,10 +1220,11 @@ pub fn merge_anchor_repo_targets(command: &str) -> Option<Vec<String>> {
 }
 
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
-/// create` carrying no `--draft`/`-d` flag *in that same segment*. Scoping the
-/// draft-flag scan to one segment is what keeps an unrelated sibling command's
-/// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
-/// splits first rather than scanning the whole token stream).
+/// create` that gh reads as no draft ([`create_is_draft`]) *in that same
+/// segment*. Scoping the draft-flag scan to one segment is what keeps an
+/// unrelated sibling command's `-d` from suppressing a real ship (the reason
+/// [`is_polish_ship_anchor`] splits first rather than scanning the whole token
+/// stream).
 ///
 /// Group wrappers are stripped before tokenizing, the same order the other
 /// guards use (`enforce_worktree`), because [`tokenize`] fuses the punctuation
@@ -1145,7 +1254,10 @@ fn segment_ship_anchor(segment: &str, origin: Option<&str>) -> Option<&'static s
         // 12` is a real ship and must keep anchoring, and requiring the current
         // branch would kill the canonical `gh pr ready <n>` spelling.
         "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
-        "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
+        // Draft is read with `create`'s flag grammar (cadence-hooks#998), so
+        // another flag's value (`-t -d`) or a redirect target (`> -d`) is not
+        // a draft, and a shorthand cluster (`-fd`, `-dH x`) is.
+        "create" if !create_is_draft(invocation.operands) => Some("create"),
         "merge" if invocation.targets_the_current_branch(origin) => Some("merge"),
         _ => None,
     }
@@ -1442,8 +1554,8 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
         // form is left deliberately unhandled and errs toward the FALSE NUDGE:
         // `--undo=false` is a real ship, and a prefix match would suppress it
         // (the costly direction), while `--undo=true` merely anchors wrongly —
-        // one spurious nudge on a fail-open advisory, the same accepted gap the
-        // `create` arm carries for `--draft=true`.
+        // one spurious nudge on a fail-open advisory. (The `create` arm no
+        // longer carries that gap: [`create_is_draft`] reads `--draft=V`.)
         if token == "--undo" {
             return true;
         }
@@ -2055,6 +2167,91 @@ fn scan_ship_flags(grammar: &FlagGrammar, operands: &[String]) -> ShipFlagScan {
     scan
 }
 
+/// True when gh reads the `gh pr create` `operands` as a draft
+/// (cadence-hooks#998). Only [`segment_ship_anchor`] calls this, and every
+/// consumer of that anchor (`nudge-polish-before-pr`, `warn-changelog-entry`,
+/// `log-polish-nudge`) is advisory: no block decision reads it.
+///
+/// The walk is [`scan_ship_flags`]' walk over [`CREATE_FLAGS`], so a token is
+/// a draft flag only where pflag would parse one:
+///
+/// - `--draft`, or a shorthand cluster that reaches `d` before any
+///   value-taking letter (`-d`, `-fd`, `-dH x`).
+/// - `--draft=V` and `-d=V` take `V` as a bool the way pflag's
+///   `strconv.ParseBool` does; only a true spelling is a draft. An unreadable
+///   `V` is not a draft (gh rejects it, and the direction is a nudge).
+/// - Another flag's value (`-t -d`), a redirect target (`> -d`), anything
+///   after `--` or a `#` comment, and a positional are never a draft.
+/// - The last setting wins, as in pflag (`--draft --draft=false` is no
+///   draft).
+///
+/// **Ambiguity reads as no draft**, so the create anchors and the advisory
+/// nudges: once a flag this grammar does not know makes the alignment of
+/// flags and values unreadable, the walk stops and only draft settings seen
+/// before it count. A spurious nudge on a draft is the accepted cost; a
+/// silent real ship is not.
+fn create_is_draft(operands: &[String]) -> bool {
+    let mut draft = false;
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        if token == "#" || token == "--" {
+            break;
+        }
+        if let Some(next) = skip_redirect(operands, i) {
+            i = next;
+            continue;
+        }
+        if let Some(setting) = draft_setting(token) {
+            draft = setting;
+        }
+        let read = read_flag_token(
+            &CREATE_FLAGS,
+            token,
+            operands.get(i + 1).map(String::as_str),
+        );
+        if read.taints_rest {
+            break;
+        }
+        i += read.consumed;
+    }
+    draft
+}
+
+/// What one `gh pr create` flag token sets `--draft` to, or `None` when it
+/// does not set it. See [`create_is_draft`] for the grammar.
+fn draft_setting(token: &str) -> Option<bool> {
+    if let Some(long) = token.strip_prefix("--") {
+        return match long.split_once('=') {
+            Some(("draft", value)) => Some(parse_bool_true(value)),
+            None if long == "draft" => Some(true),
+            _ => None,
+        };
+    }
+    let cluster = token.strip_prefix('-').filter(|c| !c.is_empty())?;
+    for (idx, letter) in cluster.char_indices() {
+        if letter == 'd' {
+            // pflag: a `=` right after a bool shorthand gives it the rest of
+            // the token as its value (`-d=false`).
+            let rest = &cluster[idx + 1..];
+            return Some(rest.strip_prefix('=').is_none_or(parse_bool_true));
+        }
+        // Only a known bool shorthand lets the walk go on to a later letter;
+        // a value-taking letter swallows the rest of the token, and an
+        // unknown one leaves it unreadable.
+        if !CREATE_FLAGS.short_bools.contains(letter) {
+            return None;
+        }
+    }
+    None
+}
+
+/// True for the spellings Go's `strconv.ParseBool` reads as true, which is
+/// what pflag uses for a bool flag's `=value`.
+fn parse_bool_true(value: &str) -> bool {
+    matches!(value, "1" | "t" | "T" | "true" | "TRUE" | "True")
+}
+
 /// Read one operand token under `grammar`; `next` is the token after it.
 fn read_flag_token(grammar: &FlagGrammar, token: &str, next: Option<&str>) -> TokenRead {
     // The value of a value-taking flag: attached, or the next token.
@@ -2203,9 +2400,18 @@ pub const GH_DEFAULT_HOST: &str = "github.com";
 /// `-R git@github.com:cameronsjo/cadence-hooks.git` both resolved). The
 /// `owner/repo` slugs must be equal. The host is compared when the value
 /// names one, or else against `implied_host` (the host a bare slug means to
-/// the caller); `None` there compares the slug alone. A remote whose host is
-/// an SSH config alias ([`host_is_unknowable`]) matches on the slug alone,
-/// because the alias names no real host to compare.
+/// the caller); `None` there compares the slug alone.
+///
+/// A remote whose host is an SSH config alias ([`host_is_unknowable`]) names
+/// no real host, so it is taken to stand for [`GH_DEFAULT_HOST`]: it matches
+/// a value that names no host, or names `github.com` (cadence-hooks#999). A
+/// value naming another forge (`-R gitlab.example.com/own/repo`, or a bare
+/// slug under `GH_HOST=ghe.corp.example`) does not match it, even with the
+/// same `owner/repo`, because gh would reach a different repository. The cost
+/// is an alias for a GitHub Enterprise host used with that host spelled out:
+/// it reads as no match, which is the cannot-check advisory in the resolver
+/// and no merge anchor, never a lookup on the wrong forge. This reads no SSH
+/// config. A real dotless host (`localhost`) still matches itself exactly.
 pub fn repo_value_names_remote(
     value: &str,
     implied_host: Option<&str>,
@@ -2221,7 +2427,9 @@ pub fn repo_value_names_remote(
     let host = value_host
         .or_else(|| implied_host.map(str::to_ascii_lowercase))
         .map(forge_host);
-    host.is_none_or(|host| host_is_unknowable(remote_host) || host == remote_host)
+    host.is_none_or(|host| {
+        host == remote_host || (host_is_unknowable(remote_host) && host == GH_DEFAULT_HOST)
+    })
 }
 
 /// A remote URL as `(host, owner/repo)`: the host mapped by [`forge_host`],
@@ -2241,7 +2449,8 @@ pub fn origin_triple(url: &str) -> Option<String> {
 
 /// A remote host that cannot be compared to a forge host: an SSH config alias
 /// (`git@github-work:own/repo.git`) has no dot and names no real host. Only
-/// the `owner/repo` comparison applies to such a remote. A real dotless host
+/// the `owner/repo` comparison applies to such a remote, and only for a value
+/// that means github.com ([`repo_value_names_remote`]). A real dotless host
 /// (`localhost`, a LAN short name) is treated the same way.
 pub fn host_is_unknowable(remote_host: &str) -> bool {
     !remote_host.contains('.')
@@ -5429,6 +5638,60 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_marked_reports_the_leading_expanding_run() {
+        // `expanding_prefix_len` is the byte length of the token's first run
+        // in ONE parameter-expanding context (unquoted or a single `"…"`).
+        for (command, want) in [
+            ("$HOME/x", 7),
+            ("\"$HOME/x\"", 7),
+            ("\"$HOME\"/x", 5),
+            ("$HOME\"/x\"", 5),
+            ("'$HOME/x'", 0),
+            ("$'$HOME/x'", 0),
+            ("\"$\"HOME/x", 1),
+            ("\\\"$HOME", 0),
+            ("''$HOME", 0),
+            ("", 0),
+        ] {
+            let marked = tokenize_marked(command);
+            let got = marked.first().map_or(0, |t| t.expanding_prefix_len);
+            assert_eq!(got, want, "{command:?} → {marked:?}");
+        }
+        // The state resets per token.
+        let marked = tokenize_marked("'$a' $HOME");
+        assert_eq!(marked[0].expanding_prefix_len, 0);
+        assert_eq!(marked[1].expanding_prefix_len, 5);
+    }
+
+    #[test]
+    fn expand_leading_home_expands_only_what_bash_would() {
+        let expand = |command: &str| {
+            let marked = tokenize_marked(command);
+            expand_leading_home(&marked[0], "/home/u")
+        };
+        assert_eq!(expand("\"$HOME/src/x\"").as_deref(), Some("/home/u/src/x"));
+        assert_eq!(expand("$HOME/src/x").as_deref(), Some("/home/u/src/x"));
+        assert_eq!(expand("\"${HOME}\"/x").as_deref(), Some("/home/u/x"));
+        assert_eq!(expand("$HOME").as_deref(), Some("/home/u"));
+        // Literal to bash, another name, or an operator form: declined.
+        for command in [
+            "'$HOME/x'",
+            "$'$HOME/x'",
+            "\"$\"HOME/x",
+            "$HOMEDIR/x",
+            "${HOME:-/y}/x",
+            "$HOME.bak",
+            "~/x",
+            "$OTHER/x",
+        ] {
+            assert_eq!(expand(command), None, "{command}");
+        }
+        // An empty home declines rather than producing a root-relative path.
+        let marked = tokenize_marked("$HOME/x");
+        assert_eq!(expand_leading_home(&marked[0], ""), None);
+    }
+
+    #[test]
     fn tokenize_is_the_text_projection_of_tokenize_marked() {
         // `tokenize` delegates, so the two can never disagree about where a
         // token ends — the drift this branch already paid for once.
@@ -5866,6 +6129,41 @@ mod tests {
     }
 
     #[test]
+    fn is_polish_ship_anchor_reads_draft_with_the_create_grammar() {
+        // cadence-hooks#998: a `-d` that is another flag's value or a
+        // redirect target is no draft, so these real creates anchor.
+        for command in [
+            "gh pr create -t -d --head feat/unpol -b b",
+            "gh pr create --head feat/unpol -t a -b b > -d",
+            "gh pr create --title --draft",
+            "gh pr create -b x -- --draft",
+            "gh pr create --draft=false",
+            "gh pr create -d=false -t x",
+            "gh pr create --draft --draft=false",
+            "gh pr create -td",
+            // An unknown flag makes the rest unreadable: ambiguity anchors.
+            "gh pr create --newflag --draft",
+            "gh pr create -z -d",
+        ] {
+            assert!(is_polish_ship_anchor(command), "{command} should anchor");
+        }
+        // Real drafts in every spelling pflag accepts do not anchor.
+        for command in [
+            "gh pr create -d",
+            "gh pr create --draft",
+            "gh pr create -fd",
+            "gh pr create -dH feat/x",
+            "gh pr create -t x -d",
+            "gh pr create --draft=true",
+            "gh pr create -d=1",
+            "gh pr create --draft --newflag",
+            "gh pr create -d > out.log",
+        ] {
+            assert!(!is_polish_ship_anchor(command), "{command} is a draft");
+        }
+    }
+
+    #[test]
     fn is_polish_ship_anchor_draft_flag_scoped_to_create_segment() {
         // A bare `-d`/`--draft` in an UNRELATED sibling command on a compound
         // line must not misclassify a real non-draft create as a draft. The
@@ -6253,6 +6551,43 @@ mod tests {
             "own/repo",
             None,
             "ghe.example.com",
+            "own/repo"
+        ));
+    }
+
+    #[test]
+    fn repo_value_names_remote_takes_an_alias_for_github_only() {
+        // cadence-hooks#999: an SSH-alias remote stands for github.com, so a
+        // value naming another forge with the same owner/repo is not it.
+        let alias = "github-work";
+        for (value, implied) in [
+            ("own/repo", None),
+            ("own/repo", Some(GH_DEFAULT_HOST)),
+            ("github.com/own/repo", None),
+            ("https://github.com/own/repo", None),
+            ("git@github.com:own/repo.git", None),
+        ] {
+            assert!(
+                repo_value_names_remote(value, implied, alias, "own/repo"),
+                "{value} {implied:?}"
+            );
+        }
+        for (value, implied) in [
+            ("gitlab.example.com/own/repo", None),
+            ("https://gitlab.example.com/own/repo", None),
+            ("own/repo", Some("ghe.corp.example")),
+            ("gitlab.example.com/own/repo", Some(GH_DEFAULT_HOST)),
+        ] {
+            assert!(
+                !repo_value_names_remote(value, implied, alias, "own/repo"),
+                "{value} {implied:?}"
+            );
+        }
+        // A real dotless host still matches itself exactly.
+        assert!(repo_value_names_remote(
+            "localhost/own/repo",
+            None,
+            "localhost",
             "own/repo"
         ));
     }

@@ -202,6 +202,13 @@ enum Commands {
         /// With --prune, actually remove the orphaned version dirs (default is dry-run)
         #[arg(long)]
         apply: bool,
+        /// With --prune, keep the N most recently orphaned dirs; with either bound, a dir is
+        /// removed only if every live session started after it was orphaned
+        #[arg(long, value_name = "N")]
+        keep_newest: Option<usize>,
+        /// With --prune, remove only dirs orphaned at least this long ago (e.g. 90m, 12h, 7d, 2w)
+        #[arg(long, value_name = "AGE", value_parser = doctor::parse_age)]
+        older_than: Option<u64>,
     },
 
     /// Convert legacy .claude/{redaction,terminology}.json into the unified .claude/cadence.json (#153)
@@ -1408,8 +1415,14 @@ fn main() {
             quiet,
             prune,
             apply,
+            keep_newest,
+            older_than,
         } => {
-            process::exit(doctor::run(root.as_deref(), quiet, prune, apply).into());
+            let limits = doctor::PruneLimits {
+                keep_newest,
+                older_than_secs: older_than,
+            };
+            process::exit(doctor::run(root.as_deref(), quiet, prune, apply, limits).into());
         }
         Commands::MigrateConfig => {
             process::exit(migrate::run().into());
