@@ -12,9 +12,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`enforce-worktree` sees a whole `git commit` written as one brace word.** `{git,commit,-m,x}` and `{git,-C,<primary>,commit,-m,x}` exit 0: the segment cleaner dropped the word's closing `}` as group syntax, so it never expanded. A `}` now closes a group only as a word of its own. A brace expansion past core's bounds in a command that mentions `git` or `commit`, or that has a brace word in command position, is unreadable and blocks from a linked worktree too (cameronsjo/cadence-hooks#1115)
 - **`enforce-worktree` pins that an unresolvable `cd` target blocks a commit from a linked worktree.** `cd "$VAR"`, `cd $(…)`, `cd <glob>` and `cd ~user/…` before a commit already block with the `git -C <path>` guidance, from a primary and from a worktree; the 2026-09-28 comment describing a worktree allow does not reproduce on current main, so this adds table tests and no behavior change (cameronsjo/cadence-hooks#346)
 
+### Added
+
+- **`ToolInput` models the Agent/Task `prompt`, `description` and `model`.** A live PreToolUse probe (claude-code 2.1.271) showed the dispatch prompt and label are on the wire; they were landing unread in `extra`. Accessors `agent_prompt()`, `agent_description()` and `agent_model()` sit beside `subagent_type()`. (cameronsjo/cadence-hooks#374)
+- **`guardrails warn-agent-dispatch` warns on an Agent/Task dispatch with no `model`, or a `model` on a fork.** A non-fork dispatch that omits `model` inherits the session's most expensive tier; a `model` on a fork dispatch (`subagent_type` `fork` or omitted) is ignored by the platform. Advisory only. Built unwired: the hooks.json entry lands in a follow-up cadence monorepo PR. The `SendMessage` arm is not built. (cameronsjo/cadence-hooks#606)
+- **`warn-agent-dispatch` nudges when a brief asks a subagent to execute commands without naming a scrubbed or isolated HOME.** A narrow phrase match ("execution oracle", "run the corpus", "run each command", "in a real shell", ...) with no containment wording ("scratch home", "sandbox", `HOME=`, `env -i`, `bash -n`, "do not run", ...) names the requirement; the prompt is never echoed. This is the nudge tier only, not the structural control the issue asks for. (cameronsjo/cadence-hooks#837)
+
 ### Changed
 
 - **The `enforce-worktree` block message names the ff-merge path for live-state and release-style repos.** In an auto-mode session both the settings edit and the dismiss can be refused by the permission classifier; the message now says the sanctioned route is to edit and commit in a worktree, then `git merge --ff-only <branch>` on the primary. Message only, no verdict change (cameronsjo/cadence-hooks#717)
+
+### Fixed
+
+- **The backstop's "last session out" gate counts live sessions in sibling worktrees.** Each worktree keeps its own `.claude/sessions` registry, so two sessions in sibling worktrees of one repo each saw themselves as last out and each recorded the other's in-progress work as loose ends. The gate now reads the union of the repo's worktree registries, the same enumeration `session status` uses. If `git worktree list` cannot answer it checks only its own registry, as before. `registry::sessions_dir` and the lane guards stay per-working-tree by design. Part 1 of #928 only. (cameronsjo/cadence-hooks#928)
+- **The polish marker lives under the Claude config dir, not the shared temp dir.** It moves to `<config dir>/cadence-hooks/markers` (`0700`, honors `CLAUDE_CONFIG_DIR`), which has no shared base to fail open into, so a co-tenant can no longer plant it. Markers recorded in the old temp-based directory are still read for one release, and only when that directory is private. A `CADENCE_MARKER_DIR` override still wins. The rest of the marker family stays in the temp dir. Part 2 of #565 only; part 3 (a `sha` staleness verdict) is already covered by the `diff_digest` comparison from #874. (cameronsjo/cadence-hooks#565)
 
 ## [0.114.0] - 2026-09-29
 
