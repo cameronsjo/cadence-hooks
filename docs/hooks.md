@@ -80,6 +80,9 @@ Rules for wiring:
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
+| `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |
+| `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) |
+| `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable |
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
@@ -114,6 +117,11 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |
+| `warn-subagent-worktree` | PreToolUse (Agent, Task) | Warn when dispatching a subagent from main while a sibling worktree exists |
+| `enforcement-status` | SessionStart | Report when `CADENCE_BYPASS=1` or `CADENCE_DISABLE` names a protected guard |
+| `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) |
+| `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) |
+| `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
 so the browser action would already have hit a device before the context
@@ -128,6 +136,8 @@ advises.
 |------|-------|--------------|
 | `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md, command, living-plan, and plugin-agent frontmatter |
 | `security-patterns` | PostToolUse (Write, Edit) | Scan for security anti-patterns |
+| `warn-recommended-option` | PreToolUse (`AskUserQuestion`) | Nudge to label a recommended option "(Recommended)" |
+| `warn-empty-answers` | PostToolUse (`AskUserQuestion`) | Nudge to re-ask when `AskUserQuestion` returns empty auto-approve answers |
 
 `security-patterns` is a **zero-config, no-API baseline** — a per-edit pattern
 scan with no setup. For configurable patterns plus model-backed diff and commit
@@ -186,6 +196,8 @@ exit 0. They never block a tool call (see
 | `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` |
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
+| `log-skill` | PostToolUse (`Skill`) | Append each Skill invocation to `skills.jsonl` |
+| `warn-stale` | SessionStart | Warn when metrics telemetry has gone stale (a nudge, never a block) |
 
 `metrics grade` is a **CLI action, not a hook** — it has no `hooks.json` wiring,
 reads no stdin payload, and is not subject to `CADENCE_DISABLE`. It grades one
@@ -232,10 +244,15 @@ id.
 | Hook | Event | What it does |
 |------|-------|--------------|
 | `start` | SessionStart | Register this session, sweep stale entries, and disclose the live-peer count in one line (`cadence-hooks session status` for the detail) |
-| `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
+| `heartbeat` | — (unwired) | Touch this session's registry file; refresh the recorded branch so peers see branch drift. The beat now rides `persist-plan-approval`'s PostToolUse process, throttled (#902) |
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
+| `warn-branch-intent` | PreToolUse (Edit, Write) | Nudge once per session when new work starts on a stale feature branch whose name shares nothing with the declared intent |
 | `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one |
+| `persist-plan-approval` | PostToolUse (every tool) | On `ExitPlanMode`, persist the approved plan into the repo's plans dir, merging its frontmatter and nudging when it carries no settled `Panel:` line (`CADENCE_NO_PERSIST_PLAN` opts out); on every call, refresh this session's liveness heartbeat, throttled |
+| `backstop-warn` | SessionStart | Warn once when the last session left loose ends, then clear the marker |
+| `backstop-record` | SessionEnd | Record loose ends (uncommitted changes, unpushed commits, stashes, other worktrees with unpushed work) for the next `session start` to surface, only when no live peer remains in the checkout |
+| `end` | SessionEnd | Deregister this session's registry file |
 
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
 and is presumed dead after 30 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
