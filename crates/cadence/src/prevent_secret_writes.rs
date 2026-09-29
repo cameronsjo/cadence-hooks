@@ -13,8 +13,8 @@ use crate::secret_patterns::{
     wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, redirect_targets, skip_git_global_options,
-    strip_group_wrappers, tokenize,
+    carries_substitution, command_segments, command_word, is_assignment_word, redirect_targets,
+    skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -180,6 +180,31 @@ fn program_commands(segment: &str) -> Vec<String> {
         .collect()
 }
 
+/// The text a segment's substitution-bearing COMMAND WORD would hand the
+/// parser, when `eval` or a shell's `-c` runs it: `bash -c "$(echo echo x \>
+/// .env)"` writes `.env`, because the substitution prints `echo x > .env` and
+/// the shell parses that as code. [`command_segments`] surfaces the `-c` or
+/// `eval` script as a segment whose command word is the substitution, kept
+/// whole by the tokenizer (cadence-hooks#1106), so no redirect was ever seen.
+///
+/// Re-read the same way `prevent-secret-leaks` and `trash-guard` re-read such a
+/// word: grouping syntax blanked out, and one level of backslash removal for
+/// the `echo`/`printf` that prints it. At the top level bash does NOT parse a
+/// substitution's output (`$(echo echo x \> .env)` just echoes), and after
+/// segmentation the two are indistinguishable, so that spelling blocks too —
+/// the over-block direction, for a command nobody writes.
+fn substituted_command_text(segment: &str) -> Option<String> {
+    if !carries_substitution(segment) {
+        return None;
+    }
+    let tokens = tokenize(segment);
+    let head = tokens.iter().find(|t| {
+        !is_assignment_word(t) && !COMMAND_WRAPPERS.contains(&command_word(t).as_ref())
+    })?;
+    carries_substitution(head)
+        .then(|| unescape_word(&head.replace(['(', ')', '`'], " ")).into_owned())
+}
+
 /// How deep [`matched_secret_write_target`] follows a command a sed/awk
 /// program runs into another such command.
 const PROGRAM_COMMAND_DEPTH: usize = 3;
@@ -248,6 +273,7 @@ fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String>
         let unwrapped = strip_group_wrappers(trimmed);
         let unwrapped = (trimmed.starts_with(['(', '{']) && unwrapped != trimmed)
             .then(|| unwrapped.to_string());
+        let substituted = substituted_command_text(&segment);
         let candidates: Vec<String> = std::iter::once(&segment)
             .chain(unwrapped.as_ref())
             .flat_map(|view| {
@@ -255,6 +281,7 @@ fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String>
                     .into_iter()
                     .chain(writer_targets(view))
             })
+            .chain(substituted.iter().flat_map(|text| redirect_targets(text)))
             .collect();
         if let Some(target) = candidates
             .into_iter()
@@ -545,6 +572,29 @@ mod tests {
         assert!(!bash_targets_env_file(
             "D=$(mktemp -d); echo x > $D/out.txt"
         ));
+    }
+
+    #[test]
+    fn substitution_output_parsed_as_code_is_judged_for_redirects() {
+        // `eval` and `sh -c` parse a substitution's output as shell code, so
+        // the `>` it prints is a real redirect (measured under bash 5.2: both
+        // write the canary). cadence-hooks#1106 keeps the substitution one
+        // word, so its text is re-read with one level of escapes removed.
+        for command in [
+            "bash -c \"$(echo echo x \\> .env)\"",
+            "sh -c \"$(echo echo x \\> .env)\"",
+            "eval \"$(echo echo x \\> .env)\"",
+            "bash -c \"`echo echo x \\> .env`\"",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        for command in [
+            "bash -c \"$(echo echo x \\> out.txt)\"",
+            "eval \"$(ssh-agent -s)\"",
+            "x $(echo echo x \\> .env)",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
     }
 
     #[test]

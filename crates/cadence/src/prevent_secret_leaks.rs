@@ -15,9 +15,9 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
-    brace_expansion_overflows, command_segments, command_word, executable_tokens,
-    is_assignment_word, skip_git_global_options, split_segments, strip_group_wrappers,
-    strip_heredoc_bodies, tokenize, tokenize_marked,
+    brace_expansion_overflows, carries_substitution, command_segments, command_word,
+    executable_tokens, is_assignment_word, skip_git_global_options, split_segments,
+    strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -621,6 +621,11 @@ fn segment_env_reads_at(
             }
         }
     }
+    for read in substituted_command_word_reads(&tokens, context) {
+        if !found.contains(&read) {
+            found.push(read);
+        }
+    }
     if depth < NESTED_SCAN_DEPTH {
         for script in nested_command_strings(&tokens) {
             if !budget.spend(&script) {
@@ -644,6 +649,47 @@ fn segment_env_reads_at(
         }
     }
     found
+}
+
+/// Reads for a segment whose COMMAND WORD carries a substitution, where bash
+/// runs the substitution's output as the command: `$(echo cat .env)` reads
+/// `.env`, and so does every `eval "$(…)"` and `bash -c "$(…)"` whose script
+/// [`command_segments`] surfaces as such a segment.
+///
+/// The tokenizer keeps `$(echo cat .env)` as one word (cadence-hooks#1106),
+/// and a whitespace-bearing word is never judged as an operand, so the read
+/// went unseen. Before #1106 the split at the inner blanks handed `.env)` to
+/// the operand scan by accident. This restores that reading on purpose: the
+/// word's text is re-read as blank-split words with the grouping syntax
+/// blanked out — the same re-read `trash-guard` applies — and those words,
+/// followed by the segment's own arguments, are judged as the argv of a
+/// command this guard does not know. What the substitution prints is only
+/// known to the running shell, so any secret-shaped word in its source counts.
+///
+/// Only the command word: `x $(echo cat .env)` hands the output to `x` as
+/// arguments, which bash never runs.
+fn substituted_command_word_reads(
+    tokens: &[String],
+    context: ScanContext,
+) -> Vec<(String, String)> {
+    let Some((_, argv)) = resolve_command(tokens) else {
+        return Vec::new();
+    };
+    let Some(at) = argv.iter().position(|t| !is_assignment_word(t)) else {
+        return Vec::new();
+    };
+    let head = &argv[at];
+    if !carries_substitution(head) {
+        return Vec::new();
+    }
+    let reread: Vec<String> = std::iter::once("$(".to_string())
+        .chain(tokenize(&head.replace(['(', ')', '`'], " ")))
+        .chain(argv[at + 1..].iter().cloned())
+        .collect();
+    // Every word came through a substitution's output or sits beside one, so
+    // none keeps a pattern-operand exemption.
+    let globs = vec![true; reread.len()];
+    segment_direct_reads(&reread, &globs, context)
 }
 
 /// Shell options whose VALUE is the next token, so it is not the script.
@@ -6182,6 +6228,52 @@ mod tests {
                     .outcome,
                 cadence_hooks_core::Outcome::Allow,
                 "a redirection does not hide the command operand: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_as_the_command_word_is_read_as_the_command_it_prints() {
+        // cadence-hooks#1106 keeps `$(echo cat .env)` as one word. Where bash
+        // RUNS that word's output — as the command word, or as an `eval` /
+        // `sh -c` script — the body's words are judged as operands of an
+        // unknown command. Each row measured reading a canary `.env` under
+        // bash 5.2.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, want) in [
+            ("$(echo cat .env)", Block),
+            ("`echo cat .env`", Block),
+            ("sudo $(echo cat .env)", Block),
+            ("eval \"$(echo cat .env)\"", Block),
+            ("eval `echo cat .env`", Block),
+            ("eval \"`echo cat .env`\"", Block),
+            ("eval $(echo cat .env)", Block),
+            ("bash -c \"$(echo cat .env)\"", Block),
+            ("bash -c \"`echo cat .env`\"", Block),
+            ("sh -c \"$(echo cat .env)\"", Block),
+            ("zsh -c \"$(echo cat .env)\"", Block),
+            ("bash -c \"echo; $(echo cat .env)\"", Block),
+            // The output is `x`'s arguments, never run (measured: no read).
+            ("x $(echo cat .env)", Allow),
+            ("echo $(echo cat .env)", Allow),
+            // Ordinary substitution-headed commands name no secret.
+            ("echo $(date)", Allow),
+            ("$(git rev-parse --show-toplevel)/script.sh --flag", Allow),
+            ("\"$(brew --prefix)/bin/tool\" --version", Allow),
+            ("eval \"$(ssh-agent -s)\"", Allow),
+            ("eval \"$(direnv hook bash)\"", Allow),
+            ("eval \"$(/opt/homebrew/bin/brew shellenv)\"", Allow),
+            (
+                "bash -c \"$(curl -fsSL https://example.com/install.sh)\"",
+                Allow,
+            ),
+        ] {
+            assert_eq!(
+                SecretLeaksGuard::default()
+                    .run(&make_bash_input(command))
+                    .outcome,
+                want,
+                "{command}"
             );
         }
     }
