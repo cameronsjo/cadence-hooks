@@ -23,6 +23,7 @@ pub mod patch;
 pub mod pathclass;
 pub mod paths;
 pub mod push;
+pub mod remote;
 pub mod shell;
 pub mod stdout;
 pub mod time;

@@ -11,7 +11,7 @@
 use crate::guard_gh_write::gh_argv;
 use cadence_hooks_cadence::prevent_secret_leaks::piped_shell_scripts;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, brace_expansion_overflows, command_segments, command_word,
+    ExpansionWork, MAX_WRAPPER_DEPTH, brace_expansion_overflows, command_segments, command_word,
     contains_ignoring_ascii_case, fold_verb, gh_command_path, heredoc_introducers, logical_lines,
     may_spell_word, requote_words, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
 };
@@ -328,7 +328,18 @@ impl GhDangerousGuard {
         // a repo deletion (#509). Per-segment stripping retains the prose
         // exemption without giving one well-formed quoted argument authority
         // over a different segment.
+        //
+        // The walk runs on an allowance: each substitution level re-reads its
+        // body, so a nested `$(x $(x …))` flood costs seconds at 250 KB and a
+        // hook past its deadline fails OPEN (cadence-hooks#1141). Spent, what
+        // is left unread is exactly what this guard cannot rule out, so the
+        // command is refused when it names the operation this guard exists
+        // for and allowed otherwise.
+        let _work = ExpansionWork::arm(command.len().saturating_mul(3).saturating_add(32 * 1024));
         let segments = command_segments(command);
+        if ExpansionWork::spent() {
+            return Self::unread_command(command);
+        }
         for segment in &segments {
             // Also judged from the DECODED words: `gh $'repo' delete`,
             // `'gh' repo delete` and `$'\x67h' repo delete` all run the delete,
@@ -442,6 +453,31 @@ impl GhDangerousGuard {
             }
         }
 
+        if ExpansionWork::spent() {
+            return Self::unread_command(command);
+        }
+        CheckResult::allow()
+    }
+
+    /// The verdict for a command too large to read within its allowance:
+    /// block when it can spell `gh` and names `delete` once quotes and
+    /// backslashes are dropped (or builds words from `$'…'` escapes), else
+    /// allow. A `delete` assembled by a substitution's output is not seen.
+    fn unread_command(command: &str) -> CheckResult {
+        let bare: String = command
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        if may_spell_word(command, "gh")
+            && (contains_ignoring_ascii_case(&bare, "delete") || command.contains("$'"))
+        {
+            return CheckResult::block(
+                "🚫 git-guardrails: gh command too large to read\n   \
+                 It may spell `gh repo delete`, which is irreversible, and this guard cannot \
+                 rule that out within its time budget.\n   \
+                 Fix: split the command into smaller ones",
+            );
+        }
         CheckResult::allow()
     }
 }
@@ -1370,6 +1406,41 @@ mod tests {
                 cadence_hooks_core::Outcome::Allow,
                 "{command}"
             );
+        }
+    }
+
+    /// cadence-hooks#1141: nested substitution floods cost ~0.65 s at 250 KB
+    /// (the hook deadline fails open). Spent allowance blocks only a command
+    /// that can spell `gh` and `delete`.
+    #[test]
+    fn nested_substitution_floods_stay_fast_and_fail_closed() {
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.3 });
+        let n = 240_000;
+        let shapes = [
+            ("$(x ".repeat(n / 4) + &")".repeat(n / 4)),
+            format!("gh {}{}", "$(x ".repeat(n / 4), ")".repeat(n / 4)),
+            format!("gh {}{}", "$(echo ".repeat(n / 6), ")".repeat(n / 6)),
+            format!("gh {}{}", "\"$(x ".repeat(n / 5), ")\"".repeat(n / 5)),
+            format!(
+                "gh {}{}",
+                "$(bash -c \"x ".repeat(n / 14),
+                ")\"".repeat(n / 14)
+            ),
+            format!("gh {}", "`x ".repeat(n / 3)),
+        ];
+        for shape in &shapes {
+            for (tail, want) in [
+                (" pr list", cadence_hooks_core::Outcome::Allow),
+                (" repo delete o/r --yes", cadence_hooks_core::Outcome::Block),
+            ] {
+                let command = format!("{shape}{tail}");
+                let start = std::time::Instant::now();
+                let result = GhDangerousGuard.run(&make_bash(&command));
+                let took = start.elapsed();
+                assert_eq!(result.outcome, want, "{} bytes{tail}", command.len());
+                assert!(took < limit, "{} bytes{tail}: {took:?}", command.len());
+            }
         }
     }
 }

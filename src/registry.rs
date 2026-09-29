@@ -31,6 +31,65 @@ pub struct HookEntry {
     /// loggers, which react to `hook_event_name` in the payload rather than a
     /// fixed event. Keep the primary in sync with the dispatch in main.rs.
     pub events: &'static [HookEvent],
+    /// What this hook does under `CLAUDE_CODE_REMOTE=true` (a Claude Code cloud
+    /// session). Required, so a new hook cannot ship without a decision
+    /// (cameronsjo/cadence-hooks#1197). Each entry carries a one-line rationale
+    /// comment above the field.
+    pub remote: RemotePolicy,
+}
+
+/// A hook's behavior in a cloud session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePolicy {
+    /// Runs exactly as it does locally.
+    Run,
+    /// Exits 0 with no output: the hook's job is machine-local state or a local
+    /// workflow that does not exist in a throwaway VM.
+    SelfDisable,
+    /// Exits 2 with the reason on stderr. No hook uses it yet; the variant is
+    /// part of the declared policy surface.
+    #[allow(dead_code)]
+    BlockWithReason(&'static str),
+}
+
+impl RemotePolicy {
+    /// The stable label the manifest and docs use.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::SelfDisable => "self-disable",
+            Self::BlockWithReason(_) => "block-with-reason",
+        }
+    }
+}
+
+/// What dispatch does about `hook` given whether this is a cloud session.
+/// `None` runs the hook; `Some(policy)` is a policy that stops it. Pure over
+/// its inputs so the table is testable without the process env.
+pub fn remote_gate(hook: &str, remote: bool) -> Option<RemotePolicy> {
+    if !remote {
+        return None;
+    }
+    let entry = HOOKS.iter().find(|h| h.name == hook)?;
+    match entry.remote {
+        RemotePolicy::Run => None,
+        stop => Some(stop),
+    }
+}
+
+/// Apply the remote policy for `hook` to this process: exit 0 silently for a
+/// self-disabled hook, exit 2 with the reason for a blocked one, return for
+/// everything else. Called after the `CADENCE_DISABLE` resolution and before
+/// any stdin is read.
+pub fn enforce_remote_policy(hook: &str) {
+    match remote_gate(hook, cadence_hooks_core::remote::is_remote()) {
+        None | Some(RemotePolicy::Run) => {}
+        Some(RemotePolicy::SelfDisable) => std::process::exit(0),
+        Some(RemotePolicy::BlockWithReason(reason)) => {
+            eprintln!("cadence-hooks: {hook} is blocked in cloud sessions: {reason}");
+            std::process::exit(2);
+        }
+    }
 }
 
 impl HookEntry {
@@ -62,120 +121,160 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Block inclusive terminology violations",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content guard; no machine-local state.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "orphaned-todos",
         description: "Block orphaned code markers without issue references",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content guard; no machine-local state.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "prevent-secret-leaks",
         description: "Guard against reading/ingesting secrets",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "prevent-secret-writes",
         description: "Guard against writing/editing/deleting secrets",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "memory-guard",
         description: "Enforce MEMORY.md line limits",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge; harmless when the local memory dir is absent.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "git-safety",
         description: "Block dangerous git operations",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "line-endings",
         description: "Validate shell script line endings",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content guard; no machine-local state.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "env-vars",
         description: "Warn about generic environment variable names",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content guard; no machine-local state.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-docs-update",
         description: "Nudge to review docs when creating a PR",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge about the repo's own content.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-changelog-entry",
         description: "Nudge to add a CHANGELOG.md entry when shipping code changes",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge about the repo's own content.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge about the repo's own content.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-instruction-narrative",
         description: "Nudge when an always-loaded instruction file (CLAUDE.md, AGENTS.md) gains narrative",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge about the repo's own content.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-live-memory-write",
         description: "Nudge on a direct write to live auto-memory outside a dream adoption window",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge; harmless when the local memory dir is absent.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-plugin-root-cruft",
         description: "Nudge on a write creating plugin-root docs/ or scripts/ in a plugin marketplace",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge about the repo's own content.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "nudge-polish-before-pr",
         description: "Nudge to run `/polish` before creating a PR",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge; cloud sessions ship PRs too.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "markdown-lint",
         description: "Run markdownlint on markdown files",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only lint; fails open when no markdownlint CLI is on PATH.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "audit-runner-pool",
         description: "Run the runner-pool workflow audit after a workflow file is edited; findings return as a nudge",
         namespace: "cadence",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only audit of the edited workflow file.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "redact-external-content",
         description: "Nudge when an external post mentions internal harness vocabulary",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-held-close",
         description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "platform-drift",
         description: "Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline",
         namespace: "cadence",
         events: &[HookEvent::SessionStart],
+        // Remote: read-only; ruled Run for cloud sessions (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         // Wired on SessionStart *and* PostModelSwitch; the subcommand picks its
@@ -184,6 +283,8 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Inject the Fable seat posture at session start and on a switch onto Fable",
         namespace: "cadence",
         events: &[HookEvent::SessionStart, HookEvent::PostModelSwitch],
+        // Remote: read-only; ruled Run for cloud sessions (#1197).
+        remote: RemotePolicy::Run,
     },
     // guardrails
     HookEntry {
@@ -191,210 +292,280 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Block git push to non-owned remotes",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: the guards worth having in the cloud (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-gh-dangerous",
         description: "Block irreversible gh operations (repo delete)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: the guards worth having in the cloud (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-gh-write",
         description: "Block gh write operations to non-owned repos",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: the guards worth having in the cloud (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-forge-write",
         description: "Block tea/glab write operations to non-owned repos",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: an owner-allowlist write guard, like guard-gh-write (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-git-init",
         description: "Nudge to scaffold and confirm license after git init or gh repo create",
         namespace: "guardrails",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only guard.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-main-branch",
         description: "Warn when editing on main/master branch",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: nudge only; a fresh clone starts on the default branch.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "enforce-worktree",
         description: "Block mutations in a primary checkout of a branch-mode repo",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: the fresh cloud clone is the primary checkout and all work lands on a session branch, so the guard would block every commit.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "warn-subagent-worktree",
         description: "Warn when dispatching a subagent from main while a sibling worktree exists",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: steers toward sibling worktrees, which a single-clone cloud VM does not use.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "warn-agent-dispatch",
         description: "Warn on an Agent/Task dispatch with no model, a model on a fork, or an execution brief with no isolated HOME",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-branch-base",
         description: "Warn when creating a branch from a non-main base",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-cron-datetime",
         description: "Remind to check datetime before scheduling cron jobs",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "nudge-upgrade-after-push",
         description: "Nudge to schedule a brew upgrade after pushing cadence-hooks to main",
         namespace: "guardrails",
         events: &[HookEvent::PostToolUse],
+        // Remote: suggests a local cron and a script that does not exist in the plugin.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "warn-untracked",
         description: "Warn about untracked files during git commit operations",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-amend-pushed",
         description: "Warn when git commit --amend rewrites a commit a remote already has",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-dotfiles",
         description: "Block direct edits to production dotfiles (opt-in)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "enforcement-status",
-        description: "Report at SessionStart when CADENCE_BYPASS=1 or CADENCE_DISABLE names a protected guard",
+        description: "Report at SessionStart when CADENCE_BYPASS=1 or CADENCE_DISABLE names a protected guard; in a cloud session (CLAUDE_CODE_REMOTE=true) also one ARMED/INERT line",
         namespace: "guardrails",
         events: &[HookEvent::SessionStart],
+        // Remote: carries the ARMED/INERT line (#1197); must survive.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-pr-issue-link",
         description: "Nudge when gh pr create has no closing issue keyword",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-body-budget",
         description: "Measure gh pr/issue bodies against a per-surface word budget",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-issue-tracker",
         description: "Nudge when gh issue create targets a repo other than the canonical tracker",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-going-public",
         description: "Nudge on repo create/publicize when name or description telegraphs sensitive content",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-inline-body",
         description: "Nudge when gh pr/issue create posts a long body inline instead of via --body-file",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         namespace: "guardrails",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-sops-decrypt",
         description: "Block a sops decrypt whose plaintext is not consumed by an allowed tool",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: no-op when the tool is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-op-vault-scan",
         description: "Block uninvited 1Password vault enumeration (op item list)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: no-op when the tool is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-curl-alias",
         description: "Warn when bare curl (aliased to curlie) is used with custom headers",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-gh-merge-preflight",
         description: "Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-unreviewed-ready-flip",
         description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-chezmoi-apply",
         description: "Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally; the nudge flags an unscoped apply",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only nudge; no-op without chezmoi.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-entry-posture",
         description: "Warn on a session's first write in a linked worktree whose branch has no upstream or no open PR",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-stacked-base-delete",
         description: "Warn before deleting a branch (`git push --delete`, `gh pr merge --delete-branch`) that open PRs use as their base",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-stale-pr-body",
         description: "Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since creation while the branch gained commits",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-alias-parsing",
         description: "Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "guard-browser-device",
         description: "Block the first Claude-in-Chrome action per session until the device is confirmed",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: no-op when the tool is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "inject-gh-write-context",
         description: "Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only guard or nudge over the command or repo.
+        remote: RemotePolicy::Run,
     },
     // rules
     HookEntry {
@@ -402,24 +573,32 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Validate SKILL.md, command, living-plan, and plugin-agent frontmatter",
         namespace: "rules",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content check.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "security-patterns",
         description: "Scan for security anti-patterns",
         namespace: "rules",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only content check.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-recommended-option",
         description: "Nudge to label a recommended AskUserQuestion option \"(Recommended)\"",
         namespace: "rules",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only content check.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-empty-answers",
         description: "Nudge to re-ask when AskUserQuestion returns empty auto-approve answers",
         namespace: "rules",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only content check.
+        remote: RemotePolicy::Run,
     },
     // obsidian
     HookEntry {
@@ -427,12 +606,16 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Block rm in Obsidian vault (use .trash/ instead)",
         namespace: "obsidian",
         events: &[HookEvent::PreToolUse],
+        // Remote: guard over the tool call; inert without a vault.
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "trash-guard-liveness",
         description: "Report at SessionStart when a configured vault's trash-guard routes no longer judge as contracted",
         namespace: "obsidian",
         events: &[HookEvent::SessionStart],
+        // Remote: probes a machine-local Obsidian vault configuration.
+        remote: RemotePolicy::SelfDisable,
     },
     // metrics
     HookEntry {
@@ -440,54 +623,72 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Snapshot HEAD before a git commit (PreToolUse)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-commit",
         description: "Log cost-per-commit after a git commit (PostToolUse)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-subagent",
         description: "Log subagent lifecycle (SubagentStart / SubagentStop)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-session",
         description: "Log per-session cost at SessionEnd (SessionEnd)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-session-start",
         description: "Capture session start timestamp (SessionStart)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-ask-user-question",
         description: "Log AskUserQuestion asked (PreToolUse) + answered (PostToolUse) events",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "log-skill",
         description: "Log skill invocations (PostToolUse:Skill)",
         namespace: "metrics",
         events: &[],
+        // Remote: writes ledgers under the Claude config dir, lost with the VM.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "warn-stale",
         description: "Warn at SessionStart when metrics telemetry has gone stale",
         namespace: "metrics",
         events: &[HookEvent::SessionStart],
+        // Remote: reports on metrics ledgers that cloud sessions never write.
+        remote: RemotePolicy::SelfDisable,
     },
     // session — the clap namespace for plan and session state. Wired by the
     // always-on `cadence` plugin, not by a plugin of its own: `cadence-canon`
@@ -498,78 +699,104 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Register this session, disclose live peers, and surface in-flight plans",
         namespace: "session",
         events: &[HookEvent::SessionStart],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "heartbeat",
         description: "Touch this session's registry file (mtime is the liveness signal)",
         namespace: "session",
         events: &[],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "guard",
         description: "Warn when an action intersects a live peer session's lane",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "warn-branch-drift",
         description: "Warn when HEAD drifted from the session's recorded branch at git commit",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only against the repo (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-branch-intent",
         description: "Nudge when new work starts on a stale, unrelated feature branch",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only against the repo (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-commit-provenance",
         description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: runs, but the Machine: field becomes the fixed value `cloud` (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         namespace: "session",
         events: &[],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "backstop-record",
         description: "Record loose ends at session end for the next start to surface (SessionEnd)",
         namespace: "session",
         events: &[],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "backstop-warn",
         description: "Warn at session start when the last session left loose ends",
         namespace: "session",
         events: &[HookEvent::SessionStart],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "persist-plan-approval",
         description: "Persist an approved plan at approval, merging into its own frontmatter and nudging when it carries no settled Panel: line; CADENCE_NO_PERSIST_PLAN opts out (PostToolUse:ExitPlanMode)",
         namespace: "session",
         events: &[HookEvent::PostToolUse],
+        // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
+        remote: RemotePolicy::SelfDisable,
     },
     HookEntry {
         name: "nudge-plan-tick",
         description: "Nudge once per session when successful commits keep skipping the branch's in-flight plan doc (PostToolUse:Bash)",
         namespace: "session",
         events: &[HookEvent::PostToolUse],
+        // Remote: read-only against the repo (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "warn-plan-ready-flip",
         description: "Warn on gh pr ready/merge while the branch's plan is still in-flight or carries unticked boxes (PreToolUse:Bash)",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only against the repo (#1197).
+        remote: RemotePolicy::Run,
     },
     HookEntry {
         name: "lint-plan-shape",
         description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every outcome carries the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
+        // Remote: read-only against the repo (#1197).
+        remote: RemotePolicy::Run,
     },
 ];
 
@@ -1036,6 +1263,95 @@ mod tests {
                 registered.len(),
                 "docs/hooks.md `## {ns}` lists a hook more than once: {documented:?}"
             );
+        }
+    }
+
+    /// Hooks that do not simply `Run` in a cloud session. Everything not listed
+    /// here must declare `Run`, so a new hook cannot slip in with a different
+    /// policy without this table being updated with it (#1197).
+    const NOT_RUN_IN_CLOUD: &[&str] = &[
+        "enforce-worktree",
+        "warn-subagent-worktree",
+        "nudge-upgrade-after-push",
+        "trash-guard-liveness",
+        "snapshot",
+        "log-commit",
+        "log-subagent",
+        "log-session",
+        "log-session-start",
+        "log-polish-nudge",
+        "log-ask-user-question",
+        "log-skill",
+        "warn-stale",
+        "start",
+        "heartbeat",
+        "guard",
+        "end",
+        "backstop-record",
+        "backstop-warn",
+        "persist-plan-approval",
+    ];
+
+    #[test]
+    fn hook_names_are_unique_across_namespaces() {
+        // `remote_gate` resolves by name alone, like `namespace_of`.
+        let mut names: Vec<_> = HOOKS.iter().map(|h| h.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len());
+    }
+
+    #[test]
+    fn every_hook_declares_the_remote_policy_the_table_expects() {
+        for h in HOOKS {
+            let expected = if NOT_RUN_IN_CLOUD.contains(&h.name) {
+                RemotePolicy::SelfDisable
+            } else {
+                RemotePolicy::Run
+            };
+            assert_eq!(h.remote, expected, "{} {}", h.namespace, h.name);
+        }
+        for name in NOT_RUN_IN_CLOUD {
+            assert!(HOOKS.iter().any(|h| h.name == *name), "stale row {name}");
+        }
+    }
+
+    #[test]
+    fn remote_gate_stops_only_non_run_hooks_and_only_when_remote() {
+        for h in HOOKS {
+            assert_eq!(remote_gate(h.name, false), None, "{}: not remote", h.name);
+            let gated = remote_gate(h.name, true);
+            match h.remote {
+                RemotePolicy::Run => assert_eq!(gated, None, "{}", h.name),
+                stop => assert_eq!(gated, Some(stop), "{}", h.name),
+            }
+        }
+        assert_eq!(remote_gate("no-such-hook", true), None);
+    }
+
+    #[test]
+    fn a_blocking_policy_is_reported_as_such() {
+        assert_eq!(
+            RemotePolicy::BlockWithReason("x").label(),
+            "block-with-reason"
+        );
+        assert_eq!(RemotePolicy::SelfDisable.label(), "self-disable");
+        assert_eq!(RemotePolicy::Run.label(), "run");
+    }
+
+    /// Every hook row in `docs/hooks.md` carries the remote-policy column value
+    /// the registry declares (#1197).
+    #[test]
+    fn docs_hooks_catalog_states_each_remote_policy() {
+        let doc = include_str!("../docs/hooks.md");
+        for h in HOOKS {
+            let row = doc
+                .lines()
+                .find(|l| l.starts_with(&format!("| `{}` |", h.name)))
+                .unwrap_or_else(|| panic!("no docs row for {}", h.name));
+            let last = row.trim_end_matches('|').rsplit('|').next().unwrap().trim();
+            assert_eq!(last, h.remote.label(), "docs remote cell for {}", h.name);
         }
     }
 
