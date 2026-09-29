@@ -160,6 +160,59 @@ const CASES: &[Case] = &[
         "#652 escaped opener inside double quotes stays literal",
         "echo $(echo \"\\$(\") ; PAYLOAD",
     ),
+    // The shared heredoc model (#813, #1116, #1117, #1094, #1122): each row
+    // is a heredoc body boundary the top-level reader or the substitution
+    // scanner placed where bash does not, which dropped the payload bash runs.
+    Case::executes(
+        "#813 escaped quote before a fake introducer",
+        "echo \"a\\\"b <<EOF\"\nPAYLOAD\nEOF",
+    ),
+    Case::executes(
+        "#1116 escaped quote inside a quoted delimiter",
+        "echo $(cat <<\"E\\\"F\"\nx\nE\"F\n) ; PAYLOAD",
+    ),
+    Case::executes(
+        "#1117 quote open on the introducing line",
+        "echo $(cat <<EOF;echo 'q\nit's\nEOF\n) ; PAYLOAD",
+    ),
+    Case::executes(
+        "#1094 case pattern paren inside a heredoc substitution",
+        "cat <<EOF\n$(case a in a) PAYLOAD;; esac)\nEOF",
+    ),
+    Case::executes(
+        "#1122 continuation destroys the terminator",
+        "cat <<EOF\nx\\\nEOF\n: <<EOG\nEOF\nPAYLOAD\nEOG",
+    ),
+    Case::executes(
+        "#813 indented terminator is body text",
+        "cat <<EOF\n  EOF\n: <<EOG\nEOF\nPAYLOAD\nEOG",
+    ),
+    // A skipped `"$( … )"` span's quoted-delimiter body joins nothing, and
+    // backtick text is joined before its heredoc is read (PR #1136 review).
+    Case::executes(
+        "quoted delimiter in a double-quoted substitution joins nothing",
+        "echo \"$(cat <<'EOF'\nx\\\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "escaped delimiter in a double-quoted substitution joins nothing",
+        "echo \"$(cat <<\\EOF\nx\\\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "a backslash before a CR is no continuation",
+        "echo \"$(cat <<'EOF'\nx\\\r\nEOF\nPAYLOAD\nEOF\n)\"",
+    ),
+    Case::executes(
+        "backtick heredoc ends at a joined terminator",
+        "x=`cat <<\\EOF\nEO\\\nF\nPAYLOAD\nEOF\n`",
+    ),
+    Case::does_not_execute(
+        "backtick heredoc joins through its terminator",
+        "x=`cat <<\\EOF\nx\\\nEOF\nPAYLOAD\nEOF\n`",
+    ),
+    Case::does_not_execute(
+        "#813 terminator with a CR is body text",
+        "cat <<EOF\nEOF\r\nPAYLOAD\nEOF",
+    ),
 ];
 
 struct BashObservation {
