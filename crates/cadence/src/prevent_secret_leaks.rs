@@ -329,9 +329,20 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
     if cmd_word == "forgectl" && tokens.first().is_some_and(|head| head == "forgectl") {
         return forgectl_env_leak(argv);
     }
-    if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref())
-        && !(cmd_word == "git" && git_reads_worktree_file(&argv[1..]))
-    {
+    // `git` keeps its metadata-only exemption only for the subcommands that
+    // earn it ([`git_keeps_exemption`], #850); every other shape falls through
+    // to the full operand scan. Even an exempt `git` segment is refused an
+    // input redirection from a secret file — `git column <.env` and
+    // `git stripspace <.env` print their stdin, and the shell opens that file
+    // whatever the subcommand.
+    if cmd_word == "git" {
+        if git_keeps_exemption(&argv[1..]) {
+            return secret_input_redirections(argv)
+                .into_iter()
+                .map(|value| (cmd_word.to_string(), value.to_string()))
+                .collect();
+        }
+    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -353,6 +364,12 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
         (cmd_word == "jq" && plain_jq_pipeline && tokens.first().is_some_and(|head| head == "jq"))
             .then(|| jq_filter_index(argv))
             .flatten();
+    // `busybox dd`/`toybox dd` run the applet named by their first operand.
+    let dd_like = DD_COMMANDS.contains(&cmd_word.as_ref())
+        || (matches!(cmd_word.as_ref(), "busybox" | "toybox")
+            && argv
+                .get(1)
+                .is_some_and(|applet| command_word(applet) == "dd"));
     argv.iter()
         .enumerate()
         .filter(|(i, _)| Some(*i) != jq_filter)
@@ -363,10 +380,23 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
             // every path-valued assignment (`make ENV=.env`, `export F=.env`),
             // the #771 false-block class. dd reads that operand, so it is a
             // known filename.
-            if cmd_word == "dd"
-                && let Some(input) = t.strip_prefix("if=")
-            {
+            if dd_like && let Some(input) = t.strip_prefix("if=") {
                 return dangerous_secret_operand(input, Filename::Known);
+            }
+            // A non-exempt `git` names files through attached option values
+            // too: `git commit --file=.env` echoes the file's first line as
+            // the commit subject, `git config --file=.env --list` prints it.
+            if cmd_word == "git" {
+                let attached = t
+                    .strip_prefix("--")
+                    .and_then(|long| long.split_once('='))
+                    .map(|(_, value)| value)
+                    .or_else(|| t.strip_prefix("-F").filter(|v| !v.is_empty()));
+                if let Some(value) =
+                    attached.and_then(|v| dangerous_secret_operand(v, Filename::Known))
+                {
+                    return Some(value);
+                }
             }
             dangerous_secret_operand(t, position)
         })
@@ -374,32 +404,153 @@ fn segment_env_reads(segment: &str, plain_jq_pipeline: bool) -> Vec<(String, Str
         .collect()
 }
 
-/// `git` subcommands that print a WORKING-TREE file's bytes whether or not git
-/// tracks it — the reason the blanket `git` entry in
-/// [`METADATA_SAFE_COMMANDS`] is wrong for them (#850). That entry's accepted
-/// residual is committed content (`git show HEAD:.env`), justified by `.env`
-/// being gitignored; these two read the file on disk, so gitignore is no
-/// defense. `git diff` counts whole, not only under `--no-index`: git implies
-/// `--no-index` when a path lies outside the work tree
-/// (`git diff /dev/null .env`), and a tracked `.env`'s diff is its content too.
-const GIT_CONTENT_SUBCOMMANDS: &[&str] = &["diff", "stripspace"];
+/// Heads that take dd's `if=FILE` operand grammar: GNU `dd`, the Homebrew
+/// `gdd` spelling, and the forensic forks `dcfldd` and `dc3dd`.
+const DD_COMMANDS: &[&str] = &["dd", "gdd", "dcfldd", "dc3dd"];
 
-/// Does this `git` argv (the tokens AFTER the verb) print a working-tree file?
+/// `git` subcommands that keep the metadata-only exemption (#850). An
+/// ALLOWLIST, because the denylist it replaced was the wrong structure: the
+/// first cut named `diff` and `stripspace`, and review found `column`,
+/// `interpret-trailers`, `merge-file -p`, `config -f .env --list`,
+/// `grep --untracked`, and alias expansion printing the same file. Git has
+/// too many content-emitting subcommands, plus user aliases, to enumerate.
 ///
-/// Fails CLOSED: a global option [`skip_git_global_options`] cannot classify
-/// leaves a `-`-led token where the subcommand should be, and that loses the
-/// exemption rather than guessing. `--no-index` anywhere is also enough on its
-/// own. Both only ever REMOVE the metadata exemption — the operands are then
-/// scanned like any other command's, so a `git diff` with no secret operand
-/// still allows.
-fn git_reads_worktree_file(args: &[String]) -> bool {
-    if args.iter().any(|t| t == "--no-index") {
-        return true;
+/// Every listed subcommand stages, moves, deletes, or names files, or reports
+/// repository state, without printing a working-tree file's bytes. Losing the
+/// exemption costs nothing unless the segment also carries a secret-file
+/// operand, which is the only thing the fall-through scan can block on.
+const GIT_METADATA_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "rm",
+    "mv",
+    "status",
+    "check-ignore",
+    "check-attr",
+    "ls-files",
+    "ls-tree",
+    "restore",
+    "checkout",
+    "switch",
+    "commit",
+    "stash",
+    "branch",
+    "fetch",
+    "push",
+    "pull",
+    "clone",
+    "init",
+    "merge",
+    "rebase",
+    "reset",
+    "revert",
+    "cherry-pick",
+    "clean",
+    "rev-parse",
+    "rev-list",
+    "remote",
+    "worktree",
+    "tag",
+    "describe",
+    "reflog",
+];
+
+/// `log`/`show`/`diff`/`whatchanged` keep the exemption only in a names-only
+/// form: one of these flags present, and no patch flag.
+const GIT_NAMES_ONLY_FLAGS: &[&str] = &[
+    "--stat",
+    "--name-only",
+    "--name-status",
+    "--numstat",
+    "--shortstat",
+];
+
+/// Long flags that print or imply a patch. The short forms are `-p`, `-U<n>`
+/// (implies `--patch`), `-W`, and `-c` (combined diff), matched anywhere in a
+/// short cluster.
+const GIT_PATCH_LONG_FLAGS: &[&str] = &[
+    "--patch",
+    "--unified",
+    "--word-diff",
+    "--color-words",
+    "--function-context",
+    "--cc",
+    "--combined",
+];
+
+/// Does this `git` argv (the tokens AFTER the verb) keep the metadata-only
+/// exemption? Fails CLOSED at every doubt:
+///
+/// - a global option [`skip_git_global_options`] cannot classify, or no
+///   subcommand at all;
+/// - `-c alias.*=…`, any `-c` value containing `!` (a shell alias), or a
+///   `--config-env` naming an alias — `git -c alias.x='!cat' x .env` runs `cat`;
+/// - a subcommand outside [`GIT_METADATA_SUBCOMMANDS`], or `log`/`show`/
+///   `diff`/`whatchanged` without a [`GIT_NAMES_ONLY_FLAGS`] flag;
+/// - `--no-index` anywhere, a patch flag in any form ([`GIT_PATCH_LONG_FLAGS`];
+///   `git add -p .env` prints hunks of the file), or `-F`/`--file` (a message
+///   read from a file).
+fn git_keeps_exemption(args: &[String]) -> bool {
+    let mut prev: Option<&str> = None;
+    for token in args {
+        let lower = token.to_ascii_lowercase();
+        let aliased = (prev == Some("-c") && (lower.starts_with("alias.") || token.contains('!')))
+            || (lower.starts_with("--config-env") && lower.contains("alias."));
+        if aliased {
+            return false;
+        }
+        prev = Some(token.as_str());
     }
-    match skip_git_global_options(args).first() {
-        Some(sub) => sub.starts_with('-') || GIT_CONTENT_SUBCOMMANDS.contains(&sub.as_str()),
-        None => false,
+    let rest = skip_git_global_options(args);
+    let Some((sub, operands)) = rest.split_first() else {
+        return false;
+    };
+    let names_only = || {
+        operands
+            .iter()
+            .any(|t| GIT_NAMES_ONLY_FLAGS.contains(&t.split('=').next().unwrap_or(t)))
+    };
+    let known = match sub.as_str() {
+        "log" | "show" | "diff" | "whatchanged" => names_only(),
+        s => GIT_METADATA_SUBCOMMANDS.contains(&s),
+    };
+    known
+        && !operands.iter().any(|t| {
+            t == "--no-index"
+                || GIT_PATCH_LONG_FLAGS.iter().any(|flag| t.starts_with(flag))
+                || t.starts_with("--file")
+                || t.starts_with("-F")
+                || (t.starts_with('-') && !t.starts_with("--") && t.contains(['p', 'U', 'W', 'c']))
+        })
+}
+
+/// Every secret file an INPUT redirection in `tokens` opens — `< .env`,
+/// `<.env`, `0<.env`, `<> .env`, `{fd}<.env`. The shell opens these whatever
+/// the command is, so they are judged even where the command is exempt.
+fn secret_input_redirections(tokens: &[String]) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = tokens.iter();
+    while let Some(token) = rest.next() {
+        match redirection_of(token) {
+            Some(true) => {
+                let op = strip_fd_prefix(token);
+                if matches!(op, "<" | "<>")
+                    && let Some(target) = rest.next()
+                    && let Some(value) = dangerous_secret_operand(target, Filename::Known)
+                {
+                    found.push(value);
+                }
+            }
+            Some(false) => {
+                if let Some(target) = attached_input_redirection_target(token)
+                    && let Some(value) = dangerous_secret_operand(target, Filename::Known)
+                {
+                    found.push(value);
+                }
+            }
+            None => {}
+        }
     }
+    found
 }
 
 /// Heads a command may use anywhere and still let the jq filter exemption
@@ -5873,7 +6024,12 @@ mod tests {
                 "git diff -- .env.example",
                 "git add .env",
                 "git status .env",
-                "git log -- .env",
+                "git log --stat -- .env",
+                "git log --name-only -- .env",
+                "git diff --stat -- .env",
+                "git commit -m wip .env",
+                "git mv .env .env.bak",
+                "git -C . add .env",
                 "git check-ignore .env",
                 "git rm --cached .env",
             ],
@@ -6170,6 +6326,61 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn git_outside_the_metadata_allowlist_blocks_on_a_secret() {
+        // #850 review I2: the diff/stripspace denylist left every other
+        // content-emitting subcommand, and aliases, exempt.
+        assert_bash(
+            &[
+                "git column <.env",
+                "git column < .env",
+                "git interpret-trailers .env",
+                "git merge-file -p .env /dev/null /dev/null",
+                "git config -f .env --list",
+                "git grep --untracked KEY -- .env",
+                "git show $(git hash-object -w .env)",
+                "git -c alias.x='!cat' x .env",
+                "git -c alias.x=!cat x .env",
+                "git -c core.pager='!cat' status .env",
+                "git blame .env",
+                "git log -- .env",
+                "git log -p --stat -- .env",
+                "git diff --stat --patch -- .env",
+                "git show --stat -U3 -- .env",
+                "git add -p .env",
+                "git commit -F .env",
+                "git commit --file=.env",
+                "git commit -F.env",
+                "git config --file=.env --list",
+                "git status <.env",
+                "git x .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "only the metadata allowlist keeps git's exemption",
+        );
+    }
+
+    #[test]
+    fn dd_family_heads_peel_if() {
+        // #850 review N1.
+        assert_bash(
+            &[
+                "gdd if=.env",
+                "dcfldd if=.env",
+                "dc3dd if=.env",
+                "busybox dd if=.env",
+                "toybox dd if=.env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "dd-family heads read their if= operand",
+        );
+        assert_bash(
+            &["busybox ls if=.env", "gdd if=/dev/zero of=x count=1"],
+            cadence_hooks_core::Outcome::Allow,
+            "only a dd applet peels if=",
         );
     }
 }
