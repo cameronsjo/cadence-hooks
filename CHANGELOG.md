@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.110.0] - 2026-09-29
+
 ### Changed
 
 - **The registration audit treats eight hooks as wired, and its checked-in fixture follows the monorepo.** `guard-held-close`, `warn-chezmoi-apply`, `warn-entry-posture`, `warn-stacked-base-delete`, `warn-stale-pr-body`, `warn-instruction-narrative`, `warn-plugin-root-cruft` and `warn-inline-body` leave `PENDING_WIRING_HOOKS` now that cameronsjo/cadence#1526 wires them (the #618, #610 and #902 rows stay). `warn-stacked-base-delete` joins `KNOWN_DUPLICATE_REGISTRATIONS`: it is wired as two single-rule `if:` entries (`Bash(*git push*)`, `Bash(*gh pr merge*)`) because `if:` alternation is unsupported. `tests/fixtures/registration-audit/` is refreshed from cadence `origin/main` (06e35d85). (cameronsjo/cadence-hooks#612, #514, #620, #473, #766, #922, #282, #611)
