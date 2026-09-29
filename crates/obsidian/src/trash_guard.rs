@@ -9,7 +9,7 @@
 use cadence_hooks_core::shell::{
     carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
     executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
-    redirect_operator_span, skip_git_global_options, tokenize,
+    redirect_operator_span, redirect_targets, skip_git_global_options, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -162,19 +162,40 @@ impl FileMeta for RealFs {
     }
 
     fn physical(&self, path: &str) -> Option<String> {
-        let mut existing = std::path::PathBuf::from(path);
-        let mut tail = Vec::new();
-        loop {
-            if let Ok(mut resolved) = std::fs::canonicalize(&existing) {
-                resolved.extend(tail.iter().rev());
-                return Some(normalize_path(&resolved.to_string_lossy()));
-            }
-            tail.push(existing.file_name()?.to_owned());
-            if !existing.pop() {
-                return None;
+        let path = std::path::Path::new(path);
+        if let Ok(resolved) = std::fs::canonicalize(path) {
+            return Some(normalize_path(&resolved.to_string_lossy()));
+        }
+        // Find the longest existing prefix by binary search — existence is
+        // monotone along the prefix chain — and resolve it once. A per-step
+        // walk costs a full-path lookup per component, quadratic in depth:
+        // 64 operands 1000 directories deep took 4.6 s that way.
+        let components: Vec<_> = path.components().collect();
+        let prefix = |n: usize| components[..n].iter().collect::<std::path::PathBuf>();
+        let (mut lo, mut hi) = (0, components.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if std::fs::symlink_metadata(prefix(mid)).is_ok() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
         }
+        let mut resolved = canonicalize_or_parent(&prefix(lo))?;
+        resolved.extend(&components[lo..]);
+        Some(normalize_path(&resolved.to_string_lossy()))
     }
+}
+
+/// Canonicalize an existing path; a dangling symlink, which does not, resolves
+/// through its parent and keeps its own name.
+fn canonicalize_or_parent(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let mut parent = std::fs::canonicalize(path.parent()?).ok()?;
+    parent.push(path.file_name()?);
+    Some(parent)
 }
 
 /// Split an absolute path into its root prefix (`"/"` or a Windows drive
@@ -245,6 +266,22 @@ fn resolve_in_vault(target: &str, cwd: &str, vault: &str, vault_prefix: &str) ->
 /// instead of racing the clock.
 const MAX_JUDGED_OPERANDS: usize = 64;
 
+/// Longest operand judged, `PATH_MAX`: the kernel refuses a longer path, and
+/// the physical walk costs a lookup per component, so anything past this is
+/// read as possibly inside the vault.
+const MAX_OPERAND_LEN: usize = 4096;
+
+/// Deepest operand judged. Resolving a path through symlinks (`realpath`)
+/// costs a lookup of every prefix, quadratic in depth, and an existing tree
+/// 1000 directories deep took 0.57 s for 8 operands; anything deeper than this
+/// is read as possibly inside the vault.
+const MAX_OPERAND_DEPTH: usize = 64;
+
+/// Longest command judged operand by operand. A deletion anyone types is far
+/// shorter; past this the cwd verdict (block) stands without a second
+/// segmentation pass over the input.
+const MAX_JUDGED_COMMAND_LEN: usize = 16 * 1024;
+
 /// Most segments a command may carry and still be judged operand by operand,
 /// for the same reason: every `eval`/`find` segment is re-scanned, and a
 /// 200 KB chain of them came within 0.05 s of the hook deadline.
@@ -276,14 +313,17 @@ fn touches_vault(path: &str, vault: &str) -> bool {
 /// expansion, a `..` climb a symlink could redirect, a control character —
 /// reads as inside.
 fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> bool {
-    if !looks_absolute(operand)
+    if operand.len() > MAX_OPERAND_LEN
+        || !looks_absolute(operand)
         || operand.contains(UNRESOLVABLE_OPERAND_CHARS)
         || operand.chars().any(char::is_control)
     {
         return false;
     }
     let path = normalize_path(operand);
-    if path.split('/').any(|segment| segment == "..") {
+    if path.split('/').count() > MAX_OPERAND_DEPTH + 1
+        || path.split('/').any(|segment| segment == "..")
+    {
         return false;
     }
     let lexical = collapse_dots(&path);
@@ -303,6 +343,23 @@ fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> boo
     }
 }
 
+/// Verbs that neither touch the filesystem nor run another command, so a
+/// segment made of one (with no output redirect) cannot change what a
+/// sibling deletion's operand resolves to.
+const INERT_VERBS: &[&str] = &[
+    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[",
+];
+
+/// Is this non-deleting segment one that cannot reshape the filesystem before
+/// a sibling deletion runs? An [`INERT_VERBS`] head with no output redirect.
+/// Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a shell wrapper,
+/// `find`, `eval`, a function call, an unknown command — is not.
+fn is_inert_segment(argv: &[String], segment: &str) -> bool {
+    argv.first()
+        .is_some_and(|first| INERT_VERBS.contains(&command_word(first).as_ref()))
+        && redirect_targets(segment).is_empty()
+}
+
 /// With the shell standing inside the vault, is every deletion the command
 /// makes provably aimed outside it (cadence-hooks#839)? The cwd names where
 /// the shell stands, not what `rm` is handed, so `rm /tmp/scratch.py` issued
@@ -311,14 +368,17 @@ fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> boo
 /// Only a plain deletion verb (`rm`, `unlink`, `shred`, `truncate`) at a
 /// segment head is judged operand by operand. Every other destructive shape
 /// keeps the cwd verdict: `git rm` (pathspecs, `--pathspec-from-file`),
-/// `xargs` (operands arrive on stdin), `find … -delete`/`-exec`, and `eval`. A
-/// shell wrapper's script (`sh -c 'rm …'`) is not an exception: its segments
-/// are part of `command_segments`' view, so its `rm` is judged like any other.
-/// Options are skipped only before the
+/// `xargs` (operands arrive on stdin), and every command that sits beside the
+/// deletion unless it is inert ([`is_inert_segment`]) — so `find`, `eval`, a
+/// shell wrapper, and anything that could re-point an operand (`ln`, `mv`,
+/// `cd`) keep the block. Options are skipped only before the
 /// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
 /// is judged as one. A redirection is skipped only when its operator is
 /// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
 fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) -> bool {
+    if command.len() > MAX_JUDGED_COMMAND_LEN {
+        return false;
+    }
     let segments = command_segments(command);
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
@@ -328,12 +388,11 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
         let argv = peel_command_runners(&tokens);
         if !head_deletes(argv) {
-            // A shell wrapper's script is already in `command_segments`' view
-            // and judged there, so only the two verbs whose deletion
-            // `is_destructive_at` finds INSIDE their own segment need it here —
-            // re-scanning every segment made a 200 KB wrapper chain cost 0.37 s.
-            let verb = argv.first().map(|first| command_word(first));
-            if matches!(verb.as_deref(), Some("eval" | "find")) && is_destructive_at(&segment, 0) {
+            // Every other segment must be provably inert. The physical check
+            // reads the disk at hook time, so a sibling that reshapes it first
+            // — `ln -s <vault> /tmp/l; rm -rf /tmp/l/`, a `mv`, a `cd` — would
+            // walk an operand into the vault after the check passed it.
+            if !is_inert_segment(argv, &segment) {
                 return false;
             }
             continue;
@@ -639,11 +698,30 @@ mod tests {
             ("eval rm /tmp/a", Block),
             ("sh -c 'eval rm /tmp/a'", Block),
             (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
-            // A wrapper's script is judged like the top level.
-            ("sh -c 'rm /tmp/a'", Allow),
+            // A wrapper is not inert, whatever its script says.
+            ("sh -c 'rm /tmp/a'", Block),
             ("sh -c 'rm note.md'", Block),
             ("bash -c 'rm \"$1\"' _ note.md", Block),
             ("bash -c 'cd /tmp && rm a'", Block),
+            // A sibling that could re-point an operand before the deletion
+            // runs keeps the block; only inert siblings pass.
+            ("ln -s /vault /tmp/l; rm -rf /tmp/l/", Block),
+            ("ln -s /vault /tmp/l && rm -rf /tmp/l/note.md", Block),
+            ("mv /vault/note.md /tmp/y; rm /tmp/y", Block),
+            ("cd /tmp && rm -rf x", Block),
+            ("cd /tmp && rm -rf /tmp/x", Block),
+            ("pushd /tmp; rm /tmp/x", Block),
+            ("mkdir -p /tmp/d && rm -r /tmp/d", Block),
+            ("cp -r /vault /tmp/v; rm -r /tmp/v", Block),
+            ("my_func; rm /tmp/x", Block),
+            ("echo $(ln -s /vault /tmp/l); rm -rf /tmp/l/", Block),
+            ("echo x > /tmp/f; rm /tmp/a", Block),
+            ("ls /tmp; rm /tmp/x.txt", Allow),
+            ("echo done && rm /tmp/a", Allow),
+            ("test -e /tmp/a && rm /tmp/a", Allow),
+            ("[ -e /tmp/a ] && rm /tmp/a", Allow),
+            ("cat /tmp/list | rm /tmp/a", Allow),
+            ("pwd; printf 'x'; true; :; rm /tmp/a", Allow),
         ];
         for &(command, expected) in cases {
             let result =
@@ -681,9 +759,36 @@ mod tests {
     }
 
     #[test]
-    fn deletion_from_vault_cwd_past_the_operand_or_segment_cap_keeps_blocking() {
+    fn deletion_from_vault_cwd_past_a_size_cap_keeps_blocking() {
         let at_cap = format!("rm {}", vec!["/tmp/a"; MAX_JUDGED_OPERANDS].join(" "));
         let past_cap = format!("{at_cap} /tmp/a");
+        let long_operand = format!("rm /{}", "a/".repeat(MAX_OPERAND_LEN / 2));
+        assert_eq!(
+            check_destructive_in_vault(&long_operand, "/vault", "/vault", &FakeFs::default())
+                .outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let too_deep = format!("rm /{}x", "a/".repeat(MAX_OPERAND_DEPTH));
+        assert_eq!(
+            check_destructive_in_vault(&too_deep, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+        let at_depth = format!("rm /{}x", "a/".repeat(MAX_OPERAND_DEPTH - 1));
+        assert_eq!(
+            check_destructive_in_vault(&at_depth, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        let at_len = format!("rm /{}", "a".repeat(MAX_OPERAND_LEN - 1));
+        assert_eq!(
+            check_destructive_in_vault(&at_len, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        let too_long = format!("rm {}", vec!["/tmp/abcdefghij"; 1200].join(" "));
+        assert!(too_long.len() > MAX_JUDGED_COMMAND_LEN);
+        assert_eq!(
+            check_destructive_in_vault(&too_long, "/vault", "/vault", &FakeFs::default()).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
         let many_segments = "echo x; ".repeat(MAX_JUDGED_SEGMENTS) + "rm /tmp/a";
         assert_eq!(
             check_destructive_in_vault(&many_segments, "/vault", "/vault", &FakeFs::default())
@@ -737,6 +842,18 @@ mod tests {
                 judge(&format!("rm {outside_s}/link/note.md"), &vault_s),
                 Block
             );
+            // A link the same command creates does not exist at hook time.
+            assert_eq!(
+                judge(
+                    &format!("ln -s {vault_s} {outside_s}/new; rm -rf {outside_s}/new/"),
+                    &vault_s
+                ),
+                Block
+            );
+            // A dangling link resolves through its parent, not to nothing.
+            std::os::unix::fs::symlink(base.join("gone"), outside.join("dangling"))
+                .expect("dangling");
+            assert_eq!(judge(&format!("rm {outside_s}/dangling"), &vault_s), Allow);
             assert_eq!(
                 judge(&format!("rm -r {outside_s}/link/notes"), &vault_s),
                 Block
