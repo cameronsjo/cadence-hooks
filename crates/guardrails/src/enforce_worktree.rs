@@ -1421,12 +1421,24 @@ fn flag_value(argv: &[String], flag: &str) -> Option<String> {
 /// where the shell started — an extra line acknowledges the redirect, so the
 /// block reads as "this command targets repo X" rather than misattributing
 /// the policy to the repo the shell happened to start in (issue #224).
+///
+/// The dismiss it suggests carries `--repo <repo_root>` whenever the judged
+/// repo is not the one the shell starts in (or the shell starts in no repo).
+/// A dismiss is keyed on the repo it runs in, so the bare command, run from
+/// the session cwd, snoozed THAT repo, printed a success line naming it, and
+/// left this block standing (cadence-hooks#758).
 fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
+    let repo_flag = if origin_repo == Some(repo_root) {
+        String::new()
+    } else {
+        format!(" --repo {}", shell_single_quote(repo_root))
+    };
     let mut msg = format!(
         "Blocked: `{repo_root}` is a primary checkout — feature work belongs in a worktree.\n\
          Create one: {WORKTREE_CREATE_RECIPE}, then work there.\n\
-         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m \
-         --reason \"<why>\"` (reason required over 1h; logged in the repo-visible bypass log).\n\
+         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m\
+         {repo_flag} --reason \"<why>\"` (reason required over 1h; logged in the repo-visible \
+         bypass log).\n\
          Main-by-design repo? Set CADENCE_ALLOW_MAIN=true in the target repo's \
          .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1.\n\
          If the change must stay on this checkout's current branch (peer-coordinated work on a \
@@ -1442,6 +1454,21 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
         ));
     }
     msg
+}
+
+/// Quote `s` as one shell word for a command the block message suggests: bare
+/// when it holds only characters no shell treats specially, else single-quoted
+/// with each `'` spelled `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | ',')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 /// Append a hint to a Bash-arm block when the command carried a top-level `cd`
@@ -5620,6 +5647,51 @@ mod tests {
         assert_eq!(
             git_commit_targets(r"git \commit -m x", "/cwd"),
             vec!["/cwd".to_string()]
+        );
+    }
+
+    // --- dismiss scope (#758) ---
+
+    #[test]
+    fn message_dismiss_names_the_judged_repo_when_it_differs() {
+        let msg = block_message("/Users/dev/mono", Some("/Users/dev/meta"));
+        assert!(
+            msg.contains("dismiss-enforce-worktree --for 30m --repo /Users/dev/mono --reason"),
+            "{msg}"
+        );
+        // No session repo to run the dismiss from: name the target too.
+        let msg = block_message("/Users/dev/mono", None);
+        assert!(msg.contains("--repo /Users/dev/mono"), "{msg}");
+        // Same repo: the bare dismiss already lands there.
+        let msg = block_message("/Users/dev/repo", Some("/Users/dev/repo"));
+        assert!(!msg.contains("--repo"), "{msg}");
+        assert!(
+            msg.contains("dismiss-enforce-worktree --for 30m --reason"),
+            "{msg}"
+        );
+        // A path the shell would split or expand is quoted.
+        let msg = block_message("/Users/dev/my repo's", Some("/x"));
+        assert!(msg.contains(r"--repo '/Users/dev/my repo'\''s'"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_block_suggests_a_dismiss_that_clears_it() {
+        let scratch = scratch("dismiss-scope");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let other = scratch.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        init_repo(&other);
+        let p = primary.to_string_lossy().into_owned();
+        let mut input = make_bash(&format!("git -C {p} commit -m x"));
+        input.cwd = Some(other.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        let root = GitProbe::default().repo_root(&primary).unwrap();
+        assert!(
+            msg.contains(&format!("--repo {}", shell_single_quote(&root))),
+            "{msg}"
         );
     }
 }
