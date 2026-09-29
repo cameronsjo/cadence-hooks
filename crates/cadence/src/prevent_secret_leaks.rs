@@ -8850,6 +8850,24 @@ mod tests {
                 // that runs a command is still walked.
                 "false && D=x; echo ${D:-$(cat .env)}",
                 "arr=(a); echo ${arr[$(cat .env)]}",
+                // A tracked assignment that may not hold here: both ways.
+                "C=echo; C=; ${C:-cat} .env",
+                "C=echo; unset C; ${C:-cat} .env",
+                "false && C=echo; ${C:-cat} .env",
+                "C=echo cat foo; ${C:-cat} .env",
+                "C=echo; ${C=cat} .env",
+                "C=echo; ${C-cat} .env",
+                "C=echo; \"${C:-cat}\" .env",
+                "C=echo; ${C:=cat} .env",
+                "C=echo; ${C:-cat} ~/.ssh/id_rsa",
+                "D=; cat ${D:-.env}",
+                "D=x; unset D; cat ${D:-.env}",
+                "true || D=x; cat ${D:-.env}",
+                "local D=x; cat ${D:-.env}",
+                "declare -n D=x; cat ${D:-.env}",
+                "D=$(true); cat ${D:-.env}",
+                "readonly D=x; D=y; cat ${D:-.env}",
+                "D=x; cat ${D:-.env}",
             ],
             cadence_hooks_core::Outcome::Block,
             "the variable resolves to a secret file",
@@ -8857,7 +8875,6 @@ mod tests {
         assert_bash(
             &[
                 "local D=x; cat $D",
-                "D=x; cat ${D:-.env}",
                 "cat ${D:-README.md}",
                 "arr=(.env a); cat ${arr[1]}",
                 "D=.env; echo ${D:?unset}x",

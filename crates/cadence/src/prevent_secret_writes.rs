@@ -1902,9 +1902,18 @@ mod tests {
         for command in blocked {
             assert!(bash_targets_env_file(command), "{command}");
         }
+        // A tracked assignment that may not hold here: judged both ways.
         for command in [
             "D=x; echo x > ${D:-.env}",
+            "D=x; unset D; echo x > ${D:-.env}",
+            "false && D=x; cp a ${D:-.env}",
+            "D=; echo x > ${D:-.env}",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        for command in [
             "arr=(.env a); echo x > ${arr[1]}",
+            "D=x; echo x > ${D:-notes.txt}",
         ] {
             assert!(!bash_targets_env_file(command), "{command}");
         }
