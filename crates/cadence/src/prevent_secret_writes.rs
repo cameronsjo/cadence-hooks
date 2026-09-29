@@ -375,6 +375,97 @@ mod tests {
     }
 
     #[test]
+    fn bash_key_material_writes_blocked() {
+        // #814: the Write tool refuses these paths, so the shell must too.
+        for command in [
+            "rm /home/u/prod.key",
+            "rm prod.key",
+            "echo x > /home/u/prod.key",
+            "echo x > deploy-key.pem",
+            "cp a.txt cert.p12",
+            "truncate -s0 service-account-x.json",
+            "tee release.keystore < /dev/null",
+            "mv new tls_key.pem",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn bash_key_material_neighbours_allowed() {
+        for command in [
+            "rm cert.pem",
+            "echo x > keys.txt",
+            "rm id_rsa.pub",
+            "cp prod.key /tmp/backup/prod.txt.bak",
+            "echo x > service-account.yaml",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn bash_glob_targets_that_could_name_a_secret_blocked() {
+        // #814, #1052: `> .env*` reaches `redirect_targets` as the literal
+        // `.env*`, and the write lands on the real file.
+        for command in [
+            "rm .env*",
+            "echo x > .env*",
+            "echo x > .en?",
+            "rm -f .env.*",
+            "rm .[e]nv",
+            "cp x .e{n,}v",
+            "rm *.key",
+            "rm ~/.ssh/*",
+            "tee ~/.aws/cred* < /dev/null",
+            "truncate -s0 .[!A-Z]nv",
+            "rm *credentials*",
+            "rm id_*",
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        for command in [
+            "rm -rf dist/*",
+            "rm *.md",
+            "echo x > out/*.log",
+            "rm .env*.example",
+            "rm -rf node_modules/.cache/*",
+            "rm *.json",
+            "rm -f certs/*.pem",
+            "cp a.json config/*.json",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn bash_writes_under_a_substituted_directory_blocked() {
+        // #1097 review R1: an unquoted `$D` holding a whole `$(…)` value must
+        // stay one word, or the write target reads as `-d)/.env`.
+        for command in [
+            "D=$(git rev-parse --show-toplevel); rm $D/.env",
+            "D=$(git rev-parse --show-toplevel); echo x > $D/.env",
+            "D=$(git rev-parse --show-toplevel); mv x $D/.env",
+            "D=$(git rev-parse --show-toplevel); truncate -s0 $D/.env",
+            "D=$(realpath .); echo x > $D/.env",
+            "D=$(mktemp -d); echo x > $D/../.env",
+            "D=$(mktemp -d); rm $D/../.env",
+            "D=$(mktemp -d); echo x > $D/.ssh/id_rsa",
+            "D=$(mktemp -d); rm \"$D/.env\"",
+            // #1097 delta review: an escaped backslash before a closing `"`
+            // must not leave the tracker inside double quotes.
+            r#"D=$(git rev-parse --show-toplevel); rm "a\\" $D/.env"#,
+            r#"D=$(git rev-parse --show-toplevel); echo "a\\" > $D/.env"#,
+            r#"D=$(git rev-parse --show-toplevel); rm "a\\\\" "$D/.env""#,
+        ] {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        assert!(!bash_targets_env_file(
+            "D=$(mktemp -d); echo x > $D/out.txt"
+        ));
+    }
+
+    #[test]
     fn bash_env_template_allowed() {
         assert!(!bash_targets_env_file("cat .env.example"));
     }

@@ -5474,7 +5474,58 @@ fn segment_assignment(segment: &str) -> Option<(String, String)> {
     {
         return None;
     }
+    // An unquoted `D=$(mktemp -d /x.XXXX)` tokenizes on the spaces inside the
+    // substitution, so the token's value is the fragment `$(mktemp`, and every
+    // later `$D` became a broken span (cadence-hooks#970).
+    // Only a plain value is re-read; anything else keeps the fragment, as
+    // before, so no other value's expansion changes.
+    if value.contains("$(")
+        && value.matches('(').count() > value.matches(')').count()
+        && let Some(whole) = unquoted_substitution_value(segment, idx, name)
+    {
+        return Some((name.to_string(), whole));
+    }
     Some((name.to_string(), value.to_string()))
+}
+
+/// The whole value of an unquoted `NAME=$(…)` word in `segment` — the text the
+/// shell substitutes for a later `$NAME` — or `None` when it cannot be read
+/// with confidence, in which case the caller keeps the token's fragment.
+///
+/// Confident means plain: outside the substitution no quote, backslash, or
+/// backtick; inside it none of those and no `(` or `)` but the closing one. A
+/// value outside that shape, `D=$(mktemp -d "$T/x")` say, is unchanged by
+/// cadence-hooks#970. `export_idx` is 1 when the word follows `export`.
+fn unquoted_substitution_value(segment: &str, export_idx: usize, name: &str) -> Option<String> {
+    let mut rest = segment.trim_start();
+    if export_idx == 1 {
+        rest = rest.strip_prefix("export")?.trim_start();
+    }
+    let value = rest.strip_prefix(name)?.strip_prefix('=')?;
+    let mut depth = 0usize;
+    let mut end = value.len();
+    let mut chars = value.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' | '\\' | '`' => return None,
+            '$' if chars.peek().map(|&(_, n)| n) == Some('(') => {
+                if depth > 0 {
+                    return None;
+                }
+                chars.next();
+                depth = 1;
+            }
+            '(' => return None,
+            ')' if depth == 1 => depth = 0,
+            ')' => return None,
+            c if c.is_whitespace() && depth == 0 => {
+                end = at;
+                break;
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| value[..end].to_string())
 }
 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
@@ -5488,9 +5539,25 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
     let mut out = String::with_capacity(segment.len());
     let mut i = 0;
     let mut in_single = false;
+    let mut in_double = false;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\'' {
+        // Outside single quotes a backslash consumes the next character, so an
+        // escaped `"` opens and closes nothing, `\\"` still closes a string,
+        // and `\$D` stays unexpanded, as in bash.
+        if c == '\\' && !in_single {
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            i += 2;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+        }
+        // An apostrophe inside `"…"` is a literal, not a single quote.
+        if c == '\'' && !in_double {
             in_single = !in_single;
             out.push(c);
             i += 1;
@@ -5512,7 +5579,18 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
             if !name.is_empty()
                 && let Some((_, value)) = assignments.iter().rev().find(|(n, _)| *n == name)
             {
-                out.push_str(value);
+                // A whole `$(…)` value carrying whitespace (#970) is one word
+                // only inside `"…"`. Unquoted, the tokenizers downstream would
+                // split it at its spaces and a `$D/.env` write target would
+                // read as `-d)/.env`, hiding it from the writes guard, so it
+                // goes in quoted: the word boundaries stay where bash's are.
+                if !in_double && value.starts_with("$(") && value.chars().any(char::is_whitespace) {
+                    out.push('"');
+                    out.push_str(value);
+                    out.push('"');
+                } else {
+                    out.push_str(value);
+                }
                 i = j;
                 continue;
             }
@@ -10809,6 +10887,34 @@ mod tests {
         // Append-ordered lookup must find the replacement, not the original.
         let out = command_segments("F=first; F=second; cat $F");
         assert!(out.contains(&"cat second".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_expands_an_unquoted_substitution_value_whole() {
+        // #970: the value is `$(mktemp -d /x.XXXX)`, not the token `$(mktemp`.
+        for (command, expected) in [
+            (
+                "D=$(mktemp -d /x.XXXX); touch \"$D/.env\"",
+                "touch \"$(mktemp -d /x.XXXX)/.env\"",
+            ),
+            // Unquoted, the value goes in quoted so it stays one word.
+            ("export D=$(mktemp -d); ls $D/a", "ls \"$(mktemp -d)\"/a"),
+            // An apostrophe inside `"…"` does not open a single quote.
+            ("D=/x; echo \"it's $D\"", "echo \"it's /x\""),
+            ("D=$(pwd)x; cat $D", "cat $(pwd)x"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
+        // Not plain enough to read with confidence: the token's fragment, as
+        // before.
+        for (command, expected) in [
+            ("D=$(mktemp -d \"$T/x\"); touch $D/a", "touch $(mktemp/a"),
+            ("D=$(echo $(pwd) x); touch $D/a", "touch $(echo/a"),
+        ] {
+            let out = command_segments(command);
+            assert!(out.contains(&expected.to_string()), "{command}: {out:?}");
+        }
     }
 
     #[test]
