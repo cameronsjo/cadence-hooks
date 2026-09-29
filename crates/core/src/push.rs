@@ -135,6 +135,20 @@ pub struct PushInvocation {
     /// rather than blocking. Implies [`PushInvocation::unresolved`]
     /// (cadence-hooks#1095 ruling).
     pub directory_unverified: bool,
+    /// URLs a `-c remote.<name>.url=…`/`remote.<name>.pushurl=…` global hands
+    /// this push, as written. Real git sends the push there instead of the
+    /// URL the repository's own config names (measured), so an ownership
+    /// guard must judge each of these too — every one, whichever remote it
+    /// names, which is stricter than git and costs only a nonsense command
+    /// (cadence-hooks#1131).
+    pub config_destinations: Vec<String>,
+    /// A `-c`/`--config-env` global rewrites where this push goes in a way the
+    /// command text cannot show: a `url.<base>.insteadOf`/`pushInsteadOf`
+    /// rewrite, an `include.path`/`includeIf.<cond>.path` that can load either
+    /// key from a file, a `--config-env` URL key whose value lives in the
+    /// environment, or a URL value carrying `$` or a backtick. An ownership
+    /// guard must refuse it (cadence-hooks#1131).
+    pub destination_unreadable: bool,
     /// The repository argument as written — git's first positional, else a
     /// `--repo` value ([`crate::shell::push_repository_argument`]). `None` for
     /// a bare `git push`, where git uses the tracking remote. A remote name or
@@ -462,6 +476,8 @@ fn collect_push_invocations(
                 unresolved: true,
                 repository_unresolved: true,
                 directory_unverified: segment_directory,
+                config_destinations: Vec::new(),
+                destination_unreadable: false,
                 repository: None,
             });
         }
@@ -1342,6 +1358,10 @@ struct GitGlobals<'a> {
     /// A `-c`/`--config-env` global carried a key that replaces the bare-push
     /// ref computation (`push.default`, or a `remote.<name>.push` refspec).
     push_config_override: bool,
+    /// See [`PushInvocation::config_destinations`].
+    config_destinations: Vec<String>,
+    /// See [`PushInvocation::destination_unreadable`].
+    destination_unreadable: bool,
     /// The words from git's subcommand onward.
     rest: &'a [String],
 }
@@ -1373,6 +1393,14 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
     let mut foreign_redirect = false;
     let mut unreadable_dir = false;
     let mut push_config_override = false;
+    let mut config_destinations = Vec::new();
+    let mut destination_unreadable = false;
+    let mut note_redirect =
+        |setting: &str, from_env: bool| match config_push_redirect(setting, from_env) {
+            ConfigRedirect::None => {}
+            ConfigRedirect::Url(url) => config_destinations.push(url),
+            ConfigRedirect::Unreadable => destination_unreadable = true,
+        };
     let mut idx = 0;
 
     while idx < argv.len() {
@@ -1420,12 +1448,11 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
                     }
                 }
                 "--work-tree" | "--git-dir" => foreign_redirect = true,
-                "-c" | "--config-env"
-                    if argv
-                        .get(idx + 1)
-                        .is_some_and(|value| sets_push_ref_computation(value)) =>
-                {
-                    push_config_override = true;
+                "-c" | "--config-env" => {
+                    if let Some(value) = argv.get(idx + 1) {
+                        push_config_override |= sets_push_ref_computation(value);
+                        note_redirect(value, word == "--config-env");
+                    }
                 }
                 _ => {}
             }
@@ -1436,10 +1463,9 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
         if word.starts_with("--work-tree=") || word.starts_with("--git-dir=") {
             foreign_redirect = true;
         }
-        if let Some(setting) = word.strip_prefix("--config-env=")
-            && sets_push_ref_computation(setting)
-        {
-            push_config_override = true;
+        if let Some(setting) = word.strip_prefix("--config-env=") {
+            push_config_override |= sets_push_ref_computation(setting);
+            note_redirect(setting, true);
         }
         idx += 1;
     }
@@ -1452,7 +1478,63 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str, known_ok: bool) -> G
         foreign_redirect,
         unreadable_dir,
         push_config_override,
+        config_destinations,
+        destination_unreadable,
         rest: &argv[idx..],
+    }
+}
+
+/// What one `-c`/`--config-env` setting does to where a push goes.
+enum ConfigRedirect {
+    /// Nothing: the key does not decide the destination.
+    None,
+    /// `remote.<name>.url`/`.pushurl` with a literal value: the push may go
+    /// there.
+    Url(String),
+    /// The key decides the destination, but the text cannot show where.
+    Unreadable,
+}
+
+/// Does this `-c`/`--config-env` setting redirect a push (cadence-hooks#1131)?
+///
+/// Real git sends `git -c remote.origin.pushurl=<url> push origin main` and
+/// `git -c url.<base>.insteadOf=<prefix> push origin main` to the `-c` URL,
+/// while the guard's `git remote get-url --push` probe runs without the `-c`
+/// and answers with the configured one.
+///
+/// Section and variable names are case-insensitive to git, so they are
+/// compared folded, after the same unescape [`sets_push_ref_computation`]
+/// applies. A `--config-env` value names an environment variable, so a URL
+/// key arriving that way is never readable. `insteadOf` rewrites are refused
+/// rather than applied: the result depends on the configured URL and git's
+/// longest-prefix rule, and applying them here would mean re-implementing
+/// that to decide a safety question. `include.path` and
+/// `includeIf.<cond>.path` load a file that can hold any of these keys.
+fn config_push_redirect(setting: &str, from_env: bool) -> ConfigRedirect {
+    let setting = unescape_word(setting);
+    let (key, value) = match setting.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (setting.as_ref(), None),
+    };
+    let key = key.to_ascii_lowercase();
+    let names = |section: &str, variables: &[&str]| {
+        key.strip_prefix(section)
+            .is_some_and(|rest| variables.iter().any(|variable| rest.ends_with(variable)))
+    };
+    if key == "include.path"
+        || names("includeif.", &[".path"])
+        || names("url.", &[".insteadof", ".pushinsteadof"])
+    {
+        return ConfigRedirect::Unreadable;
+    }
+    if !names("remote.", &[".url", ".pushurl"]) {
+        return ConfigRedirect::None;
+    }
+    match value {
+        Some(url) if !from_env && !url.is_empty() && !url.contains(['$', '`']) => {
+            ConfigRedirect::Url(url.to_string())
+        }
+        _ => ConfigRedirect::Unreadable,
     }
 }
 
@@ -1570,6 +1652,8 @@ fn push_invocation_of(
             || (implicit && globals.push_config_override),
         repository_unresolved: globals.foreign_redirect,
         directory_unverified: globals.unreadable_dir,
+        config_destinations: globals.config_destinations,
+        destination_unreadable: globals.destination_unreadable,
         repository: {
             let named = crate::shell::push_repository_argument(words);
             named.positional.or(named.repo_flag)
@@ -2149,6 +2233,84 @@ mod tests {
         assert!(!only("git -c color.ui=never push origin", "/repo").unresolved);
         // `remote.<name>.pushurl` changes the destination, not the ref set.
         assert!(!only("git -c remote.origin.pushurl=/x push origin", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_command_line_url_override_is_reported_by_where_it_sends_the_push() {
+        // cadence-hooks#1131: git sends the push to a `-c` URL, which the
+        // repository probe cannot see.
+        for (command, destinations, unreadable) in [
+            (
+                "git -c remote.origin.pushurl=https://e.example/x push origin main",
+                vec!["https://e.example/x"],
+                false,
+            ),
+            (
+                "git -c Remote.origin.URL=/srv/x.git push origin main",
+                vec!["/srv/x.git"],
+                false,
+            ),
+            (
+                "git -c remote.a.url=u1 -c remote.a.pushurl=u2 push a main",
+                vec!["u1", "u2"],
+                false,
+            ),
+            (
+                "git -c url.https://e.example/.insteadOf=https://github.com/ push origin main",
+                vec![],
+                true,
+            ),
+            (
+                "git -c url.https://e.example/.PushInsteadOf=x push origin main",
+                vec![],
+                true,
+            ),
+            ("git -c include.path=/x push origin main", vec![], true),
+            (
+                "git -c includeIf.gitdir:/x.path=/y push origin main",
+                vec![],
+                true,
+            ),
+            (
+                "git --config-env=remote.origin.url=V push origin main",
+                vec![],
+                true,
+            ),
+            (
+                "git --config-env remote.origin.pushurl=V push origin main",
+                vec![],
+                true,
+            ),
+            (
+                "git -c remote.origin.pushurl=$U push origin main",
+                vec![],
+                true,
+            ),
+            (
+                "git -c remote.origin.pushurl push origin main",
+                vec![],
+                true,
+            ),
+            // Controls: keys that do not decide the destination.
+            ("git -c color.ui=false push origin main", vec![], false),
+            (
+                "git -c remote.origin.push=refs/x push origin main",
+                vec![],
+                false,
+            ),
+            (
+                "git -c remote.origin.urlx=y push origin main",
+                vec![],
+                false,
+            ),
+            // An empty subsection still names the variable: judged, not skipped.
+            ("git -c url..insteadof=y push origin main", vec![], true),
+            ("git push origin main", vec![], false),
+        ] {
+            let push = only(command, "/repo");
+            assert_eq!(push.config_destinations, destinations, "{command}");
+            assert_eq!(push.destination_unreadable, unreadable, "{command}");
+        }
     }
 
     #[test]
