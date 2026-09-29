@@ -178,10 +178,9 @@ use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, MarkedToken, basename, child_scripts, command_word, dollar_is_quote_sigil,
     expand_leading_home, heredoc_introducers, installs_trap_action, is_assignment_word,
     is_transparent_prefix_word, looks_absolute, redirect_operator_span, redirect_targets,
-    strip_verbatim_prefix,
     resolve_cd_target, skip_env_assignment_operands, skip_runner_flags, skip_transparent_prefixes,
     split_segments_with_ops, split_segments_with_ops_joining_redirects, strip_compound_heads,
-    strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    strip_heredoc_bodies, strip_verbatim_prefix, tokenize, tokenize_marked, unescape_word,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -8509,8 +8508,16 @@ mod tests {
                 let verbatim = format!(r"\\?\{drive}:\{}", body.replace('/', "\\"));
                 let plain = format!("{drive}:/{body}");
                 assert!(is_shell_absolute(&verbatim), "{verbatim:?}");
-                assert_eq!(lexical_normalize(&verbatim), lexical_normalize(&plain), "{verbatim:?}");
-                assert_eq!(normalize_target(&verbatim), normalize_target(&plain), "{verbatim:?}");
+                assert_eq!(
+                    lexical_normalize(&verbatim),
+                    lexical_normalize(&plain),
+                    "{verbatim:?}"
+                );
+                assert_eq!(
+                    normalize_target(&verbatim),
+                    normalize_target(&plain),
+                    "{verbatim:?}"
+                );
                 assert_eq!(
                     is_linked_worktree_admin_dir(&verbatim),
                     is_linked_worktree_admin_dir(&plain),
@@ -8579,12 +8586,23 @@ mod tests {
             (r"\\?\C:\repo\.git\worktrees\..", r"C:/repo/.git"),
             (r"\\?\C:\Repo\a\..\b", r"c:\repo\b"),
             (r"\\?\UNC\server\share\repo", "//server/share/repo"),
-            (r"\\?\UNC\server\share\repo\.git\worktrees\x", "//server/share/repo/.git/worktrees/x"),
+            (
+                r"\\?\UNC\server\share\repo\.git\worktrees\x",
+                "//server/share/repo/.git/worktrees/x",
+            ),
         ] {
             let context = format!("{verbatim:?} vs {plain:?}");
             assert!(is_shell_absolute(verbatim), "{context}");
-            assert_eq!(lexical_normalize(verbatim), lexical_normalize(plain), "{context}");
-            assert_eq!(normalize_target(verbatim), normalize_target(plain), "{context}");
+            assert_eq!(
+                lexical_normalize(verbatim),
+                lexical_normalize(plain),
+                "{context}"
+            );
+            assert_eq!(
+                normalize_target(verbatim),
+                normalize_target(plain),
+                "{context}"
+            );
             assert_eq!(
                 is_linked_worktree_admin_dir(verbatim),
                 is_linked_worktree_admin_dir(plain),
@@ -8595,8 +8613,12 @@ mod tests {
         }
         assert_eq!(lexical_normalize(r"\\?\C:\repo"), "c:/repo");
         assert_eq!(lexical_normalize(r"\\?\UNC\srv\share\r"), "/srv/share/r");
-        assert!(is_linked_worktree_admin_dir(r"\\?\C:\repo\.git\worktrees\x"));
-        assert!(!is_linked_worktree_admin_dir(r"\\?\C:\repo\.git\worktrees\.."));
+        assert!(is_linked_worktree_admin_dir(
+            r"\\?\C:\repo\.git\worktrees\x"
+        ));
+        assert!(!is_linked_worktree_admin_dir(
+            r"\\?\C:\repo\.git\worktrees\.."
+        ));
         assert_eq!(
             git_commit_targets(r"git -C '\\?\C:\repo' commit -m x", "/cwd"),
             vec!["c:/repo".to_string(), "/cwd".to_string()]

@@ -16,8 +16,8 @@ use cadence_hooks_core::shell::{
     strip_quotes, tokenize,
 };
 use cadence_hooks_core::shell::{
-    UNRESOLVABLE_DIR, apply_cd_target, skip_env_assignment_operands, skip_runner_flags,
-    skip_transparent_prefixes, unescape_word,
+    UNRESOLVABLE_DIR, apply_cd_target, executable_tokens, skip_env_assignment_operands,
+    skip_runner_flags, skip_transparent_prefixes, unescape_word, wrapped_scripts,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -3675,6 +3675,12 @@ fn runner_chdir_target(dir: &str, target: &str) -> String {
 /// [`UNRESOLVABLE_DIR`] and blocks, the same refusal
 /// `push.rs`'s `hides_a_push_behind_a_prefix` makes for a push.
 fn dir_after_runners(segment: &str, dir: &str) -> String {
+    peel_runners(segment, dir).0
+}
+
+/// [`dir_after_runners`]'s directory, and the words left once the runners in
+/// front are peeled (the runner itself when the peel gave up).
+fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
     let tokens = tokenize(segment);
     let mut argv: Vec<String> = skip_transparent_prefixes(&tokens).to_vec();
     let mut dir = dir.to_string();
@@ -3695,7 +3701,7 @@ fn dir_after_runners(segment: &str, dir: &str) -> String {
             dir = runner_chdir_target(&dir, &target);
         }
         let Some(rest) = skip_runner_flags(&runner, &operands) else {
-            return UNRESOLVABLE_DIR.to_string();
+            return (UNRESOLVABLE_DIR.to_string(), argv);
         };
         let rest = if runner == "env" {
             skip_env_assignment_operands(rest)
@@ -3709,9 +3715,9 @@ fn dir_after_runners(segment: &str, dir: &str) -> String {
         .is_some_and(|w| COMMAND_RUNNERS.contains(&command_word(w).as_ref()))
     {
         // Out of hops with a runner still in front.
-        return UNRESOLVABLE_DIR.to_string();
+        return (UNRESOLVABLE_DIR.to_string(), argv);
     }
-    dir
+    (dir, argv)
 }
 
 /// Judge every write among `segments`, each in the directory paired with it,
@@ -3742,6 +3748,39 @@ fn judge_write_segments(
     let mut word_variables = CommandWordVariables::for_command(command);
     for (segment, dir) in segments {
         let segment = word_variables.resolve_gh(&segment).unwrap_or(segment);
+        // A runner that changes directory and wraps a shell runs the script
+        // there (`env -C DIR sh -c '…'`), while the script's own segments
+        // arrive below in the directory the runner itself was in
+        // (cadence-hooks#1141). Judge the script's segments in the runner's
+        // directory as well; this only ever adds a verdict, so the reading
+        // in the original directory still stands.
+        let (moved, peeled) = peel_runners(&segment, &dir);
+        if moved != *dir {
+            let mut scripts = wrapped_scripts(&peeled);
+            for script in wrapped_scripts(&executable_tokens(&segment)) {
+                if !scripts.contains(&script) {
+                    scripts.push(script);
+                }
+            }
+            let moved: std::rc::Rc<str> = std::rc::Rc::from(moved.as_str());
+            for body in scripts {
+                let inner: Reading = command_segments(&body)
+                    .into_iter()
+                    .map(|inner| (inner, moved.clone()))
+                    .collect();
+                if let Some(block) = judge_write_segments(
+                    &body,
+                    inner,
+                    whole_dir,
+                    allowed_owners,
+                    allowed_repos,
+                    extra_hosts,
+                    judged,
+                ) {
+                    return Some(block);
+                }
+            }
+        }
         // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
         // it decides which host every later gh write reaches (#548). A gh
         // segment is a child process and cannot change it.
@@ -9289,6 +9328,52 @@ mod tests {
                     "{UB}",
                     unowned.path().file_name().unwrap().to_str().unwrap(),
                 );
+                let result = GhWriteGuard.run(&input_with(&command, o));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A runner that changes directory AND wraps a shell runs the script's
+    /// writes there (cadence-hooks#1141). The script's own segments used to
+    /// keep the top-level directory, so from an owned checkout an unowned
+    /// `-C`/`-D` directory was never judged. Verified against a real
+    /// `env -C` / `sudo -D` canary that the inner command runs in DIR.
+    #[test]
+    fn gh_write_follows_a_runner_directory_change_into_a_wrapped_shell() {
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                ("sudo -D {U} sh -c 'gh pr create -t x'", true),
+                ("sudo --chdir={U} bash -c 'gh pr create -t x'", true),
+                ("env -C {U} bash -c 'echo hi; gh pr create -t x'", true),
+                ("env --chdir {U} sh -c \"gh pr create -t x\"", true),
+                ("env -C {U} sh -c 'sh -c \"gh pr create -t x\"'", true),
+                ("env -C {U} FOO=1 sh -c 'gh pr create -t x'", true),
+                ("nice env -C {U} sh -c 'gh pr create -t x'", true),
+                ("env -C \"$D\" sh -c 'gh pr create -t x'", true),
+                (
+                    "env -C {U} sh -c 'gh pr create -R cameronsjo/x -t x'",
+                    false,
+                ),
+                // Controls: an owned directory, or nothing moves.
+                ("env -C {O} sh -c 'gh pr create -t x'", false),
+                ("sudo -D {O} bash -c 'gh pr create -t x'", false),
+                ("env -C {U} env -C {O} sh -c 'gh pr create -t x'", false),
+                ("sh -c 'gh pr create -t x'", false),
+                ("env FOO=1 sh -c 'gh pr create -t x'", false),
+                ("env -C {U} sh -c 'gh pr view 1'", false),
+                ("env -C {U} sh -c 'echo hi'", false),
+            ] {
+                let command = command.replace("{O}", o).replace("{U}", u);
                 let result = GhWriteGuard.run(&input_with(&command, o));
                 assert_eq!(
                     matches!(result.outcome, cadence_hooks_core::Outcome::Block),

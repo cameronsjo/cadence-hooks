@@ -11421,7 +11421,7 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
-fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
+pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
