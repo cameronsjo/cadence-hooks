@@ -6908,7 +6908,7 @@ struct HeredocLex {
     backticks: bool,
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
     /// be bounded, stop trying, so an opener flood stays linear.
-    exhausted: bool,
+    exhausted: SpanLatch,
 }
 
 /// A heredoc operator [`scan_command_line`] found, by char index.
@@ -6981,14 +6981,15 @@ fn scan_command_line(
                 j += 2;
                 continue;
             }
-            if !lex.exhausted && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'('))) {
+            if !lex.exhausted.tripped && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'(')))
+            {
                 let bound = quoted_substitution_bound(chars, j);
                 if let SubstBound::Bounded(end) = bound {
                     skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
                     j = end;
                     continue;
                 }
-                lex.exhausted = bound.latches();
+                lex.exhausted.note(bound);
             }
         }
         // `\` before a CRLF continues the line the way [`take_logical_line`]
@@ -7185,7 +7186,7 @@ fn split_segments_impl(
     // of the pass keeps the old character-by-character reading instead of
     // paying O(n) per opener — a flood of them was quadratic, seconds long,
     // and a hook timeout fails open.
-    let mut scan_exhausted = false;
+    let mut scan_exhausted = SpanLatch::default();
 
     while let Some(c) = chars.next() {
         // A substitution inside `"…"` is copied whole: its own quoting belongs
@@ -7204,7 +7205,7 @@ fn split_segments_impl(
             continue;
         }
         if quote == Some(Quote::Double)
-            && !scan_exhausted
+            && !scan_exhausted.tripped
             && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
         {
             let i = all.len() - chars.len() - 1;
@@ -7216,7 +7217,7 @@ fn split_segments_impl(
                     }
                     continue;
                 }
-                other => scan_exhausted = other.latches(),
+                other => scan_exhausted.note(other),
             }
         }
         if let Some(q) = quote {
@@ -7438,7 +7439,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     let mut table: Option<(Vec<char>, Vec<usize>)> = None;
     // Same latch as [`split_segments_with_ops`]: after one unboundable scan,
     // stop scanning so an opener flood stays linear.
-    let mut scan_exhausted = false;
+    let mut scan_exhausted = SpanLatch::default();
 
     while let Some((i, c)) = chars.next() {
         // A substitution inside `"…"` is skipped whole, the same way
@@ -7453,7 +7454,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 chars.next();
                 continue;
             }
-            if !scan_exhausted
+            if !scan_exhausted.tripped
                 && (c == '`' || (c == '$' && chars.peek().map(|&(_, n)| n) == Some('(')))
             {
                 let (all, byte_of) = table.get_or_insert_with(|| {
@@ -7475,7 +7476,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     boundary = false;
                     continue;
                 }
-                scan_exhausted = bound.latches();
+                scan_exhausted.note(bound);
             }
         }
         if let Some(q) = quote {
@@ -9271,11 +9272,34 @@ enum SubstBound {
     Unbounded,
 }
 
-impl SubstBound {
-    /// Whether a caller's latch should trip: the failure cost a scan to the
-    /// end of the input.
-    fn latches(self) -> bool {
-        self == Self::Unbounded
+/// The most too-deep failures one pass retries before it latches anyway. A
+/// too-deep scan reads only the cap's worth of nested openers, but an
+/// unclosed flood (`"$("` × 60 000) fails at every opener, ~17 levels each —
+/// 0.3-0.6 s at 200 KB, in a hook whose deadline fails open. Past the cap the
+/// pass reads the rest character by character, as it always did.
+const MAX_TOO_DEEP_RETRIES: usize = 4096;
+
+/// Whether a pass has stopped asking [`quoted_substitution_bound`].
+#[derive(Default)]
+struct SpanLatch {
+    tripped: bool,
+    too_deep: usize,
+}
+
+impl SpanLatch {
+    /// Record a span that could not be bounded. An [`SubstBound::Unbounded`]
+    /// scan ran to the end of the input, so every later one would too: trip.
+    /// A [`SubstBound::TooDeep`] one is local to its span: retry the next
+    /// span, up to [`MAX_TOO_DEEP_RETRIES`].
+    fn note(&mut self, bound: SubstBound) {
+        match bound {
+            SubstBound::Bounded(_) => {}
+            SubstBound::Unbounded => self.tripped = true,
+            SubstBound::TooDeep => {
+                self.too_deep += 1;
+                self.tripped |= self.too_deep > MAX_TOO_DEEP_RETRIES;
+            }
+        }
     }
 }
 
@@ -16479,6 +16503,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn too_deep_retries_are_capped_so_an_unclosed_opener_flood_stays_fast() {
+        // The no-latch rule for too-deep spans retries every opener of an
+        // unclosed `"$(` flood, ~17 levels each; the retry cap bounds that.
+        let flood = "\"$(".repeat(200 * 1024 / 3);
+        let cmd = format!("{flood} ; cat .env");
+        let started = std::time::Instant::now();
+        let segs = split_segments(&cmd);
+        let took = started.elapsed();
+        assert!(!segs.is_empty());
+        // Debug builds get headroom; release is the hook's real budget.
+        let limit =
+            std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
+        assert!(took < limit, "{took:?}");
     }
 
     #[test]
