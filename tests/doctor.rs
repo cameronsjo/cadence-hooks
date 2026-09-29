@@ -1212,3 +1212,108 @@ fn doctor_still_flags_missing_cache_dir_for_non_directory_source() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── doctor --prune gate window (#902) ───────────────────────────────────────
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+const DAY: u64 = 86_400;
+
+fn set_mtime(path: &std::path::Path, epoch: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch))
+        .unwrap();
+}
+
+/// Create `<parent>/<sha>` as an orphan, stamped `.orphaned_at` at `at`
+/// (contents and mtime) unless `at` is `None`.
+fn orphan(parent: &std::path::Path, sha: &str, at: Option<u64>) -> std::path::PathBuf {
+    let dir = parent.join(sha);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload"), "x").unwrap();
+    if let Some(at) = at {
+        let marker = dir.join(".orphaned_at");
+        std::fs::write(&marker, at.to_string()).unwrap();
+        set_mtime(&marker, at);
+    }
+    dir
+}
+
+/// A Claude config dir with a pinned install and two stamped orphans: one
+/// orphaned three days ago, one a day ago. Returns (home, config, metrics,
+/// pinned, three_days, one_day).
+fn live_prune_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let metrics = home.path().join("metrics");
+    std::fs::create_dir_all(&metrics).unwrap();
+    let plugins = config.join("plugins");
+    let parent = plugins.join("cache/workbench/my-plugin");
+    let pinned = orphan(&parent, "pinned-sha", None);
+    write_installed_plugins_manifest(&plugins, "my-plugin@workbench", &pinned);
+    let now = now_epoch();
+    let three_days = orphan(&parent, "three-days-sha", Some(now - 3 * DAY));
+    let one_day = orphan(&parent, "one-day-sha", Some(now - DAY));
+    (home, config, metrics, pinned, three_days, one_day)
+}
+
+/// Write a live-session record into the cross-checkout mirror.
+fn seed_live_session(config: &std::path::Path, id: &str, started: u64, verified: bool, mtime: u64) {
+    let dir = config.join("cadence/live-sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{id}.json"));
+    let rec = serde_json::json!({
+        "name": &id[..8],
+        "session_id": id,
+        "started_epoch": started,
+        "start_verified": verified,
+    });
+    std::fs::write(&path, rec.to_string()).unwrap();
+    set_mtime(&path, mtime);
+}
+
+fn live_prune(
+    home: &std::path::Path,
+    config: &std::path::Path,
+    metrics: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Command {
+    let mut cmd = doctor_in_config_dir(home, config, metrics);
+    cmd.args(["--prune", "--apply"])
+        .args(extra)
+        .current_dir(home)
+        .env_remove("CADENCE_DOCTOR_PRUNE_FORCE")
+        .env_remove("CADENCE_SESSION_STALE_MINUTES");
+    cmd
+}
+
+/// cameronsjo/cadence-hooks#902: peers refresh their records on the default
+/// cadence, so a doctor run with a shorter `CADENCE_SESSION_STALE_MINUTES`
+/// read a working peer 12 minutes into its beat interval as stale and pruned.
+#[test]
+fn doctor_prune_apply_refuses_a_peer_between_beats_under_a_short_stale_override() {
+    let (home, config, metrics, pinned, three_days, one_day) = live_prune_fixture();
+    let now = now_epoch();
+    seed_live_session(&config, "busypeer-0000", now - 2 * DAY, true, now - 12 * 60);
+
+    let out = live_prune(home.path(), &config, &metrics, &[])
+        .env("CADENCE_SESSION_STALE_MINUTES", "5")
+        .output()
+        .expect("failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to prune"), "{stderr}");
+    assert!(three_days.exists() && one_day.exists() && pinned.exists());
+}

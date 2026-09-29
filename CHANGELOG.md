@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `doctor --prune --apply` gate no longer reads a working session as stale under a short `CADENCE_SESSION_STALE_MINUTES`.** A working session with no override refreshes its record every ten minutes, a third of the default window, whatever the reader's setting. A doctor run with the variable set to 5 read a peer between beats as stale and pruned under it. The gate now reads sessions on the longer of the variable and the default. The gaps 0.106.0 named remain, and closing them is an operator call: a session idle at the prompt for 30 minutes has its record swept by peers, and a session outside any git repo never registers. Close sessions before an unbounded `--prune --apply`. (cameronsjo/cadence-hooks#902)
+
 ## [0.108.0] - 2026-09-28
 
 ### Changed

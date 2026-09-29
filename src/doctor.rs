@@ -2774,6 +2774,21 @@ fn prune_liveness_gate(
     PruneGate::Blocked(names)
 }
 
+/// The staleness window the prune gate reads sessions on: the LONGER of this
+/// process's `CADENCE_SESSION_STALE_MINUTES` and the default.
+///
+/// Sessions refresh their records on the default cadence whatever the reader's
+/// override (`heartbeat::beat_interval_secs` caps the beat at a third of the
+/// default window), so a doctor run with a shorter override read a working
+/// peer between beats as stale and proceeded (cameronsjo/cadence-hooks#902).
+/// A longer window only blocks more: a false block costs a re-run, a false
+/// proceed deletes dirs a session is reading.
+fn prune_gate_window_secs(stale_minutes: u64) -> u64 {
+    stale_minutes
+        .saturating_mul(60)
+        .max(session_registry::default_stale_secs())
+}
+
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
 /// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
 /// must be paired with `prune` at the call site (`run` enforces this before
@@ -2851,7 +2866,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
     // below — `--root` fixtures must stay hermetic and never read live sessions.
     // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
     if root_override.is_none() && apply {
-        let stale_secs = session_registry::stale_minutes() * 60;
+        let stale_secs = prune_gate_window_secs(session_registry::stale_minutes());
         let force = matches!(
             std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
             Ok("1") | Ok("true")
@@ -7094,6 +7109,21 @@ mod tests {
             prune_liveness_gate(Some(&dir), None, 0, false),
             PruneGate::Proceed
         ));
+    }
+
+    // ── prune liveness window (#902) ─────────────────────────────────────────
+
+    /// A shorter `CADENCE_SESSION_STALE_MINUTES` in the doctor's own env must
+    /// never shrink the gate's window below the default: peers beat on the
+    /// default cadence, so a 5-minute window read a working peer as stale.
+    #[test]
+    fn prune_gate_window_is_never_shorter_than_the_default() {
+        let default = session_registry::default_stale_secs();
+        assert_eq!(prune_gate_window_secs(5), default);
+        assert_eq!(prune_gate_window_secs(1), default);
+        assert_eq!(prune_gate_window_secs(30), default);
+        assert_eq!(prune_gate_window_secs(120), 7_200);
+        assert_eq!(prune_gate_window_secs(u64::MAX), u64::MAX);
     }
 
     // ── guardrails_identity_finding (#275) ───────────────────────────────────
