@@ -133,7 +133,7 @@
 
 use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files, working_tree_digest};
 use cadence_hooks_core::markers::{
-    MarkerTarget, POLISH_MARKER_TTL_DAYS, located_ship_segments, marker_dir, marker_dir_is_private,
+    MarkerTarget, POLISH_MARKER_TTL_DAYS, located_ship_segments, polish_dir, polish_dir_is_private,
     polish_marker_present, read_polish_marker, resolve_located_ships,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -275,8 +275,8 @@ fn judge_target(target: &MarkerTarget) -> Verdict {
     // absent — and says why, since a nudge on a branch that visibly WAS
     // polished otherwise reads as a false positive. Only the dir path is
     // named — never its contents.
-    if !marker_dir_is_private() {
-        annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
+    if !polish_dir_is_private() {
+        annotations.push(degraded_dir_annotation(&polish_dir().display().to_string()));
     }
     // The diff subprocess is handed to `judge` as a LAZY predicate, so it
     // runs only when a guard actually consults it — the common full-polish
@@ -706,6 +706,7 @@ fn wrong_family_nudge_message(family: &str) -> String {
 mod tests {
     use super::*;
     use cadence_hooks_core::gitstate::GitState;
+    use cadence_hooks_core::markers::{marker_dir, marker_dir_is_private};
     use cadence_hooks_core::markers::{polish_marker, write_marker};
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd, with_marker_dir};
     use cadence_hooks_core::{Outcome, ToolInput};

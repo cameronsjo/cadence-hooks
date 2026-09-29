@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The backstop's "last session out" gate counts live sessions in sibling worktrees.** Each worktree keeps its own `.claude/sessions` registry, so two sessions in sibling worktrees of one repo each saw themselves as last out and each recorded the other's in-progress work as loose ends. The gate now reads the union of the repo's worktree registries, the same enumeration `session status` uses. If `git worktree list` cannot answer it checks only its own registry, as before. `registry::sessions_dir` and the lane guards stay per-working-tree by design. Part 1 of #928 only. (cameronsjo/cadence-hooks#928)
+- **The polish marker lives under the Claude config dir, not the shared temp dir.** It moves to `<config dir>/cadence-hooks/markers` (`0700`, honors `CLAUDE_CONFIG_DIR`), which has no shared base to fail open into, so a co-tenant can no longer plant it. Markers recorded in the old temp-based directory are still read for one release, and only when that directory is private. A `CADENCE_MARKER_DIR` override still wins. The rest of the marker family stays in the temp dir. Part 2 of #565 only; part 3 (a `sha` staleness verdict) is already covered by the `diff_digest` comparison from #874. (cameronsjo/cadence-hooks#565)
+
 ## [0.114.0] - 2026-09-29
 
 ### Security
