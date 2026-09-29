@@ -10850,8 +10850,13 @@ mod tests {
             let started = std::time::Instant::now();
             let _ = scan_targets(&cmd, "/w", false);
             let _ = inchain_dismissed_commits(&cmd, "/w", false);
+            // Wall-clock only: 4 s is the hook's budget in the shipped release
+            // build. An unoptimized build under a loaded parallel suite hit
+            // 4.36 s on one input with no algorithmic change (PR #1118), so
+            // debug gets headroom; a return to quadratic work still trips it.
+            let limit = std::time::Duration::from_secs(if cfg!(debug_assertions) { 12 } else { 4 });
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(4),
+                started.elapsed() < limit,
                 "{:?}: {:?}",
                 &cmd[..40],
                 started.elapsed()

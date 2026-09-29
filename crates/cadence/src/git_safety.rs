@@ -12,7 +12,7 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    command_segments, may_spell_word, parse_work_dir, tokenize, unescape_word,
+    command_segments, may_spell_word, parse_work_dir, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -650,7 +650,12 @@ impl Check for GitSafetyGuard {
                 continue;
             }
 
-            let norm_tokens = normalize_git_command(&segment);
+            // A subshell or group glued to the words — `(git push --force
+            // origin main)`, `{(git reset --hard)}` — tokenized as `(git` and
+            // `main)`, which no check recognizes, while bash runs the push
+            // (found during the PR #1118 review). The wrapper-stripped segment
+            // is what the shell executes.
+            let norm_tokens = normalize_git_command(strip_group_wrappers(&segment));
             let tokens: Vec<&str> = norm_tokens.iter().map(String::as_str).collect();
             // Joined form is only for the substring-based reflog/gc checks; the
             // git-word match runs on the span-preserved token list above.
@@ -2024,6 +2029,64 @@ mod tests {
             let command = format!("{prefix}F=main; git push --force origin $F");
             let result = GitSafetyGuard.run(&make_bash_input(&command));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        }
+    }
+
+    /// PR #1118 review: 5000 levels (~50 KB) of `{ (` around `inner`, in the
+    /// three spellings bash runs as groups.
+    fn deep_nests_1118(inner: &str) -> Vec<String> {
+        let k = 5000;
+        vec![
+            format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+            format!("{}{inner}{}", "{(".repeat(k), ")}".repeat(k)),
+            format!("{}{inner}{}", "{ ".repeat(k), "; }".repeat(k)),
+        ]
+    }
+
+    /// Release is the shipped profile; the debug bound only catches a return
+    /// to quadratic work (seconds per shape), not normal debug slowness.
+    fn nest_time_limit_1118() -> std::time::Duration {
+        std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 })
+    }
+
+    #[test]
+    fn deep_group_nesting_force_push_blocks_in_time() {
+        for command in deep_nests_1118("git push --force origin main") {
+            let start = std::time::Instant::now();
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            assert!(
+                start.elapsed() < nest_time_limit_1118(),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn subshell_wrapped_git_commands_are_judged() {
+        // Found during the PR #1118 review: `(git` and `main)` matched nothing.
+        for command in [
+            "(git push --force origin main)",
+            "((git push --force origin main))",
+            "{(git push --force origin main)}",
+            "{ (git push --force origin main) }",
+            "(git reset --hard HEAD~3)",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in ["(git status)", "{(git push origin feature)}"] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
         }
     }
 }

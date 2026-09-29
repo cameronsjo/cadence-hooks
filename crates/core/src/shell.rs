@@ -384,6 +384,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                     expanding_prefix_len,
                     budget,
                 );
+                true
             },
         );
     });
@@ -396,13 +397,28 @@ fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
     let mut words = Vec::new();
     walk_words(command, &mut |text, flags, _, _| {
         words.push((text, flags.to_vec()));
+        true
     });
     words
 }
 
+/// The first word of `command` as [`raw_words`] reads it, walking no further
+/// than that word. [`strip_group_wrappers`] asks this at every leading `{`,
+/// and walking the whole remaining text each time made `{ ( ` nested 5000
+/// deep (50 KB) take seconds, past the hook deadline (PR #1118 review).
+fn first_raw_word(command: &str) -> Option<(String, Vec<bool>)> {
+    let mut first = None;
+    walk_words(command, &mut |text, flags, _, _| {
+        first = Some((text, flags.to_vec()));
+        false
+    });
+    first
+}
+
 /// Receives one finished word: its text, per-byte structural flags,
-/// `unquoted_prefix_len`, and `expanding_prefix_len`.
-type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) + 'a;
+/// `unquoted_prefix_len`, and `expanding_prefix_len`. Returns whether the walk
+/// should go on to the next word.
+type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) -> bool + 'a;
 
 /// The single tokenizer walk behind [`tokenize_marked`] and [`raw_words`]:
 /// calls `emit(text, structural, unquoted_prefix_len, expanding_prefix_len)`
@@ -514,7 +530,9 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                         let flags = std::mem::take(&mut structural);
                         let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
                         let expanding_prefix_len = lead.finish(text.len());
-                        emit(text, &flags, unquoted_prefix_len, expanding_prefix_len);
+                        if !emit(text, &flags, unquoted_prefix_len, expanding_prefix_len) {
+                            return;
+                        }
                         in_token = false;
                     }
                 }
@@ -532,7 +550,7 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
     if in_token {
         let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
         let expanding_prefix_len = lead.finish(current.len());
-        emit(
+        let _ = emit(
             current,
             &structural,
             unquoted_prefix_len,
@@ -1552,12 +1570,26 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
     // `cat,.env}`, a word nothing expands (cadence-hooks#1096).
     let mut rest = trimmed;
+    // Each `{` whose word runs on (`{a,b}`, `{{x`) costs a walk of that word;
+    // past [`MAX_GLUED_BRACE_WALKS`] the strip stops and keeps the text. A
+    // glued `{` is not a group opener to bash anyway (`{{echo` is a command
+    // name), so stopping loses nothing the shell would run, and it keeps a
+    // 50 KB run of openers linear (PR #1118 review).
+    let mut glued_walks = 0usize;
     loop {
         rest = rest.trim_start_matches(['(', ' ', '\t']);
-        match rest.strip_prefix('{') {
-            Some(after) if !opens_brace_expansion(rest) => rest = after,
-            _ => break,
+        let Some(after) = rest.strip_prefix('{') else {
+            break;
+        };
+        if brace_stands_alone(after) {
+            rest = after;
+            continue;
         }
+        glued_walks += 1;
+        if glued_walks > MAX_GLUED_BRACE_WALKS || opens_brace_expansion(rest) {
+            break;
+        }
+        rest = after;
     }
     loop {
         rest = rest.trim_end_matches([')', ';', ' ', '\t']);
@@ -1568,16 +1600,41 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many first-word walks [`opens_brace_expansion`] made on this
+    /// thread — the work the PR #1118 nesting fix bounds.
+    static FIRST_WORD_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Most leading `{` words [`strip_group_wrappers`] walks to ask whether they
+/// open a brace expansion. See the loop there.
+const MAX_GLUED_BRACE_WALKS: usize = 64;
+
+/// True when the text after a `{` ends that word at once — at the end, at
+/// whitespace, or at an operator character — so the word is the lone `{`,
+/// which is the group keyword and never a brace expansion. `{(echo hi)}` runs
+/// as a group in bash.
+fn brace_stands_alone(after: &str) -> bool {
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ')' | ';' | '&' | '|' | '<' | '>'))
+}
+
 /// Does `text` begin with a word whose leading `{` bash brace-expands (or that
-/// expands past the modelled bounds)? Judges only the first word.
+/// expands past the modelled bounds)? Judges only the first word, and walks
+/// no further than it.
 fn opens_brace_expansion(text: &str) -> bool {
-    if !text.starts_with('{') {
+    if !text.starts_with('{') || brace_stands_alone(&text[1..]) {
         return false;
     }
-    raw_words(text).first().is_some_and(|(word, flags)| {
+    #[cfg(test)]
+    FIRST_WORD_WALKS.with(|walks| walks.set(walks.get() + 1));
+    first_raw_word(text).is_some_and(|(word, flags)| {
         word.starts_with('{')
             && flags.first() == Some(&true)
-            && expanding_brace_word(word, flags).is_some()
+            && expanding_brace_word(&word, &flags).is_some()
     })
 }
 
@@ -13066,5 +13123,41 @@ mod tests {
             clobber_redirect_targets(r"echo hi > $'.en\x76'"),
             vec![".env".to_string()]
         );
+    }
+
+    #[test]
+    fn strip_group_wrappers_walks_a_bounded_number_of_first_words() {
+        // PR #1118 review: each leading `{` re-walked the whole rest of the
+        // segment, so 5000 levels of `{ (` took seconds.
+        let k = 5000;
+        let cases = [
+            (
+                format!("{}cat .env{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+                "cat .env",
+            ),
+            (
+                format!("{}cat .env{}", "{(".repeat(k), ")}".repeat(k)),
+                "cat .env",
+            ),
+            (
+                format!("{}cat .env{}", "{ ".repeat(k), " }".repeat(k)),
+                "cat .env",
+            ),
+            ("{ {cat,.env}; }".to_string(), "{cat,.env}"),
+            ("{(echo hi)}".to_string(), "echo hi"),
+        ];
+        for (segment, want) in cases {
+            FIRST_WORD_WALKS.with(|walks| walks.set(0));
+            assert_eq!(strip_group_wrappers(&segment), want);
+            let walks = FIRST_WORD_WALKS.with(std::cell::Cell::get);
+            assert!(walks <= MAX_GLUED_BRACE_WALKS + 1, "{walks} walks");
+        }
+        // A glued run of openers is a word, not groups; the walks stay capped
+        // and the text is kept.
+        let glued = format!("{}x", "{".repeat(k));
+        FIRST_WORD_WALKS.with(|walks| walks.set(0));
+        let kept = strip_group_wrappers(&glued);
+        assert!(kept.ends_with('x') && !kept.is_empty());
+        assert!(FIRST_WORD_WALKS.with(std::cell::Cell::get) <= MAX_GLUED_BRACE_WALKS + 1);
     }
 }
