@@ -76,7 +76,9 @@ fn only_row_error(metrics_dir: &std::path::Path, reason: &str, out: &Output) -> 
 
 #[test]
 fn check_parse_row_omits_scalar() {
-    let (out, tmp) = run(&["cadence", "terminology"], br#"{"cwd":959424242}"#, &[]);
+    // A mistyped field is salvaged now (cadence-hooks#1087 review N4), so the
+    // canary is a payload that is not an object at all.
+    let (out, tmp) = run(&["cadence", "terminology"], b"959424242", &[]);
     let error = only_row_error(tmp.path(), "parse", &out);
     assert!(!error.contains(CANARY_NUMBER), "payload leaked: {error}");
     assert!(error.contains("data error"), "{error}");
