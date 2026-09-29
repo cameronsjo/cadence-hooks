@@ -181,6 +181,199 @@ pub fn read_body_file(path: &str, base_dir: &str) -> Result<String, BodyFileErro
     crate::paths::read_untrusted_config_detailed(&full)
 }
 
+// ---------------------------------------------------------------------------
+// `gh api` request bodies (cadence-hooks#930)
+// ---------------------------------------------------------------------------
+
+/// Where a `gh api` request's `body` (or `title`) field comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiField {
+    /// `-f body=TEXT`, or `-F body=TEXT` without an `@`: the text itself.
+    Literal(String),
+    /// `-F body=@PATH`: gh reads the field's value from the file.
+    File(String),
+    /// `-F body=@-`, or `--input -`: gh reads standard input, which the hook
+    /// cannot see.
+    Stdin,
+}
+
+/// The parts of ONE `gh api` invocation a body reader needs. Pure: no file is
+/// opened building it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiRequest {
+    /// The endpoint positional, as written (`repos/o/r/issues`, `/repos/…`).
+    pub endpoint: String,
+    /// The LAST `-X`/`--method` value, uppercased; `None` when absent.
+    pub method: Option<String>,
+    /// Whether any `-f`/`-F` field was passed.
+    pub has_fields: bool,
+    /// The LAST `body` field — gh keeps the last value for a repeated key.
+    pub body: Option<ApiField>,
+    /// The LAST `title` field.
+    pub title: Option<ApiField>,
+    /// The `--input` source, when given. gh sends that file as the request
+    /// body and turns every field into a query parameter instead.
+    pub input: Option<ApiField>,
+}
+
+impl ApiRequest {
+    /// The method gh will send: the explicit one, else POST once any field or
+    /// `--input` is present, else GET (gh's own implicit rule).
+    pub fn effective_method(&self) -> String {
+        match &self.method {
+            Some(m) => m.clone(),
+            None if self.has_fields || self.input.is_some() => "POST".to_string(),
+            None => "GET".to_string(),
+        }
+    }
+
+    /// Does this request carry a payload? A literal `GET` or `HEAD` sends its
+    /// fields as a query string, so it posts nothing. Any other method —
+    /// including one the hook cannot read literally (`-X "$M"`) — is taken to
+    /// post, which is the see-more direction for a reader.
+    pub fn sends_payload(&self) -> bool {
+        !matches!(self.effective_method().as_str(), "GET" | "HEAD")
+    }
+
+    /// The endpoint with any scheme/host, `api/v3/` prefix, leading slash and
+    /// query string removed: `https://ghe.x/api/v3/repos/o/r/issues?a=b` →
+    /// `repos/o/r/issues`.
+    pub fn endpoint_path(&self) -> &str {
+        let mut e = self.endpoint.as_str();
+        if let Some(rest) = e
+            .strip_prefix("https://")
+            .or_else(|| e.strip_prefix("http://"))
+        {
+            e = rest.split_once('/').map_or("", |(_, path)| path);
+        }
+        e = e.trim_start_matches('/');
+        e = e.strip_prefix("api/v3/").unwrap_or(e);
+        e.split(['?', '#']).next().unwrap_or(e)
+    }
+}
+
+/// `gh api` flags whose value is the following token (or `=`-joined, or glued
+/// to the short form).
+const API_VALUE_FLAGS: &[(&str, Option<char>)] = &[
+    ("--method", Some('X')),
+    ("--field", Some('F')),
+    ("--raw-field", Some('f')),
+    ("--header", Some('H')),
+    ("--jq", Some('q')),
+    ("--template", Some('t')),
+    ("--preview", Some('p')),
+    ("--input", None),
+    ("--hostname", None),
+    ("--cache", None),
+];
+
+/// Parse a `key=value` field into (key, source). `typed` is `-F`/`--field`,
+/// where a value starting with `@` names a file (`@-` is stdin); `-f` values
+/// are always literal.
+fn api_field(raw: &str, typed: bool) -> Option<(&str, ApiField)> {
+    let (key, value) = raw.split_once('=')?;
+    let field = match value.strip_prefix('@') {
+        Some("-") if typed => ApiField::Stdin,
+        Some(path) if typed => ApiField::File(path.to_string()),
+        _ => ApiField::Literal(value.to_string()),
+    };
+    Some((key, field))
+}
+
+/// Read a `gh api` invocation. `argv` is the command's argv with `gh` at index
+/// 0 (transparent prefixes already peeled); `None` when the command word is not
+/// `gh` or the first non-flag word after it is not `api`.
+///
+/// Every flag spelling pflag accepts is read — separate (`-f body=x`),
+/// `=`-joined long (`--raw-field=body=x`) and glued short (`-fbody=x`,
+/// `-XPATCH`). Repeated keys keep the last value, as gh does.
+pub fn parse_gh_api(argv: &[String]) -> Option<ApiRequest> {
+    if crate::shell::command_word(argv.first()?).as_ref() != "gh" {
+        return None;
+    }
+    let mut i = 1;
+    while i < argv.len() && argv[i].starts_with('-') {
+        i += 1;
+    }
+    if argv.get(i).map(String::as_str) != Some("api") {
+        return None;
+    }
+    i += 1;
+    let mut req = ApiRequest::default();
+    let mut endpoint: Option<String> = None;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        // Resolve (long name, value, tokens consumed) for a value flag.
+        let mut hit: Option<(&str, &str, usize)> = None;
+        if tok == "--" {
+            if endpoint.is_none() {
+                endpoint = argv.get(i + 1).cloned();
+            }
+            break;
+        }
+        for (long, short) in API_VALUE_FLAGS {
+            let short_s = short.map(|c| format!("-{c}"));
+            if tok == *long || short_s.as_deref() == Some(tok) {
+                if let Some(v) = argv.get(i + 1) {
+                    hit = Some((long, v.as_str(), 2));
+                } else {
+                    hit = Some((long, "", 1));
+                }
+                break;
+            }
+            if let Some(v) = tok
+                .strip_prefix(long)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                hit = Some((long, v, 1));
+                break;
+            }
+            if let Some(s) = short_s.as_deref()
+                && !tok.starts_with("--")
+                && tok.len() > 2
+                && let Some(v) = tok.strip_prefix(s)
+            {
+                hit = Some((long, v, 1));
+                break;
+            }
+        }
+        match hit {
+            Some((long, value, used)) => {
+                match long {
+                    "--method" => req.method = Some(value.to_ascii_uppercase()),
+                    "--field" | "--raw-field" => {
+                        req.has_fields = true;
+                        if let Some((key, field)) = api_field(value, long == "--field") {
+                            match key {
+                                "body" => req.body = Some(field),
+                                "title" => req.title = Some(field),
+                                _ => {}
+                            }
+                        }
+                    }
+                    "--input" => {
+                        req.input = Some(if value == "-" {
+                            ApiField::Stdin
+                        } else {
+                            ApiField::File(value.to_string())
+                        });
+                    }
+                    _ => {}
+                }
+                i += used;
+            }
+            None => {
+                if !tok.starts_with('-') && endpoint.is_none() {
+                    endpoint = Some(tok.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    req.endpoint = endpoint.unwrap_or_default();
+    Some(req)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +580,91 @@ mod tests {
             extract_bodies("git commit -m one -m two", "."),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    // ---- parse_gh_api (cadence-hooks#930) ----
+
+    fn argv(s: &str) -> Vec<String> {
+        tokenize(s)
+    }
+
+    #[test]
+    fn parse_gh_api_reads_every_field_spelling() {
+        use ApiField::*;
+        let cases: &[(&str, Option<ApiField>)] = &[
+            (
+                "gh api repos/o/r/issues -f body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -fbody=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --raw-field body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --raw-field=body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -F body=hi",
+                Some(Literal("hi".into())),
+            ),
+            (
+                "gh api repos/o/r/issues --field=body=@b.md",
+                Some(File("b.md".into())),
+            ),
+            (
+                "gh api repos/o/r/issues -Fbody=@b.md",
+                Some(File("b.md".into())),
+            ),
+            ("gh api repos/o/r/issues -F body=@-", Some(Stdin)),
+            // A raw field never reads a file: `@` is literal text.
+            (
+                "gh api repos/o/r/issues -f body=@b.md",
+                Some(Literal("@b.md".into())),
+            ),
+            // gh keeps the last value for a repeated key.
+            (
+                "gh api repos/o/r/issues -f body=a -f body=b",
+                Some(Literal("b".into())),
+            ),
+            // Another key is not the body; a flag's VALUE is not a field.
+            ("gh api repos/o/r/issues -f labels=x", None),
+            ("gh api repos/o/r/issues -H body=x", None),
+        ];
+        for (cmd, want) in cases {
+            let req = parse_gh_api(&argv(cmd)).expect(cmd);
+            assert_eq!(&req.body, want, "{cmd}");
+            assert_eq!(req.endpoint, "repos/o/r/issues", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn parse_gh_api_method_input_and_non_api() {
+        let req = parse_gh_api(&argv("gh api -XPATCH /repos/o/r/pulls/1 --input p.json")).unwrap();
+        assert_eq!(req.method.as_deref(), Some("PATCH"));
+        assert_eq!(req.input, Some(ApiField::File("p.json".into())));
+        assert_eq!(req.endpoint_path(), "repos/o/r/pulls/1");
+        assert!(req.sends_payload());
+
+        let implicit = parse_gh_api(&argv("gh api repos/o/r/issues -f body=x")).unwrap();
+        assert_eq!(implicit.effective_method(), "POST");
+        let get = parse_gh_api(&argv("gh api -X get repos/o/r/issues -f body=x")).unwrap();
+        assert!(!get.sends_payload(), "a GET sends fields as a query string");
+        let bare = parse_gh_api(&argv("gh api repos/o/r/issues")).unwrap();
+        assert!(!bare.sends_payload());
+
+        let url = parse_gh_api(&argv(
+            "gh api https://ghe.example/api/v3/repos/o/r/issues?x=1 -f body=x",
+        ))
+        .unwrap();
+        assert_eq!(url.endpoint_path(), "repos/o/r/issues");
+
+        for not_api in ["gh pr create --body x", "gh repo view api", "echo api"] {
+            assert_eq!(parse_gh_api(&argv(not_api)), None, "{not_api}");
+        }
     }
 }

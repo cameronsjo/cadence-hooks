@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`guard-body-budget` measures bodies posted through `gh api`.** A `gh api` write to a PR, issue, comment, or review endpoint carried its body in a JSON field (`-f body=…`, `-F body=@file`, `--input file.json`) rather than a `--body` flag, so an oversized body posted that way was never measured. The endpoint path now picks the surface — `pulls[/N]` is a PR body, `issues[/N]` an issue body, `…/comments`, `…/replies` and `…/reviews` a comment — and the body is read from every field spelling gh accepts, last value winning as it does in gh. A literal `-X GET` stays unmeasured, since gh sends its fields as a query string; a body on standard input is logged `unmeasured` like the other gaps (cameronsjo/cadence-hooks#930)
 - **`strip_quotes` reads quote boundaries with the shared quote model.** Its private two-toggle scan ended `"a\"b"` at the escaped quote, so quoted prose after it leaked into every consumer's structure scan and the real closer reopened a phantom run that hid the next command: `warn-alias-parsing` nudged on `cat f | jq .` inside an escaped JSON string and stayed silent on a real `echo "a\"b" ; cat f | jq .`. `warn-alias-parsing` also strips heredoc bodies now, so a `cat f | jq .` written into one no longer nudges. A 16,632-cell old/new differential across twelve Bash guards moved no verdict from BLOCK to ALLOW. (cameronsjo/cadence-hooks#1035)
 
 ## [0.111.0] - 2026-09-29

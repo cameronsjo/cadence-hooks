@@ -230,7 +230,7 @@ row to `failopen.jsonl` rather than blocking:
 - An **unreadable** or **non-UTF-8** body file (a write/hook race, a permission, a binary file).
 - A body assembled by a command substitution the guard cannot resolve to a literal.
 - A **`gh` alias** (`gh alias set prc 'pr create'`) — the expansion lives in `gh`'s own config, which the hook does not read.
-- **`gh api … -f body=@file`** — the raw API path carries no `--body` flag to find.
+- A **`gh api`** body on **standard input** (`-F body=@-`, `--input -`), or an `--input` file that is not JSON or carries no `body` field. Every other `gh api` write to a PR, issue, comment or review endpoint (`repos/O/R/pulls[/N]`, `issues[/N]`, `…/comments`, `…/reviews`) is measured on the surface its path names: `-f`/`-F body=…`, `-F body=@file`, and `--input file.json`'s `body` field. `graphql` mutations are not read.
 - A body reached through **`xargs`** (`echo x | xargs -I{} gh pr create --body …`) — the `gh` argv is assembled by another process at run time. Write the body to a regular file and call `gh` directly if you want it measured.
 
 Two shapes are **not** silent. Each produces the block text rather than an

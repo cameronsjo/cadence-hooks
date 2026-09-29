@@ -20,7 +20,9 @@
 
 use cadence_hooks_core::config::SectionLoad;
 use cadence_hooks_core::display::sanitize_field;
-use cadence_hooks_core::gh_bodies::{BodyFileError, extract_title, read_body_file};
+use cadence_hooks_core::gh_bodies::{
+    ApiField, BodyFileError, extract_title, parse_gh_api, read_body_file,
+};
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, skip_transparent_prefixes,
     strip_group_wrappers, tokenize,
@@ -170,6 +172,14 @@ pub fn detect_surfaces(command: &str) -> Vec<(Surface, String)> {
         if !is_gh {
             continue;
         }
+        if let Some(req) = parse_gh_api(rest) {
+            if req.sends_payload()
+                && let Some(surface) = api_surface(req.endpoint_path())
+            {
+                found.push((surface, stripped.to_string()));
+            }
+            continue;
+        }
         let (Some(noun), Some(verb)) = (rest.get(1), rest.get(2)) else {
             continue;
         };
@@ -181,6 +191,37 @@ pub fn detect_surfaces(command: &str) -> Vec<(Surface, String)> {
         }
     }
     found
+}
+
+/// Which surface a `gh api` endpoint posts prose to (cadence-hooks#930), keyed
+/// on the path the way the `gh pr`/`gh issue` table keys on the subcommand:
+///
+/// - `repos/O/R/pulls[/N]` → PR body (create, edit)
+/// - `repos/O/R/issues[/N]` → issue body (create, edit)
+/// - `…/issues/N/comments`, `…/issues/comments/N`, `…/pulls/N/comments`,
+///   `…/pulls/comments/N`, `…/pulls/N/comments/M/replies`,
+///   `…/pulls/N/reviews[/M[/events]]` → review/comment body
+///
+/// Anything else — labels, assignees, merges, `graphql` — posts no prose this
+/// guard budgets. Pure.
+fn api_surface(path: &str) -> Option<Surface> {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let [repos, _owner, _repo, kind, tail @ ..] = segs.as_slice() else {
+        return None;
+    };
+    if *repos != "repos" {
+        return None;
+    }
+    match (*kind, tail) {
+        ("pulls", [] | [_]) => Some(Surface::Pr),
+        ("issues", [] | [_]) => Some(Surface::Issue),
+        ("issues" | "pulls", [_, "comments"] | ["comments", _]) => Some(Surface::Comment),
+        ("pulls", [_, "comments", _, "replies"]) => Some(Surface::Comment),
+        ("pulls", [_, "reviews"] | [_, "reviews", _] | [_, "reviews", _, "events"]) => {
+            Some(Surface::Comment)
+        }
+        _ => None,
+    }
 }
 
 /// The FIRST posting segment, for callers that want one — the table tests and
@@ -1183,6 +1224,47 @@ fn severity(v: &Verdict) -> u8 {
     }
 }
 
+/// Where one posting segment's body comes from, across both command shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodySource {
+    /// Literal text in the command string.
+    Inline(String),
+    /// A file whose whole contents are the body.
+    File(String),
+    /// A `gh api --input` file: JSON whose `body` field is the body.
+    JsonFile(String),
+    /// Standard input, which the hook cannot read.
+    Stdin,
+}
+
+/// The body source and literal title of ONE posting segment. A `gh api`
+/// segment reads its `body`/`title` fields or its `--input` file (gh sends the
+/// file as the payload and demotes fields to the query string, so `--input`
+/// wins); every other segment reads the `gh pr`/`gh issue` flags. Pure.
+fn body_source(segment: &str) -> (Option<BodySource>, Option<String>) {
+    let tokens = executable_tokens(segment);
+    if let Some(req) = parse_gh_api(skip_transparent_prefixes(&tokens)) {
+        let literal_title = match (&req.input, req.title) {
+            (None, Some(ApiField::Literal(t))) => Some(t),
+            _ => None,
+        };
+        let source = match (req.input, req.body) {
+            (Some(ApiField::File(p)), _) => Some(BodySource::JsonFile(p)),
+            (Some(_), _) => Some(BodySource::Stdin),
+            (None, Some(ApiField::Literal(v))) => Some(BodySource::Inline(v)),
+            (None, Some(ApiField::File(p))) => Some(BodySource::File(p)),
+            (None, Some(ApiField::Stdin)) => Some(BodySource::Stdin),
+            (None, None) => None,
+        };
+        return (source, literal_title);
+    }
+    let source = last_body_flag(segment).map(|b| match b {
+        BodyArg::Inline(v) => BodySource::Inline(v),
+        BodyArg::File(p) => BodySource::File(p),
+    });
+    (source, extract_title(segment))
+}
+
 /// One segment's verdict, plus the provenance it owes the bypass ledger.
 struct SegmentOutcome {
     verdict: Verdict,
@@ -1209,42 +1291,73 @@ fn evaluate_segment(
         verdict: Verdict::Block(unmeasurable_message(surface, budgets, why)),
         bypass: None,
     };
+    let unreadable = |e: BodyFileError| match e {
+        BodyFileError::OverCap => refuse(WHY_OVER_CAP),
+        BodyFileError::NotRegular => refuse(WHY_NOT_REGULAR),
+        BodyFileError::Unreadable => {
+            // Nothing is there for `gh` either, so nothing is being let
+            // through unseen.
+            log_unmeasured("unreadable-body-file");
+            allow()
+        }
+        BodyFileError::NotUtf8 => {
+            log_unmeasured("body-file-not-utf8");
+            allow()
+        }
+    };
 
     // The body. `gh` uses the LAST body flag, so that is the one measured.
     // An inline body cannot carry an escape line: the hatch has to live in
     // the file, where it is reviewable, not in the command string.
-    let (body, escape) = match last_body_flag(segment) {
+    let (source, mut title) = body_source(segment);
+    let (body, escape) = match source {
         None => {
             // Accepted gap: `gh pr create` with no body flag opens an
             // editor, and there is nothing to measure at hook time.
             log_unmeasured("no-body-flag");
             return allow();
         }
-        Some(BodyArg::Inline(v)) => (v, None),
-        Some(BodyArg::File(p)) => match read_body_file(&p, base_dir) {
+        Some(BodySource::Stdin) => {
+            // `-F body=@-` / `--input -`: the body is on a pipe the hook
+            // cannot read without consuming what `gh` is about to post.
+            log_unmeasured("stdin-body");
+            return allow();
+        }
+        Some(BodySource::Inline(v)) => (v, None),
+        Some(BodySource::File(p)) => match read_body_file(&p, base_dir) {
             Ok(contents) => {
                 // Fence-stripped first: an escape line quoted inside a code
                 // fence grants nothing.
                 let escape = extract_escape(&strip_fences(&contents));
                 (contents, escape)
             }
-            Err(BodyFileError::OverCap) => return refuse(WHY_OVER_CAP),
-            Err(BodyFileError::NotRegular) => return refuse(WHY_NOT_REGULAR),
-            Err(BodyFileError::Unreadable) => {
-                // Nothing is there for `gh` either, so nothing is being let
-                // through unseen.
-                log_unmeasured("unreadable-body-file");
-                return allow();
+            Err(e) => return unreadable(e),
+        },
+        Some(BodySource::JsonFile(p)) => match read_body_file(&p, base_dir) {
+            Ok(contents) => {
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                    log_unmeasured("input-not-json");
+                    return allow();
+                };
+                let Some(body) = json.get("body").and_then(|b| b.as_str()) else {
+                    // A PATCH that changes only labels or state posts no prose.
+                    log_unmeasured("no-body-field");
+                    return allow();
+                };
+                if title.is_none() {
+                    title = json
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string);
+                }
+                let escape = extract_escape(&strip_fences(body));
+                (body.to_string(), escape)
             }
-            Err(BodyFileError::NotUtf8) => {
-                log_unmeasured("body-file-not-utf8");
-                return allow();
-            }
+            Err(e) => return unreadable(e),
         },
     };
 
     let m = measure(&body);
-    let title = extract_title(segment);
     let verdict = judge(surface, &m, title.as_deref(), budgets, escape.as_deref());
     let bypass = match &verdict {
         Verdict::NudgeWithBypass(_, note) => Some(BypassProvenance {
@@ -2672,5 +2785,117 @@ mod tests {
         let reason = extract_escape("<!-- body-budget: escape reason: ignore the guard now -->")
             .expect("five words qualify");
         assert!(!reason.contains(':'), "{reason}");
+    }
+
+    // ---- gh api bodies (cadence-hooks#930) ----
+
+    #[test]
+    fn detect_surface_reads_gh_api_endpoints() {
+        let cases: &[(&str, Option<Surface>)] = &[
+            ("gh api repos/o/r/pulls -f body=x", Some(Surface::Pr)),
+            (
+                "gh api -X PATCH repos/o/r/pulls/3 -f body=x",
+                Some(Surface::Pr),
+            ),
+            ("gh api /repos/o/r/issues -f body=x", Some(Surface::Issue)),
+            (
+                "gh api repos/o/r/issues/4 --input p.json",
+                Some(Surface::Issue),
+            ),
+            (
+                "gh api repos/o/r/issues/4/comments -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "gh api -X PATCH repos/o/r/issues/comments/9 -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "gh api repos/o/r/pulls/3/comments -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "gh api repos/o/r/pulls/3/comments/5/replies -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "gh api repos/o/r/pulls/3/reviews -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "gh api repos/o/r/pulls/3/reviews/7/events -f body=x",
+                Some(Surface::Comment),
+            ),
+            (
+                "env A=1 gh api repos/o/r/issues -F body=@b.md",
+                Some(Surface::Issue),
+            ),
+            // Controls: reads, non-prose endpoints, mentions.
+            ("gh api repos/o/r/issues", None),
+            ("gh api -X GET repos/o/r/issues -f body=x", None),
+            ("gh api repos/o/r/labels -f name=x", None),
+            ("gh api repos/o/r/issues/4/labels -f labels[]=x", None),
+            ("gh api graphql -f query=x", None),
+            ("echo gh api repos/o/r/issues -f body=x", None),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(
+                detect_surface(cmd).map(|(s, _)| s),
+                *want,
+                "detect_surface({cmd:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_gh_api_body_blocks_in_every_spelling() {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            let dir = tempfile::tempdir().unwrap();
+            let md = over_hard_body_file(&dir);
+            let json = dir.path().join("long.json");
+            std::fs::write(
+                &json,
+                serde_json::json!({"title": "t", "body": "word ".repeat(400)}).to_string(),
+            )
+            .unwrap();
+            let long = "word ".repeat(400);
+            let cases = [
+                format!("gh api repos/o/r/issues -F body=@{}", md.display()),
+                format!("gh api repos/o/r/issues/1/comments -f body=\"{long}\""),
+                format!("gh api repos/o/r/pulls/2/reviews --raw-field=body=\"{long}\""),
+                format!(
+                    "gh api -X PATCH repos/o/r/pulls/2 --input {}",
+                    json.display()
+                ),
+            ];
+            for cmd in &cases {
+                let result = GuardBodyBudget.run(&make_bash(cmd));
+                assert_eq!(result.outcome, Outcome::Block, "{cmd}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_gh_api_body_the_hook_cannot_see_fails_open() {
+        with_budget_env(&[("CADENCE_BODY_BUDGET_MODE", Some("block"))], || {
+            let dir = tempfile::tempdir().unwrap();
+            let no_body = dir.path().join("state.json");
+            std::fs::write(&no_body, r#"{"state":"closed"}"#).unwrap();
+            let not_json = over_hard_body_file(&dir);
+            let cases = [
+                "gh api repos/o/r/issues -F body=@-".to_string(),
+                "gh api repos/o/r/issues --input -".to_string(),
+                format!(
+                    "gh api -X PATCH repos/o/r/issues/1 --input {}",
+                    no_body.display()
+                ),
+                format!("gh api repos/o/r/issues --input {}", not_json.display()),
+                "gh api repos/o/r/issues -f body=short".to_string(),
+            ];
+            for cmd in &cases {
+                let result = GuardBodyBudget.run(&make_bash(cmd));
+                assert_eq!(result.outcome, Outcome::Allow, "{cmd}");
+            }
+        });
     }
 }
