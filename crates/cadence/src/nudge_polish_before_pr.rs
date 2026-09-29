@@ -134,7 +134,7 @@
 use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files, working_tree_digest};
 use cadence_hooks_core::markers::{
     MarkerTarget, POLISH_MARKER_TTL_DAYS, located_ship_segments, marker_dir, marker_dir_is_private,
-    polish_marker_present, read_polish_marker, resolve_ship_target,
+    polish_marker_present, read_polish_marker, resolve_located_ships,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -219,17 +219,14 @@ impl Check for NudgePolishBeforePr {
         // vouch for the second. Each ship is judged both in the directory its
         // own segment runs in and in the whole-command directory
         // (cadence-hooks#997), so a `cd` inside `( … )` or between two ships
-        // can add a nudge but never clear one; the sharpest verdict wins. The `git remote get-url origin` spawn is paid only for
-        // a repo-retargeted `gh pr merge` (cadence-hooks#881), so the common
-        // `create`/`ready` paths never pay for it.
-        located_ship_segments(command, input.cwd.as_deref())
+        // can add a nudge but never clear one; the sharpest verdict wins. The
+        // `git remote get-url origin` spawn is paid only for a repo-retargeted
+        // `gh pr merge` (cadence-hooks#881), so the common `create`/`ready`
+        // paths never pay for it. Each distinct target is judged once, and
+        // past `MAX_JUDGED_SHIPS` the rest nudge unjudged (cadence-hooks#1152).
+        resolve_located_ships(&located_ship_segments(command, input.cwd.as_deref()))
             .iter()
-            .map(|ship| {
-                judge_target(&resolve_ship_target(
-                    &ship.segment.target,
-                    ship.work_dir.as_deref(),
-                ))
-            })
+            .map(judge_target)
             .min()
             .map_or_else(CheckResult::allow, Verdict::into_result)
     }
@@ -3156,5 +3153,109 @@ mod tests {
                 .outcome,
             Outcome::Allow
         );
+    }
+
+    // --- cadence-hooks#1152: distinct-target floods stay cheap ---
+
+    /// A repo on `feat/x` with a real `origin`, a recorded full polish, and
+    /// `dirs` empty subdirectories `d0`, `d1`, … for `cd` targets.
+    fn polished_repo_with_subdirs(dirs: usize) -> (tempfile::TempDir, String) {
+        let (tmp, root) = init_repo_with_real_origin_remote("feat/x", OWN_URL, &["src/lib.rs"]);
+        for i in 0..dirs {
+            std::fs::create_dir(tmp.path().join(format!("d{i}"))).unwrap();
+        }
+        (tmp, root)
+    }
+
+    #[test]
+    fn ship_floods_stay_within_the_hook_deadline() {
+        // cadence-hooks#1152: every distinct ship spawned git, so a 200 KB
+        // flood of distinct `-R` values or `cd` targets took 3 s in a
+        // checkout. Identical floods keep the verdict one copy draws; a
+        // flood past MAX_JUDGED_SHIPS distinct targets nudges.
+        let flood = |unit: &str| unit.repeat(200 * 1024 / unit.len());
+        let distinct = |unit: &dyn Fn(usize) -> String| {
+            let mut command = String::new();
+            let mut i = 0;
+            while command.len() < 200 * 1024 {
+                command.push_str(&unit(i));
+                i += 1;
+            }
+            command
+        };
+        let (tmp, root) = polished_repo_with_subdirs(6000);
+        let cwd = tmp.path().to_str().unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for (command, want, needle) in [
+                (flood("gh pr ready; "), Outcome::Allow, ""),
+                (flood("gh pr create -t a -b b; "), Outcome::Allow, ""),
+                (
+                    flood("(cd d0 && gh pr merge -R own/repo); "),
+                    Outcome::Allow,
+                    "",
+                ),
+                (flood("gh pr ready 1 -R x/y; "), Outcome::Nudge, "x/y"),
+                (
+                    distinct(&|i| format!("gh pr ready 1 -R x{i}/y{i}; ")),
+                    Outcome::Nudge,
+                    "Can't check polish",
+                ),
+                (
+                    distinct(&|i| format!("(cd d{i} && gh pr merge -R own/repo); ")),
+                    Outcome::Nudge,
+                    "more than 32 distinct targets",
+                ),
+            ] {
+                let start = std::time::Instant::now();
+                let result = run_at(&command, cwd);
+                let elapsed = start.elapsed();
+                let head = &command[..24];
+                assert_eq!(result.outcome, want, "{head:?}…");
+                let msg = result.message.unwrap_or_default();
+                assert!(msg.contains(needle), "{head:?}…: {msg}");
+                // Release is the shipped profile; debug builds get headroom.
+                let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+                assert!(elapsed.as_secs_f64() < limit, "{head:?}…: {elapsed:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn ship_judging_caps_distinct_targets() {
+        // cadence-hooks#1152: at or under MAX_JUDGED_SHIPS distinct (dir,
+        // target) pairs each is judged; past it the rest go unjudged and
+        // the gate nudges instead of going silent.
+        use cadence_hooks_core::markers::MAX_JUDGED_SHIPS;
+        let (tmp, root) = polished_repo_with_subdirs(MAX_JUDGED_SHIPS + 1);
+        let cwd = tmp.path().to_str().unwrap();
+        // Each subshell ship is judged in its own `dN` and again in the
+        // whole-command directory, which is the cwd for all of them.
+        let subshells = |n: usize| {
+            (0..n)
+                .map(|i| format!("(cd d{i} && gh pr ready)"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/x"), RAN).unwrap();
+            for (command, want) in [
+                (subshells(MAX_JUDGED_SHIPS - 1), Outcome::Allow),
+                (subshells(MAX_JUDGED_SHIPS), Outcome::Nudge),
+                // Repeats collapse before the count.
+                (
+                    vec!["(cd d0 && gh pr ready)"; 500].join("; "),
+                    Outcome::Allow,
+                ),
+            ] {
+                let result = run_at(&command, cwd);
+                assert_eq!(result.outcome, want, "{command:.40}…");
+                if want == Outcome::Nudge {
+                    assert_cannot_check(&result, "more than 32 distinct targets");
+                }
+            }
+        });
     }
 }
