@@ -91,6 +91,8 @@ pub(crate) fn github_origin_repo() -> tempfile::TempDir {
     repo
 }
 
+/// Bounded runner for the external tools (`gh`, `chezmoi`) advisory nudges query.
+pub mod bounded_tool;
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.
@@ -139,10 +141,14 @@ pub mod warn_alias_parsing;
 pub mod warn_amend_pushed;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
+/// Warn when `chezmoi apply` would overwrite locally drifted files.
+pub mod warn_chezmoi_apply;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
 /// Warn when bare `curl` (aliased to curlie) is used with custom headers.
 pub mod warn_curl_alias;
+/// Warn on a session's first write in a worktree with no upstream or no open PR.
+pub mod warn_entry_posture;
 /// Pre-flight checklist nudge before `gh pr merge` (draft, worktree, verify).
 pub mod warn_gh_merge_preflight;
 /// Warn when creating/publicizing a repo whose name or description telegraphs sensitive content.
@@ -153,6 +159,10 @@ pub mod warn_issue_tracker;
 pub mod warn_main_branch;
 /// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
 pub mod warn_pr_issue_link;
+/// Warn before deleting a branch that open PRs use as their base.
+pub mod warn_stacked_base_delete;
+/// Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited after the branch gained commits.
+pub mod warn_stale_pr_body;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
 /// Warn on `gh pr ready`/`gh pr merge` when the PR's head SHA has no reviewed signal.

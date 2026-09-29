@@ -119,6 +119,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-held-close",
+        description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
+        namespace: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "platform-drift",
         description: "Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline",
         namespace: "cadence",
@@ -281,6 +287,30 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-unreviewed-ready-flip",
         description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-chezmoi-apply",
+        description: "Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally; the nudge flags an unscoped apply",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-entry-posture",
+        description: "Warn on a session's first write in a linked worktree whose branch has no upstream or no open PR",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-stacked-base-delete",
+        description: "Warn before deleting a branch (`git push --delete`, `gh pr merge --delete-branch`) that open PRs use as their base",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-stale-pr-body",
+        description: "Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since creation while the branch gained commits",
         namespace: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -570,6 +600,26 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // useful signal without a live gh call.
         ("guardrails", "warn-unreviewed-ready-flip") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
+        ),
+        // The five nudges-b hooks each gate on one command shape the generic
+        // `git status` sample never reaches. guard-held-close allows here
+        // unless `CADENCE_DRAIN_HELD` holds the named issue (`try` passes no
+        // `--ledger`). warn-chezmoi-apply's sample is a dry run on purpose:
+        // `try` must never execute `chezmoi status`, which runs templates.
+        ("cadence", "guard-held-close") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue close 354 -R cameronsjo/cadence-ecosystem"}}"#,
+        ),
+        ("guardrails", "warn-chezmoi-apply") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"chezmoi apply --dry-run"}}"#,
+        ),
+        ("guardrails", "warn-entry-posture") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
+        ),
+        ("guardrails", "warn-stacked-base-delete") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git push origin --delete feat/sample"}}"#,
+        ),
+        ("guardrails", "warn-stale-pr-body") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr ready 5"}}"#,
         ),
         // guard-body-budget only engages on a gh posting subcommand carrying a
         // body flag; the generic PreToolUse sample (`git status`) would allow

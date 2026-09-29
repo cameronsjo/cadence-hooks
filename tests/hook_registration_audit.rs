@@ -307,6 +307,25 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
     ),
+    // The five nudges-b hooks: built here, wired by the cadence-monorepo PR that
+    // follows (each entry leaves in that wiring PR).
+    ("cadence guard-held-close", "cameronsjo/cadence-hooks#612"),
+    (
+        "guardrails warn-chezmoi-apply",
+        "cameronsjo/cadence-hooks#514",
+    ),
+    (
+        "guardrails warn-entry-posture",
+        "cameronsjo/cadence-hooks#620",
+    ),
+    (
+        "guardrails warn-stacked-base-delete",
+        "cameronsjo/cadence-hooks#473",
+    ),
+    (
+        "guardrails warn-stale-pr-body",
+        "cameronsjo/cadence-hooks#766",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

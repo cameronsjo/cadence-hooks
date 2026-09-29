@@ -80,6 +80,7 @@ Rules for wiring:
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
+| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger |
 | `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary |
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable |
@@ -114,6 +115,10 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
 | `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) |
+| `warn-stale-pr-body` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since the PR was opened while the branch has gained commits since — the placeholder body is about to become the squash-merge record |
+| `warn-stacked-base-delete` | PreToolUse (Bash) | Warn before `git push <remote> --delete <branch>` / `:<branch>` or `gh pr merge --delete-branch` when open PRs base on the branch (deleting it closes them, never retargets); names the PRs |
+| `warn-entry-posture` | PreToolUse (Write, Edit) | Once per session per linked worktree, at the first write: warn when the branch has no upstream (`git push -u`) or no open PR (`gh pr create --draft`) |
+| `warn-chezmoi-apply` | PreToolUse (Bash) | Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally (`MM`/`MD`), narrowed to the apply's targets and `--include`/`--exclude`; an unscoped apply gets a scoping clause. Silent on a clean tree, a dry run, a relocated source/config, or no `chezmoi` |
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |

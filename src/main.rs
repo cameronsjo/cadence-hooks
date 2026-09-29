@@ -272,6 +272,13 @@ enum CadenceCommands {
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
     MarkdownLint,
+    /// Block `gh issue close` against the HELD-issue ledger
+    GuardHeldClose {
+        /// Ledger file: whitespace-separated `owner/repo#N` entries
+        /// (`CADENCE_DRAIN_HELD` overrides it when set)
+        #[arg(long, value_name = "PATH")]
+        ledger: Option<String>,
+    },
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
     /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
@@ -412,6 +419,14 @@ enum GuardrailsCommands {
     WarnGhMergePreflight,
     /// Warn on gh pr ready/merge when the PR head has no reviewed signal
     WarnUnreviewedReadyFlip,
+    /// Warn when `chezmoi apply` would overwrite locally drifted files
+    WarnChezmoiApply,
+    /// Warn on a session's first write in a worktree with no upstream or no open PR
+    WarnEntryPosture,
+    /// Warn before deleting a branch that open PRs use as their base
+    WarnStackedBaseDelete,
+    /// Warn on gh pr ready/merge when the PR body was never edited since the branch gained commits
+    WarnStalePrBody,
     /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
@@ -574,6 +589,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
+            CadenceCommands::GuardHeldClose { .. } => "guard-held-close",
             CadenceCommands::RedactExternalContent => "redact-external-content",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
             CadenceCommands::ModelPosture => "model-posture",
@@ -615,6 +631,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
+            GuardrailsCommands::WarnChezmoiApply => "warn-chezmoi-apply",
+            GuardrailsCommands::WarnEntryPosture => "warn-entry-posture",
+            GuardrailsCommands::WarnStackedBaseDelete => "warn-stacked-base-delete",
+            GuardrailsCommands::WarnStalePrBody => "warn-stale-pr-body",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
             GuardrailsCommands::InjectGhWriteContext => "inject-gh-write-context",
@@ -748,6 +768,12 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 Box::new(cadence_hooks_cadence::markdown_lint::MarkdownLint),
                 pre,
             ),
+            CadenceCommands::GuardHeldClose { ledger } => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::guard_held_close::GuardHeldClose {
+                    ledger_path: ledger.clone(),
+                }),
+                pre,
+            ),
             CadenceCommands::RedactExternalContent => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::redact_external_content::RedactExternalContent),
                 pre,
@@ -860,6 +886,22 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 Box::new(
                     cadence_hooks_guardrails::warn_unreviewed_ready_flip::WarnUnreviewedReadyFlip,
                 ),
+                pre,
+            ),
+            GuardrailsCommands::WarnChezmoiApply => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_chezmoi_apply::WarnChezmoiApply),
+                pre,
+            ),
+            GuardrailsCommands::WarnEntryPosture => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_entry_posture::WarnEntryPosture),
+                pre,
+            ),
+            GuardrailsCommands::WarnStackedBaseDelete => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_stacked_base_delete::WarnStackedBaseDelete),
+                pre,
+            ),
+            GuardrailsCommands::WarnStalePrBody => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_stale_pr_body::WarnStalePrBody),
                 pre,
             ),
             GuardrailsCommands::WarnAliasParsing => CheckPlan::new(

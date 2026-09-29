@@ -9,6 +9,8 @@ pub mod block_orphaned_todos;
 mod forgectl_hint;
 /// Block dangerous git operations (force-push main, reset --hard, etc.).
 pub mod git_safety;
+/// Block `gh issue close` against the HELD-issue ledger.
+pub mod guard_held_close;
 /// Run markdownlint on markdown files being written.
 pub mod markdown_lint;
 /// Enforce line limits on MEMORY.md and topic files.
