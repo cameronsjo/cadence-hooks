@@ -302,9 +302,17 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     // The plan speaks for the cwd's branch only, so a flip aimed anywhere
     // else says nothing about it (cadence-hooks#972).
     let branch = plan.branch.as_deref().unwrap_or_default();
-    if !flips
-        .iter()
-        .any(|tokens| flips_the_cwd_branch(tokens, cwd, branch))
+    // Each check resolves the checkout through git, so a flood of flips
+    // aimed elsewhere (`gh pr ready 1 -R x/y; ` × 10 000) spawned git per flip
+    // and ran seconds past the hook deadline (cadence-hooks#1150). Identical
+    // flips are judged once; past the cap, the unjudged remainder counts as a
+    // flip of this branch — the advisory's nudge direction.
+    flips.sort_unstable();
+    flips.dedup();
+    if flips.len() <= MAX_JUDGED_FLIPS
+        && !flips
+            .iter()
+            .any(|tokens| flips_the_cwd_branch(tokens, cwd, branch))
     {
         return CheckResult::allow();
     }
@@ -327,6 +335,11 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
          then flip. Advisory only."
     ))
 }
+
+/// How many distinct flips [`run_warn_plan_ready_flip`] resolves against the
+/// checkout before it stops judging and nudges. Real commands carry one or
+/// two; each judgment can spawn git.
+const MAX_JUDGED_FLIPS: usize = 32;
 
 /// Flips the shared matcher does not see because a prefix outside the
 /// transparent set sits in front of `gh` (`sudo`, `timeout 60`, `nice -n 5`,
@@ -351,25 +364,38 @@ fn windowed_flips(command: &str) -> Vec<Vec<String>> {
         .filter(|segment| gh_pr_segments(segment).is_empty())
         .flat_map(|segment| {
             let tokens = tokenize(&segment);
-            (0..tokens.len().saturating_sub(2))
+            // An inline retarget ahead of `gh` would be dropped by the slice
+            // below, so no window at or past the first one is read at all.
+            let retarget = tokens
+                .iter()
+                .position(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="))
+                .unwrap_or(tokens.len());
+            let starts: Vec<usize> = (0..tokens.len().saturating_sub(2).min(retarget + 1))
                 .filter(|&i| {
-                    // An inline retarget ahead of `gh` would be dropped by the
-                    // slice below, so such a window is not read at all.
-                    !tokens[..i]
-                        .iter()
-                        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="))
-                        && basename(&tokens[i]) == "gh"
+                    basename(&tokens[i]) == "gh"
                         && tokens[i + 1] == "pr"
-                        && match tokens[i + 2].as_str() {
-                            "ready" => !carries_undo_flag(&tokens[i + 3..]),
-                            "merge" => true,
-                            _ => false,
-                        }
+                        && matches!(tokens[i + 2].as_str(), "ready" | "merge")
                 })
-                .map(|i| {
-                    let mut flip = tokens[i..].to_vec();
-                    flip[0] = "gh".to_string();
-                    flip
+                .collect();
+            // Linear in the segment (cadence-hooks#1150): the first window
+            // carries the whole tail — the argv its `gh` actually receives —
+            // and each later one, a `gh pr …` sitting inside that argv, ends
+            // where the next begins. Copying the tail for every window made a
+            // 200 KB `sudo gh pr ready …` flood quadratic.
+            starts
+                .iter()
+                .enumerate()
+                .filter_map(|(n, &i)| {
+                    let end = match n {
+                        0 => tokens.len(),
+                        _ => starts.get(n + 1).copied().unwrap_or(tokens.len()),
+                    };
+                    let window = &tokens[i..end];
+                    (window[2] == "merge" || !carries_undo_flag(&window[3..])).then(|| {
+                        let mut flip = window.to_vec();
+                        flip[0] = "gh".to_string();
+                        flip
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -1112,6 +1138,63 @@ mod tests {
                 cadence_hooks_core::Outcome::Allow,
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn ready_flip_floods_stay_within_the_hook_deadline() {
+        // cadence-hooks#1150: the window scan re-read every earlier token for
+        // each index (2.8 s on 200 KB of `a b `), copied the whole tail for
+        // every `gh pr` hit, and a flood of flips aimed elsewhere spawned git
+        // once per flip (3.2 s in a checkout with a plan). Verdicts are the
+        // ones a single copy of each unit draws.
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let tmp = repo_with_plan_and_origin();
+        let flood = |unit: &str| unit.repeat(200 * 1024 / unit.len());
+        for (command, want) in [
+            (flood("a b "), Allow),
+            (flood("a; "), Allow),
+            // One `gh` whose selector is the word `gh`: another branch.
+            (flood("gh pr ready "), Allow),
+            (flood("gh pr ready; "), Nudge),
+            (format!("sudo {}", flood("gh pr ready ")), Nudge),
+            (flood("sudo gh pr ready; "), Nudge),
+            (flood("gh pr ready 1 -R x/y; "), Allow),
+            (format!("sudo {}", flood("gh pr ready 1 -R x/y ")), Allow),
+            (flood("sudo gh pr ready 1 -R x/y; "), Allow),
+        ] {
+            let input = bash_input("flip-1150", tmp.path(), &command, "");
+            let start = std::time::Instant::now();
+            let outcome = run_warn_plan_ready_flip(&input).outcome;
+            let elapsed = start.elapsed();
+            let head = &command[..24];
+            assert_eq!(outcome, want, "{head:?}…");
+            // Release is the shipped profile; debug builds get headroom.
+            let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+            assert!(elapsed.as_secs_f64() < limit, "{head:?}…: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn ready_flip_judges_at_most_the_cap_of_distinct_flips() {
+        // cadence-hooks#1150: past MAX_JUDGED_FLIPS distinct flips the rest
+        // go unjudged and the guard nudges; at or under it, each is judged.
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let tmp = repo_with_plan_and_origin();
+        let elsewhere = |n: usize| {
+            (0..n)
+                .map(|i| format!("gh pr ready {i} -R other/r{i}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        for (command, want) in [
+            (elsewhere(MAX_JUDGED_FLIPS), Allow),
+            (elsewhere(MAX_JUDGED_FLIPS + 1), Nudge),
+            // Duplicates collapse before the count.
+            (vec!["gh pr ready 1 -R other/r"; 500].join("; "), Allow),
+        ] {
+            let input = bash_input("flip-1150-cap", tmp.path(), &command, "");
+            assert_eq!(run_warn_plan_ready_flip(&input).outcome, want);
         }
     }
 
