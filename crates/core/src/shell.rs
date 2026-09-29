@@ -9698,7 +9698,8 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubstBound {
     Bounded(usize),
-    /// Nesting past [`MAX_SUBSTITUTION_DEPTH`]: cheap, and local.
+    /// Nesting past [`MAX_QUOTED_SUBSTITUTION_FRAMES`] (an input over 750 KB):
+    /// the pass stops asking.
     TooDeep,
     /// No closer found: the scan read to the end of the input.
     Unbounded,
@@ -9792,9 +9793,6 @@ impl SpanLatch {
 /// character reading, which is the status quo rather than a new deletion.
 fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
     match chars[i] {
-        '$' if chars.get(i + 1) == Some(&'(') => {
-            SpanLatch::classify(scan_substitution_body(chars, i + 2, true))
-        }
         '`' => backtick_span_end(chars, i).map_or(SubstBound::Unbounded, SubstBound::Bounded),
         _ => SubstBound::Unbounded,
     }
