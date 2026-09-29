@@ -266,30 +266,123 @@ impl MarkerTarget {
 /// Git runs for remotes or worktrees only when the target names one, so the
 /// common `gh pr create --title x` pays nothing beyond the cwd's own state.
 pub fn resolve_ship_target(target: &ShipTarget, cwd_dir: Option<&str>) -> MarkerTarget {
-    let Some(cwd_dir) = cwd_dir else {
-        return MarkerTarget::Unknown;
-    };
-    let Some(state) = GitState::resolve(Path::new(cwd_dir)) else {
-        return cannot_check(
-            "the command runs outside a git checkout, so the branch it ships cannot be looked up"
-                .to_string(),
-        );
-    };
-    let Some(cwd_branch) = state.branch else {
-        return MarkerTarget::Unknown;
-    };
-    if !target.names_another_target() {
-        return MarkerTarget::Local {
-            work_dir: cwd_dir.to_string(),
-        };
+    ShipLookups::default().resolve(target, cwd_dir)
+}
+
+/// Most distinct (directory, target) pairs [`resolve_located_ships`] resolves
+/// (cadence-hooks#1152). Each costs git spawns and a marker read, so a flood
+/// of distinct `-R` values or `cd` targets would otherwise spawn git once per
+/// ship and blow the hook deadline.
+///
+/// Past the cap the rest are **not judged**: one
+/// [`MarkerTarget::CannotCheck`] stands in for all of them. That is safe
+/// because the polish gate is advisory and cannot-check is its sharpest
+/// nudge, so a capped command always nudges. It never goes silent, and never
+/// nudges less than judging every ship would.
+pub const MAX_JUDGED_SHIPS: usize = 32;
+
+/// Resolve every ship [`located_ship_segments`] found to the checkout its
+/// marker lives in (cadence-hooks#1152). Shared by `nudge-polish-before-pr`
+/// and `log-polish-nudge`, so the gate and its ledger judge the same targets
+/// (#177).
+///
+/// - Each distinct (directory, target) pair is resolved once, and each
+///   distinct result is returned once, in command order of its first ship.
+///   A repeat can only repeat its verdict, so dropping it changes neither
+///   the gate's sharpest verdict nor the ledger's all/any reading.
+/// - Git lookups are shared: one checkout-state read per directory, and one
+///   `git remote -v` per checkout and one `git worktree list` per (checkout,
+///   branch), however many ships and directories name them.
+/// - Past [`MAX_JUDGED_SHIPS`] distinct pairs, the rest are not judged and
+///   one [`MarkerTarget::CannotCheck`] is appended in their place.
+pub fn resolve_located_ships(ships: &[LocatedShip]) -> Vec<MarkerTarget> {
+    let mut lookups = ShipLookups::default();
+    let mut pairs: Vec<(Option<&str>, &ShipTarget)> = Vec::new();
+    let mut targets: Vec<MarkerTarget> = Vec::new();
+    for ship in ships {
+        let pair = (ship.work_dir.as_deref(), &ship.segment.target);
+        if pairs.contains(&pair) {
+            continue;
+        }
+        if pairs.len() == MAX_JUDGED_SHIPS {
+            targets.push(cannot_check(format!(
+                "the command ships more than {MAX_JUDGED_SHIPS} distinct targets, so only the first {MAX_JUDGED_SHIPS} were looked up"
+            )));
+            break;
+        }
+        pairs.push(pair);
+        let target = lookups.resolve(pair.1, pair.0);
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
     }
-    decide_ship_target(
-        target,
-        cwd_dir,
-        &cwd_branch,
-        || git_remotes(cwd_dir),
-        |branch| worktree_for_branch(cwd_dir, branch),
-    )
+    targets
+}
+
+/// The git reads [`resolve_ship_target`] makes, memoized for one hook run
+/// (cadence-hooks#1152). Nothing a hook run does moves a checkout's branch,
+/// remotes, or worktrees, so a cached answer is the answer a fresh spawn
+/// would give.
+///
+/// The checkout state is keyed by directory. Remotes and worktrees are keyed
+/// by the checkout root that state names, since every directory inside one
+/// checkout reads the same config, so `cd a && …; cd b && …` in one repo
+/// spawns `git remote -v` once, not once per directory.
+#[derive(Default)]
+struct ShipLookups {
+    /// Per directory: `None` outside any repo, else the checkout root and its
+    /// branch (`None` for a detached HEAD).
+    states: std::collections::HashMap<String, Option<(String, Option<String>)>>,
+    remotes: std::collections::HashMap<String, Vec<(String, String)>>,
+    worktrees: std::collections::HashMap<(String, String), Option<String>>,
+}
+
+impl ShipLookups {
+    fn resolve(&mut self, target: &ShipTarget, cwd_dir: Option<&str>) -> MarkerTarget {
+        let Some(cwd_dir) = cwd_dir else {
+            return MarkerTarget::Unknown;
+        };
+        let state = self
+            .states
+            .entry(cwd_dir.to_string())
+            .or_insert_with(|| {
+                GitState::resolve(Path::new(cwd_dir))
+                    .map(|state| (state.repo_root.to_string_lossy().into_owned(), state.branch))
+            })
+            .clone();
+        let Some((root, branch)) = state else {
+            return cannot_check(
+                "the command runs outside a git checkout, so the branch it ships cannot be looked up"
+                    .to_string(),
+            );
+        };
+        let Some(cwd_branch) = branch else {
+            return MarkerTarget::Unknown;
+        };
+        if !target.names_another_target() {
+            return MarkerTarget::Local {
+                work_dir: cwd_dir.to_string(),
+            };
+        }
+        let (remotes, worktrees) = (&mut self.remotes, &mut self.worktrees);
+        decide_ship_target(
+            target,
+            cwd_dir,
+            &cwd_branch,
+            || {
+                remotes
+                    .entry(root.clone())
+                    .or_insert_with(|| git_remotes(cwd_dir))
+                    .clone()
+            },
+            |branch| {
+                worktrees
+                    .entry((root.clone(), branch.to_string()))
+                    .or_insert_with(|| worktree_for_branch(cwd_dir, branch))
+                    .clone()
+            },
+        )
+    }
 }
 
 /// One anchoring segment of a ship command and the directory it is judged in
@@ -3580,5 +3673,45 @@ mod tests {
         assert_eq!(ships.len(), 2);
         // Debug build; the release bound is 0.5 s.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn resolve_located_ships_judges_each_pair_once_up_to_the_cap() {
+        // cadence-hooks#1152: repeats collapse before the count, each
+        // distinct result is returned once, and past MAX_JUDGED_SHIPS pairs
+        // one cannot-check stands in for the rest. Every directory here is
+        // outside any repo, so nothing spawns git.
+        let cwd = "/nonexistent-1152";
+        let subshells = |n: usize| {
+            (0..n)
+                .map(|i| format!("(cd d{i} && gh pr ready)"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let outside = cannot_check(
+            "the command runs outside a git checkout, so the branch it ships cannot be looked up"
+                .to_string(),
+        );
+        let capped = cannot_check(format!(
+            "the command ships more than {MAX_JUDGED_SHIPS} distinct targets, so only the first {MAX_JUDGED_SHIPS} were looked up"
+        ));
+        // Each subshell ship is judged in its `dN` and in the cwd.
+        for (command, cwd, want) in [
+            (
+                subshells(MAX_JUDGED_SHIPS - 1),
+                Some(cwd),
+                vec![outside.clone()],
+            ),
+            (
+                subshells(MAX_JUDGED_SHIPS),
+                Some(cwd),
+                vec![outside.clone(), capped],
+            ),
+            ("gh pr ready; ".repeat(500), Some(cwd), vec![outside]),
+            (subshells(100), None, vec![MarkerTarget::Unknown]),
+        ] {
+            let ships = located_ship_segments(&command, cwd);
+            assert_eq!(resolve_located_ships(&ships), want, "{command:.40}…");
+        }
     }
 }
