@@ -9,8 +9,8 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, command_word, contains_ignoring_ascii_case,
-    host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
+    LOOP_PATTERN, command_segments, command_word, host_and_repo_from_url, may_spell_word,
+    parse_work_dir, requote_words, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -2702,7 +2702,9 @@ impl Check for GhWriteGuard {
         // create` before either ran (cadence-hooks#488). The fold stops at this
         // filter: nouns, subcommand verbs, flags, and `-R owner/repo` operands
         // are all still matched case-sensitively downstream.
-        if !contains_ignoring_ascii_case(command, "gh") {
+        // Nor may it be stricter than the shell's word building: `$'\x67h'`
+        // and `g''h` run `gh` from text without the substring (#1103).
+        if !may_spell_word(command, "gh") {
             return CheckResult::allow();
         }
 
@@ -2862,7 +2864,10 @@ impl Check for GhWriteGuard {
                 continue;
             }
 
-            if !is_write_command(&segment) {
+            // The write patterns are raw-text regexes, so the decoded words
+            // are judged too: `gh $'issue' create` and `'gh' issue create` run
+            // the write while no raw `gh issue create` exists (#1103).
+            if !is_write_command(&segment) && !is_write_command(&requote_words(&segment)) {
                 continue;
             }
 
@@ -7152,5 +7157,38 @@ mod tests {
             run_case(&mut bad, command, false);
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn quoted_or_escaped_words_still_reach_the_write_check() {
+        // cadence-hooks#1103.
+        with_env(&owners_env_212(), || {
+            let blocked = [
+                "gh $'issue' create -R stranger/repo -t x -b y",
+                "gh issue $'create' -R stranger/repo -t x -b y",
+                r"$'\x67h' issue create -R stranger/repo -t x -b y",
+                "'gh' issue create -R stranger/repo -t x -b y",
+                "g''h issue create -R stranger/repo -t x -b y",
+                "gh $'repo' delete stranger/repo --yes",
+            ];
+            for command in blocked {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+            }
+            let allowed = [
+                "git commit -m 'gh issue create -R stranger/repo'",
+                "gh $'issue' list -R stranger/repo",
+            ];
+            for command in allowed {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
+            }
+        });
     }
 }

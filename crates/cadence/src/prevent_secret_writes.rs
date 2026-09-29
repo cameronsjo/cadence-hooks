@@ -11,7 +11,8 @@ use crate::secret_patterns::{
     is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, redirect_targets, skip_git_global_options, tokenize,
+    command_segments, command_word, redirect_targets, skip_git_global_options,
+    strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -192,15 +193,30 @@ fn matched_secret_write_target(command: &str) -> Option<String> {
     // `sh -c '…'` is still seen. Targets are judged by the shared
     // component-based classifier, so `settings.environment` stays clean (#86).
     for segment in command_segments(command) {
-        if let Some(target) = redirect_targets(&segment)
-            .iter()
-            .chain(writer_targets(&segment).iter())
+        // A group closer glued to the last word — `{ (cp x .env)}`, `{ (echo
+        // hi > .env)}` — reads as the target `.env)}` while bash writes
+        // `.env` (cameronsjo/cadence-hooks#1103). The wrapper-stripped view is
+        // judged as well; it only adds candidates.
+        let trimmed = segment.trim();
+        let unwrapped = strip_group_wrappers(trimmed);
+        let unwrapped = (trimmed.starts_with(['(', '{']) && unwrapped != trimmed)
+            .then(|| unwrapped.to_string());
+        let candidates: Vec<String> = std::iter::once(&segment)
+            .chain(unwrapped.as_ref())
+            .flat_map(|view| {
+                redirect_targets(view)
+                    .into_iter()
+                    .chain(writer_targets(view))
+            })
+            .collect();
+        if let Some(target) = candidates
+            .into_iter()
             // Every token here is a redirection target or a writer verb's
             // operand, so the shell has already told us it names a file — the
             // `<name>.env` shape applies without further qualification.
             .find(|t| is_dangerous_secret_token_at(t, Filename::Known))
         {
-            return Some(target.clone());
+            return Some(target);
         }
     }
 
@@ -1679,5 +1695,51 @@ mod tests {
         // assertions above are evidence about the escape branch, not the
         // parser generally.
         assert!(bash_targets_env_file(r#"echo TOKEN > "my dir/.env""#));
+    }
+
+    #[test]
+    fn decoded_and_unwrapped_write_targets_block() {
+        // cadence-hooks#1103: an ANSI-C redirect target, a group closer glued
+        // to the target, and a backslash the shell removes.
+        let blocked = [
+            r"echo hi > $'.en\x76'",
+            r"echo hi > $'\056env'",
+            r"echo hi >> $'\x2e'env",
+            "{ (echo hi > .env)}",
+            "{ (cp x .env)}",
+            r"echo hi > .e\nv",
+        ];
+        for command in blocked {
+            assert!(bash_targets_env_file(command), "{command}");
+        }
+        let allowed = [
+            "echo hi > $'notes.txt'",
+            "echo hi > $'.env.example'",
+            "{ (cp x notes.txt)}",
+            r"echo hi > my\ notes.txt",
+        ];
+        for command in allowed {
+            assert!(!bash_targets_env_file(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn padded_assignment_chain_blocks_within_the_hook_deadline() {
+        // cadence-hooks#1114 item 1: every `$` searched every earlier
+        // assignment, so a 200 KB chain took 9.9 s and the guard failed open.
+        let mut command = String::new();
+        let mut n = 0;
+        while command.len() < 200_000 {
+            n += 1;
+            command.push_str(&format!("D{n}=$(x y);"));
+        }
+        command.push_str(" rm $D1/.env");
+        let start = std::time::Instant::now();
+        let result = SecretWritesGuard::default().run(&make_bash(&command));
+        let elapsed = start.elapsed();
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        // Release is the shipped profile; debug builds get headroom.
+        let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
+        assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
     }
 }

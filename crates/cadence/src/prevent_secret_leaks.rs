@@ -16,7 +16,7 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, is_assignment_word, skip_git_global_options,
-    split_segments, strip_heredoc_bodies, tokenize,
+    split_segments, strip_group_wrappers, strip_heredoc_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -598,6 +598,20 @@ fn segment_env_reads_at(
         let _live = LiveScope::set(substitutions_live(segment));
         segment_direct_reads(&tokens, context)
     };
+    // A group closer glued to the last word — `{ (cat .env)}` — tokenizes as
+    // `.env)}`, a name no secret pattern matches, while bash reads `.env`
+    // (cameronsjo/cadence-hooks#1103). Judge the wrapper-stripped view too; the
+    // union only adds operands, so the raw view's findings all stand.
+    let trimmed = segment.trim();
+    let unwrapped = strip_group_wrappers(trimmed);
+    if trimmed.starts_with(['(', '{']) && unwrapped != trimmed {
+        let _live = LiveScope::set(substitutions_live(unwrapped));
+        for read in segment_direct_reads(&tokenize(unwrapped), context) {
+            if !found.contains(&read) {
+                found.push(read);
+            }
+        }
+    }
     if depth < NESTED_SCAN_DEPTH {
         for script in nested_command_strings(&tokens) {
             if !budget.spend(&script) {
@@ -8457,6 +8471,43 @@ mod tests {
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,
                 "{command:?} must allow"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_c_group_glued_and_escaped_reads_block() {
+        // cadence-hooks#1103 rows, re-verified after #1097.
+        let blocked = [
+            r"cat $'.en\x76'",
+            r"cat $'\056env'",
+            r"cat $'\x2eenv'",
+            "cat $'.e'nv",
+            r#"cat $'\x2e'"env""#,
+            r"sh -c $'cat \x2eenv'",
+            "{ (cat .env)}",
+            "( (cat .env))",
+            r"cat .e\nv",
+        ];
+        for command in blocked {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let allowed = [
+            "{ (cat notes.txt)}",
+            "{ cat .env.example;}",
+            r"cat notes\ file.txt",
+        ];
+        for command in allowed {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
             );
         }
     }

@@ -11,7 +11,9 @@
 //! subcommand is the first non-flag token, so an unlisted global flag
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
-use cadence_hooks_core::shell::{command_segments, parse_work_dir, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, may_spell_word, parse_work_dir, tokenize, unescape_word,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Protected branch names that trigger blocks instead of warnings.
@@ -61,7 +63,15 @@ fn is_git_word(token: &str) -> bool {
 /// directly (not a re-joined string), or a quoted span with internal spaces
 /// would re-fragment and defeat the quote-awareness.
 fn normalize_git_command(command: &str) -> Vec<String> {
-    let tokens = tokenize(&command.to_lowercase());
+    // An unquoted backslash is removed by the shell — `g\it push` runs `git
+    // push` — but [`tokenize`] keeps it outside quotes, so every word is
+    // unescaped before matching (#1103). A backslash quoted into a word
+    // (`'g\it'`) is also dropped: a command named that way over-blocks, which
+    // is the direction this guard may err in.
+    let tokens: Vec<String> = tokenize(&command.to_lowercase())
+        .iter()
+        .map(|t| unescape_word(t).into_owned())
+        .collect();
     let mut result: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
     let mut seen_git = false;
@@ -135,6 +145,20 @@ fn is_force_flag(token: &str) -> bool {
         )
 }
 
+/// The refspec a `+`-prefixed push argument forces, or `None` for any other
+/// argument. A leading `+` is git's per-ref force: `git push origin +main`
+/// overwrites `main` exactly as `--force` would, with no flag anywhere in the
+/// argv for [`is_force_flag`] to see (cameronsjo/cadence-hooks#1103).
+fn forced_refspec(token: &str) -> Option<&str> {
+    token.strip_prefix('+').filter(|rest| !rest.is_empty())
+}
+
+/// True when a push argument names a protected branch as its destination —
+/// bare (`main`, `refs/heads/main`) or as a refspec's destination (`HEAD:main`).
+fn names_protected_destination(token: &str) -> bool {
+    is_protected_branch(push_target_branch(token)) || is_refspec_to_protected_branch(token)
+}
+
 /// Strip a `refs/heads/` prefix from a standalone push target so fully
 /// qualified refs (`refs/heads/main`) match protected branch names (#71).
 fn push_target_branch(token: &str) -> &str {
@@ -164,7 +188,7 @@ fn force_pushes_bare_head(tokens: &[&str]) -> bool {
         return false;
     }
     let args = &tokens[git_pos + 2..];
-    args.iter().any(|a| is_force_flag(a)) && args.contains(&"head")
+    (args.iter().any(|a| is_force_flag(a)) && args.contains(&"head")) || args.contains(&"+head")
 }
 
 /// Current-branch resolution for bare-`HEAD` force pushes.
@@ -290,12 +314,22 @@ impl GitSafetyGuard {
         let has_force = args.iter().any(|a| is_force_flag(a));
         let has_delete = args.iter().any(|a| *a == "--delete" || *a == "-d");
 
+        // A `+` refspec forces that one ref with no force flag in sight:
+        // `git push origin +main` and `+HEAD:main` rewrite `main` (#1103).
+        if args
+            .iter()
+            .filter_map(|a| forced_refspec(a))
+            .any(names_protected_destination)
+        {
+            return Some("Force push via + refspec to protected branch".into());
+        }
+        let forces_head = (has_force && args.contains(&"head")) || args.contains(&"+head");
+
         // Check for force push to protected branch
-        if has_force {
+        if has_force || forces_head {
             // Check if any arg is a protected branch name
-            let targets_protected = args.iter().any(|a| {
-                is_protected_branch(push_target_branch(a)) || is_refspec_to_protected_branch(a)
-            });
+            let targets_protected =
+                has_force && args.iter().any(|a| names_protected_destination(a));
             if targets_protected {
                 return Some("Force push to protected branch".into());
             }
@@ -310,7 +344,7 @@ impl GitSafetyGuard {
             // through to the routine force-push nudge: `git push --force
             // origin HEAD` on a feature branch is normal rebase workflow and
             // is never statically blocked.
-            if args.contains(&"head") {
+            if forces_head {
                 match current_branch {
                     Some(BranchResolution::Branch(branch)) if is_protected_branch(branch) => {
                         return Some("Force push of HEAD while on protected branch".into());
@@ -495,7 +529,9 @@ impl GitSafetyGuard {
 
         match subcommand {
             "push" => {
-                let has_force = args.iter().any(|a| is_force_flag(a));
+                let has_force = args
+                    .iter()
+                    .any(|a| is_force_flag(a) || forced_refspec(a).is_some());
                 if has_force {
                     return Some("Force push (non-protected branch)".into());
                 }
@@ -592,7 +628,10 @@ impl Check for GitSafetyGuard {
             return CheckResult::allow();
         };
 
-        if !command.to_lowercase().contains("git") {
+        // A fast path only: the shell can build `git` from text that does not
+        // contain it (`$'\x67it'`, `g''it`, `g\it`), so the skip is taken only
+        // when the command carries none of that syntax (#1103).
+        if !may_spell_word(command, "git") {
             return CheckResult::allow();
         }
 
@@ -1903,5 +1942,54 @@ mod tests {
         // Review M1: batch refs are invisible — surface, don't silently allow.
         let result = GitSafetyGuard.run(&make_bash_input("git update-ref --stdin"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn word_building_spellings_reach_the_push_checks() {
+        // cadence-hooks#1103: the raw `contains("git")` fast path bailed before
+        // the tokenizer decoded these, and a `+` refspec forces with no flag.
+        let blocked = [
+            r"$'\x67it' push --force origin main",
+            "$'git' push --force origin main",
+            "g''it push --force origin main",
+            r"g\it push --force origin main",
+            r"git pu\sh --force origin main",
+            "git push origin +main",
+            "git push origin +refs/heads/main",
+            "git push origin +HEAD:main",
+            "git push origin +feature:master",
+        ];
+        for command in blocked {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let nudged = ["git push origin +feature"];
+        for command in nudged {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{command}"
+            );
+        }
+        let allowed = [
+            "git push origin main",
+            "git push origin feature",
+            "echo 'git push --force origin main'",
+            "echo $'git push --force origin main'",
+            "ls -la",
+        ];
+        for command in allowed {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
     }
 }

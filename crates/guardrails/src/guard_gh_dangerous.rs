@@ -9,8 +9,8 @@
 //! you own, because there is no undo.
 
 use cadence_hooks_core::shell::{
-    command_segments, command_word, contains_ignoring_ascii_case, fold_verb, heredoc_introducers,
-    logical_lines, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
+    command_segments, command_word, fold_verb, heredoc_introducers, logical_lines, may_spell_word,
+    requote_words, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -288,7 +288,10 @@ impl Check for GhDangerousGuard {
         // the shell runs, `REPO DELETE` is not (cadence-hooks#488). A
         // lowercase-only `contains` here silently defeated the folded patterns
         // below — the fast path rejected the command before they ever ran.
-        if !contains_ignoring_ascii_case(command, "gh") {
+        //
+        // Nor may it be stricter than the shell's word building: `$'\x67h'`
+        // and `g''h` run `gh` from text without the substring (#1103).
+        if !may_spell_word(command, "gh") {
             return CheckResult::allow();
         }
 
@@ -300,8 +303,17 @@ impl Check for GhDangerousGuard {
         // over a different segment.
         let segments = command_segments(command);
         for segment in &segments {
+            // Also judged from the DECODED words: `gh $'repo' delete`,
+            // `'gh' repo delete` and `$'\x67h' repo delete` all run the delete,
+            // but a quote around any one word hid the phrase from the regex
+            // over the raw text (#1103). A quoted phrase stays quoted in the
+            // re-spelling, so the prose exemption holds.
             let stripped = strip_quotes(segment);
-            if let Some(m) = GH_REPO_DELETE.find(&stripped) {
+            let decoded = strip_quotes(&requote_words(segment));
+            if let Some(m) = GH_REPO_DELETE
+                .find(&stripped)
+                .or_else(|| GH_REPO_DELETE.find(&decoded))
+            {
                 return CheckResult::block(crate::messages::repo_delete_blocked_message(
                     m.as_str().trim(),
                 ));
@@ -1095,5 +1107,42 @@ mod tests {
             outcome("bash -c 'echo hi' 'gh repo delete o/r --yes'"),
             cadence_hooks_core::Outcome::Block
         );
+    }
+
+    #[test]
+    fn quoted_or_escaped_words_still_reach_the_repo_delete_check() {
+        // cadence-hooks#1103: a quote around any single word hid the phrase
+        // from the raw-text regex, and `$'\x67h'` from the `gh` fast path.
+        let blocked = [
+            "gh $'repo' delete stranger/repo --yes",
+            "gh repo $'delete' stranger/repo --yes",
+            r"$'\x67h' repo delete stranger/repo --yes",
+            "'gh' repo delete stranger/repo --yes",
+            "g''h repo delete stranger/repo --yes",
+            r"g\h repo delete stranger/repo --yes",
+            r#"gh "repo" delete stranger/repo --yes"#,
+        ];
+        for command in blocked {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let allowed = [
+            r#"echo "gh repo delete is dangerous""#,
+            "echo $'gh repo delete is dangerous'",
+            "git commit -m 'gh repo delete x'",
+            r#"echo "it's" && gh repo list"#,
+        ];
+        for command in allowed {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
     }
 }

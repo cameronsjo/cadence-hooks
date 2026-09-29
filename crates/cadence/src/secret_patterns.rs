@@ -430,6 +430,17 @@ pub fn is_dangerous_secret_name_at(token: &str, position: Filename) -> bool {
 }
 
 fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
+    // The shell removes an unquoted backslash — `cat .e\nv` reads `.env` —
+    // but the tokenizer keeps it outside quotes, so the unescaped spelling is
+    // judged as well (cameronsjo/cadence-hooks#1103). Additive only: the
+    // escaped form is still judged below, and a quoted backslash dropped here
+    // can only over-block.
+    if token.contains('\\') {
+        let unescaped = cadence_hooks_core::shell::unescape_word(token);
+        if unescaped != token && secret_token_verdict(&unescaped, position, globs) {
+            return true;
+        }
+    }
     // Checked before any brace or glob analysis, both of which grow with the
     // token: a 100 KB `{{{…` took seconds (#1097 review). Nothing legitimate
     // needs a 4 KiB word with glob syntax in it.
