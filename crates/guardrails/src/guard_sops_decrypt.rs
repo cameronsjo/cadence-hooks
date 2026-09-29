@@ -47,6 +47,17 @@
 //! the listed literals, and the trust model is the same as running the repo's
 //! own scripts. No file means no change in behavior.
 //!
+//! **The list and every script it names are read from what is COMMITTED, never
+//! from the working tree**, so the session cannot vouch for itself by writing
+//! the file or editing a listed script. The list is the blob at
+//! `HEAD:.cadence/sops-consumers` (bounded `git show`); if the working-tree
+//! copy is absent or differs from that blob in any way, the whole list is
+//! ignored and the block message says so. A listed script vouches only while it
+//! is tracked and clean (`git ls-files` non-empty, `git status --porcelain`
+//! empty for that path). Any git failure, timeout or ambiguity means no vouch.
+//! A command containing `cd`/`pushd`/`popd` vouches for nothing, because the
+//! guard does not track the directory the script operand resolves in.
+//!
 //! **Every other disposition of the plaintext is refused**, including a bare
 //! decrypt (stdout *is* the transcript) and a redirect to a file.
 //!
@@ -80,9 +91,9 @@
 
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_word,
-    peel_command_runners, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
-    tokenize,
+    MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_segments,
+    command_word, peel_command_runners, skip_transparent_prefixes, split_segments_with_ops,
+    strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -124,19 +135,101 @@ fn parse_repo_consumers(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Read the vouched-consumer list for the repo enclosing `cwd`, or empty.
-fn load_repo_consumers(cwd: Option<&str>) -> Vec<String> {
-    let Some(state) = cwd.and_then(|c| GitState::resolve(std::path::Path::new(c))) else {
-        return Vec::new();
-    };
-    let path = state.repo_root.join(REPO_CONSUMERS_FILE);
-    match std::fs::metadata(&path) {
-        Ok(m) if m.is_file() && m.len() <= MAX_CONSUMERS_FILE_BYTES => {}
-        _ => return Vec::new(),
+/// What the guard may vouch for in this repo, decided from committed state.
+#[derive(Default)]
+struct Vouch {
+    /// Exact repo-relative script paths from the committed list.
+    list: Vec<String>,
+    /// Repo root the paths are relative to (git is run there).
+    root: String,
+    /// The working-tree copy of the list exists but was not honoured
+    /// (uncommitted, modified, or deleted relative to HEAD).
+    ignored_uncommitted_list: bool,
+    /// The command changes directory, so operands cannot be resolved.
+    cd_in_command: bool,
+    /// The session cwd is the repo root, so a typed operand is repo-relative.
+    at_root: bool,
+}
+
+impl Vouch {
+    /// True when `operand` names a listed script that is tracked and clean.
+    fn vouches(&self, operand: &str) -> bool {
+        if self.cd_in_command || !self.at_root || self.list.is_empty() {
+            return false;
+        }
+        let path = operand.strip_prefix("./").unwrap_or(operand);
+        if !self.list.iter().any(|entry| entry == path) {
+            return false;
+        }
+        script_is_committed_and_clean(&self.root, path)
     }
-    std::fs::read_to_string(&path)
-        .map(|t| parse_repo_consumers(&t))
-        .unwrap_or_default()
+}
+
+/// Tracked, and identical to HEAD in index and working tree. Anything else,
+/// including a git failure or timeout, is "no".
+fn script_is_committed_and_clean(root: &str, path: &str) -> bool {
+    use cadence_hooks_core::shell::{GitOutput, git_output_detailed};
+    let tracked = matches!(
+        git_output_detailed(root, &["ls-files", "--error-unmatch", "--", path]),
+        GitOutput::Ok(out) if !out.is_empty()
+    );
+    tracked
+        && matches!(
+            git_output_detailed(root, &["status", "--porcelain", "--", path]),
+            GitOutput::Ok(out) if out.is_empty()
+        )
+}
+
+/// True when any segment's command word is a directory change.
+fn command_changes_directory(command: &str) -> bool {
+    command_segments(command).iter().any(|segment| {
+        tokenize(segment)
+            .first()
+            .is_some_and(|t| matches!(command_word(t).as_ref(), "cd" | "pushd" | "popd"))
+    })
+}
+
+/// Build the [`Vouch`] for the repo enclosing `cwd`: the list from
+/// `HEAD:.cadence/sops-consumers`, honoured only when the working-tree copy
+/// equals it.
+fn load_vouch(cwd: Option<&str>, command: &str) -> Vouch {
+    use cadence_hooks_core::shell::{GitOutput, git_output_detailed};
+    let Some(state) = cwd.and_then(|c| GitState::resolve(std::path::Path::new(c))) else {
+        return Vouch::default();
+    };
+    let root = state.repo_root.to_string_lossy().into_owned();
+    let path = state.repo_root.join(REPO_CONSUMERS_FILE);
+    let worktree = match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_CONSUMERS_FILE_BYTES => {
+            std::fs::read_to_string(&path).ok()
+        }
+        _ => None,
+    };
+    let committed =
+        match git_output_detailed(&root, &["show", &format!("HEAD:{REPO_CONSUMERS_FILE}")]) {
+            GitOutput::Ok(text) => Some(text),
+            _ => None,
+        };
+    let same = match (&worktree, &committed) {
+        (Some(w), Some(c)) => w.trim() == c.trim(),
+        _ => false,
+    };
+    if !same {
+        return Vouch {
+            root,
+            ignored_uncommitted_list: worktree.is_some() || committed.is_some() || path.exists(),
+            ..Vouch::default()
+        };
+    }
+    Vouch {
+        list: parse_repo_consumers(committed.as_deref().unwrap_or("")),
+        root,
+        ignored_uncommitted_list: false,
+        cd_in_command: command_changes_directory(command),
+        at_root: cwd
+            .and_then(|c| std::fs::canonicalize(c).ok())
+            .is_some_and(|c| c == state.repo_root),
+    }
 }
 
 /// Shell command words that run their `-c`/script argument as the real command.
@@ -146,10 +239,16 @@ const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
 /// Blocks a `sops` decrypt whose plaintext is not consumed by an allowed tool.
 pub struct SopsDecryptGuard;
 
-fn block_message(found: &str) -> String {
+fn block_message(found: &str, ignored_list: bool) -> String {
+    let ignored = if ignored_list {
+        "Note: uncommitted changes to .cadence/sops-consumers are ignored; only the committed list counts.\n   "
+    } else {
+        ""
+    };
     format!(
         "🚫 guard-sops-decrypt: decrypted secret would reach the transcript\n   \
          Found: `{found}`\n   \
+         {ignored}\
          Why the allowlist is exact: the only consumers vouched for are exact literals \
          (`secret-keys.sh`, `curl --config -`, and script paths a repo lists in \
          `.cadence/sops-consumers`); nothing composes, so `sed`/`grep`/a new script name \
@@ -195,7 +294,7 @@ fn render_found(segment: &str, consumer: Option<&str>) -> String {
 /// own segment list, on the shared [`MAX_WRAPPER_DEPTH`] budget — so a decrypt
 /// hidden inside a substitution or a wrapper is still seen, and a `&&`/`;`
 /// chain is walked to its end rather than judged on its first command.
-fn first_unsafe_decrypt(script: &str, depth: usize, vouched: &[String]) -> Option<String> {
+fn first_unsafe_decrypt(script: &str, depth: usize, vouched: &Vouch) -> Option<String> {
     let segments = split_segments_with_ops(script);
 
     for (index, (segment, op)) in segments.iter().enumerate() {
@@ -312,7 +411,7 @@ fn writes_elsewhere(token: &str) -> bool {
 /// Exactly two built-in members (plus the repo's own vouched scripts), and an unrecognized consumer is refused — that is the
 /// allowlist property, and it is what makes a tool nobody anticipated
 /// (`xxd`, `bat`, a future pager) refuse by default rather than by enumeration.
-fn consumer_is_allowed(segment: &str, vouched: &[String]) -> bool {
+fn consumer_is_allowed(segment: &str, vouched: &Vouch) -> bool {
     let stripped = strip_group_wrappers(segment);
     let tokens = tokenize(stripped);
     let argv = skip_transparent_prefixes(&tokens);
@@ -332,12 +431,7 @@ fn consumer_is_allowed(segment: &str, vouched: &[String]) -> bool {
     } else {
         Some(first)
     };
-    target.is_some_and(|path| {
-        KEY_NAME_TOOLS.contains(&basename(path))
-            || vouched
-                .iter()
-                .any(|v| v == path.strip_prefix("./").unwrap_or(path))
-    })
+    target.is_some_and(|path| KEY_NAME_TOOLS.contains(&basename(path)) || vouched.vouches(path))
 }
 
 /// This `curl` reads its configuration — and therefore the secret — from
@@ -379,7 +473,7 @@ impl Check for SopsDecryptGuard {
         // unexpanded, so a decrypt it builds (`{sops,-d,…}`) is invisible:
         // refuse rather than judge a command this guard cannot see
         // (cadence-hooks#1096). No real command comes near the bounds.
-        let vouched = load_repo_consumers(input.cwd.as_deref());
+        let vouched = load_vouch(input.cwd.as_deref(), command);
         let found = first_unsafe_decrypt(command, 0, &vouched).or_else(|| {
             (command.contains('{') && brace_expansion_overflows(command)).then(|| {
                 "a brace expansion too large to model, which can hide a decrypt".to_string()
@@ -396,7 +490,7 @@ impl Check for SopsDecryptGuard {
             return CheckResult::allow_bypassed(env_switch(ESCAPE_ENV));
         }
 
-        CheckResult::block(block_message(&found))
+        CheckResult::block(block_message(&found, vouched.ignored_uncommitted_list))
     }
 }
 
@@ -408,7 +502,7 @@ mod tests {
     fn escape_hint_says_where_the_override_is_read() {
         // #975: the override is read from the hook's environment, so the
         // message must not imply an inline `VAR=1 cmd` prefix works.
-        let msg = block_message("sops -d x | cat");
+        let msg = block_message("sops -d x | cat", false);
         // Personal scopes only: a shared .claude/settings.json would commit the
         // bypass for every teammate (review on #1017).
         assert!(msg.contains(".claude/settings.local.json"), "{msg}");
@@ -1025,72 +1119,222 @@ mod tests {
         );
     }
 
-    fn repo_with_list(list: Option<&str>) -> tempfile::TempDir {
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A real repo with `scripts/check.sh` and (when given) the list committed
+    /// (`commit_list`) or only written to the working tree.
+    fn repo(list: Option<&str>, commit_list: bool) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        std::fs::create_dir_all(p.join("scripts")).unwrap();
+        std::fs::write(p.join("scripts/check.sh"), "echo keys\n").unwrap();
+        git(p, &["add", "scripts/check.sh"]);
         if let Some(list) = list {
-            std::fs::create_dir_all(dir.path().join(".cadence")).unwrap();
-            std::fs::write(dir.path().join(REPO_CONSUMERS_FILE), list).unwrap();
+            std::fs::create_dir_all(p.join(".cadence")).unwrap();
+            std::fs::write(p.join(REPO_CONSUMERS_FILE), list).unwrap();
+            if commit_list {
+                git(p, &["add", REPO_CONSUMERS_FILE]);
+            }
         }
+        git(p, &["commit", "-q", "-m", "init"]);
         dir
     }
 
+    fn verdict(repo: &tempfile::TempDir, command: &str) -> (Outcome, String) {
+        let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
+            command,
+            repo.path().to_str().unwrap(),
+        );
+        let r = SopsDecryptGuard.run(&input);
+        (r.outcome, r.message.unwrap_or_default())
+    }
+
+    const PIPE: &str = "sops -d s.yaml | bash scripts/check.sh";
+
     #[test]
     fn a_repo_listed_script_is_a_vouched_consumer_and_nothing_else_is() {
-        let listed = repo_with_list(Some("scripts/check.sh\n"));
-        let unlisted = repo_with_list(None);
-        // (repo, command, blocks)
+        let committed = repo(Some("scripts/check.sh\n"), true);
+        let unlisted = repo(None, false);
         let table = [
-            (&listed, "sops -d s.yaml | bash scripts/check.sh", false),
-            (&listed, "sops -d s.yaml | bash ./scripts/check.sh", false),
-            (&listed, "sops -d s.yaml | bash -x scripts/check.sh", false),
-            (&listed, "sops -d s.yaml | scripts/check.sh", false),
-            // Exact literal: neighbours, prefixes, other spellings, globs.
-            (&listed, "sops -d s.yaml | bash scripts/check.sh.bak", true),
-            (&listed, "sops -d s.yaml | bash scripts/other.sh", true),
+            (&committed, PIPE, false),
             (
-                &listed,
+                &committed,
+                "sops -d s.yaml | bash ./scripts/check.sh",
+                false,
+            ),
+            (
+                &committed,
+                "sops -d s.yaml | bash -x scripts/check.sh",
+                false,
+            ),
+            (&committed, "sops -d s.yaml | scripts/check.sh", false),
+            // Exact literal: neighbours, prefixes, other spellings.
+            (
+                &committed,
+                "sops -d s.yaml | bash scripts/check.sh.bak",
+                true,
+            ),
+            (&committed, "sops -d s.yaml | bash scripts/other.sh", true),
+            (
+                &committed,
                 "sops -d s.yaml | bash scripts/../scripts/check.sh",
                 true,
             ),
-            (&listed, "sops -d s.yaml | bash /abs/scripts/check.sh", true),
-            (&listed, "sops -d s.yaml | bash -c 'cat'", true),
-            (&listed, "sops -d s.yaml | grep x", true),
+            (
+                &committed,
+                "sops -d s.yaml | bash /abs/scripts/check.sh",
+                true,
+            ),
+            (&committed, "sops -d s.yaml | bash -c 'cat'", true),
+            (&committed, "sops -d s.yaml | grep x", true),
+            // A directory change means the operand cannot be resolved.
+            (
+                &committed,
+                "cd /tmp && sops -d s.yaml | bash scripts/check.sh",
+                true,
+            ),
             // No list file: no change in behavior.
-            (&unlisted, "sops -d s.yaml | bash scripts/check.sh", true),
+            (&unlisted, PIPE, true),
         ];
         without_escape(|| {
             for (repo, command, blocks) in table {
-                let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
-                    command,
-                    repo.path().to_str().unwrap(),
-                );
                 let want = if blocks {
                     Outcome::Block
                 } else {
                     Outcome::Allow
                 };
-                assert_eq!(SopsDecryptGuard.run(&input).outcome, want, "{command}");
+                assert_eq!(verdict(repo, command).0, want, "{command}");
             }
+        });
+    }
+
+    /// The self-vouching hole: only committed, unmodified state counts.
+    #[test]
+    fn only_committed_unmodified_state_vouches() {
+        // (name, fixture, expect block, expect the "ignored" note)
+        let table: Vec<(&str, tempfile::TempDir, bool, bool)> = vec![
+            (
+                "file only in the working tree",
+                repo(Some("scripts/check.sh\n"), false),
+                true,
+                true,
+            ),
+            (
+                "committed and unchanged",
+                repo(Some("scripts/check.sh\n"), true),
+                false,
+                false,
+            ),
+            (
+                "committed but dirty",
+                {
+                    let r = repo(Some("scripts/check.sh\n"), true);
+                    std::fs::write(
+                        r.path().join(REPO_CONSUMERS_FILE),
+                        "scripts/check.sh\nscripts/evil.sh\n",
+                    )
+                    .unwrap();
+                    r
+                },
+                true,
+                true,
+            ),
+            (
+                "committed but deleted in the working tree",
+                {
+                    let r = repo(Some("scripts/check.sh\n"), true);
+                    std::fs::remove_file(r.path().join(REPO_CONSUMERS_FILE)).unwrap();
+                    r
+                },
+                true,
+                true,
+            ),
+            (
+                "listed script dirty",
+                {
+                    let r = repo(Some("scripts/check.sh\n"), true);
+                    std::fs::write(r.path().join("scripts/check.sh"), "echo $SECRET\n").unwrap();
+                    r
+                },
+                true,
+                false,
+            ),
+            (
+                "listed script dirty in the index only",
+                {
+                    let r = repo(Some("scripts/check.sh\n"), true);
+                    std::fs::write(r.path().join("scripts/check.sh"), "echo $SECRET\n").unwrap();
+                    git(r.path(), &["add", "scripts/check.sh"]);
+                    r
+                },
+                true,
+                false,
+            ),
+            (
+                "listed script untracked",
+                {
+                    let r = repo(Some("scripts/check.sh\nscripts/new.sh\n"), true);
+                    std::fs::write(r.path().join("scripts/new.sh"), "echo hi\n").unwrap();
+                    r
+                },
+                false,
+                false,
+            ), // check.sh (clean) still vouches; new.sh is asserted below
+        ];
+        without_escape(|| {
+            for (name, fixture, blocks, note) in &table {
+                let (outcome, msg) = verdict(fixture, PIPE);
+                let want = if *blocks {
+                    Outcome::Block
+                } else {
+                    Outcome::Allow
+                };
+                assert_eq!(outcome, want, "{name}");
+                if *blocks {
+                    assert_eq!(
+                        msg.contains("uncommitted changes to .cadence/sops-consumers are ignored"),
+                        *note,
+                        "{name}: {msg}"
+                    );
+                }
+            }
+            // The untracked-but-listed script does not vouch.
+            let (_, fixture, _, _) = &table[6];
+            assert_eq!(
+                verdict(fixture, "sops -d s.yaml | bash scripts/new.sh").0,
+                Outcome::Block
+            );
         });
     }
 
     #[test]
     fn a_glob_entry_vouches_for_nothing() {
-        let repo = repo_with_list(Some("scripts/*.sh\n"));
+        let repo = repo(Some("scripts/*.sh\n"), true);
         without_escape(|| {
-            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
-                "sops -d s.yaml | bash scripts/a.sh",
-                repo.path().to_str().unwrap(),
-            );
-            assert_eq!(SopsDecryptGuard.run(&input).outcome, Outcome::Block);
+            assert_eq!(verdict(&repo, PIPE).0, Outcome::Block);
         });
     }
 
     #[test]
     fn block_message_says_the_allowlist_is_exact_and_points_to_the_terminal() {
-        let msg = block_message("sops -d x | cat");
+        let msg = block_message("sops -d x | cat", false);
         assert!(msg.contains("exact literal"), "{msg}");
         assert!(msg.contains("operator's own terminal"), "{msg}");
         assert!(msg.contains(".cadence/sops-consumers"), "{msg}");
