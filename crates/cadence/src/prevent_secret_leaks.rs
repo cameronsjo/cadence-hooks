@@ -886,6 +886,13 @@ fn segment_direct_reads(tokens: &[String], context: ScanContext) -> Vec<(String,
                     return Some(value);
                 }
             }
+            if cmd_word == "jq"
+                && let Some(value) = attached_option_values(t)
+                    .into_iter()
+                    .find_map(|v| dangerous_secret_operand(v, Filename::Known))
+            {
+                return Some(value);
+            }
             dangerous_secret_operand(t, position)
         })
         .map(|value| (cmd_word.to_string(), value.to_string()))
@@ -1266,7 +1273,13 @@ fn secret_input_redirections(tokens: &[String]) -> Vec<&str> {
                     found.push(value);
                 }
             }
-            None => {}
+            // `git column<.env`: the operator is glued to a word (#1054).
+            None => found.extend(
+                glued_operands(token, Filename::Unqualified)
+                    .into_iter()
+                    .filter(|&(_, position)| position == Filename::Known)
+                    .filter_map(|(piece, _)| dangerous_secret_operand(piece, Filename::Known)),
+            ),
         }
     }
     found
@@ -1845,6 +1858,89 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 /// the substitution can be shown to produce; anything else keeps the firewall.
 fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
     let value = attached_input_redirection_target(token).unwrap_or(token);
+    whole_word_secret(value, position).or_else(|| {
+        glued_operands(value, position)
+            .into_iter()
+            .find_map(|(piece, position)| whole_word_secret(piece, position))
+    })
+}
+
+/// The words the shell reads out of one whitespace-free token that glues a
+/// redirection to a word with no space between (#1054): `cat<.env`,
+/// `jq .x<.env`, `cat .env>/tmp/x`.
+///
+/// - the text before the first `<` or `>`, judged where the token sat;
+/// - the text after each `<` or `<>` operator, a file the shell opens for
+///   reading. `<<`, `<<<`, `<&`, and every `>` form are skipped: a heredoc
+///   delimiter or here-string is text, an fd duplication names no file, and
+///   an output target is `prevent-secret-writes`' shape.
+///
+/// Prose never reaches this: a token carrying whitespace or a substitution
+/// is left to [`whole_word_secret`] alone, so a quoted `"see <.env> docs"`
+/// keeps the firewall. Splitting can only add candidates to judge, never
+/// remove the whole token from judgment.
+fn glued_operands(token: &str, position: Filename) -> Vec<(&str, Filename)> {
+    if token.chars().any(char::is_whitespace) || token.contains('`') || token.contains("$(") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let head_end = token.find(['<', '>']).unwrap_or(token.len());
+    let head = &token[..head_end];
+    if head_end < token.len() && !head.is_empty() {
+        out.push((head, position));
+    }
+    let mut rest = &token[head_end..];
+    while !rest.is_empty() {
+        let op_len = rest
+            .find(|c: char| !matches!(c, '<' | '>' | '&' | '|'))
+            .unwrap_or(rest.len());
+        let (op, tail) = rest.split_at(op_len);
+        let piece_len = tail.find(['<', '>']).unwrap_or(tail.len());
+        let piece = &tail[..piece_len];
+        if matches!(op, "<" | "<>") && !piece.is_empty() {
+            out.push((piece, Filename::Known));
+        }
+        rest = &tail[piece_len..];
+    }
+    out
+}
+
+/// Values a `jq` option token may carry attached (#1054): everything after
+/// the first `=` of a `--long=VALUE`, and each tail of a `-abcVALUE` cluster
+/// from its second character up to and including its first character that
+/// is not a letter or digit (`-rf.env` → `f.env`, `.env`).
+///
+/// jq alone, on purpose. jq 1.7 rejects every attached spelling as an unknown
+/// option, so for jq this costs nothing, and a later jq that accepts
+/// `--from-file=FILE` or `-fFILE` loads that file as its program and prints
+/// it in the parse error. For other commands an attached path is the
+/// consumed-path class this guard deliberately allows
+/// (`node --env-file=.env app.js`, cadence-hooks#771).
+fn attached_option_values(word: &str) -> Vec<&str> {
+    if let Some(long) = word.strip_prefix("--") {
+        return long
+            .split_once('=')
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect();
+    }
+    let Some(cluster) = word.strip_prefix('-') else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    for (at, c) in cluster.char_indices().skip(1) {
+        values.push(&cluster[at..]);
+        if !c.is_ascii_alphanumeric() {
+            break;
+        }
+    }
+    values
+}
+
+/// [`dangerous_secret_operand`] for one word, as the shell would read it
+/// whole.
+fn whole_word_secret(value: &str, position: Filename) -> Option<&str> {
     // A backtick routes through the substitution check even without
     // whitespace: an unquoted `` cat `echo .env` `` tokenizes into
     // `` `echo `` and `` .env` ``, and the second is a broken span whose raw
@@ -7346,6 +7442,69 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "a glob that cannot match a secret, or a metadata-only command",
         );
+    }
+
+    #[test]
+    fn glued_redirections_and_option_values_block() {
+        // #1054: the spaced spellings always blocked.
+        assert_bash(
+            &[
+                "cat<.env",
+                "jq -R .x<.env",
+                "jq .env<.env",
+                "jq -R '.'<.env.local",
+                "jq -f.env .x",
+                "jq -rf.env .x",
+                "jq --from-file=.env .x",
+                "cat .env>/tmp/x",
+                "cat<id_rsa",
+                "cat 0<.env",
+                "x<>.env",
+                "git column<.env",
+                "bash -c 'cat<.env'",
+                "cat<.env*",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a secret glued to an operator or option is still read",
+        );
+        assert_bash(
+            &[
+                "cat<<<.env",
+                "cat x 2>/dev/null",
+                "cat x.txt 2>&1",
+                "head -n1 x.txt>out.txt",
+                "echo hi>.env",
+                "make ENV=.env",
+                "cat --number x.txt",
+                "git log -1 --format=%H",
+                "curl -sSf -o/dev/null https://x",
+                "cat<.env.example",
+                "gh pr create --body \"see <.env> docs\"",
+                "wc -l<.env",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "here-strings, fd duplications, output targets, prose, templates",
+        );
+    }
+
+    #[test]
+    fn glued_operands_splits_only_what_the_shell_splits() {
+        use Filename::{Known, Unqualified};
+        assert_eq!(
+            glued_operands("cat<.env", Unqualified),
+            vec![("cat", Unqualified), (".env", Known)]
+        );
+        assert_eq!(
+            glued_operands("a<<b", Unqualified),
+            vec![("a", Unqualified)]
+        );
+        assert_eq!(glued_operands("a>b", Unqualified), vec![("a", Unqualified)]);
+        assert!(glued_operands("-rf.env", Unqualified).is_empty());
+        assert_eq!(attached_option_values("-rf.env"), vec!["f.env", ".env"]);
+        assert_eq!(attached_option_values("--from-file=.env"), vec![".env"]);
+        assert!(attached_option_values("--raw-output").is_empty());
+        assert!(glued_operands("see <.env> docs", Unqualified).is_empty());
+        assert!(glued_operands("$(cat<.env)", Unqualified).is_empty());
     }
 
     #[test]
