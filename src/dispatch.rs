@@ -57,6 +57,13 @@ fn test_panic_trigger() {
             "⚠️  cadence-hooks: enforcement bypassed — CADENCE_TEST_PANIC=1 is forcing a \
              synthetic panic before this hook can decide (debug builds only)"
         );
+        // Guarantee a measurable span. `log_timing` writes only when elapsed
+        // strictly exceeds the (zeroed) threshold, so a panic that lands in
+        // under 1 ms would leave no `hooks.jsonl` row and the "dispatch
+        // resumed" assertion would read an empty ledger (#540). The parent
+        // cannot supply this span by stalling stdin: under load the child can
+        // start after the stall has already elapsed.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         panic!("CADENCE_TEST_PANIC: synthetic panic exercising the dispatch panic guard");
     }
     // `formatted` panics with a runtime `String` payload, the shape that can

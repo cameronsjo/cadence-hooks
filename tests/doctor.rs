@@ -3,6 +3,8 @@
 //! Build a fixture plugin cache in a tempdir, point doctor at it via
 //! `--root`, and assert exit code + stderr/stdout content.
 
+mod support;
+
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -16,7 +18,7 @@ use std::time::{Duration, SystemTime};
 /// false failure about the plugin scan. Cleared here rather than per test, so a
 /// future `doctor` test cannot be steered by whoever runs it.
 fn cadence_hooks() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    let mut cmd = support::cadence_hooks();
     cmd.env_remove("CADENCE_BYPASS")
         .env_remove("CADENCE_DISABLE");
     cmd
