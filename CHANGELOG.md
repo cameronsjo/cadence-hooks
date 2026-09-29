@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`warn-unreviewed-ready-flip`'s GraphQL field mapping is now pinned in raw response JSON.** The one-request lookup from cadence-hooks#1024 reads bot logins without REST's `[bot]` suffix and the reviewed commit from `commit.oid`; the existing fixtures reached that shape only through a REST-to-GraphQL conversion in the test double. A table test now feeds the GraphQL shape directly: a bot author's self-approval still nudges, another bot's or a human's approval on head stays silent, and an approval on a stale `commit.oid` nudges. Test-only; no verdict changes. (cameronsjo/cadence-hooks#985)
+
 ## [0.110.0] - 2026-09-29
 
 ### Changed
