@@ -6518,16 +6518,18 @@ fn emit_segment(
             expand_segments(&body, &mut scope, depth + 1, out);
         }
     }
-    match shell_c_argument(&segment) {
-        Some(inner) if depth < MAX_WRAPPER_DEPTH => {
-            out.push(segment);
-            // A child shell inherits what is set so far, but its own
-            // assignments die with the subshell — recurse on a snapshot so
-            // they cannot reach the parent's later segments.
-            let mut scope = assignments.child();
-            expand_segments(&inner, &mut scope, depth + 1, out);
-        }
-        _ => out.push(segment),
+    let scripts = if depth < MAX_WRAPPER_DEPTH {
+        wrapped_scripts(&executable_tokens(&segment))
+    } else {
+        Vec::new()
+    };
+    out.push(segment);
+    for inner in scripts {
+        // A child shell inherits what is set so far, but its own
+        // assignments die with the subshell — recurse on a snapshot so
+        // they cannot reach the parent's later segments.
+        let mut scope = assignments.child();
+        expand_segments(&inner, &mut scope, depth + 1, out);
     }
 }
 
@@ -6553,9 +6555,7 @@ fn emit_segment(
 /// cwd (issue #228).
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(inner) = shell_c_argument_tokens(argv) {
-        out.push(inner);
-    }
+    out.extend(wrapped_scripts(argv));
     out.extend(substitution_bodies(segment));
     out
 }
@@ -8069,6 +8069,7 @@ fn parameter_word_end(
 /// carrying a stray paren. Only a string-level strip fixes both, and only
 /// alternating it with the token-level one reaches `do (bash -c '…')`
 /// (#528 review E).
+#[cfg(test)]
 fn shell_c_argument(segment: &str) -> Option<String> {
     shell_c_argument_tokens(&executable_tokens(segment))
 }
@@ -8821,15 +8822,31 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
 /// `trap 'cat .env' EXIT` read the file while the leak guard allowed it
 /// (cadence-hooks#1059). Answering them here, rather than per guard, is what
 /// makes `command_segments` and [`child_scripts`] gain them together.
+///
+/// **So are the utilities that run a command string they were handed**
+/// (cadence-hooks#1144): `env -S`, `script -c`, `flock`, `watch`, `su -c` /
+/// `runuser`, and a here-string fed to a shell — see [`wrapper_utility_script`]
+/// and [`shell_here_string`]. `tmux` can start several scripts in one
+/// invocation, so it is answered by [`wrapped_scripts`], the list form.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let tokens = peel_command_runners(strip_compound_heads(tokens));
-    match command_word(tokens.first()?).as_ref() {
+    let verb = command_word(tokens.first()?);
+    match verb.as_ref() {
         "sh" | "bash" | "zsh" | "dash" => {}
         "eval" => return eval_script(&tokens[1..]),
         "trap" => return trap_action(&tokens[1..]),
-        _ => return None,
+        other => return wrapper_utility_script(other, &tokens[1..]),
     }
+    let mut script_file = false;
     for (i, raw) in tokens.iter().enumerate().skip(1) {
+        // A redirection is not an operand: `bash <<< 'x' -c y` still runs
+        // `y`, and `bash 2>/dev/null script.sh` still names a file.
+        if is_redirect_token(raw) || i > 1 && is_redirect_operator_alone(&tokens[i - 1]) {
+            continue;
+        }
+        if script_file {
+            continue;
+        }
         // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
         // raw, `sh \-c 'git push origin main'` matched no `-c` spelling, fell to
         // the non-flag arm below, and returned `None` — so the inline script was
@@ -8862,12 +8879,57 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
             return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
-        // (e.g. `sh script.sh`) — no inline script to expand.
+        // (e.g. `sh script.sh`) — no inline script to expand. Unless `-s`
+        // made the operands positional parameters, stdin is then data too.
         if !tok.starts_with('-') {
-            return None;
+            if !reads_script_from_stdin(&tokens[1..i]) {
+                return None;
+            }
+            script_file = true;
         }
     }
-    None
+    shell_here_string(&tokens[1..])
+}
+
+/// Whether a shell's options before its first operand include `-s`, which
+/// makes the operands positional parameters and keeps stdin the script.
+fn reads_script_from_stdin(options: &[String]) -> bool {
+    options.iter().any(|raw| {
+        let tok = unescape_word(raw);
+        tok.starts_with('-') && !tok.starts_with("--") && tok.contains('s')
+    })
+}
+
+/// A redirection operator standing alone, so its target is the next word.
+fn is_redirect_operator_alone(token: &str) -> bool {
+    redirect_operator_span(token).is_some_and(|(_, alone)| alone)
+}
+
+/// The script a here-string hands a shell on stdin: `bash <<< 'cat .env'`
+/// runs `cat .env` exactly as `bash -c` would (cadence-hooks#1144). Only fd 0
+/// feeds the shell its script, so `bash 3<<< x` is not one. The word is
+/// returned with the shell's backslash removal applied, as [`eval_script`]
+/// does. The caller has already ruled out the `-c` and script-file forms,
+/// where stdin is data.
+fn shell_here_string(operands: &[String]) -> Option<String> {
+    let mut script = None;
+    for (i, raw) in operands.iter().enumerate() {
+        let fd_len = raw.len() - raw.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if fd_len > 0 && &raw[..fd_len] != "0" {
+            continue;
+        }
+        let Some(glued) = raw[fd_len..].strip_prefix("<<<") else {
+            continue;
+        };
+        let word = if glued.is_empty() {
+            operands.get(i + 1)?
+        } else {
+            glued
+        };
+        // bash reads the LAST stdin redirection; keep scanning.
+        script = Some(unescape_word(word).into_owned());
+    }
+    script.filter(|s| !s.trim().is_empty())
 }
 
 /// How many directly nested `eval`s [`eval_script`] unwraps in place, without
@@ -8992,6 +9054,490 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
         .first()
         .is_some_and(|first| command_word(first) == "trap")
         && trap_action(&tokens[1..]).is_some()
+}
+
+/// Every script one segment's command word hands to something that runs it:
+/// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
+/// invocation can chain several commands that each start a shell — one entry
+/// per script ([`tmux_scripts`]).
+fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
+    let argv = peel_command_runners(strip_compound_heads(tokens));
+    match argv.first() {
+        Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
+        _ => shell_c_argument_tokens(tokens).into_iter().collect(),
+    }
+}
+
+/// The command string a utility that is not a shell hands to one, or execs
+/// directly, for the utilities that do (cadence-hooks#1144). Each answer is
+/// the command it runs, written as a script, with the shell's backslash
+/// removal applied — as [`eval_script`] does, so `watch cat\ .env` surfaces
+/// `cat .env`. Measured against GNU coreutils 9.4, util-linux 2.39 and
+/// procps-ng 4.0.4 with canary files:
+///
+/// - `env -S STRING` / `--split-string` splits STRING into the command line
+///   ([`env_split_string_script`]);
+/// - `script -c CMD` / `--command` (util-linux), and BSD's
+///   `script [opts] FILE CMD…` ([`script_command`]);
+/// - `flock [opts] FILE CMD…` and `flock [opts] FILE -c CMD`
+///   ([`flock_command`]);
+/// - `watch [opts] CMD…`, which joins its operands and runs them under
+///   `sh -c` ([`watch_command`]);
+/// - `su`/`runuser` `-c CMD` (any spelling [`su_command_value`] reads), and
+///   `runuser -u USER CMD…`.
+///
+/// **`ssh HOST CMD` is deliberately absent.** Its command runs on another
+/// machine, against that machine's files and repositories; surfacing it would
+/// judge a remote `cat .env` or `git push` by the local checkout's state, and
+/// no guard here can know what the remote side holds.
+///
+/// Surfacing only ever ADDS segments to inspect, so a misread option costs at
+/// most a false block on a script that never runs — never a hidden one.
+fn wrapper_utility_script(verb: &str, operands: &[String]) -> Option<String> {
+    match verb {
+        "env" => env_split_string_script(operands),
+        "script" => script_command(operands),
+        "flock" => flock_command(operands),
+        "watch" => watch_command(operands),
+        "su" | "runuser" => su_script(verb, operands),
+        _ => None,
+    }
+}
+
+/// Words joined as the shell hands them over, one space apart; `None` when
+/// they carry nothing but blanks.
+fn joined_script(words: &[String]) -> Option<String> {
+    let script = words
+        .iter()
+        .map(|word| unescape_word(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!script.trim().is_empty()).then_some(script)
+}
+
+/// `env -S STRING [ARG…]` / `--split-string[=]STRING`: env splits STRING into
+/// words and prepends them to the rest of its command line, so STRING may
+/// itself carry options, assignments and the command
+/// (`env -S '-i A=1 cat .env'` reads the file, measured). When it opens with
+/// one of those the answer is `env STRING ARG…`, which the recursive walk
+/// peels like any other `env`; otherwise it is `STRING ARG…`. `\_` is env's own escape for a separating blank
+/// (`env -S 'cat\_.env'` reads `.env`), so it is turned into one before the
+/// shell-style unescape; inside a quoted part of STRING that over-splits,
+/// which only adds a word to inspect.
+fn env_split_string_script(operands: &[String]) -> Option<String> {
+    let mut i = 0;
+    let (value, rest) = loop {
+        let tok = unescape_word(operands.get(i)?);
+        if tok == "--" || !tok.starts_with('-') || tok == "-" {
+            // The command (or an assignment) with no `-S` before it.
+            return None;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            let (name, glued) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if "split-string".starts_with(name) {
+                break match glued {
+                    Some(value) => (value.to_string(), i + 1),
+                    None => (operands.get(i + 1)?.clone(), i + 2),
+                };
+            }
+            let takes_value = glued.is_none() && ENV_VALUE_LONG_FLAGS.contains(&tok.as_ref());
+            i += if takes_value { 2 } else { 1 };
+            continue;
+        }
+        let cluster = &tok[1..];
+        let mut next = i + 1;
+        let mut split = None;
+        for (at, c) in cluster.char_indices() {
+            let glued = &cluster[at + c.len_utf8()..];
+            if c == 'S' {
+                split = Some(if glued.is_empty() {
+                    next += 1;
+                    operands.get(i + 1)?.clone()
+                } else {
+                    glued.to_string()
+                });
+                break;
+            }
+            if ENV_VALUE_SHORT_FLAGS.contains(c) {
+                next += usize::from(glued.is_empty());
+                break;
+            }
+        }
+        if let Some(value) = split {
+            break (value, next);
+        }
+        i = next;
+    };
+    let split = unescape_word(&value.replace("\\_", " ")).into_owned();
+    if split.trim().is_empty() {
+        return None;
+    }
+    let tail = joined_script(operands.get(rest..).unwrap_or(&[])).unwrap_or_default();
+    // Keep `env` in front only when STRING opens with something env itself
+    // reads — an option or an assignment. A plain command is surfaced bare,
+    // so a guard that does not peel `env` still sees its verb.
+    let env_reads_first = tokenize(&split)
+        .first()
+        .is_some_and(|word| word.starts_with('-') || word.contains('='));
+    let head = if env_reads_first { "env " } else { "" };
+    Some(format!("{head}{split} {tail}").trim_end().to_string())
+}
+
+/// util-linux `script`'s options that take a value, glued or as the next word
+/// — plus BSD's `-t time`/`-T fmt` (util-linux's `-t` takes only a glued
+/// value, so reading it as value-taking only matters to the BSD operand form).
+const SCRIPT_VALUE_SHORT_FLAGS: &str = "EIOBTmot";
+const SCRIPT_VALUE_LONG_FLAGS: &[&str] = &[
+    "--echo",
+    "--log-in",
+    "--log-out",
+    "--log-io",
+    "--log-timing",
+    "--logging-format",
+    "--output-limit",
+];
+
+/// The command `script` runs: util-linux's `-c CMD` / `--command[=]CMD`
+/// (anywhere, since GNU getopt permutes — `script /dev/null -c 'x'` runs `x`),
+/// or BSD/macOS's `script [opts] FILE CMD…`, where every word after the
+/// transcript file is the command. util-linux 2.39 rejects the operand form,
+/// so on Linux that answer inspects a command that never runs — the detector
+/// direction; on macOS it is what runs.
+fn script_command(operands: &[String]) -> Option<String> {
+    let mut i = 0;
+    let mut file_seen = false;
+    while let Some(raw) = operands.get(i) {
+        let tok = unescape_word(raw);
+        if tok == "--" {
+            // Options end; the file and then the BSD command follow.
+            let rest = operands.get(i + 1..)?;
+            return if file_seen {
+                joined_script(rest)
+            } else {
+                joined_script(rest.get(1..)?)
+            };
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            let (name, glued) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if name.len() >= 3 && "command".starts_with(name) {
+                return match glued {
+                    Some(value) => Some(value.to_string()).filter(|v| !v.trim().is_empty()),
+                    None => operands.get(i + 1).map(|w| unescape_word(w).into_owned()),
+                };
+            }
+            let takes_value = SCRIPT_VALUE_LONG_FLAGS
+                .iter()
+                .any(|f| f.trim_start_matches('-').starts_with(name) && !name.is_empty());
+            i += if takes_value && glued.is_none() { 2 } else { 1 };
+            continue;
+        }
+        if let Some(cluster) = tok.strip_prefix('-').filter(|c| !c.is_empty()) {
+            let mut next = i + 1;
+            for (at, c) in cluster.char_indices() {
+                let glued = &cluster[at + c.len_utf8()..];
+                if c == 'c' {
+                    return if glued.is_empty() {
+                        operands.get(i + 1).map(|w| unescape_word(w).into_owned())
+                    } else {
+                        Some(glued.to_string())
+                    };
+                }
+                if SCRIPT_VALUE_SHORT_FLAGS.contains(c) {
+                    if glued.is_empty() {
+                        next += 1;
+                    }
+                    break;
+                }
+            }
+            i = next;
+            continue;
+        }
+        if file_seen {
+            // BSD: everything after the transcript file is the command.
+            return joined_script(&operands[i..]);
+        }
+        file_seen = true;
+        i += 1;
+    }
+    None
+}
+
+/// `flock`'s options that take a value (`-w`/`--timeout`/`--wait`,
+/// `-E`/`--conflict-exit-code`). Its option walk stops at the first operand
+/// (`+` getopt), which is the lock file.
+const FLOCK_VALUE_SHORT_FLAGS: &str = "wE";
+const FLOCK_VALUE_LONG_FLAGS: &[&str] = &["--timeout", "--wait", "--conflict-exit-code"];
+
+/// The command `flock [opts] FILE CMD [ARG…]` runs, or the string
+/// `flock [opts] FILE -c|--command CMD` hands to `sh -c`. A `-c` BEFORE the
+/// file is not the command form (measured: flock takes the script as the lock
+/// path and runs nothing); a lone FILE (or an fd number) runs nothing.
+fn flock_command(operands: &[String]) -> Option<String> {
+    let at = skip_simple_options(operands, FLOCK_VALUE_SHORT_FLAGS, FLOCK_VALUE_LONG_FLAGS);
+    let after_file = operands.get(at + 1..)?;
+    let first = unescape_word(after_file.first()?);
+    if first == "-c" || first == "--command" {
+        return after_file
+            .get(1)
+            .map(|w| unescape_word(w).into_owned())
+            .filter(|s| !s.trim().is_empty());
+    }
+    joined_script(after_file)
+}
+
+/// `watch`'s options that take a value (`-n`/`--interval`,
+/// `-q`/`--equexit`); `-d`'s argument is optional and glued-only.
+const WATCH_VALUE_SHORT_FLAGS: &str = "nq";
+const WATCH_VALUE_LONG_FLAGS: &[&str] = &["--interval", "--equexit"];
+
+/// The command `watch [opts] CMD…` runs: its operands joined with spaces and
+/// handed to `sh -c` (or exec'd with `-x`, which runs the same words).
+fn watch_command(operands: &[String]) -> Option<String> {
+    let at = skip_simple_options(operands, WATCH_VALUE_SHORT_FLAGS, WATCH_VALUE_LONG_FLAGS);
+    joined_script(operands.get(at..)?)
+}
+
+/// Index of the first operand after a utility's leading options (stopping at,
+/// and skipping, `--`), given which options take a value. An unlisted option
+/// is read as argument-free: every caller here only surfaces, so a misread
+/// costs an extra segment and never hides one.
+fn skip_simple_options(operands: &[String], value_short: &str, value_long: &[&str]) -> usize {
+    let mut i = 0;
+    while let Some(raw) = operands.get(i) {
+        let tok = unescape_word(raw);
+        if tok == "--" {
+            return i + 1;
+        }
+        if tok.starts_with("--") {
+            let takes = !tok.contains('=') && value_long.contains(&tok.as_ref());
+            i += if takes { 2 } else { 1 };
+            continue;
+        }
+        let Some(cluster) = tok.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            return i;
+        };
+        i += 1;
+        for (at, c) in cluster.char_indices() {
+            if value_short.contains(c) {
+                if at + c.len_utf8() == cluster.len() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+    }
+    i
+}
+
+/// The command string a `su`/`runuser` option carries: `-c VALUE`,
+/// `-lc VALUE`, `-c'VALUE'` (attached), `--command[=]VALUE`,
+/// `--session-command[=]VALUE`. Walks a short cluster up to `c`, stopping at
+/// another value-taking letter (`-g`, `-G`, `-s`, `-w`).
+pub fn su_command_value<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    if let Some(long) = token.strip_prefix("--") {
+        let (name, value) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        let is_command =
+            name.len() >= 3 && ("command".starts_with(name) || "session-command".starts_with(name));
+        return is_command.then(|| value.or(next)).flatten();
+    }
+    let cluster = token.strip_prefix('-')?;
+    for (at, c) in cluster.char_indices() {
+        match c {
+            'c' => {
+                let rest = &cluster[at + 1..];
+                return if rest.is_empty() { next } else { Some(rest) };
+            }
+            'g' | 'G' | 's' | 'w' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The script `su`/`runuser` runs: the first `-c`-family value
+/// ([`su_command_value`]) — GNU getopt permutes, so `su root -c 'x'` counts
+/// — or, for `runuser -u USER [--] CMD…`, the command it execs directly.
+/// `su`'s other operands are the user and arguments for the user's shell, so
+/// they are no script. The walk stops at a nested `su`/`runuser`, which the
+/// recursion answers for itself.
+fn su_script(verb: &str, operands: &[String]) -> Option<String> {
+    let mut user_flag = false;
+    for (k, raw) in operands.iter().enumerate() {
+        if matches!(command_word(raw).as_ref(), "su" | "runuser") {
+            break;
+        }
+        let tok = unescape_word(raw);
+        let next = operands.get(k + 1).map(|w| unescape_word(w).into_owned());
+        if let Some(value) = su_command_value(&tok, next.as_deref()) {
+            return Some(value.to_string()).filter(|v| !v.trim().is_empty());
+        }
+        user_flag |= verb == "runuser" && (tok == "-u" || tok == "--user");
+    }
+    if !user_flag {
+        return None;
+    }
+    // `runuser -u USER [opts] [--] CMD…`: the first operand that is not an
+    // option or `-u`'s value is the command.
+    let mut i = 0;
+    while let Some(raw) = operands.get(i) {
+        let tok = unescape_word(raw);
+        if tok == "--" {
+            return joined_script(operands.get(i + 1..)?);
+        }
+        if !tok.starts_with('-') {
+            return joined_script(&operands[i..]);
+        }
+        let takes = matches!(
+            tok.as_ref(),
+            "-u" | "--user"
+                | "-g"
+                | "--group"
+                | "-G"
+                | "--supp-group"
+                | "-s"
+                | "--shell"
+                | "-w"
+                | "--whitelist-environment"
+        );
+        i += if takes { 2 } else { 1 };
+    }
+    None
+}
+
+/// How a `tmux` command's operands become a script.
+#[derive(Clone, Copy)]
+enum TmuxOperands {
+    /// Every operand is the shell command and its arguments.
+    Command,
+    /// Only the first operand is a shell command (`if-shell`).
+    First,
+    /// The operands are keys typed into a pane (`send-keys`).
+    Keys,
+}
+
+/// The `tmux` commands that run a shell command, with their aliases and the
+/// flags that take a value (tmux 3.4's manual); an unlisted flag is read as
+/// argument-free.
+const TMUX_COMMANDS: &[(&str, &str, &str, TmuxOperands)] = &[
+    ("new-session", "new", "cefFnstxy", TmuxOperands::Command),
+    ("new-window", "neww", "ceFnt", TmuxOperands::Command),
+    ("split-window", "splitw", "celtFp", TmuxOperands::Command),
+    ("respawn-pane", "respawnp", "cet", TmuxOperands::Command),
+    ("respawn-window", "respawnw", "cet", TmuxOperands::Command),
+    ("run-shell", "run", "cdt", TmuxOperands::Command),
+    (
+        "display-popup",
+        "popup",
+        "bcdehsStTwxy",
+        TmuxOperands::Command,
+    ),
+    ("pipe-pane", "pipep", "t", TmuxOperands::Command),
+    ("if-shell", "if", "t", TmuxOperands::First),
+    ("send-keys", "send", "cNt", TmuxOperands::Keys),
+];
+
+/// tmux's global options that take a value; `-c` is answered separately.
+const TMUX_GLOBAL_VALUE_FLAGS: &str = "fLST";
+
+/// Key names that submit a line typed by `send-keys`.
+const TMUX_SUBMIT_KEYS: &[&str] = &["Enter", "C-m", "C-j", "KPEnter"];
+
+/// The scripts one `tmux` invocation starts (cadence-hooks#1144, measured on
+/// tmux 3.4): the global `-c CMD`; each `new-session`/`new-window`/
+/// `split-window`/`respawn-*`/`run-shell`/`display-popup`/`pipe-pane` shell
+/// command; `if-shell`'s condition; and the text `send-keys` types into a pane
+/// — the pane's shell runs it on `Enter` (measured), and a line typed without
+/// one can be submitted by a later key, so it is surfaced either way. Commands
+/// chained with a `;` word are each answered; a command name may be any
+/// unique prefix, as tmux itself accepts.
+///
+/// These scripts run in the tmux server, in a pane's directory rather than
+/// the segment's, so a walker that tracks the directory cannot vouch for
+/// where they run — the same caution [`installs_trap_action`] names for a
+/// `trap`.
+fn tmux_scripts(operands: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Global options, up to the first command.
+    while let Some(raw) = operands.get(i) {
+        let tok = unescape_word(raw);
+        let Some(cluster) = tok.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            break;
+        };
+        i += 1;
+        if cluster == "-" {
+            break;
+        }
+        for (at, c) in cluster.char_indices() {
+            let glued = &cluster[at + c.len_utf8()..];
+            if c == 'c' || TMUX_GLOBAL_VALUE_FLAGS.contains(c) {
+                let value = if glued.is_empty() {
+                    i += 1;
+                    operands.get(i - 1).map(|w| unescape_word(w).into_owned())
+                } else {
+                    Some(glued.to_string())
+                };
+                if c == 'c' {
+                    out.extend(value.filter(|v| !v.trim().is_empty()));
+                }
+                break;
+            }
+        }
+    }
+    let commands = operands.get(i..).unwrap_or(&[]);
+    for command in commands.split(|w| unescape_word(w).as_ref() == ";") {
+        if let Some(script) = tmux_command_script(command) {
+            out.push(script);
+        }
+    }
+    out
+}
+
+/// The script one `tmux` command (name first) runs, per [`TMUX_COMMANDS`].
+fn tmux_command_script(command: &[String]) -> Option<String> {
+    let name = unescape_word(command.first()?);
+    let exact = TMUX_COMMANDS
+        .iter()
+        .find(|(full, alias, ..)| *full == name.as_ref() || *alias == name.as_ref());
+    let entry = exact.or_else(|| {
+        let mut matches = TMUX_COMMANDS
+            .iter()
+            .filter(|(full, ..)| !name.is_empty() && full.starts_with(name.as_ref()));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    })?;
+    let (_, _, value_flags, shape) = *entry;
+    let args = &command[1..];
+    let at = skip_simple_options(args, value_flags, &[]);
+    let operands = args.get(at..)?;
+    match shape {
+        TmuxOperands::Command => joined_script(operands),
+        TmuxOperands::First => joined_script(operands.get(..1)?),
+        TmuxOperands::Keys => {
+            let script = operands
+                .iter()
+                .map(|key| {
+                    let key = unescape_word(key);
+                    if TMUX_SUBMIT_KEYS.contains(&key.as_ref()) {
+                        "\n".to_string()
+                    } else {
+                        key.into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!script.trim().is_empty()).then_some(script)
+        }
+    }
 }
 
 /// Regex pattern for detecting shell loops (`for ... in` / `while ... do`).
@@ -14253,6 +14799,10 @@ mod tests {
             "xargs -I{} sh -c 'cat .env'",
             "sudo -u me sh -c 'cat .env'",
             "nice -n 10 sudo -E bash -c 'cat .env'", // stacked
+            // `env -S` was a refusal control here; it re-splits its STRING
+            // into the command line and runs it (measured), so it is now
+            // surfaced on purpose (cadence-hooks#1144).
+            "env -S 'sh -c \"cat .env\"'",
         ] {
             assert!(
                 command_segments(cmd).contains(&inner),
@@ -14266,7 +14816,6 @@ mod tests {
         // operand expanded — the shell never runs it.
         for cmd in [
             "nice ---10 sh -c 'cat .env'",
-            "env -S 'sh -c \"cat .env\"'",
             "sudo -Z sh -c 'cat .env'",
             "sudo -l sh -c 'cat .env'",
         ] {
@@ -15574,6 +16123,168 @@ mod tests {
             assert!(
                 segments.iter().any(|segment| segment == inner),
                 "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    // --- utilities that run a command string (cadence-hooks#1144) ---
+
+    #[test]
+    fn command_segments_surfaces_the_script_a_wrapper_utility_runs() {
+        // Each row runs its inner command under bash 5.2 with the real tool
+        // (coreutils 9.4, util-linux 2.39, procps-ng 4.0.4, tmux 3.4 —
+        // measured with canary files), in the quoted and the escaped spelling.
+        for (command, inner) in [
+            ("env -S 'cat .env'", "cat .env"),
+            ("env -S cat\\ .env", "cat .env"),
+            ("env --split-string='cat .env'", "cat .env"),
+            ("env --split-string 'cat .env'", "cat .env"),
+            ("env -iS 'cat .env'", "cat .env"),
+            ("env -S'cat .env'", "cat .env"),
+            ("env -u X -S 'cat .env'", "cat .env"),
+            ("env -S 'cat' .env", "cat .env"),
+            // env's own `\_` blank, and a STRING carrying env's options.
+            ("env -S 'cat\\_.env'", "cat .env"),
+            ("env -S '-i cat .env'", "env -i cat .env"),
+            (
+                "env -S 'git push --force origin main'",
+                "git push --force origin main",
+            ),
+            ("bash <<< 'cat .env'", "cat .env"),
+            ("bash <<< cat\\ .env", "cat .env"),
+            ("sh <<<'cat .env'", "cat .env"),
+            ("bash -s <<< 'cat .env'", "cat .env"),
+            ("bash -s arg <<< 'cat .env'", "cat .env"),
+            ("bash 0<<< 'cat .env'", "cat .env"),
+            ("script -c 'cat .env' /dev/null", "cat .env"),
+            ("script -qc 'cat .env' /dev/null", "cat .env"),
+            ("script -q -c cat\\ .env /dev/null", "cat .env"),
+            ("script --command='cat .env' /dev/null", "cat .env"),
+            ("script --command 'cat .env' /dev/null", "cat .env"),
+            ("script /dev/null -c 'cat .env'", "cat .env"),
+            ("script -q -O log -c 'cat .env'", "cat .env"),
+            // BSD/macOS: every word after the transcript file.
+            ("script -q /dev/null cat .env", "cat .env"),
+            ("flock /tmp/l -c 'cat .env'", "cat .env"),
+            ("flock -n /tmp/l -c cat\\ .env", "cat .env"),
+            ("flock /tmp/l --command 'cat .env'", "cat .env"),
+            ("flock /tmp/l cat .env", "cat .env"),
+            ("flock -w 5 /tmp/l cat .env", "cat .env"),
+            ("watch 'cat .env'", "cat .env"),
+            ("watch -n1 cat .env", "cat .env"),
+            ("watch -n 1 cat\\ .env", "cat .env"),
+            ("watch -d -x cat .env", "cat .env"),
+            ("watch --interval 2 -- cat .env", "cat .env"),
+            ("tmux new-session -d 'cat .env'", "cat .env"),
+            ("tmux new -d -s x 'cat .env'", "cat .env"),
+            ("tmux new-window 'cat .env'", "cat .env"),
+            ("tmux neww -t w cat .env", "cat .env"),
+            ("tmux split-window -h 'cat .env'", "cat .env"),
+            ("tmux run-shell 'cat .env'", "cat .env"),
+            ("tmux if-shell 'cat .env' 'display x'", "cat .env"),
+            ("tmux -L sock -c 'cat .env'", "cat .env"),
+            ("tmux new-w 'cat .env'", "cat .env"),
+            (r"tmux new -d 'sleep 1' \; neww 'cat .env'", "cat .env"),
+            (
+                "su -c 'git push --force origin main'",
+                "git push --force origin main",
+            ),
+            ("su root -c 'cat .env'", "cat .env"),
+            ("su -lc cat\\ .env", "cat .env"),
+            ("su --command='cat .env'", "cat .env"),
+            ("runuser -l me -c 'cat .env'", "cat .env"),
+            ("runuser -u me -- cat .env", "cat .env"),
+            ("runuser -u me cat .env", "cat .env"),
+            // Behind a runner, and nested wrappers.
+            ("sudo watch 'cat .env'", "cat .env"),
+            ("flock /tmp/l watch -n1 'cat .env'", "cat .env"),
+            ("env -S 'bash -c \"cat .env\"'", "cat .env"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+        // `send-keys` types into a pane; `Enter` submits the line.
+        let segments = command_segments("tmux send-keys -t x 'cat .env' Enter");
+        assert!(
+            segments.iter().any(|s| s.trim() == "cat .env"),
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_leaves_a_wrapper_utility_s_data_alone() {
+        // Shapes that run no inner script (measured): stdin is data under
+        // `-c` or a script file; `flock -c` BEFORE the file is the lock path;
+        // `ssh`'s command runs on another machine — deliberately not surfaced.
+        for (command, inner) in [
+            ("bash script.sh <<< 'cat .env'", "cat .env"),
+            ("bash -c true <<< 'cat .env'", "cat .env"),
+            ("bash 3<<< 'cat .env'", "cat .env"),
+            ("cat <<< 'cat .env'", "cat .env"),
+            ("ssh host 'cat .env'", "cat .env"),
+            ("env -i cat .env", "env -i cat .env"),
+            ("flock /tmp/l", "/tmp/l"),
+            ("su root", "root"),
+            ("runuser -l me", "me"),
+            ("tmux kill-server", "kill-server"),
+            ("tmux list-sessions -F '#{session_name}'", "#{session_name}"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                !segments.iter().skip(1).any(|segment| segment == inner),
+                "{command:?} must not surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_scripts_of_common_flows_are_the_benign_commands() {
+        for (command, want) in [
+            (
+                "env -S 'python3 -u' script.py",
+                vec!["python3 -u script.py"],
+            ),
+            ("watch -n1 git status", vec!["git status"]),
+            ("flock /tmp/l make", vec!["make"]),
+            ("script -q -c 'cargo test' /dev/null", vec!["cargo test"]),
+            ("tmux new-session -d 'npm run dev'", vec!["npm run dev"]),
+            ("tmux send-keys 'ls' Enter", vec!["ls \n"]),
+            (
+                r"tmux -c 'make' \; new -d 'npm run dev' ';' send -t x q",
+                vec!["make", "npm run dev", "q"],
+            ),
+        ] {
+            assert_eq!(wrapped_scripts(&tokenize(command)), want, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_utility_floods_stay_linear() {
+        // 200 KB of repeated and nested wrappers: every level re-tokenizes
+        // its script, so the shared MAX_WRAPPER_DEPTH is what bounds the
+        // work. Release runs these in milliseconds; the bound is for debug.
+        for unit in [
+            "env -S ",
+            "watch ",
+            "flock /tmp/l ",
+            "script -c ",
+            "tmux new ",
+            r"tmux send-keys x \; ",
+            "su -c ",
+            "bash <<< ",
+            "watch flock /tmp/l env -S ",
+        ] {
+            let command = format!("{}cat .env", unit.repeat(200 * 1024 / unit.len()));
+            let started = std::time::Instant::now();
+            let segments = command_segments(&command);
+            assert!(!segments.is_empty());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{unit:?} took {:?}",
+                started.elapsed()
             );
         }
     }

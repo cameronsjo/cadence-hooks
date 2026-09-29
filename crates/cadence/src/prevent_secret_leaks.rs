@@ -17,7 +17,8 @@ use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_word,
     executable_tokens, is_assignment_word, skip_git_global_options, split_segments,
-    strip_group_wrappers, strip_heredoc_bodies, tokenize, tokenize_marked, unescape_word,
+    strip_group_wrappers, strip_heredoc_bodies, su_command_value, tokenize, tokenize_marked,
+    unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -873,34 +874,6 @@ fn nested_command_strings(tokens: &[String]) -> Vec<String> {
         }
     }
     scripts
-}
-
-/// The command string a `su`/`runuser` option carries: `-c VALUE`,
-/// `-lc VALUE`, `-c'VALUE'` (attached), `--command[=]VALUE`,
-/// `--session-command[=]VALUE`. Walks a short cluster up to `c`, stopping at
-/// another value-taking letter (`-g`, `-G`, `-s`, `-w`).
-fn su_command_value<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
-    if let Some(long) = token.strip_prefix("--") {
-        let (name, value) = match long.split_once('=') {
-            Some((name, value)) => (name, Some(value)),
-            None => (long, None),
-        };
-        let is_command =
-            name.len() >= 3 && ("command".starts_with(name) || "session-command".starts_with(name));
-        return is_command.then(|| value.or(next)).flatten();
-    }
-    let cluster = token.strip_prefix('-')?;
-    for (at, c) in cluster.char_indices() {
-        match c {
-            'c' => {
-                let rest = &cluster[at + 1..];
-                return if rest.is_empty() { next } else { Some(rest) };
-            }
-            'g' | 'G' | 's' | 'w' => return None,
-            _ => {}
-        }
-    }
-    None
 }
 
 /// The command string a `git` option carries, for the options that RUN one.
@@ -8025,6 +7998,60 @@ mod tests {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(result.outcome, expected, "{command}: {why}");
         }
+    }
+
+    #[test]
+    fn wrapper_utility_scripts_block() {
+        // cadence-hooks#1144: utilities that run a command string no guard
+        // parsed. Each reads `.env` under bash 5.2 (measured with canaries),
+        // in the quoted and the escaped spelling.
+        assert_bash(
+            &[
+                "env -S 'cat .env'",
+                "env -S cat\\ .env",
+                "env --split-string='cat .env'",
+                "env -iS 'cat .env'",
+                "env -S 'cat\\_.env'",
+                "bash <<< 'cat .env'",
+                "bash <<< cat\\ .env",
+                "sh <<<'cat .env'",
+                "script -c 'cat .env' /dev/null",
+                "script -qc cat\\ .env /dev/null",
+                "flock /tmp/l -c 'cat .env'",
+                "flock /tmp/l -c cat\\ .env",
+                "watch 'cat .env'",
+                "watch -n1 cat\\ .env",
+                "tmux new-session -d 'cat .env'",
+                "tmux new-window cat\\ .env",
+                "tmux send-keys 'cat .env' Enter",
+                "tmux -c 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "the wrapper runs the read",
+        );
+    }
+
+    #[test]
+    fn wrapper_utility_common_flows_allowed() {
+        // cadence-hooks#1144 controls: the everyday spellings, and the shapes
+        // where the string is data or runs elsewhere. `ssh`'s command runs on
+        // the remote machine and is deliberately not surfaced.
+        assert_bash(
+            &[
+                "env -S 'python3 -u' script.py",
+                "watch -n1 git status",
+                "flock /tmp/l make",
+                "script -q -c 'cargo test' /dev/null",
+                "tmux new-session -d 'npm run dev'",
+                "tmux send-keys 'ls' Enter",
+                "bash <<< 'echo hi'",
+                "bash -c true <<< 'cat .env'",
+                "bash script.sh <<< 'cat .env'",
+                "ssh host 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "no local secret read runs",
+        );
     }
 
     #[test]
