@@ -12,7 +12,8 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    command_segments, may_spell_word, parse_work_dir, strip_group_wrappers, tokenize, unescape_word,
+    command_segments, command_segments_with_dirs, may_spell_word, parse_work_dir,
+    strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -205,17 +206,50 @@ enum BranchResolution {
     TimedOut,
 }
 
-/// Resolve the current branch in the command's effective directory,
+/// Most distinct directories [`resolve_current_branch`] looks a branch up
+/// in. Each is a git spawn, and a lookup that runs past the deadline fails
+/// open, so past the cap the branch reads as unresolvable, which blocks.
+const MAX_BRANCH_DIRS: usize = 16;
+
+/// Resolve the current branch where the bare-`HEAD` force push runs,
 /// lowercased to match normalized tokens.
+///
+/// Looked up in two readings of where that is, and the sharpest answer wins:
+/// the whole-command [`parse_work_dir`] directory, and the directory each
+/// bare-`HEAD` force-push segment runs in ([`command_segments_with_dirs`]).
+/// The whole-command scan misses a `cd` on a later line, after a
+/// backgrounded command, or in a `{ …; }` group, and lets a subshell's `cd`
+/// leak into the parent, so `echo hi⏎cd <main checkout>⏎git push --force
+/// origin HEAD` was judged on the session's feature branch. Judging both can
+/// only add a block, never remove one.
 fn resolve_current_branch(input: &HookInput, command: &str) -> BranchResolution {
     let cwd_fallback = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
     let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-    let work_dir = parse_work_dir(command, cwd);
+    let mut dirs = vec![parse_work_dir(command, cwd)];
+    for (segment, dir) in command_segments_with_dirs(command, cwd) {
+        if dirs.contains(&dir) {
+            continue;
+        }
+        let norm_tokens = normalize_git_command(strip_group_wrappers(&segment));
+        let tokens: Vec<&str> = norm_tokens.iter().map(String::as_str).collect();
+        if !force_pushes_bare_head(&tokens) {
+            continue;
+        }
+        if dirs.len() == MAX_BRANCH_DIRS {
+            return BranchResolution::Unresolvable;
+        }
+        dirs.push(dir);
+    }
+    sharpest_branch(dirs.iter().map(|dir| branch_in(dir)))
+}
+
+/// The current branch in `work_dir`.
+fn branch_in(work_dir: &str) -> BranchResolution {
     match cadence_hooks_core::shell::git_command_detailed(
-        &work_dir,
+        work_dir,
         &["rev-parse", "--abbrev-ref", "HEAD"],
     ) {
         cadence_hooks_core::shell::GitQuery::Value(branch) => {
@@ -224,6 +258,28 @@ fn resolve_current_branch(input: &HookInput, command: &str) -> BranchResolution 
         cadence_hooks_core::shell::GitQuery::Failed => BranchResolution::Unresolvable,
         cadence_hooks_core::shell::GitQuery::TimedOut => BranchResolution::TimedOut,
     }
+}
+
+/// The resolution [`GitSafetyGuard::check_push_blocked`] judges most
+/// strictly: a protected branch, then an unresolvable one (both block),
+/// then a timeout (a suppressed block), then any other branch.
+fn sharpest_branch(resolutions: impl IntoIterator<Item = BranchResolution>) -> BranchResolution {
+    let rank = |resolution: &BranchResolution| match resolution {
+        BranchResolution::Branch(branch) if is_protected_branch(branch) => 3,
+        BranchResolution::Unresolvable => 2,
+        BranchResolution::TimedOut => 1,
+        BranchResolution::Branch(_) => 0,
+    };
+    resolutions
+        .into_iter()
+        .reduce(|sharpest, next| {
+            if rank(&next) > rank(&sharpest) {
+                next
+            } else {
+                sharpest
+            }
+        })
+        .unwrap_or(BranchResolution::Unresolvable)
 }
 
 /// Return true if a token is a refspec targeting a protected branch.

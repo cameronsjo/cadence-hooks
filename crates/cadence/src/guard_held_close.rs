@@ -41,7 +41,8 @@
 //! guard's own failure to read the ledger allows (ADR-0001).
 
 use cadence_hooks_core::shell::{
-    GhIssueCall, command_segments, gh_issue_calls, git_command, parse_work_dir, tokenize,
+    GhIssueCall, command_segments, command_segments_with_dirs, gh_issue_calls, git_command,
+    parse_work_dir, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::collections::BTreeSet;
@@ -295,6 +296,40 @@ fn remote_slugs(work_dir: &str) -> Vec<Slug> {
     slugs
 }
 
+/// Most distinct directories [`close_repos`] reads remotes in. Each is a git
+/// spawn, and a hook that runs past its deadline fails open.
+const MAX_CLOSE_DIRS: usize = 16;
+
+/// Slugs of every remote a bare `gh issue close` in `command` may resolve
+/// against, or `None` past [`MAX_CLOSE_DIRS`] directories.
+///
+/// Read in two directories and unioned, so a held number matches in either:
+/// the whole-command [`parse_work_dir`] one, and the one each close's own
+/// segment runs in ([`command_segments_with_dirs`]). The whole-command scan
+/// misses a `cd` on a later line, after a backgrounded command, or in a
+/// `{ …; }` group, and lets a subshell's `cd` leak into the parent. A union
+/// can only add a hit, never remove one.
+fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
+    let mut dirs = vec![parse_work_dir(command, cwd)];
+    for (segment, dir) in command_segments_with_dirs(command, cwd) {
+        if dirs.contains(&dir)
+            || !gh_issue_calls(&segment)
+                .iter()
+                .any(|call| call.subcommand == "close")
+        {
+            continue;
+        }
+        if dirs.len() == MAX_CLOSE_DIRS {
+            return None;
+        }
+        dirs.push(dir);
+    }
+    let mut slugs: Vec<Slug> = dirs.iter().flat_map(|dir| remote_slugs(dir)).collect();
+    slugs.sort();
+    slugs.dedup();
+    Some(slugs)
+}
+
 /// Blocks `gh issue close` against the HELD ledger.
 pub struct GuardHeldClose {
     /// The ledger file named by `--ledger`, if any.
@@ -334,8 +369,13 @@ impl Check for GuardHeldClose {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| ".".to_string());
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
-        let work_dir = parse_work_dir(command, cwd);
-        let cwd_repos = remote_slugs(&work_dir);
+        let Some(cwd_repos) = close_repos(command, cwd) else {
+            return CheckResult::block(format!(
+                "guard-held-close: the `gh issue close` calls in this command run in more \
+                 than {MAX_CLOSE_DIRS} directories, too many to check against the HELD \
+                 ledger. Run the closes in fewer commands."
+            ));
+        };
         let hits: BTreeSet<HeldIssue> = calls
             .iter()
             .flat_map(|c| held_targets(c, command, &ledger, &cwd_repos))
