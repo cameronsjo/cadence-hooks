@@ -757,11 +757,44 @@ pub fn looks_absolute(p: &str) -> bool {
 /// rather than a bare `(`/`{` token. [`tokenize`] treats the punctuation as
 /// part of the adjacent word (`(gh` is one token), so a caller that gates on
 /// the leading word MUST strip first or the gate never fires (#239 F4).
+///
+/// **A trailing `}` is trimmed only where the shell would read it as a group
+/// closer** (cadence-hooks#889). The earlier unconditional trim ate real word
+/// bytes: `git push origin secret}` publishes `secret}` (bash prints the `}` in
+/// `echo main}`, and `git check-ref-format` accepts it), `cd /other}` moves to
+/// `/other}`, and `rm {a,b}` / `echo ${HOME}` end in a brace that belongs to
+/// the word. `}` is a reserved word, so it closes a group only as its own word:
+/// `{ echo hi }` is a syntax error while `{ echo hi;}` and `{ (echo hi)}` run
+/// (measured under bash). So a `}` counts as a closer when nothing precedes it
+/// in the segment, or when whitespace, `;`, `&`, `|` or `)` does, and is kept
+/// as a word byte otherwise. Opener matching is not the test: the segmenter
+/// splits on `;`, so `{ echo hi; }` puts its opener and closer in different
+/// segments and a per-segment count would keep correct closers.
+///
+/// `)` is still trimmed unconditionally. Outside a `case` label an unquoted `)`
+/// is always an operator — `bash -c 'echo hi)'` is a syntax error — so a
+/// segment-trailing `)` glued to a word cannot occur in a command that runs.
+/// That also settles the one ambiguous brace: after `)` a `}` is a closer in
+/// `{ (cd x)}` and a word byte in `echo $(echo a)}`, and it is trimmed — keeping
+/// it would glue `)}` onto the last word of the far more common group form.
 pub fn strip_group_wrappers(segment: &str) -> &str {
-    segment
-        .trim()
-        .trim_start_matches(['(', '{', ' ', '\t'])
-        .trim_end_matches([')', '}', ';', ' ', '\t'])
+    let mut rest = segment.trim().trim_start_matches(['(', '{', ' ', '\t']);
+    loop {
+        rest = rest.trim_end_matches([')', ';', ' ', '\t']);
+        match rest.strip_suffix('}') {
+            Some(before) if closes_a_group(before) => rest = before,
+            _ => return rest,
+        }
+    }
+}
+
+/// Whether a `}` following `before` stands as its own word, which is the only
+/// place the shell reads it as a group closer. See [`strip_group_wrappers`].
+fn closes_a_group(before: &str) -> bool {
+    before
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
 }
 
 /// Reserved words that occupy the head position of a segment without being the
@@ -1040,8 +1073,16 @@ pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice",
 /// every gate downstream. `env` and `nice` escaped that only because they are
 /// ALSO in [`COMMAND_RUNNERS`], whose peel resolves through [`command_word`],
 /// which does unescape (cadence-hooks#237 security review, F13).
+///
+/// **The word resolves through [`command_word`], so a path spelling counts.**
+/// The earlier unescape-and-fold did not basename, so `/usr/bin/nohup sops -d
+/// secrets.yaml`, `/usr/bin/time -p …` and `/usr/bin/env GIT_DIR=/x git …` kept
+/// the prefix as the command word and hid the verb behind it from every guard
+/// that peels through here (cadence-hooks#888). Skipping more prefixes only
+/// exposes more verbs to the gates downstream — it can add blocks and never
+/// subtract one (the cadence-hooks#488 argument).
 pub fn names_transparent_prefix(word: &str) -> bool {
-    TRANSPARENT.contains(&fold_verb(unescape_word(word).as_ref()).as_ref())
+    TRANSPARENT.contains(&command_word(word).as_ref())
 }
 
 /// Is `tokens[idx]` a leading word the real command runs *through* — a
@@ -1077,14 +1118,33 @@ pub fn names_transparent_prefix(word: &str) -> bool {
 /// with nothing after it is not a prefix word — there is no command for it to
 /// run through. A panic in a guard is a hard block by another name, which
 /// ADR-0001's fail-open posture forbids.
+///
+/// **A `--` straight after a prefix is part of the prefix.** Every
+/// [`TRANSPARENT`] word reads it as the end of its own options and runs the
+/// word after it (measured under bash for all seven, and for the `/usr/bin`
+/// spellings of `nohup` and `env`), so `nohup -- sops -d secrets.yaml` runs sops.
+/// Read as a flag, it stopped the skip and left `nohup` as the command word,
+/// hiding the verb from every gate (cadence-hooks#888). The `--` is itself a
+/// prefix word only when the word before it is a prefix and something follows
+/// it to run.
 pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
     let Some(tok) = tokens.get(idx).map(String::as_str) else {
         return false;
     };
-    let runs_the_next_word = tokens
-        .get(idx + 1)
-        .is_some_and(|next| !unescape_word(next).starts_with('-'));
-    (names_transparent_prefix(tok) && runs_the_next_word) || is_assignment_word(tok)
+    let is_end_of_options = |word: &str| unescape_word(word).as_ref() == "--";
+    let runs_the_next_word = tokens.get(idx + 1).is_some_and(|next| {
+        !unescape_word(next).starts_with('-')
+            || (is_end_of_options(next) && tokens.get(idx + 2).is_some())
+    });
+    let ends_a_prefix_s_options = is_end_of_options(tok)
+        && idx
+            .checked_sub(1)
+            .and_then(|before| tokens.get(before))
+            .is_some_and(|before| names_transparent_prefix(before))
+        && tokens.get(idx + 1).is_some();
+    (names_transparent_prefix(tok) && runs_the_next_word)
+        || ends_a_prefix_s_options
+        || is_assignment_word(tok)
 }
 
 /// Skip transparent command prefixes that run their argument as the command, so
@@ -5344,13 +5404,21 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
 /// `for f in a; do bash -c 'rm note.md'; done` and `(bash -c 'rm note.md')` all
 /// deleted a real file while the bare `rm` one position over blocked (#528
 /// review E). Idempotent, so a caller that already stripped loses nothing.
+///
+/// **`eval` and `trap` are the two builtins that hand a WORD back to the parser
+/// as a script, so they are answered here too** — see [`eval_script`] and
+/// [`trap_action`]. Both were opaque operands before: `eval 'git push origin
+/// main'` returned zero invocations to every walker (cadence-hooks#886), and
+/// `trap 'cat .env' EXIT` read the file while the leak guard allowed it
+/// (cadence-hooks#1059). Answering them here, rather than per guard, is what
+/// makes `command_segments` and [`child_scripts`] gain them together.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let tokens = peel_command_runners(strip_compound_heads(tokens));
-    if !matches!(
-        command_word(tokens.first()?).as_ref(),
-        "sh" | "bash" | "zsh" | "dash"
-    ) {
-        return None;
+    match command_word(tokens.first()?).as_ref() {
+        "sh" | "bash" | "zsh" | "dash" => {}
+        "eval" => return eval_script(&tokens[1..]),
+        "trap" => return trap_action(&tokens[1..]),
+        _ => return None,
     }
     for (i, raw) in tokens.iter().enumerate().skip(1) {
         // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
@@ -5386,6 +5454,78 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The script `eval` runs: its operands joined with single spaces, which is
+/// exactly what bash, zsh and sh hand back to the parser. The operands arrive
+/// quote-removed from [`tokenize`], matching the one round of expansion the
+/// shell performs before `eval` sees them, so `eval 'git push origin main'` and
+/// `eval git push origin main` both yield `git push origin main`.
+///
+/// A leading `--` is skipped: bash and zsh treat it as the end of `eval`'s
+/// options. dash runs it as a command named `--`, which fails, so surfacing the
+/// rest there over-inspects a script that never runs — the detector direction,
+/// a possible false block and never a miss.
+///
+/// **An operand that is not statically known stays visible, it is not
+/// resolved.** `eval "$CMD"` yields the script `$CMD`, whose segment names no
+/// verb a guard knows, so the command it runs is not judged — the same
+/// deliberate miss as a command word behind a variable anywhere else
+/// ([`command_word`]). The `eval` segment itself still reaches every guard, and
+/// a walker that tracks state across segments must still refuse on `eval`
+/// (`push::directory_verb` does), because an `eval`'d `cd` moves the PARENT
+/// shell while a child script is walked in its own scope.
+fn eval_script(operands: &[String]) -> Option<String> {
+    let operands = match operands.first() {
+        Some(first) if unescape_word(first).as_ref() == "--" => &operands[1..],
+        _ => operands,
+    };
+    let script = operands.join(" ");
+    (!script.trim().is_empty()).then_some(script)
+}
+
+/// The command string `trap` installs, when the invocation installs one:
+/// `trap [--] ACTION SIGSPEC...`. Bash runs ACTION as a script when the signal
+/// fires — and `EXIT` fires when the Bash tool's own shell ends, so
+/// `trap 'cat .env' EXIT` reads the file as surely as `cat .env`
+/// (cadence-hooks#1059).
+///
+/// `None` for the shapes that install nothing: `-l`/`-p` (print), a lone
+/// operand (bash reads it as a signal to reset, or a usage error), and an
+/// ACTION of `-` or the empty string (reset / ignore). A numeric first operand
+/// is POSIX's reset spelling; it is surfaced anyway, since a script of `1`
+/// names no command and costs nothing to inspect.
+///
+/// A trap action runs LATER, in the parent shell, with whatever directory and
+/// environment are current when the signal arrives — not the ones in force at
+/// the `trap` segment. A walker that recurses into child scripts with the
+/// segment's own state therefore cannot vouch for WHERE the action runs; ask
+/// [`installs_trap_action`] and refuse on it.
+fn trap_action(operands: &[String]) -> Option<String> {
+    let operands = match operands.first() {
+        Some(first) if unescape_word(first).as_ref() == "--" => &operands[1..],
+        _ => operands,
+    };
+    let action = operands.first()?;
+    // Everything after the action is a signal spec; with none, bash resets or
+    // refuses rather than installing.
+    operands.get(1)?;
+    let unescaped = unescape_word(action);
+    if unescaped.starts_with('-') || action.trim().is_empty() {
+        return None;
+    }
+    Some(action.clone())
+}
+
+/// Whether this token view is a `trap` that installs an action — the one child
+/// script [`child_scripts`] returns whose state (directory, environment) is not
+/// the segment's own. See [`trap_action`].
+pub fn installs_trap_action(tokens: &[String]) -> bool {
+    let tokens = peel_command_runners(strip_compound_heads(tokens));
+    tokens
+        .first()
+        .is_some_and(|first| command_word(first) == "trap")
+        && trap_action(&tokens[1..]).is_some()
 }
 
 /// Regex pattern for detecting shell loops (`for ... in` / `while ... do`).
@@ -10090,5 +10230,150 @@ mod tests {
             d.repo_flag.as_deref(),
             Some("https://github.com/evil/x.git")
         );
+    }
+
+    // --- eval / trap child scripts (cadence-hooks#886, #1059) ---
+
+    #[test]
+    fn child_scripts_surfaces_the_script_eval_and_trap_run() {
+        for (command, want) in [
+            ("eval 'git push origin main'", Some("git push origin main")),
+            (
+                "eval \"git push origin main\"",
+                Some("git push origin main"),
+            ),
+            // Operands are joined with single spaces, as the shell does.
+            ("eval git push origin main", Some("git push origin main")),
+            ("eval -- 'cat .env'", Some("cat .env")),
+            ("GIT_DIR=/x eval 'git push'", Some("git push")),
+            ("sudo eval 'cat .env'", Some("cat .env")),
+            ("\\eval 'cat .env'", Some("cat .env")),
+            // Not statically known: surfaced as written, never resolved.
+            ("eval \"$CMD\"", Some("$CMD")),
+            ("trap 'cat .env' EXIT", Some("cat .env")),
+            ("trap -- 'cat .env' EXIT INT", Some("cat .env")),
+            ("trap 'cat .env' 0", Some("cat .env")),
+            // Installs nothing: print, reset, ignore, or a lone operand.
+            ("trap -p", None),
+            ("trap -l", None),
+            ("trap - EXIT", None),
+            ("trap '' INT", None),
+            ("trap 'cat .env'", None),
+            ("eval", None),
+            ("eval ''", None),
+            // Not the builtin at all.
+            ("echo eval 'cat .env'", None),
+            ("evaluate 'cat .env'", None),
+        ] {
+            let tokens = tokenize(command);
+            let argv = skip_transparent_prefixes(&tokens);
+            let got = child_scripts(argv, command);
+            assert_eq!(
+                got.first().map(String::as_str),
+                want,
+                "{command:?} yielded {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_expands_eval_and_trap_scripts() {
+        for (command, inner) in [
+            ("eval 'cat .env'", "cat .env"),
+            ("trap 'cat .env' EXIT", "cat .env"),
+            ("trap 'cat .env' DEBUG; true", "cat .env"),
+            ("if true; then eval 'rm note.md'; fi", "rm note.md"),
+            ("bash -c \"eval 'rm note.md'\"", "rm note.md"),
+            ("eval 'echo a; rm note.md'", "rm note.md"),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn installs_trap_action_names_only_a_trap_that_installs() {
+        for (command, want) in [
+            ("trap 'git push' EXIT", true),
+            ("command trap 'git push' EXIT", true),
+            ("trap - EXIT", false),
+            ("trap -p", false),
+            ("eval 'git push'", false),
+            ("git push", false),
+        ] {
+            assert_eq!(
+                installs_trap_action(&tokenize(command)),
+                want,
+                "{command:?}"
+            );
+        }
+    }
+
+    // --- transparent prefix basename and `--` (cadence-hooks#888) ---
+
+    #[test]
+    fn skip_transparent_prefixes_reads_a_path_spelling_and_end_of_options() {
+        for (command, want_head) in [
+            ("/usr/bin/nohup sops -d x", "sops"),
+            ("/usr/bin/nohup -- sops -d x", "sops"),
+            ("nohup -- sops -d x", "sops"),
+            ("/usr/bin/time sops -d x", "sops"),
+            ("command -- git push", "git"),
+            ("exec -- git push", "git"),
+            ("\\nohup -- git push", "git"),
+            ("/usr/bin/env GIT_DIR=/x git commit", "git"),
+            // Unchanged: a real flag still stops the skip, so a prefix with no
+            // runner grammar survives into argv[0] for a caller to refuse on.
+            ("/usr/bin/time -p sops -d x", "/usr/bin/time"),
+            ("nohup --help", "nohup"),
+            // A `--` with nothing after it runs nothing.
+            ("nohup --", "nohup"),
+            // A `--` that no prefix owns is an ordinary word.
+            ("git -- push", "git"),
+            ("-- git push", "--"),
+            // Not a prefix, whatever the directory.
+            ("/usr/bin/nohupx git push", "/usr/bin/nohupx"),
+        ] {
+            let tokens = tokenize(command);
+            let head = skip_transparent_prefixes(&tokens).first().cloned();
+            assert_eq!(head.as_deref(), Some(want_head), "{command:?}");
+        }
+    }
+
+    // --- strip_group_wrappers keeps a `}` that is a word byte (cadence-hooks#889) ---
+
+    #[test]
+    fn strip_group_wrappers_trims_a_brace_only_where_it_closes_a_group() {
+        for (segment, want) in [
+            // Word bytes: glued to the word, the shell keeps them.
+            ("git push origin secret}", "git push origin secret}"),
+            ("git push origin secret}}", "git push origin secret}}"),
+            ("cd /other}", "cd /other}"),
+            ("rm {a,b}", "rm {a,b}"),
+            ("echo ${HOME}", "echo ${HOME}"),
+            ("git push origin ${BRANCH}", "git push origin ${BRANCH}"),
+            ("rm 'x'}", "rm 'x'}"),
+            ("rm x\\}", "rm x\\}"),
+            ("find . -exec rm {}", "find . -exec rm {}"),
+            // Closers: standing as their own word, or after an operator.
+            ("{ git commit;}", "git commit"),
+            ("{ git commit; }", "git commit"),
+            ("{ git commit }", "git commit"),
+            ("}", ""),
+            ("(git commit)", "git commit"),
+            ("( gh pr create )", "gh pr create"),
+            ("{ (cd x)}", "cd x"),
+            ("{ ( rm x ) }", "rm x"),
+            ("{ echo a &}", "echo a &"),
+            ("git push origin main;", "git push origin main"),
+            // A group closer after a kept word brace still goes.
+            ("{ rm {a,b}; }", "rm {a,b}"),
+            ("{ echo ${X} }", "echo ${X}"),
+        ] {
+            assert_eq!(strip_group_wrappers(segment), want, "{segment:?}");
+        }
     }
 }

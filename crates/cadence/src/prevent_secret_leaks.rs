@@ -7852,4 +7852,46 @@ mod tests {
         );
         assert!(run("true; su -c 'ls'").is_none());
     }
+
+    #[test]
+    fn a_dotenv_read_inside_a_trap_or_eval_script_blocks() {
+        // cadence-hooks#1059 / #886: `trap` and `eval` hand a WORD back to the
+        // parser as a script, and the guard read it as one opaque operand. Every
+        // row below reads the file under bash (the EXIT trap fires when the
+        // tool's shell ends); every one was rc=0 at the parent commit.
+        for command in [
+            "trap 'cat .env' EXIT",
+            "trap 'cat .env' DEBUG; true",
+            "trap -- 'cat .env' EXIT",
+            "trap \"cat .env\" 0 INT",
+            "eval 'cat .env'",
+            "eval \"cat .env\"",
+            "eval -- 'cat .env'",
+            "sudo eval 'cat .env'",
+            "if true; then trap 'cat .env' EXIT; fi",
+            "bash -c \"trap 'cat .env' EXIT\"",
+            "eval \"trap 'cat .env' EXIT\"",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?} must block"
+            );
+        }
+        // Controls: a trap that installs nothing, and a harmless action.
+        for command in [
+            "trap - EXIT",
+            "trap -p",
+            "trap 'rm -f /tmp/x' EXIT",
+            "eval 'echo hi'",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?} must allow"
+            );
+        }
+    }
 }
