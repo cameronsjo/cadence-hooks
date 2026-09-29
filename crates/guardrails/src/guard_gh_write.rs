@@ -11,7 +11,8 @@ use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, GhRepoFlag, LOOP_PATTERN, TRANSPARENT, brace_expansion_overflows,
     command_segments, command_word, contains_ignoring_ascii_case, gh_command_path, gh_repo_flags,
-    host_and_repo_from_url, parse_gh_repo_value, parse_work_dir, strip_quotes, tokenize,
+    host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -3018,8 +3019,22 @@ impl Check for GhWriteGuard {
         // create` before either ran (cadence-hooks#488). The fold stops at this
         // filter: nouns, subcommand verbs, flags, and `-R owner/repo` operands
         // are all still matched case-sensitively downstream.
-        if !contains_ignoring_ascii_case(command, "gh") {
+        // Nor may it be stricter than the shell's word building: `$'\x67h'`
+        // and `g''h` run `gh` from text without the substring (#1103).
+        if !may_spell_word(command, "gh") {
             return CheckResult::allow();
+        }
+
+        // Nesting past what the shell parser is fed is unreadable here, and
+        // at ~900 levels it used to overflow the stack and abort — a noisy
+        // fail-open (PR #1118 review). Fail closed instead.
+        if loop_analysis::group_nesting_depth(command) > loop_analysis::MAX_PARSE_NESTING {
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: command nests groups more than {} levels deep — \
+                 too deep to verify its gh targets\n   \
+                 Fix: flatten the command, or run each gh command on its own",
+                loop_analysis::MAX_PARSE_NESTING
+            ));
         }
 
         // A word whose brace expansion is past what the tokenizer models is
@@ -3205,7 +3220,10 @@ impl Check for GhWriteGuard {
                 continue;
             }
 
-            if !is_write_command(&segment) {
+            // The write patterns are raw-text regexes, so the decoded words
+            // are judged too: `gh $'issue' create` and `'gh' issue create` run
+            // the write while no raw `gh issue create` exists (#1103).
+            if !is_write_command(&segment) && !is_write_command(&requote_words(&segment)) {
                 continue;
             }
 
@@ -7713,5 +7731,121 @@ mod tests {
             run_case(&mut bad, command, false);
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn quoted_or_escaped_words_still_reach_the_write_check() {
+        // cadence-hooks#1103.
+        with_env(&owners_env_212(), || {
+            let blocked = [
+                "gh $'issue' create -R stranger/repo -t x -b y",
+                "gh issue $'create' -R stranger/repo -t x -b y",
+                r"$'\x67h' issue create -R stranger/repo -t x -b y",
+                "'gh' issue create -R stranger/repo -t x -b y",
+                "g''h issue create -R stranger/repo -t x -b y",
+                "gh $'repo' delete stranger/repo --yes",
+            ];
+            for command in blocked {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+            }
+            let allowed = [
+                "git commit -m 'gh issue create -R stranger/repo'",
+                "gh $'issue' list -R stranger/repo",
+            ];
+            for command in allowed {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    /// PR #1118 review: padded prefixes that once turned a size bound into a
+    /// literal `$NAME` — the expansion budget, the name count, and (for `D`
+    /// itself) a value longer than the stored-value limit.
+    fn padded_prefixes_1118() -> Vec<String> {
+        vec![
+            String::new(),
+            format!("P={}; : {}; ", "a".repeat(4096), vec!["$P"; 256].join(" ")),
+            (0..300).map(|n| format!("V{n}=v{n}; ")).collect(),
+        ]
+    }
+
+    #[test]
+    fn padded_assignment_prefix_cannot_hide_a_write() {
+        with_env(&owners_env_212(), || {
+            for prefix in padded_prefixes_1118() {
+                let command = format!("{prefix}R=repo; gh $R delete x/y --yes");
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            }
+        });
+    }
+
+    #[test]
+    fn deep_group_nesting_fails_closed_instead_of_overflowing() {
+        // PR #1118 review: ~900 levels of `{ (` overflowed the parser's stack
+        // and aborted the hook, a noisy fail-open.
+        with_env(&owners_env_212(), || {
+            let nest =
+                |k: usize, inner: &str| format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k));
+            let cases = [
+                // Nothing here can spell `gh`: the fast path skips it, so it
+                // never reaches the parser at all.
+                (nest(1000, "echo $HOME"), false),
+                (nest(1000, "echo $(date)"), true),
+                (nest(1000, "gh repo delete x/y --yes"), true),
+                (nest(3, "gh repo delete x/y --yes"), true),
+                (nest(3, "gh pr list"), false),
+            ];
+            for (command, blocks) in cases {
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{}",
+                    &command[..command.len().min(40)]
+                );
+            }
+        });
+    }
+
+    /// PR #1118 review: 5000 levels (~50 KB) of `{ (` around `inner`, in the
+    /// three spellings bash runs as groups.
+    fn deep_nests_1118(inner: &str) -> Vec<String> {
+        let k = 5000;
+        vec![
+            format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k)),
+            format!("{}{inner}{}", "{(".repeat(k), ")}".repeat(k)),
+            format!("{}{inner}{}", "{ ".repeat(k), "; }".repeat(k)),
+        ]
+    }
+
+    /// Release is the shipped profile; the debug bound only catches a return
+    /// to quadratic work (seconds per shape), not normal debug slowness.
+    fn nest_time_limit_1118() -> std::time::Duration {
+        std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 })
+    }
+
+    #[test]
+    fn deep_group_nesting_write_blocks_in_time() {
+        with_env(&owners_env_212(), || {
+            for command in deep_nests_1118("gh repo delete x/y --yes") {
+                let start = std::time::Instant::now();
+                let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+                assert!(
+                    start.elapsed() < nest_time_limit_1118(),
+                    "{:?}",
+                    start.elapsed()
+                );
+            }
+        });
     }
 }
