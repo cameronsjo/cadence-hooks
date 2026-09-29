@@ -1815,6 +1815,36 @@ fn api_unverifiable_block(
     )
 }
 
+/// True when the arguments after `gh` are a PURE help request: exactly a
+/// literal `<noun> <verb>` followed only by `--help`/`-h` tokens (#868).
+///
+/// gh prints help and exits for that shape without contacting GitHub, so it is
+/// a read whatever the verb. The shape is deliberately this narrow, because a
+/// help token anywhere else is not proof: pflag hands the token after a
+/// value-taking flag to that flag, so `gh issue create --title --help` creates
+/// an issue titled `--help`. Requiring every token past the verb to be a help
+/// flag means nothing can consume one. The noun and verb must be plain
+/// lowercase words — an expansion there (`gh issue create $ARGS --help`) could
+/// splice a value-taking flag in front of the help token, so it does not count.
+fn gh_args_are_pure_help(args: &[String]) -> bool {
+    let is_word = |w: &String| {
+        w.starts_with(|c: char| c.is_ascii_lowercase())
+            && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    };
+    args.len() > 2
+        && args[..2].iter().all(is_word)
+        && args[2..].iter().all(|a| a == "--help" || a == "-h")
+}
+
+/// [`looped_write_kind`] for one loop-analysis command, with a pure help
+/// request read as a read (#868).
+fn looped_command_kind(c: &loop_analysis::LoopedCommand) -> LoopedWriteKind {
+    if gh_args_are_pure_help(&c.args) {
+        return LoopedWriteKind::ReadOrAllowed;
+    }
+    looped_write_kind(&format!("gh {}", c.args.join(" ")))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopedWriteKind {
     ReadOrAllowed,
@@ -2024,13 +2054,12 @@ impl Check for GhWriteGuard {
                 // branch, which already gates on write kind (#158). -R targets are
                 // always on the default host (gh CLI convention).
                 for c in &cmds {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_write_kind(&reconstructed)
+                    } = looped_command_kind(c)
                     {
                         return api_unverifiable_block(
-                            &reconstructed,
+                            &format!("gh {}", c.args.join(" ")),
                             undeterminable_query,
                             &allowed_owners,
                             &allowed_repos,
@@ -2040,10 +2069,7 @@ impl Check for GhWriteGuard {
                 let dh = default_host();
                 let unowned_write_targets: Vec<&str> = cmds
                     .iter()
-                    .filter(|c| {
-                        let reconstructed = format!("gh {}", c.args.join(" "));
-                        looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
-                    })
+                    .filter(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite)
                     .filter(|c| {
                         !c.explicit_repo
                             .as_ref()
@@ -2072,23 +2098,21 @@ impl Check for GhWriteGuard {
                 // Only block if any looped gh command is a write — read-only
                 // commands (gh pr list, gh issue view) are safe without -R.
                 for c in &cmds {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
                     if let LoopedWriteKind::ApiUnverifiable {
                         undeterminable_query,
-                    } = looped_write_kind(&reconstructed)
+                    } = looped_command_kind(c)
                     {
                         return api_unverifiable_block(
-                            &reconstructed,
+                            &format!("gh {}", c.args.join(" ")),
                             undeterminable_query,
                             &allowed_owners,
                             &allowed_repos,
                         );
                     }
                 }
-                let has_write = cmds.iter().any(|c| {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
-                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
-                });
+                let has_write = cmds
+                    .iter()
+                    .any(|c| looped_command_kind(c) == LoopedWriteKind::RepoWrite);
                 if has_write {
                     // Relaxed-when-deterministic policy (#44): a loop whose
                     // body never changes directory, running in an owned
@@ -2111,10 +2135,8 @@ impl Check for GhWriteGuard {
                         let writes: Vec<String> = cmds
                             .iter()
                             .filter(|c| {
-                                let reconstructed = format!("gh {}", c.args.join(" "));
                                 c.explicit_repo.is_none()
-                                    && looped_write_kind(&reconstructed)
-                                        == LoopedWriteKind::RepoWrite
+                                    && looped_command_kind(c) == LoopedWriteKind::RepoWrite
                             })
                             .map(|c| format!("`gh {}`", c.args.join(" ")))
                             .collect();
@@ -2165,6 +2187,11 @@ impl Check for GhWriteGuard {
             }
 
             if !is_write_command(&segment) {
+                continue;
+            }
+
+            // `gh <noun> <verb> --help` prints help and writes nothing (#868).
+            if gh_argv(&segment).is_some_and(|argv| gh_args_are_pure_help(&argv[1..])) {
                 continue;
             }
 
@@ -5950,6 +5977,68 @@ mod tests {
                 "/tmp",
             ));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // --- #868: a pure `--help` request is not a write ---
+
+    #[test]
+    fn pure_help_shape_is_exactly_noun_verb_then_help_flags() {
+        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for yes in ["issue create --help", "pr merge -h", "secret set --help -h"] {
+            assert!(gh_args_are_pure_help(&args(yes)), "{yes}");
+        }
+        for no in [
+            // A value-taking flag in front consumes the help token.
+            "issue create --title --help",
+            "issue create --help --title x",
+            // A positional or expansion could splice a flag in front of it.
+            "issue create x --help",
+            "issue create $A --help",
+            "issue $V --help",
+            "issue create --help=true",
+            "issue create -- --help",
+            "issue create",
+            "-R evil/x issue create --help",
+            "issue --help",
+        ] {
+            assert!(!gh_args_are_pure_help(&args(no)), "{no}");
+        }
+    }
+
+    #[test]
+    fn looped_pure_help_is_allowed_outside_any_repo() {
+        with_env(&owners_env(), || {
+            for command in [
+                "for i in $(seq 1 30); do gh issue create --help | grep -q -- '--parent' || fails=$((fails+1)); done",
+                "for i in 1 2; do gh pr create -h; done",
+                "gh issue create --help",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "expected ALLOW: {command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn help_does_not_cover_a_real_write_beside_it() {
+        with_env(&owners_env(), || {
+            for command in [
+                "for i in 1 2; do gh issue create --title x; done",
+                "for i in 1 2; do gh issue create --help; gh issue create --title x; done",
+                "gh issue create --help; gh issue create --title x",
+                "for i in 1 2; do gh issue create --title --help; done",
+                "gh issue create --title --help",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "expected BLOCK: {command}"
+                );
+            }
         });
     }
 }
