@@ -267,6 +267,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-inline-body",
+        description: "Nudge when gh pr/issue create posts a long body inline instead of via --body-file",
+        namespace: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         namespace: "guardrails",
@@ -594,6 +600,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // without measuring anything.
         ("guardrails", "guard-body-budget") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
+        ),
+        // warn-inline-body only engages on `gh pr|issue create` with an inline
+        // body past the threshold; the generic sample (`git status`) would allow.
+        ("guardrails", "warn-inline-body") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue create --title test --body \"This sample body is deliberately long enough to cross the inline-body threshold, so that try exercises the nudge path rather than the silent short-body allow. It says nothing else, and it is posted nowhere at all.\""}}"#,
         ),
         // warn-instruction-narrative only engages on a CLAUDE.md/AGENTS.md
         // write; the generic sample is a Bash call and would allow unjudged.

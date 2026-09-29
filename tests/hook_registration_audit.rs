@@ -306,6 +306,7 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     (
         "guardrails warn-amend-pushed",
         "cameronsjo/cadence-hooks#610",
+    ),
     // New nudges built ahead of their wiring: each hooks.json entry lands in a
     // follow-up cadence-monorepo PR, which also removes the row here.
     (
@@ -320,6 +321,9 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-plugin-root-cruft",
         "cameronsjo/cadence-hooks#282",
     ),
+    (
+        "guardrails warn-inline-body",
+        "cameronsjo/cadence-hooks#611",
     ),
 ];
 

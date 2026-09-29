@@ -406,6 +406,8 @@ enum GuardrailsCommands {
     WarnIssueTracker,
     /// Nudge on repo create/publicize when name or description telegraphs sensitive content
     WarnGoingPublic,
+    /// Nudge when gh pr/issue create posts a long body inline instead of via --body-file
+    WarnInlineBody,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -618,6 +620,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardBodyBudget { .. } => "guard-body-budget",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
+            GuardrailsCommands::WarnInlineBody => "warn-inline-body",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
@@ -857,6 +860,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::WarnGoingPublic => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::warn_going_public::GoingPublicGuard),
+                pre,
+            ),
+            GuardrailsCommands::WarnInlineBody => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::warn_inline_body::WarnInlineBody),
                 pre,
             ),
             GuardrailsCommands::VerifyPrAutoclose => CheckPlan::new(
