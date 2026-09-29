@@ -976,7 +976,7 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
     let value = attached_input_redirection_target(token).unwrap_or(token);
     if value.chars().any(char::is_whitespace) {
-        return substitution_operand_is_secret(value, position, 0).then_some(value);
+        return substitution_operand_is_secret(value, position).then_some(value);
     }
     is_dangerous_secret_token_at(value, position).then_some(value)
 }
@@ -1014,54 +1014,233 @@ fn substitution_spans(word: &str) -> Option<Vec<(usize, usize, usize, usize)>> {
     Some(spans)
 }
 
+/// Longest word [`substitution_operand_is_secret`] resolves. Past it, only the
+/// literal tail is judged — resolution builds candidate strings, and an
+/// unbounded word made that quadratic (a 100k-argument `echo` took minutes).
+const SUBSTITUTION_WORD_LIMIT: usize = 8 * 1024;
+/// Most substitutions in one word that are resolved together.
+const SUBSTITUTION_SPAN_LIMIT: usize = 16;
+/// Most outputs one substitution contributes before its outputs are judged
+/// one by one instead of combined with the rest of the word.
+const SUBSTITUTION_OUTPUT_LIMIT: usize = 32;
+/// Most combined candidates built for one word.
+const SUBSTITUTION_CANDIDATE_LIMIT: usize = 256;
+/// Stand-in for a substitution whose output cannot be read from the text.
+const UNKNOWN_OUTPUT: &str = "sub";
+
+/// Metadata-safe heads whose stdout is (a form of) their own operands —
+/// `$(realpath .env)` prints a path ending in `.env`. Judged as echoing each
+/// non-flag operand (#815 review).
+const OPERAND_ECHOING_HEADS: &[&str] =
+    &["ls", "find", "realpath", "readlink", "basename", "dirname"];
+
 /// Does a whitespace-bearing operand holding a command substitution resolve to
-/// a secret file? Two shapes are provable from the text alone:
+/// a secret file (#815)?
 ///
-/// - **The text after the LAST substitution** decides the basename:
-///   `"$(git rev-parse --show-toplevel)/.env"` ends in `/.env` whatever the
-///   substitution prints. That tail is classified behind a placeholder
-///   directory when it carries no whitespace of its own.
-/// - **An `echo`/`printf` substitution with nothing after it** prints its own
-///   arguments, so `"$(echo .env)"` and `"$(printf %s .env)"` are classified
-///   argument by argument, joined to whatever text precedes the substitution.
+/// The word is split into its literal pieces and its top-level substitutions.
+/// **If any literal piece carries whitespace, the word is prose** — the
+/// firewall's original reason — and nothing is resolved: a quoted title like
+/// `"fix $(date) .env handling"` stays allowed. Otherwise the word is
+/// path-shaped, and each substitution is replaced by what it can be shown to
+/// print ([`substitution_outputs`]), or by a placeholder when it cannot. Every
+/// combination is classified, so `"$(pwd)/$(echo .env)"`,
+/// `"$(echo .env)$(true)"`, and `"$(echo .e)nv"` all resolve.
 ///
-/// Everything else — `"$(cat <<'EOF' … EOF)"` PR bodies, prose quoting a
-/// filename after a space, an unterminated substitution — keeps the
-/// whitespace firewall's skip, which is the pre-#815 verdict, not a new allow.
-fn substitution_operand_is_secret(word: &str, position: Filename, depth: usize) -> bool {
-    if depth > 4 {
+/// Fails CLOSED on what it cannot resolve: an unterminated substitution, or a
+/// word past [`SUBSTITUTION_WORD_LIMIT`], is judged on its literal tail alone
+/// ([`secret_shaped_tail`]), so `"$(echo "(")/.env"` still blocks.
+///
+/// A PR body written as `"$(cat <<'EOF' … EOF)"` is untouched: `cat` has no
+/// readable output, so the word resolves to the placeholder and nothing else.
+fn substitution_operand_is_secret(word: &str, position: Filename) -> bool {
+    if !(word.contains("$(") || word.contains('`')) {
         return false;
+    }
+    if word.len() > SUBSTITUTION_WORD_LIMIT {
+        return secret_shaped_tail(word, position);
     }
     let Some(spans) = substitution_spans(word) else {
-        return false;
+        return secret_shaped_tail(word, position);
     };
-    let Some(&(open, body_start, body_end, close_end)) = spans.last() else {
-        return false;
-    };
-    let tail = &word[close_end..];
-    if !tail.is_empty() {
-        return !tail.chars().any(char::is_whitespace)
-            && is_dangerous_secret_token_at(&format!("sub{tail}"), position);
+    if spans.len() > SUBSTITUTION_SPAN_LIMIT {
+        return secret_shaped_tail(word, position);
     }
-    if spans.len() != 1 {
-        return false;
+    let mut literals = Vec::with_capacity(spans.len() + 1);
+    let mut at = 0;
+    for &(open, _, _, close_end) in &spans {
+        literals.push(&word[at..open]);
+        at = close_end;
     }
-    let body = tokenize(&word[body_start..body_end]);
-    let Some((head, args)) = body.split_first() else {
-        return false;
-    };
-    if !matches!(command_word(head).as_ref(), "echo" | "printf") {
+    literals.push(&word[at..]);
+    if literals.iter().any(|l| l.chars().any(char::is_whitespace)) {
         return false;
     }
-    let prefix = &word[..open];
-    args.iter().filter(|arg| !arg.starts_with('-')).any(|arg| {
-        let candidate = format!("{prefix}{arg}");
-        if candidate.chars().any(char::is_whitespace) {
-            substitution_operand_is_secret(&candidate, position, depth + 1)
-        } else {
-            is_dangerous_secret_token_at(&candidate, position)
+    let outputs: Vec<Vec<String>> = spans
+        .iter()
+        .map(|&(_, body_start, body_end, _)| substitution_outputs(&word[body_start..body_end], 0))
+        .collect();
+    word_candidates(&literals, &outputs)
+        .iter()
+        .any(|candidate| is_dangerous_secret_token_at(candidate, position))
+}
+
+/// Every word `literals` interleaved with one output per substitution can
+/// spell, bounded. Over [`SUBSTITUTION_CANDIDATE_LIMIT`] combinations, each
+/// substitution varies alone with the others at their placeholder; a
+/// substitution with too many outputs to combine contributes each output on
+/// its own, joined to nothing, so a secret-shaped output is still seen.
+fn word_candidates(literals: &[&str], outputs: &[Vec<String>]) -> Vec<String> {
+    let build = |choice: &dyn Fn(usize) -> String| {
+        let mut word = String::from(literals[0]);
+        for (k, literal) in literals[1..].iter().enumerate() {
+            word.push_str(&choice(k));
+            word.push_str(literal);
         }
-    })
+        word
+    };
+    let mut candidates = Vec::new();
+    let combinable: Vec<bool> = outputs
+        .iter()
+        .map(|o| {
+            if o.len() > SUBSTITUTION_OUTPUT_LIMIT {
+                candidates.extend(o.iter().cloned());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let pick = |k: usize, i: usize| -> String {
+        if combinable[k] {
+            outputs[k][i].clone()
+        } else {
+            UNKNOWN_OUTPUT.to_string()
+        }
+    };
+    let product = outputs
+        .iter()
+        .zip(&combinable)
+        .try_fold(1usize, |acc, (o, &c)| {
+            acc.checked_mul(if c { o.len() } else { 1 })
+                .filter(|n| *n <= SUBSTITUTION_CANDIDATE_LIMIT)
+        });
+    if product.is_some() {
+        let mut index = vec![0usize; outputs.len()];
+        loop {
+            candidates.push(build(&|k| pick(k, index[k])));
+            let Some(k) =
+                (0..outputs.len()).find(|&k| combinable[k] && index[k] + 1 < outputs[k].len())
+            else {
+                break;
+            };
+            index[k] += 1;
+            index[..k].iter_mut().for_each(|i| *i = 0);
+        }
+    } else {
+        for k in (0..outputs.len()).filter(|&k| combinable[k]) {
+            for i in 0..outputs[k].len() {
+                candidates.push(build(&|j| {
+                    if j == k {
+                        pick(k, i)
+                    } else {
+                        UNKNOWN_OUTPUT.to_string()
+                    }
+                }));
+            }
+        }
+    }
+    candidates
+}
+
+/// What a substitution body can be shown to print — one entry per possible
+/// output, never empty. A body the resolver cannot read yields the
+/// [`UNKNOWN_OUTPUT`] placeholder, so the word around it is still judged.
+///
+/// Resolved: `echo` (its operands joined by a space — a quoted multi-argument
+/// `echo` is ONE word, so `"$(echo see .env docs)"` is prose, not a path);
+/// `printf` (its format, each argument, and their concatenation, which covers
+/// `printf %s .env`); `true`/`false`/`:` (nothing); and the
+/// [`OPERAND_ECHOING_HEADS`] (each non-flag operand). Wrapper prefixes are
+/// peeled (`command echo .env`), every `;`/`&&` segment contributes
+/// (`echo .env; true`), and a nested substitution is expanded into its body
+/// first (`` $(echo `echo .env`) ``).
+fn substitution_outputs(body: &str, depth: usize) -> Vec<String> {
+    let unknown = || vec![UNKNOWN_OUTPUT.to_string()];
+    if depth > 3 || body.len() > SUBSTITUTION_WORD_LIMIT {
+        return unknown();
+    }
+    let Some(spans) = substitution_spans(body) else {
+        return unknown();
+    };
+    if !spans.is_empty() {
+        if spans.len() > SUBSTITUTION_SPAN_LIMIT {
+            return unknown();
+        }
+        let mut literals = Vec::with_capacity(spans.len() + 1);
+        let mut at = 0;
+        for &(open, _, _, close_end) in &spans {
+            literals.push(&body[at..open]);
+            at = close_end;
+        }
+        literals.push(&body[at..]);
+        let inner: Vec<Vec<String>> = spans
+            .iter()
+            .map(|&(_, bs, be, _)| substitution_outputs(&body[bs..be], depth + 1))
+            .collect();
+        let mut out: Vec<String> = word_candidates(&literals, &inner)
+            .iter()
+            .flat_map(|expanded| substitution_outputs(expanded, depth + 1))
+            .collect();
+        out.dedup();
+        return out;
+    }
+    let mut out = Vec::new();
+    for segment in split_segments(body) {
+        let tokens = tokenize(&segment);
+        let Some((word, argv)) = resolve_command(&tokens) else {
+            continue;
+        };
+        let operands: Vec<&str> = argv
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .filter(|t| !t.starts_with('-'))
+            .collect();
+        match word.as_ref() {
+            "echo" => out.push(operands.join(" ")),
+            "printf" => {
+                out.extend(operands.iter().map(|t| t.to_string()));
+                out.push(operands.iter().skip(1).copied().collect());
+            }
+            "true" | "false" | ":" => out.push(String::new()),
+            // `dirname a/.env/x` prints `a/.env`: the parent, not the operand.
+            "dirname" if !operands.is_empty() => out.extend(operands.iter().map(|t| {
+                t.trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map_or(".", |(parent, _)| parent)
+                    .to_string()
+            })),
+            w if OPERAND_ECHOING_HEADS.contains(&w) && !operands.is_empty() => {
+                out.extend(operands.iter().map(|t| t.to_string()));
+            }
+            _ => out.push(UNKNOWN_OUTPUT.to_string()),
+        }
+    }
+    if out.is_empty() {
+        return unknown();
+    }
+    out
+}
+
+/// Fail-closed judgment of a word the resolver will not expand: the text after
+/// its last substitution delimiter or whitespace, placed behind a placeholder,
+/// so a `…)/.env` tail still classifies as the `.env` it names.
+fn secret_shaped_tail(word: &str, position: Filename) -> bool {
+    let tail = word
+        .rsplit(|c: char| c == ')' || c == '`' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    !tail.is_empty() && is_dangerous_secret_token_at(&format!("{UNKNOWN_OUTPUT}{tail}"), position)
 }
 
 /// Commands whose every non-flag operand is a FILE THEY READ — nothing else.
@@ -5735,7 +5914,6 @@ mod tests {
                 "gh pr create --body \"$(cat <<'EOF'\nfixes the .env loader\nEOF\n)\"",
                 "gh pr create --title \"fix $(date) .env handling\"",
                 "cat \"$(echo .env.example)\"",
-                "cat \"$(echo .env\"",
                 "wc -l \"$(echo .env)\"",
                 "cat \"$(echo é .env.example)\"",
             ],
@@ -5926,5 +6104,72 @@ mod tests {
         assert_eq!(strip_fd_prefix("{1x}>o"), "{1x}>o");
         assert_eq!(strip_fd_prefix("{a b}>o"), "{a b}>o");
         assert_eq!(strip_fd_prefix("{fd}"), "{fd}");
+    }
+
+    #[test]
+    fn substitution_review_repros_block() {
+        // #815 review I1: every shape the first cut still let through.
+        assert_bash(
+            &[
+                "cat \"$(pwd)/$(echo .env)\"",
+                "cat \"$(echo .env)$(true)\"",
+                "cat \"$(echo `echo .env`)\"",
+                // A tail completing the output. (`"$(echo .e)nv"` spells the
+                // same file but never reaches the resolver: the raw-text
+                // pre-filter sees no `.env` — cadence-hooks#819.)
+                "cat \"$(echo .env).local\"",
+                "cat \"$(echo config/.env).production\"",
+                "cat \"$(echo .env; true)\"",
+                "cat \"$(command echo .env)\"",
+                "cat \"$(echo \"(\")/.env\"",
+                "cat \"$(realpath .env)\"",
+                "cat \"$(ls .env)\"",
+                "cat \"$(basename x/.env)\"",
+                "cat \"$(find . -name .env)\"",
+                "cat \"$(dirname .env/x)\"",
+                "cat \"$(printf '%s' .env)\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a substitution provably producing a secret path is a read",
+        );
+    }
+
+    #[test]
+    fn quoted_multi_argument_echo_is_one_word() {
+        // #815 review N2: `"$(echo a b)"` is the single word `a b`, so prose
+        // that mentions `.env` is not a path to it.
+        assert_bash(
+            &[
+                "gh pr create --body \"$(echo see .env docs)\"",
+                "gh pr create --body \"$(cat <<'EOF'\nsee (the) .env docs\nEOF\n)\"",
+                "cat \"$(git rev-parse --show-toplevel)/README.md\"",
+                "cat \"$(true)$(echo README.md)\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "prose and non-secret paths stay allowed",
+        );
+    }
+
+    #[test]
+    fn oversized_substitution_word_is_bounded_and_judged_by_its_tail() {
+        // #815 review I3: resolution built one candidate per echo argument,
+        // quadratic in the word. A 100k-argument word must stay fast, and a
+        // secret-shaped tail past the limit still blocks.
+        let args = "a ".repeat(100_000);
+        let started = std::time::Instant::now();
+        let allow = format!("cat \"$(echo {args})\"");
+        let block = format!("cat \"$(echo {args})/.env\"");
+        let small = format!("cat \"$(echo {})\"", "a ".repeat(3_000));
+        assert_bash(
+            &[&allow, &small],
+            cadence_hooks_core::Outcome::Allow,
+            "no secret",
+        );
+        assert_bash(&[&block], cadence_hooks_core::Outcome::Block, "secret tail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
