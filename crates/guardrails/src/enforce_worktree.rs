@@ -5640,6 +5640,39 @@ mod tests {
         );
     }
 
+    /// Characterizes the WHOLE enforce-worktree verdict on a native Windows
+    /// build (cameronsjo/cadence-hooks#513, ask 2): the one test above covers
+    /// `git_commit_targets` only. A commit into the primary checkout through
+    /// a `-C` redirect blocks from the linked worktree whichever separator
+    /// the target is written with, and a redirect into the worktree from the
+    /// primary allows. Unix-only fixtures never exercise this branch, so a
+    /// Unix path literal here would pass on Windows for the wrong reason:
+    /// every path below is the platform's own `PathBuf` rendering, with
+    /// backslashes, and its forward-slash twin.
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_paths_reach_the_same_verdict_in_every_spelling() {
+        let scratch = scratch("win-spellings");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let native = |path: &Path| path.to_string_lossy().into_owned();
+        let forward = |path: &Path| native(path).replace('\\', "/");
+        assert!(
+            native(&primary).contains('\\'),
+            "the fixture must be a backslash path, or this test proves nothing"
+        );
+        for (cwd, target, expected) in [
+            (&wt, &primary, Outcome::Block),
+            (&primary, &wt, Outcome::Allow),
+        ] {
+            for spelling in [native(target), forward(target)] {
+                let mut input = make_bash(&format!("git -C {spelling} commit -m 'x'"));
+                input.cwd = Some(native(cwd));
+                let r = run_enforce(&input, &cfg(false, false));
+                assert_eq!(r.outcome, expected, "-C {spelling} from {}", native(cwd));
+            }
+        }
+    }
+
     // --- git_commit_targets: grouping / prefixes / quoting (#239 F4/F5/F9) ---
 
     #[test]
@@ -8401,6 +8434,134 @@ mod tests {
         // splitting is scoped to paths a Windows drive prefix already
         // identified as native Windows.
         assert_eq!(lexical_normalize("/tmp/weird\\name"), "/tmp/weird\\name");
+    }
+
+    /// Every spelling of a Windows drive path this module can be handed: the
+    /// drive letter in either case, and `/`, `\\` or a mix as the separator.
+    fn drive_spellings(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for drive in ["C", "c"] {
+            out.push(format!("{drive}:/{body}"));
+            out.push(format!("{drive}:\\{}", body.replace('/', "\\")));
+            // Alternate the separator: every second one is a backslash.
+            let mixed: String = body
+                .split('/')
+                .enumerate()
+                .map(|(i, part)| {
+                    if i == 0 {
+                        part.to_string()
+                    } else {
+                        format!("\\{part}")
+                    }
+                })
+                .collect();
+            out.push(format!("{drive}:/{mixed}"));
+        }
+        out
+    }
+
+    /// The invariant cameronsjo/cadence-hooks#513 asks to pin: a path's
+    /// classification does not depend on the separator flavour (`/`, `\`, or
+    /// a mix) or the drive letter's case. A hand-enumerated table across
+    /// separator x path shape, per the issue's ruling (this repo has no
+    /// proptest); each row is judged by every classifier the guard uses on a
+    /// target, not just the fold.
+    #[test]
+    fn classification_is_independent_of_separator_flavour_on_every_platform() {
+        for body in [
+            "repo",
+            "repo/wt",
+            "repo/",
+            "repo/./sub",
+            "repo/a/../b",
+            "repo/../../..",
+            "Repo/Sub",
+            "repo/.git",
+            "repo/.git/",
+            "repo/.git/worktrees/x",
+            "repo/.git/worktrees/..",
+            "repo/.git/worktrees/../..",
+            "repo//wt",
+            "",
+        ] {
+            let spellings = drive_spellings(body);
+            let reference = &spellings[0];
+            for spelling in &spellings {
+                let context = format!("{spelling:?} vs {reference:?}");
+                assert!(is_shell_absolute(spelling), "{context}");
+                assert_eq!(
+                    lexical_normalize(spelling),
+                    lexical_normalize(reference),
+                    "fold {context}"
+                );
+                assert_eq!(
+                    normalize_target(spelling),
+                    normalize_target(reference),
+                    "target key {context}"
+                );
+                assert_eq!(
+                    is_linked_worktree_admin_dir(spelling),
+                    is_linked_worktree_admin_dir(reference),
+                    "linked-worktree exclusion {context}"
+                );
+                assert!(
+                    !lexical_normalize(spelling).contains('\\'),
+                    "a folded drive path is a shell path {context}"
+                );
+                let command = |target: &str| format!("git -C '{target}' commit -m x");
+                assert_eq!(
+                    git_commit_targets(&command(spelling), "/cwd"),
+                    git_commit_targets(&command(reference), "/cwd"),
+                    "commit target {context}"
+                );
+            }
+        }
+        // The exclusion itself is not vacuous: it holds for a linked worktree's
+        // admin dir in every spelling, and not for the primary's own git dir.
+        for spelling in drive_spellings("repo/.git/worktrees/x") {
+            assert!(is_linked_worktree_admin_dir(&spelling), "{spelling}");
+        }
+        for spelling in drive_spellings("repo/.git/worktrees/..") {
+            assert!(!is_linked_worktree_admin_dir(&spelling), "{spelling}");
+        }
+        // The control: without a drive prefix a backslash is a filename
+        // character, so the flavours must NOT collapse for a POSIX path.
+        assert_ne!(
+            lexical_normalize("/repo/a\\b"),
+            lexical_normalize("/repo/a/b")
+        );
+        assert!(!is_shell_absolute("repo\\wt"));
+    }
+
+    /// Characterizes, and does not endorse, how the fold treats a Windows
+    /// verbatim path (`\\?\C:\…`) today: it is not recognised as a drive path,
+    /// so it is read as one relative segment and returned as written. The
+    /// separator invariant above therefore does NOT extend to the verbatim
+    /// prefix (cameronsjo/cadence-hooks#513, ask 1). A change to this shows up
+    /// here as a diff, not as a CI surprise on a Windows runner.
+    #[test]
+    fn verbatim_prefix_paths_are_not_folded_today() {
+        for verbatim in [
+            r"\\?\C:\repo\.git",
+            r"\\?\c:\repo\wt",
+            r"\\?\UNC\server\share\repo",
+        ] {
+            assert_eq!(
+                lexical_normalize(verbatim),
+                verbatim,
+                "the verbatim spelling is returned unfolded"
+            );
+            assert_ne!(
+                lexical_normalize(verbatim),
+                lexical_normalize(&verbatim.replacen(r"\\?\", "", 1)),
+                "and so differs from the same path without the prefix: {verbatim}"
+            );
+            assert!(!is_linked_worktree_admin_dir(verbatim));
+        }
+        assert_eq!(
+            git_commit_targets(r"git -C '\\?\C:\repo' commit -m x", "/cwd"),
+            vec![r"/cwd/\\?\C:\repo".to_string(), "/cwd".to_string()]
+        );
     }
 
     #[test]

@@ -7270,13 +7270,12 @@ fn scan_command_line(
             }
             if !lex.exhausted.tripped && (c == '`' || (c == '$' && chars.get(j + 1) == Some(&'(')))
             {
-                let bound = quoted_substitution_bound(chars, j);
+                let bound = lex.exhausted.bound(chars, j);
                 if let SubstBound::Bounded(end) = bound {
                     skipped_heredoc |= chars[j..end].windows(2).any(|w| w == ['<', '<']);
                     j = end;
                     continue;
                 }
-                lex.exhausted.note(bound);
             }
         }
         // `\` before a CRLF continues the line the way [`take_logical_line`]
@@ -7496,15 +7495,12 @@ fn split_segments_impl(
             && (c == '`' || (c == '$' && chars.peek() == Some(&'(')))
         {
             let i = all.len() - chars.len() - 1;
-            match quoted_substitution_bound(&all, i) {
-                SubstBound::Bounded(end) => {
-                    current.extend(&all[i..end]);
-                    for _ in i + 1..end {
-                        chars.next();
-                    }
-                    continue;
+            if let SubstBound::Bounded(end) = scan_exhausted.bound(&all, i) {
+                current.extend(&all[i..end]);
+                for _ in i + 1..end {
+                    chars.next();
                 }
-                other => scan_exhausted.note(other),
+                continue;
             }
         }
         if let Some(q) = quote {
@@ -7754,7 +7750,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     (all, byte_of)
                 });
                 let at = byte_of.binary_search(&i).expect("char boundary");
-                let bound = quoted_substitution_bound(all, at);
+                let bound = scan_exhausted.bound(all, at);
                 if let SubstBound::Bounded(end) = bound {
                     let end_byte = byte_of[end];
                     while chars.peek().is_some_and(|&(j, _)| j < end_byte) {
@@ -7763,7 +7759,6 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                     boundary = false;
                     continue;
                 }
-                scan_exhausted.note(bound);
             }
         }
         if let Some(q) = quote {
@@ -8907,32 +8902,183 @@ fn scan_substitution_body_bounded(
     quote_aware: bool,
     budget: usize,
 ) -> Result<(String, usize), ScanStop> {
+    scan_substitution_frames(chars, start, quote_aware, budget, None, None)
+}
+
+/// One `$( … )` level of [`scan_substitution_frames`]: everything the scan
+/// of that level carries between two of its characters, so a nested `$(`
+/// can suspend it and resume it once the nested level is bounded.
+struct ScanFrame {
+    /// Where this level's body starts: the memo key of its outcome.
+    start: usize,
+    j: usize,
+    depth: usize,
+    body: String,
+    quote: Option<Quote>,
+    boundary: bool,
+    lexed: bool,
+    arithmetic: bool,
+    pending: Vec<PendingHeredoc>,
+    command_position: bool,
+    cases: Vec<CaseState>,
+}
+
+impl ScanFrame {
+    fn new(chars: &[char], start: usize) -> Self {
+        ScanFrame {
+            start,
+            depth: 1,
+            j: start,
+            body: String::new(),
+            quote: None,
+            // Where a new word could begin — the only place bash starts a `#` comment.
+            boundary: true,
+            // Whether the scan leaned on its own comment/backtick/brace lexing, so running
+            // off the end afterwards is reported as the scanner limit it may be.
+            lexed: false,
+            // `$((` is arithmetic: no word grammar, so neither a `#` comment nor a
+            // `<<` heredoc exists there (`$(( 1 << 2 ))` is a shift).
+            arithmetic: chars.get(start) == Some(&'('),
+            // Heredocs introduced on the current line, in order, waiting for the
+            // newline that starts their bodies.
+            pending: Vec::new(),
+            // Where a command word could begin: the body's start, after a separator,
+            // or after a reserved word that leads a command (`then`, `do`, `!`, …).
+            // Only there is `case` the keyword (cameronsjo/cadence-hooks#1094).
+            command_position: true,
+            // The `case` statements open at this level, innermost last.
+            cases: Vec::new(),
+        }
+    }
+}
+
+/// What one run of [`scan_frame`] ended in.
+enum FrameStep {
+    Done(Result<(String, usize), ScanStop>),
+    /// A nested `$(` whose body starts at this index: bound it, then resume.
+    Nested(usize),
+}
+
+/// How many `$( … )` levels the heap-stacked scan of
+/// [`quoted_substitution_bound`] keeps open at once: past this the span is
+/// [`SubstBound::TooDeep`]. A level costs ~150 bytes, and an opener is three
+/// characters, so an input this deep is over 750 KB.
+const MAX_QUOTED_SUBSTITUTION_FRAMES: usize = 1 << 18;
+
+/// [`scan_substitution_body`] with the nested levels on the heap.
+///
+/// `max_frames: None` is the recursion-shaped reading every caller but the
+/// splitters wants: level `k` gets `budget - k - 1`, so nesting past `budget`
+/// is [`ScanStop::DepthExceeded`]. `Some(cap)` keeps up to `cap` levels open
+/// (each spends one unit of `budget` only for the native recursion a `${…}`
+/// expansion can start), so a flood of unclosed `"$(` costs one linear pass
+/// instead of ~16 levels for every opener the caller retries — which is what
+/// let the splitters drop their too-deep retry cap
+/// (cameronsjo/cadence-hooks#1143 residual).
+fn scan_substitution_frames(
+    chars: &[char],
+    start: usize,
+    quote_aware: bool,
+    budget: usize,
+    max_frames: Option<usize>,
+    mut memo: Option<&mut SubstMemo>,
+) -> Result<(String, usize), ScanStop> {
     // Fail the scan rather than the process, and say WHICH failure it was —
     // every caller has to tell "the shell would reject this" from "we gave up".
-    let Some(budget) = budget.checked_sub(1) else {
+    let frame_budget = |level: usize| match max_frames {
+        None => budget.checked_sub(level + 1),
+        Some(cap) if level < cap => budget.checked_sub(1),
+        Some(_) => None,
+    };
+    let Some(first_budget) = frame_budget(0) else {
         return Err(ScanStop::DepthExceeded);
     };
-    let mut depth = 1usize;
-    let mut j = start;
-    let mut body = String::new();
-    let mut quote: Option<Quote> = None;
-    // Where a new word could begin — the only place bash starts a `#` comment.
-    let mut boundary = true;
-    // Whether the scan leaned on its own comment/backtick/brace lexing, so running
-    // off the end afterwards is reported as the scanner limit it may be.
-    let mut lexed = false;
-    // `$((` is arithmetic: no word grammar, so neither a `#` comment nor a
-    // `<<` heredoc exists there (`$(( 1 << 2 ))` is a shift).
-    let arithmetic = chars.get(start) == Some(&'(');
-    // Heredocs introduced on the current line, in order, waiting for the
-    // newline that starts their bodies.
-    let mut pending: Vec<PendingHeredoc> = Vec::new();
-    // Where a command word could begin: the body's start, after a separator,
-    // or after a reserved word that leads a command (`then`, `do`, `!`, …).
-    // Only there is `case` the keyword (cameronsjo/cadence-hooks#1094).
-    let mut command_position = true;
-    // The `case` statements open at this level, innermost last.
-    let mut cases: Vec<CaseState> = Vec::new();
+    // Only the outermost body is returned; a nested level's text is copied in
+    // solely when a legacy caller reads it, which is quadratic on a deep chain.
+    let want_nested_text = max_frames.is_none();
+    let mut stack = vec![ScanFrame::new(chars, start)];
+    let mut level_budget = first_budget;
+    loop {
+        let frame = stack.last_mut().expect("a frame is open");
+        // The outcome of the level that just ended, and whether it is still on
+        // the stack (a memo hit never was).
+        let (mut child, mut on_stack) = match scan_frame(chars, quote_aware, level_budget, frame) {
+            FrameStep::Done(result) => (result, true),
+            FrameStep::Nested(nested_start) => {
+                if let Some(&hit) = memo.as_ref().and_then(|m| m.get(&nested_start)) {
+                    (hit.map(|end| (String::new(), end)), false)
+                } else if let Some(next_budget) = frame_budget(stack.len()) {
+                    level_budget = next_budget;
+                    stack.push(ScanFrame::new(chars, nested_start));
+                    continue;
+                } else {
+                    // A nested failure is relabelled, never propagated as-is
+                    // (see below).
+                    return Err(ScanStop::NestedTooDeep);
+                }
+            }
+        };
+        // Hand a finished level to its parent, unwinding while parents fail.
+        loop {
+            if on_stack {
+                let finished = stack.pop().expect("a frame is open");
+                if let Some(memo) = memo.as_mut() {
+                    memo.insert(
+                        finished.start,
+                        child.as_ref().map(|&(_, end)| end).map_err(|&stop| stop),
+                    );
+                }
+            }
+            let Some(parent) = stack.last_mut() else {
+                return child;
+            };
+            match child {
+                Ok((_, nested_end)) => {
+                    if want_nested_text {
+                        parent.body.extend(&chars[parent.j..nested_end]);
+                    }
+                    parent.j = nested_end;
+                    parent.boundary = false;
+                    level_budget = frame_budget(stack.len() - 1).expect("parent had a budget");
+                    break;
+                }
+                // Depth is remembered through the relabelling: a depth failure
+                // read only as far as the cap's openers, unlike one that ran to
+                // the end of input.
+                Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => {
+                    child = Err(ScanStop::NestedTooDeep);
+                }
+                Err(_) => child = Err(ScanStop::NestedUnresolved),
+            }
+            on_stack = true;
+        }
+    }
+}
+
+/// The outcome of every `$( … )` level a heap-stacked scan finished, by the
+/// index its body starts at. A level's outcome depends on the text from
+/// there on and nothing before it, so a later scan that meets the same start
+/// reuses it: an unclosed opener flood is scanned once, not once per opener.
+type SubstMemo = std::collections::HashMap<usize, Result<usize, ScanStop>>;
+
+/// Run one level of [`scan_substitution_frames`] until it ends or meets a
+/// nested `$(`. `budget` is what a `${…}` inside it may still recurse with.
+fn scan_frame(
+    chars: &[char],
+    quote_aware: bool,
+    budget: usize,
+    frame: &mut ScanFrame,
+) -> FrameStep {
+    let mut j = frame.j;
+    let mut depth = frame.depth;
+    let mut body = std::mem::take(&mut frame.body);
+    let mut quote = frame.quote;
+    let mut boundary = frame.boundary;
+    let mut lexed = frame.lexed;
+    let arithmetic = frame.arithmetic;
+    let mut pending = std::mem::take(&mut frame.pending);
+    let mut command_position = frame.command_position;
+    let mut cases = std::mem::take(&mut frame.cases);
     while j < chars.len() {
         // A `case` statement's pattern list closes each pattern with a
         // bare `)`, which this scanner counted as the terminator:
@@ -9029,7 +9175,7 @@ fn scan_substitution_body_bounded(
                         body.extend(&chars[j..end]);
                         j = end;
                     }
-                    None => return Err(ScanStop::LexUnresolved),
+                    None => return FrameStep::Done(Err(ScanStop::LexUnresolved)),
                 }
                 boundary = true;
                 command_position = true;
@@ -9067,7 +9213,7 @@ fn scan_substitution_body_bounded(
             // #836). An unclosed span is a scanner limit, never a deletion.
             if matches!(quote, None | Some(Quote::Double)) && chars[j] == '`' {
                 let Some(end) = backtick_span_end(chars, j) else {
-                    return Err(ScanStop::LexUnresolved);
+                    return FrameStep::Done(Err(ScanStop::LexUnresolved));
                 };
                 body.extend(&chars[j..end]);
                 j = end;
@@ -9086,7 +9232,7 @@ fn scan_substitution_body_bounded(
                 && chars.get(j + 1) == Some(&'{')
             {
                 let Some(end) = brace_expansion_end(chars, j, budget) else {
-                    return Err(ScanStop::LexUnresolved);
+                    return FrameStep::Done(Err(ScanStop::LexUnresolved));
                 };
                 body.extend(&chars[j..end]);
                 j = end;
@@ -9133,21 +9279,20 @@ fn scan_substitution_body_bounded(
                 // on that reading. Measured cost: a `#` comment inside the
                 // nested body flipped a heredoc secret read from blocked to
                 // allowed (see [`ScanStop`]).
-                let (_, nested_end) =
-                    match scan_substitution_body_bounded(chars, j + 2, true, budget) {
-                        Ok(found) => found,
-                        // Depth is remembered through the relabelling: a
-                        // depth failure read only as far as the cap's
-                        // openers, unlike one that ran to the end of input.
-                        Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => {
-                            return Err(ScanStop::NestedTooDeep);
-                        }
-                        Err(_) => return Err(ScanStop::NestedUnresolved),
-                    };
-                body.extend(&chars[j..nested_end]);
-                j = nested_end;
-                boundary = false;
-                continue;
+                *frame = ScanFrame {
+                    start: frame.start,
+                    j,
+                    depth,
+                    body,
+                    quote,
+                    boundary,
+                    lexed,
+                    arithmetic,
+                    pending,
+                    command_position,
+                    cases,
+                };
+                return FrameStep::Nested(j + 2);
             }
             if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
                 body.extend(&chars[j..next]);
@@ -9209,7 +9354,7 @@ fn scan_substitution_body_bounded(
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok((body, j + 1));
+                    return FrameStep::Done(Ok((body, j + 1)));
                 }
                 body.push(')');
             }
@@ -9236,16 +9381,16 @@ fn scan_substitution_body_bounded(
     // The comment arm above now reads that shape the way bash does; this stop
     // remains the backstop for any quote this scanner opens and bash does not.
     if quote.is_some() {
-        return Err(ScanStop::QuoteUnresolved);
+        return FrameStep::Done(Err(ScanStop::QuoteUnresolved));
     }
     // More than one level still open means the scan opened parens it never
     // closed — some `(` shape with no arm here — on a line the shells may run.
     // And a comment, backtick or brace span this scanner lexed itself may be
     // where it went wrong. Both widen (cadence-hooks#831).
     if depth > 1 || lexed {
-        return Err(ScanStop::LexUnresolved);
+        return FrameStep::Done(Err(ScanStop::LexUnresolved));
     }
-    Err(ScanStop::Unterminated)
+    FrameStep::Done(Err(ScanStop::Unterminated))
 }
 
 /// A heredoc operator's delimiter word, read the way bash reads it.
@@ -9673,39 +9818,84 @@ fn brace_expansion_end(chars: &[char], i: usize, budget: usize) -> Option<usize>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubstBound {
     Bounded(usize),
-    /// Nesting past [`MAX_SUBSTITUTION_DEPTH`]: cheap, and local.
+    /// Nesting past [`MAX_QUOTED_SUBSTITUTION_FRAMES`] (an input over 750 KB):
+    /// the pass stops asking.
     TooDeep,
     /// No closer found: the scan read to the end of the input.
     Unbounded,
 }
 
-/// The most too-deep failures one pass retries before it latches anyway. A
-/// too-deep scan reads only the cap's worth of nested openers, but an
-/// unclosed flood (`"$("` × 60 000) fails at every opener, ~17 levels each —
-/// 0.3-0.6 s at 200 KB, in a hook whose deadline fails open. Past the cap the
-/// pass reads the rest character by character, as it always did.
-const MAX_TOO_DEEP_RETRIES: usize = 1024;
+/// Fresh scan work (characters) a pass may spend on spans whose start no
+/// earlier scan already resolved, as a multiple of the input plus a floor.
+/// An opener the scanner reads as data (`"$(#` inside a comment) is never
+/// memoized, so each retry of one is a fresh scan to the end of the input:
+/// quadratic, and the hook deadline fails open. Past the allowance the pass
+/// stops asking, as it always did after an unbounded span.
+const SCAN_WORK_FACTOR: usize = 8;
+const SCAN_WORK_FLOOR: usize = 1 << 16;
 
-/// Whether a pass has stopped asking [`quoted_substitution_bound`].
+/// One pass's view of [`quoted_substitution_bound`]: whether it has stopped
+/// asking, and what its earlier scans already resolved.
+///
+/// A span that cannot be bounded no longer switches span handling off for the
+/// rest of the pass. The scan of an unclosed `"$(` records every level it
+/// opened, so a span nested inside it — a commit heredoc with an odd `"`
+/// after 5000 unclosed openers — is still bounded (cameronsjo/cadence-hooks#1143).
+/// The pass stops only for a backtick with no closer (nothing later can close
+/// either), for nesting past [`MAX_QUOTED_SUBSTITUTION_FRAMES`], or once the
+/// fresh work allowance is spent.
 #[derive(Default)]
 struct SpanLatch {
     tripped: bool,
-    too_deep: usize,
+    memo: SubstMemo,
+    work: usize,
 }
 
 impl SpanLatch {
-    /// Record a span that could not be bounded. An [`SubstBound::Unbounded`]
-    /// scan ran to the end of the input, so every later one would too: trip.
-    /// A [`SubstBound::TooDeep`] one is local to its span: retry the next
-    /// span, up to [`MAX_TOO_DEEP_RETRIES`].
-    fn note(&mut self, bound: SubstBound) {
-        match bound {
-            SubstBound::Bounded(_) => {}
-            SubstBound::Unbounded => self.tripped = true,
-            SubstBound::TooDeep => {
-                self.too_deep += 1;
-                self.tripped |= self.too_deep > MAX_TOO_DEEP_RETRIES;
+    /// [`quoted_substitution_bound`] through the memo; trips the latch when
+    /// the pass should stop asking.
+    fn bound(&mut self, chars: &[char], i: usize) -> SubstBound {
+        match chars[i] {
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                let start = i + 2;
+                if let Some(&hit) = self.memo.get(&start) {
+                    return Self::classify(hit.map(|end| (String::new(), end)));
+                }
+                if self.work > SCAN_WORK_FACTOR * chars.len() + SCAN_WORK_FLOOR {
+                    self.tripped = true;
+                    return SubstBound::Unbounded;
+                }
+                let found = scan_substitution_frames(
+                    chars,
+                    start,
+                    true,
+                    MAX_SUBSTITUTION_DEPTH,
+                    Some(MAX_QUOTED_SUBSTITUTION_FRAMES),
+                    Some(&mut self.memo),
+                );
+                self.work += match &found {
+                    Ok((_, end)) => end - start,
+                    Err(_) => chars.len() - start,
+                };
+                let bound = Self::classify(found);
+                self.tripped |= bound == SubstBound::TooDeep;
+                bound
             }
+            _ => {
+                let bound = quoted_substitution_bound(chars, i);
+                // Bash ends a backtick span at the first unescaped backtick, so
+                // none found here means none found for any later opener.
+                self.tripped |= bound == SubstBound::Unbounded;
+                bound
+            }
+        }
+    }
+
+    fn classify(found: Result<(String, usize), ScanStop>) -> SubstBound {
+        match found {
+            Ok((_, end)) => SubstBound::Bounded(end),
+            Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => SubstBound::TooDeep,
+            Err(_) => SubstBound::Unbounded,
         }
     }
 }
@@ -9723,11 +9913,6 @@ impl SpanLatch {
 /// character reading, which is the status quo rather than a new deletion.
 fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
     match chars[i] {
-        '$' if chars.get(i + 1) == Some(&'(') => match scan_substitution_body(chars, i + 2, true) {
-            Ok((_, end)) => SubstBound::Bounded(end),
-            Err(ScanStop::DepthExceeded | ScanStop::NestedTooDeep) => SubstBound::TooDeep,
-            Err(_) => SubstBound::Unbounded,
-        },
         '`' => backtick_span_end(chars, i).map_or(SubstBound::Unbounded, SubstBound::Bounded),
         _ => SubstBound::Unbounded,
     }
@@ -17012,20 +17197,83 @@ mod tests {
         }
     }
 
+    /// `echo "$(`×n `echo x` `)"`×n, the odd-`"` commit heredoc, then a read.
+    fn nested_then_odd_quote_commit(n: usize) -> String {
+        format!(
+            "{}; git commit -m \"$(cat <<'EOF'\nit\"s\nEOF\n)\"; cat .env",
+            "echo \"$(".repeat(n) + "echo x" + &")\"".repeat(n),
+        )
+    }
+
     #[test]
-    fn too_deep_retries_are_capped_so_an_unclosed_opener_flood_stays_fast() {
-        // The no-latch rule for too-deep spans retries every opener of an
-        // unclosed `"$(` flood, ~17 levels each; the retry cap bounds that.
-        let flood = "\"$(".repeat(200 * 1024 / 3);
-        let cmd = format!("{flood} ; cat .env");
-        let started = std::time::Instant::now();
-        let segs = split_segments(&cmd);
-        let took = started.elapsed();
-        assert!(!segs.is_empty());
-        // Debug builds get headroom; release is the hook's real budget.
+    fn deep_or_unclosed_quoted_nesting_never_reopens_the_odd_quote_evasion() {
+        // cadence-hooks#1143 residual: the too-deep retry cap (1024) reopened
+        // the evasion for an input with ~3 KB of unclosed `"$(` before the
+        // heredoc, and 17+ balanced levels are past the old depth cap too.
+        // `cat .env` must be a segment of its own for every shape.
+        let mut shapes: Vec<(String, String)> = [17usize, 40, 2000]
+            .iter()
+            .map(|&n| (format!("nested n={n}"), nested_then_odd_quote_commit(n)))
+            .collect();
+        for prefix in [2usize, 1100, 5000] {
+            shapes.push((
+                format!("unclosed prefix {prefix} + n=17"),
+                "\"$(".repeat(prefix) + &nested_then_odd_quote_commit(17),
+            ));
+        }
+        for (name, cmd) in shapes {
+            for (fn_name, segs) in [
+                ("split_segments", split_segments(&cmd)),
+                ("command_segments", command_segments(&cmd)),
+            ] {
+                assert!(
+                    segs.iter().any(|s| s.trim() == "cat .env"),
+                    "{name} {fn_name}: the read is hidden inside a phantom quote"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_scan_keeps_nested_levels_on_the_heap() {
+        // 20 000 levels on a 256 KB stack: the levels are frames, not native
+        // recursion, and every one is memoized as it finishes.
+        let n = 20_000;
+        let cmd = format!("{}echo x{}", "\"$(".repeat(n), ")\"".repeat(n));
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let chars: Vec<char> = cmd.chars().collect();
+                let mut latch = SpanLatch::default();
+                (latch.bound(&chars, 1), chars.len(), latch.memo.len())
+            })
+            .expect("spawn");
+        let (bound, len, memoized) = handle.join().expect("overflowed the stack");
+        assert_eq!(bound, SubstBound::Bounded(len - 1));
+        assert_eq!(memoized, 20_000);
+    }
+
+    #[test]
+    fn unclosed_opener_floods_stay_fast() {
+        // Every 200 KB flood shape, retried at every opener before this fix,
+        // now costs one linear pass. Release is the hook's real budget.
         let limit =
             std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
-        assert!(took < limit, "{took:?}");
+        let unit_n = |unit: &str| unit.repeat(200 * 1024 / unit.len());
+        let inputs = [
+            format!("{} ; cat .env", unit_n("\"$(")),
+            format!("echo {} ; cat .env", unit_n("\"$(echo x ")),
+            format!("{}; cat .env", unit_n("echo \"$(")),
+            format!("echo \"{} ; cat .env", unit_n("$(#")),
+            format!("{}{}", unit_n("\"$(a'"), " ; cat .env"),
+        ];
+        for input in inputs {
+            let started = std::time::Instant::now();
+            let segs = split_segments(&input);
+            let took = started.elapsed();
+            assert!(!segs.is_empty());
+            assert!(took < limit, "{took:?} on {:.30}", input);
+        }
     }
 
     #[test]
