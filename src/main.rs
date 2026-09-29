@@ -496,6 +496,8 @@ enum RulesCommands {
 enum ObsidianCommands {
     /// Block rm in Obsidian vault (use .trash/ instead)
     TrashGuard,
+    /// Report at SessionStart when a trash-guard route no longer judges as contracted
+    TrashGuardLiveness,
 }
 
 #[derive(Subcommand)]
@@ -678,6 +680,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         }),
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
+            ObsidianCommands::TrashGuardLiveness => "trash-guard-liveness",
         }),
         Commands::Metrics(m) => Some(match m {
             MetricsCommands::Snapshot => "snapshot",
@@ -994,6 +997,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ObsidianCommands::TrashGuard => CheckPlan::new(
                 Box::new(cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard),
                 pre,
+            ),
+            ObsidianCommands::TrashGuardLiveness => CheckPlan::new(
+                Box::new(cadence_hooks_obsidian::trash_guard_liveness::TrashGuardLiveness),
+                session,
             ),
         },
         // warn-stale is a SessionStart *check*, not a logger — it reads the

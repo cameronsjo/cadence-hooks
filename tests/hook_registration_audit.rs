@@ -314,6 +314,12 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     // PostToolUse on Write/Edit/MultiEdit with `if: Write(*/.github/workflows/*)`
     // style single rules; the wiring lands in the cadence monorepo follow-up.
     ("cadence audit-runner-pool", "cameronsjo/cadence-hooks#1072"),
+    // SessionStart entry in the cadence-obsidian hooks.json; lands in the
+    // cadence monorepo follow-up.
+    (
+        "obsidian trash-guard-liveness",
+        "cameronsjo/cadence-hooks#797",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
