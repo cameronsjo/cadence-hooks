@@ -1171,6 +1171,38 @@ fn panic_row_error(
     }
 }
 
+/// The most characters of a panic message the panic hook prints to stderr.
+const PANIC_STDERR_MAX: usize = 400;
+
+/// The panic text the panic hook prints to stderr (cadence-hooks#990).
+///
+/// Unlike [`panic_row_error`], the message is kept: stderr is the one place a
+/// person debugging the panic can read it, and it goes back to the harness
+/// that sent the payload. It is still bounded, because Claude Code can keep
+/// hook stderr in its debug logs and a formatted panic can quote arbitrary
+/// runtime data (a whole `tool_input.command`). So every control and
+/// invisible-format character becomes a space (no forged lines, no terminal
+/// escapes, no bidi reordering) and the message is cut at
+/// [`PANIC_STDERR_MAX`] characters. The source location is appended after the
+/// cut, so it survives any message length.
+fn panic_stderr_text(
+    payload: &(dyn std::any::Any + Send),
+    loc: Option<&std::panic::Location<'_>>,
+) -> String {
+    let raw = if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.as_str()
+    } else {
+        "unknown panic"
+    };
+    let message = cadence_hooks_core::display::sanitize_field(raw, PANIC_STDERR_MAX);
+    match loc {
+        Some(loc) => format!("{message} (at {}:{})", loc.file(), loc.line()),
+        None => message,
+    }
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition before anything can write to
     // stdout. Rust leaves SIGPIPE ignored, which turns `cadence-hooks … | head`
@@ -1208,16 +1240,10 @@ fn main() {
     // exiting, so the waiting `catch_unwind` can finish the dispatch tail and
     // fail open at exit 0 (see the flag's doc, cameronsjo/cadence-hooks#349).
     std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(msg) = info.payload().downcast_ref::<&str>() {
-            (*msg).to_string()
-        } else if let Some(msg) = info.payload().downcast_ref::<String>() {
-            msg.clone()
-        } else {
-            "unknown panic".to_string()
-        };
         eprintln!(
             "cadence-hooks: internal error (panic). This hook will not block your operation.\n\
-             {payload}"
+             {}",
+            panic_stderr_text(info.payload(), info.location())
         );
         // Best-effort argv re-read: this closure has no access to the `Check`/
         // `Logger`/`hook` context computed elsewhere in `main` (a panic can
@@ -1237,10 +1263,10 @@ fn main() {
         // (cameronsjo/cadence-hooks#398). `panic_row_error` keeps a `&str`
         // payload (a compile-time literal) and withholds a `String` payload
         // (formatted, so it can carry runtime data); its doc says why a
-        // `scan_secret_values` pass was rejected. The `eprintln!` above still
-        // prints the full payload: stderr goes back to the harness that sent
-        // the payload in the first place, while the durable ledger is the
-        // privacy boundary (cameronsjo/cadence-hooks#959).
+        // `scan_secret_values` pass was rejected. The `eprintln!` above keeps
+        // the message but bounds it (`panic_stderr_text`,
+        // cameronsjo/cadence-hooks#990); the durable ledger stays the privacy
+        // boundary (cameronsjo/cadence-hooks#959).
         let error = panic_row_error(info.payload(), info.location());
         cadence_hooks_metrics::log_failopen(
             "panic",
@@ -1712,6 +1738,37 @@ mod tests {
         let row = panic_row_error(&formatted, None);
         assert_eq!(row, "panic message withheld (formatted, 9 chars)");
         assert_eq!(panic_row_error(&7_u8, None), "unknown panic");
+    }
+
+    /// cadence-hooks#990: stderr keeps the message, bounded and sanitized, and
+    /// always keeps the location. (payload, expected text before the location)
+    #[test]
+    fn panic_stderr_text_is_sanitized_capped_and_keeps_the_location() {
+        let loc = std::panic::Location::caller();
+        let at = format!(" (at {}:{})", loc.file(), loc.line());
+        let long = "x".repeat(PANIC_STDERR_MAX + 50);
+        let cases: Vec<(Box<dyn std::any::Any + Send>, String)> = vec![
+            (Box::new("static message"), "static message".to_string()),
+            (
+                Box::new(String::from("line one\nforged: line\x1b[31m")),
+                "line one forged: line [31m".to_string(),
+            ),
+            (
+                Box::new(String::from("abc\u{202E}def")),
+                "abc def".to_string(),
+            ),
+            (
+                Box::new(long.clone()),
+                format!("{}…", "x".repeat(PANIC_STDERR_MAX)),
+            ),
+            (Box::new(7_u8), "unknown panic".to_string()),
+        ];
+        for (payload, expected) in &cases {
+            let text = panic_stderr_text(payload.as_ref(), Some(loc));
+            assert_eq!(text, format!("{expected}{at}"));
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+        assert_eq!(panic_stderr_text(&"m", None), "m");
     }
 
     #[test]

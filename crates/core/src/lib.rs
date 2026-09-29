@@ -323,7 +323,50 @@ pub struct HookInput {
     /// the drift-shaped half of the degradation (cadence-hooks#364).
     #[serde(skip)]
     pub schema_drift: Vec<&'static str>,
+    /// `tool_input` keys that were present but failed their typed shape, and
+    /// so were dropped while the rest of `tool_input` was kept (see
+    /// [`salvage_tool_input`], cadence-hooks#1087). `"tool_input"` means the
+    /// object could not be salvaged at all. Derived, never deserialized.
+    #[serde(skip)]
+    pub mistyped_tool_input: Vec<&'static str>,
+    /// True when `tool_input` was present and non-null but not a JSON object
+    /// (a string, array, number, or bool). Derived, never deserialized.
+    #[serde(skip)]
+    pub tool_input_non_object: bool,
 }
+
+/// `tool_input` keys that carry the operation a guard judges, for a
+/// command-running tool. Anything else on a Bash payload (`file_path: 5`) is
+/// unrelated, and the salvaged command is judged on its own merits.
+const COMMAND_OPERATION_KEYS: &[&str] = &["command", "cmd", "tool_input"];
+
+/// `tool_input` keys that carry the operation a guard judges, for every other
+/// Claude Code tool: the target path(s), the written content, and the edit
+/// shape that the content guards simulate.
+const FILE_OPERATION_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "source",
+    "sourcePath",
+    "from",
+    "destination",
+    "destinationPath",
+    "to",
+    "command",
+    "cmd",
+    "patch",
+    "operation",
+    "content",
+    "new_string",
+    "old_string",
+    "replace_all",
+    "edits",
+    "tool_input",
+];
+
+/// Tools whose `tool_input` Claude Code always sends as an object, so a
+/// non-object value there cannot be ordinary per-tool variance.
+const OBJECT_INPUT_TOOLS: &[&str] = &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// Tool-specific fields from the hook input.
 ///
@@ -520,6 +563,85 @@ fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
     drift
 }
 
+/// Every key [`ToolInput`] models, aliases included, as static names.
+///
+/// A key that fails [`ToolInput`]'s typed shape can only be one of these, since
+/// unmodeled keys land in [`ToolInput::extra`] as raw JSON and never fail. The
+/// static list is what lets [`HookInput::mistyped_tool_input`] name a field
+/// without carrying a payload-supplied string anywhere.
+const TOOL_INPUT_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "source",
+    "sourcePath",
+    "from",
+    "destination",
+    "destinationPath",
+    "to",
+    "command",
+    "cmd",
+    "patch",
+    "operation",
+    "content",
+    "new_string",
+    "old_string",
+    "replace_all",
+    "edits",
+    "questions",
+    "subagent_type",
+    "isolation",
+    "skill",
+    "args",
+    "plan",
+    "planFilePath",
+];
+
+/// Salvage a `tool_input` object that fails its typed shape, field by field
+/// (cadence-hooks#1087).
+///
+/// Before this, one wrong-typed field anywhere in `tool_input` degraded the
+/// WHOLE struct to `None` through `lenient_option`, so `{"command": "git reset
+/// --hard", "file_path": 5}` hid a readable command from every guard. Here each
+/// key is tried on its own; a key that fails alone is removed, and the rest
+/// parse normally. The removed keys are returned as static names so the caller
+/// can decide whether the operation is still judgeable.
+///
+/// When every key passes alone but the object still fails (duplicate aliases
+/// such as `source` + `sourcePath`), the whole object is unreadable: it is
+/// left in place to degrade to `None` as before, and `"tool_input"` is returned
+/// so the caller does not mistake that for an absent input.
+///
+/// Runs only on the failure path, and a non-object `tool_input` is untouched.
+fn salvage_tool_input(value: &mut serde_json::Value) -> Vec<&'static str> {
+    let Some(serde_json::Value::Object(map)) = value.get_mut("tool_input") else {
+        return Vec::new();
+    };
+    if ToolInput::deserialize(&serde_json::Value::Object(map.clone())).is_ok() {
+        return Vec::new();
+    }
+    let mut mistyped = Vec::new();
+    map.retain(|key, field| {
+        let alone = serde_json::json!({ key.as_str(): field });
+        if ToolInput::deserialize(&alone).is_ok() {
+            return true;
+        }
+        mistyped.push(
+            TOOL_INPUT_KEYS
+                .iter()
+                .copied()
+                .find(|known| *known == key)
+                .unwrap_or("tool_input"),
+        );
+        false
+    });
+    if ToolInput::deserialize(&serde_json::Value::Object(map.clone())).is_err() {
+        mistyped.push("tool_input");
+    }
+    mistyped.sort_unstable();
+    mistyped.dedup();
+    mistyped
+}
+
 /// Describe a hook-payload parse failure without echoing any of the payload.
 ///
 /// serde's `Display` is not safe to record: a data error quotes the offending
@@ -670,6 +792,10 @@ impl HookInput {
             }
         }
         let drift = schema_drift(&value);
+        let tool_input_non_object = value
+            .get("tool_input")
+            .is_some_and(|v| !v.is_null() && !v.is_object());
+        let mistyped = salvage_tool_input(&mut value);
         let mut input: HookInput = serde_json::from_value(value).map_err(|e| {
             plain(json_parse_failure(&e, raw, || {
                 serde_json::from_str::<HookInput>(raw)
@@ -678,6 +804,8 @@ impl HookInput {
             }))
         })?;
         input.schema_drift = drift;
+        input.mistyped_tool_input = mistyped;
+        input.tool_input_non_object = tool_input_non_object;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1025,6 +1153,49 @@ impl HookInput {
             .or(self.tool_name.as_deref())
     }
 
+    /// The operation-bearing `tool_input` fields this payload carried in a
+    /// shape no guard can read (cadence-hooks#1087). Empty means every guard
+    /// sees the operation the harness would run.
+    ///
+    /// Non-empty is not a guard bug (ADR-0001's fail-open case): the payload is
+    /// partly unreadable, so a guard cannot prove the operation safe. The
+    /// dispatch layer blocks a security-critical hook on it rather than letting
+    /// the missing field read as "no command" and allow.
+    ///
+    /// Scoped so ordinary variance never reaches it:
+    /// - MCP tools (`mcp__*`) are skipped, like [`schema_drift`] skips them:
+    ///   their shapes belong to third-party servers (an array `content` is a
+    ///   normal MCP shape), so a mismatch says nothing about the operation.
+    /// - A mistyped field unrelated to the tool is ignored: on a Bash payload
+    ///   only `command`/`cmd` count, since the salvaged command is judged anyway.
+    /// - A non-object `tool_input` counts only for tools Claude Code always
+    ///   sends an object for ([`OBJECT_INPUT_TOOLS`]).
+    pub fn unreadable_operation_fields(&self) -> Vec<&'static str> {
+        if self
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("mcp__"))
+        {
+            return Vec::new();
+        }
+        let tool = self.normalized_tool_name();
+        let relevant = if tool == Some("Bash") {
+            COMMAND_OPERATION_KEYS
+        } else {
+            FILE_OPERATION_KEYS
+        };
+        let mut fields: Vec<&'static str> = self
+            .mistyped_tool_input
+            .iter()
+            .copied()
+            .filter(|field| relevant.contains(field))
+            .collect();
+        if self.tool_input_non_object && tool.is_some_and(|t| OBJECT_INPUT_TOOLS.contains(&t)) {
+            fields.push("tool_input");
+        }
+        fields
+    }
+
     /// The Claude Code session id, if present (SessionStart and some payloads).
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
@@ -1168,8 +1339,12 @@ impl MetricsInput {
 
     /// Parse metrics input from a JSON string, capturing the raw top-level keys.
     pub fn from_json(s: &str) -> Result<Self, String> {
-        let value: serde_json::Value =
+        let mut value: serde_json::Value =
             serde_json::from_str(s).map_err(|e| json_parse_failure(&e, s, || None))?;
+        let drift = schema_drift(&value);
+        // Same per-field salvage as `HookInput` (cadence-hooks#1087), so one
+        // mistyped field does not cost a logger the whole `tool_input`.
+        salvage_tool_input(&mut value);
         let mut input: MetricsInput = serde_json::from_value(value.clone()).map_err(|e| {
             json_parse_failure(&e, s, || {
                 serde_json::from_str::<MetricsInput>(s)
@@ -1180,7 +1355,7 @@ impl MetricsInput {
         if let Some(obj) = value.as_object() {
             input.raw_keys = obj.keys().cloned().collect();
         }
-        input.schema_drift = schema_drift(&value);
+        input.schema_drift = drift;
         Ok(input)
     }
 
@@ -3500,7 +3675,95 @@ mod tests {
         );
         let hook = HookInput::from_json(json).unwrap();
         assert_eq!(hook.schema_drift, ["tool_input", "tool_response"]);
-        assert!(hook.tool_input.is_none());
+        assert!(hook.command().is_none(), "the mistyped command is dropped");
+        assert_eq!(hook.mistyped_tool_input, ["command"]);
+    }
+
+    #[test]
+    fn mistyped_tool_input_fields_are_salvaged_and_classified() {
+        // (payload, command read, mistyped, unreadable) — cadence-hooks#1087.
+        type Case<'a> = (&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
+        let cases: &[Case] = &[
+            (
+                r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard","file_path":5}}"#,
+                Some("git reset --hard"),
+                &["file_path"],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"Bash","tool_input":{"command":["git","reset"]}}"#,
+                None,
+                &["command"],
+                &["command"],
+            ),
+            (
+                r#"{"tool_name":"exec_command","tool_input":{"cmd":7}}"#,
+                None,
+                &["cmd"],
+                &["cmd"],
+            ),
+            (
+                r#"{"tool_name":"Bash","tool_input":"git reset --hard"}"#,
+                None,
+                &[],
+                &["tool_input"],
+            ),
+            (r#"{"tool_name":"Bash","tool_input":null}"#, None, &[], &[]),
+            (
+                r#"{"tool_name":"Write","tool_input":{"file_path":"a","content":{"x":1}}}"#,
+                None,
+                &["content"],
+                &["content"],
+            ),
+            (
+                r#"{"tool_name":"MultiEdit","tool_input":{"file_path":"a","edits":[{"old_string":5}]}}"#,
+                None,
+                &["edits"],
+                &["edits"],
+            ),
+            (
+                r#"{"tool_name":"Edit","tool_input":{"file_path":"a","source":"b","sourcePath":"c"}}"#,
+                None,
+                &["tool_input"],
+                &["tool_input"],
+            ),
+            (
+                r#"{"tool_name":"Agent","tool_input":{"subagent_type":5,"prompt":"p"}}"#,
+                None,
+                &["subagent_type"],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"mcp__fs__write_file","tool_input":{"path":"a","content":[1]}}"#,
+                None,
+                &["content"],
+                &[],
+            ),
+            (
+                r#"{"tool_name":"Read","tool_input":{"file_path":"a","limit":"x"}}"#,
+                None,
+                &[],
+                &[],
+            ),
+        ];
+        for (json, command, mistyped, unreadable) in cases {
+            let input = HookInput::from_json(json).unwrap();
+            assert_eq!(input.command(), *command, "{json}");
+            assert_eq!(input.mistyped_tool_input, *mistyped, "{json}");
+            assert_eq!(input.unreadable_operation_fields(), *unreadable, "{json}");
+        }
+        // The salvaged fields keep their values.
+        let input = HookInput::from_json(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.env","content":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.file_path().as_deref(), Some("a.env"));
+        // Loggers get the same salvage.
+        let metrics = MetricsInput::from_json(
+            r#"{"tool_name":"Bash","tool_input":{"command":"git commit","file_path":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(metrics.command(), Some("git commit"));
     }
 
     #[test]

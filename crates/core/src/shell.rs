@@ -3542,6 +3542,13 @@ pub fn looks_like_push_url(candidate: &str) -> bool {
 /// It is deliberately NOT [`GitSpawn::Completed`], because a caller cannot
 /// tell a complete answer from a clipped one, and a guard reading a clipped
 /// answer is a guard reading attacker-chosen data.
+///
+/// **Match it exhaustively, with no `_` arm** (cadence-hooks#939). Every
+/// production match site lists all four variants, so adding a fifth fails to
+/// compile at each one and forces its allow/block routing to be re-decided
+/// there. `#[non_exhaustive]` would do the opposite for the cross-crate
+/// callers, forcing a wildcard on them. Tests may use a wildcard to report an
+/// unexpected variant.
 #[derive(Debug)]
 pub enum GitSpawn {
     /// The process ran to completion (any exit code); stderr is not captured.
@@ -3592,6 +3599,15 @@ pub enum GitQuery {
 /// (measured: 20s against a 1s deadline). Every return path therefore gives
 /// the reader a budget and takes whatever bytes have arrived, returning
 /// [`GitSpawn::Truncated`] when EOF was never observed.
+///
+/// **On Unix the child leads its own process group**, and every give-up path
+/// (timeout, overflow, an un-drainable pipe) signals the whole group, so the
+/// orphaned grandchild that held the pipe dies with the child instead of
+/// running on after the hook returns (cadence-hooks#939). The cost is that
+/// the child no longer shares the terminal's foreground group; a probe run
+/// with null stdin and piped stdout never reads the terminal, so nothing it
+/// does changes. A process that leaves the group itself (`setsid`) is out of
+/// reach. Windows has no equivalent here and keeps killing only the child.
 pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
     run_bounded_capped(cmd, timeout, None)
 }
@@ -3626,6 +3642,11 @@ pub fn run_bounded_capped(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -3640,10 +3661,16 @@ pub fn run_bounded_capped(
     // Set by the reader when `max_stdout` is exceeded; checked before any
     // "complete" verdict so a capped read never reports as Completed.
     let overflow = Arc::new(AtomicBool::new(false));
+    // Set when the parent returns without a complete answer. A reader leaked
+    // on a pipe that never closes then stops appending at its next chunk, so
+    // a sequence of truncated probes on the long-lived `doctor` path cannot
+    // grow its sinks without bound (cadence-hooks#939).
+    let abandoned = Arc::new(AtomicBool::new(false));
     let done = child.stdout.take().map(|mut out| {
         let (tx, rx) = mpsc::channel::<()>();
         let sink = Arc::clone(&sink);
         let overflow = Arc::clone(&overflow);
+        let abandoned = Arc::clone(&abandoned);
         // The thread is deliberately leaked when it is still blocked on a read
         // the orphan holds open — joining it IS the hang this function exists
         // to avoid. Bounded in practice for hooks, which are short-lived
@@ -3656,11 +3683,15 @@ pub fn run_bounded_capped(
             loop {
                 // Never hold the lock across a read.
                 match out.read(&mut chunk) {
+                    // `read_to_end` retries an interrupted read, and so does
+                    // this loop, so an EINTR cannot end a read early.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     // A read ERROR signals the same "done" as EOF, so an EIO
                     // mid-stream reports complete on a partial buffer. That is
                     // parity with the previous `read_to_end`, which also
                     // discarded its error, and is kept deliberately.
                     Ok(0) | Err(_) => break,
+                    Ok(_) if abandoned.load(Ordering::SeqCst) => break,
                     Ok(n) => {
                         let mut buf = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         match max_stdout {
@@ -3699,10 +3730,18 @@ pub fn run_bounded_capped(
             .clone()
     };
 
+    // Give up on the child: signal its whole process group (Unix), then the
+    // child itself, and tell a leaked reader to stop collecting.
+    let give_up = |child: &mut std::process::Child| {
+        abandoned.store(true, Ordering::SeqCst);
+        kill_process_group(child);
+        let _ = child.kill();
+    };
+
     let started = std::time::Instant::now();
     loop {
         if overflow.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            give_up(&mut child);
             let status = child.wait();
             let _ = drained(Duration::ZERO);
             return match status {
@@ -3719,6 +3758,7 @@ pub fn run_bounded_capped(
                 let budget = timeout.saturating_sub(started.elapsed()).max(DRAIN_FLOOR);
                 let complete = drained(budget);
                 if overflow.load(Ordering::SeqCst) {
+                    give_up(&mut child);
                     return GitSpawn::Truncated(std::process::Output {
                         status,
                         stdout: bytes_so_far(),
@@ -3736,12 +3776,14 @@ pub fn run_bounded_capped(
                 // Truncation means the drain spent its bound, which is the
                 // deadline being hit — and it is what makes the downstream
                 // `Truncated -> TimedOut` routing honest for the guards.
+                // Whatever still holds the pipe is reaped with the group.
+                give_up(&mut child);
                 crate::deadline::note_hit();
                 return GitSpawn::Truncated(output);
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
-                    let _ = child.kill();
+                    give_up(&mut child);
                     let _ = child.wait();
                     // The bytes are discarded on this arm, and the shared
                     // budget is already at zero, so spend nothing here.
@@ -3752,7 +3794,7 @@ pub fn run_bounded_capped(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(_) => {
-                let _ = child.kill();
+                give_up(&mut child);
                 let _ = child.wait();
                 let _ = drained(Duration::ZERO);
                 return GitSpawn::SpawnFailed;
@@ -3760,6 +3802,32 @@ pub fn run_bounded_capped(
         }
     }
 }
+
+/// SIGKILL the process group [`run_bounded_capped`] put `child` at the head
+/// of. Best-effort: an already-empty group is `ESRCH`, which is ignored.
+///
+/// On the un-drainable-pipe path the child has already been reaped, so its
+/// pid is signalled as a group id after the reap. The kernel does not hand
+/// that id to a new process while any member of the group is still alive,
+/// and a live member is exactly what that path detected, so the signal reaches
+/// the orphan and nothing else.
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child) {
+    let Ok(pgid) = i32::try_from(child.id()) else {
+        return;
+    };
+    if pgid <= 0 {
+        return;
+    }
+    // SAFETY: kill(2) takes plain integers and touches no memory. A negative
+    // pid addresses the group `process_group(0)` created for this child.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &std::process::Child) {}
 
 /// Run a prepared git command bounded by the process deadline
 /// ([`crate::deadline`]): armed hook paths share one budget across spawns
@@ -8014,6 +8082,97 @@ mod tests {
             elapsed < std::time::Duration::from_secs(3),
             "the orphan must not hold the deadline, took {elapsed:?}"
         );
+    }
+
+    /// True once `pid` has exited (gone, or a zombie awaiting its new
+    /// parent's reap). Polls for up to 2s; Linux-only, since it reads `/proc`.
+    #[cfg(target_os = "linux")]
+    fn pid_exits_soon(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.chars().next())
+                });
+            if matches!(state, None | Some('Z' | 'X')) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// cadence-hooks#939: every give-up path reaps the grandchild, not just the
+    /// child. (script, expected variant, why)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_give_up_paths_reap_the_whole_process_group() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "sleep 30 & echo $! > \"$1\"; echo held; exit 0",
+                "Truncated",
+                "an orphan holding the pipe after the child exits",
+            ),
+            (
+                "sleep 30 & echo $! > \"$1\"; sleep 30",
+                "TimedOut",
+                "a child killed at the timeout with a grandchild beside it",
+            ),
+        ];
+        for (index, (script, expected, why)) in cases.iter().enumerate() {
+            let pidfile = dir.path().join(format!("grandchild-{index}"));
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script, "sh"]).arg(&pidfile);
+            let result = run_bounded_with(&mut cmd, std::time::Duration::from_millis(300));
+            let variant = match result {
+                GitSpawn::Completed(_) => "Completed",
+                GitSpawn::Truncated(_) => "Truncated",
+                GitSpawn::SpawnFailed => "SpawnFailed",
+                GitSpawn::TimedOut => "TimedOut",
+            };
+            assert_eq!(variant, *expected, "{why}");
+            let pid: u32 = std::fs::read_to_string(&pidfile)
+                .expect("the grandchild's pid")
+                .trim()
+                .parse()
+                .expect("a pid");
+            assert!(pid_exits_soon(pid), "{why}: grandchild {pid} still running");
+        }
+    }
+
+    /// A clean run leaves a detached grandchild alone: only a give-up path
+    /// signals the group, so a background helper a tool starts on purpose
+    /// (git's fsmonitor daemon, say) is not killed by an ordinary probe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_clean_run_leaves_a_detached_grandchild_running() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let pidfile = dir.path().join("detached");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; echo done",
+            "sh",
+        ])
+        .arg(&pidfile);
+        let result = run_bounded_with(&mut cmd, std::time::Duration::from_secs(5));
+        assert!(matches!(result, GitSpawn::Completed(_)), "got {result:?}");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}")).is_ok(),
+            "a clean run must not signal the group"
+        );
+        // Tidy up the helper this test started.
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
 
     #[cfg(unix)]
