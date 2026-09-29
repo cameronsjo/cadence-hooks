@@ -132,11 +132,7 @@ impl Logger for LogPolishNudge {
             anchor,
         );
 
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        if let Ok(mut file) = common::open_ledger(&path) {
             // Single `write_all` of record + newline so concurrent appends from
             // other sessions can't interleave (mirrors log_commit).
             let mut line = record.to_string();
