@@ -566,26 +566,49 @@ fn trigger_nudge(content: &str, fields: &[(String, String)]) -> Option<Problem> 
     })
 }
 
-/// The markdown body of a skill or command: everything after the closing `---`
-/// of its frontmatter, found the way [`extract_frontmatter`] finds it. Without
-/// a frontmatter block the whole document is the body. Frontmatter is YAML, not
+/// Where Claude Code ends the frontmatter: it splits with the lazy regex
+/// `^---\s*\n([\s\S]*?)---\s*\n?`, so the FIRST `---` anywhere after the opener
+/// closes it — mid-line, or followed by trailing whitespace — and the body
+/// starts after the whitespace that follows. `None` when the document does not
+/// open that way.
+fn claude_code_body_start(content: &str) -> Option<usize> {
+    let rest = content.strip_prefix("---")?;
+    let ws = rest.len() - rest.trim_start().len();
+    let nl = rest[..ws].rfind('\n')?;
+    let inner_start = 3 + nl + 1;
+    let close = inner_start + content[inner_start..].find("---")?;
+    let after = &content[close + 3..];
+    Some(close + 3 + (after.len() - after.trim_start().len()))
+}
+
+/// The markdown body of a skill or command. The frontmatter is YAML, not
 /// markdown: parsing it as markdown lets a block-scalar line (`   <!--`, a
-/// leading fence) swallow the real body.
+/// leading fence) swallow the real body. The body starts at the EARLIER of
+/// two ends of the frontmatter — the first exact `---` line (as
+/// [`extract_frontmatter`] finds it) and Claude Code's lazy-match end
+/// ([`claude_code_body_start`]) — because scanning a little frontmatter only
+/// fails toward blocking, while scanning too little lets a reference the
+/// platform reads as body go unseen. Without either, the whole document.
 fn body_after_frontmatter(content: &str) -> &str {
     let mut offset = 0;
-    let mut close = None;
+    let mut exact = None;
     for (i, line) in content.split_inclusive('\n').enumerate() {
         let text = line.trim_end_matches(['\r', '\n']);
         if i == 0 && text != "---" {
-            return content;
+            break;
         }
         offset += line.len();
         if i > 0 && text == "---" {
-            close = Some(offset);
+            exact = Some(offset);
             break;
         }
     }
-    close.map_or(content, |o| &content[o..])
+    let start = [exact, claude_code_body_start(content)]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
+    &content[start..]
 }
 
 /// Every `@skills/…` token in prose (#614). `@skills/` force-loads the file
@@ -739,7 +762,29 @@ fn second_frontmatter_block(rest: &[&str]) -> bool {
     if rest[open] != "---" {
         return false;
     }
-    let Some(len) = rest[open + 1..].iter().position(|l| *l == "---") else {
+    // The closing `---` must come before the first ATX heading: past it the
+    // opener was a thematic break in the body, not a frontmatter block.
+    let is_heading = |l: &str| {
+        let t = l.trim_start_matches(' ');
+        l.len() - t.len() <= 3 && t.starts_with('#') && {
+            let h = t.trim_start_matches('#');
+            t.len() - h.len() <= 6 && (h.is_empty() || h.starts_with([' ', '\t']))
+        }
+    };
+    // Leading `#` lines right after the opener are YAML comments, not headings.
+    let comments = rest[open + 1..]
+        .iter()
+        .take_while(|l| l.trim_start().starts_with('#'))
+        .count();
+    let search = comments
+        + rest[open + 1 + comments..]
+            .iter()
+            .position(|l| is_heading(l))
+            .unwrap_or(rest.len() - open - 1 - comments);
+    let Some(len) = rest[open + 1..open + 1 + search]
+        .iter()
+        .position(|l| *l == "---")
+    else {
         return false;
     };
     let inner = &rest[open + 1..open + 1 + len];
@@ -2636,5 +2681,33 @@ mod tests {
     #[test]
     fn n5_trailing_angle_bracket_is_trimmed() {
         assert_eq!(force_load_refs("<@skills/x>"), vec!["@skills/x"]);
+    }
+
+    #[test]
+    fn claude_code_lazy_frontmatter_end_is_scanned_as_body() {
+        let skill = |fm: &str| {
+            format!("---\nname: probe\ndescription: {fm}\nLoad @skills/x/SKILL.md\n---\n")
+        };
+        let cases = [
+            skill("Use when probing---"),
+            skill("Use when probing.\n--- "),
+            "---\ndescription: x---\nLoad @skills/x/SKILL.md\n---\nbody\n".to_string(),
+            "---\ndescription: x\n---\r \nLoad @skills/x/SKILL.md\n---\nbody\n".to_string(),
+        ];
+        for doc in &cases {
+            assert_eq!(force_load_refs(doc), vec!["@skills/x/SKILL.md"], "{doc:?}");
+        }
+        // Through the check itself, as skill and as command.
+        let r = ValidateSkillFrontmatter.run(&make_write_input(SKILL_PATH, &cases[0]));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Block);
+        let r = ValidateSkillFrontmatter
+            .run(&make_write_input("/repo/.claude/commands/c.md", &cases[2]));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn second_frontmatter_search_stops_at_the_first_heading() {
+        let doc = "---\nstatus: p\n---\n---\nContext: we need a plan.\n\n# Plan\n\nstuff\n\n---\n\nmore\n";
+        assert_eq!(plan_verdict(doc).0, cadence_hooks_core::Outcome::Allow);
     }
 }
