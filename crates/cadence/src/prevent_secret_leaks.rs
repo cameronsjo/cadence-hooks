@@ -9,8 +9,8 @@
 
 use crate::forgectl_hint::{HintKind, is_forgectl_env_file, with_forgectl_hint};
 use crate::secret_patterns::{
-    Filename, command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
-    is_dangerous_secret_token_at, is_safe_template, is_secret_shaped_var_name,
+    Filename, envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token_at,
+    is_safe_template, is_secret_shaped_var_name,
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
@@ -3015,7 +3015,15 @@ fn bash_leaks_secrets_within(
     // credential stores) handed to any command that is not metadata-safe
     // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
     // is still seen.
-    if !oversized && command_may_reference_secret(&lower) {
+    //
+    // No raw-substring prefilter gates this scan (#819), for the reason the
+    // writes guard dropped its own in #655: a quote-split operand (`.en''v`),
+    // a substitution that spells the name (`"$(echo .e)nv"`), a glob, or a
+    // key-material name only resolves to a secret AFTER tokenizing, so any gate
+    // that reads the raw text vetoes the resolver that would have caught it.
+    // Dropping it adds no blocks the resolver would not reach anyway: every
+    // block below needs an operand the token classifier calls a secret.
+    if !oversized {
         // #308: computed once per command — an in-command cd/pushd/popd
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
@@ -3039,10 +3047,9 @@ fn bash_leaks_secrets_within(
         // command is what the sibling
         // `prevent_secret_writes::bash_targets_env_file` also does — though it
         // no longer keeps a `lower` at all, having dropped its own raw-text
-        // pre-filter in #655. Here `lower` still backs
-        // `command_may_reference_secret` above — #538 ended the cd scan's use
-        // of it, so `command_changes_directory` now folds only the verb, like
-        // everything else here — and every downstream comparison
+        // pre-filter in #655; this guard dropped its own in #819. #538 ended
+        // the cd scan's use of `lower`, so `command_changes_directory` folds
+        // only the verb, like everything else here — and every downstream comparison
         // that needs case-insensitivity (`command_word`'s verb fold,
         // `is_dangerous_secret_token`, `METADATA_SAFE_COMMANDS`) folds at its
         // own comparison site rather than depending on pre-lowered input.
@@ -7240,9 +7247,7 @@ mod tests {
                 "cat \"$(pwd)/$(echo .env)\"",
                 "cat \"$(echo .env)$(true)\"",
                 "cat \"$(echo `echo .env`)\"",
-                // A tail completing the output. (`"$(echo .e)nv"` spells the
-                // same file but never reaches the resolver: the raw-text
-                // pre-filter sees no `.env` — cadence-hooks#819.)
+                // A tail completing the output.
                 "cat \"$(echo .env).local\"",
                 "cat \"$(echo config/.env).production\"",
                 "cat \"$(echo .env; true)\"",
@@ -7257,6 +7262,37 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Block,
             "a substitution provably producing a secret path is a read",
+        );
+    }
+
+    #[test]
+    fn operands_that_spell_a_secret_only_after_tokenizing_block() {
+        // #819: the raw text names no deny-set file, so the old substring
+        // pre-filter skipped the resolver that classifies each of these.
+        assert_bash(
+            &[
+                "cat .en''v",
+                "cat .e\"\"nv",
+                "cat .ssh/id_''rsa",
+                "cat ~/.pg''pass",
+                "head -1 .n'e'trc",
+                "cat \"$(echo .e)nv\"",
+                "cat \"$(printf %s .e nv)\"",
+                "bash -c 'cat .en\"\"v'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a quote-split or substitution-built secret name is a read",
+        );
+        assert_bash(
+            &[
+                "cat README.md",
+                "cat .en''vironment",
+                "cargo test",
+                "ls -la .en''v",
+                "git status",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "no secret operand once tokenized, or a metadata-only command",
         );
     }
 

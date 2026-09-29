@@ -407,23 +407,6 @@ pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
             .any(|frag| trimmed.contains(frag))
 }
 
-/// Cheap superset pre-filter for `prevent-secret-leaks`' Bash arm — its only
-/// production caller: might this lowercased command mention any deny-set
-/// secret file? A false positive only costs a tokenize.
-/// Generalizes the old `command.contains(".env")` gate (#138). Input must be
-/// already lowercased.
-///
-/// `prevent-secret-writes` deliberately does NOT use this (#655): it reads the
-/// raw command text, so a quote-split target (`.en''v`) — which only resolves
-/// to a secret name after tokenizing — reads as clean here and vetoes the
-/// resolver that would have caught it. Do not re-add it there.
-pub fn command_may_reference_secret(lower_command: &str) -> bool {
-    BLOCKED_FILENAMES.iter().any(|&f| lower_command.contains(f))
-        || BLOCKED_PATH_FRAGMENTS
-            .iter()
-            .any(|frag| lower_command.contains(frag))
-}
-
 /// Substrings that mark a variable NAME as secret-shaped (`API_KEY`,
 /// `DB_PASSWORD`, `GH_TOKEN`). Matched case-insensitively against the name.
 const SECRET_VAR_NAME_KEYWORDS: &[&str] =
@@ -832,20 +815,6 @@ mod tests {
         ));
         assert!(!is_dangerous_secret_token("main.rs"));
         assert!(!is_dangerous_secret_token("config.toml"));
-    }
-
-    #[test]
-    fn command_may_reference_secret_gate() {
-        assert!(command_may_reference_secret("cat ~/.aws/credentials"));
-        assert!(command_may_reference_secret("cat ~/.ssh/id_rsa"));
-        assert!(command_may_reference_secret("grep pw ~/.git-credentials"));
-        assert!(command_may_reference_secret("cat ~/.pgpass"));
-        assert!(command_may_reference_secret("cat ~/.kube/config"));
-        assert!(command_may_reference_secret("cat ~/.netrc"));
-        // Negatives: no deny-set filename or fragment mentioned.
-        assert!(!command_may_reference_secret("cargo test"));
-        assert!(!command_may_reference_secret("cat config.toml"));
-        assert!(!command_may_reference_secret("git status"));
     }
 
     // --- #85: secret-value content scanner ---
