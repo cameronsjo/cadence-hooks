@@ -3346,15 +3346,20 @@ impl Check for GhWriteGuard {
         // finds.
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
-        let whole = command_segments(command)
-            .into_iter()
-            .map(|segment| (segment, std::rc::Rc::from(work_dir.as_str())))
-            .collect();
+        let whole = || {
+            let dir: std::rc::Rc<str> = std::rc::Rc::from(work_dir.as_str());
+            command_segments(command)
+                .into_iter()
+                .map(|segment| (segment, dir.clone()))
+                .collect()
+        };
+        let own = || command_segments_with_dirs(command, cwd);
         let mut judged = WriteJudgments::default();
-        for readings in [whole, command_segments_with_dirs(command, cwd)] {
+        let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
+        for reading in readings {
             if let Some(block) = judge_write_segments(
                 command,
-                readings,
+                reading(),
                 &work_dir,
                 &allowed_owners,
                 &allowed_repos,
@@ -3377,6 +3382,9 @@ impl Check for GhWriteGuard {
 /// allow. Past the cap the command blocks: no legitimate command writes
 /// from this many checkouts at once.
 const MAX_SEGMENT_DIRS: usize = 16;
+
+/// One reading of a command: each segment with the directory it is judged in.
+type Reading = Vec<(String, std::rc::Rc<str>)>;
 
 /// What [`judge_write_segments`] has already judged across both readings.
 #[derive(Default)]
@@ -3420,7 +3428,7 @@ fn too_many_dirs_block(
 /// inherits is tracked along the reading's own order.
 fn judge_write_segments(
     command: &str,
-    segments: Vec<(String, std::rc::Rc<str>)>,
+    segments: Reading,
     whole_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],

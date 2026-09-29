@@ -4875,7 +4875,9 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 /// positions above: a recognized `cd` inside a `( … )` that an earlier
 /// segment opened still resolves as though it applied to the parent.
 /// Long-standing behavior — stated so a reader does not mistake this for a
-/// general shell-grammar model.
+/// general shell-grammar model. A guard judging where a write runs pairs
+/// this with [`segment_work_dirs`], which does follow those, and keeps the
+/// sharpest verdict of the two.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
     let mut previous_op: Option<&str> = None;
@@ -16520,17 +16522,16 @@ mod tests {
         let groups = "{ cd /u; }; ".repeat(17_000);
         let nested = format!("{}cd /u{}", "( ".repeat(70_000), " )".repeat(70_000));
         let writes = "cd a; gh pr create -t x; ".repeat(8_000);
+        // Release bound 0.5 s (the hook deadline fails open); debug is slower.
+        let limit =
+            std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
         for command in [
             relative, newlines, absolute, subshells, groups, nested, writes,
         ] {
             assert!(command.len() >= 200_000, "{}", command.len());
             let start = std::time::Instant::now();
             let _ = command_segments_with_dirs(&command, "/unowned");
-            assert!(
-                start.elapsed() < std::time::Duration::from_millis(500),
-                "{:?}",
-                start.elapsed()
-            );
+            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
         }
     }
 

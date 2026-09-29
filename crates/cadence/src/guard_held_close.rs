@@ -307,8 +307,10 @@ const MAX_CLOSE_DIRS: usize = 16;
 /// the whole-command [`parse_work_dir`] one, and the one each close's own
 /// segment runs in ([`command_segments_with_dirs`]). The whole-command scan
 /// misses a `cd` on a later line, after a backgrounded command, or in a
-/// `{ …; }` group, and lets a subshell's `cd` leak into the parent. A union
-/// can only add a hit, never remove one.
+/// `{ …; }` group, and lets a subshell's `cd` leak into the parent. The
+/// slugs are unioned, and a directory with no readable remote empties the
+/// list — [`held_targets`] reads an empty list as "any repository" — so
+/// either reading can only add a hit, never remove one.
 fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
     let mut dirs = vec![parse_work_dir(command, cwd)];
     for (segment, dir) in command_segments_with_dirs(command, cwd) {
@@ -324,7 +326,16 @@ fn close_repos(command: &str, cwd: &str) -> Option<Vec<Slug>> {
         }
         dirs.push(dir.to_string());
     }
-    let mut slugs: Vec<Slug> = dirs.iter().flat_map(|dir| remote_slugs(dir)).collect();
+    let mut slugs: Vec<Slug> = Vec::new();
+    for dir in &dirs {
+        let found = remote_slugs(dir);
+        // No remote read means a bare close matches a held number in any
+        // repository, the widest reading, so it wins outright.
+        if found.is_empty() {
+            return Some(Vec::new());
+        }
+        slugs.extend(found);
+    }
     slugs.sort();
     slugs.dedup();
     Some(slugs)
@@ -648,6 +659,11 @@ mod tests {
                 false,
                 false,
             ),
+            // A directory with no readable remote matches any repository in
+            // either reading, and still does when the other has a remote.
+            ("(true; cd /nonexistent ); gh issue close 354", false, true),
+            ("cd /nonexistent | cat; gh issue close 354", false, true),
+            ("echo hi\ncd /nonexistent\ngh issue close 354", false, true),
         ] {
             let command = command.replace("{H}", h).replace("{F}", f);
             let cwd = if in_held { h } else { f };
