@@ -2440,4 +2440,41 @@ mod tests {
             );
         }
     }
+
+    /// cadence-hooks#1142: a write target the shell builds from a substitution
+    /// still names the secret file it writes.
+    #[test]
+    fn a_secret_target_built_by_a_substitution_blocks() {
+        for command in [
+            "echo x > .env$(:)",
+            "echo x > .env$(: a b)",
+            "echo x > .en$(echo)v",
+            "echo x >> .env`true`",
+            "echo x > \"$(pwd)\"/.env",
+            "$(echo rm .env)",
+            "$(echo touch .env)",
+            "eval \"$(echo 'echo x > .env')\"",
+            "bash -c \"$(printf 'echo x > .env')\"",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo x > \"$(mktemp)\"",
+            "echo x > \"$(pwd)\"/out.txt",
+            "echo x > $(echo out.txt)",
+            "echo $(date) > log.txt",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
 }

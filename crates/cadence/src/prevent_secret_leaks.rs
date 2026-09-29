@@ -11849,4 +11849,56 @@ mod tests {
             );
         }
     }
+
+    /// cadence-hooks#1142 / #1134: a word the shell builds from a substitution,
+    /// a pattern substitution or an array element still names the secret it
+    /// reads. Every blocking row reads `.env` under bash 5.2.
+    #[test]
+    fn substitutions_and_expansions_that_build_a_secret_name_block() {
+        assert_bash(
+            &[
+                "cat .env$(true)",
+                "cat .en$(echo)v",
+                "cat .env$(: a b)",
+                "cat .env`true`",
+                "cat \"$(pwd)\"/.env",
+                "$(echo cat .env)",
+                "$(echo 'cat .env')",
+                "`echo cat .env`",
+                "eval \"$(echo 'cat .env')\"",
+                "bash -c \"$(printf 'cat .env')\"",
+                "D=x; cat ${D/x/.env}",
+                "D=x; cat ${D//x/.env}",
+                "D=xx; cat ${D//x/.env}",
+                "D=x; cat ${D/#x/.env}",
+                "D=zz; cat ${D/q*/.env}",
+                "a[1]=.env; cat ${a[1]}",
+                "m[k]=.env; cat ${m[k]}",
+                "m[k]=.env; cat ${m[@]}",
+                "a=(x y); a[2]=.env; cat ${a[2]}",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "the command reads .env",
+        );
+    }
+
+    #[test]
+    fn everyday_substitutions_and_expansions_stay_allowed() {
+        assert_bash(
+            &[
+                "cat \"$(pwd)\"/x.txt",
+                "cat $(git rev-parse --show-toplevel)/README.md",
+                "cat $(echo README.md)",
+                "cd \"$(git rev-parse --show-toplevel)\" && ls",
+                "echo $(date)",
+                "$(echo ls) -la",
+                "D=x; cat ${D/x/README.md}",
+                "D=x; echo ${D//x/y}",
+                "a[1]=README.md; cat ${a[1]}",
+                "m[k]=notes.txt; cat ${m[k]}",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "nothing secret is named",
+        );
+    }
 }

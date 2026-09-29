@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 mod static_subst;
-pub use static_subst::names_command_by_unknown_substitution;
+pub use static_subst::{evaluated_static_substitutions, names_command_by_unknown_substitution};
 
 /// Strip quoted strings from a shell command to expose its structure.
 ///

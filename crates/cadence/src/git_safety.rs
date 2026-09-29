@@ -12,8 +12,10 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    command_segments, command_segments_with_dirs, may_spell_word, parse_work_dir,
-    strip_group_wrappers, tokenize, unescape_word,
+    carries_substitution, command_segments, command_segments_with_dirs, command_word,
+    evaluated_static_substitutions, executable_tokens, is_assignment_word, may_spell_word,
+    names_command_by_unknown_substitution, parse_work_dir, peel_command_runners,
+    skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -674,6 +676,107 @@ impl GitSafetyGuard {
     }
 }
 
+/// Text worth reading segments for before the unseen-execution nudge: a
+/// substitution, an `eval`, a shell, or a script file. Everything else cannot
+/// name one, so the common command never pays for the segment walk.
+fn may_run_unseen_text(command: &str) -> bool {
+    [
+        "$(", "`", "eval", ".sh", ".bash", ".zsh", ".ksh", "source", "sh ", "bash", "zsh", "dash",
+        "ksh",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+const SHELL_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
+
+/// Script file suffixes a `source`/`.` operand or a direct `./x.sh` names.
+const SCRIPT_SUFFIXES: &[&str] = &[".sh", ".bash", ".zsh", ".ksh"];
+
+/// Options of a shell that take the NEXT word as their value.
+const SHELL_VALUE_OPTIONS: &[&str] = &["-o", "-O", "+o", "+O", "--rcfile", "--init-file"];
+
+fn has_script_suffix(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    SCRIPT_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+}
+
+/// The script file operand of a shell invocation (`bash x.sh`, `sh -e x.sh`),
+/// or `None` for `-c`, stdin, or no operand.
+fn shell_script_file(argv: &[String]) -> Option<&str> {
+    let mut i = 1;
+    while let Some(word) = argv.get(i) {
+        if word == "--" {
+            return argv.get(i + 1).map(String::as_str);
+        }
+        if !(word.starts_with('-') || word.starts_with('+')) || word.len() < 2 {
+            return Some(word);
+        }
+        if SHELL_VALUE_OPTIONS.contains(&word.as_str()) {
+            i += 2;
+            continue;
+        }
+        if word.starts_with('-') && !word.starts_with("--") && word.contains('c') {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// What runs text this guard cannot read (cadence-hooks#456, #1142): a script
+/// file, an `eval` of text no walk resolved, or a command named by a
+/// substitution. `None` when every command is one the guard reads.
+///
+/// A segment is judged as the shell reads it, literal `echo`/`printf`
+/// substitutions evaluated, so `eval "$(echo git status)"` is the `git status`
+/// it runs and not an opaque `eval`.
+fn unseen_execution(command: &str) -> Option<&'static str> {
+    if !may_run_unseen_text(command) {
+        return None;
+    }
+    for segment in command_segments(command) {
+        if is_alias_definition(&segment) {
+            continue;
+        }
+        let read = evaluated_static_substitutions(&segment).unwrap_or_else(|| segment.clone());
+        if names_command_by_unknown_substitution(&read) {
+            return Some("a command named by a substitution");
+        }
+        let tokens = executable_tokens(&read);
+        let mut argv = peel_command_runners(skip_transparent_prefixes(&tokens));
+        while let Some((first, rest)) = argv.split_first() {
+            if !is_assignment_word(first) {
+                break;
+            }
+            argv = rest;
+        }
+        let Some(head) = argv.first() else { continue };
+        let word = command_word(head);
+        let operand = argv.get(1).map(String::as_str);
+        match word.as_ref() {
+            w if SHELL_NAMES.contains(&w) && shell_script_file(argv).is_some() => {
+                return Some("a script file");
+            }
+            "source" | "." if operand.is_some_and(has_script_suffix) => {
+                return Some("a sourced script file");
+            }
+            "eval"
+                if argv[1..]
+                    .iter()
+                    .any(|a| carries_substitution(a) || a.contains('$')) =>
+            {
+                return Some("an eval of text built at run time");
+            }
+            _ if head.contains('/') && has_script_suffix(head) => {
+                return Some("a script file");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Check for GitSafetyGuard {
     fn name(&self) -> &str {
         "git-safety"
@@ -687,8 +790,8 @@ impl Check for GitSafetyGuard {
         // A fast path only: the shell can build `git` from text that does not
         // contain it (`$'\x67it'`, `g''it`, `g\it`), so the skip is taken only
         // when the command carries none of that syntax (#1103).
-        if !may_spell_word(command, "git") {
-            return CheckResult::allow();
+        if !may_spell_word(command, "git") && !carries_substitution(command) {
+            return unseen_execution_nudge(command);
         }
 
         // Judge each command segment independently so a benign first command
@@ -746,7 +849,20 @@ impl Check for GitSafetyGuard {
             ));
         }
 
-        CheckResult::allow()
+        unseen_execution_nudge(command)
+    }
+}
+
+/// The nudge for a command that is otherwise allowed but runs text this guard
+/// cannot read, once per command however many segments do (cadence-hooks#456).
+fn unseen_execution_nudge(command: &str) -> CheckResult {
+    match unseen_execution(command) {
+        Some(what) => CheckResult::nudge(format!(
+            "git-safety cannot see inside {what}: the executed command is not visible to \
+             the guards, so a destructive git operation there would not be caught. \
+             Run the git command directly if it needs the check."
+        )),
+        None => CheckResult::allow(),
     }
 }
 
@@ -2257,5 +2373,101 @@ mod tests {
                 "{resolutions:?}"
             );
         }
+    }
+
+    /// cadence-hooks#1142 / #1134: a literal `echo`/`printf` substitution, or a
+    /// variable's default, that spells the git command is judged as the git
+    /// command it runs.
+    #[test]
+    fn a_git_command_spelled_by_a_literal_substitution_is_judged() {
+        let block = cadence_hooks_core::Outcome::Block;
+        for command in [
+            "$(echo git) push --force origin main",
+            "`echo git` push --force origin main",
+            "git push $(echo --force) origin main",
+            "git $(echo push) --force origin main",
+            "$(echo git) reset --hard",
+            "git $(echo reset) --hard",
+            "$(printf git) reset --hard",
+            "eval \"$(echo 'git reset --hard')\"",
+            "bash -c \"$(echo 'git reset --hard')\"",
+            "C=x; ${C:-git} reset --hard",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(result.outcome, block, "{command}");
+        }
+        for command in [
+            "$(echo git) status",
+            "git push origin feature $(echo -u)",
+            "git commit -m \"$(date)\"",
+            "git checkout \"$(git branch --show-current)\"",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_ne!(result.outcome, block, "{command}");
+        }
+    }
+
+    /// cadence-hooks#456: a script file, an unresolved `eval`, or a command
+    /// named by an unknown substitution nudges, once, and never blocks.
+    #[test]
+    fn commands_the_guard_cannot_read_nudge() {
+        let nudge = cadence_hooks_core::Outcome::Nudge;
+        for command in [
+            "bash script.sh",
+            "sh x.sh",
+            "bash -e ./scripts/deploy",
+            "./x.sh",
+            "scripts/run.sh --fast",
+            "source x.sh",
+            ". ./x.sh",
+            "eval \"$UNSET_ELSEWHERE\"",
+            "eval \"$(ssh-agent -s)\"",
+            "$(which python) x.py",
+            "`which python` x.py",
+            "\"$(git rev-parse --show-toplevel)/x.sh\"",
+            "gh $(which x) delete",
+            "bash x.sh && bash y.sh",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(result.outcome, nudge, "{command}");
+        }
+        let once = GitSafetyGuard.run(&make_bash_input("bash a.sh; bash b.sh; ./c.sh"));
+        let message = once.message.unwrap_or_default();
+        assert_eq!(message.matches("cannot see inside").count(), 1, "{message}");
+        for command in [
+            "bash -c 'ls'",
+            "bash -c \"echo hi\"",
+            "echo hi | bash",
+            "bash",
+            "bash --version",
+            "./target/debug/tool --flag",
+            "source .venv/bin/activate",
+            "eval \"$(echo ls)\"",
+            "cat x.sh",
+            "echo 'bash x.sh'",
+            "cd \"$(git rev-parse --show-toplevel)\" && ls",
+            "echo $(date)",
+            "cat \"$(pwd)/x\"",
+            "git status",
+            "ls -la",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    /// The nudge yields to a block and to the guard's own nudge.
+    #[test]
+    fn the_unseen_execution_nudge_never_replaces_a_finding() {
+        let result = GitSafetyGuard.run(&make_bash_input("bash x.sh && git reset --hard"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        let result = GitSafetyGuard.run(&make_bash_input("bash x.sh && git rebase feature"));
+        let message = result.message.unwrap_or_default();
+        assert!(message.contains("may modify history"), "{message}");
+        assert!(!message.contains("cannot see inside"), "{message}");
     }
 }

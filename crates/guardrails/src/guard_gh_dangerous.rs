@@ -1311,4 +1311,68 @@ mod tests {
             }
         }
     }
+
+    /// cadence-hooks#1142: a literal substitution that spells a word of the
+    /// command is judged as the command it runs.
+    #[test]
+    fn a_repo_delete_spelled_by_a_literal_substitution_blocks() {
+        for command in [
+            "gh $(echo repo) delete o/r --yes",
+            "$(echo gh) repo delete o/r --yes",
+            "`echo gh` repo delete o/r --yes",
+            "gh repo $(printf delete) o/r --yes",
+            "$(echo g)h repo delete o/r --yes",
+            "eval \"$(echo 'gh repo delete o/r --yes')\"",
+        ] {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in ["gh $(echo repo) view o/r", "$(echo gh) pr list"] {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    /// cadence-hooks#544: a literal piped into a shell is a script.
+    #[test]
+    fn a_literal_piped_into_a_shell_is_judged_as_a_script() {
+        for command in [
+            "echo 'gh repo delete o/r --yes' | bash -s",
+            "echo 'gh repo delete o/r --yes' | bash",
+            "printf 'gh repo delete o/r --yes' | sh",
+            "echo \"gh repo delete o/r --yes\" | zsh -s",
+            "echo 'gh repo delete o/r --yes' | /bin/bash",
+            "echo x | tee log | echo 'gh repo delete o/r --yes' | bash",
+            "echo 'echo \"gh repo delete o/r --yes\" | bash' | bash",
+        ] {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo 'gh repo delete o/r --yes' | cat",
+            "echo 'gh repo delete o/r --yes' | grep delete",
+            "echo 'gh repo delete o/r --yes' > notes.md",
+            "echo 'gh pr list' | bash",
+            "cat notes.md | bash",
+        ] {
+            let result = GhDangerousGuard.run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
 }

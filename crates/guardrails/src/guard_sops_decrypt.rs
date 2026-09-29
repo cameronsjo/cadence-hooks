@@ -1366,4 +1366,31 @@ mod tests {
         assert!(msg.contains("operator's own terminal"), "{msg}");
         assert!(msg.contains(".cadence/sops-consumers"), "{msg}");
     }
+
+    /// cadence-hooks#1134 / #1142: a decrypt spelled by a literal substitution
+    /// or a variable's default is the decrypt it runs.
+    #[test]
+    fn a_decrypt_spelled_by_a_substitution_or_variable_blocks() {
+        without_escape(|| {
+            for command in [
+                "$(echo sops) -d secrets.yaml",
+                "`echo sops` -d secrets.yaml",
+                "sops $(echo -d) secrets.yaml",
+                "C=x; ${C:-sops} -d secrets.yaml",
+                "C=sops; $C -d secrets.yaml",
+                "$(echo sops) -d secrets.yaml | grep key",
+                "bash -c \"$(echo 'sops -d secrets.yaml')\"",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command}");
+            }
+            for command in [
+                "$(echo sops) edit secrets.yaml",
+                "C=x; ${C:-sops} edit secrets.yaml",
+                "$(echo ls) -la",
+                "cat $(echo secrets.yaml)",
+            ] {
+                assert_eq!(outcome(command), Outcome::Allow, "{command}");
+            }
+        });
+    }
 }

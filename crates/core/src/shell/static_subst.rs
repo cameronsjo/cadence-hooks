@@ -265,6 +265,12 @@ pub(super) fn rewrite(segment: &str) -> Option<Rewrite> {
     })
 }
 
+/// `segment` with every literal `echo`/`printf` substitution replaced by its
+/// output, or `None` when it has none.
+pub fn evaluated_static_substitutions(segment: &str) -> Option<String> {
+    rewrite(segment)?.evaluated
+}
+
 /// Whether the command `segment` runs is named by a substitution no guard can
 /// read: its command word, or the subcommand word of `git`/`gh`, carries
 /// `$(…)` or a backtick that is not a literal `echo`/`printf`
