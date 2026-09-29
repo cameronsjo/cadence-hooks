@@ -799,6 +799,18 @@ impl HookInput {
             .map(normalize_path)
     }
 
+    /// The write target EXACTLY as the harness sent it (`file_path`, else
+    /// `path`) — no trimming or slash normalization. This is the path
+    /// [`Self::effective_content`] reads when it simulates an edit, so a guard
+    /// comparing the resulting document against the on-disk "before" must read
+    /// the same file, not the [`Self::file_path`] view (a trailing space would
+    /// otherwise make the before-read miss and every violation look introduced).
+    pub fn literal_file_path(&self) -> Option<&str> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
+    }
+
     /// Harness-neutral operation kind supplied by Codex adapters.
     pub fn operation(&self) -> Option<&str> {
         self.tool_input.as_ref()?.operation.as_deref()
