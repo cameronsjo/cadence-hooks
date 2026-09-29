@@ -126,7 +126,7 @@ advises.
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md and command frontmatter |
+| `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md, command, living-plan, and plugin-agent frontmatter |
 | `security-patterns` | PostToolUse (Write, Edit) | Scan for security anti-patterns |
 
 `security-patterns` is a **zero-config, no-API baseline** — a per-edit pattern

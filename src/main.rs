@@ -448,7 +448,7 @@ enum GuardrailsCommands {
 
 #[derive(Subcommand)]
 enum RulesCommands {
-    /// Validate SKILL.md and command frontmatter
+    /// Validate SKILL.md and command frontmatter and description rules, `@skills/` force-loads, living-plan frontmatter, and plugin-agent fields
     ValidateFrontmatter,
     /// Scan for security anti-patterns
     SecurityPatterns,
