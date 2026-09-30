@@ -789,7 +789,14 @@ fn merge_group_output(
         };
     }
     let asks = messages(Outcome::Ask);
-    if asks.is_empty() && nudges.is_empty() {
+    // An output rewrite (cameronsjo/cadence-hooks#776) rides the exit-0
+    // envelope; exit 2 discards stdout, so a Block above drops it, which is
+    // correct: a blocked call has no output to rewrite.
+    let rewrite = results
+        .iter()
+        .filter(|r| r.outcome == Outcome::Allow)
+        .find_map(|r| r.updated_tool_output.as_ref());
+    if asks.is_empty() && nudges.is_empty() && rewrite.is_none() {
         return if degraded.is_empty() {
             GroupOutput::default()
         } else {
@@ -814,6 +821,9 @@ fn merge_group_output(
             "additionalContext".into(),
             join_within_budget(&context).into(),
         );
+    }
+    if let Some(output) = rewrite {
+        specific.insert("updatedToolOutput".into(), output.clone());
     }
     GroupOutput {
         stdout: Some(serde_json::json!({ "hookSpecificOutput": specific }).to_string()),
@@ -896,6 +906,7 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
     let mut messages = Vec::new();
     let mut block_metadata = None;
     let mut winning_bypass = None;
+    let mut updated_tool_output = None;
     let mut bypasses: Vec<BypassProvenance> = Vec::new();
     for result in &mut results {
         // Harvested from EVERY result, not just the winners: a bypass ridden by
@@ -919,6 +930,11 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
         if block_metadata.is_none() {
             block_metadata = result.block_metadata.take();
         }
+        // An output rewrite only exists on an Allow, so it survives only when
+        // Allow won. The first one wins: a Bash payload has one target.
+        if updated_tool_output.is_none() {
+            updated_tool_output = result.updated_tool_output.take();
+        }
     }
     Some(Aggregated {
         result: CheckResult {
@@ -928,6 +944,7 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
             // Unchanged from before: the winner carries a winner's bypass, so
             // every existing consumer of this field sees what it always did.
             bypass: winning_bypass,
+            updated_tool_output,
         },
         outcomes,
         bypasses,
@@ -1416,6 +1433,7 @@ mod tests {
                 message: Some("confirm?".to_string()),
                 block_metadata: None,
                 bypass: None,
+                updated_tool_output: None,
             };
 
             for _ in 0..3 {

@@ -150,6 +150,58 @@ fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
+/// The per-match gates shared by [`scan`] and [`direct_spans`], so the block
+/// tier and the output redactor can never disagree about what is a token.
+fn accepts(idx: usize, token: &str, orig: &str, offset: usize) -> bool {
+    // Left boundary, judged in the ORIGINAL text so a token fused onto a
+    // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
+    if let Some(prev) = orig[..offset].chars().next_back()
+        && (prev.is_ascii_alphanumeric() || prev == '_' || (idx == 5 && prev == '-'))
+    {
+        return false;
+    }
+    // sk- also needs a random-looking body: prose can resemble it.
+    !(idx == 5 && !looks_random(&token[3..]))
+}
+
+/// One credential token found by [`direct_spans`]: its kind and its byte
+/// range in the scanned text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub kind: &'static str,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Every credential token written **as-is** in `text`, as byte ranges, with no
+/// hit cap. For `redact-secret-output` (cameronsjo/cadence-hooks#776), which
+/// must mask each token in place: the normalized pass is skipped because a
+/// command's output is not shell source, so a split form is not a token there
+/// and its offsets could not be masked byte-exactly anyway. Same regex and
+/// same gates as [`scan`] — one source of truth for token grammar.
+pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
+    let mut out = Vec::new();
+    for caps in TOKEN_RE.captures_iter(text) {
+        let Some((idx, m)) =
+            (0..KINDS.len()).find_map(|i| caps.name(&format!("k{i}")).map(|m| (i, m)))
+        else {
+            continue;
+        };
+        if accepts(idx, m.as_str(), text, m.start()) {
+            out.push(TokenSpan {
+                kind: KINDS[idx],
+                start: m.start(),
+                end: m.end(),
+            });
+        }
+    }
+    out
+}
+
+/// Kind name of the PEM private-key header, for callers that extend its span
+/// over the key body.
+pub const PEM_KIND: &str = KINDS[7];
+
 fn scan_one(scan: &str, orig: &str, map: Option<&[usize]>, out: &mut Vec<CredHit>) {
     for caps in TOKEN_RE.captures_iter(scan) {
         if out.len() >= MAX_HITS {
@@ -162,15 +214,7 @@ fn scan_one(scan: &str, orig: &str, map: Option<&[usize]>, out: &mut Vec<CredHit
         };
         let s = m.as_str();
         let offset = map.map_or(m.start(), |mp| mp[m.start()]);
-        // Left boundary, judged in the ORIGINAL text so a token fused onto a
-        // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
-        if let Some(prev) = orig[..offset].chars().next_back()
-            && (prev.is_ascii_alphanumeric() || prev == '_' || (idx == 5 && prev == '-'))
-        {
-            continue;
-        }
-        // sk- also needs a random-looking body: prose can resemble it.
-        if idx == 5 && !looks_random(&s[3..]) {
+        if !accepts(idx, s, orig, offset) {
             continue;
         }
         let hit = CredHit {

@@ -506,6 +506,13 @@ fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
 pub struct ToolResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    /// Bash tool: the command was interrupted. Carried so a PostToolUse
+    /// output rewrite can return the full Bash output object
+    /// (cameronsjo/cadence-hooks#776).
+    pub interrupted: Option<bool>,
+    /// Bash tool: stdout is an image payload. Same reason as `interrupted`.
+    #[serde(rename = "isImage")]
+    pub is_image: Option<bool>,
     /// AskUserQuestion tool: answers keyed by question text. Values are strings
     /// (multiSelect = comma-joined) or null when unanswered. Present only on the
     /// PostToolUse payload for AskUserQuestion.
@@ -1641,6 +1648,14 @@ pub struct CheckResult {
     /// fine on its own. `None` for a normal allow/nudge/block. When `Some`, the
     /// dispatch seam records a `used` line in `bypasses.jsonl`.
     pub bypass: Option<BypassProvenance>,
+    /// A replacement for the tool's output, emitted as PostToolUse
+    /// `hookSpecificOutput.updatedToolOutput` (cameronsjo/cadence-hooks#776).
+    /// Only ever set on an `Allow` by [`CheckResult::rewrite_output`]; must be
+    /// the tool's **full** output object (for Bash:
+    /// `{stdout, stderr, interrupted, isImage}`) — Claude Code silently ignores
+    /// a wrong shape. `None` everywhere else: an identity rewrite would compete
+    /// last-write-wins with a sibling hook's real rewrite.
+    pub updated_tool_output: Option<serde_json::Value>,
 }
 
 impl CheckResult {
@@ -1650,6 +1665,7 @@ impl CheckResult {
             message: None,
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1659,6 +1675,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1668,6 +1685,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1680,6 +1698,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: Some(meta),
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1693,6 +1712,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1706,6 +1726,7 @@ impl CheckResult {
             message: None,
             block_metadata: None,
             bypass: Some(bypass),
+            updated_tool_output: None,
         }
     }
 
@@ -1722,6 +1743,18 @@ impl CheckResult {
     /// bypass armed and both an identity and a shaped hit present, the honest
     /// result is a nudge carrying the shaped finding *and* the attribution that
     /// a bypass suppressed the block.
+    /// Allow the tool call and replace what it returned with `output`, the
+    /// tool's full output object. The one PostToolUse shape that changes both
+    /// what the model sees and what the transcript JSONL stores (probe on
+    /// Claude Code 2.1.285, cameronsjo/cadence-hooks#776). Callers must only
+    /// build this when the output actually changed.
+    pub fn rewrite_output(output: serde_json::Value) -> Self {
+        Self {
+            updated_tool_output: Some(output),
+            ..Self::allow()
+        }
+    }
+
     pub fn with_bypass(mut self, bypass: BypassProvenance) -> Self {
         self.bypass = Some(bypass);
         self
@@ -2008,13 +2041,7 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    let rendered = render_output(
-        result.outcome,
-        result.message.as_deref(),
-        result.block_metadata.as_ref(),
-        event,
-        feedback_footer().as_deref(),
-    );
+    let rendered = render_check_result(result, event, feedback_footer().as_deref());
     if let Some(out) = rendered.stdout {
         crate::outln!("{out}");
     }
@@ -2031,14 +2058,48 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
 /// and has to merge their outputs into the single response one hook process
 /// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
 pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
-    let rendered = render_output(
+    let rendered = render_check_result(result, event, feedback_footer().as_deref());
+    (rendered.stdout, rendered.stderr)
+}
+
+/// The `hookSpecificOutput` envelope that replaces a tool's output
+/// (cameronsjo/cadence-hooks#776). Shared by the single-check path and the
+/// `group` merge so the two cannot drift.
+pub fn updated_tool_output_envelope(event: HookEvent, output: &serde_json::Value) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event.name(),
+            "updatedToolOutput": output,
+        }
+    })
+    .to_string()
+}
+
+/// [`render_output`] for a whole [`CheckResult`]: an `Allow` carrying
+/// [`CheckResult::updated_tool_output`] renders the output-replacement
+/// envelope; everything else renders exactly as before. Never unclamped
+/// context: the replacement is tool output, not injected context, so the
+/// additionalContext budget does not apply to it.
+fn render_check_result(
+    result: &CheckResult,
+    event: HookEvent,
+    footer: Option<&str>,
+) -> RenderedOutput {
+    if result.outcome == Outcome::Allow
+        && let Some(output) = &result.updated_tool_output
+    {
+        return RenderedOutput {
+            stdout: Some(updated_tool_output_envelope(event, output)),
+            stderr: None,
+        };
+    }
+    render_output(
         result.outcome,
         result.message.as_deref(),
         result.block_metadata.as_ref(),
         event,
-        feedback_footer().as_deref(),
-    );
-    (rendered.stdout, rendered.stderr)
+        footer,
+    )
 }
 
 /// The generic fallback payload for fire-and-forget loggers ([`MetricsInput`]
