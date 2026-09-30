@@ -59,6 +59,13 @@
 //! parser cannot see (`python -c`, `tar -x -C`, `git -C`, `mkdir`, `xargs cp`
 //! fed on stdin, `unzip -d`, …).
 //!
+//! A listed reader counts as read-only only without the options that make it
+//! write or run a program (`sort -o`/`-T`, `tree -o`/`-R`, `fd -x`, `rg --pre`,
+//! a second `uniq` operand; long options matched by any `getopt_long` prefix)
+//! and without a `NAME=value` assignment in front of it (`LESSOPEN=… less`,
+//! `env RIPGREP_CONFIG_PATH=… rg`), or a standalone assignment of a variable
+//! that steers one (`LESSOPEN=…; less f`, `PATH=…; cat f`).
+//!
 //! A Bash command carrying more target-plus-directory text than
 //! [`JUDGE_BUDGET`] is refused as too large to judge, so a flood cannot run
 //! out the hook deadline (which fails open).
@@ -91,6 +98,17 @@
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
+//! **Known over-blocks (the safe direction, documented):**
+//! - A session whose cwd is inside the directory: every command running a
+//!   program outside the read-only list (`git status`, `python3 x.py`) blocks.
+//! - A read of the directory that writes elsewhere: `ls Runbooks > /tmp/list`
+//!   from the vault root names the directory and makes a write, so it blocks.
+//! - An Edit that creates a new file (empty `old_string`) under the directory
+//!   blocks as uncomputable; create it with the Write tool.
+//! - Any write target that is exactly the marker directory's parent blocks,
+//!   whatever the writer (a recursive copy there could land a forged marker
+//!   directory); a grandparent is not checked.
+//!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
 //! means allow — but never on a miss, and an uncomputable resulting document
@@ -102,7 +120,7 @@
 use cadence_hooks_cadence::prevent_secret_writes::{segment_command_argv, segment_write_targets};
 use cadence_hooks_core::markers;
 use cadence_hooks_core::shell::{
-    UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir,
+    UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir, tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
@@ -135,6 +153,33 @@ const MAX_ECHO: usize = 200;
 /// brace. Past it the reference stays unexpanded (opaque), which keeps a flood
 /// of unclosed `${HOME:-` openers linear.
 const MAX_DEFAULT_SCAN: usize = 1024;
+
+/// A character that can continue a path word in [`RunbooksDir::mention_text`].
+fn mention_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '~' | '+' | '@')
+}
+
+/// `out` ends with `/..`: drop it and the component before it, when that
+/// component is a plain name (not `..`, not empty, only path characters,
+/// found within [`MAX_FOLD_SCAN`] bytes). Otherwise leave `out` alone.
+fn fold_parent(out: &mut String) {
+    let head = &out[..out.len() - 3];
+    let mut window = head.len().saturating_sub(MAX_FOLD_SCAN);
+    while !head.is_char_boundary(window) {
+        window += 1;
+    }
+    let Some(slash) = head[window..].rfind('/').map(|i| i + window) else {
+        return;
+    };
+    let name = &head[slash + 1..];
+    if name.is_empty() || name == ".." || name == "." || !name.chars().all(mention_path_char) {
+        return;
+    }
+    out.truncate(slash);
+}
+
+/// How far back [`fold_parent`] looks for the component a `..` cancels.
+const MAX_FOLD_SCAN: usize = 4096;
 
 /// True for a two-character drive component (`c:`).
 fn is_drive_comp(name: &str) -> bool {
@@ -507,8 +552,8 @@ impl RunbooksDir {
 
     /// Does the command text spell the directory? A path spelling counts
     /// only on a path boundary, so `…/Runbooks-old` or `/other/vault/Runbooks`
-    /// does not name `/vault/Runbooks`; a short flag's attached value
-    /// (`-C/vault/Runbooks`) is on one. Matched on [`Self::mention_text`].
+    /// does not name `/vault/Runbooks`; a short-option cluster's attached
+    /// value (`-C/vault/Runbooks`, `-xzC/…`) is on one. Matched on [`Self::mention_text`].
     fn named_in(&self, command: &str) -> bool {
         let lower = self.mention_text(command);
         let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
@@ -517,11 +562,18 @@ impl RunbooksDir {
                 let head = &lower.as_bytes()[..at];
                 let before = lower[..at].chars().next_back();
                 let after = lower[at + m.len()..].chars().next();
-                // `-C/path`: one letter after a word-initial `-`.
-                let short_flag = head.len() >= 2
-                    && head[head.len() - 1].is_ascii_alphabetic()
-                    && head[head.len() - 2] == b'-'
-                    && (head.len() == 2 || !path_char(head[head.len() - 3] as char));
+                // `-C/path`, `-xzC/path`: a word-initial short-option
+                // cluster's attached value.
+                let letters = head
+                    .iter()
+                    .rev()
+                    .take_while(|b| b.is_ascii_alphabetic())
+                    .count();
+                let dash = head.len().checked_sub(letters + 1);
+                let short_flag = letters > 0
+                    && dash.is_some_and(|d| {
+                        head[d] == b'-' && (d == 0 || !path_char(head[d - 1] as char))
+                    });
                 let open_before =
                     m.starts_with('$') || short_flag || !before.is_some_and(path_char);
                 let open_after = if m.starts_with('$') {
@@ -534,21 +586,30 @@ impl RunbooksDir {
         })
     }
 
-    /// The lowercased copy of `command` the mention rule reads: `$HOME`,
-    /// `${HOME}` and its defaulted forms, and a word-initial `~`/`~/`
-    /// expanded; on Windows `\` read as `/`; and `//` and `/./` collapsed, so
-    /// `/vault//Runbooks` and `/vault/./Runbooks` spell `/vault/Runbooks`.
+    /// The lowercased copy of `command` the mention rule reads: quotes and
+    /// backslashes removed (`"$HOME"/…`, `/vault/"Runbooks"`, `Run\\books`;
+    /// on Windows a `\\` is read as `/` first); `$HOME`, `${HOME}` and its
+    /// defaulted forms, and a word-initial `~`/`~/`, expanded; and `//`,
+    /// `/./` and `/name/../` folded, so `/vault//Runbooks`,
+    /// `/vault/./Runbooks` and `/vault/x/../Runbooks` spell `/vault/Runbooks`.
     /// Never executed or re-parsed: it only feeds a substring search.
     fn mention_text(&self, command: &str) -> String {
-        let mut text = match self.home.as_deref() {
-            Some(home) => expand_word_tildes(&substitute_var(command, "HOME", home), home),
-            None => command.to_string(),
+        let unquoted: String = command
+            .chars()
+            .filter_map(|c| match c {
+                '"' | '\'' => None,
+                '\\' if cfg!(windows) => Some('/'),
+                '\\' => None,
+                c => Some(c),
+            })
+            .collect();
+        let text = match self.home.as_deref() {
+            Some(home) => expand_word_tildes(&substitute_var(&unquoted, "HOME", home), home),
+            None => unquoted,
         };
-        if cfg!(windows) {
-            text = text.replace('\\', "/");
-        }
         let mut out = String::with_capacity(text.len());
-        for c in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
             if c == '/' {
                 if out.ends_with('/') {
                     continue;
@@ -559,6 +620,13 @@ impl RunbooksDir {
                 }
             }
             out.push(c.to_ascii_lowercase());
+            // `/name/..` just completed: fold it back to before `/name`.
+            let at_end = chars
+                .peek()
+                .is_none_or(|n| *n == '/' || !mention_path_char(*n));
+            if c == '.' && at_end && out.ends_with("/..") {
+                fold_parent(&mut out);
+            }
         }
         out
     }
@@ -818,6 +886,48 @@ fn bash_target_landing(
     }
 }
 
+/// True when a Bash write target is exactly the parent of the directory
+/// spelled `spellings` (either reading): a recursive copy or move there
+/// (`cp -r forged/markers <parent>`) can land a whole forged directory.
+fn bash_target_is_parent(
+    target: &str,
+    work_dirs: &[&str],
+    dir: &RunbooksDir,
+    spellings: &[Vec<String>],
+    resolver: &Resolver,
+) -> bool {
+    let parents: Vec<&[String]> = spellings
+        .iter()
+        .filter(|s| s.len() > 1)
+        .map(|s| &s[..s.len() - 1])
+        .collect();
+    let text = dir.expand(target);
+    let uses_pwd = text.contains("PWD") || text.starts_with("~+");
+    let bases: &[&str] = if text.starts_with('/') && !uses_pwd {
+        &["/"]
+    } else {
+        work_dirs
+    };
+    bases
+        .iter()
+        .filter(|b| **b != UNRESOLVABLE_DIR)
+        .any(|base| {
+            let text = if uses_pwd {
+                expand_pwd(&text, base)
+            } else {
+                text.clone()
+            };
+            let shape = PathShape(absolute(&text, base, true));
+            std::iter::once(shape.lexical())
+                .chain(shape.physical(resolver))
+                .any(|comps| {
+                    parents
+                        .iter()
+                        .any(|p| comps.len() == p.len() && reaches(&comps, p))
+                })
+        })
+}
+
 /// The first Bash write target that lands in the directory — or, failing
 /// that, one whose location the hook cannot read when the command names the
 /// directory. Each segment's targets are judged in the directory that segment
@@ -850,7 +960,7 @@ fn bash_write_into(
     for (segment, seg_dir) in command_segments_with_dirs(command, cwd) {
         let argv = segment_command_argv(&segment);
         if writer.is_none() {
-            writer = unvetted_program(&argv);
+            writer = unvetted_program(&segment, &argv);
         }
         if !dir_named && asked.insert((seg_dir.clone(), argv.clone())) {
             spent += seg_dir.len() + argv.iter().map(String::len).sum::<usize>();
@@ -874,8 +984,22 @@ fn bash_write_into(
             }
             let mut bases: Vec<&str> = vec![&seg_dir, cwd, &whole];
             bases.dedup();
+            // Every `$PWD`/`~+` expands to a whole work dir: charge the
+            // expanded length, or a short spelling multiplies past the budget.
+            let pwd_refs = target.matches("PWD").count() + usize::from(target.starts_with("~+"));
+            if pwd_refs > 0 {
+                let base_len: usize = bases.iter().map(|b| b.len()).sum();
+                let passes = if marker_dir.is_some() { 3 } else { 1 };
+                spent =
+                    spent.saturating_add(pwd_refs.saturating_mul(base_len).saturating_mul(passes));
+                if spent > JUDGE_BUDGET {
+                    return Some(BashFinding::TooLarge);
+                }
+            }
             if let Some(markers) = marker_dir
-                && bash_target_landing(&target, &bases, dir, markers, &resolver) == Landing::Inside
+                && (bash_target_landing(&target, &bases, dir, markers, &resolver)
+                    == Landing::Inside
+                    || bash_target_is_parent(&target, &bases, dir, markers, &resolver))
             {
                 return Some(BashFinding::MarkerTarget(target));
             }
@@ -968,49 +1092,127 @@ const FIND_WRITING_ACTIONS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
 
-/// True when `arg` is the long option `long` (bare or `--long=…`) or a
-/// short-option cluster (`-uo`) carrying one of `shorts`.
+/// True when `arg` is a long option that `getopt_long` would read as one of
+/// `long` — the full name or any non-empty prefix of it (`--out`, `--o`),
+/// bare or with `=value` — or a short-option cluster (`-uo`) carrying one of
+/// `shorts`. A prefix another option shares is ambiguous, which the program
+/// rejects; refusing it too only over-blocks.
 fn has_option(arg: &str, long: &[&str], shorts: &[char]) -> bool {
     if let Some(name) = arg.strip_prefix("--") {
         let name = name.split_once('=').map_or(name, |(n, _)| n);
-        return long.contains(&name);
+        return !name.is_empty() && long.iter().any(|l| l.starts_with(name));
     }
     arg.strip_prefix('-')
         .is_some_and(|cluster| cluster.chars().any(|c| shorts.contains(&c)))
 }
 
+/// `uniq`'s operands: `-` counts as one; the value word after `-f`/`-s`/`-w`
+/// (or a cluster ending in one) and after a bare `--skip-fields`,
+/// `--skip-chars`, `--check-chars` (or a prefix) is skipped; everything after
+/// `--` is an operand.
+fn uniq_operands(args: &[String]) -> usize {
+    const VALUE_LONG: &[&str] = &["skip-fields", "skip-chars", "check-chars"];
+    let mut count = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            return count + (args.len() - i);
+        }
+        if a == "-" || !a.starts_with('-') {
+            count += 1;
+        } else if let Some(name) = a.strip_prefix("--") {
+            if !name.contains('=')
+                && !name.is_empty()
+                && VALUE_LONG.iter().any(|l| l.starts_with(name))
+            {
+                i += 1;
+            }
+        } else if let Some(at) = a[1..].find(['f', 's', 'w']) {
+            // The rest of the cluster is the value; nothing left: the next word.
+            if a.len() == at + 2 {
+                i += 1;
+            }
+        }
+    }
+    count
+}
+
 /// True when a listed program's options make it write a file or run another
-/// program: `find` with a writing action, `sort -o`/`--output` (or
-/// `--compress-program`), `tree -o`, `fd -x`/`-X`, `rg --pre`, and `uniq`
-/// with a second operand (its output file).
+/// program: `find` with a writing action; `sort -o`/`--output`,
+/// `--compress-program`, `-T`/`--temporary-directory`; `tree -o`/`--output`
+/// and `-R` (writes `00Tree.html` into each directory with `-H`);
+/// `fd -x`/`-X`/`--exec`/`--exec-batch`; `rg --pre`; and `uniq` with a
+/// second operand (its output file). Long options match by prefix
+/// ([`has_option`]).
 fn writes_or_runs(word: &str, args: &[String]) -> bool {
+    let any = |long: &[&str], shorts: &[char]| args.iter().any(|a| has_option(a, long, shorts));
     match word {
         "find" => args
             .iter()
             .any(|a| FIND_WRITING_ACTIONS.contains(&a.as_str())),
-        "sort" => args
-            .iter()
-            .any(|a| has_option(a, &["output", "compress-program"], &['o'])),
-        "tree" => args.iter().any(|a| has_option(a, &["output"], &['o'])),
-        "fd" => args
-            .iter()
-            .any(|a| has_option(a, &["exec", "exec-batch"], &['x', 'X'])),
-        "rg" => args.iter().any(|a| has_option(a, &["pre"], &[])),
-        "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() > 1,
+        "sort" => any(
+            &["output", "compress-program", "temporary-directory"],
+            &['o', 'T'],
+        ),
+        "tree" => any(&["output"], &['o', 'R']),
+        "fd" => any(&["exec", "exec-batch"], &['x', 'X']),
+        "rg" => any(&["pre"], &[]),
+        "uniq" => uniq_operands(args) > 1,
         _ => false,
     }
 }
 
-/// The command word of `argv` when it is a program outside
-/// [`READ_ONLY_PROGRAMS`], or a listed one whose options write or run
-/// another program ([`writes_or_runs`]). `None` for an empty or
-/// assignment-only segment.
-fn unvetted_program(argv: &[String]) -> Option<String> {
-    let at = argv.iter().position(|w| !is_assignment(w))?;
+/// Environment variables that make a listed reader run a program or read
+/// another configuration (`LESSOPEN`, `PAGER`, `RIPGREP_CONFIG_PATH`, …), or
+/// change which program runs at all (`PATH`, `LD_PRELOAD`).
+fn is_steering_var(name: &str) -> bool {
+    name.starts_with("LESS")
+        || name.starts_with("BAT_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(
+            name,
+            "RIPGREP_CONFIG_PATH"
+                | "PAGER"
+                | "MANPAGER"
+                | "PATH"
+                | "BASH_ENV"
+                | "ENV"
+                | "EDITOR"
+                | "VISUAL"
+        )
+}
+
+/// The command word of `segment` (whose peeled argv is `argv`) when it is a
+/// program outside [`READ_ONLY_PROGRAMS`]; a listed one whose options write
+/// or run another program ([`writes_or_runs`]); or a listed one run with any
+/// `NAME=value` assignment in front of it — directly or through `env`/`sudo`
+/// — since an assignment can point a reader at a program (`LESSOPEN`,
+/// `RIPGREP_CONFIG_PATH`). An assignment-only segment counts when it sets an
+/// [`is_steering_var`] name (`LESSOPEN=…; less f` reaches `less` when the
+/// variable was already exported). `None` otherwise.
+fn unvetted_program(segment: &str, argv: &[String]) -> Option<String> {
+    let Some(at) = argv.iter().position(|w| !is_assignment(w)) else {
+        return argv
+            .iter()
+            .find(|w| w.split_once('=').is_some_and(|(n, _)| is_steering_var(n)))
+            .map(|w| echo(w));
+    };
     let word = command_word(&argv[at]).into_owned();
     let vetted =
         READ_ONLY_PROGRAMS.contains(&word.as_str()) && !writes_or_runs(&word, &argv[at + 1..]);
-    (!vetted).then_some(word)
+    if !vetted {
+        return Some(word);
+    }
+    // Vetted: refuse it if any assignment precedes it among the raw words
+    // (the ones `env`/`sudo` peeling drops included). Not found: refuse.
+    let tokens = tokenize(segment);
+    match tokens.iter().position(|t| t == &argv[at]) {
+        Some(k) if at == 0 && !tokens[..k].iter().any(|t| is_assignment(t)) => None,
+        _ => Some(format!("{word} (with an environment assignment)")),
+    }
 }
 
 /// `NAME=value`: a shell variable assignment, not a program.
@@ -1090,8 +1292,14 @@ fn resulting_document(input: &HookInput) -> Option<String> {
     if edits.is_empty() {
         return None;
     }
-    let path = ti.file_path.as_deref().or(ti.path.as_deref())?;
-    let mut doc = std::fs::read_to_string(path).ok()?.replace("\r\n", "\n");
+    let path = Path::new(ti.file_path.as_deref().or(ti.path.as_deref())?);
+    // A relative path is the harness's, relative to the payload cwd, not to
+    // this hook process's own working directory.
+    let path = match input.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(cwd) if path.is_relative() => Path::new(cwd).join(path),
+        _ => path.to_path_buf(),
+    };
+    let mut doc = std::fs::read_to_string(&path).ok()?.replace("\r\n", "\n");
     for (old, new, all) in edits {
         let (old, new) = (old?.replace("\r\n", "\n"), new?.replace("\r\n", "\n"));
         if old.is_empty() || !doc.contains(&old) {
@@ -1609,6 +1817,44 @@ mod tests {
             (format!("fd . {rb} --exec-batch rm"), Outcome::Block),
             (format!("rg --pre=./x term {rb}"), Outcome::Block),
             (format!("rg --pre ./x term {rb}"), Outcome::Block),
+            // H1: `-` is an operand; a value word is not.
+            (format!("cat s | uniq - {rb}/x.md"), Outcome::Block),
+            (format!("uniq -f 1 - {rb}/x.md"), Outcome::Block),
+            (
+                format!("uniq --skip-fields 1 {rb}/a.md {rb}/x.md"),
+                Outcome::Block,
+            ),
+            (format!("uniq -- {rb}/a.md -x"), Outcome::Block),
+            // H2: getopt_long prefixes, temp dirs, tree -R.
+            (format!("sort --out={rb}/a.md x"), Outcome::Block),
+            (format!("sort --o {rb}/a.md x"), Outcome::Block),
+            (format!("sort --compress=sh {rb}/b.md"), Outcome::Block),
+            (format!("sort --com sh {rb}/b.md"), Outcome::Block),
+            (format!("sort -T {rb} x"), Outcome::Block),
+            (format!("sort --temporary-directory={rb} x"), Outcome::Block),
+            (format!("sort --temp={rb} x"), Outcome::Block),
+            (format!("tree -R -H . {rb}"), Outcome::Block),
+            (format!("tree --output={rb}/a {rb}"), Outcome::Block),
+            (format!("fd . {rb} --exe rm"), Outcome::Block),
+            (format!("fd . {rb} --exec-b rm"), Outcome::Block),
+            (format!("rg --pr=./x term {rb}"), Outcome::Block),
+            // H3: an environment assignment reaches a listed program.
+            (
+                format!("LESSOPEN='|sh x %s' less {rb}/a.md"),
+                Outcome::Block,
+            ),
+            (
+                format!("RIPGREP_CONFIG_PATH=/x/rc rg term {rb}"),
+                Outcome::Block,
+            ),
+            (format!("env PAGER=sh cat {rb}/a.md"), Outcome::Block),
+            (format!("sudo LESSOPEN=x less {rb}/a.md"), Outcome::Block),
+            (
+                format!("export LESSOPEN='|sh x'; less {rb}/a.md"),
+                Outcome::Block,
+            ),
+            (format!("LESSOPEN='|sh x'; less {rb}/a.md"), Outcome::Block),
+            (format!("PATH=/x:$PATH; cat {rb}/a.md"), Outcome::Block),
             // Naming the dir to read it stays allowed.
             (format!("cat {rb}/a.md"), Outcome::Allow),
             (format!("grep -rn term {rb} | head -20"), Outcome::Allow),
@@ -1620,6 +1866,10 @@ mod tests {
             (format!("tree -L 2 {rb}"), Outcome::Allow),
             (format!("sort -u {rb}/a.md | uniq -c"), Outcome::Allow),
             (format!("uniq -c {rb}/a.md"), Outcome::Allow),
+            (format!("uniq -f 1 {rb}/a.md"), Outcome::Allow),
+            (format!("uniq --skip-chars=2 {rb}/a.md"), Outcome::Allow),
+            (format!("sort -k2 -t, {rb}/a.md"), Outcome::Allow),
+            (format!("sort --check {rb}/a.md"), Outcome::Allow),
             // Outside the dir: unaffected.
             (format!("echo x > {}/a.md", f.work), Outcome::Allow),
             ("echo x > draft.md".to_string(), Outcome::Allow),
@@ -1958,6 +2208,16 @@ mod tests {
             (format!("echo '{{}}' > {md}/scrub-abc"), Outcome::Block),
             (format!("cd {md} && cp /x/y scrub-abc"), Outcome::Block),
             (format!("cp x {md}"), Outcome::Block),
+            // L2: the marker dir's parent, where a recursive copy or move
+            // lands a whole forged marker dir.
+            (format!("cp -r forged/markers {}", f.root), Outcome::Block),
+            (format!("mv forged/markers {}/", f.root), Outcome::Block),
+            (format!("rsync -a forged/ {}", f.root), Outcome::Block),
+            (format!("cp x {}/y", f.root), Outcome::Allow),
+            (
+                "cadence-hooks cadence record-polish".to_string(),
+                Outcome::Allow,
+            ),
             // `record-scrub` itself names neither directory as a target.
             (
                 format!(
@@ -2064,6 +2324,45 @@ mod tests {
                 "git commit -m 'edit runbooks'".into(),
                 &vault,
                 Outcome::Allow,
+            ),
+            // M1: quoting and escapes inside the spelling.
+            (
+                "tar -xf x.tar -C \"$HOME\"/vault/Runbooks".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "tar -xf x.tar -C ~/\"vault\"/'Runbooks'".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 x.py {root}/vault/\"Runbooks\""),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 x.py {root}/vault/Run\\books"),
+                &f.work,
+                Outcome::Block,
+            ),
+            // M2: `x/..` folded.
+            (
+                format!("python3 x.py {root}/vault/tmp/../Runbooks/a.md"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 x.py {root}/vault/Runbooks/../x.md"),
+                &f.work,
+                Outcome::Allow,
+            ),
+            // M3: a short-option cluster's attached value.
+            (format!("tar -xzC{rb}"), &f.work, Outcome::Block),
+            (
+                format!("tar -xzf x.tgz -C{rb}/sub"),
+                &f.work,
+                Outcome::Block,
             ),
         ];
         for (command, cwd, want) in rows {
@@ -2220,6 +2519,41 @@ mod tests {
         ] {
             assert_eq!(expand_word_tildes(text, "/h/"), want, "{text}");
         }
+    }
+
+    // H4: every `$PWD` in a target expands to the whole work dir, so a
+    // target of thousands of them after a long `cd` must be charged for
+    // the expansion, not its spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_pwd_amplification_flood_is_refused_quickly() {
+        let f = fixture("a-pwd-amplification-flood-is-refused-qui");
+        let long = format!("{}/{}", f.work, "d/".repeat(5_000));
+        let command = format!("cd {long} && echo x > {}", "$PWD".repeat(10_000));
+        let input = make_bash_with_cwd(&command, &f.work);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bash_write_into(
+                &command,
+                &f.work,
+                &RunbooksDir::resolve(Some(&f.runbooks), None, "/").unwrap(),
+                None,
+            ),
+            Some(BashFinding::TooLarge)
+        );
+        assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
+        // Debug build; the release bound (< 0.5 s) is probed separately.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    // L4: a relative Edit path is read against the payload cwd.
+    #[test]
+    fn a_relative_edit_path_is_read_against_the_payload_cwd() {
+        let f = fixture("a-relative-edit-path-is-read-against-the");
+        std::fs::write(format!("{}/rel.md", f.runbooks), "alpha\n").unwrap();
+        let edit = with_cwd(make_edit("rel.md", "alpha", "a"), &f.runbooks);
+        assert_eq!(resulting_document(&edit).as_deref(), Some("a\n"));
+        assert_eq!(outcome(&edit, Some(&f.runbooks), &["a\n"]), Outcome::Allow);
     }
 
     #[test]
