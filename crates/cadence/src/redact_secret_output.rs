@@ -81,7 +81,7 @@
 //! hook's real rewrite last-write-wins. Image output is never touched. Any
 //! doubt about a span (a non-char-boundary offset) abandons the rewrite: the
 //! failure mode is "no change", never corrupted output. Every pass is linear in
-//! the output size (every 5 MB adversarial shape measured at 0.32 s CPU or
+//! the output size (every 5 MB adversarial shape measured at 0.34 s CPU or
 //! less in a release build).
 //!
 //! **Escape:** `CADENCE_ALLOW_SECRET_OUTPUT` (truthy) passes output through
@@ -426,6 +426,8 @@ fn collect_mapped(original: &str, view: &View<'_>, names: &mut Names, spans: &mu
     name_value_json_spans(t, names, &mut local);
     env_string_spans(t, names, &mut local);
     inline_spans(t, names, &mut local);
+    quoted_key_spans(t, names, &mut local);
+    argv_flag_spans(t, &mut local);
     line_spans(t, names, &mut local);
     for s in local {
         if s.start >= s.end {
@@ -580,16 +582,20 @@ pub enum Strength {
 #[derive(Default)]
 struct Names {
     memo: HashMap<String, Option<Strength>>,
-    /// The last name looked up: adversarial and real runs repeat one name.
-    last: Option<(String, Option<Strength>)>,
+    /// The last name looked up (buffer reused): real and adversarial runs
+    /// repeat one name.
+    last: String,
+    last_strength: Option<Strength>,
 }
+
+/// Memo entries kept per call; past this, distinct names are classified
+/// without being stored, so a flood of distinct names cannot grow the map.
+const MEMO_CAP: usize = 1024;
 
 impl Names {
     fn get(&mut self, name: &str) -> Option<Strength> {
-        if let Some((last, s)) = &self.last
-            && last == name
-        {
-            return *s;
+        if !self.last.is_empty() && self.last == name {
+            return self.last_strength;
         }
         let s = if name.len() > MAX_NAME || !might_be_secret(name) {
             None
@@ -597,10 +603,14 @@ impl Names {
             s
         } else {
             let s = name_strength(name);
-            self.memo.insert(name.to_string(), s);
+            if self.memo.len() < MEMO_CAP {
+                self.memo.insert(name.to_string(), s);
+            }
             s
         };
-        self.last = Some((name.to_string(), s));
+        self.last.clear();
+        self.last.push_str(name);
+        self.last_strength = s;
         s
     }
 }
@@ -631,13 +641,29 @@ pub fn name_strength(name: &str) -> Option<Strength> {
     if matches!(name, "PASS" | "FAIL" | "OK" | "PWD" | "OLDPWD") {
         return None;
     }
-    let all = segments(name);
-    // Numeric segments (`API_KEY_2`) neither qualify nor terminate a name.
-    let segs: Vec<&str> = all
-        .iter()
-        .map(String::as_str)
-        .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
-        .collect();
+    if name.len() > MAX_NAME {
+        return None;
+    }
+    // Lowercase into a stack buffer and slice segments out of it: no heap
+    // allocation per name (a flood of distinct names is the perf worst case).
+    let mut buf = [0u8; MAX_NAME];
+    let lower = &mut buf[..name.len()];
+    lower.copy_from_slice(name.as_bytes());
+    lower.make_ascii_lowercase();
+    let lower = std::str::from_utf8(lower).ok()?;
+    let mut ranges = [(0usize, 0usize); MAX_SEGMENTS];
+    let count = segment_ranges(name.as_bytes(), &mut ranges);
+    let mut seg_buf = [""; MAX_SEGMENTS];
+    let mut n = 0;
+    for &(a, b) in &ranges[..count] {
+        let seg = &lower[a..b];
+        // Numeric segments (`API_KEY_2`) neither qualify nor terminate a name.
+        if !seg.bytes().all(|c| c.is_ascii_digit()) {
+            seg_buf[n] = seg;
+            n += 1;
+        }
+    }
+    let segs = &seg_buf[..n];
     let (&last, body) = segs.split_last()?;
     // A metadata last segment describes the secret rather than holding it —
     // unless the rest of the name is strong, where the VALUE decides (Meta).
@@ -651,7 +677,7 @@ pub fn name_strength(name: &str) -> Option<Strength> {
     if meta_suffix {
         return (classify(body) == Some(Strength::Strong)).then_some(Strength::Meta);
     }
-    classify(&segs)
+    classify(segs)
 }
 
 fn classify(segs: &[&str]) -> Option<Strength> {
@@ -690,27 +716,79 @@ fn classify(segs: &[&str]) -> Option<Strength> {
 }
 
 /// A strong word glued to a prefix: `pgpassword`, `githubtoken`,
-/// `clientsecret`, `masterpassword`. `…token` is everywhere in package and
-/// type names (`jsonwebtoken`, `cancellationtoken`), so a glued `token`
-/// counts only after a credential-ish prefix.
+/// `clientsecret`, `hftoken`, `masterpassword`. Any prefix counts, except a
+/// counter (`maxtoken`) and a short list of non-secret compound words that
+/// end in `token` (`jsonwebtoken`, `cancellationtoken`, …).
 fn glued_strong(seg: &str) -> bool {
-    if let Some(prefix) = seg.strip_suffix("token") {
-        return GLUED_TOKEN_PREFIXES.contains(&prefix);
+    if NON_SECRET_GLUED.contains(&seg) {
+        return false;
+    }
+    if let Some(prefix) = seg.strip_suffix("token")
+        && TOKEN_COUNT_QUALIFIERS.contains(&prefix)
+    {
+        return false;
+    }
+    if let Some(prefix) = seg.strip_suffix("key") {
+        return GLUED_KEY_PREFIXES.contains(&prefix);
+    }
+    if let Some(prefix) = seg.strip_suffix("pass") {
+        return !prefix.is_empty() && !NON_SECRET_PASS_PREFIXES.contains(&prefix);
     }
     STRONG_SUFFIXES
         .iter()
         .any(|w| seg.len() > w.len() && seg.ends_with(w))
 }
 
-/// Prefixes that make a glued `…token` a credential name.
-const GLUED_TOKEN_PREFIXES: &[&str] = &[
-    "api", "auth", "access", "refresh", "github", "gh", "gitlab", "bearer", "session", "id",
-    "csrf", "oauth", "bot", "slack", "npm", "pypi", "ci", "deploy", "service", "secret", "client",
-    "user", "admin", "master", "root", "app", "personal", "private",
+/// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
+/// `…key` is too common a word ending (`monkey`, `hotkey`, `turnkey`,
+/// `sortkey`) to accept any prefix.
+const GLUED_KEY_PREFIXES: &[&str] = &[
+    // Not `signing`: git's `user.signingkey` is a public key ID.
+    "master",
+    "encryption",
+    "ssh",
+    "license",
+    "api",
+    "access",
+    "secret",
+    "private",
+    "client",
+    "app",
+    "auth",
+    "session",
+    "jwt",
+    "hmac",
+    "aes",
+    "crypt",
+    "gpg",
+    "pgp",
+    "deploy",
+    "service",
+    "webhook",
+];
+
+/// Word stems before `pass` that are ordinary words (`bypass`, `compass`).
+const NON_SECRET_PASS_PREFIXES: &[&str] = &[
+    "by", "com", "sur", "over", "under", "tres", "encom", "im", "re", "first", "second", "single",
+    "multi", "one", "two", "ask", "sshask", "gitask",
+];
+
+/// Glued `…token` words that are not credential names.
+const NON_SECRET_GLUED: &[&str] = &[
+    "jsonwebtoken",
+    "cancellationtoken",
+    "continuationtoken",
+    "nexttoken",
+    "pagetoken",
+    "synctoken",
+    "resumetoken",
+    "keytoken",
 ];
 
 /// Word endings that make a glued segment strong.
-const STRONG_SUFFIXES: &[&str] = &["password", "passwd", "passwort", "secret", "apikey", "pwd"];
+const STRONG_SUFFIXES: &[&str] = &[
+    "password", "passwd", "passwort", "secret", "apikey", "pwd", "token",
+];
 
 /// Segments that make a name a STRONG secret name wherever they sit.
 const STRONG_WORDS: &[&str] = &[
@@ -901,6 +979,24 @@ fn metadata_value(value: &str) -> bool {
         })
 }
 
+/// An HTTP credential header whose value (`Bearer …`, `Basic …`) has spaces
+/// by design — never read as prose, even after a label (`curl --trace-ascii`
+/// prints `001f: Authorization: Bearer …`).
+fn is_header_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "private-token"
+            | "api-key"
+    )
+}
+
 /// For a WEAK name in a prose-shaped form: the value must look like a
 /// credential — one word of at least 8 characters that is not a plain word,
 /// number, duration, or identifier/type expression.
@@ -965,14 +1061,16 @@ static ENV_STRING: LazyLock<Regex> = LazyLock::new(|| {
 
 /// A mid-line `NAME=` / `--name=` (after a separator, quote or `?`/`&`).
 static INLINE_EQ: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)(?:^|[\s;|&'"(?,{\[])(?:--?)?[A-Za-z_][A-Za-z0-9_.\-]*="#)
+    // No `^`/newline alternative: line-start forms are `line_spans`' job, and
+    // matching every line start only to discard it was the cost on
+    // name-per-line floods.
+    Regex::new(r#"[ \t;|&'"(?,{\[](?:--?)?[A-Za-z_][A-Za-z0-9_.\-]*="#)
         .expect("inline eq regex is valid")
 });
 
 /// A mid-line `name:` / `Name: ` (after whitespace, a quote or a bracket).
 static INLINE_COLON: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)(?:^|[\s'"(\[{,])[A-Za-z_][A-Za-z0-9_.\-]*:[ \t]*"#)
-        .expect("inline colon regex is valid")
+    Regex::new(r#"[ \t'"(\[{,][A-Za-z_][A-Za-z0-9_.\-]*:"#).expect("inline colon regex is valid")
 });
 
 /// `--name value` (a secret-named flag with its value as the next word).
@@ -1094,6 +1192,131 @@ fn env_string_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     }
 }
 
+/// A single-quoted or symbol key with its value: Python dict/repr
+/// (`{'password': 'V'}`, `environ({'GITHUB_TOKEN': 'V'})`), tuples
+/// (`('password', 'V')`), subscript assignment (`os.environ['API_TOKEN'] =
+/// 'V'`), and Ruby (`'password' => 'V'`, `:password => "V"`).
+static QUOTED_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:'([A-Za-z_.][A-Za-z0-9_.\-]*)'\]?|:([A-Za-z_][A-Za-z0-9_]*))[ \t]*(?::|=>|,|=)[ \t]*(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)")"#,
+    )
+    .expect("quoted key regex is valid")
+});
+
+fn quoted_key_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
+    if !text.contains('\'') && !text.contains("=>") {
+        return;
+    }
+    // Resume at the end of each VALUE, so `'a': 'b', 'password': 'V'` and a
+    // value's closing quote opening the next key both align (linear).
+    let mut pos = 0;
+    while pos < text.len() {
+        let Some(caps) = QUOTED_KEY.captures_at(text, pos) else {
+            break;
+        };
+        let (Some(whole), Some(name)) = (caps.get(0), caps.get(1).or_else(|| caps.get(2))) else {
+            break;
+        };
+        let Some(value) = caps.get(3).or_else(|| caps.get(4)) else {
+            break;
+        };
+        pos = value.end().max(whole.start() + 1);
+        if let Some(strength) = names.get(name.as_str())
+            && value_masks(strength, value.as_str(), false)
+        {
+            spans.push(named(value.start(), value.end()));
+        }
+    }
+}
+
+/// Credentials passed as short flags on a command line — what `set -x`
+/// traces, `ps` and `history` print. Command-aware: the flag means a
+/// password only for these tools (`-P` is psql's port, `-p` ssh's).
+/// `(command, flag regex)`; group 1 is the value.
+static ARGV_FLAGS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    [
+        // mysql family: `-pVALUE` (attached only; a bare `-p` prompts).
+        ("mysql", r#"(?:^|\s)-p('[^'\n]*'|"[^"\n]*"|[^\s'"]\S*)"#),
+        ("mariadb", r#"(?:^|\s)-p('[^'\n]*'|"[^"\n]*"|[^\s'"]\S*)"#),
+        // curl `-u user:VALUE` / `--user user:VALUE`.
+        (
+            "curl",
+            r#"(?:^|\s)(?:-u|--user)[ \t=]*['"]?[^\s:'"]*:([^\s'"]+)"#,
+        ),
+        // `docker|podman|helm registry login -p VALUE`.
+        (" login", r"(?:^|\s)-p[ 	]+(\S+)"),
+        ("sshpass", r"(?:^|\s)-p[ 	]*(\S+)"),
+        ("redis-cli", r"(?:^|\s)-a[ 	]+(\S+)"),
+        ("smbclient", r"(?:^|\s)-U[ 	]*[^\s%]*%(\S+)"),
+        ("zip", r"(?:^|\s)-P[ 	]+(\S+)"),
+        ("7z", r"(?:^|\s)-p(\S+)"),
+        ("openssl", r"pass:(\S+)"),
+        ("ngrok", r"authtoken[ \t]+(\S+)"),
+        // `htpasswd -b[other flags] FILE USER PASSWORD`.
+        (
+            "htpasswd",
+            r"(?:^|\s)-[a-zA-Z]*b[a-zA-Z]*[ \t]+\S+[ \t]+\S+[ \t]+(\S+)",
+        ),
+    ]
+    .into_iter()
+    .map(|(cmd, re)| (cmd, Regex::new(re).expect("argv flag regex is valid")))
+    .collect()
+});
+
+/// Flag values judged per command line before the rest is masked whole.
+const ARGV_FLAG_CAP: usize = 256;
+
+fn argv_flag_spans(text: &str, spans: &mut Vec<Span>) {
+    for (cmd, re) in ARGV_FLAGS.iter() {
+        // Each word-bounded occurrence of the command, scanned to its line
+        // end once (a later occurrence on an already-scanned line is skipped).
+        let mut scanned_to = 0;
+        for (at, _) in text.match_indices(cmd) {
+            if at < scanned_to {
+                continue;
+            }
+            // The rest of the word counts as the command (`mysqldump`,
+            // `mysqladmin`); what follows must be a blank.
+            let from = at
+                + cmd.len()
+                + text[at + cmd.len()..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+                    .count();
+            let before_ok = text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                || cmd.starts_with(' ');
+            let after_ok = text[from..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace());
+            if !(before_ok && after_ok) {
+                continue;
+            }
+            let eol = text[from..].find('\n').map_or(text.len(), |i| from + i);
+            scanned_to = eol;
+            for (k, caps) in re.captures_iter(&text[from..eol]).enumerate() {
+                // A line carrying thousands of flag values is not a command
+                // line; past the cap, mask the rest of it rather than pay a
+                // capture per flag (fail toward masking, bounded time).
+                if k >= ARGV_FLAG_CAP {
+                    let at = caps.get(0).map_or(from, |m| from + m.start());
+                    spans.push(named(at, eol));
+                    break;
+                }
+                if let Some(v) = caps.get(1) {
+                    let (vs, ve) = unquote(0, v.as_str());
+                    if ve > vs && maskable(&v.as_str()[vs..ve]) {
+                        spans.push(named(from + v.start() + vs, from + v.start() + ve));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// End of the line containing `from` (exclusive of `\r\n`/`\n`), cached in
 /// `cache` so a run of matches on one long line finds its end once — a fresh
 /// search per match is quadratic on a 5 MB single line.
@@ -1137,19 +1360,21 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         };
         let lead = head.chars().next().filter(|c| !is_name_char(*c));
         let eol = line_end(text, start, &mut eol_cache);
-        // Inside a call's argument list (`Client(api_key=api_key, …)`): the
-        // value ends at `,`/`)`, and a bare identifier, attribute path or call
-        // there is code — a variable passed along, not a secret literal.
+        // Inside a call's argument list (`Client(api_key=api_key, …)`), a
+        // value closed by `,`/`)` that is the name itself, an attribute path,
+        // a call, or a lowercase snake identifier is a variable passed along.
+        // Anything else — a mixed-case or digit-bearing word, or a value with
+        // no closing `,`/`)` (`INFO (pid 12 token=…`) — takes the normal path.
         if parens.depth_at(text, name_at) > 0
             && !matches!(text[start..].chars().next(), Some('"' | '\''))
+            && let Some(len) = text[start..eol].find([',', ')'])
         {
-            let len = text[start..eol].find([',', ')']).unwrap_or(eol - start);
             let value = &text[start..start + len];
-            done = start + len;
-            if !is_code_reference(value) && value_masks(strength, value, false) {
-                spans.push(named(start, start + len));
+            let name = tail_name(&head[..head.len() - 1]);
+            if is_arg_reference(value, name) || !maskable(value) {
+                done = start + len;
+                continue;
             }
-            continue;
         }
         let (vs, ve) = match text[start..eol].chars().next() {
             Some(q @ ('"' | '\'')) => {
@@ -1182,7 +1407,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     eol_cache = (usize::MAX, 0);
     for m in INLINE_COLON.find_iter(text) {
         let head = m.as_str();
-        let start = m.end();
+        // The blanks after `:` are skipped here, not matched, so the next
+        // `name:` on the line can still use one as its leading separator
+        // (`=> Send header: Authorization: Bearer …`).
+        let start =
+            m.end() + text[m.end()..].len() - text[m.end()..].trim_start_matches([' ', '\t']).len();
         let name_at =
             m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
         if start < done || at_line_start(text, name_at) {
@@ -1213,7 +1442,8 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let value = &rest[vs..ve];
         let masks = if quoted {
             value_masks(strength, value, false)
-        } else if label && value.trim().contains(' ') {
+        } else if label && value.trim().contains(' ') && !is_header_name(tail_name(&head[..colon]))
+        {
             false
         } else {
             value_masks(strength, value, true)
@@ -1262,20 +1492,26 @@ impl Parens {
     }
 }
 
-/// A value that is code referring to something else: an identifier, an
-/// attribute path, or a call (`api_key=api_key`, `token=self.token`,
-/// `password=get_password()`).
-fn is_code_reference(value: &str) -> bool {
+/// An argument value that is code referring to something else: the name
+/// itself (`api_key=api_key`), an attribute path (`token=self.token`), a call
+/// (`password=get_password()`), or a lowercase snake identifier
+/// (`password=password_default`). A mixed-case or digit-bearing bare word is
+/// never exempt — that is what a secret literal looks like.
+fn is_arg_reference(value: &str, name: &str) -> bool {
     let v = value.trim();
+    if v.is_empty() || v == name {
+        return !v.is_empty();
+    }
     let (head, call) = match v.split_once('(') {
-        Some((head, _)) => (head, v.ends_with(')')),
+        Some((head, _)) => (head, true),
         None => (v, false),
     };
     let ident = head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && head
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'));
-    ident && (call || head.len() == v.len())
+    let snake = v.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    ident && (call || head.contains('.') || snake)
 }
 
 fn leading_indent(line: &str) -> usize {
@@ -1669,36 +1905,50 @@ const TOKEN_COUNT_QUALIFIERS: &[&str] = &[
     "context",
 ];
 
-/// Split a name into lowercase segments on `_`, `-`, `.`, other non-alnum
-/// characters, and camelCase / acronym boundaries (`APIKey` → `api`, `key`).
-fn segments(name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in name.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let chars: Vec<char> = part.chars().collect();
-        let mut current = String::new();
-        for (i, &c) in chars.iter().enumerate() {
-            let prev = i.checked_sub(1).map(|p| chars[p]);
-            let next = chars.get(i + 1).copied();
-            let boundary = match prev {
-                Some(p) if c.is_ascii_uppercase() => {
-                    p.is_ascii_lowercase()
-                        || p.is_ascii_digit()
-                        || (p.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()))
-                }
-                Some(p) if c.is_ascii_digit() => !p.is_ascii_digit(),
-                Some(p) if c.is_ascii_alphabetic() => p.is_ascii_digit(),
-                _ => false,
-            };
-            if boundary && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-            }
-            current.push(c.to_ascii_lowercase());
+/// Most segments a name is split into; the rest are ignored (a name is at
+/// most [`MAX_NAME`] bytes).
+const MAX_SEGMENTS: usize = 32;
+
+/// Byte ranges of `name`'s segments: split on `_`, `-`, `.` and every other
+/// non-alphanumeric byte, and on camelCase / acronym / digit boundaries
+/// (`APIKey` → `API`, `Key`). Returns how many ranges were written.
+fn segment_ranges(name: &[u8], out: &mut [(usize, usize); MAX_SEGMENTS]) -> usize {
+    let mut n = 0;
+    let mut push = |a: usize, b: usize, n: &mut usize| {
+        if *n < MAX_SEGMENTS && a < b {
+            out[*n] = (a, b);
+            *n += 1;
         }
-        if !current.is_empty() {
-            out.push(current);
+    };
+    let mut seg_start = 0;
+    for i in 0..name.len() {
+        let c = name[i];
+        if !c.is_ascii_alphanumeric() {
+            push(seg_start, i, &mut n);
+            seg_start = i + 1;
+            continue;
+        }
+        if i == seg_start {
+            continue;
+        }
+        let p = name[i - 1];
+        let next = name.get(i + 1).copied();
+        let boundary = if c.is_ascii_uppercase() {
+            p.is_ascii_lowercase()
+                || p.is_ascii_digit()
+                || (p.is_ascii_uppercase() && next.is_some_and(|x| x.is_ascii_lowercase()))
+        } else if c.is_ascii_digit() {
+            !p.is_ascii_digit()
+        } else {
+            p.is_ascii_digit()
+        };
+        if boundary {
+            push(seg_start, i, &mut n);
+            seg_start = i;
         }
     }
-    out
+    push(seg_start, name.len(), &mut n);
+    n
 }
 
 #[cfg(test)]
@@ -1958,6 +2208,74 @@ mod tests {
             ("default login u password Zq9vKh7wR\n", "Zq9vKh7wR"),
             ("machine\th\tlogin\tu\tpassword\tZq9vKh7wR\n", "Zq9vKh7wR"),
             ("machine h password Zq9vKh7wR\\\n", "Zq9vKh7wR"),
+            // Round 4 (#776 review 4).
+            (
+                "connect(host=db, password=Zq9vKh7wR3xPq)\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (
+                "sqlalchemy.url(postgresql, password=Zq9vKh7wR3xPq)\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("INFO (pid 12 token=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            (
+                "log: retrying (attempt 2 of 3 password=Zq9vKh7wR3xPq\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("DEBUG :( failed; token=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("{'password': 'Zq9vKh7wR3xPq'}\n", "Zq9vKh7wR3xPq"),
+            (
+                "{'user': 'bob', 'password': 'Zq9vKh7wR3xPq'}\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (
+                "environ({'PATH': '/bin', 'GITHUB_TOKEN': 'Zq9vKh7wR3xPq'})\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (
+                "{'Authorization': 'Bearer Zq9vKh7wR3xPq'}\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("[('password', 'Zq9vKh7wR3xPq')]\n", "Zq9vKh7wR3xPq"),
+            (
+                "os.environ['API_TOKEN'] = 'Zq9vKh7wR3xPq'\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (":password => \"Zq9vKh7wR3xPq\"\n", "Zq9vKh7wR3xPq"),
+            ("{:password=>\"Zq9vKh7wR3xPq\"}\n", "Zq9vKh7wR3xPq"),
+            ("+ mysql -uroot -pZq9vKh7wR3xPq -h db\n", "Zq9vKh7wR3xPq"),
+            ("+ mysql -u root -p'Zq9vKh7wR3xPq' db\n", "Zq9vKh7wR3xPq"),
+            (
+                "  502  mysqldump -u root -pZq9vKh7wR3xPq app\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("+ curl -u user:Zq9vKh7wR3xPq https://h\n", "Zq9vKh7wR3xPq"),
+            (
+                "+ docker login -u u -p Zq9vKh7wR3xPq reg\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("+ sshpass -p Zq9vKh7wR3xPq ssh h\n", "Zq9vKh7wR3xPq"),
+            ("+ redis-cli -h h -a Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("+ smbclient -U user%Zq9vKh7wR3xPq //h/s\n", "Zq9vKh7wR3xPq"),
+            ("+ zip -P Zq9vKh7wR3xPq a.zip f\n", "Zq9vKh7wR3xPq"),
+            ("+ 7z a -pZq9vKh7wR3xPq a.7z f\n", "Zq9vKh7wR3xPq"),
+            (
+                "001f: Authorization: Bearer Zq9vKh7wR3xPq\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (
+                "=> Send header: Authorization: Bearer Zq9vKh7wR3xPq\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("HFTOKEN=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("VAULTTOKEN: Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("MYTOKEN=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("XSRFTOKEN=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("MASTERKEY=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("SSHKEY: Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("DBPASS=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("ngrok authtoken Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("+ htpasswd -b f user Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
         ];
         let mut cases = cases;
         for (input, canary) in round2 {
@@ -2070,6 +2388,11 @@ mod tests {
             "  -H 'Authorization: Bearer $TOKEN'\n  -H \"Authorization: Bearer ${TOKEN}\"\n",
             "PWD=/home/dev/app\nOLDPWD=/home/dev\n",
             "TOKEN_URL=https://auth.example.com/oauth/token\nSECRET_NAME=prod/api\n",
+            "jsonwebtoken=9.0.2\ncancellationtoken: x\ntokenizer=fast\nmaxtokens: 4096\n",
+            "hotkey=ctrl-k\nmonkey=banana\nbypass=true\ncompass=north\nsortkey=name\n",
+            "GIT_ASKPASS=/usr/local/bin/askpass\nSSH_ASKPASS=/usr/bin/ssh-askpass\nuser.signingkey=ABCDEF1234567890\n",
+            "mysql -uroot -P 3306 -p -h db\npsql -h db -p 5432 -U app\n",
+            "curl -u admin:$ADMIN_PASSWORD https://x\n",
             "apiVersion: v1\nkind: ConfigMap\ndata:\n  token_ttl: 1h\n  auth_mode: oidc\n  key_rotation: enabled\n  password_policy: strong\n",
             "  with:\n    token: ***\n    persist-credentials: false\n",
             "properties:\n  password:\n    type: string\n    minLength: 8\n",
@@ -2305,6 +2628,13 @@ mod tests {
             "machine h password x\\\n".repeat(5 * MB / 22),
             "machine password x\\\n".repeat(5 * MB / 20),
             "DB_PASSWORD=Zq9vKx7Wm3\\\n".repeat(5 * MB / 22),
+            // Round 4: distinct names defeat any per-name memo.
+            (0..5 * MB / 14)
+                .map(|i| format!("{:06x}token=v\n", i * 2_654_435_761usize % 0xFF_FFFF))
+                .collect::<String>(),
+            "{'password': 'hunter2x', ".repeat(5 * MB / 26),
+            format!("mysql {}", "-px ".repeat(5 * MB / 4)),
+            "f(g(h(password=x, ".repeat(5 * MB / 20),
             format!("'Authorization: {p}' ").repeat(5 * MB / 32),
             "token=".repeat(5 * MB / 6),
             "password: ".repeat(5 * MB / 10),
