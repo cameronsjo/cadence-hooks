@@ -563,31 +563,34 @@ fn alias_config(dir: &str) -> Result<AliasConfig, Stop> {
 
 /// Is `name` a command git knows: a builtin, or a `git-<name>` in git's
 /// exec-path or on `PATH`? git runs one before it would autocorrect, so such a
-/// subcommand is not a guess. Asked once per process through
-/// `git --list-cmds=builtins,main,others`, which also covers Git for Windows
-/// (dashed builtins are not installed there, and executables carry `.exe`).
-/// If git cannot answer, only a `git-<name>` file on `PATH` counts (stricter).
+/// subcommand is not a guess. Builtins and the exec-path are asked of git
+/// through `git --list-cmds=builtins,main`, which also covers Git for Windows
+/// (dashed builtins are not installed there, and executables carry `.exe`);
+/// `PATH` is searched here rather than through `others`, whose scan of every
+/// `PATH` directory overran the probe budget on a loaded Windows runner. A
+/// probe that fails is not remembered, so the next call asks again; until
+/// git answers, only a `git-<name>` file on `PATH` counts (stricter).
 fn external_subcommand_exists(dir: &str, name: &str) -> bool {
-    static KNOWN: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+    static KNOWN: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
     if name.is_empty() || name.contains(['/', '\\']) {
         return false;
     }
-    let known = KNOWN.get_or_init(|| {
+    let known = KNOWN.get().or_else(|| {
         match git(
             dir,
-            &["--list-cmds=builtins,main,others"],
+            &["--list-cmds=builtins,main"],
             256 * 1024,
             Budget::Probe,
         ) {
             Git::Ok(list) if !list.trim().is_empty() => {
-                Some(list.lines().map(|l| l.trim().to_string()).collect())
+                Some(KNOWN.get_or_init(|| list.lines().map(|l| l.trim().to_string()).collect()))
             }
             _ => None,
         }
     });
-    if let Some(known) = known {
-        return known.contains(name);
+    if known.is_some_and(|known| known.contains(name)) {
+        return true;
     }
     let file = format!("git-{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH")

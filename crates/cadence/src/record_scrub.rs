@@ -34,21 +34,38 @@ use std::path::Path;
 pub const MAX_SCRUB_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Hash `path`'s bytes, or say why they cannot be hashed.
+///
+/// The file is opened once and judged by the OPENED handle (`fstat`), then
+/// read through a `MAX_SCRUB_FILE_BYTES + 1` cap: a path swapped for a FIFO,
+/// a device or a larger file between a `stat` and the read can no longer
+/// stall the reader or have bytes other than the judged object's hashed.
+/// Opening non-blocking keeps a FIFO from stalling the open itself.
 fn read_for_digest(path: &Path) -> Result<Vec<u8>, String> {
-    // `metadata` follows a symlink, so a link to a regular file is hashed as
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| format!("cannot read {path:?} ({e})");
+    // `open` follows a symlink, so a link to a regular file is hashed as
     // that file — the bytes the Write will carry are what matter, not the name.
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path:?} ({e})"))?;
+    let file = cadence_hooks_core::paths::open_nonblocking(path).map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
         // A FIFO or `/dev/fd/N` would hand this reader one stream and the
         // Write another; a directory has no content to vouch for.
         return Err(format!("{path:?} is not a regular file"));
     }
+    let too_large =
+        || format!("{path:?} is larger than {MAX_SCRUB_FILE_BYTES} bytes — not a runbook");
     if meta.len() > MAX_SCRUB_FILE_BYTES {
-        return Err(format!(
-            "{path:?} is larger than {MAX_SCRUB_FILE_BYTES} bytes — not a runbook"
-        ));
+        return Err(too_large());
     }
-    std::fs::read(path).map_err(|e| format!("cannot read {path:?} ({e})"))
+    let mut bytes = Vec::new();
+    file.take(MAX_SCRUB_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    // A file that grew after the `fstat` is read no further than the cap.
+    if bytes.len() as u64 > MAX_SCRUB_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 /// The marker body: when it was recorded. Nothing path- or content-derived is
@@ -130,5 +147,39 @@ mod tests {
                 assert_eq!(run_record(path), 1, "{path}");
             }
         });
+    }
+
+    /// A FIFO with no writer is refused without stalling: the open is
+    /// non-blocking and the opened handle is what is judged.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_fifo_without_blocking() {
+        let markers = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let fifo = work.path().join("draft.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        with_marker_dir(markers.path(), || {
+            assert_eq!(run_record(fifo.to_str().unwrap()), 1);
+        });
+    }
+
+    /// A file past the cap is refused, whatever its size read as.
+    #[test]
+    fn refuses_a_file_past_the_cap() {
+        let work = tempfile::tempdir().unwrap();
+        let big = work.path().join("big.md");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_SCRUB_FILE_BYTES + 1).unwrap();
+        let err = read_for_digest(&big).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+        file.set_len(MAX_SCRUB_FILE_BYTES).unwrap();
+        assert_eq!(
+            read_for_digest(&big).unwrap().len() as u64,
+            MAX_SCRUB_FILE_BYTES
+        );
     }
 }
