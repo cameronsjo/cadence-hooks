@@ -91,6 +91,11 @@
 //! - MCP write verbs the tool-name classifier does not recognize
 //!   (`append_file`, `save_file`, `str_replace`, `copy_file`, …) are not
 //!   classified as writes and reach no branch of this guard.
+//! - **Known miss:** a recursive copy or move into the marker directory's
+//!   grandparent or higher (`cp -r forged ~/.claude`) is not refused; only
+//!   the marker directory itself and its exact parent are.
+//! - A lesskey file or `bat` config planted earlier in the real `$HOME`
+//!   steers `less`/`bat` without any assignment in the command.
 //! - A write into the marker directory through a location the hook cannot
 //!   read, or by a program whose writes it cannot see, is not caught: the
 //!   marker-dir refusal judges write targets only. (`record-scrub` itself
@@ -107,7 +112,9 @@
 //!   blocks as uncomputable; create it with the Write tool.
 //! - Any write target that is exactly the marker directory's parent blocks,
 //!   whatever the writer (a recursive copy there could land a forged marker
-//!   directory); a grandparent is not checked.
+//!   directory) — unless that parent is the root or a shared temp dir.
+//! - A mention is read additively (raw, expanded, and normalized text), so a
+//!   spelling that walks back out (`…/Runbooks/../x.md`) still names it.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -553,9 +560,24 @@ impl RunbooksDir {
     /// Does the command text spell the directory? A path spelling counts
     /// only on a path boundary, so `…/Runbooks-old` or `/other/vault/Runbooks`
     /// does not name `/vault/Runbooks`; a short-option cluster's attached
-    /// value (`-C/vault/Runbooks`, `-xzC/…`) is on one. Matched on [`Self::mention_text`].
+    /// value (`-C/vault/Runbooks`, `-xzC/…`) is on one.
+    ///
+    /// **Additive:** a mention counts when it is found in ANY of three
+    /// readings — the raw lowercased text, [`Self::mention_text`] with quotes
+    /// kept and no `..` folding, and the fully normalized one — because each
+    /// transform also destroys spellings the others keep (`R/..` folds away;
+    /// `r"R/x"` loses its boundary once the quote is stripped).
     fn named_in(&self, command: &str) -> bool {
-        let lower = self.mention_text(command);
+        [
+            command.to_ascii_lowercase(),
+            self.mention_text(command, false),
+            self.mention_text(command, true),
+        ]
+        .iter()
+        .any(|text| self.named_in_text(text))
+    }
+
+    fn named_in_text(&self, lower: &str) -> bool {
         let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
         self.mentions.iter().any(|m| {
             lower.match_indices(m.as_str()).any(|(at, _)| {
@@ -593,10 +615,14 @@ impl RunbooksDir {
     /// `/./` and `/name/../` folded, so `/vault//Runbooks`,
     /// `/vault/./Runbooks` and `/vault/x/../Runbooks` spell `/vault/Runbooks`.
     /// Never executed or re-parsed: it only feeds a substring search.
-    fn mention_text(&self, command: &str) -> String {
+    ///
+    /// With `normalize` false, quotes and backslashes are kept and `..` is
+    /// not folded (only the expansions and `//`/`/./` apply).
+    fn mention_text(&self, command: &str, normalize: bool) -> String {
         let unquoted: String = command
             .chars()
             .filter_map(|c| match c {
+                '"' | '\'' | '\\' if !normalize => Some(c),
                 '"' | '\'' => None,
                 '\\' if cfg!(windows) => Some('/'),
                 '\\' => None,
@@ -624,7 +650,7 @@ impl RunbooksDir {
             let at_end = chars
                 .peek()
                 .is_none_or(|n| *n == '/' || !mention_path_char(*n));
-            if c == '.' && at_end && out.ends_with("/..") {
+            if normalize && c == '.' && at_end && out.ends_with("/..") {
                 fold_parent(&mut out);
             }
         }
@@ -896,11 +922,23 @@ fn bash_target_is_parent(
     spellings: &[Vec<String>],
     resolver: &Resolver,
 ) -> bool {
+    // A parent that is the root or a shared temp dir (a `CADENCE_MARKER_DIR`
+    // override under /tmp) is not refused: that would gate every copy there.
+    let temp_dirs: Vec<String> = ["/tmp".to_string(), "/private/tmp".to_string()]
+        .into_iter()
+        .chain(std::env::var("TMPDIR").ok())
+        .chain(Some(std::env::temp_dir().to_string_lossy().into_owned()))
+        .map(|t| t.trim_end_matches(['/', '\\']).to_ascii_lowercase())
+        .collect();
     let parents: Vec<&[String]> = spellings
         .iter()
         .filter(|s| s.len() > 1)
         .map(|s| &s[..s.len() - 1])
+        .filter(|p| !temp_dirs.contains(&format!("/{}", p.join("/")).to_ascii_lowercase()))
         .collect();
+    if parents.is_empty() {
+        return false;
+    }
     let text = dir.expand(target);
     let uses_pwd = text.contains("PWD") || text.starts_with("~+");
     let bases: &[&str] = if text.starts_with('/') && !uses_pwd {
@@ -1144,7 +1182,8 @@ fn uniq_operands(args: &[String]) -> usize {
 /// `--compress-program`, `-T`/`--temporary-directory`; `tree -o`/`--output`
 /// and `-R` (writes `00Tree.html` into each directory with `-H`);
 /// `fd -x`/`-X`/`--exec`/`--exec-batch`; `rg --pre`; and `uniq` with a
-/// second operand (its output file). Long options match by prefix
+/// second operand (its output file); `file -C`/`--compile` (writes a `.mgc`
+/// into the cwd). Long options match by prefix
 /// ([`has_option`]).
 fn writes_or_runs(word: &str, args: &[String]) -> bool {
     let any = |long: &[&str], shorts: &[char]| args.iter().any(|a| has_option(a, long, shorts));
@@ -1159,6 +1198,7 @@ fn writes_or_runs(word: &str, args: &[String]) -> bool {
         "tree" => any(&["output"], &['o', 'R']),
         "fd" => any(&["exec", "exec-batch"], &['x', 'X']),
         "rg" => any(&["pre"], &[]),
+        "file" => any(&["compile"], &['C']),
         "uniq" => uniq_operands(args) > 1,
         _ => false,
     }
@@ -1182,6 +1222,8 @@ fn is_steering_var(name: &str) -> bool {
                 | "ENV"
                 | "EDITOR"
                 | "VISUAL"
+                | "HOME"
+                | "XDG_CONFIG_HOME"
         )
 }
 
@@ -1206,13 +1248,32 @@ fn unvetted_program(segment: &str, argv: &[String]) -> Option<String> {
     if !vetted {
         return Some(word);
     }
-    // Vetted: refuse it if any assignment precedes it among the raw words
-    // (the ones `env`/`sudo` peeling drops included). Not found: refuse.
+    // Vetted: refuse it if any assignment other than a harmless one comes
+    // before it among the raw words (the ones `env`/`sudo` peeling drops
+    // included), aligned from the tail since the peeled argv is a suffix of
+    // them — or if a steering variable is assigned anywhere in the segment.
     let tokens = tokenize(segment);
-    match tokens.iter().position(|t| t == &argv[at]) {
-        Some(k) if at == 0 && !tokens[..k].iter().any(|t| is_assignment(t)) => None,
-        _ => Some(format!("{word} (with an environment assignment)")),
-    }
+    let steered = |w: &String| is_assignment(w) && !is_harmless_assignment(w);
+    let tail = argv.len() - at;
+    let refused = argv[..at].iter().any(steered)
+        || tokens.len() < argv.len()
+        || tokens[..tokens.len() - tail].iter().any(steered)
+        || tokens.iter().any(|t| {
+            is_assignment(t) && t.split_once('=').is_some_and(|(n, _)| is_steering_var(n))
+        });
+    refused.then(|| format!("{word} (with an environment assignment)"))
+}
+
+/// An assignment that cannot steer a listed reader: locale, time zone,
+/// terminal size and color switches.
+fn is_harmless_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with("LC_")
+            || matches!(
+                name,
+                "LANG" | "LANGUAGE" | "TZ" | "NO_COLOR" | "COLUMNS" | "LINES" | "TERM"
+            )
+    })
 }
 
 /// `NAME=value`: a shell variable assignment, not a program.
@@ -1855,6 +1916,22 @@ mod tests {
             ),
             (format!("LESSOPEN='|sh x'; less {rb}/a.md"), Outcome::Block),
             (format!("PATH=/x:$PATH; cat {rb}/a.md"), Outcome::Block),
+            // Round 3: token alignment through runner options, and more
+            // steering variables.
+            (
+                format!("env -u less LESSOPEN='|sh x %s' less {rb}/a.md"),
+                Outcome::Block,
+            ),
+            (
+                format!("exec -a less env LESSOPEN='|sh x' less {rb}/a.md"),
+                Outcome::Block,
+            ),
+            (format!("HOME=/x; bat {rb}/a.md"), Outcome::Block),
+            (format!("XDG_CONFIG_HOME=/x; bat {rb}/a.md"), Outcome::Block),
+            (format!("HOME=/x less {rb}/a.md"), Outcome::Block),
+            // `file -C` compiles a magic file into the cwd.
+            (format!("cd {rb} && file -C -m /x/m"), Outcome::Block),
+            (format!("file --compile -m /x/m {rb}/a.md"), Outcome::Block),
             // Naming the dir to read it stays allowed.
             (format!("cat {rb}/a.md"), Outcome::Allow),
             (format!("grep -rn term {rb} | head -20"), Outcome::Allow),
@@ -1870,6 +1947,15 @@ mod tests {
             (format!("uniq --skip-chars=2 {rb}/a.md"), Outcome::Allow),
             (format!("sort -k2 -t, {rb}/a.md"), Outcome::Allow),
             (format!("sort --check {rb}/a.md"), Outcome::Allow),
+            // Harmless locale/terminal assignments stay allowed.
+            (format!("LC_ALL=C sort -u {rb}/a.md"), Outcome::Allow),
+            (format!("LANG=C grep -rn x {rb}"), Outcome::Allow),
+            (format!("TZ=UTC ls -l {rb}"), Outcome::Allow),
+            (
+                format!("NO_COLOR=1 TERM=dumb COLUMNS=80 ls {rb}"),
+                Outcome::Allow,
+            ),
+            (format!("file {rb}/a.md"), Outcome::Allow),
             // Outside the dir: unaffected.
             (format!("echo x > {}/a.md", f.work), Outcome::Allow),
             ("echo x > draft.md".to_string(), Outcome::Allow),
@@ -2352,10 +2438,54 @@ mod tests {
                 &f.work,
                 Outcome::Block,
             ),
+            // The raw spelling still names it (mentions are additive).
             (
                 format!("python3 x.py {root}/vault/Runbooks/../x.md"),
                 &f.work,
-                Outcome::Allow,
+                Outcome::Block,
+            ),
+            // Round-3 regressions: the normalized copy loses these, the raw
+            // text keeps them.
+            (
+                format!("x={rb}/..; python3 w.py ${{x%/..}}"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c \"import sys; open(sys.argv[1][:-3]+'/x.md','w')\" {rb}/.."),
+                &f.work,
+                Outcome::Block,
+            ),
+            (format!("python3 w.py {rb}/.."), &f.work, Outcome::Block),
+            (
+                format!("x={rb}~/..; python3 w.py $x"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("x={rb}:/..; python3 w.py $x"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c 'open(r\"{rb}/x.md\",\"w\")'"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c 'open(b\"{rb}/x.md\",\"w\")'"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c 'open(f\"{rb}/x.md\",\"w\")'"),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c 'open(u\"{rb}/x.md\",\"w\")'"),
+                &f.work,
+                Outcome::Block,
             ),
             // M3: a short-option cluster's attached value.
             (format!("tar -xzC{rb}"), &f.work, Outcome::Block),
@@ -2544,6 +2674,39 @@ mod tests {
         assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
         // Debug build; the release bound (< 0.5 s) is probed separately.
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    // L2: a marker dir whose parent is a temp dir or the root (the
+    // `CADENCE_MARKER_DIR` override case) does not refuse writes there.
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_or_root_marker_parent_is_not_refused() {
+        let f = fixture("a-temp-or-root-marker-parent-is-not-refu");
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        for (marker_dir, command) in [
+            (
+                "/tmp/cadence-markers-x".to_string(),
+                "cp -r x /tmp".to_string(),
+            ),
+            (
+                "/private/tmp/m-x".to_string(),
+                "cp -r x /private/tmp/".to_string(),
+            ),
+            ("/m-x".to_string(), "cp -r x /".to_string()),
+            (format!("{tmp}/m-x"), format!("cp -r x {tmp}")),
+        ] {
+            let input = make_bash_with_cwd(&command, &f.work);
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(&marker_dir),
+                    ..Env::default()
+                },
+                &[],
+            );
+            assert_eq!(got.outcome, Outcome::Allow, "{marker_dir} {command}");
+        }
     }
 
     // L4: a relative Edit path is read against the payload cwd.
