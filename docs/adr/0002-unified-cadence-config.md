@@ -119,6 +119,23 @@ instead of duplicating path logic.
   cross-cutting on *all* block messages, not a per-guard nudge, so it is an
   optional top-level boolean, built with #216.
 
+### Implementation notes for §3 (#216, built 2026-09-30)
+
+- Loader, glob match and `feedbackFooter` reader: `crates/core/src/nudges.rs`.
+  Glob semantics mirror terminology's `glob_match` (a pattern with `/` matches the
+  repo-relative path, `*` stops at `/`, `**` crosses it; a bare pattern matches
+  the basename). #164's `pathclass` turned out to be a path-*class* map, not a
+  glob matcher, so nothing was reused from it.
+- `suppressible: bool` on `HookEntry`, enforced at dispatch (`apply_nudge_config`
+  in `src/dispatch.rs`) independently of `doctor`, and only on a `Nudge`.
+- A path-glob list needs a file path inside the repo root; without one it never
+  matches (the nudge stays). Only `suppress: true` silences a Bash-shaped nudge.
+- Config suppression is **not** recorded through `BypassProvenance`: like
+  `Exemption` it is configured structure, and a recurring nudge would write a row
+  per tool call.
+- `feedbackFooter` is read from the process cwd's git root; `false` hides the
+  footer, env `CADENCE_NO_FEEDBACK_FOOTER` still wins.
+
 ## Options considered (#153)
 
 | Option | Shape | Verdict |

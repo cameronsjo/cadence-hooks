@@ -261,7 +261,7 @@ pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
 /// cleverness: two string-aware passes rather than one dense one, and no new
 /// parser dependency. Genuinely malformed input still returns `None`, so every
 /// caller keeps its existing fail-open fall-through.
-fn parse_jsonc(content: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_jsonc(content: &str) -> Option<serde_json::Value> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let cleaned = strip_jsonc(content);
     serde_json::from_str(&cleaned).ok()

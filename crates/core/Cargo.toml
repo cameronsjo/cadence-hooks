@@ -16,6 +16,7 @@ regex.workspace = true
 brush-parser.workspace = true
 jiff.workspace = true
 sha2.workspace = true
+glob = "0.3"
 
 # `O_NONBLOCK` for the capped untrusted-file reader (`paths::read_capped`).
 # Already in the lock file, so this adds no new code to the build.

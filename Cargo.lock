@@ -223,6 +223,7 @@ name = "cadence-hooks-core"
 version = "0.116.0"
 dependencies = [
  "brush-parser",
+ "glob",
  "jiff",
  "libc",
  "regex",

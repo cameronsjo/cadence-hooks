@@ -419,9 +419,20 @@ fn decide_member(
         catch_unwind(AssertUnwindSafe(|| {
             test_panic_trigger();
             let mut results = Vec::new();
+            // Loaded at most once, and only when a suppressible hook actually
+            // nudges: the common path (no nudge) never touches the config file.
+            let mut nudges: Option<cadence_hooks_core::nudges::NudgesConfig> = None;
             for target in normalized_inputs {
                 let Some(result) = decide_check(plan.check.as_ref(), target) else {
                     continue;
+                };
+                let result = if result.outcome == Outcome::Nudge
+                    && crate::registry::is_suppressible(hook_name)
+                {
+                    let config = nudges.get_or_insert_with(|| load_nudges_for(target));
+                    apply_nudge_config(result, hook_name, config, target)
+                } else {
+                    result
                 };
                 results.push(result);
             }
@@ -482,6 +493,60 @@ fn decide_member(
             }
             MemberVerdict::Emit(Box::new(result), event)
         }
+    }
+}
+
+/// The repo's `nudges` config, resolved from the payload's `cwd` (else the
+/// target file's directory). Empty — suppress nothing — when there is no repo,
+/// no file, or a malformed one (cameronsjo/cadence-hooks#216; `doctor` reports
+/// the malformed case, this path stays silent and fails toward MORE nudging).
+fn load_nudges_for(input: &HookInput) -> cadence_hooks_core::nudges::NudgesConfig {
+    let start = input
+        .cwd
+        .clone()
+        .or_else(|| input.file_path())
+        .unwrap_or_default();
+    match cadence_hooks_core::paths::find_git_root(&start) {
+        Some(root) => cadence_hooks_core::nudges::load_nudges(&root).config,
+        None => Default::default(),
+    }
+}
+
+/// Silence a `Nudge` the repo config asked to silence, or return it unchanged.
+///
+/// Only a `Nudge` is ever rewritten, so a `Block` or `Ask` reaches the caller
+/// untouched whatever the config says, and the caller has already checked the
+/// registry's `suppressible` field. The rewrite is a plain `Allow`, carrying any
+/// bypass provenance the guard itself attached. It is deliberately not recorded
+/// in `bypasses.jsonl`: a per-repo config entry is configured structure, like
+/// `Exemption` and `EffortSkip` (see `BypassKind`), not an operator stepping
+/// outside a guard, and a recurring nudge would write a row per tool call.
+fn apply_nudge_config(
+    result: CheckResult,
+    hook_name: &str,
+    config: &cadence_hooks_core::nudges::NudgesConfig,
+    target: &HookInput,
+) -> CheckResult {
+    if result.outcome != Outcome::Nudge || !crate::registry::is_suppressible(hook_name) {
+        return result;
+    }
+    let rel = target.file_path().and_then(|file| {
+        let cwd = target.cwd.as_deref()?;
+        let root = cadence_hooks_core::paths::find_git_root(cwd)?;
+        // A relative path is relative to the payload cwd, not the repo root.
+        let absolute = if file.starts_with('/') {
+            file
+        } else {
+            format!("{cwd}/{file}")
+        };
+        cadence_hooks_core::nudges::repo_relative(&root, &absolute)
+    });
+    if !config.suppresses(hook_name, rel.as_deref()) {
+        return result;
+    }
+    CheckResult {
+        bypass: result.bypass,
+        ..CheckResult::allow()
     }
 }
 
@@ -1451,5 +1516,125 @@ mod tests {
                 "the gate must still collapse a real fan-out"
             );
         });
+    }
+
+    // --- apply_nudge_config (#216) ---
+
+    fn nudges(json: &str) -> cadence_hooks_core::nudges::NudgesConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A payload writing `rel` inside a fresh repo whose root is `root`.
+    fn write_in(root: &std::path::Path, rel: &str) -> HookInput {
+        let mut input = cadence_hooks_core::test_builders::make_bash("true");
+        input.cwd = Some(root.to_string_lossy().into_owned());
+        input.tool_input = Some(cadence_hooks_core::ToolInput {
+            file_path: Some(format!("{}/{rel}", root.display())),
+            ..Default::default()
+        });
+        input
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        dir
+    }
+
+    /// Suppression never touches a Block or Ask, for a suppressible hook, a
+    /// protected one, and one with a matching config entry alike; and it never
+    /// touches a hook the registry does not mark suppressible, Nudge included.
+    #[test]
+    fn config_suppresses_only_a_nudge_of_a_suppressible_hook() {
+        let dir = repo();
+        let input = write_in(dir.path(), "docs/a.md");
+        let config = nudges(
+            r#"{"warn-overshare":{"suppress":true},"git-safety":{"suppress":true},
+                "enforce-worktree":{"suppress":true},"terminology":{"suppress":true}}"#,
+        );
+        let mk = |outcome: Outcome| match outcome {
+            Outcome::Allow => CheckResult::allow(),
+            Outcome::Nudge => CheckResult::nudge("n"),
+            Outcome::Block => CheckResult::block("b"),
+            Outcome::Ask => CheckResult::ask("a"),
+        };
+        let rows: &[(&str, Outcome, Outcome)] = &[
+            ("warn-overshare", Outcome::Nudge, Outcome::Allow),
+            ("warn-overshare", Outcome::Block, Outcome::Block),
+            ("warn-overshare", Outcome::Ask, Outcome::Ask),
+            ("warn-overshare", Outcome::Allow, Outcome::Allow),
+            ("git-safety", Outcome::Nudge, Outcome::Nudge),
+            ("git-safety", Outcome::Block, Outcome::Block),
+            ("enforce-worktree", Outcome::Nudge, Outcome::Nudge),
+            ("terminology", Outcome::Nudge, Outcome::Nudge),
+            ("terminology", Outcome::Block, Outcome::Block),
+            ("no-such-hook", Outcome::Nudge, Outcome::Nudge),
+        ];
+        for (hook, before, after) in rows {
+            let got = apply_nudge_config(mk(*before), hook, &config, &input);
+            assert_eq!(got.outcome, *after, "{hook} {before:?}");
+            if *after == Outcome::Allow && *before == Outcome::Nudge {
+                assert!(
+                    got.message.is_none(),
+                    "{hook}: a silenced nudge keeps no text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_path_globs_scope_the_suppression() {
+        let dir = repo();
+        let config = nudges(r#"{"warn-overshare":{"suppress":["docs/**","*.md"]}}"#);
+        for (rel, want) in [
+            ("docs/a/b.txt", Outcome::Allow),
+            ("README.md", Outcome::Allow),
+            ("src/a.rs", Outcome::Nudge),
+            ("mydocs/a.txt", Outcome::Nudge),
+        ] {
+            let input = write_in(dir.path(), rel);
+            let got =
+                apply_nudge_config(CheckResult::nudge("n"), "warn-overshare", &config, &input);
+            assert_eq!(got.outcome, want, "{rel}");
+        }
+        // No file path (a Bash-shaped call): a glob list cannot match.
+        let mut bash = cadence_hooks_core::test_builders::make_bash("git push");
+        bash.cwd = Some(dir.path().to_string_lossy().into_owned());
+        let got = apply_nudge_config(CheckResult::nudge("n"), "warn-overshare", &config, &bash);
+        assert_eq!(got.outcome, Outcome::Nudge);
+        // A path outside the repo root never matches a glob.
+        let mut outside = write_in(dir.path(), "docs/a.md");
+        outside.tool_input.as_mut().unwrap().file_path = Some("/elsewhere/docs/a.md".into());
+        let got = apply_nudge_config(CheckResult::nudge("n"), "warn-overshare", &config, &outside);
+        assert_eq!(got.outcome, Outcome::Nudge);
+    }
+
+    /// The guard's own bypass provenance survives a config rewrite.
+    #[test]
+    fn config_suppression_keeps_the_guards_own_provenance() {
+        let dir = repo();
+        let input = write_in(dir.path(), "a.md");
+        let mut nudge = CheckResult::nudge("n");
+        nudge.bypass = Some(BypassProvenance::env_switch("CADENCE_SKIP_OVERSHARE_AUDIT"));
+        let config = nudges(r#"{"warn-overshare":{"suppress":true}}"#);
+        let got = apply_nudge_config(nudge, "warn-overshare", &config, &input);
+        assert_eq!(got.outcome, Outcome::Allow);
+        assert_eq!(
+            got.bypass.map(|b| b.mechanism).as_deref(),
+            Some("CADENCE_SKIP_OVERSHARE_AUDIT")
+        );
+    }
+
+    #[test]
+    fn load_nudges_for_reads_the_repo_config_and_fails_open() {
+        let dir = repo();
+        let input = write_in(dir.path(), "a.md");
+        assert!(!load_nudges_for(&input).suppresses("warn-overshare", None));
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let cfg = dir.path().join(".claude/cadence.json");
+        std::fs::write(&cfg, r#"{"nudges":{"warn-overshare":{"suppress":true}}}"#).unwrap();
+        assert!(load_nudges_for(&input).suppresses("warn-overshare", None));
+        std::fs::write(&cfg, "{broken").unwrap();
+        assert!(!load_nudges_for(&input).suppresses("warn-overshare", None));
     }
 }
