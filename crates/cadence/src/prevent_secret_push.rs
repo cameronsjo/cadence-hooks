@@ -125,6 +125,8 @@ const SPAWN_CAP: Duration = Duration::from_millis(2000);
 /// (`CADENCE_HOOK_DEADLINE_MS=0`). Under an armed deadline a scan spawn takes
 /// whatever the shared budget has left.
 const LONG_CAP: Duration = Duration::from_secs(20);
+/// Most distinct directories probed for aliases in one command.
+const MAX_ALIAS_PROBES: usize = 4;
 /// Deepest alias-of-alias chain followed.
 const MAX_ALIAS_DEPTH: usize = 10;
 
@@ -433,7 +435,7 @@ fn alias_runs_push(aliases: &HashMap<String, String>, name: &str) -> bool {
     true // a chain this deep is not something to vouch for
 }
 
-/// The first alias the command runs that hides a push, if any.
+/// Why an alias the command runs may hide a push, if one may.
 fn hidden_alias_push(calls: &[GitCall], hints: &CommandHints) -> Option<String> {
     let mut probed: HashMap<String, HashMap<String, String>> = HashMap::new();
     for call in calls {
@@ -445,7 +447,16 @@ fn hidden_alias_push(calls: &[GitCall], hints: &CommandHints) -> Option<String> 
             continue;
         }
         if hints.aliases.contains(&sub) {
-            return Some(sub);
+            return Some(format!(
+                "`git {}` runs an alias this same command writes",
+                sane(&sub)
+            ));
+        }
+        if !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES {
+            return Some(format!(
+                "`git {}` may be an alias, in more directories than this guard will probe",
+                sane(&sub)
+            ));
         }
         let aliases = probed.entry(call.dir.clone()).or_insert_with(|| {
             // An unreadable config is not a detected push: nothing to judge.
@@ -456,7 +467,11 @@ fn hidden_alias_push(calls: &[GitCall], hints: &CommandHints) -> Option<String> 
                 .collect()
         });
         if alias_runs_push(aliases, &sub) {
-            return Some(sub);
+            return Some(format!(
+                "`git {}` is an alias that can run a push (its value names `push` or runs a \
+                 shell command)",
+                sane(&sub)
+            ));
         }
     }
     None
@@ -1211,11 +1226,9 @@ fn scan_refs(
 fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
     let calls = git_calls(command, cwd);
     let hints = command_hints(&calls);
-    if let Some(alias) = hidden_alias_push(&calls, &hints) {
+    if let Some(why) = hidden_alias_push(&calls, &hints) {
         return Err(Stop::Refused(format!(
-            "`git {}` is an alias that can run a push (its value names `push` or runs a \
-             shell command), so what it publishes could not be resolved",
-            sane(&alias)
+            "{why}, so what it publishes could not be resolved"
         )));
     }
     for inv in push_invocations(command, cwd) {
@@ -1929,6 +1942,12 @@ mod tests {
         // An alias that does not push is untouched, as is a builtin.
         assert_allows(&fx.run("git lg -1"));
         assert_allows(&fx.run("git status"));
+        // Probing is bounded: past the cap an unknown subcommand is refused.
+        let many = (0..=MAX_ALIAS_PROBES)
+            .map(|i| format!("git -C /nonexistent-{i} zz"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_blocks(&fx.run(&many), &["more directories"]);
         // An alias this same command writes is refused before the probe could
         // see it.
         let fresh = Fx::new("alias-inline");
