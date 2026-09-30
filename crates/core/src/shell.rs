@@ -6498,6 +6498,22 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
     (opens, shape.paren_closes)
 }
 
+/// The text after each inner `(` a top-level segment leaves open at its end
+/// ([`SegmentShape::inner_open`]), outermost first: `cd /u` for
+/// `echo $(cd /u`. The splitter cut that substitution at a separator inside
+/// it, so this text is a command its subshell runs before the segments that
+/// follow, up to the `)` that closes it (cameronsjo/cadence-hooks#1233).
+pub(crate) fn cut_inner_tails(raw: &str) -> Vec<String> {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let command = peeled.command.unwrap_or("");
+    segment_shape(command)
+        .inner_tails
+        .into_iter()
+        .map(|at| command[at..].to_string())
+        .collect()
+}
+
 /// How far a segment opens (positive) or closes (negative) groups — the
 /// depth a function body's definition is recorded by.
 fn group_depth_change(raw: &str) -> isize {
@@ -6596,6 +6612,9 @@ struct SegmentShape {
     /// splitter cut at a `;` inside it. What follows, up to its `)`, runs
     /// in the substitution's subshell.
     inner_open: usize,
+    /// Where the text inside each of those opens begins, as a byte offset
+    /// into the segment, outermost first.
+    inner_tails: Vec<usize>,
 }
 
 /// Read [`SegmentShape`] from a segment. Quoted text (`'…'`, `"…"`,
@@ -6625,10 +6644,11 @@ fn segment_shape(segment: &str) -> SegmentShape {
             break;
         }
     }
-    let mut inner = 0usize;
+    let base = segment.len() - rest.len();
+    let mut inner = Vec::new();
     let mut previous: Option<char> = None;
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = rest.char_indices();
+    while let Some((at, c)) = chars.next() {
         match c {
             '\\' => {
                 chars.next();
@@ -6638,21 +6658,24 @@ fn segment_shape(segment: &str) -> SegmentShape {
             '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
             '\'' => skip_quoted(&mut chars, '\'', false),
             '"' => skip_quoted(&mut chars, '"', true),
-            '(' => inner += 1,
-            ')' if inner > 0 => inner -= 1,
+            '(' => inner.push(base + at + 1),
+            ')' if !inner.is_empty() => {
+                inner.pop();
+            }
             ')' => shape.paren_closes += 1,
             _ => {}
         }
         previous = Some(c);
     }
-    shape.inner_open = inner;
+    shape.inner_open = inner.len();
+    shape.inner_tails = inner;
     shape
 }
 
 /// Advance past a quoted run up to its closing `quote`; `escapes` honors
 /// `\` inside it (`"…"`, `$'…'`). An unterminated quote runs to the end.
-fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char, escapes: bool) {
-    while let Some(c) = chars.next() {
+fn skip_quoted(chars: &mut std::str::CharIndices<'_>, quote: char, escapes: bool) {
+    while let Some((_, c)) = chars.next() {
         if escapes && c == '\\' {
             chars.next();
         } else if c == quote {
@@ -8764,7 +8787,7 @@ fn unmark(text: String) -> String {
 fn is_only_an_expanded_substitution(script: &str) -> bool {
     let chars: Vec<char> = script.trim().chars().collect();
     match chars.as_slice() {
-        ['$', '(', EXPANDED_MARK, ..] => {
+        ['$' | '<' | '>', '(', EXPANDED_MARK, ..] => {
             matches!(scan_substitution_body(&chars, 2, true), Ok((_, end)) if end == chars.len())
         }
         ['`', EXPANDED_MARK, rest @ ..] => {
@@ -8776,7 +8799,8 @@ fn is_only_an_expanded_substitution(script: &str) -> bool {
 
 /// Scripts a single segment will itself execute in a child shell context: a
 /// `sh`/`bash`/`zsh`/`dash` `-c <script>` wrapper's script AND any
-/// `$(…)`/backtick substitution bodies in executed context. Both can coexist —
+/// `$(…)`/backtick substitution bodies in executed context, and any unquoted
+/// `<(…)`/`>(…)` process substitution body (cameronsjo/cadence-hooks#1233). Both can coexist —
 /// `bash -c 'true' "$(git commit)"` runs the substitution in the parent before
 /// spawning bash — so the two are unioned rather than either/or (guardrails
 /// issue cameronsjo/cadence-hooks#228, review finding 2).
@@ -10077,6 +10101,8 @@ fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
 /// parens and quoting) and `` `…` `` backticks, in executed context only.
 /// Single quotes suppress; double quotes do not. A backslash escapes the next
 /// char outside single quotes, so `\$(` and an escaped backtick are literal.
+/// Unquoted process substitutions `<(…)` and `>(…)` are read like `$(…)`;
+/// double quotes suppress those (cameronsjo/cadence-hooks#1233).
 ///
 /// Backticks deliberately get NO quote tracking for where the span CLOSES —
 /// bash truncates a backtick span at the first unescaped backtick even inside
@@ -10132,7 +10158,19 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
         // `$(` … `)` with paren-depth AND quote tracking. `$(< file)` keeps
         // its `<`. Reached in executed context only — unquoted or inside double
         // quotes, both of which run the substitution.
-        if c == '$' && chars.get(i + 1) == Some(&'(') {
+        //
+        // A process substitution `<(` … `)` / `>(` … `)` runs its body the
+        // same way, in a subshell started from the parent's directory, and
+        // bash parses the body with the same reader, so it takes this arm
+        // (cameronsjo/cadence-hooks#1233). Unquoted only: inside `"…"` it is
+        // literal text (`echo "<(x)"` prints `<(x)`), where a `$(` still runs.
+        // Anywhere else in a word it opens one — `a<(x)`, `$<(x)`, `2>(x)`,
+        // `${v:-<(x)}` and `x=<(y)` all run their bodies in bash 5.2 — so no
+        // word-start test narrows it. Inside `(( … ))` arithmetic `<(` is a
+        // comparison, which this reads as a body anyway: that surfaces more
+        // than bash runs, never less.
+        let opens = c == '$' || (quote.is_none() && matches!(c, '<' | '>'));
+        if opens && chars.get(i + 1) == Some(&'(') {
             if let Ok((body, end)) = scan_substitution_body(&chars, i + 2, true) {
                 if !body.trim().is_empty() {
                     if !body.contains('\\') {
@@ -20344,6 +20382,7 @@ mod tests {
             brace_closes,
             paren_closes,
             inner_open: 0,
+            inner_tails: Vec::new(),
         };
         for (segment, want) in [
             ("gh pr create", shape(&[], 0, 0)),
@@ -20373,6 +20412,7 @@ mod tests {
                 "echo $(true",
                 SegmentShape {
                     inner_open: 1,
+                    inner_tails: vec![7],
                     ..shape(&[], 0, 0)
                 },
             ),

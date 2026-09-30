@@ -903,6 +903,21 @@ fn collect_push_invocations(
         // command can have redefined the name and the segment has no quoting
         // that could make the text a literal (cadence-hooks#1095 review).
         let known_ok = walk.trusts_known_commands && substitutions_are_live(segment);
+        // A substitution the splitter cut open — `echo $(cd /u && git push
+        // origin main )`, `diff <(cd /u` ⏎ `git push origin main` ⏎ `) x` —
+        // starts its subshell inside THIS segment, so a directory verb there
+        // is not this segment's command and the walk never moved. The
+        // segments after it, up to the `)`, run in that subshell's directory,
+        // which this walk cannot vouch for: they are marked directory-
+        // unverified rather than placed in the parent's cwd, and the subshell
+        // scope pushed above restores the flag at its `)` (#1233).
+        if segment.contains('(')
+            && crate::shell::cut_inner_tails(segment).iter().any(|tail| {
+                directory_verb(&crate::shell::executable_tokens(tail), known_ok).is_some()
+            })
+        {
+            scope_directory = true;
+        }
         // `env -C DIR`/`--chdir=DIR` runs this segment's command in DIR — and
         // any child script it starts — without moving the scope.
         //
