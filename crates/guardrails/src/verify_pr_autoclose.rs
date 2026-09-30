@@ -584,21 +584,14 @@ enum Flow {
     Neither,
 }
 
-/// Pick the flow from the command's `gh pr <sub>` segments
-/// ([`gh_pr_segments`]) rather than a substring (cadence-hooks#1076).
-///
-/// The substring test missed `gh pr -R owner/repo merge 17` and
-/// `gh -R owner/repo pr merge 17`, which [`merge_target`] resolves, and
-/// matched `gh pr merge` inside an `echo` or a commit message. A command with
-/// both a create and a merge segment takes the create flow, as the substring
-/// order did.
-/// The directory `gh` ran in: the payload cwd after a leading `cd` chain,
-/// resolved to the repo it lands in, so `cd <nested> && gh pr create` from a
-/// meta-repo session reads the nested repo's origin, not the meta-repo's
-/// (cameronsjo/cadence-hooks#225). No payload cwd falls back to this
-/// process's directory (long-standing). `None` — a `cd` into somewhere no
-/// repo can be named — keeps the advisory quiet rather than reading the
-/// wrong repo.
+/// The directory `gh` ran in: the payload cwd after an unconditional leading
+/// `cd` chain, resolved to the repo it lands in, so `cd <nested> && gh pr
+/// create` from a meta-repo session reads the nested repo's origin, not the
+/// meta-repo's (cameronsjo/cadence-hooks#225). No payload cwd falls back to
+/// this process's directory (long-standing). `None` — a conditional `cd`
+/// (`false && cd other`), a repo outside the session's tree, or a directory
+/// no repo can be named for — keeps the advisory quiet: the merge flow closes
+/// issues, so it must never act on a repo the command may not have touched.
 fn gh_work_dir(cmd: &str, cwd: Option<&str>) -> Option<String> {
     match cwd {
         Some(cwd) => cadence_hooks_core::target_repo::command_repo_dir(cmd, cwd),
@@ -611,6 +604,14 @@ fn gh_work_dir(cmd: &str, cwd: Option<&str>) -> Option<String> {
     }
 }
 
+/// Pick the flow from the command's `gh pr <sub>` segments
+/// ([`gh_pr_segments`]) rather than a substring (cadence-hooks#1076).
+///
+/// The substring test missed `gh pr -R owner/repo merge 17` and
+/// `gh -R owner/repo pr merge 17`, which [`merge_target`] resolves, and
+/// matched `gh pr merge` inside an `echo` or a commit message. A command with
+/// both a create and a merge segment takes the create flow, as the substring
+/// order did.
 fn flow_for(cmd: &str) -> Flow {
     let segments = gh_pr_segments(cmd);
     let has = |sub: &str| segments.iter().any(|t| gh_pr_subcommand(t) == Some(sub));
@@ -1824,8 +1825,13 @@ mod tests {
             let url = format!("https://github.com/o/{slug}.git");
             git_in(dir, &["remote", "add", "origin", &url]);
         };
+        let other = s.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        init_repo(&other);
         remote(&meta, "meta");
         remote(&nested, "nested");
+        remote(&other, "other");
+        let o = other.to_str().unwrap();
         let m = meta.to_str().unwrap();
         let n = nested.to_str().unwrap();
         // (label, command, cwd, expected origin slug: None = quiet)
@@ -1843,10 +1849,28 @@ mod tests {
                 Some("o/meta"),
             ),
             (
-                "nested cwd, cd out to the meta repo",
+                "nested cwd, cd out to the enclosing meta repo: outside the session tree",
                 format!("cd {m} && gh pr merge 3"),
                 n,
-                Some("o/meta"),
+                None,
+            ),
+            (
+                "a cd behind `false &&` never reaches the other repo",
+                format!("false && cd {o} && gh pr merge 5"),
+                m,
+                None,
+            ),
+            (
+                "an unrelated repo outside the session's tree",
+                format!("cd {o} && gh pr merge 5"),
+                m,
+                None,
+            ),
+            (
+                "a nested cd behind `false &&`",
+                "false && cd nested && gh pr merge 5".into(),
+                m,
+                None,
             ),
             (
                 "cd into a missing dir: quiet",

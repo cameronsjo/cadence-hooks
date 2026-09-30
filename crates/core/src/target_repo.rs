@@ -212,10 +212,24 @@ pub fn resolve_effective_repo(cwd: &Path, target: &Path, kind: TargetKind) -> Re
 /// session is judged against the nested repo, not the meta-repo.
 ///
 /// - No `cd` in effect: `cwd` itself, unchanged (the long-standing reading).
-/// - A `cd` into a repo: that repo's root (a gitignored nested repo, a linked
-///   worktree, another checkout).
-/// - A `cd` into somewhere that is no repo, does not exist, or cannot be read
-///   ([`Resolution::NotARepo`] / [`Resolution::Ambiguous`]): `None`.
+/// - A `cd` into the session's own repo, or into a repo nested INSIDE its
+///   tree (the gitignored nested repo of a meta-repo, a worktree kept under
+///   the checkout): that repo's root.
+/// - Anything else is `None`:
+///   - a `cd` that does not run unconditionally — the chain must be the
+///     command's leading segments, each a bare `cd` joined by `&&` or `;`
+///     (`false && cd x`, `cd x || exit`, `git status; cd x` all fail this),
+///     since [`crate::shell::parse_work_dir`] assumes every `cd` runs;
+///   - a target outside the session repo's tree (an unrelated checkout, an
+///     enclosing repo, a sibling worktree), or a session cwd in no repo;
+///   - a target that is no repo, does not exist, or cannot be read
+///     ([`Resolution::NotARepo`] / [`Resolution::Ambiguous`]).
+///
+/// **Why so narrow.** Callers run `git` in the returned directory before the
+/// user approves the command, and a repo's own config can name programs git
+/// executes (`core.fsmonitor`, filter drivers). The session's own tree is the
+/// only one a hook may treat that way; a command's text must never be able to
+/// point a hook at an arbitrary repo on disk.
 ///
 /// `None` means "cannot name the repo this command runs in". Only a guard that
 /// nudges may read it as quiet; a guard whose verdict relaxes on the repo must
@@ -225,9 +239,38 @@ pub fn command_repo_dir(command: &str, cwd: &str) -> Option<String> {
     if work == cwd {
         return Some(cwd.to_string());
     }
-    resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir)
-        .resolved()
-        .map(|r| r.state.repo_root.to_string_lossy().into_owned())
+    if !leading_cd_chain_is_unconditional(command) {
+        return None;
+    }
+    let resolution = resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir);
+    let repo = resolution.resolved()?;
+    let session_root = std::fs::canonicalize(&repo.cwd_state.as_ref()?.repo_root).ok()?;
+    let target_root = std::fs::canonicalize(&repo.state.repo_root).ok()?;
+    target_root
+        .starts_with(&session_root)
+        .then(|| target_root.to_string_lossy().into_owned())
+}
+
+/// True when every `cd` segment of `command` is part of an unconditional
+/// leading chain: the segments up to and including the last `cd` are all bare
+/// `cd` commands, each followed by `&&` or `;`. A `cd` behind a guard
+/// (`false && cd x`), before `||`, in a pipeline, or after any other command
+/// fails — the caller cannot be sure the shell ends up there. So does a
+/// newline between `cd`s, which [`crate::shell::parse_work_dir`] does not
+/// follow: the directory it reports would not be where the shell ends up.
+fn leading_cd_chain_is_unconditional(command: &str) -> bool {
+    let segments = crate::shell::split_segments_with_ops(command);
+    let is_cd = |segment: &str| {
+        crate::shell::tokenize(segment)
+            .first()
+            .is_some_and(|word| word == "cd")
+    };
+    let Some(last_cd) = segments.iter().rposition(|(segment, _)| is_cd(segment)) else {
+        return false;
+    };
+    segments[..=last_cd]
+        .iter()
+        .all(|(segment, op)| is_cd(segment) && matches!(op, Some("&&" | ";")))
 }
 
 fn relate(target: &GitState, cwd: Option<&GitState>) -> RepoRelation {
@@ -604,12 +647,21 @@ mod tests {
 
     #[test]
     fn command_repo_dir_keys_off_the_repo_a_leading_cd_moves_into() {
-        let (_s, meta, plugin) = meta_layout("command-dir");
+        let (s, meta, plugin) = meta_layout("command-dir");
         std::fs::create_dir_all(meta.join("plain-dir")).unwrap();
+        // An unrelated repo outside the session's tree, and a symlink inside
+        // the meta repo that points at it.
+        let foreign = s.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        init_repo(&foreign);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&foreign, meta.join("link-out")).unwrap();
         let m = meta.to_str().unwrap();
+        let f = foreign.to_str().unwrap();
         let p = canon(&plugin).to_string_lossy().into_owned();
+        let meta_root = canon(&meta).to_string_lossy().into_owned();
         // (label, command, cwd, expected)
-        let cases: Vec<(&str, String, &str, Option<String>)> = vec![
+        let mut cases: Vec<(&str, String, &str, Option<String>)> = vec![
             (
                 "no cd: the cwd, unchanged",
                 "git status".into(),
@@ -629,10 +681,64 @@ mod tests {
                 Some(p.clone()),
             ),
             (
-                "nested cwd, cd out to the meta repo",
+                "multi-cd chain ending in the nested repo",
+                "cd plain-dir && cd ../plugin && git status".into(),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "a newline-joined cd chain the parser does not follow: quiet",
+                "cd plain-dir\ncd ../plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a plain dir inside the meta repo: the meta repo",
+                "cd plain-dir; git status".into(),
+                m,
+                Some(meta_root.clone()),
+            ),
+            (
+                "nested cwd, cd out to the enclosing meta repo: outside the session tree",
                 format!("cd {m} && git status"),
                 &p,
-                Some(canon(&meta).to_string_lossy().into_owned()),
+                None,
+            ),
+            (
+                "cd into an unrelated repo",
+                format!("cd {f} && git status"),
+                m,
+                None,
+            ),
+            (
+                "cd into an unrelated repo via ..",
+                "cd ../foreign && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd behind `false &&` may never run",
+                "false && cd plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd before `||`",
+                "cd plugin || exit; git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd after another command",
+                "git status; cd plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd in a pipeline",
+                "cd plugin | cat; git status".into(),
+                m,
+                None,
             ),
             (
                 "cd into a missing dir: cannot say",
@@ -641,13 +747,15 @@ mod tests {
                 None,
             ),
         ];
+        #[cfg(unix)]
+        cases.push((
+            "a symlink inside the meta repo pointing out of it",
+            "cd link-out && git status".into(),
+            m,
+            None,
+        ));
         for (label, command, cwd, want) in cases {
             assert_eq!(command_repo_dir(&command, cwd), want, "{label}");
         }
-        // A plain (non-repo) dir inside the meta repo resolves to the meta repo.
-        assert_eq!(
-            command_repo_dir("cd plain-dir && git status", m),
-            Some(canon(&meta).to_string_lossy().into_owned())
-        );
     }
 }

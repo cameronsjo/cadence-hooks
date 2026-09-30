@@ -418,6 +418,11 @@ mod tests {
                 true,
             ),
             (
+                "a cd behind `false &&`: the nested origin is never read",
+                "false && cd nested && gh issue comment 5 -R o/meta --body 'see #7'",
+                false,
+            ),
+            (
                 "cd into a missing dir: no origin can be named, quiet",
                 "cd nested/no-such && gh issue comment 5 -R o/nested --body 'see #7'",
                 false,

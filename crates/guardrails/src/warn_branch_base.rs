@@ -163,11 +163,12 @@ fn is_main_branch(name: &str) -> bool {
 /// root through [`cadence_hooks_core::target_repo`].
 ///
 /// - No `cd` in effect: the cwd itself (long-standing behavior; `.` with no cwd).
-/// - A `cd` that resolves into a repo: that repo's root — the nested repo of a
-///   meta-repo session, a linked worktree, or another checkout.
-/// - A `cd` into somewhere that is no repo, does not exist, or cannot be
-///   read: `None`, so the caller stays quiet rather than judging the wrong repo
-///   (or, worse, the hook process's own directory).
+/// - An unconditional `cd` into the session's repo or a repo nested inside its
+///   tree: that repo's root — the nested repo of a meta-repo session.
+/// - Anything else (a conditional `cd`, a repo outside the session's tree, a
+///   directory that is no repo or does not exist): `None`, so the caller stays
+///   quiet rather than judging the wrong repo (or, worse, the hook process's
+///   own directory). See [`cadence_hooks_core::target_repo::command_repo_dir`].
 fn effective_repo_dir(command: &str, cwd: Option<&str>) -> Option<String> {
     let Some(cwd) = cwd else {
         return Some(".".to_string());
@@ -543,10 +544,17 @@ mod tests {
                     "",
                 ),
                 (
-                    "nested cwd, cd out to the meta primary: worktree-first",
+                    "nested cwd, cd out to the enclosing meta primary: outside the session tree, quiet",
                     format!("cd {m} && git checkout -b feat/y"),
                     w,
-                    Some("enforce-worktree"),
+                    None,
+                    "",
+                ),
+                (
+                    "meta cwd, a cd behind `false &&` may never run: quiet",
+                    format!("false && cd {w} && git checkout -b feat/y"),
+                    m,
+                    None,
                     "",
                 ),
                 (
