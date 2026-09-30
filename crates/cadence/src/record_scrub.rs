@@ -4,8 +4,9 @@
 //! A **CLI action**, not a hook: the `cadence:mining-runbooks` promotion step
 //! runs `scrub.py --apply`, then `scrub.py` in check mode, and only on a
 //! check-mode exit 0 runs `cadence-hooks cadence record-scrub --file <draft>`.
-//! That writes a marker keyed on the SHA-256 of the file's exact bytes
-//! ([`markers::scrub_marker`]); `guardrails guard-runbook-scrub` then lets a
+//! That writes a marker keyed on the SHA-256 of the file's bytes, with
+//! `\r\n` read as `\n` ([`markers::scrub_digest`], [`markers::scrub_marker`]);
+//! `guardrails guard-runbook-scrub` then lets a
 //! Write/Edit under `$CADENCE_RUNBOOKS_DIR` through only when the resulting
 //! document hashes to a recorded marker.
 //!

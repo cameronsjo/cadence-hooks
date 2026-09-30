@@ -9,18 +9,27 @@
 //!
 //! - **Write / Edit / MultiEdit** whose target resolves under the directory is
 //!   allowed only when the **resulting document** (the Write's content, or the
-//!   on-disk file with the edit applied — [`HookInput::effective_content`])
-//!   hashes to a marker `cadence-hooks cadence record-scrub --file <path>`
-//!   recorded ([`markers::scrub_marker_present`]). A resulting document that
-//!   cannot be computed (an Edit of an unreadable file) blocks.
+//!   on-disk file with every edit applied — [`resulting_document`]) hashes to
+//!   a marker `cadence-hooks cadence record-scrub --file <path>` recorded
+//!   ([`markers::scrub_marker_present`]; the digest is line-ending-insensitive).
+//!   A resulting document that cannot be computed blocks: an Edit of an
+//!   unreadable file, an edit whose `old_string` is not found literally in the
+//!   document so far (Claude Code's own Edit normalizes curly quotes, so it
+//!   may apply an edit this simulation cannot), or an edit entry without a
+//!   readable `old_string`/`new_string` pair (an MCP `edit_file`'s
+//!   `oldText`/`newText`). An MCP move into the directory arrives as a Write
+//!   with no content and blocks the same way.
 //! - **Bash** writing into the directory — a redirect or a writer verb (`tee`,
 //!   `cp`/`mv`/`install`/`ln`, `rsync`, `dd`, `truncate`, `touch`, `rm`,
 //!   `sed -i`, …), as `prevent-secret-writes` parses them
 //!   ([`segment_write_targets`]) — blocks outright: the bytes a command writes
 //!   are not knowable before it runs, so there is nothing to match a marker
 //!   against. The message points at the Write-tool path.
-//! - An MCP-style move/copy (`tool_input.destination`) into the directory
-//!   blocks outright for the same reason.
+//! - **The scrub-marker directory** ([`markers::polish_dir`]) is refused as a
+//!   write target to every one of those tools, so a marker cannot be forged by
+//!   writing the file `record-scrub` would have written. That refusal is part
+//!   of this guard, so it too is active only while `$CADENCE_RUNBOOKS_DIR` is
+//!   set.
 //!
 //! **Where a path lands** is decided on two readings, and either one landing
 //! inside is enough ([`PathShape::lands_in`]): the lexical path (`..` folded
@@ -29,14 +38,20 @@
 //! ASCII-case-insensitively, because the vault lives on a case-insensitive
 //! volume on macOS. A Bash target's glob component (`*`, `?`, `[`, `{`)
 //! matches any single directory name; a `~` or `$HOME` / `$CADENCE_RUNBOOKS_DIR`
-//! is expanded; a relative target is judged against the payload `cwd`, the
+//! (bare, braced, or with a `:-`/`-`/`:=`/`=` default) is expanded, and a
+//! `$PWD`, `${PWD}` or `~+` is read as each directory the target may be judged
+//! in; a relative target is judged against the payload `cwd`, the
 //! whole-command `cd` reading ([`parse_work_dir`]) and the directory its own
 //! segment runs in ([`command_segments_with_dirs`]), keeping the sharpest verdict.
 //!
-//! **A command that names the directory may only read it.** When the command
-//! text spells the directory (its configured, lexical, physical, or `~/` form,
-//! on a path boundary, or `$CADENCE_RUNBOOKS_DIR` / `${CADENCE_RUNBOOKS_DIR…`
-//! as an expansion), it also blocks on: any write target anywhere (other than
+//! **A command that names the directory may only read it.** A command names
+//! the directory when its text spells it — its configured, lexical, physical,
+//! or `~/` form, on a path boundary (a short flag's attached value, `-C/…`,
+//! counts), read after `$HOME`/`${HOME}`/`~` are expanded and `//` and `/./`
+//! collapsed; or `$CADENCE_RUNBOOKS_DIR` / `${CADENCE_RUNBOOKS_DIR…` as an
+//! expansion — or when a segment runs *inside* the directory, or runs in its
+//! parent with a word that is the directory's own name (`tar -C Runbooks`,
+//! `unzip -d Runbooks/`). Such a command also blocks on: any write target anywhere (other than
 //! `/dev/null` and the standard streams); a target whose location the hook
 //! cannot read (another variable, a substitution, `~user`, `**`, a relative
 //! target after an unreadable `cd`); and any program outside a short read-only
@@ -61,6 +76,18 @@
 //!   with a runbook is judged by its own path.
 //! - Unicode-normalization and non-ASCII case variants of the directory's
 //!   spelling (only ASCII case is folded).
+//! - A relative spelling of the directory inside a program's own argument
+//!   text, run from the parent (`python3 -c "open('Runbooks/a.md','w')"` in
+//!   the vault): only a whole word equal to the directory's name counts.
+//! - A `${HOME:-…}` whose default runs past [`MAX_DEFAULT_SCAN`] bytes stays
+//!   unexpanded (opaque).
+//! - MCP write verbs the tool-name classifier does not recognize
+//!   (`append_file`, `save_file`, `str_replace`, `copy_file`, …) are not
+//!   classified as writes and reach no branch of this guard.
+//! - A write into the marker directory through a location the hook cannot
+//!   read, or by a program whose writes it cannot see, is not caught: the
+//!   marker-dir refusal judges write targets only. (`record-scrub` itself
+//!   trusts its caller, so it is the simpler forgery anyway.)
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
@@ -103,6 +130,64 @@ const JUDGE_BUDGET: usize = 256 * 1024;
 
 /// Longest target text echoed into a block message.
 const MAX_ECHO: usize = 200;
+
+/// Longest `${NAME:-default}` body [`substitute_var`] scans for its closing
+/// brace. Past it the reference stays unexpanded (opaque), which keeps a flood
+/// of unclosed `${HOME:-` openers linear.
+const MAX_DEFAULT_SCAN: usize = 1024;
+
+/// True for a two-character drive component (`c:`).
+fn is_drive_comp(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// A Windows drive spelling of `text` rewritten as `/x:/rest` (the letter
+/// lowercased, separators forward): `X:\…`, `X:/…`, the verbatim `\\?\X:\…`,
+/// and — when `git_bash` — Git Bash's `/x/…`. `None` for any other text.
+///
+/// Pure, so it is tested on every platform; only a Windows build applies it
+/// ([`absolute`]), because on Unix `/c/…` is a real path and `C:` a file name.
+fn drive_form(text: &str, git_bash: bool) -> Option<String> {
+    let forward = text.replace('\\', "/");
+    let t = forward.strip_prefix("//?/").unwrap_or(&forward);
+    let b = t.as_bytes();
+    let rest_ok = |at: usize| b.len() == at || b[at] == b'/';
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && rest_ok(2) {
+        return Some(format!(
+            "/{}:{}",
+            b[0].to_ascii_lowercase() as char,
+            &t[2..]
+        ));
+    }
+    if git_bash && b.len() >= 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && rest_ok(2) {
+        return Some(format!(
+            "/{}:{}",
+            b[1].to_ascii_lowercase() as char,
+            &t[2..]
+        ));
+    }
+    None
+}
+
+/// The extra command spellings of a drive-rooted mention `/x:/rest`:
+/// `x:/rest` (native, after the command copy's `\` → `/`) and Git Bash's
+/// `/x/rest`. Empty for any other mention. Pure; applied on Windows only.
+fn drive_mentions(joined: &str) -> Vec<String> {
+    let b = joined.as_bytes();
+    if b.len() >= 3
+        && b[0] == b'/'
+        && is_drive_comp(&joined[1..3])
+        && (b.len() == 3 || b[3] == b'/')
+    {
+        vec![
+            joined[1..].to_string(),
+            format!("/{}{}", &joined[1..2], &joined[3..]),
+        ]
+    } else {
+        Vec::new()
+    }
+}
 
 /// One path component, as a location judgment sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,8 +259,12 @@ impl PathShape {
             .position(|c| matches!(c, Comp::Wild | Comp::Opaque))
             .unwrap_or(self.0.len());
         let mut prefix = PathBuf::from("/");
-        for c in &self.0[..split] {
+        for (i, c) in self.0[..split].iter().enumerate() {
             match c {
+                // A drive component roots the path on that drive (Windows).
+                Comp::Lit(name) if i == 0 && cfg!(windows) && is_drive_comp(name) => {
+                    prefix = PathBuf::from(format!("{name}\\"));
+                }
                 Comp::Lit(name) => prefix.push(name),
                 _ => prefix.push(".."),
             }
@@ -213,9 +302,26 @@ fn path_names(path: &Path) -> Vec<String> {
     path.components()
         .filter_map(|c| match c {
             Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            // A Windows drive prefix, as the `x:` component [`drive_form`] makes.
+            Component::Prefix(p) => {
+                drive_form(&p.as_os_str().to_string_lossy(), false).map(|d| d[1..].to_string())
+            }
             _ => None,
         })
         .collect()
+}
+
+/// The root a walk of `path` starts from: its drive root on Windows
+/// (`C:\`), else `/`.
+fn walk_root(path: &Path) -> PathBuf {
+    match path.components().next() {
+        Some(Component::Prefix(p)) => {
+            let mut root = PathBuf::from(p.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            root
+        }
+        _ => PathBuf::from("/"),
+    }
 }
 
 /// `path` with every symlink that exists on the way followed and each `..`
@@ -235,7 +341,7 @@ fn physical(path: &Path) -> Option<PathBuf> {
 fn physical_walk(path: &Path) -> Option<(PathBuf, bool)> {
     let mut pending: Vec<std::ffi::OsString> = Vec::new();
     push_components(&mut pending, path);
-    let mut resolved = PathBuf::from("/");
+    let mut resolved = walk_root(path);
     // How many trailing components of `resolved` do not exist on disk.
     let mut missing = 0usize;
     let mut hops = 0;
@@ -259,7 +365,7 @@ fn physical_walk(path: &Path) -> Option<(PathBuf, bool)> {
                 let target = std::fs::read_link(&resolved).ok()?;
                 resolved.pop();
                 if target.has_root() {
-                    resolved = PathBuf::from("/");
+                    resolved = walk_root(&target);
                 }
                 push_components(&mut pending, &target);
             }
@@ -386,6 +492,9 @@ impl RunbooksDir {
                     mentions.insert(format!("~/{rest}"));
                 }
             }
+            if cfg!(windows) {
+                mentions.extend(drive_mentions(&joined));
+            }
             mentions.insert(joined);
         }
         Some(Self {
@@ -398,15 +507,23 @@ impl RunbooksDir {
 
     /// Does the command text spell the directory? A path spelling counts
     /// only on a path boundary, so `…/Runbooks-old` or `/other/vault/Runbooks`
-    /// does not name `/vault/Runbooks`.
+    /// does not name `/vault/Runbooks`; a short flag's attached value
+    /// (`-C/vault/Runbooks`) is on one. Matched on [`Self::mention_text`].
     fn named_in(&self, command: &str) -> bool {
-        let lower = command.to_ascii_lowercase();
+        let lower = self.mention_text(command);
         let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
         self.mentions.iter().any(|m| {
             lower.match_indices(m.as_str()).any(|(at, _)| {
+                let head = &lower.as_bytes()[..at];
                 let before = lower[..at].chars().next_back();
                 let after = lower[at + m.len()..].chars().next();
-                let open_before = m.starts_with('$') || !before.is_some_and(path_char);
+                // `-C/path`: one letter after a word-initial `-`.
+                let short_flag = head.len() >= 2
+                    && head[head.len() - 1].is_ascii_alphabetic()
+                    && head[head.len() - 2] == b'-'
+                    && (head.len() == 2 || !path_char(head[head.len() - 3] as char));
+                let open_before =
+                    m.starts_with('$') || short_flag || !before.is_some_and(path_char);
                 let open_after = if m.starts_with('$') {
                     !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
                 } else {
@@ -414,6 +531,60 @@ impl RunbooksDir {
                 };
                 open_before && open_after
             })
+        })
+    }
+
+    /// The lowercased copy of `command` the mention rule reads: `$HOME`,
+    /// `${HOME}` and its defaulted forms, and a word-initial `~`/`~/`
+    /// expanded; on Windows `\` read as `/`; and `//` and `/./` collapsed, so
+    /// `/vault//Runbooks` and `/vault/./Runbooks` spell `/vault/Runbooks`.
+    /// Never executed or re-parsed: it only feeds a substring search.
+    fn mention_text(&self, command: &str) -> String {
+        let mut text = match self.home.as_deref() {
+            Some(home) => expand_word_tildes(&substitute_var(command, "HOME", home), home),
+            None => command.to_string(),
+        };
+        if cfg!(windows) {
+            text = text.replace('\\', "/");
+        }
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            if c == '/' {
+                if out.ends_with('/') {
+                    continue;
+                }
+                if out.ends_with("/.") {
+                    out.pop();
+                    continue;
+                }
+            }
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    }
+
+    /// True when a directory a segment runs in names the runbooks directory:
+    /// it is inside it, or it is its parent and a word of `argv` is the
+    /// directory's own name (`tar -C Runbooks`, `unzip -d./Runbooks/`).
+    fn named_by_work_dir(&self, work_dir: &str, argv: &[String], resolver: &Resolver) -> bool {
+        if work_dir == UNRESOLVABLE_DIR {
+            return false;
+        }
+        let shape = PathShape(absolute(work_dir, "/", false));
+        if shape.lands_in(&self.spellings, resolver) {
+            return true;
+        }
+        let readings: Vec<Vec<Comp>> = std::iter::once(shape.lexical())
+            .chain(shape.physical(resolver))
+            .collect();
+        self.spellings.iter().any(|dir| {
+            let Some((last, parent)) = dir.split_last() else {
+                return false;
+            };
+            readings
+                .iter()
+                .any(|comps| comps.len() == parent.len() && reaches(comps, parent))
+                && argv.iter().any(|w| word_names(w, last))
         })
     }
 
@@ -436,29 +607,128 @@ impl RunbooksDir {
     }
 }
 
-/// Replace `$name` and `${name}` in `text` with `value`, only where the bare
-/// form ends on an identifier boundary (`$HOMEX` is another variable).
+/// Replace `$name`, `${name}`, and the defaulted `${name:-…}` / `${name-…}`
+/// / `${name:=…}` / `${name=…}` in `text` with `value` — each of which is
+/// `value` when the variable is set, as the caller asserts it is. The bare
+/// form counts only on an identifier boundary (`$HOMEX` is another variable);
+/// `${name:+…}` and other operators stay as written (opaque).
 fn substitute_var(text: &str, name: &str, value: &str) -> String {
-    let text = text.replace(&format!("${{{name}}}"), value);
     let bare = format!("${name}");
+    let braced = format!("${{{name}");
     let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find(&bare) {
-        let after = &rest[at + bare.len()..];
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
         out.push_str(&rest[..at]);
-        if after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            out.push_str(&bare);
+        let tail = &rest[at..];
+        if let Some(after) = tail.strip_prefix(braced.as_str()) {
+            if let Some(end) = default_close(after) {
+                out.push_str(value);
+                rest = &after[end..];
+            } else {
+                out.push_str(&braced);
+                rest = after;
+            }
+        } else if let Some(after) = tail.strip_prefix(bare.as_str()) {
+            let joined = after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            out.push_str(if joined { &bare } else { value });
+            rest = after;
         } else {
-            out.push_str(value);
+            out.push('$');
+            rest = &tail[1..];
         }
-        rest = after;
     }
     out.push_str(rest);
     out
+}
+
+/// For the text after `${name`: the byte offset just past the reference's
+/// closing `}` when it is `}` or a `:-`/`-`/`:=`/`=` default (nested braces
+/// counted, scanning at most [`MAX_DEFAULT_SCAN`] bytes). `None` otherwise.
+fn default_close(after: &str) -> Option<usize> {
+    if after.starts_with('}') {
+        return Some(1);
+    }
+    let op = [":-", ":=", "-", "="]
+        .iter()
+        .find(|op| after.starts_with(**op))?
+        .len();
+    let mut depth = 0usize;
+    for (i, b) in after.bytes().enumerate().skip(op).take(MAX_DEFAULT_SCAN) {
+        match b {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return Some(i + 1),
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `text` with every word-initial `~` (alone, or before `/`) replaced by
+/// `home`. A word starts at the text's start or after a character that
+/// cannot continue a path (space, quote, `=`, `:`, `(`, …); `~user`, `~+`,
+/// `~-` are left alone.
+fn expand_word_tildes(text: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let word_start = !prev.is_some_and(|p| {
+            p.is_ascii_alphanumeric() || matches!(p, '_' | '-' | '.' | '/' | '~' | '$')
+        });
+        let ends = chars.peek().is_none_or(|n| {
+            *n == '/' || n.is_whitespace() || matches!(n, '"' | '\'' | ';' | '&' | '|' | ')')
+        });
+        if c == '~' && word_start && ends {
+            out.push_str(home);
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+    }
+    out
+}
+
+/// `target` with `$PWD`, `${PWD}` (and its defaulted forms) and a leading
+/// `~+` read as `work_dir`, the directory it is judged in.
+fn expand_pwd(target: &str, work_dir: &str) -> String {
+    let text = if target.contains("PWD") {
+        substitute_var(target, "PWD", work_dir)
+    } else {
+        target.to_string()
+    };
+    match text.strip_prefix("~+") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{work_dir}{rest}"),
+        _ => text,
+    }
+}
+
+/// True when shell word `word` is the directory name `last` (or a path under
+/// it): as-is, after a `--opt=` or a short flag (`-dRunbooks`), with leading
+/// `./` and trailing `/` ignored. ASCII-case-insensitive.
+fn word_names(word: &str, last: &str) -> bool {
+    let mut candidates = vec![word];
+    if let Some((_, value)) = word.split_once('=') {
+        candidates.push(value);
+    }
+    if word.starts_with('-') && !word.starts_with("--") && word.len() > 2 {
+        candidates.push(&word[2..]);
+    }
+    candidates.into_iter().any(|c| {
+        let mut c = c;
+        while let Some(rest) = c.strip_prefix("./") {
+            c = rest;
+        }
+        let c = c.trim_end_matches('/');
+        c.len() >= last.len()
+            && c.is_char_boundary(last.len())
+            && c[..last.len()].eq_ignore_ascii_case(last)
+            && (c.len() == last.len() || c.as_bytes()[last.len()] == b'/')
+    })
 }
 
 /// A leading `~` or `~/` replaced with `home`; any other text unchanged.
@@ -474,12 +744,21 @@ fn expand_home(text: &str, home: Option<&str>) -> String {
 }
 
 /// `text` as absolute components: as-is when rooted, else under `cwd`.
+///
+/// On Windows a drive spelling (`C:\…`, `C:/…`, `\\?\C:\…`, Git Bash's
+/// `/c/…`) is rooted on a `c:` component ([`drive_form`]).
 fn absolute(text: &str, cwd: &str, shell: bool) -> Vec<Comp> {
-    let text = text.replace('\\', "/");
+    let native = |t: &str| {
+        cfg!(windows)
+            .then(|| drive_form(t, true))
+            .flatten()
+            .unwrap_or_else(|| t.replace('\\', "/"))
+    };
+    let text = native(text);
     if text.starts_with('/') {
         PathShape::parse(&text, shell)
     } else {
-        let mut comps = PathShape::parse(cwd, false);
+        let mut comps = PathShape::parse(&native(cwd), false);
         comps.extend(PathShape::parse(&text, shell));
         comps
     }
@@ -494,29 +773,40 @@ enum Landing {
     Outside,
 }
 
-/// Where a Bash write target lands, judged against every directory the
-/// command may run it in.
+/// Where a Bash write target lands relative to the directory spelled
+/// `spellings`, judged against every directory the command may run it in.
+/// `dir` supplies the `~`/`$HOME`/`$CADENCE_RUNBOOKS_DIR` expansion; a
+/// `$PWD`/`~+` is read as each work dir in turn.
 fn bash_target_landing(
     target: &str,
     work_dirs: &[&str],
     dir: &RunbooksDir,
+    spellings: &[Vec<String>],
     resolver: &Resolver,
 ) -> Landing {
     let text = dir.expand(target);
-    // `~user` (the only `~` form left after expansion) is someone's home.
-    let mut unknown = text.starts_with('~');
-    let bases: &[&str] = if text.starts_with('/') {
+    let uses_pwd = text.contains("PWD") || text.starts_with("~+");
+    let bases: &[&str] = if text.starts_with('/') && !uses_pwd {
         &["/"]
     } else {
         work_dirs
     };
+    let mut unknown = false;
     for base in bases {
         if *base == UNRESOLVABLE_DIR {
             unknown = true;
             continue;
         }
+        let text = if uses_pwd {
+            expand_pwd(&text, base)
+        } else {
+            text.clone()
+        };
+        // `~user` or `~-` (the `~` forms left after expansion): a directory
+        // the hook cannot read.
+        unknown |= text.starts_with('~');
         let shape = PathShape(absolute(&text, base, true));
-        if shape.lands_in(&dir.spellings, resolver) {
+        if shape.lands_in(spellings, resolver) {
             return Landing::Inside;
         }
         unknown |= shape.has_opaque();
@@ -540,7 +830,12 @@ fn bash_target_landing(
 /// Past [`JUDGE_BUDGET`] bytes of judged text the command is refused as too
 /// large to judge (the over-block direction): the hook deadline fails open,
 /// so running out the clock must not be a way through.
-fn bash_write_into(command: &str, cwd: &str, dir: &RunbooksDir) -> Option<BashFinding> {
+fn bash_write_into(
+    command: &str,
+    cwd: &str,
+    dir: &RunbooksDir,
+    marker_dir: Option<&[Vec<String>]>,
+) -> Option<BashFinding> {
     let whole = parse_work_dir(command, cwd);
     let mut judged: HashSet<(String, Rc<str>)> = HashSet::new();
     let mut unknown: Option<String> = None;
@@ -548,21 +843,43 @@ fn bash_write_into(command: &str, cwd: &str, dir: &RunbooksDir) -> Option<BashFi
     let mut writer: Option<String> = None;
     let mut spent = 0usize;
     let resolver = Resolver::default();
+    // Work dirs already asked whether they name the runbooks dir, with the
+    // argv words they were asked with — a flood repeats one directory.
+    let mut dir_named = false;
+    let mut asked: HashSet<(Rc<str>, Vec<String>)> = HashSet::new();
     for (segment, seg_dir) in command_segments_with_dirs(command, cwd) {
+        let argv = segment_command_argv(&segment);
         if writer.is_none() {
-            writer = unvetted_program(&segment_command_argv(&segment));
+            writer = unvetted_program(&argv);
+        }
+        if !dir_named && asked.insert((seg_dir.clone(), argv.clone())) {
+            spent += seg_dir.len() + argv.iter().map(String::len).sum::<usize>();
+            if spent > JUDGE_BUDGET {
+                return Some(BashFinding::TooLarge);
+            }
+            dir_named = [&*seg_dir, cwd, whole.as_str()]
+                .iter()
+                .any(|d| dir.named_by_work_dir(d, &argv, &resolver));
         }
         for target in segment_write_targets(&segment) {
             if !judged.insert((target.clone(), seg_dir.clone())) {
                 continue;
             }
             spent += target.len() + seg_dir.len() + cwd.len() + whole.len();
+            if marker_dir.is_some() {
+                spent += target.len() + seg_dir.len() + cwd.len() + whole.len();
+            }
             if spent > JUDGE_BUDGET {
                 return Some(BashFinding::TooLarge);
             }
             let mut bases: Vec<&str> = vec![&seg_dir, cwd, &whole];
             bases.dedup();
-            match bash_target_landing(&target, &bases, dir, &resolver) {
+            if let Some(markers) = marker_dir
+                && bash_target_landing(&target, &bases, dir, markers, &resolver) == Landing::Inside
+            {
+                return Some(BashFinding::MarkerTarget(target));
+            }
+            match bash_target_landing(&target, &bases, dir, &dir.spellings, &resolver) {
                 Landing::Inside => return Some(BashFinding::Target(target)),
                 Landing::Unknown => {
                     unknown.get_or_insert(target);
@@ -578,7 +895,7 @@ fn bash_write_into(command: &str, cwd: &str, dir: &RunbooksDir) -> Option<BashFi
     // A command that names the directory may read it, and nothing else: any
     // write it makes, and any program whose writes the parser cannot see
     // (an interpreter, `tar -x`, `git`, `mkdir`, …), is refused.
-    if !dir.named_in(command) {
+    if !dir_named && !dir.named_in(command) {
         return None;
     }
     unknown
@@ -639,6 +956,11 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "rev",
     "jq",
     "find",
+    "rg",
+    "fd",
+    "tree",
+    "sort",
+    "uniq",
 ];
 
 /// `find` actions that write, delete, or run another program.
@@ -646,19 +968,48 @@ const FIND_WRITING_ACTIONS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
 
+/// True when `arg` is the long option `long` (bare or `--long=…`) or a
+/// short-option cluster (`-uo`) carrying one of `shorts`.
+fn has_option(arg: &str, long: &[&str], shorts: &[char]) -> bool {
+    if let Some(name) = arg.strip_prefix("--") {
+        let name = name.split_once('=').map_or(name, |(n, _)| n);
+        return long.contains(&name);
+    }
+    arg.strip_prefix('-')
+        .is_some_and(|cluster| cluster.chars().any(|c| shorts.contains(&c)))
+}
+
+/// True when a listed program's options make it write a file or run another
+/// program: `find` with a writing action, `sort -o`/`--output` (or
+/// `--compress-program`), `tree -o`, `fd -x`/`-X`, `rg --pre`, and `uniq`
+/// with a second operand (its output file).
+fn writes_or_runs(word: &str, args: &[String]) -> bool {
+    match word {
+        "find" => args
+            .iter()
+            .any(|a| FIND_WRITING_ACTIONS.contains(&a.as_str())),
+        "sort" => args
+            .iter()
+            .any(|a| has_option(a, &["output", "compress-program"], &['o'])),
+        "tree" => args.iter().any(|a| has_option(a, &["output"], &['o'])),
+        "fd" => args
+            .iter()
+            .any(|a| has_option(a, &["exec", "exec-batch"], &['x', 'X'])),
+        "rg" => args.iter().any(|a| has_option(a, &["pre"], &[])),
+        "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() > 1,
+        _ => false,
+    }
+}
+
 /// The command word of `argv` when it is a program outside
-/// [`READ_ONLY_PROGRAMS`] (or a `find` with a writing action). `None` for an
-/// empty or assignment-only segment.
+/// [`READ_ONLY_PROGRAMS`], or a listed one whose options write or run
+/// another program ([`writes_or_runs`]). `None` for an empty or
+/// assignment-only segment.
 fn unvetted_program(argv: &[String]) -> Option<String> {
-    let word = argv
-        .iter()
-        .find(|w| !is_assignment(w))
-        .map(|w| command_word(w).into_owned())?;
-    let vetted = READ_ONLY_PROGRAMS.contains(&word.as_str())
-        && (word != "find"
-            || !argv
-                .iter()
-                .any(|a| FIND_WRITING_ACTIONS.contains(&a.as_str())));
+    let at = argv.iter().position(|w| !is_assignment(w))?;
+    let word = command_word(&argv[at]).into_owned();
+    let vetted =
+        READ_ONLY_PROGRAMS.contains(&word.as_str()) && !writes_or_runs(&word, &argv[at + 1..]);
     (!vetted).then_some(word)
 }
 
@@ -689,13 +1040,70 @@ enum BashFinding {
     /// The command names the dir and runs this program, whose writes the
     /// parser cannot see.
     Program(String),
+    /// This write target lands in the scrub-marker directory.
+    MarkerTarget(String),
     /// The command is past [`JUDGE_BUDGET`].
     TooLarge,
 }
 
-/// True when a Write-tool path lands in the directory.
-fn file_path_lands_in(path: &str, cwd: &str, dir: &RunbooksDir) -> bool {
-    PathShape(absolute(path, cwd, false)).lands_in(&dir.spellings, &Resolver::default())
+/// True when a Write-tool path lands in the directory spelled `spellings`.
+fn file_path_lands_in(path: &str, cwd: &str, spellings: &[Vec<String>]) -> bool {
+    PathShape(absolute(path, cwd, false)).lands_in(spellings, &Resolver::default())
+}
+
+/// The document a Write / Edit / MultiEdit leaves on disk, simulated
+/// strictly, with `\r\n` read as `\n` on both sides (the scrub digest is
+/// line-ending-insensitive). `None` — which the guard blocks on — when it
+/// cannot be computed:
+///
+/// - an Edit/MultiEdit of a file that cannot be read as UTF-8;
+/// - an edit whose `old_string` is empty or not found literally in the
+///   document so far — Claude Code's Edit normalizes curly quotes and may
+///   apply what this simulation cannot, so the result is unknown;
+/// - an edit, or an `edits[]` entry, without both an `old_string` and a
+///   `new_string` (an MCP `edit_file`'s `oldText`/`newText` entries);
+/// - a payload carrying neither content nor any edit (an MCP move's
+///   synthesized Write).
+///
+/// Stricter than [`HookInput::effective_content`], which skips an edit it
+/// cannot apply; that helper's other consumers keep its semantics.
+fn resulting_document(input: &HookInput) -> Option<String> {
+    let ti = input.tool_input.as_ref()?;
+    if let Some(content) = ti.content.as_deref() {
+        return Some(content.to_string());
+    }
+    let mut edits: Vec<(Option<&str>, Option<&str>, bool)> = Vec::new();
+    if ti.old_string.is_some() || ti.new_string.is_some() {
+        edits.push((
+            ti.old_string.as_deref(),
+            ti.new_string.as_deref(),
+            ti.replace_all.unwrap_or(false),
+        ));
+    }
+    for e in ti.edits.iter().flatten() {
+        edits.push((
+            e.old_string.as_deref(),
+            e.new_string.as_deref(),
+            e.replace_all.unwrap_or(false),
+        ));
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let path = ti.file_path.as_deref().or(ti.path.as_deref())?;
+    let mut doc = std::fs::read_to_string(path).ok()?.replace("\r\n", "\n");
+    for (old, new, all) in edits {
+        let (old, new) = (old?.replace("\r\n", "\n"), new?.replace("\r\n", "\n"));
+        if old.is_empty() || !doc.contains(&old) {
+            return None;
+        }
+        doc = if all {
+            doc.replace(&old, &new)
+        } else {
+            doc.replacen(&old, &new, 1)
+        };
+    }
+    Some(doc)
 }
 
 fn echo(text: &str) -> String {
@@ -733,6 +1141,17 @@ fn write_block(path: &str, why: &str) -> String {
     )
 }
 
+fn marker_block(target: &str) -> String {
+    format!(
+        "🚫 BLOCKED: guard-runbook-scrub: this writes into the scrub-marker directory. \
+         Scrub markers are recorded only by `cadence-hooks cadence record-scrub`, never \
+         written directly.\n   \
+         Found:  {}\n   \
+         {FIX_AND_ESCAPE}",
+        echo(target)
+    )
+}
+
 fn bash_block(target: &str) -> String {
     format!(
         "🚫 BLOCKED: guard-runbook-scrub: this command writes into the runbooks directory \
@@ -756,28 +1175,43 @@ impl Check for RunbookScrubGuard {
         let dir = std::env::var(DIR_ENV).ok();
         let escape = std::env::var(ESCAPE_ENV).ok();
         let home = cadence_hooks_core::paths::user_home().map(|h| h.to_string_lossy().into_owned());
+        let marker_dir = markers::polish_dir().to_string_lossy().into_owned();
         self.run_with(
             input,
-            dir.as_deref(),
-            escape.as_deref(),
-            home.as_deref(),
+            Env {
+                dir: dir.as_deref(),
+                escape: escape.as_deref(),
+                home: home.as_deref(),
+                marker_dir: Some(&marker_dir),
+            },
             &markers::scrub_marker_present,
         )
     }
+}
+
+/// Every environment input [`RunbookScrubGuard::run_with`] reads.
+#[derive(Clone, Copy, Default)]
+struct Env<'a> {
+    /// `$CADENCE_RUNBOOKS_DIR`.
+    dir: Option<&'a str>,
+    /// `$CADENCE_ALLOW_UNSCRUBBED_RUNBOOK`.
+    escape: Option<&'a str>,
+    home: Option<&'a str>,
+    /// The scrub-marker directory ([`markers::polish_dir`]).
+    marker_dir: Option<&'a str>,
 }
 
 impl RunbookScrubGuard {
     /// [`Check::run`] with every environment input passed in, so tests need no
     /// env mutation and an ambient escape cannot turn a block-expecting
     /// assertion into a false pass (cadence-hooks#486).
-    fn run_with(
-        &self,
-        input: &HookInput,
-        dir: Option<&str>,
-        escape: Option<&str>,
-        home: Option<&str>,
-        marked: &dyn Fn(&str) -> bool,
-    ) -> CheckResult {
+    fn run_with(&self, input: &HookInput, env: Env, marked: &dyn Fn(&str) -> bool) -> CheckResult {
+        let Env {
+            dir,
+            escape,
+            home,
+            marker_dir,
+        } = env;
         let cwd = input
             .cwd
             .clone()
@@ -791,28 +1225,25 @@ impl RunbookScrubGuard {
         let Some(dir) = RunbooksDir::resolve(dir, home, &cwd) else {
             return CheckResult::allow();
         };
+        // The marker directory, as spellings (lexical and physical).
+        let marker_spellings = marker_dir
+            .and_then(|m| RunbooksDir::resolve(Some(m), home, &cwd))
+            .map(|m| m.spellings);
 
         let message = match input.normalized_tool_name().unwrap_or("") {
             "Write" | "Edit" | "MultiEdit" => {
-                let destination = input
-                    .tool_input
-                    .as_ref()
-                    .and_then(|ti| ti.destination.as_deref())
-                    .filter(|d| file_path_lands_in(d, &cwd, &dir));
-                if let Some(destination) = destination {
-                    Some(write_block(
-                        destination,
-                        "this moves or copies a file into the runbooks directory, whose \
-                         content cannot be matched to a scrub marker.",
-                    ))
+                let Some(path) = input.file_path() else {
+                    return CheckResult::allow();
+                };
+                if marker_spellings
+                    .as_deref()
+                    .is_some_and(|m| file_path_lands_in(&path, &cwd, m))
+                {
+                    Some(marker_block(&path))
+                } else if !file_path_lands_in(&path, &cwd, &dir.spellings) {
+                    return CheckResult::allow();
                 } else {
-                    let Some(path) = input.file_path() else {
-                        return CheckResult::allow();
-                    };
-                    if !file_path_lands_in(&path, &cwd, &dir) {
-                        return CheckResult::allow();
-                    }
-                    match input.effective_content() {
+                    match resulting_document(input) {
                         Some(content) if marked(&markers::scrub_digest(content.as_bytes())) => {
                             return CheckResult::allow();
                         }
@@ -821,12 +1252,14 @@ impl RunbookScrubGuard {
                             "this write lands in the runbooks directory, and the resulting \
                              content has no scrub marker.",
                         )),
-                        // Fail closed: an Edit of a file this hook cannot read
-                        // has a resulting document nobody can vouch for.
+                        // Fail closed: a resulting document this hook cannot
+                        // compute is one nobody can vouch for.
                         None => Some(write_block(
                             &path,
                             "this edit lands in the runbooks directory, and its resulting \
-                             content cannot be computed to check for a scrub marker.",
+                             content cannot be computed to check for a scrub marker (an \
+                             unreadable file, an old_string not found literally, or an edit \
+                             without an old_string/new_string pair).",
                         )),
                     }
                 }
@@ -835,8 +1268,9 @@ impl RunbookScrubGuard {
                 let Some(command) = input.command() else {
                     return CheckResult::allow();
                 };
-                bash_write_into(command, &cwd, &dir).map(|finding| match finding {
+                bash_write_into(command, &cwd, &dir, marker_spellings.as_deref()).map(|finding| match finding {
                     BashFinding::Target(target) => bash_block(&target),
+                    BashFinding::MarkerTarget(target) => marker_block(&target),
                     BashFinding::Program(program) => format!(
                         "🚫 BLOCKED: guard-runbook-scrub: this command names the runbooks \
                          directory ($CADENCE_RUNBOOKS_DIR) and runs `{}`, whose writes cannot \
@@ -893,7 +1327,16 @@ mod tests {
         let scratch_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/guard-runbook-scrub-scratch");
         let scratch = Scratch::new(&scratch_root, tag);
-        let path = scratch.path().canonicalize().unwrap();
+        // Canonical, minus Windows' verbatim `\\?\` prefix: the rows paste
+        // these paths into strings, as a harness would send them.
+        let canonical = scratch.path().canonicalize().unwrap();
+        let path = PathBuf::from(
+            canonical
+                .to_string_lossy()
+                .strip_prefix(r"\\?\")
+                .map(str::to_string)
+                .unwrap_or_else(|| canonical.to_string_lossy().into_owned()),
+        );
         let runbooks = path.join("vault/Runbooks");
         std::fs::create_dir_all(&runbooks).unwrap();
         std::fs::create_dir_all(path.join("work")).unwrap();
@@ -914,13 +1357,31 @@ mod tests {
 
     /// Run with the dir set, no escape, and a marker set of `marks`.
     fn run(input: &HookInput, dir: Option<&str>, marks: &[&str]) -> CheckResult {
+        run_env(
+            input,
+            Env {
+                dir,
+                home: Some("/home/op"),
+                ..Env::default()
+            },
+            marks,
+        )
+    }
+
+    fn run_env(input: &HookInput, env: Env, marks: &[&str]) -> CheckResult {
         let digests: Vec<String> = marks
             .iter()
             .map(|m| markers::scrub_digest(m.as_bytes()))
             .collect();
-        RunbookScrubGuard.run_with(input, dir, None, Some("/home/op"), &|d| {
-            digests.iter().any(|x| x == d)
-        })
+        RunbookScrubGuard.run_with(input, env, &|d| digests.iter().any(|x| x == d))
+    }
+
+    fn env<'a>(dir: &'a str, escape: Option<&'a str>) -> Env<'a> {
+        Env {
+            dir: Some(dir),
+            escape,
+            ..Env::default()
+        }
     }
 
     fn outcome(input: &HookInput, dir: Option<&str>, marks: &[&str]) -> Outcome {
@@ -934,8 +1395,10 @@ mod tests {
         let bash = make_bash_with_cwd(&format!("echo x > {}/a.md", f.runbooks), &f.work);
         for dir in [None, Some(""), Some("   ")] {
             assert_eq!(outcome(&write, dir, &[]), Outcome::Allow, "{dir:?}");
+            #[cfg(unix)]
             assert_eq!(outcome(&bash, dir, &[]), Outcome::Allow, "{dir:?}");
         }
+        let _ = bash;
     }
 
     #[test]
@@ -1048,6 +1511,8 @@ mod tests {
         assert_eq!(outcome(&missing, Some(&f.runbooks), &["b"]), Outcome::Block);
     }
 
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
     #[test]
     fn bash_rows() {
         let f = fixture("bash-rows");
@@ -1130,12 +1595,31 @@ mod tests {
                 format!("find {rb} -name '*.md' -exec sh -c 'x' \\;"),
                 Outcome::Block,
             ),
+            // Listed readers whose options write or run a program.
+            (format!("sort -o {rb}/a.md {rb}/b.md"), Outcome::Block),
+            (format!("sort -uo {rb}/a.md {rb}/b.md"), Outcome::Block),
+            (format!("sort --output={rb}/a.md x"), Outcome::Block),
+            (
+                format!("sort --compress-program=sh {rb}/b.md"),
+                Outcome::Block,
+            ),
+            (format!("uniq {rb}/b.md {rb}/a.md"), Outcome::Block),
+            (format!("tree -o {rb}/a.md {rb}"), Outcome::Block),
+            (format!("fd -e md . {rb} -x rm"), Outcome::Block),
+            (format!("fd . {rb} --exec-batch rm"), Outcome::Block),
+            (format!("rg --pre=./x term {rb}"), Outcome::Block),
+            (format!("rg --pre ./x term {rb}"), Outcome::Block),
             // Naming the dir to read it stays allowed.
             (format!("cat {rb}/a.md"), Outcome::Allow),
             (format!("grep -rn term {rb} | head -20"), Outcome::Allow),
             (format!("ls -la {rb} 2>/dev/null"), Outcome::Allow),
             (format!("find {rb} -name '*.md' | wc -l"), Outcome::Allow),
             (format!("R={rb}; cat \"$R\"/a.md"), Outcome::Allow),
+            (format!("rg -n term {rb}"), Outcome::Allow),
+            (format!("fd -e md . {rb}"), Outcome::Allow),
+            (format!("tree -L 2 {rb}"), Outcome::Allow),
+            (format!("sort -u {rb}/a.md | uniq -c"), Outcome::Allow),
+            (format!("uniq -c {rb}/a.md"), Outcome::Allow),
             // Outside the dir: unaffected.
             (format!("echo x > {}/a.md", f.work), Outcome::Allow),
             ("echo x > draft.md".to_string(), Outcome::Allow),
@@ -1161,6 +1645,8 @@ mod tests {
         }
     }
 
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
     #[test]
     fn a_relative_bash_write_from_inside_the_directory_blocks() {
         let f = fixture("a-relative-bash-write-from-inside-the-di");
@@ -1168,6 +1654,8 @@ mod tests {
         assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
     }
 
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
     #[test]
     fn a_bash_write_blocks_even_when_the_content_is_marked() {
         let f = fixture("a-bash-write-blocks-even-when-the-conten");
@@ -1178,6 +1666,8 @@ mod tests {
         );
     }
 
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
     #[test]
     fn tilde_and_home_spellings_expand() {
         // The dir configured with `~`, and targets spelled through `~`/$HOME.
@@ -1215,6 +1705,8 @@ mod tests {
         );
     }
 
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
     #[test]
     fn a_flood_past_the_judge_budget_is_refused_not_waved_through() {
         let f = fixture("judge-budget");
@@ -1230,7 +1722,8 @@ mod tests {
             bash_write_into(
                 &flood,
                 &f.work,
-                &RunbooksDir::resolve(Some(&f.runbooks), None, "/").unwrap()
+                &RunbooksDir::resolve(Some(&f.runbooks), None, "/").unwrap(),
+                None,
             ),
             Some(BashFinding::TooLarge)
         );
@@ -1250,10 +1743,17 @@ mod tests {
     #[test]
     fn block_message_names_both_scrub_commands_and_the_escape() {
         let f = fixture("block-message-names-both-scrub-commands-");
-        for input in [
-            with_cwd(make_write(&format!("{}/a.md", f.runbooks), "b"), &f.work),
-            make_bash_with_cwd(&format!("cp x {}/", f.runbooks), &f.work),
-        ] {
+        let mut inputs = vec![with_cwd(
+            make_write(&format!("{}/a.md", f.runbooks), "b"),
+            &f.work,
+        )];
+        if cfg!(unix) {
+            inputs.push(make_bash_with_cwd(
+                &format!("cp x {}/", f.runbooks),
+                &f.work,
+            ));
+        }
+        for input in inputs {
             let msg = run(&input, Some(&f.runbooks), &[]).message.unwrap();
             assert!(msg.contains("scrub.py --apply"), "{msg}");
             assert!(msg.contains("check mode"), "{msg}");
@@ -1275,43 +1775,477 @@ mod tests {
             false
         };
         let inside = with_cwd(make_write(&format!("{}/a.md", f.runbooks), "b"), &f.work);
-        let result =
-            RunbookScrubGuard.run_with(&inside, Some(&f.runbooks), Some("1"), None, &marked);
+        let result = RunbookScrubGuard.run_with(&inside, env(&f.runbooks, Some("1")), &marked);
         assert_eq!(result.outcome, Outcome::Allow);
         let bypass = result.bypass.expect("escape records provenance");
         assert_eq!(bypass.mechanism, ESCAPE_ENV);
 
-        let bash = make_bash_with_cwd(&format!("cp x {}/", f.runbooks), &f.work);
-        let result =
-            RunbookScrubGuard.run_with(&bash, Some(&f.runbooks), Some("yes"), None, &marked);
-        assert_eq!(result.outcome, Outcome::Allow);
-        assert!(result.bypass.is_some());
+        #[cfg(unix)]
+        {
+            let bash = make_bash_with_cwd(&format!("cp x {}/", f.runbooks), &f.work);
+            let result = RunbookScrubGuard.run_with(&bash, env(&f.runbooks, Some("yes")), &marked);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.bypass.is_some());
+        }
 
         // Outside the dir: a plain allow, no bypass row.
         let outside = with_cwd(make_write(&format!("{}/a.md", f.work), "b"), &f.work);
-        let result =
-            RunbookScrubGuard.run_with(&outside, Some(&f.runbooks), Some("1"), None, &marked);
+        let result = RunbookScrubGuard.run_with(&outside, env(&f.runbooks, Some("1")), &marked);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.bypass.is_none());
 
         // A falsy escape does nothing.
-        let result =
-            RunbookScrubGuard.run_with(&inside, Some(&f.runbooks), Some("0"), None, &marked);
+        let result = RunbookScrubGuard.run_with(&inside, env(&f.runbooks, Some("0")), &marked);
         assert_eq!(result.outcome, Outcome::Block);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_loop_terminates_and_falls_back_to_the_lexical_reading() {
         let f = fixture("a-symlink-loop-does-not-hang-or-allow");
-        #[cfg(unix)]
-        {
-            let a = format!("{}/loop-a", f.work);
-            let b = format!("{}/loop-b", f.work);
-            std::os::unix::fs::symlink(&b, &a).unwrap();
-            std::os::unix::fs::symlink(&a, &b).unwrap();
-            assert!(physical(Path::new(&format!("{a}/x"))).is_none());
-            let input = with_cwd(make_write(&format!("{a}/x.md"), "b"), &f.work);
-            assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Allow);
+        let a = format!("{}/loop-a", f.work);
+        let b = format!("{}/loop-b", f.work);
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(physical(Path::new(&format!("{a}/x"))).is_none());
+        let input = with_cwd(make_write(&format!("{a}/x.md"), "b"), &f.work);
+        assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Allow);
+    }
+
+    #[test]
+    fn an_edit_that_cannot_be_simulated_literally_blocks_even_on_a_marked_file() {
+        let f = fixture("an-edit-that-cannot-be-simulated-literal");
+        let rb = f.runbooks.as_str();
+        let path = format!("{rb}/quoted.md");
+        let on_disk = "alpha \u{201c}q\u{201d} omega\n";
+        std::fs::write(&path, on_disk).unwrap();
+        // The on-disk document is marked, so a no-op simulation would allow.
+        // (edit, marks, expected)
+        let rows: Vec<(HookInput, Vec<&str>, Outcome)> = vec![
+            // Straight quotes: Claude Code's Edit normalizes and applies it;
+            // a literal simulation cannot, so the result is unknown.
+            (
+                make_edit(&path, "\"q\"", "LEAK"),
+                vec![on_disk],
+                Outcome::Block,
+            ),
+            // One MultiEdit entry missing is enough.
+            (
+                make_multi_edit(&path, &[("alpha", "a"), ("\"q\"", "LEAK")]),
+                vec![on_disk, "a \u{201c}q\u{201d} omega\n"],
+                Outcome::Block,
+            ),
+            // An empty old_string on an existing file.
+            (make_edit(&path, "", "LEAK"), vec![on_disk], Outcome::Block),
+            // A literal match still simulates and is judged on its result.
+            (
+                make_edit(&path, "alpha", "a"),
+                vec!["a \u{201c}q\u{201d} omega\n"],
+                Outcome::Allow,
+            ),
+            (
+                make_edit(&path, "alpha", "a"),
+                vec![on_disk],
+                Outcome::Block,
+            ),
+        ];
+        for (input, marks, want) in rows {
+            let input = with_cwd(input, &f.work);
+            assert_eq!(
+                outcome(&input, Some(rb), &marks),
+                want,
+                "{:?}",
+                input.tool_input
+            );
         }
+    }
+
+    #[test]
+    fn an_mcp_edit_without_an_old_new_pair_blocks() {
+        let f = fixture("an-mcp-edit-without-an-old-new-pair-bloc");
+        let path = format!("{}/doc.md", f.runbooks);
+        std::fs::write(&path, "alpha\n").unwrap();
+        let payload = |edits: serde_json::Value| {
+            let raw = serde_json::json!({
+                "tool_name": "mcp__filesystem__edit_file",
+                "tool_input": {"path": path, "edits": edits},
+                "cwd": f.work,
+            });
+            HookInput::from_json(&raw.to_string()).unwrap()
+        };
+        let rows = [
+            // The MCP shape: `oldText`/`newText`, which no field reads.
+            (
+                serde_json::json!([{"oldText": "alpha", "newText": "LEAK"}]),
+                Outcome::Block,
+            ),
+            // Half a pair.
+            (serde_json::json!([{"old_string": "alpha"}]), Outcome::Block),
+            (serde_json::json!([]), Outcome::Block),
+            // A readable pair is simulated as usual.
+            (
+                serde_json::json!([{"old_string": "alpha", "new_string": "a"}]),
+                Outcome::Allow,
+            ),
+        ];
+        for (edits, want) in rows {
+            let input = payload(edits.clone());
+            assert_eq!(input.normalized_tool_name(), Some("Edit"));
+            // The on-disk document is marked, and so is the one good result.
+            assert_eq!(
+                outcome(&input, Some(&f.runbooks), &["alpha\n", "a\n"]),
+                want,
+                "{edits}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_endings_do_not_change_the_verdict() {
+        let f = fixture("line-endings-do-not-change-the-verdict");
+        let rb = f.runbooks.as_str();
+        // A draft recorded with LF endings, written with CRLF, and the reverse.
+        let crlf = with_cwd(make_write(&format!("{rb}/a.md"), "a\r\nb\r\n"), &f.work);
+        assert_eq!(outcome(&crlf, Some(rb), &["a\nb\n"]), Outcome::Allow);
+        let lf = with_cwd(make_write(&format!("{rb}/a.md"), "a\nb\n"), &f.work);
+        assert_eq!(outcome(&lf, Some(rb), &["a\r\nb\r\n"]), Outcome::Allow);
+        // An LF old_string edits a CRLF file, as Claude Code's Edit does.
+        let path = format!("{rb}/crlf.md");
+        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let edit = with_cwd(make_edit(&path, "one\ntwo", "1\n2"), &f.work);
+        assert_eq!(outcome(&edit, Some(rb), &["1\n2\n"]), Outcome::Allow);
+        assert_eq!(outcome(&edit, Some(rb), &["one\ntwo\n"]), Outcome::Block);
+    }
+
+    #[test]
+    fn the_marker_directory_is_refused_as_a_write_target() {
+        let f = fixture("the-marker-directory-is-refused-as-a-wri");
+        let md = format!("{}/markers", f.root);
+        std::fs::create_dir_all(&md).unwrap();
+        let with_markers = |input: &HookInput, dir: Option<&str>| {
+            run_env(
+                input,
+                Env {
+                    dir,
+                    marker_dir: Some(&md),
+                    ..Env::default()
+                },
+                &[],
+            )
+        };
+        let write = with_cwd(make_write(&format!("{md}/scrub-abc"), "{}"), &f.work);
+        let result = with_markers(&write, Some(&f.runbooks));
+        assert_eq!(result.outcome, Outcome::Block);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("scrub-marker directory"), "{msg}");
+        assert!(msg.contains("cadence-hooks cadence record-scrub"), "{msg}");
+        let edit = with_cwd(make_edit(&format!("{md}/scrub-abc"), "a", "b"), &f.work);
+        assert_eq!(
+            with_markers(&edit, Some(&f.runbooks)).outcome,
+            Outcome::Block
+        );
+        // Inert with the runbooks dir unset, like the rest of the guard.
+        assert_eq!(with_markers(&write, None).outcome, Outcome::Allow);
+        // Elsewhere is unaffected.
+        let other = with_cwd(make_write(&format!("{}/a.md", f.work), "x"), &f.work);
+        assert_eq!(
+            with_markers(&other, Some(&f.runbooks)).outcome,
+            Outcome::Allow
+        );
+        #[cfg(unix)]
+        for (command, want) in [
+            (format!("touch {md}/scrub-abc"), Outcome::Block),
+            (format!("echo '{{}}' > {md}/scrub-abc"), Outcome::Block),
+            (format!("cd {md} && cp /x/y scrub-abc"), Outcome::Block),
+            (format!("cp x {md}"), Outcome::Block),
+            // `record-scrub` itself names neither directory as a target.
+            (
+                format!(
+                    "cadence-hooks cadence record-scrub --file {}/draft.md",
+                    f.work
+                ),
+                Outcome::Allow,
+            ),
+            (format!("ls {md}"), Outcome::Allow),
+        ] {
+            let input = make_bash_with_cwd(&command, &f.work);
+            assert_eq!(
+                with_markers(&input, Some(&f.runbooks)).outcome,
+                want,
+                "{command}"
+            );
+        }
+    }
+
+    // Shell semantics: Bash rows paste native paths into shell text.
+    #[cfg(unix)]
+    #[test]
+    fn named_directory_spellings_rows() {
+        let f = fixture("named-directory-spellings-rows");
+        let rb = f.runbooks.as_str();
+        let root = f.root.as_str();
+        let vault = format!("{root}/vault");
+        // (command, cwd, expected); HOME is the fixture root.
+        let rows: Vec<(String, &str, Outcome)> = vec![
+            // `$HOME` / `${HOME}` / defaulted spellings of the directory.
+            (
+                "tar -xf x.tar -C \"$HOME/vault/Runbooks\"".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "tar -xf x.tar -C ${HOME}/vault/Runbooks".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "tar -xf x.tar -C ${HOME:-/x}/vault/Runbooks".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "tar -xf x.tar -C ~/vault/Runbooks/".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            // `//` and `/./` inside the spelling.
+            (
+                format!("python3 -c \"open('{root}/vault//Runbooks/a.md','w')\""),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                format!("python3 -c \"open('{root}/./vault/./Runbooks/a.md','w')\""),
+                &f.work,
+                Outcome::Block,
+            ),
+            // A short flag's attached value.
+            (format!("tar -xf x.tar -C{rb}"), &f.work, Outcome::Block),
+            (format!("unzip x.zip -d{rb}/"), &f.work, Outcome::Block),
+            // A relative name from the parent directory.
+            ("tar -xf x.tar -C Runbooks".into(), &vault, Outcome::Block),
+            ("unzip x.zip -d ./runbooks/".into(), &vault, Outcome::Block),
+            ("unzip x.zip -dRunbooks".into(), &vault, Outcome::Block),
+            (
+                "tar --directory=Runbooks/sub -xf x".into(),
+                &vault,
+                Outcome::Block,
+            ),
+            (
+                format!("cd {vault} && unzip x.zip -d Runbooks"),
+                &f.work,
+                Outcome::Block,
+            ),
+            // Running inside the directory.
+            ("python3 -c \"open('a.md','w')\"".into(), rb, Outcome::Block),
+            (format!("cd {rb}/sub && git init"), &f.work, Outcome::Block),
+            // Reading it that way stays allowed.
+            ("ls Runbooks".into(), &vault, Outcome::Allow),
+            ("cat a.md".into(), rb, Outcome::Allow),
+            // Look-alikes do not name it.
+            (
+                "tar -xf x.tar -C Runbooks-old".into(),
+                &vault,
+                Outcome::Allow,
+            ),
+            ("tar -xf x.tar -C Runbooks".into(), &f.work, Outcome::Allow),
+            (format!("tar -xf x.tar -C{rb}-old"), &f.work, Outcome::Allow),
+            (
+                format!("tar -xf x.tar -C{root}/vault/./Runbooksx"),
+                &f.work,
+                Outcome::Allow,
+            ),
+            (
+                "tar -xf x.tar -C $HOMEDIR/vault/Runbooks".into(),
+                &f.work,
+                Outcome::Allow,
+            ),
+            (
+                "git commit -m 'edit runbooks'".into(),
+                &vault,
+                Outcome::Allow,
+            ),
+        ];
+        for (command, cwd, want) in rows {
+            let input = make_bash_with_cwd(&command, cwd);
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(rb),
+                    home: Some(root),
+                    ..Env::default()
+                },
+                &[],
+            )
+            .outcome;
+            assert_eq!(got, want, "{command} (cwd {cwd})");
+        }
+    }
+
+    // `cd ~` resolves against the process's real home, so the directory is
+    // spelled under it (nothing on disk is touched).
+    #[cfg(unix)]
+    #[test]
+    fn a_cd_through_tilde_into_the_parent_names_the_directory() {
+        let Some(home) = cadence_hooks_core::paths::user_home() else {
+            return;
+        };
+        let home = home.to_string_lossy().into_owned();
+        let dir = format!("{home}/no-such-runbook-scrub-vault-7f3a/Runbooks");
+        let input = make_bash_with_cwd(
+            "cd ~/no-such-runbook-scrub-vault-7f3a && unzip x.zip -d Runbooks",
+            "/",
+        );
+        let got = run_env(
+            &input,
+            Env {
+                dir: Some(&dir),
+                home: Some(&home),
+                ..Env::default()
+            },
+            &[],
+        );
+        assert_eq!(got.outcome, Outcome::Block);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwd_and_defaulted_home_targets_rows() {
+        let f = fixture("pwd-and-defaulted-home-targets-rows");
+        let rb = f.runbooks.as_str();
+        let root = f.root.as_str();
+        let vault = format!("{root}/vault");
+        let sub = format!("{root}/vault/sub");
+        let rows: Vec<(String, &str, Outcome)> = vec![
+            ("echo x > $PWD/Runbooks/a.md".into(), &vault, Outcome::Block),
+            (
+                "echo x > \"${PWD}/Runbooks/a.md\"".into(),
+                &vault,
+                Outcome::Block,
+            ),
+            (
+                "echo x > ${PWD}/../Runbooks/a.md".into(),
+                &sub,
+                Outcome::Block,
+            ),
+            ("echo x > ~+/Runbooks/a.md".into(), &vault, Outcome::Block),
+            (
+                "cd .. && echo x > $PWD/Runbooks/a.md".into(),
+                &sub,
+                Outcome::Block,
+            ),
+            (
+                "echo x > ${HOME:-/x}/vault/Runbooks/a.md".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "echo x > ${HOME-/x}/vault/Runbooks/a.md".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            (
+                "echo x > ${HOME:=/x}/vault/Runbooks/a.md".into(),
+                &f.work,
+                Outcome::Block,
+            ),
+            // `~-` stays unknown: blocks only when the command names the dir.
+            (
+                format!("cd {rb} && cd /x && echo x > ~-/a.md"),
+                &f.work,
+                Outcome::Block,
+            ),
+            ("echo x > ~-/a.md".into(), &f.work, Outcome::Allow),
+            // `$PWD` elsewhere.
+            ("echo x > $PWD/a.md".into(), &f.work, Outcome::Allow),
+            ("echo x > ~+/a.md".into(), &f.work, Outcome::Allow),
+            (
+                "echo x > $PWDX/Runbooks/a.md".into(),
+                &vault,
+                Outcome::Allow,
+            ),
+        ];
+        for (command, cwd, want) in rows {
+            let input = make_bash_with_cwd(&command, cwd);
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(rb),
+                    home: Some(root),
+                    ..Env::default()
+                },
+                &[],
+            )
+            .outcome;
+            assert_eq!(got, want, "{command} (cwd {cwd})");
+        }
+    }
+
+    #[test]
+    fn substitute_var_expands_set_forms_only() {
+        for (text, want) in [
+            ("$HOME/x", "/h/x"),
+            ("${HOME}/x", "/h/x"),
+            ("${HOME:-/d}/x", "/h/x"),
+            ("${HOME-/d}/x", "/h/x"),
+            ("${HOME:=/d}/x", "/h/x"),
+            ("${HOME=/d}/x", "/h/x"),
+            ("${HOME:-${X}}/x", "/h/x"),
+            ("${HOME:+/d}/x", "${HOME:+/d}/x"),
+            ("$HOMEDIR/x", "$HOMEDIR/x"),
+            ("${HOMEDIR}/x", "${HOMEDIR}/x"),
+            ("${HOME:-unclosed", "${HOME:-unclosed"),
+            ("a$ b$", "a$ b$"),
+        ] {
+            assert_eq!(substitute_var(text, "HOME", "/h"), want, "{text}");
+        }
+        // A flood of unclosed defaults stays linear.
+        let flood = "${HOME:-".repeat(25_000);
+        let started = std::time::Instant::now();
+        assert_eq!(substitute_var(&flood, "HOME", "/h"), flood);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn word_initial_tildes_expand() {
+        for (text, want) in [
+            ("~/v", "/h/v"),
+            ("cd ~ && x", "cd /h && x"),
+            ("-C ~/v", "-C /h/v"),
+            ("a=~/v", "a=/h/v"),
+            ("'~/v'", "'/h/v'"),
+            ("x~/v", "x~/v"),
+            ("~user/v", "~user/v"),
+            ("~+/v", "~+/v"),
+        ] {
+            assert_eq!(expand_word_tildes(text, "/h/"), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn drive_spellings_normalize_as_a_pure_function() {
+        for (text, git_bash, want) in [
+            (r"C:\Users\op\Vault", false, Some("/c:/Users/op/Vault")),
+            ("C:/Users/op", false, Some("/c:/Users/op")),
+            (r"\\?\D:\a\b", false, Some("/d:/a/b")),
+            ("C:", false, Some("/c:")),
+            ("/c/Users/op", true, Some("/c:/Users/op")),
+            ("/c", true, Some("/c:")),
+            ("/c/Users/op", false, None),
+            ("/cd/x", true, None),
+            ("/home/op", true, None),
+            ("CC:/x", false, None),
+            ("relative/x", true, None),
+        ] {
+            assert_eq!(drive_form(text, git_bash).as_deref(), want, "{text}");
+        }
+        assert_eq!(
+            drive_mentions("/c:/users/op/runbooks"),
+            vec![
+                "c:/users/op/runbooks".to_string(),
+                "/c/users/op/runbooks".to_string()
+            ]
+        );
+        assert!(drive_mentions("/home/op").is_empty());
     }
 }

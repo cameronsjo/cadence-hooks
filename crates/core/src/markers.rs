@@ -258,9 +258,23 @@ pub fn scrub_marker(digest: &str) -> PathBuf {
 /// document under. Cryptographic on purpose (unlike [`hash_of`]): the marker
 /// grants an allow, so a second document must not be craftable to collide
 /// with a scrubbed one.
+///
+/// **Line-ending-insensitive:** every `\r\n` is hashed as `\n` (a lone `\r`
+/// is kept), so a draft recorded with CRLF endings matches the same text
+/// written with LF, and the reverse. Claude Code's Write/Edit may convert line
+/// endings on the way to disk; the scrub's verdict does not depend on them.
 pub fn scrub_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+    let mut hasher = Sha256::new();
+    let mut start = 0;
+    for (at, pair) in bytes.windows(2).enumerate() {
+        if pair == b"\r\n" {
+            hasher.update(&bytes[start..at]);
+            start = at + 1;
+        }
+    }
+    hasher.update(&bytes[start..]);
+    format!("{:x}", hasher.finalize())
 }
 
 /// True when a scrub marker for `digest` exists as a regular file in a
@@ -1713,6 +1727,19 @@ pub fn write_marker(path: &Path, contents: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scrub_digest_is_line_ending_insensitive() {
+        assert_eq!(scrub_digest(b"a\r\nb\r\n"), scrub_digest(b"a\nb\n"));
+        assert_eq!(scrub_digest(b"\r\n\r\n"), scrub_digest(b"\n\n"));
+        // A lone CR is content, not a line ending.
+        assert_ne!(scrub_digest(b"a\rb"), scrub_digest(b"ab"));
+        assert_ne!(scrub_digest(b"a\rb"), scrub_digest(b"a\nb"));
+        assert_eq!(
+            scrub_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     use super::*;
     // The one shared marker-dir env helper (and its one lock) for the whole
     // workspace — never mint a module-local sibling (#446).
