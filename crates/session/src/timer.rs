@@ -144,7 +144,9 @@ pub fn apply(
         TimerAction::Stop => {
             // Claim the timer by renaming it away first: of two concurrent
             // stops exactly one rename succeeds, so exactly one logs a row.
-            let claim = path.with_file_name(format!(".{label}.stop.{}", std::process::id()));
+            // `~` is outside the label charset, so no valid label can name
+            // (and so collide with) a claim file.
+            let claim = path.with_file_name(format!("{label}~stop.{}", std::process::id()));
             if std::fs::rename(&path, &claim).is_err() {
                 return not_running(label);
             }

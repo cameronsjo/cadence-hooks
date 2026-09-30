@@ -104,9 +104,30 @@ fn stamp_path(state_dir: &Path, session_id: &str) -> std::path::PathBuf {
     state_dir.join(format!("{session_id}.{STAMP_SUFFIX}"))
 }
 
+/// Longest stamp read: a `u64` in ASCII is at most 20 digits.
+const MAX_STAMP_BYTES: u64 = 64;
+
 /// Read a stamp: Unix seconds as ASCII. Anything else reads as absent.
+///
+/// This runs on every PostToolUse while the hook is enabled, so it must never
+/// block: the open is `O_NONBLOCK | O_NOFOLLOW` on Unix (a FIFO or symlink
+/// planted at the path cannot stall or redirect it), the handle must be a
+/// regular file, and the read is capped at [`MAX_STAMP_BYTES`].
 fn read_stamp(path: &Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut raw = String::new();
+    file.take(MAX_STAMP_BYTES).read_to_string(&mut raw).ok()?;
     raw.trim().parse::<u64>().ok()
 }
 
@@ -393,6 +414,73 @@ mod tests {
         // Then a real six-hour idle stretch still fires.
         let line = observe_prompt(&state, "sid", 22 * H, 4 * H).unwrap();
         assert!(line.starts_with("6 hours later…"), "{line}");
+    }
+
+    /// A FIFO at either stamp path must neither hang nor count (Gate 2 M1).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_stamp_reads_as_absent_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().to_path_buf();
+        for path in [activity_path(&state, "sid"), stamp_path(&state, "sid")] {
+            let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = state.clone();
+        std::thread::spawn(move || {
+            let wrote = record_tool_activity(&dir, "sid", 10 * H);
+            let line = observe_prompt(&dir, "sid", 20 * H, 4 * H);
+            let _ = tx.send((wrote, line));
+        });
+        let (wrote, line) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO stamp hung");
+        assert!(
+            wrote,
+            "a FIFO stamp should read as absent, so the refresh is due"
+        );
+        assert!(line.is_none(), "{line:?}");
+    }
+
+    #[test]
+    fn an_oversized_stamp_reads_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = stamp_path(tmp.path(), "sid");
+        std::fs::write(&path, format!("{}{}", " ".repeat(100), 5)).unwrap();
+        assert_eq!(read_stamp(&path), None);
+        std::fs::write(&path, "  123\n").unwrap();
+        assert_eq!(read_stamp(&path), Some(123));
+    }
+
+    /// The activity stamp must stay reachable from the PostToolUse entry point
+    /// that carries the heartbeat (`persist-plan-approval`). If that entry
+    /// point moves or splits (cameronsjo/cadence-hooks#1259), move
+    /// `note_tool_activity` with it, or long autonomous turns read as idle.
+    #[test]
+    fn persist_plan_approval_refreshes_the_activity_stamp() {
+        use cadence_hooks_core::Check;
+        let tmp = tempfile::tempdir().unwrap();
+        let metrics = tmp.path().join("metrics");
+        crate::registry::test_metrics_env::with_env_vars(
+            &[
+                (ENABLE_VAR, Some("1")),
+                ("CADENCE_METRICS_DIR", Some(metrics.to_str().unwrap())),
+            ],
+            || {
+                let mut input =
+                    cadence_hooks_core::test_builders::make_bash_post_tool_use("ls", "");
+                input.session_id = Some("afk-ppa-sid".into());
+                input.cwd = Some(tmp.path().to_str().unwrap().into());
+                crate::persist_plan::PersistPlanApproval.run(&input);
+                let stamp = activity_path(&metrics.join("state"), "afk-ppa-sid");
+                assert!(
+                    read_stamp(&stamp).is_some(),
+                    "no activity stamp at {stamp:?}"
+                );
+            },
+        );
     }
 
     #[test]

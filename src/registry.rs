@@ -927,8 +927,8 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Mark a long idle gap (\"6 hours later…\") on the next prompt; opt-in via CADENCE_AFK_GAP=1, threshold CADENCE_AFK_GAP_MINUTES (default 240) (UserPromptSubmit)",
         namespace: "session",
         events: &[HookEvent::UserPromptSubmit],
-        // Remote: writes only its own per-session stamp under the metrics state dir; a lost stamp (fresh VM) is silent.
-        remote: RemotePolicy::Run,
+        // Remote: its tool-activity stamp is written by persist-plan-approval, which self-disables in the cloud; running without it would read a long autonomous turn as idle.
+        remote: RemotePolicy::SelfDisable,
         suppressible: false,
     },
 ];
@@ -1436,6 +1436,7 @@ mod tests {
         "backstop-record",
         "backstop-warn",
         "persist-plan-approval",
+        "nudge-afk-gap",
     ];
 
     #[test]

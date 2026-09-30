@@ -93,6 +93,37 @@ fn every_hook_behaves_as_its_remote_policy_declares() {
     );
 }
 
+/// `nudge-afk-gap` must stay silent in the cloud even when enabled and fed a
+/// payload that would fire locally: its tool-activity stamp comes from
+/// `persist-plan-approval`, which self-disables there (cadence-hooks#480).
+#[test]
+fn afk_gap_self_disables_in_the_cloud_even_when_enabled() {
+    let metrics = tempfile::tempdir().unwrap();
+    let state = metrics.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("afk-cloud-sid.afk-gap"), "1").unwrap();
+    let payload =
+        r#"{"session_id":"afk-cloud-sid","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+    let dir = metrics.path().to_str().unwrap();
+    for (remote, fires) in [(true, false), (false, true)] {
+        std::fs::write(state.join("afk-cloud-sid.afk-gap"), "1").unwrap();
+        let out = run(
+            "session",
+            "nudge-afk-gap",
+            payload,
+            remote,
+            &[("CADENCE_AFK_GAP", "1"), ("CADENCE_METRICS_DIR", dir)],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "remote={remote}");
+        assert_eq!(
+            stdout.contains("later…"),
+            fires,
+            "remote={remote}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn policy_is_inert_outside_a_cloud_session() {
     // Same payload, remote unset: a self-disabled hook (enforce-worktree) runs.
