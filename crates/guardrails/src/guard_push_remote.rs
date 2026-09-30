@@ -3121,4 +3121,41 @@ mod tests {
             }
         });
     }
+
+    /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
+    /// own exec argument is judged where it runs. `submodule foreach` and
+    /// `filter-branch` run it where this guard cannot follow, so they refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_nested_in_a_git_exec_argument_is_judged() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let other = checkout_with_origin("https://github.com/evil/y.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                (
+                    "git rebase -x 'cd {other} && git push origin main' HEAD~1",
+                    Block,
+                ),
+                ("git rebase --exec='git -C {other} push' HEAD~1", Block),
+                (
+                    "git -C {other} rebase -x 'git push origin main' HEAD~1",
+                    Block,
+                ),
+                ("git bisect run git -C {other} push origin main", Block),
+                ("git submodule foreach 'git push origin main'", Block),
+                ("git filter-branch --env-filter 'git push' HEAD", Block),
+                ("git rebase -x \"$CMD\" HEAD~1 # push", Block),
+                ("git rebase -x 'git push origin main' HEAD~1", Allow),
+                ("git bisect run git push origin main", Allow),
+                ("git rebase -x 'make test' HEAD~1", Allow),
+            ] {
+                let command = command.replace("{other}", &other);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
 }

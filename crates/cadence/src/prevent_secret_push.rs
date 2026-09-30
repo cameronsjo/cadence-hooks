@@ -2123,6 +2123,39 @@ mod tests {
         assert_blocks(&fx.run("echo $(git push origin main)"), &["s.txt"]);
     }
 
+    /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
+    /// own exec argument publishes the same commits, so it is scanned — or,
+    /// where git runs it somewhere this guard cannot follow, refused.
+    #[test]
+    fn a_push_nested_in_a_git_exec_argument_is_scanned() {
+        let fx = Fx::new("gitexec");
+        fx.commit("s.txt", &format!("{}\n", aws_key()), "s");
+        for command in [
+            "git rebase -x 'git push origin main' HEAD~1",
+            "git rebase --exec='git push origin main' HEAD~1",
+            "git rebase -ix'git push origin main' HEAD~1",
+            "git bisect run git push origin main",
+            "git bisect run sh -c 'git push origin main'",
+        ] {
+            assert_blocks(&fx.run(command), &["s.txt"]);
+        }
+        for command in [
+            "git submodule foreach 'git push origin main'",
+            "git filter-branch --env-filter 'git push origin main' HEAD",
+            "git rebase -x \"$CMD\" HEAD~1",
+        ] {
+            assert_blocks(&fx.run(command), &["could not resolve"]);
+        }
+        // Nothing nested pushes: nothing to scan.
+        for command in [
+            "git rebase -x 'make test' HEAD~1",
+            "git bisect run make test",
+            "git submodule foreach 'git pull origin $branch'",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+    }
+
     #[test]
     fn in_repo_fixture_paths_are_exempt_from_the_content_scan() {
         // A repo whose checkout path carries a `cadence-hooks` component, like

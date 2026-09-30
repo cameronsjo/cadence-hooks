@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Every push guard now sees a `git push` that another git command runs through its own exec argument.** `core` re-reads as commands the value of `git rebase -x`/`--exec` (any abbreviation or short cluster git accepts, repeatable), the tail of `git bisect run`, the command of `git submodule foreach`, and each `git filter-branch` `--setup`/`--*-filter` value, so `prevent-secret-push`, `guard-push-remote`, `warn-stacked-base-delete` and `nudge-upgrade-after-push` judge the nested push, and every other guard sees the nested command. A push run in each submodule or under `filter-branch`'s exported `GIT_DIR`, or under an exported `--git-dir`/`-c` global, reads as one whose repository cannot be known; a command whose name is an expansion (`-x "$CMD"`), more than 16 exec scripts, or nesting past the wrapper depth reads as a push that cannot be resolved, so fail-closed guards refuse it (cameronsjo/cadence-hooks#1226).
+
 ## [0.119.0] - 2026-09-30
 
 ### Added

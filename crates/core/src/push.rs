@@ -34,10 +34,11 @@
 use std::borrow::Cow;
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, apply_cd_target, child_scripts,
-    command_word, executable_tokens_marked, git_command_line_aliases, git_output_detailed,
-    installs_trap_action, is_assignment_word, peel_command_runners, resolve_cd_target,
-    runs_in_found_directories, split_segments_with_ops, strip_group_wrappers, unescape_word,
+    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, apply_cd_target,
+    child_scripts_but_git_exec, command_word, executable_tokens_marked, git_command_line_aliases,
+    git_exec, git_output_detailed, installs_trap_action, is_assignment_word, peel_command_runners,
+    resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories,
+    split_segments_with_ops, strip_group_wrappers, unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -913,7 +914,7 @@ fn collect_push_invocations(
                     || runs_in_found_directories(argv),
                 directory: segment_directory,
             };
-            for child in child_scripts(argv, segment) {
+            for child in child_scripts_but_git_exec(argv, segment) {
                 collect_push_invocations(
                     &child,
                     &segment_dir,
@@ -924,6 +925,22 @@ fn collect_push_invocations(
                     out,
                 );
             }
+        }
+        if let Some(exec) = git_exec(argv) {
+            collect_git_exec_pushes(
+                argv,
+                &exec,
+                &segment_dir,
+                depth,
+                Doubt {
+                    repository: segment_unresolved,
+                    directory: segment_directory,
+                },
+                known_ok,
+                walk,
+                writes,
+                out,
+            );
         }
 
         match directory_verb(&tokens, known_ok) {
@@ -990,25 +1007,109 @@ fn collect_push_invocations(
             }
             out.push(invocation);
         } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &segment_dir) {
-            out.push(PushInvocation {
-                work_dir: segment_dir.to_string(),
-                refspecs: Vec::new(),
-                all_or_mirror: false,
-                tags: false,
-                dry_run: false,
-                mirror: false,
-                follow_tags: None,
-                recurse_submodules: None,
-                unresolved: true,
-                repository_unresolved: true,
-                directory_unverified: segment_directory,
-                config_destinations: Vec::new(),
-                destination_unreadable: false,
-                config_remotes: Vec::new(),
-                repository: None,
-                via_alias: false,
-            });
+            out.push(unresolvable_push(&segment_dir, segment_directory));
         }
+    }
+}
+
+/// A push this walk knows may run but cannot place or describe: every
+/// which-repository doubt set, so a fail-closed caller refuses it.
+fn unresolvable_push(work_dir: &str, directory_unverified: bool) -> PushInvocation {
+    PushInvocation {
+        work_dir: work_dir.to_string(),
+        refspecs: Vec::new(),
+        all_or_mirror: false,
+        tags: false,
+        dry_run: false,
+        mirror: false,
+        follow_tags: None,
+        recurse_submodules: None,
+        unresolved: true,
+        repository_unresolved: true,
+        directory_unverified,
+        config_destinations: Vec::new(),
+        destination_unreadable: false,
+        config_remotes: Vec::new(),
+        repository: None,
+        via_alias: false,
+    }
+}
+
+/// More exec scripts than this on one git invocation are read as one push
+/// that cannot be resolved rather than walked: the count is the command's to
+/// choose, and each costs a walk (and, for a bare push, a config probe).
+const MAX_GIT_EXEC_SCRIPTS: usize = 16;
+
+/// Walk the commands one git invocation runs through an exec argument of its
+/// own — `rebase -x`, `bisect run`, `submodule foreach`, `filter-branch
+/// --*-filter` ([`git_exec`]) — as the child scripts they are
+/// (cameronsjo/cadence-hooks#1226). Before this, `git rebase -x 'git push
+/// origin main' HEAD~1` pushed while every push guard saw only a rebase.
+///
+/// **Where they run.** git runs a rebase or bisect command at the root of the
+/// repository `-C` names (measured under git 2.43: the working-tree root, with
+/// no `GIT_DIR` exported), so the walk starts it in the `-C` directory — the
+/// same repository, which is what a push's remotes and history are read from.
+/// It cannot vouch for the rest, and marks them as a which-repository doubt:
+///
+/// - `submodule foreach` runs in each submodule, `filter-branch` with
+///   `GIT_DIR` exported ([`GitExec::elsewhere`]);
+/// - a `--git-dir`/`--work-tree` global is exported to the command;
+/// - a `-c`/`--config-env` global is exported too (`GIT_CONFIG_PARAMETERS`,
+///   measured), reaching the nested push's remote and ref config where no
+///   reading of the nested text sees it.
+///
+/// **What cannot be read is a push that cannot be resolved**, never an absent
+/// one: a command whose name is an expansion (`-x "$CMD"`), more scripts than
+/// [`MAX_GIT_EXEC_SCRIPTS`], or nesting past [`MAX_WRAPPER_DEPTH`] — so a
+/// `git rebase -x "git rebase -x …"` flood stops at the bound and refuses.
+#[allow(clippy::too_many_arguments)]
+fn collect_git_exec_pushes(
+    argv: &[String],
+    exec: &GitExec,
+    segment_dir: &str,
+    depth: usize,
+    inherited: Doubt,
+    known_ok: bool,
+    walk: Walk<'_>,
+    writes: &mut Vec<ConfigRedirect>,
+    out: &mut Vec<PushInvocation>,
+) {
+    let (work_dir, exported, unreadable_dir) = match argv.split_first() {
+        Some((first, operands)) if command_word(first) == "git" => {
+            let globals = git_globals(operands, segment_dir, known_ok);
+            let written = &operands[..operands.len() - globals.rest.len()];
+            let exports_config = written.iter().any(|word| {
+                let word = unescape_word(word);
+                word == "-c" || word.starts_with("--config-env")
+            });
+            (
+                globals.work_dir,
+                globals.foreign_redirect || exports_config,
+                globals.unreadable_dir,
+            )
+        }
+        _ => (segment_dir.to_string(), false, false),
+    };
+    let doubt = Doubt {
+        repository: inherited.repository || exec.elsewhere || exported,
+        directory: inherited.directory || unreadable_dir,
+    };
+    if depth >= MAX_WRAPPER_DEPTH
+        || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS
+        || exec
+            .scripts
+            .iter()
+            .any(|script| runs_an_unreadable_command(script))
+    {
+        out.push(unresolvable_push(&work_dir, doubt.directory));
+    }
+    if depth >= MAX_WRAPPER_DEPTH || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS {
+        return;
+    }
+    for script in &exec.scripts {
+        eprintln!("DBG depth={depth} script={script}");
+        collect_push_invocations(script, &work_dir, depth + 1, doubt, walk, writes, out);
     }
 }
 
@@ -3433,6 +3534,207 @@ mod tests {
         }
         // The ref-only cause still reaches `unresolved`.
         assert!(push_locations("git -c push.default=matching push origin", "/repo")[0].unresolved);
+    }
+
+    /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
+    /// own exec argument is a push. Each row: the command, then per push found
+    /// `(work_dir, repository_unresolved, unresolved, repository)`.
+    #[test]
+    fn pushes_nested_in_a_git_exec_argument_are_seen() {
+        type Want = (&'static str, bool, bool, Option<&'static str>);
+        let resolved = |dir| (dir, false, false, Some("origin"));
+        let elsewhere = |dir| (dir, true, true, Some("origin"));
+        let refused = |dir| (dir, true, true, None);
+        let cases: Vec<(&str, Vec<Want>)> = vec![
+            // rebase: every spelling git's option parser takes.
+            (
+                "git rebase -x 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase --exec 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase --exec='git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase --exe='git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase --ex 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase -ix'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase -ix 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase HEAD~1 -x 'git push origin main'",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase -x 'make test' --exec 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase -x 'git push origin main' -x 'git push origin main' HEAD~1",
+                vec![resolved("/repo"), resolved("/repo")],
+            ),
+            (
+                "git rebase -x 'cd /other && git push origin main' HEAD~1",
+                vec![resolved("/other")],
+            ),
+            (
+                "git rebase -x 'sh -c \"git push origin main\"' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git -C /other rebase -x 'git push origin main' HEAD~1",
+                vec![resolved("/other")],
+            ),
+            (
+                "sudo git rebase -x 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git-rebase -x 'git push origin main' HEAD~1",
+                vec![resolved("/repo")],
+            ),
+            // A global the command exports to the nested push.
+            (
+                "git --git-dir=/x/.git rebase -x 'git push origin main' HEAD~1",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git -c remote.origin.url=https://x/y rebase -x 'git push origin main' HEAD~1",
+                vec![elsewhere("/repo")],
+            ),
+            // bisect run: the words, quoted as git hands them to its shell.
+            (
+                "git bisect run git push origin main",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git bisect run sh -c 'git push origin main'",
+                vec![resolved("/repo")],
+            ),
+            // Older gits joined the words unquoted; that reading is kept too.
+            (
+                "git bisect run 'git push origin main'",
+                vec![resolved("/repo")],
+            ),
+            // submodule foreach and filter-branch run somewhere else.
+            (
+                "git submodule foreach 'git push origin main'",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git submodule --quiet foreach --recursive git push origin main",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git filter-branch --env-filter 'git push origin main' HEAD",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git filter-branch -f -d /tmp/t --msg-filter 'git push origin main' HEAD",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git filter-branch --tree-filter true --commit-filter 'git push origin main' HEAD",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git filter-branch --setup 'git push origin main' HEAD",
+                vec![elsewhere("/repo")],
+            ),
+            // A command no reading can name: a push that cannot be resolved.
+            ("git rebase -x \"$CMD\" HEAD~1", vec![refused("/repo")]),
+            ("git rebase -x '$(cat cmd)' HEAD~1", vec![refused("/repo")]),
+            ("git bisect run \"$RUNNER\"", vec![refused("/repo")]),
+            ("git submodule foreach '`cat cmd`'", vec![refused("/repo")]),
+            // Past the script cap: one refusal, nothing walked.
+            (
+                "git rebase -x a -x a -x a -x a -x a -x a -x a -x a -x a -x a -x a -x a -x a \
+                 -x a -x a -x a -x a HEAD~1",
+                vec![refused("/repo")],
+            ),
+            // Controls: nested commands that are not pushes.
+            ("git rebase -x 'make test' HEAD~1", vec![]),
+            ("git rebase -x 'git status' HEAD~1", vec![]),
+            ("git rebase --onto main HEAD~1", vec![]),
+            ("git rebase -- -x", vec![]),
+            ("git bisect start HEAD HEAD~1", vec![]),
+            ("git bisect run make test", vec![]),
+            ("git submodule foreach 'git pull origin $branch'", vec![]),
+            ("git submodule update --init", vec![]),
+            (
+                "git filter-branch --subdirectory-filter 'git push' HEAD",
+                vec![],
+            ),
+            (
+                "git filter-branch --index-filter 'git rm --cached x' HEAD",
+                vec![],
+            ),
+            ("git log -x 'git push origin main'", vec![]),
+            ("echo git rebase -x", vec![]),
+        ];
+        for (command, want) in cases {
+            let found: Vec<Want> = push_locations(command, "/repo")
+                .iter()
+                .map(|push| {
+                    let dir: &'static str = Box::leak(push.work_dir.clone().into_boxed_str());
+                    let repository: Option<&'static str> = push
+                        .repository
+                        .clone()
+                        .map(|repository| &*Box::leak(repository.into_boxed_str()));
+                    (dir, push.repository_unresolved, push.unresolved, repository)
+                })
+                .collect();
+            assert_eq!(found, want, "{command}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1226: the nesting is bounded. A git exec
+    /// argument past [`MAX_WRAPPER_DEPTH`] is a refusal, never a miss, and a
+    /// 200 KB flood of it stays linear.
+    #[test]
+    fn nested_git_exec_is_bounded_and_refused_past_the_bound() {
+        let within = "git rebase -x \"git rebase -x 'git push origin main' HEAD~1\" HEAD~1";
+        let found = push_locations(within, "/repo");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].unresolved, "{found:?}");
+
+        // `bisect run` re-quotes its words, so the nesting needs no escapes.
+        let at = |levels: usize| "git bisect run ".repeat(levels) + "git push origin main";
+        let found = push_locations(&at(MAX_WRAPPER_DEPTH), "/repo");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].unresolved, "{found:?}");
+        let found = push_locations(&at(MAX_WRAPPER_DEPTH + 1), "/repo");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].repository_unresolved, "{found:?}");
+
+        for flood in [
+            "git rebase -x \"".repeat(10_000) + "git push origin main",
+            "git rebase -x a ".repeat(12_500),
+            "git submodule foreach 'git rebase -x ".repeat(6_000),
+        ] {
+            let started = std::time::Instant::now();
+            let found = push_locations(&flood, "/repo");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "took {:?}",
+                started.elapsed()
+            );
+            assert!(found.len() <= 16, "{}", found.len());
+        }
     }
 
     #[test]

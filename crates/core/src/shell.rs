@@ -8774,9 +8774,23 @@ fn is_only_an_expanded_substitution(script: &str) -> bool {
 /// `segment` yields the same scripts as `argv`; otherwise every script is
 /// kept.
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
-    let mut out = wrapped_scripts(argv);
+    child_scripts_reading(argv, segment, true)
+}
+
+/// [`child_scripts`] without the scripts a git subcommand runs through its own
+/// exec argument ([`git_exec`]), for a walker that recurses those itself with
+/// the directory git runs them in.
+pub fn child_scripts_but_git_exec(argv: &[String], segment: &str) -> Vec<String> {
+    child_scripts_reading(argv, segment, false)
+}
+
+fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> Vec<String> {
+    let mut out = wrapped_scripts_reading(argv, git_exec_too);
     if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
-        let marked = wrapped_scripts(&executable_tokens(&mark_expanded_substitutions(segment)));
+        let marked = wrapped_scripts_reading(
+            &executable_tokens(&mark_expanded_substitutions(segment)),
+            git_exec_too,
+        );
         let aligned = marked.len() == out.len()
             && marked
                 .iter()
@@ -11746,12 +11760,255 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
 pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
+    wrapped_scripts_reading(tokens, true)
+}
+
+/// [`wrapped_scripts`], leaving out the scripts a git subcommand runs through
+/// its own exec argument ([`git_exec`]) when `git_exec_too` is false — for a
+/// walker that recurses those itself, with the directory and doubt git gives
+/// them.
+fn wrapped_scripts_reading(tokens: &[String], git_exec_too: bool) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
         Some(first) if command_word(first) == "find" => find_exec_scripts(&argv[1..]),
+        Some(first) if command_word(first).starts_with("git") => {
+            let mut out: Vec<String> = shell_c_argument_tokens(tokens).into_iter().collect();
+            if git_exec_too && let Some(exec) = git_exec(argv) {
+                out.extend(exec.scripts);
+            }
+            out
+        }
         _ => shell_c_argument_tokens(tokens).into_iter().collect(),
     }
+}
+
+/// The commands one git invocation runs through an exec argument of its own
+/// (cameronsjo/cadence-hooks#1226), each as a script.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitExec {
+    /// Each command git runs, as a script, in command-line order.
+    pub scripts: Vec<String>,
+    /// git runs them somewhere other than the invocation's own repository
+    /// root: `submodule foreach` in each submodule, `filter-branch` with
+    /// `GIT_DIR`/`GIT_WORK_TREE` exported over a scratch tree. A walker that
+    /// tracks a directory cannot vouch for where they run.
+    pub elsewhere: bool,
+}
+
+/// `filter-branch` options whose value it `eval`s (git 2.43's
+/// `git-filter-branch`); `--commit-filter` runs under `sh -c`.
+const FILTER_BRANCH_SCRIPTS: &[&str] = &[
+    "--setup",
+    "--env-filter",
+    "--tree-filter",
+    "--index-filter",
+    "--parent-filter",
+    "--msg-filter",
+    "--commit-filter",
+    "--tag-name-filter",
+];
+
+/// The commands a git subcommand runs through its own argument
+/// (cameronsjo/cadence-hooks#1226), read from a token view whose command word
+/// is `git` (or a dashed `git-rebase`, …). `None` when it runs none. Each
+/// shape measured under git 2.43 with canary commands:
+///
+/// - `rebase -x CMD` / `--exec CMD` / `--exec=CMD`, repeatable, anywhere
+///   before `--`: git's option parser also takes an unambiguous abbreviation
+///   (`--ex`, `--exe=`) and a short cluster (`-ixCMD`, `-ix CMD`), so every
+///   long word `exec` starts with and every cluster holding `x` is read. CMD
+///   runs under a shell at the repository root.
+/// - `bisect run CMD ARG…`: git quotes each word and hands the result to a
+///   shell, so the words come back quoted ([`quoted_script`]). Older gits
+///   joined them unquoted, so that reading is surfaced too when it differs.
+/// - `submodule [--quiet] foreach [--recursive] CMD`: a single CMD runs under
+///   a shell, several words are exec'd as they are — in each submodule.
+/// - `filter-branch --{setup,env,tree,index,parent,msg,commit,tag-name}-filter
+///   CMD`: `eval`'d with `GIT_DIR` exported. Every other option takes one
+///   value word, except the four flags the script names.
+///
+/// Surfacing only ever adds a script to inspect: a misread option (a rebase
+/// `--onto -x`) costs a false block on a command git refuses, never a miss.
+pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
+    let argv = peel_command_runners(strip_compound_heads(tokens));
+    let verb = command_word(argv.first()?);
+    let rest = match verb.strip_prefix("git-") {
+        Some(_) => &argv[..],
+        // A global the grammar does not know stops the skip; the first word
+        // naming one of these subcommands is read instead, which can only add
+        // a script to inspect.
+        None if verb == "git" => skip_runner_flags("git", &argv[1..]).or_else(|| {
+            let at = argv[1..].iter().position(|word| {
+                matches!(
+                    unescape_word(word).as_ref(),
+                    "rebase" | "bisect" | "submodule" | "filter-branch"
+                )
+            })?;
+            Some(&argv[1 + at..])
+        })?,
+        None => return None,
+    };
+    let (subcommand, args) = rest.split_first()?;
+    let subcommand = if verb == "git" {
+        unescape_word(subcommand).into_owned()
+    } else {
+        verb.trim_start_matches("git-").to_string()
+    };
+    let exec = match subcommand.as_str() {
+        "rebase" => GitExec {
+            scripts: rebase_exec_scripts(args),
+            elsewhere: false,
+        },
+        "bisect" => GitExec {
+            scripts: bisect_run_scripts(args),
+            elsewhere: false,
+        },
+        "submodule" => GitExec {
+            scripts: submodule_foreach_script(args).into_iter().collect(),
+            elsewhere: true,
+        },
+        "filter-branch" => GitExec {
+            scripts: filter_branch_scripts(args),
+            elsewhere: true,
+        },
+        _ => return None,
+    };
+    (!exec.scripts.is_empty()).then_some(exec)
+}
+
+/// Every `-x`/`--exec` value of a `git rebase`, before `--`. See [`git_exec`].
+fn rebase_exec_scripts(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(raw) = args.get(i) {
+        i += 1;
+        let word = unescape_word(raw);
+        if word == "--" {
+            break;
+        }
+        let value = if let Some(long) = word.strip_prefix("--") {
+            let (name, glued) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if name.is_empty() || !"exec".starts_with(name) {
+                continue;
+            }
+            match glued {
+                Some(value) => Some(value.to_string()),
+                None => args.get(i).map(|value| {
+                    i += 1;
+                    unescape_word(value).into_owned()
+                }),
+            }
+        } else if let Some(cluster) = word.strip_prefix('-') {
+            let Some(at) = cluster.find('x') else {
+                continue;
+            };
+            let glued = &cluster[at + 1..];
+            if glued.is_empty() {
+                args.get(i).map(|value| {
+                    i += 1;
+                    unescape_word(value).into_owned()
+                })
+            } else {
+                Some(glued.to_string())
+            }
+        } else {
+            continue;
+        };
+        out.extend(value.filter(|script| !script.trim().is_empty()));
+    }
+    out
+}
+
+/// The command a `git bisect run CMD ARG…` runs. See [`git_exec`].
+fn bisect_run_scripts(args: &[String]) -> Vec<String> {
+    let Some((verb, command)) = args.split_first() else {
+        return Vec::new();
+    };
+    if unescape_word(verb).as_ref() != "run" {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = quoted_script(command).into_iter().collect();
+    if let Some(joined) = joined_script(command)
+        && !out.contains(&joined)
+    {
+        out.push(joined);
+    }
+    out
+}
+
+/// The command a `git submodule … foreach … CMD` runs. See [`git_exec`].
+fn submodule_foreach_script(args: &[String]) -> Option<String> {
+    let at = args
+        .iter()
+        .position(|word| !unescape_word(word).starts_with('-'))?;
+    if unescape_word(&args[at]).as_ref() != "foreach" {
+        return None;
+    }
+    let mut command = &args[at + 1..];
+    while let Some((first, tail)) = command.split_first() {
+        let word = unescape_word(first);
+        if !matches!(word.as_ref(), "--recursive" | "-q" | "--quiet" | "--") {
+            break;
+        }
+        command = tail;
+        if word == "--" {
+            break;
+        }
+    }
+    match command {
+        [] => None,
+        [single] => Some(unescape_word(single).into_owned()).filter(|s| !s.trim().is_empty()),
+        words => quoted_script(words),
+    }
+}
+
+/// Every command a `git filter-branch` `eval`s. See [`git_exec`].
+fn filter_branch_scripts(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(raw) = args.get(i) {
+        i += 1;
+        let word = unescape_word(raw);
+        match word.as_ref() {
+            "--" => break,
+            "--force" | "-f" | "--remap-to-ancestor" | "--prune-empty" => continue,
+            _ if !word.starts_with('-') => break,
+            _ => {}
+        }
+        // git's own script takes no `--opt=value`; one is read anyway, as
+        // the option it spells, which only adds a script to inspect.
+        let (name, value) = match word.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (
+                word.as_ref(),
+                args.get(i).map(|value| {
+                    i += 1;
+                    unescape_word(value).into_owned()
+                }),
+            ),
+        };
+        if FILTER_BRANCH_SCRIPTS.contains(&name) {
+            out.extend(value.filter(|script| !script.trim().is_empty()));
+        }
+    }
+    out
+}
+
+/// Whether `script` runs a command whose name is an expansion — `$CMD`,
+/// `"$(cat cmd)"`, a backtick — so no reading of the text can say what runs.
+/// Asked of a script a git subcommand runs ([`git_exec`]): the push walk
+/// reads such a script as a push it cannot resolve (cameronsjo/cadence-hooks#1226).
+pub fn runs_an_unreadable_command(script: &str) -> bool {
+    split_segments(script).iter().any(|segment| {
+        let tokens = executable_tokens(segment);
+        peel_command_runners(strip_compound_heads(&tokens))
+            .first()
+            .is_some_and(|first| first.contains(['$', '`']))
+    })
 }
 
 /// `find`'s actions that run a command of their own: `-exec`/`-ok` in find's
@@ -20419,6 +20676,140 @@ mod tests {
                 segments.iter().any(|segment| segment.trim() == inner),
                 "{command:?} must surface {inner:?}, got {segments:?}"
             );
+        }
+    }
+
+    #[test]
+    fn git_exec_reads_every_command_a_git_subcommand_runs() {
+        // cameronsjo/cadence-hooks#1226. Each shape measured under git 2.43.
+        let git_exec_of = |command: &str| git_exec(&tokenize(command));
+        for (command, scripts, elsewhere) in [
+            ("git rebase -x 'cat .env' HEAD~1", vec!["cat .env"], false),
+            (
+                "git rebase --exec 'cat .env' HEAD~1",
+                vec!["cat .env"],
+                false,
+            ),
+            (
+                "git rebase --exec='cat .env' HEAD~1",
+                vec!["cat .env"],
+                false,
+            ),
+            ("git rebase --ex 'cat .env' HEAD~1", vec!["cat .env"], false),
+            (
+                "git rebase --exe=cat\\ .env HEAD~1",
+                vec!["cat .env"],
+                false,
+            ),
+            ("git rebase -ixcat\\ .env HEAD~1", vec!["cat .env"], false),
+            ("git rebase -ix 'cat .env' HEAD~1", vec!["cat .env"], false),
+            ("git rebase HEAD~1 -x a --exec b", vec!["a", "b"], false),
+            ("git -C /x -c a.b=c rebase -x a HEAD~1", vec!["a"], false),
+            ("git --no-such-global rebase -x a HEAD~1", vec!["a"], false),
+            ("git-rebase -x a HEAD~1", vec!["a"], false),
+            ("sudo git rebase -x a HEAD~1", vec!["a"], false),
+            ("git bisect run make test", vec!["make test"], false),
+            (
+                "git bisect run sh -c 'cat .env'",
+                vec!["sh -c 'cat .env'", "sh -c cat .env"],
+                false,
+            ),
+            (
+                "git bisect run 'cat .env'",
+                vec!["'cat .env'", "cat .env"],
+                false,
+            ),
+            (
+                "git submodule foreach 'cat .env; pwd'",
+                vec!["cat .env; pwd"],
+                true,
+            ),
+            (
+                "git submodule --quiet foreach --recursive cat .env",
+                vec!["cat .env"],
+                true,
+            ),
+            (
+                "git submodule foreach echo 'a; b'",
+                vec!["echo 'a; b'"],
+                true,
+            ),
+            (
+                "git filter-branch -f --env-filter a --tree-filter b --index-filter c \
+                 --parent-filter d --msg-filter e --commit-filter f --tag-name-filter g \
+                 --setup h HEAD",
+                vec!["a", "b", "c", "d", "e", "f", "g", "h"],
+                true,
+            ),
+            (
+                "git filter-branch -d /tmp/x --prune-empty --msg-filter=a HEAD",
+                vec!["a"],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                git_exec_of(command),
+                Some(GitExec {
+                    scripts: scripts.into_iter().map(String::from).collect(),
+                    elsewhere,
+                }),
+                "{command:?}"
+            );
+        }
+        // Controls: nothing runs a command.
+        for command in [
+            "git rebase HEAD~1",
+            "git rebase -- -x a",
+            "git rebase -x '' HEAD~1",
+            "git bisect start",
+            "git bisect run",
+            "git submodule update --init",
+            "git submodule foreach",
+            "git filter-branch --subdirectory-filter a HEAD",
+            "git filter-branch HEAD --env-filter a",
+            "git log -x a",
+            "git status",
+            "echo git rebase -x a",
+            "gitk -x a",
+        ] {
+            assert_eq!(git_exec_of(command), None, "{command:?}");
+        }
+        // Every guard sees the nested command, and the one inside that.
+        for (command, inner) in [
+            ("git rebase -x 'cat .env' HEAD~1", "cat .env"),
+            ("git bisect run sh -c 'cat .env'", "cat .env"),
+            ("git submodule foreach 'bash -c \"cat .env\"'", "cat .env"),
+            (
+                "git filter-branch --tree-filter 'cat .env' HEAD",
+                "cat .env",
+            ),
+            (
+                "git -c alias.r='rebase -x \"cat .env\"' r HEAD~1",
+                "cat .env",
+            ),
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment.trim() == inner),
+                "{command:?} must surface {inner:?}, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runs_an_unreadable_command_names_an_expanded_command_word() {
+        for (script, want) in [
+            ("$CMD", true),
+            ("${CMD} arg", true),
+            ("$(cat cmd)", true),
+            ("`cat cmd`", true),
+            ("make test && $NEXT", true),
+            ("sudo $CMD", true),
+            ("git push origin $branch", false),
+            ("echo $name", false),
+            ("make test", false),
+        ] {
+            assert_eq!(runs_an_unreadable_command(script), want, "{script:?}");
         }
     }
 
