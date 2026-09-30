@@ -1882,6 +1882,102 @@ fn word_is_fixed(token: &MarkedToken) -> bool {
     !expands || (one_double_quoted_run && !text.contains('@'))
 }
 
+/// The top-level segments whose `gh api`/`tea api` endpoint may be exempt:
+/// those after which NO command can run (cadence-hooks#1237 review). Bash
+/// hands the endpoint on to whatever runs next — `$_`, `${!v}` with `v=_`, a
+/// `declare -n r=_` nameref, `fc`/`history` once `set -o history` is on — so
+/// the exemption is structural rather than a list of those spellings:
+///
+/// - after the api call's own pipeline (its `| jq …` consumers, scanned as
+///   usual), only closing words may follow — `done`, `fi`, `esac`, `}`, each
+///   with nothing after it but a redirection — or pipeline consumers of such a
+///   closer;
+/// - inside a loop, the loop must be a `for NAME` loop (a `while`/`until`
+///   condition runs after the body, and so does a `for ((…))` step) whose body
+///   is that pipeline alone: the api segment opens with the body's `do`, the
+///   segment right before it is the `for NAME …` header, and no other loop is
+///   open around it — an outer body could run a reader on its next pass;
+/// - no `trap` anywhere, and no `&` after the call;
+/// - the segment's text appears exactly once, since the caller matches by
+///   text.
+///
+/// Anything else returns nothing, and the endpoint is scanned like any operand.
+fn api_exempt_segments(command: &str) -> Vec<String> {
+    static TRAP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\btrap\b").expect("trap"));
+    if TRAP.is_match(command) {
+        return Vec::new();
+    }
+    let segments = split_segments_with_ops(command);
+    let words: Vec<Vec<String>> = segments.iter().map(|(s, _)| tokenize(s)).collect();
+    let is_closer = |i: usize| {
+        let text = segments[i].0.trim_start_matches(is_bash_blank);
+        ["done", "fi", "esac", "}"].iter().any(|closer| {
+            text.strip_prefix(closer).is_some_and(|rest| {
+                let rest = rest.trim_start_matches(is_bash_blank);
+                rest.is_empty()
+                    || rest
+                        .trim_start_matches(|c: char| c.is_ascii_digit())
+                        .starts_with(['<', '>'])
+            })
+        })
+    };
+    let piped_into = |i: usize| i > 0 && segments[i - 1].1 == Some("|");
+    let leads: Vec<usize> = segments
+        .iter()
+        .zip(&words)
+        .map(|((segment, _), words)| unquoted_leading_keywords(segment, words))
+        .collect();
+    let dos: Vec<usize> = words
+        .iter()
+        .zip(&leads)
+        .map(|(words, &lead)| words[..lead].iter().filter(|w| *w == "do").count())
+        .collect();
+    let mut opened_before = 0;
+    let mut out: Vec<String> = Vec::new();
+    for (i, (segment, _)) in segments.iter().enumerate() {
+        let lead = leads[i];
+        let own_do = dos[i];
+        let before = opened_before;
+        opened_before += own_do;
+        if words[i].first().is_some_and(|w| w == "done") && is_closer(i) {
+            opened_before = opened_before.saturating_sub(1);
+        }
+        let argv = &words[i][lead..];
+        let is_api = argv
+            .first()
+            .is_some_and(|head| head == "gh" || head == "tea")
+            && argv.get(1).is_some_and(|sub| sub == "api");
+        if !is_api {
+            continue;
+        }
+        // Nothing but consumers and closers after it, and no background `&`.
+        let tail_ok = (i + 1..segments.len()).all(|j| piped_into(j) || is_closer(j))
+            && segments[i..].iter().all(|(_, op)| *op != Some("&"));
+        // No loop opened before this segment; at most its own `do`, of a
+        // `for NAME` loop.
+        let loop_ok = match own_do {
+            0 => before == 0,
+            1 => {
+                before == 0
+                    && lead == 1
+                    && i > 0
+                    && words[i - 1][leads[i - 1]..]
+                        .first()
+                        .is_some_and(|w| w == "for")
+                    && words[i - 1][leads[i - 1]..]
+                        .get(1)
+                        .is_some_and(|name| !name.starts_with('('))
+            }
+            _ => false,
+        };
+        if tail_ok && loop_ok {
+            out.push(segment.clone());
+        }
+    }
+    out.retain(|text| segments.iter().filter(|(s, _)| s == text).count() == 1);
+    out
+}
+
 /// Could this command make the words `gh` or `tea` run something other than
 /// the API client? Refuses the endpoint exemption on any function definition
 /// (`gh() { cat "$2"; }`), `alias`, `function`, `eval`, `source` or `.`,
@@ -5529,11 +5625,23 @@ fn bash_leaks_secrets_within(
                 && !api_client_may_be_rebound(command),
         };
         let segments = command_segments(command);
+        let api_exempt = if context.api_endpoint_trusted {
+            api_exempt_segments(command)
+        } else {
+            Vec::new()
+        };
         let mut budget = RescanBudget::new(deadline);
         for segment in &segments {
             if budget.out_of_time() {
                 break;
             }
+            // The api endpoint exemption holds only for a segment after which
+            // nothing runs, matched by text once (#1237 review).
+            let context = ScanContext {
+                api_endpoint_trusted: api_exempt.contains(segment)
+                    && segments.iter().filter(|s| *s == segment).count() == 1,
+                ..context
+            };
             // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
             // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
             // proven pure-loader `.envrc`; any other dangerous operand in the
@@ -12307,6 +12415,15 @@ mod api_endpoint_tests {
             "gh api \"repos/o/r/contents/.env?ref=$SHA\"",
             "if true; then gh api .env; fi",
             "x=1; gh api .env | jq .",
+            // Nothing runs after the call but its consumers and closers.
+            "gh api .env | jq .",
+            "gh api .env 2>/dev/null | jq -r . >> /tmp/x.tsv",
+            "v=_; gh api .env | cat \"${!v}\"",
+            "for p in 1 2; do gh api .env | jq .; done | sort",
+            "for p in 1; do gh api .env; done > /tmp/out",
+            "v=_; for a in 1 2; do cat x; done; for p in 1; do gh api .env; done",
+            "if true; then for p in 1; do gh api .env; done; fi",
+            "tea api --login sjo '/repos/search?limit=50&page=1' 2>&1 | jq -r '.x' > /tmp/x.tsv; for p in 2 3 4; do tea api --login sjo \"/repos/search?limit=50&page=$p\" 2>/dev/null | jq -r '.x' >> /tmp/x.tsv; done",
         ] {
             assert_eq!(verdict(command).outcome, Outcome::Allow, "{command}");
         }
@@ -12386,6 +12503,34 @@ mod api_endpoint_tests {
             "gh api .env; mapfile -t a < \"$_\"; echo \"${a[@]}\"",
             "gh api .env; exec 3<$_; cat <&3",
             "trap 'cat \"$_\"' DEBUG; gh api .env; true",
+            // Indirect `$_`: any command after the call could read it.
+            "v=_; gh api .env; cat \"${!v}\"",
+            "v=_; tea api .env; cat \"${!v}\"",
+            "v=_; gh api .env && cat \"${!v}\"",
+            "for v in _; do gh api .env; cat \"${!v}\"; done",
+            "v=_; gh api .env; grep . \"${!v}\"",
+            "v=_; gh api .env; mapfile -t a < \"${!v}\"; echo \"${a[@]}\"",
+            "declare -n r=_; gh api .env; cat \"$r\"",
+            "typeset -n r=_; gh api .env; cat \"$r\"",
+            "local -n r=_; gh api .env; cat \"$r\"",
+            "readonly -n r=_; gh api .env; cat \"$r\"",
+            "declare -n r=_; gh api .env; while read l; do echo \"$l\"; done < \"$r\"",
+            "v=_; for p in 1; do gh api .env; done > /tmp/o; cat \"${!v}\"",
+            // A loop re-runs what precedes or guards the call.
+            "v=_; for p in 1 2; do cat \"${!v}\"; gh api .env; done",
+            "v=_; for a in 1 2; do for p in 1; do gh api .env; done; cat \"${!v}\"; done",
+            "v=_; while cat \"${!v}\"; do gh api .env; done",
+            "v=_; until cat \"${!v}\"; do gh api .env; done",
+            "v=_; select p in 1; do gh api .env; done",
+            "v=_; if true; then while cat \"${!v}\"; do gh api .env; done; fi",
+            "v=_; for ((i=0;i<2;i++)); do gh api .env; done",
+            "v=_; gh api .env & cat \"${!v}\"",
+            "trap 'cat \"${!v}\"' EXIT; v=_; gh api .env",
+            // History re-reads the endpoint in a later command.
+            "set -o history\ngh api .env\nfc -ln -1 | awk '{print $NF}' | xargs cat",
+            "set -o history\ngh api .env\ncat $(history 2 | head -1 | awk '{print $NF}')",
+            "set -H -o history\ngh api .env\ncat !$",
+            "gh api .env; gh api .env",
             "for p in 1; do gh api \"/r?p=$p\" --input .env; done",
         ] {
             assert_eq!(verdict(command).outcome, Outcome::Block, "{command}");
