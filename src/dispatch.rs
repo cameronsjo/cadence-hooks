@@ -1241,6 +1241,46 @@ mod tests {
     }
 
     #[test]
+    fn output_rewrite_rides_group_and_aggregate_and_matches_standalone() {
+        let out = serde_json::json!({
+            "stdout": "masked", "stderr": "", "interrupted": false, "isImage": false,
+        });
+        let rewrite = || CheckResult::rewrite_output(out.clone());
+        // Standalone and a one-member group render the same envelope.
+        let alone = cadence_hooks_core::render_result(&rewrite(), HookEvent::PostToolUse).0;
+        let group = merge_group_output(HookEvent::PostToolUse, &[rewrite()], &[]);
+        assert_eq!(group.code, 0);
+        assert_eq!(group.stdout, alone);
+        let v = parse_stdout(&group);
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        // Alongside a nudge, both ride one envelope.
+        let v = parse_stdout(&merge_group_output(
+            HookEvent::PostToolUse,
+            &[CheckResult::nudge("note"), rewrite()],
+            &[],
+        ));
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "note");
+        // A block wins and exit 2 carries no stdout.
+        let blocked = merge_group_output(
+            HookEvent::PostToolUse,
+            &[CheckResult::block("no"), rewrite()],
+            &[],
+        );
+        assert_eq!(blocked.stdout, None);
+        // The per-target aggregate keeps the rewrite when Allow wins, drops it otherwise.
+        let kept = aggregate_results(vec![rewrite()]).expect("aggregate");
+        assert_eq!(kept.result.updated_tool_output, Some(out.clone()));
+        let lost = aggregate_results(vec![rewrite(), CheckResult::nudge("n")]).expect("aggregate");
+        assert_eq!(lost.result.updated_tool_output, None);
+        // A plain allow still renders nothing.
+        let plain =
+            cadence_hooks_core::render_result(&CheckResult::allow(), HookEvent::PostToolUse);
+        assert_eq!(plain, (None, None));
+    }
+
+    #[test]
     fn group_ask_carries_nudges_alongside() {
         let results = [CheckResult::nudge("context"), CheckResult::ask("confirm?")];
         let v = parse_stdout(&merge_group_output(HookEvent::PreToolUse, &results, &[]));
