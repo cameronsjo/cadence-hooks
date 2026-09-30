@@ -3170,9 +3170,57 @@ mod tests {
                 ("git re\\base --exe \"$CMD\" HEAD~1", Block),
                 ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
                 ("git ls-remote --exec=\"$C\" .", Block),
-                ("GIT_EDITOR=\"$E\" git commit", Allow),
+                ("GIT_EDITOR=\"$E\" git commit", Block),
+                ("GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("GIT_EDITOR=\"$EDITOR\" git status", Allow),
+                ("GIT_EDITOR=\"${EDITOR:-vim}\" git commit", Allow),
+                (
+                    "GIT_EDITOR=\"${EDITOR:-git push origin main}\" git commit",
+                    Block,
+                ),
+                ("source ./e.sh; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                ("GIT_EDITOR='git -C {other} push' git checkout -p", Block),
+                ("GIT_EDITOR='git -C {other} push' git stash push -p", Block),
+                ("GIT_EDITOR='git -C {other} push' git config edit", Block),
+                ("GIT_EDITOR='git -C {other} push' git ci", Block),
+                ("GIT_EDITOR='git -C {other} push' git log", Allow),
                 ("E=x; GIT_EDITOR=\"$E\" git commit", Block),
                 ("EDITOR=\"$HOME/bin/vim\" git commit", Allow),
+                // Review 4: only a plain inherited `$NAME` is the session's
+                // editor; anything the command can set or cannot read is not.
+                (
+                    "GIT_EDITOR='$(echo git push origin main)' git commit",
+                    Block,
+                ),
+                ("GIT_EDITOR=\"`cat f`\" git commit", Block),
+                (
+                    "set -- 'git push origin main'; GIT_EDITOR=\"$1\" git commit",
+                    Block,
+                ),
+                (
+                    "for E in 'git push origin main'; do GIT_EDITOR=\"$E\" git commit; done",
+                    Block,
+                ),
+                (
+                    "E=\"$E;git push origin main\"; GIT_EDITOR=\"$E\" git commit",
+                    Block,
+                ),
+                (
+                    "printf -v E 'git push origin main'; GIT_EDITOR=\"$E\" git commit",
+                    Block,
+                ),
+                (
+                    "GIT_EDITOR=\"${E:-git push origin main}\" git commit",
+                    Block,
+                ),
+                (
+                    "EDITOR=\"$EDITOR\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Allow,
+                ),
+                (
+                    "git submodule foreach 'shift; eval \"$@\" #' x 'git push origin main'",
+                    Block,
+                ),
                 ("git -c core.editor=\"$EDITOR\" commit", Allow),
                 ("EDITOR=$VISUAL git status", Allow),
                 (

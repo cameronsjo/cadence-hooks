@@ -2148,10 +2148,19 @@ mod tests {
             "git -c alias.q=push rebase -x 'git q origin main' HEAD~1",
             "git -c alias.q=push bisect run git q origin main",
             "git submodule foreach 'eval \"$@\" #' 'git push origin main'",
-            "git submodule foreach 'git \"$@\" #' push origin main",
+            // Review 4: a `shift` the substitution cannot follow, and an
+            // editor that is a command substitution.
+            "git submodule foreach 'shift; eval \"$@\" #' x 'git push origin main'",
+            "GIT_EDITOR='$(echo git push origin main)' git commit",
         ] {
             assert_blocks(&fx.run(command), &["could not resolve"]);
         }
+        // Its raw text names the subcommand through `$@`, which the block
+        // says in its own words.
+        assert_blocks(
+            &fx.run("git submodule foreach 'git \"$@\" #' push origin main"),
+            &["cannot resolve"],
+        );
         // Nothing nested pushes: nothing to scan.
         for command in [
             "git rebase -x 'make test' HEAD~1",

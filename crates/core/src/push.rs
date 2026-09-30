@@ -1127,26 +1127,72 @@ fn nested_git_runs_an_alias(script: &str, aliases: &[(String, Option<String>)]) 
 /// walk are all taken as assigned: each costs a scan of the whole command.
 const MAX_ASSIGNED_LOOKUPS: usize = 16;
 
-/// Whether `command` assigns a variable `script` expands — `NAME=…`,
-/// `export`/`readonly`/`declare`/`typeset`/`local NAME`, `read … NAME` —
-/// anywhere, nested scripts included (a text match, so it over-reads). A
-/// self-referential `NAME="$NAME…"` keeps what the session inherited and
-/// does not count.
+/// Whether `command` may set the variable `name` an editor expands, so the
+/// editor is not simply the program the session inherited. A text match
+/// that over-reads: every mention of `name` other than a plain `$NAME` or
+/// `${NAME}` expansion counts — `NAME=…`, `for NAME in`, `printf -v NAME`,
+/// `read NAME`, `export NAME`, an appending `NAME="$NAME;…"` — and so does
+/// any `${NAME` operator (`${NAME:=…}`, `${NAME:-…}`) but a one-word
+/// default (`${EDITOR:-vim}`), which can supply the value. Only an exact self-reference, `NAME="$NAME"` (or `$NAME`,
+/// `${NAME}`, quoted or not), keeps what the session inherited and does not
+/// count.
 fn assigns_a_variable(command: &str, name: &str) -> bool {
-    let name = regex::escape(name);
-    let assignment = regex::Regex::new(&format!(
-        r#"(?:^|[\s;&|(){{}}'"`])(?:(?:export|readonly|local|declare|typeset)\s+(?:-\w+\s+)*)?{name}\+?=(["']?\$\{{?{name}\b)?"#
-    ));
-    let declared = regex::Regex::new(&format!(
-        r"\b(?:export|readonly|local|declare|typeset|read)\b[^;&|\n]*\b{name}\b"
-    ));
-    let (Ok(assignment), Ok(declared)) = (assignment, declared) else {
+    let Ok(mention) = regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))) else {
         return true;
     };
-    assignment
-        .captures_iter(command)
-        .any(|found| found.get(1).is_none())
-        || declared.is_match(command)
+    // `NAME="$NAME"`, `NAME=${NAME}`, `NAME="${NAME:-vim}"`: the whole value
+    // is the inherited one (or a one-word default), and the word ends there.
+    let Ok(self_reference) = regex::Regex::new(&format!(
+        r#"^=("?)\$(?:{name}|\{{{name}(?::?-[A-Za-z0-9_./+-]+)?\}})"#,
+        name = regex::escape(name)
+    )) else {
+        return true;
+    };
+    let one_word_default = |after: &str| {
+        after
+            .strip_prefix(":-")
+            .or_else(|| after.strip_prefix('-'))
+            .and_then(|rest| rest.split_once('}'))
+            .is_some_and(|(word, _)| {
+                !word.is_empty()
+                    && word.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '+' | '-')
+                    })
+            })
+    };
+    mention.find_iter(command).any(|found| {
+        let before = &command[..found.start()];
+        let after = &command[found.end()..];
+        if before.ends_with("${") {
+            // `${NAME}`, or a default that is one plain word
+            // (`${EDITOR:-vim}`); any other operator can supply the command.
+            return !(after.starts_with('}') || one_word_default(after));
+        }
+        if before.ends_with('$') {
+            return false;
+        }
+        // `--config-env=core.editor=NAME` reads the variable, it does not
+        // set it.
+        let words: Vec<&str> = before.split_whitespace().rev().take(2).collect();
+        let reads_it = before.ends_with('=')
+            && (words
+                .first()
+                .is_some_and(|word| word.starts_with("--config-env="))
+                || words.get(1).is_some_and(|word| *word == "--config-env"));
+        if reads_it {
+            return false;
+        }
+        !self_reference.captures(after).is_some_and(|found| {
+            let quote = found.get(1).map_or("", |q| q.as_str());
+            let Some(tail) = after[found.get(0).map_or(0, |m| m.end())..].strip_prefix(quote)
+            else {
+                return false;
+            };
+            tail.chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+        })
+    })
 }
 
 /// Whether `path` is a `.git` git's discovery accepts: a directory holding
@@ -1173,6 +1219,40 @@ impl Toplevels {
         static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("pattern should compile")
         });
+        // Only a plain named expansion is the inherited program: a command
+        // substitution, a backquote, or a positional or special parameter
+        // (`$1`, `$@`, `${#…}`) is text this walk cannot read.
+        static OPAQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\$\(|`|\$\{?[^A-Za-z_{]|\$\{[^A-Za-z_]")
+                .expect("pattern should compile")
+        });
+        if OPAQUE.is_match(script) {
+            return true;
+        }
+        // Only the variables that name the session's own editor, or its
+        // home, are read as inherited; any other name is one the command, a
+        // sourced file or an earlier call may have set.
+        const INHERITED: &[&str] = &[
+            "EDITOR",
+            "VISUAL",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "HOME",
+        ];
+        if NAME
+            .captures_iter(script)
+            .any(|found| !INHERITED.contains(&&found[1]))
+        {
+            return true;
+        }
+        // A sourced file or an `eval` can set any of them unseen.
+        static RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?:^|[\s;&|(){}])(?:source|eval|\.)(?:\s|$)")
+                .expect("pattern should compile")
+        });
+        if RUNS_TEXT.is_match(command) {
+            return true;
+        }
         let mut known = self.assigned.borrow_mut();
         NAME.captures_iter(script).any(|found| {
             let name = &found[1];
@@ -1298,6 +1378,7 @@ fn collect_git_exec_pushes(
         |script: &String| !aliases.is_empty() && nested_git_runs_an_alias(script, &aliases);
     if depth >= MAX_WRAPPER_DEPTH
         || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS
+        || exec.opaque
         || exec
             .scripts
             .iter()
@@ -4132,19 +4213,30 @@ mod tests {
                 "/repo",
                 vec![elsewhere("/repo")],
             ),
-            // Review 3: an editor that is an expansion is the inherited program,
-            // unless the command assigns what it expands.
+            // Review 3/4: an editor that expands only the session's own
+            // editor variables is the inherited program, unless the command
+            // assigns one; any other name may have been set anywhere.
+            (
+                "GIT_SEQUENCE_EDITOR=\"$EDITOR\" git rebase -i HEAD~1",
+                "/repo",
+                vec![],
+            ),
             (
                 "GIT_SEQUENCE_EDITOR=\"$ED\" git rebase -i HEAD~1",
                 "/repo",
-                vec![],
+                vec![refused("/repo")],
             ),
             (
                 "ED='git push origin main'; GIT_SEQUENCE_EDITOR=\"$ED\" git rebase -i HEAD~1",
                 "/repo",
                 vec![refused("/repo")],
             ),
-            ("GIT_EDITOR=\"$E\" git commit", "/repo", vec![]),
+            (
+                "GIT_EDITOR=\"$E\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
+            ("GIT_EDITOR=\"$VISUAL\" git commit", "/repo", vec![]),
             (
                 "export E=x; GIT_EDITOR=\"$E\" git commit",
                 "/repo",
@@ -4153,17 +4245,40 @@ mod tests {
             ("EDITOR=\"$HOME/bin/vim\" git commit", "/repo", vec![]),
             ("EDITOR=\"$EDITOR\" git commit", "/repo", vec![]),
             ("EDITOR=\"${EDITOR:-vim}\" git commit", "/repo", vec![]),
-            ("EDITOR=\"$(which vim)\" git commit", "/repo", vec![]),
+            // Review 4: a command substitution is text this walk cannot
+            // read, whatever it usually prints.
+            (
+                "EDITOR=\"$(which vim)\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
             ("EDITOR=$VISUAL git status", "/repo", vec![]),
             (
                 "GIT_EDITOR='git push origin main' git status",
                 "/repo",
                 vec![],
             ),
+            // Review 4: `--config-env` names a variable other than the
+            // session's own editor ones, which may have been set anywhere.
             (
                 "git --config-env=core.editor=ED rebase -i HEAD~1",
                 "/repo",
+                vec![refused("/repo")],
+            ),
+            (
+                "git --config-env=core.editor=EDITOR rebase -i HEAD~1",
+                "/repo",
                 vec![],
+            ),
+            (
+                "GIT_EDITOR='git push origin main' git ci",
+                "/repo",
+                vec![resolved("/repo")],
+            ),
+            (
+                "GIT_EDITOR='git push origin main' git checkout -p",
+                "/repo",
+                vec![resolved("/repo")],
             ),
             ("git -c core.editor=\"$EDITOR\" commit", "/repo", vec![]),
             // Review 3 (L1): git passes over an empty `.git`, and takes a
