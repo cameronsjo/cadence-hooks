@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor` reports direction-aware drift for the deployed rule trees (cameronsjo/cadence-hooks#688).** `<config>/rules/cadence` and `<config>/rules/workbench` are compared file by file against the pinned `cadence` and `cadence-rules` plugin copies, and each differing file is classified from content alone: upstream-ahead (resync is safe), deployed-ahead (a local edit; re-add it upstream before resyncing) or diverged. Machine-local files with no upstream twin and upstream files never deployed are exempt, the check only reads, and it stays silent when the rules dir or the plugin cache is absent. `cadence-rules.md` stays with the existing single-file check.
+
 ## [0.117.0] - 2026-09-30
 
 ### Added
