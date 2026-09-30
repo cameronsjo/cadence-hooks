@@ -18,6 +18,7 @@ pub mod display;
 pub mod gh_bodies;
 pub mod gitstate;
 pub mod loop_analysis;
+pub mod nudges;
 pub mod markers;
 pub mod patch;
 pub mod pathclass;
