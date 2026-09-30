@@ -42,6 +42,7 @@ This repo's code is the guards: it decides allow and block for shell commands, p
 ## Reviewer tiers
 
 - **Every PR gets an Opus security review with adversarial rounds,** except a diff that changes only `README.md`. That includes tests, fixtures, docs, the changelog, build files, and this file. No other exemption applies, however the change is described.
+- **Guard surfaces** (graded against `origin/main` as of run start, across all of the run's PRs): everything under `crates/*/src/`, `src/`, `.github/`, `scripts/`, and `tests/fixtures/registration-audit/`, plus `deny.toml` and this file.
 - Frame the security review as "find inputs where a dangerous command slips through unseen". A parser change that sees less of an executed command is a miss, not a fail-open.
 - A guard change that touches security also gets an Opus code review. Each has caught Criticals the other missed (`CLAUDE.md`).
 - **Parser work is serial.** One PR at a time through `crates/core/src/shell.rs`, `crates/core/src/shell/**`, and `crates/core/src/push.rs`; the next starts after the previous merges or parks. Parallel parser PRs conflict and hide each other's misses.
