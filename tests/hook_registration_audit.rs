@@ -311,6 +311,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // Guard logic ships here first; its cadence-guardrails hooks.json entry
+    // (PreToolUse Write/Edit/MultiEdit + an unfiltered Bash matcher) rides the
+    // follow-up monorepo wiring PR (two-PR shape, cameronsjo/cadence-hooks#755).
+    (
+        "guardrails guard-runbook-scrub",
+        "cameronsjo/cadence-hooks#755",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

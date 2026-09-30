@@ -34,6 +34,10 @@ const RECORDING: &[(&str, &[&str])] = &[
         &["crates/guardrails/src/guard_sops_decrypt.rs"],
     ),
     (
+        "CADENCE_ALLOW_UNSCRUBBED_RUNBOOK",
+        &["crates/guardrails/src/guard_runbook_scrub.rs"],
+    ),
+    (
         "CADENCE_ALLOW_SUBAGENT_FROM_MAIN",
         &["crates/guardrails/src/warn_subagent_worktree.rs"],
     ),

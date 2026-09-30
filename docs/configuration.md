@@ -288,6 +288,8 @@ kept unprefixed because it's a cross-tool convention.
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
 | `CADENCE_ALLOW_SECRET_PUSH` | `prevent-secret-push` | Set truthy (`1`/`true`/`yes`) in the hook's environment (not inline on the command) to let a push through that the guard would block; the allow is recorded as a bypass row. **Weakens a protected guard** |
 | `CADENCE_ALLOW_SOPS_DECRYPT` | `guard-sops-decrypt` | Set truthy (`1`/`true`/`yes`) to let a decrypt through; the allow is recorded as a bypass row. **Weakens a protected guard** |
+| `CADENCE_RUNBOOKS_DIR` | `guard-runbook-scrub` | The runbooks directory the guard protects (a leading `~/` is expanded). Unset or blank leaves the guard inert |
+| `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK` | `guard-runbook-scrub` | Set truthy (`1`/`true`/`yes`) in the hook's environment (not inline on the command) to let an unscrubbed write into `CADENCE_RUNBOOKS_DIR` through; the allow is recorded as a bypass row. **Weakens a protected guard** |
 | `CADENCE_ALLOW_SENSITIVE_TERMS` | `redact-external-content`, `redact-scan` | Any value except empty or `0` downgrades the identity-tier block to a nudge. **Weakens a protected guard** |
 | `CADENCE_AUDIENCE` | `redact-external-content` | `owned-internal`, `private-external`, or `public` (unknown values mean `public`); a lower tier redacts less in the advisory tier |
 | `CADENCE_READ_MODEL_GUARD_MODELS` | `guard-read-model` | Model list that turns the opt-in guard on; empty means off |

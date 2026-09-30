@@ -125,6 +125,8 @@ pub mod guard_op_vault_scan;
 pub mod guard_push_remote;
 /// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
 pub mod guard_read_model;
+/// Block an unscrubbed write into `$CADENCE_RUNBOOKS_DIR` (content-hash scrub marker).
+pub mod guard_runbook_scrub;
 /// Block a `sops` decrypt whose plaintext would reach the transcript.
 pub mod guard_sops_decrypt;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.

@@ -242,6 +242,52 @@ fn polish_dir_from(override_dir: Option<String>, config_dir: &Path) -> (PathBuf,
     (dir, private)
 }
 
+/// The scrub marker for content with SHA-256 `digest` (cameronsjo/cadence-hooks#755),
+/// under the same private config-dir directory as the polish marker
+/// ([`polish_dir`]). `digest` is always [`scrub_digest`]'s lowercase hex, so it
+/// is safe as a filename component; the result is a direct child of the dir.
+///
+/// Keyed on content alone, deliberately: the gate's question is "was *this
+/// text* scrubbed?", and a draft scrubbed at one path and promoted to another
+/// carries the same bytes. Any change to the content is a key-miss.
+pub fn scrub_marker(digest: &str) -> PathBuf {
+    polish_dir().join(format!("scrub-{digest}"))
+}
+
+/// Lowercase-hex SHA-256 of `bytes` — the key [`scrub_marker`] files a scrubbed
+/// document under. Cryptographic on purpose (unlike [`hash_of`]): the marker
+/// grants an allow, so a second document must not be craftable to collide
+/// with a scrubbed one.
+///
+/// **Line-ending-insensitive:** every `\r\n` is hashed as `\n` (a lone `\r`
+/// is kept), so a draft recorded with CRLF endings matches the same text
+/// written with LF, and the reverse. Claude Code's Write/Edit may convert line
+/// endings on the way to disk; the scrub's verdict does not depend on them.
+pub fn scrub_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut start = 0;
+    for (at, pair) in bytes.windows(2).enumerate() {
+        if pair == b"\r\n" {
+            hasher.update(&bytes[start..at]);
+            start = at + 1;
+        }
+    }
+    hasher.update(&bytes[start..]);
+    format!("{:x}", hasher.finalize())
+}
+
+/// True when a scrub marker for `digest` exists as a regular file in a
+/// **private** marker directory. A degraded (plantable) directory or a symlink
+/// squatting the name is never evidence, so either reads as absent and the
+/// runbook gate keeps blocking.
+pub fn scrub_marker_present(digest: &str) -> bool {
+    if !polish_dir_is_private() {
+        return false;
+    }
+    std::fs::symlink_metadata(scrub_marker(digest)).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// The legacy (pre-config-dir) polish marker directory, read for one release
 /// so markers recorded before the move still count. `None` under a
 /// `CADENCE_MARKER_DIR` override (the new dir *is* the legacy dir there) and
@@ -1681,6 +1727,19 @@ pub fn write_marker(path: &Path, contents: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scrub_digest_is_line_ending_insensitive() {
+        assert_eq!(scrub_digest(b"a\r\nb\r\n"), scrub_digest(b"a\nb\n"));
+        assert_eq!(scrub_digest(b"\r\n\r\n"), scrub_digest(b"\n\n"));
+        // A lone CR is content, not a line ending.
+        assert_ne!(scrub_digest(b"a\rb"), scrub_digest(b"ab"));
+        assert_ne!(scrub_digest(b"a\rb"), scrub_digest(b"a\nb"));
+        assert_eq!(
+            scrub_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     use super::*;
     // The one shared marker-dir env helper (and its one lock) for the whole
     // workspace — never mint a module-local sibling (#446).

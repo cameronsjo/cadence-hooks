@@ -15,7 +15,8 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::shell::{
     carries_substitution, command_segments, command_word, executable_tokens, peel_command_runners,
-    redirect_targets, skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
+    redirect_operator_span, redirect_targets, skip_git_global_options, strip_group_wrappers,
+    tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -135,11 +136,14 @@ fn writer_targets(segment: &str) -> Vec<String> {
             }
             if has_target_dir {
                 targets.append(&mut operands);
-            } else if let Some(last) = operands.pop() {
-                targets.push(last);
+            } else {
+                targets.extend(last_operands(&operands));
             }
             targets
         }
+        // cameronsjo/cadence-hooks#755: the destination (last operand) plus
+        // every file or directory a flag names for rsync to write into.
+        "rsync" => rsync_write_targets(args),
         "dd" => args
             .iter()
             .filter_map(|t| t.strip_prefix("of="))
@@ -220,6 +224,142 @@ fn writer_targets(segment: &str) -> Vec<String> {
         "perl" => inplace_file_operands(argv, InplaceGrammar::Perl),
         _ => Vec::new(),
     }
+}
+
+/// rsync options whose value is a separate token; the value is never the
+/// destination operand.
+const RSYNC_VALUE_FLAGS: &[&str] = &[
+    "-e",
+    "--rsh",
+    "-f",
+    "--filter",
+    "--exclude",
+    "--include",
+    "--exclude-from",
+    "--include-from",
+    "--files-from",
+    "--rsync-path",
+    "--password-file",
+    "--out-format",
+    "--timeout",
+    "--contimeout",
+    "--bwlimit",
+    "--port",
+    "--max-size",
+    "--min-size",
+    "--max-delete",
+    "-B",
+    "--block-size",
+    "-M",
+    "--remote-option",
+    "--chmod",
+    "--chown",
+    "--usermap",
+    "--groupmap",
+    "--iconv",
+    "--checksum-choice",
+    "--cc",
+    "--compress-choice",
+    "--zc",
+    "--compress-level",
+    "--zl",
+    "--sockopts",
+    "--info",
+    "--debug",
+    "--suffix",
+    "--stop-at",
+    "--stop-after",
+    "--modify-window",
+    "--address",
+    "--protocol",
+    "--read-batch",
+    "--copy-dest",
+    "--compare-dest",
+    "--link-dest",
+];
+
+/// rsync options that name a path rsync itself writes: a log, a batch file, or
+/// a directory it stages or backs files up into.
+const RSYNC_WRITE_FLAGS: &[&str] = &[
+    "--log-file",
+    "--write-batch",
+    "--only-write-batch",
+    "--backup-dir",
+    "--partial-dir",
+    "-T",
+    "--temp-dir",
+];
+
+/// What an `rsync` invocation writes (cameronsjo/cadence-hooks#755): its last
+/// operand (the destination; a `host:path` remote one is harmless to judge by
+/// name) and the value of every flag in [`RSYNC_WRITE_FLAGS`], spelled as a
+/// separate token or `--flag=value`. An option this table does not know is
+/// read as a bare flag, so its value can only become a candidate operand —
+/// the over-inclusive direction.
+fn rsync_write_targets(args: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut operands: Vec<&String> = Vec::new();
+    let mut i = 0;
+    while let Some(t) = args.get(i) {
+        i += 1;
+        if t == "--" {
+            operands.extend(&args[i..]);
+            break;
+        }
+        if !t.starts_with('-') || t == "-" {
+            operands.push(t);
+            continue;
+        }
+        if let Some((name, value)) = t.split_once('=') {
+            if RSYNC_WRITE_FLAGS.contains(&name) {
+                targets.push(value.to_string());
+            }
+            continue;
+        }
+        if RSYNC_WRITE_FLAGS.contains(&t.as_str()) {
+            if let Some(v) = args.get(i) {
+                targets.push(v.clone());
+            }
+            i += 1;
+        } else if RSYNC_VALUE_FLAGS.contains(&t.as_str()) {
+            i += 1;
+        }
+    }
+    let operands: Vec<String> = operands.into_iter().cloned().collect();
+    targets.extend(last_operands(&operands));
+    targets
+}
+
+/// The destination candidates of a last-operand verb (`cp`, `mv`, `install`,
+/// `ln`, `rsync`): the last operand, and the last one that is not a
+/// redirection.
+///
+/// The tokens still carry the segment's redirections, so a trailing
+/// `2>/dev/null` (or a standalone `> log`) used to take the destination's
+/// place and `cp x .env 2>/dev/null` went unjudged. A redirect-shaped word is
+/// skipped (with the target word after a standalone operator) to find the real
+/// destination; the literal last word is kept as well, because quote removal
+/// makes a quoted `'>x'` file name look like a redirection and keeping both
+/// can only add a candidate (cameronsjo/cadence-hooks#755).
+fn last_operands(operands: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = operands.last().cloned().into_iter().collect();
+    let mut real: Option<&String> = None;
+    let mut i = 0;
+    while let Some(word) = operands.get(i) {
+        match redirect_operator_span(word) {
+            Some((_, whole_word)) => i += if whole_word { 2 } else { 1 },
+            None => {
+                real = Some(word);
+                i += 1;
+            }
+        }
+    }
+    if let Some(real) = real
+        && out.first() != Some(real)
+    {
+        out.push(real.clone());
+    }
+    out
 }
 
 /// Which option grammar [`inplace_file_operands`] reads.
@@ -365,6 +505,74 @@ fn substituted_texts(segment: &str) -> Vec<String> {
     }
 }
 
+/// Every file one [`command_segments`] segment writes by redirect or writer
+/// verb: the segment itself, its group-wrapper-stripped view, and the redirects
+/// a re-parsed substitution spells. The one candidate list both
+/// [`matched_secret_write_target`] and [`segment_write_targets`] judge, so the two
+/// can never disagree about what a command writes.
+fn segment_write_candidates(segment: &str) -> Vec<String> {
+    // A group closer glued to the last word — `{ (cp x .env)}`, `{ (echo
+    // hi > .env)}` — reads as the target `.env)}` while bash writes
+    // `.env` (cameronsjo/cadence-hooks#1103). The wrapper-stripped view is
+    // judged as well; it only adds candidates.
+    let trimmed = segment.trim();
+    let unwrapped = strip_group_wrappers(trimmed);
+    let unwrapped =
+        (trimmed.starts_with(['(', '{']) && unwrapped != trimmed).then(|| unwrapped.to_string());
+    let substituted = substituted_texts(segment);
+    std::iter::once(segment)
+        .chain(unwrapped.as_deref())
+        .flat_map(|view| {
+            redirect_targets(view)
+                .into_iter()
+                .chain(writer_targets(view))
+        })
+        .chain(substituted.iter().flat_map(|text| redirect_targets(text)))
+        .collect()
+}
+
+/// The argv of the command one [`command_segments`] segment runs, after the
+/// runner peel [`writer_argv`] applies (`sudo`, `env`, `nice`, `xargs`,
+/// `command`, `exec`, `time`, …) — the words the writer-verb table is read
+/// against, for a guard that must also ask *which* program runs
+/// (`guard-runbook-scrub`, cameronsjo/cadence-hooks#755).
+pub fn segment_command_argv(segment: &str) -> Vec<String> {
+    let tokens = executable_tokens(segment);
+    writer_argv(&tokens).to_vec()
+}
+
+/// Every file path one [`command_segments`] segment would write, delete, or
+/// replace, as the shell spells it (unexpanded: a `$VAR`, `~`, or glob stays
+/// literal): its redirect targets and writer-verb operands, plus those of the
+/// commands a `sed`/`awk` program in it runs.
+///
+/// The same parse `prevent-secret-writes` judges by *name*, exposed for a
+/// guard that judges by *location* (`guard-runbook-scrub`,
+/// cameronsjo/cadence-hooks#755), so a second guard never grows a second
+/// write-target parser. Per segment, so the caller can pair each segment with
+/// the directory it runs in (`command_segments_with_dirs`). Over-inclusive by
+/// the same rules — an ambiguous word becomes a candidate, never dropped.
+pub fn segment_write_targets(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_segment_targets(segment, 0, &mut out);
+    out
+}
+
+fn collect_write_targets(command: &str, depth: usize, out: &mut Vec<String>) {
+    for segment in command_segments(command) {
+        collect_segment_targets(&segment, depth, out);
+    }
+}
+
+fn collect_segment_targets(segment: &str, depth: usize, out: &mut Vec<String>) {
+    out.extend(segment_write_candidates(segment));
+    if depth < PROGRAM_COMMAND_DEPTH {
+        for inner in program_commands(segment) {
+            collect_write_targets(&inner, depth + 1, out);
+        }
+    }
+}
+
 /// How deep [`matched_secret_write_target`] follows a command a sed/awk
 /// program runs into another such command.
 const PROGRAM_COMMAND_DEPTH: usize = 3;
@@ -425,25 +633,7 @@ fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String>
     // `sh -c '…'` is still seen. Targets are judged by the shared
     // component-based classifier, so `settings.environment` stays clean (#86).
     for segment in command_segments(command) {
-        // A group closer glued to the last word — `{ (cp x .env)}`, `{ (echo
-        // hi > .env)}` — reads as the target `.env)}` while bash writes
-        // `.env` (cameronsjo/cadence-hooks#1103). The wrapper-stripped view is
-        // judged as well; it only adds candidates.
-        let trimmed = segment.trim();
-        let unwrapped = strip_group_wrappers(trimmed);
-        let unwrapped = (trimmed.starts_with(['(', '{']) && unwrapped != trimmed)
-            .then(|| unwrapped.to_string());
-        let substituted = substituted_texts(&segment);
-        let candidates: Vec<String> = std::iter::once(&segment)
-            .chain(unwrapped.as_ref())
-            .flat_map(|view| {
-                redirect_targets(view)
-                    .into_iter()
-                    .chain(writer_targets(view))
-            })
-            .chain(substituted.iter().flat_map(|text| redirect_targets(text)))
-            .collect();
-        if let Some(target) = candidates
+        if let Some(target) = segment_write_candidates(&segment)
             .into_iter()
             // Every token here is a redirection target or a writer verb's
             // operand, so the shell has already told us it names a file — the
@@ -1086,6 +1276,25 @@ mod tests {
     }
 
     // --- #76: writer verbs beyond redirects and rm ---
+
+    #[test]
+    fn bash_last_operand_writer_behind_a_trailing_redirect_blocked() {
+        // cameronsjo/cadence-hooks#755: the trailing redirect took the
+        // destination's place, so every row here was Allow before.
+        for cmd in [
+            "cp x .env 2>/dev/null",
+            "cp x .env >/dev/null",
+            "cp x .env > /dev/null 2>&1",
+            "mv x .env 2>>err.log",
+            "install -m 600 x .env &>/dev/null",
+            "ln -sf x .env 2>/dev/null",
+            "rsync -a x .env 2>/dev/null",
+        ] {
+            assert!(bash_targets_env_file(cmd), "should block: {cmd}");
+        }
+        // A trailing redirect after a harmless destination stays allowed.
+        assert!(!bash_targets_env_file("cp .env.example config 2>/dev/null"));
+    }
 
     #[test]
     fn bash_tee_env_blocked() {
