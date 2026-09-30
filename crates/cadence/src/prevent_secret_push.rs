@@ -75,7 +75,8 @@
 //! it cannot resolve); the probe
 //! itself fails or times out; or `help.autocorrect` is set to run a guess
 //! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
-//! neither an alias nor a command `git --list-cmds` knows.
+//! neither an alias, a builtin or exec-path command `git --list-cmds` knows,
+//! nor an executable `git-<name>` in an absolute `PATH` directory.
 //! Builtins skip all of it.
 //!
 //! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
@@ -126,8 +127,8 @@
 //! written by the same command through anything but `git config`/`git remote`
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show. The `help.autocorrect` existence check asks git with the hook's own
-//! `PATH`, which may differ from the command's.
+//! show. The `help.autocorrect` existence check asks git, and searches
+//! `PATH`, with the hook's own `PATH`, which may differ from the command's.
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
 //! allows AND records a bypass row.
@@ -563,35 +564,61 @@ fn alias_config(dir: &str) -> Result<AliasConfig, Stop> {
 
 /// Is `name` a command git knows: a builtin, or a `git-<name>` in git's
 /// exec-path or on `PATH`? git runs one before it would autocorrect, so such a
-/// subcommand is not a guess. Asked once per process through
-/// `git --list-cmds=builtins,main,others`, which also covers Git for Windows
-/// (dashed builtins are not installed there, and executables carry `.exe`).
-/// If git cannot answer, only a `git-<name>` file on `PATH` counts (stricter).
+/// subcommand is not a guess. Builtins and the exec-path are asked of git
+/// through `git --list-cmds=builtins,main`, which also covers Git for Windows
+/// (dashed builtins are not installed there, and executables carry `.exe`);
+/// `PATH` is searched here rather than through `others`, whose scan of every
+/// `PATH` directory overran the probe budget on a loaded Windows runner. A
+/// probe that fails is not remembered, so the next call asks again; until
+/// git answers, only a `git-<name>` file on `PATH` counts (stricter).
 fn external_subcommand_exists(dir: &str, name: &str) -> bool {
-    static KNOWN: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+    static KNOWN: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
     if name.is_empty() || name.contains(['/', '\\']) {
         return false;
     }
-    let known = KNOWN.get_or_init(|| {
+    let known = KNOWN.get().or_else(|| {
         match git(
             dir,
-            &["--list-cmds=builtins,main,others"],
+            &["--list-cmds=builtins,main"],
             256 * 1024,
             Budget::Probe,
         ) {
             Git::Ok(list) if !list.trim().is_empty() => {
-                Some(list.lines().map(|l| l.trim().to_string()).collect())
+                Some(KNOWN.get_or_init(|| list.lines().map(|l| l.trim().to_string()).collect()))
             }
             _ => None,
         }
     });
-    if let Some(known) = known {
-        return known.contains(name);
+    if known.is_some_and(|known| known.contains(name)) {
+        return true;
     }
+    std::env::var_os("PATH").is_some_and(|path| path_runs_git_command(&path, name))
+}
+
+/// Whether `path` (a `PATH` value) holds a `git-<name>` git would run as
+/// `git <name>`: a regular file with the owner execute bit, which is the
+/// one bit git's own `is_executable` tests, in an absolute directory. A non-executable `git-psuh` is not a
+/// command, so git still autocorrects `git psuh` to `push`; a relative or
+/// empty entry resolves against wherever git runs, which is not this hook's
+/// directory, so it is not trusted (stricter).
+fn path_runs_git_command(path: &std::ffi::OsStr, name: &str) -> bool {
     let file = format!("git-{name}{}", std::env::consts::EXE_SUFFIX);
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(&file).is_file()))
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .any(|dir| is_executable_file(&dir.join(&file)))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o100 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 /// Why the alias `name` (following alias-of-alias) may run a push, if it may:
@@ -2948,6 +2975,49 @@ mod tests {
         fx.git(&["config", "push.followTags", "true"]);
         assert_allows(&fx.run("git push --no-fol origin main"));
         assert_allows(&fx.run("git push --no-follow origin main"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_command_on_path_must_be_executable_in_an_absolute_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("git-psuh");
+        std::fs::write(&shim, "").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !path_runs_git_command(&path, "psuh"),
+            "a 0644 file is not a command"
+        );
+        // git tests the owner bit alone: group/other execute is not enough.
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o011)).unwrap();
+        assert!(
+            !path_runs_git_command(&path, "psuh"),
+            "0011 is not a command"
+        );
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o100)).unwrap();
+        assert!(path_runs_git_command(&path, "psuh"));
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(path_runs_git_command(&path, "psuh"));
+        // A relative or empty entry is not trusted, even when it holds one.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_relative(dir.path(), &cwd);
+        for entry in [rel.as_os_str(), std::ffi::OsStr::new("")] {
+            let path = std::env::join_paths([entry]).unwrap();
+            assert!(!path_runs_git_command(&path, "psuh"), "{entry:?}");
+        }
+    }
+
+    /// `target` spelled relative to `base` (via `..`), for a relative PATH
+    /// entry that really reaches it.
+    #[cfg(unix)]
+    fn pathdiff_relative(target: &std::path::Path, base: &std::path::Path) -> std::path::PathBuf {
+        let mut rel = std::path::PathBuf::new();
+        for _ in base.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(target.strip_prefix("/").unwrap())
     }
 
     #[test]
