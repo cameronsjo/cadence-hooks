@@ -846,6 +846,14 @@ pub fn evaluate(
         if let Some(hint) = marker_hint(&state) {
             msg.push_str(&hint);
         }
+        // The PR is read before the command runs, so a marker this same
+        // command posts ahead of the flip is not there yet (cadence-hooks#1236).
+        // Say so rather than parse the command text for one.
+        msg.push_str(
+            " This check reads the PR before the command runs, so a marker posted \
+             earlier in this same command is not seen; if this command posts one, \
+             this warning is stale.",
+        );
     }
     if !blockers.is_empty() {
         msg.push_str(&changes_requested_sentence(
@@ -2012,6 +2020,37 @@ mod tests {
         );
         // The approval half held, so the no-signal sentence is not printed.
         assert!(!msg.contains("no approval signal"), "{msg}");
+    }
+
+    #[test]
+    fn same_command_marker_caveat_rides_only_the_no_signal_half() {
+        // cadence-hooks#1236: the PR is read before the command runs, so a
+        // marker the same command posts first is invisible. The message says
+        // so whenever a marker could have cleared it, and not when only a
+        // CHANGES_REQUESTED review remains (a marker cannot clear that).
+        const CAVEAT: &str = "a marker posted earlier in this same command is not seen";
+        let cases: [(&str, serde_json::Value, bool); 3] = [
+            ("no reviews at all", serde_json::json!([]), true),
+            (
+                "same-command marker then merge: marker not posted yet",
+                serde_json::json!([review(101, 7, "rev", "COMMENTED", HEAD)]),
+                true,
+            ),
+            (
+                "approval held, only a request outstanding",
+                serde_json::json!([
+                    review(101, 7, "rev", "CHANGES_REQUESTED", HEAD),
+                    clean_marker()
+                ]),
+                false,
+            ),
+        ];
+        for (name, reviews, want) in cases {
+            let gh = FakeGh::new(HEAD, "cameronsjo", reviews);
+            let command = "gh pr review 5 --comment -b 'marker' && gh pr merge 5";
+            let msg = eval(command, &gh).unwrap_or_else(|| panic!("{name}: must nudge"));
+            assert_eq!(msg.contains(CAVEAT), want, "{name}: {msg}");
+        }
     }
 
     #[test]
