@@ -36,6 +36,18 @@ pub struct HookEntry {
     /// (cameronsjo/cadence-hooks#1197). Each entry carries a one-line rationale
     /// comment above the field.
     pub remote: RemotePolicy,
+    /// Whether a repo's `.claude/cadence.json` `nudges` map may silence this
+    /// hook's **nudge** outcomes (cameronsjo/cadence-hooks#216, ADR-0002 §3).
+    /// Required, so a new hook cannot ship without the decision.
+    ///
+    /// `true` only for a hook that is advisory end to end: it never blocks and
+    /// never asks, is not in `PROTECTED_GUARDS` or `SECURITY_CRITICAL_HOOKS`,
+    /// and reacts to a tool call or session event (not a logger). Dispatch
+    /// enforces the field independently of `doctor`, and only ever rewrites a
+    /// `Nudge` outcome, so a `Block` or `Ask` is untouched even for a
+    /// suppressible hook. When unsure, `false`: suppression is opt-in.
+    /// `registry_suppressible_entries_are_advisory_only` holds the invariants.
+    pub suppressible: bool,
 }
 
 /// A hook's behavior in a cloud session.
@@ -123,6 +135,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "orphaned-todos",
@@ -131,6 +144,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "prevent-secret-leaks",
@@ -139,6 +153,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "prevent-secret-writes",
@@ -147,6 +162,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "memory-guard",
@@ -155,6 +171,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge; harmless when the local memory dir is absent.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "git-safety",
@@ -163,6 +180,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "line-endings",
@@ -171,6 +189,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "env-vars",
@@ -179,6 +198,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-docs-update",
@@ -187,6 +207,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge about the repo's own content.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-changelog-entry",
@@ -195,6 +216,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge about the repo's own content.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-overshare",
@@ -203,6 +225,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge about the repo's own content.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-instruction-narrative",
@@ -211,6 +234,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge about the repo's own content.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-live-memory-write",
@@ -219,6 +243,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge; harmless when the local memory dir is absent.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-plugin-root-cruft",
@@ -227,6 +252,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge about the repo's own content.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "nudge-polish-before-pr",
@@ -235,6 +261,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge; cloud sessions ship PRs too.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "markdown-lint",
@@ -243,6 +270,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only lint; fails open when no markdownlint CLI is on PATH.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "audit-runner-pool",
@@ -251,6 +279,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only audit of the edited workflow file.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "redact-external-content",
@@ -259,6 +288,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-held-close",
@@ -267,6 +297,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "platform-drift",
@@ -275,6 +306,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: read-only; ruled Run for cloud sessions (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         // Wired on SessionStart *and* PostModelSwitch; the subcommand picks its
@@ -285,6 +317,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart, HookEvent::PostModelSwitch],
         // Remote: read-only; ruled Run for cloud sessions (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     // guardrails
     HookEntry {
@@ -294,6 +327,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: the guards worth having in the cloud (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-gh-dangerous",
@@ -302,6 +336,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: the guards worth having in the cloud (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-gh-write",
@@ -310,6 +345,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: the guards worth having in the cloud (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-forge-write",
@@ -318,6 +354,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: an owner-allowlist write guard, like guard-gh-write (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-critical-grade",
@@ -327,6 +364,7 @@ pub const HOOKS: &[HookEntry] = &[
         // Remote: a label-write guard like guard-gh-write; cloud sessions carry
         // the same token, so the same preventive control applies (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-git-init",
@@ -335,6 +373,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only guard.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-main-branch",
@@ -343,6 +382,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: nudge only; a fresh clone starts on the default branch.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "enforce-worktree",
@@ -351,6 +391,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: the fresh cloud clone is the primary checkout and all work lands on a session branch, so the guard would block every commit.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-subagent-worktree",
@@ -359,6 +400,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: steers toward sibling worktrees, which a single-clone cloud VM does not use.
         remote: RemotePolicy::SelfDisable,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-agent-dispatch",
@@ -367,6 +409,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-branch-base",
@@ -375,6 +418,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-cron-datetime",
@@ -383,6 +427,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "nudge-upgrade-after-push",
@@ -391,6 +436,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: suggests a local cron and a script that does not exist in the plugin.
         remote: RemotePolicy::SelfDisable,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-untracked",
@@ -399,6 +445,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-amend-pushed",
@@ -407,6 +454,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "guard-dotfiles",
@@ -415,6 +463,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "enforcement-status",
@@ -423,6 +472,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: carries the ARMED/INERT line (#1197); must survive.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-read-model",
@@ -431,6 +481,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-pr-issue-link",
@@ -439,6 +490,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "guard-body-budget",
@@ -447,6 +499,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-issue-tracker",
@@ -455,6 +508,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-going-public",
@@ -463,6 +517,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-inline-body",
@@ -471,6 +526,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "verify-pr-autoclose",
@@ -479,6 +535,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "guard-sops-decrypt",
@@ -487,6 +544,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the tool is absent; harmless to keep armed.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "guard-op-vault-scan",
@@ -495,6 +553,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the tool is absent; harmless to keep armed.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-curl-alias",
@@ -503,6 +562,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-gh-merge-preflight",
@@ -511,6 +571,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-unreviewed-ready-flip",
@@ -519,6 +580,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-chezmoi-apply",
@@ -527,6 +589,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only nudge; no-op without chezmoi.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-entry-posture",
@@ -535,6 +598,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-stacked-base-delete",
@@ -543,6 +607,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-stale-pr-body",
@@ -551,6 +616,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-alias-parsing",
@@ -559,6 +625,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "guard-browser-device",
@@ -567,6 +634,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the tool is absent; harmless to keep armed.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "inject-gh-write-context",
@@ -575,6 +643,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     // rules
     HookEntry {
@@ -584,6 +653,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content check.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "security-patterns",
@@ -592,6 +662,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only content check.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-recommended-option",
@@ -600,6 +671,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content check.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-empty-answers",
@@ -608,6 +680,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only content check.
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     // obsidian
     HookEntry {
@@ -617,6 +690,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: guard over the tool call; inert without a vault.
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "trash-guard-liveness",
@@ -625,6 +699,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: probes a machine-local Obsidian vault configuration.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     // metrics
     HookEntry {
@@ -634,6 +709,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-commit",
@@ -642,6 +718,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-subagent",
@@ -650,6 +727,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-session",
@@ -658,6 +736,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-session-start",
@@ -666,6 +745,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-polish-nudge",
@@ -674,6 +754,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-ask-user-question",
@@ -682,6 +763,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "log-skill",
@@ -690,6 +772,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: writes ledgers under the Claude config dir, lost with the VM.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-stale",
@@ -698,6 +781,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: reports on metrics ledgers that cloud sessions never write.
         remote: RemotePolicy::SelfDisable,
+        suppressible: true,
     },
     // session — the clap namespace for plan and session state. Wired by the
     // always-on `cadence` plugin, not by a plugin of its own: `cadence-canon`
@@ -710,6 +794,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "heartbeat",
@@ -718,6 +803,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "guard",
@@ -726,6 +812,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-branch-drift",
@@ -734,6 +821,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-branch-intent",
@@ -742,6 +830,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "warn-commit-provenance",
@@ -750,6 +839,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: runs, but the Machine: field becomes the fixed value `cloud` (#1197).
         remote: RemotePolicy::Run,
+        suppressible: true,
     },
     HookEntry {
         name: "end",
@@ -758,6 +848,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "backstop-record",
@@ -766,6 +857,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "backstop-warn",
@@ -774,6 +866,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::SessionStart],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: true,
     },
     HookEntry {
         name: "persist-plan-approval",
@@ -782,6 +875,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: the session registry, lanes and plan store are machine-local; persist-plan-approval would write into the session's repo.
         remote: RemotePolicy::SelfDisable,
+        suppressible: false,
     },
     HookEntry {
         name: "nudge-plan-tick",
@@ -790,6 +884,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PostToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "warn-plan-ready-flip",
@@ -798,6 +893,7 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
     HookEntry {
         name: "lint-plan-shape",
@@ -806,8 +902,15 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
     },
 ];
+
+/// Whether `.claude/cadence.json` may silence `hook`'s nudges. `false` for an
+/// unknown name, so a typo suppresses nothing.
+pub fn is_suppressible(hook: &str) -> bool {
+    HOOKS.iter().any(|h| h.name == hook && h.suppressible)
+}
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
 pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
@@ -1391,6 +1494,65 @@ mod tests {
                 "README.md says `{ns}` has {count} hooks; src/registry.rs registers {}",
                 registered_in(ns).len()
             );
+        }
+    }
+    /// A `suppressible` hook can never be a security guard, a detector exempt
+    /// from the blanket bypass, or a logger — the config surface must not be
+    /// able to name anything whose silence is a harm (#216).
+    #[test]
+    fn registry_suppressible_entries_are_advisory_only() {
+        use cadence_hooks_core::bypass::{BYPASS_EXEMPT_HOOKS, PROTECTED_GUARDS};
+        let mut count = 0;
+        for h in HOOKS.iter().filter(|h| h.suppressible) {
+            count += 1;
+            assert!(
+                !PROTECTED_GUARDS.contains(&h.name),
+                "{} is protected and cannot be suppressible",
+                h.name
+            );
+            assert!(
+                !is_security_critical(h.name),
+                "{} is security-critical and cannot be suppressible",
+                h.name
+            );
+            assert!(
+                !BYPASS_EXEMPT_HOOKS.contains(&h.name),
+                "{} is bypass-exempt and cannot be suppressible",
+                h.name
+            );
+            assert!(
+                !h.events.is_empty(),
+                "{} is a logger: it emits no nudge to suppress",
+                h.name
+            );
+            assert!(
+                !h.name.starts_with("guard-")
+                    && !h.name.starts_with("enforce-")
+                    && !h.name.starts_with("prevent-"),
+                "{} is named like a block-capable guard",
+                h.name
+            );
+        }
+        assert!(
+            count > 0,
+            "no suppressible hooks: the nudges config would be inert"
+        );
+    }
+
+    #[test]
+    fn is_suppressible_is_false_for_unknown_and_blocking_hooks() {
+        for (name, want) in [
+            ("warn-overshare", true),
+            ("backstop-warn", true),
+            ("git-safety", false),
+            ("enforce-worktree", false),
+            ("redact-external-content", false),
+            ("terminology", false),
+            ("log-session", false),
+            ("no-such-hook", false),
+            ("", false),
+        ] {
+            assert_eq!(is_suppressible(name), want, "{name}");
         }
     }
 }

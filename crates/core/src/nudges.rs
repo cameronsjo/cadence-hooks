@@ -218,7 +218,13 @@ mod tests {
 
     #[test]
     fn load_fails_open_on_every_broken_shape() {
-        for body in ["{not json", "[]", r#"{"nudges": []}"#, r#"{"nudges": 4}"#, ""] {
+        for body in [
+            "{not json",
+            "[]",
+            r#"{"nudges": []}"#,
+            r#"{"nudges": 4}"#,
+            "",
+        ] {
             let dir = write_cfg(body);
             let load = load_nudges(dir.path());
             assert!(!load.config.suppresses("good", None), "{body}");

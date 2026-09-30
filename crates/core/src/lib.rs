@@ -18,8 +18,8 @@ pub mod display;
 pub mod gh_bodies;
 pub mod gitstate;
 pub mod loop_analysis;
-pub mod nudges;
 pub mod markers;
+pub mod nudges;
 pub mod patch;
 pub mod pathclass;
 pub mod paths;
@@ -1762,15 +1762,33 @@ fn should_skip_for_effort(skip_levels: &[&str], current: Option<&str>) -> bool {
 /// issue on the meta-repo instead of silent friction.
 const FEEDBACK_FOOTER: &str = "\n\nIf this fired in error: /cadence:feedback";
 
-/// Resolve the feedback footer from the environment.
+/// Resolve the feedback footer from the environment and the repo config.
 ///
 /// Returns `None` when `CADENCE_NO_FEEDBACK_FOOTER` is set to any non-empty
-/// value (the suppression toggle), otherwise the [`FEEDBACK_FOOTER`] text.
+/// value, or when the repo's `.claude/cadence.json` sets `feedbackFooter` to
+/// `false` (cameronsjo/cadence-hooks#216) — either one suppresses, env is the
+/// emergency override. Otherwise the [`FEEDBACK_FOOTER`] text. The repo is
+/// resolved from the process cwd, which is the project dir for a hook; the
+/// footer is cosmetic, so an unresolvable repo just leaves it on.
 fn feedback_footer() -> Option<String> {
-    let suppressed = std::env::var("CADENCE_NO_FEEDBACK_FOOTER")
+    let env_suppressed = std::env::var("CADENCE_NO_FEEDBACK_FOOTER")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
-    if suppressed {
+    let config_setting = || {
+        let cwd = std::env::current_dir().ok()?;
+        let root = paths::find_git_root(&cwd.to_string_lossy())?;
+        nudges::feedback_footer_setting(&root)
+    };
+    resolve_feedback_footer(env_suppressed, config_setting)
+}
+
+/// Pure core of [`feedback_footer`]: env suppression wins without reading the
+/// config; otherwise only an explicit `false` in the config turns it off.
+fn resolve_feedback_footer(
+    env_suppressed: bool,
+    config_setting: impl FnOnce() -> Option<bool>,
+) -> Option<String> {
+    if env_suppressed || config_setting() == Some(false) {
         None
     } else {
         Some(FEEDBACK_FOOTER.to_string())
@@ -2206,6 +2224,27 @@ pub fn run_logger_from_stdin(logger: &dyn Logger, sample_override: Option<&str>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn feedback_footer_env_or_config_suppresses() {
+        let rows: &[(bool, Option<bool>, bool)] = &[
+            (false, None, true),
+            (false, Some(true), true),
+            (false, Some(false), false),
+            (true, None, false),
+            (true, Some(true), false),
+            (true, Some(false), false),
+        ];
+        for (env, cfg, shown) in rows {
+            assert_eq!(
+                resolve_feedback_footer(*env, || *cfg).is_some(),
+                *shown,
+                "env={env} config={cfg:?}"
+            );
+        }
+        // env suppression never reads the config
+        assert!(resolve_feedback_footer(true, || panic!("read")).is_none());
+    }
+
     use super::*;
 
     // --- Outcome ---
