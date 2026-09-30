@@ -625,11 +625,18 @@ mod tests {
 
     impl Fx {
         fn new(tag: &str) -> Self {
-            let scratch = Scratch::new(
+            Self::new_in(tag, "work")
+        }
+
+        /// `work` names the checkout's directory under the scratch root; a
+        /// nested `cadence-hooks/work` gives the absolute path the component
+        /// the fixture exemption keys on, which the relocated root lacks.
+        fn new_in(tag: &str, work: &str) -> Self {
+            let scratch = Scratch::outside_checkout(
                 &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/secretpush-scratch"),
                 tag,
             );
-            let work = scratch.path().join("work");
+            let work = scratch.path().join(work);
             let remote = scratch.path().join("remote.git");
             std::fs::create_dir_all(&work).unwrap();
             std::fs::create_dir_all(&remote).unwrap();
@@ -815,9 +822,9 @@ mod tests {
     fn in_repo_fixture_paths_are_exempt_from_the_content_scan() {
         // A repo whose checkout path carries a `cadence-hooks` component, like
         // this one, must be able to push its own fixture keys.
-        let fx = Fx::new("exempt");
+        let fx = Fx::new_in("exempt", "cadence-hooks/work");
         // The relative path (`tests/fx.rs`) carries no `cadence-hooks` component;
-        // only the ABSOLUTE path does (this checkout's own directory), so the
+        // only the ABSOLUTE path does (the fixture's `cadence-hooks/work` dir), so the
         // exemption applies only if the guard joins the repo root first.
         fx.commit(
             "tests/fx.rs",
