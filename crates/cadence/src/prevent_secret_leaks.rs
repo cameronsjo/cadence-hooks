@@ -663,9 +663,25 @@ fn segment_env_reads_at(
     if first.starts_with('#') {
         return Vec::new();
     }
-    // A loop or conditional body's reserved word is not its command (#1237).
+    // A loop or conditional body's reserved word is not its command (#1237),
+    // but peeling it would hand the segment its real verb's exemptions (a
+    // `do stat .env` would reach the metadata allowlist). So verdicts read
+    // the segment exactly as before; the peel renames the command a block
+    // message names, and moves the verdict only inside a command that is
+    // wholly in the api grammar, whose loop body is one `gh`/`tea api` call.
     let lead = unquoted_leading_keywords(segment, &tokens);
-    let (tokens, globs, fixed) = (&tokens[lead..], &globs[lead..], &fixed[lead..]);
+    let shown = (lead > 0).then(|| {
+        (
+            command_word(&tokens[0]).into_owned(),
+            resolve_command(&tokens[lead..]).map(|(word, _)| word.into_owned()),
+        )
+    });
+    let peel = if context.api_endpoint_trusted {
+        lead
+    } else {
+        0
+    };
+    let (tokens, globs, fixed) = (&tokens[peel..], &globs[peel..], &fixed[peel..]);
     let mut found = {
         let _live = LiveScope::set(substitutions_live(segment));
         segment_direct_reads(tokens, globs, fixed, context)
@@ -715,8 +731,25 @@ fn segment_env_reads_at(
                     depth + 1,
                 ));
                 if budget.exhausted {
-                    return found;
+                    return rename_keyword_head(found, shown);
                 }
+            }
+        }
+    }
+    rename_keyword_head(found, shown)
+}
+
+/// Name the command behind a leading reserved word in each read attributed
+/// to that word: `for f in 1; do cat .env; done` blocks as an operand of
+/// `cat`, not `do` (#1237). The message only — no verdict reads this.
+fn rename_keyword_head(
+    mut found: Vec<(String, String)>,
+    shown: Option<(String, Option<String>)>,
+) -> Vec<(String, String)> {
+    if let Some((keyword, Some(verb))) = shown {
+        for (cmd_word, _) in &mut found {
+            if *cmd_word == keyword {
+                cmd_word.clone_from(&verb);
             }
         }
     }
@@ -1902,7 +1935,7 @@ enum ApiLex {
 /// Characters an unquoted word of the api grammar may carry: no expansion,
 /// glob, brace, tilde, comment, or quoting character.
 fn api_plain_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "._/:@=+-".contains(c)
+    c.is_ascii_alphanumeric() || "._/:@=+-,".contains(c)
 }
 
 /// Characters of a plain redirection target (`> out/x.tsv`, `>> ~/x`).
@@ -2207,8 +2240,9 @@ fn api_call_words(words: &[(String, ApiQuote)]) -> bool {
 
 /// Is `words` one of the few pipeline consumers the grammar admits: `jq`
 /// with plain output flags and one single-quoted filter that loads nothing,
-/// bare `cat`, `sort`/`uniq` with plain flags, `head`/`tail` [`-n N`], and
-/// `wc -l`?
+/// bare `cat`, `sort` with `-r -n -u -f -k N[,M] -t 'C'`, `uniq` with
+/// `-c -d -u -i` and no operand, `head`/`tail` [`-n N`], and `wc -l` — each
+/// a flag set that opens no file?
 fn api_consumer(words: &[(String, ApiQuote)]) -> bool {
     const JQ_FLAGS: &[&str] = &[
         "-r",
@@ -2225,7 +2259,6 @@ fn api_consumer(words: &[(String, ApiQuote)]) -> bool {
     let Some(((head, ApiQuote::Plain), args)) = words.split_first() else {
         return false;
     };
-    let flag = |(w, q): &(String, ApiQuote)| *q == ApiQuote::Plain && w.starts_with('-');
     match head.as_str() {
         "jq" => {
             let mut filters = args.iter().filter(|(_, q)| *q == ApiQuote::Single);
@@ -2241,7 +2274,39 @@ fn api_consumer(words: &[(String, ApiQuote)]) -> bool {
                 })
         }
         "cat" => args.is_empty(),
-        "sort" | "uniq" => args.iter().all(flag),
+        // Flags that read no file: not `-m`/`--files0-from`/`-T`/`-o`, and
+        // `uniq` takes no operand (its second one is an output file).
+        "sort" => {
+            let mut i = 0;
+            while let Some((word, quote)) = args.get(i) {
+                let value = args.get(i + 1);
+                i += match (word.as_str(), quote) {
+                    ("-r" | "-n" | "-u" | "-f", ApiQuote::Plain) => 1,
+                    ("-k", ApiQuote::Plain)
+                        if value.is_some_and(|(v, q)| {
+                            *q == ApiQuote::Plain
+                                && v.split(',').count() <= 2
+                                && v.split(',')
+                                    .all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                        }) =>
+                    {
+                        2
+                    }
+                    ("-t", ApiQuote::Plain)
+                        if value.is_some_and(|(v, q)| {
+                            *q == ApiQuote::Single && v.chars().count() == 1
+                        }) =>
+                    {
+                        2
+                    }
+                    _ => return false,
+                };
+            }
+            true
+        }
+        "uniq" => args
+            .iter()
+            .all(|(w, q)| *q == ApiQuote::Plain && matches!(w.as_str(), "-c" | "-d" | "-u" | "-i")),
         "head" | "tail" => match args {
             [] => true,
             [(n_flag, ApiQuote::Plain), (n, ApiQuote::Plain)] => {
@@ -12792,6 +12857,20 @@ mod api_endpoint_tests {
             "gh api .env | jq -r --rawfile a x '.'",
             "gh api .env | jq 'import \"x\" as x; .'",
             "gh api .env | cat -",
+            // Consumer flags that open a file.
+            "gh api .env | sort --files0-from=.env",
+            "gh api .env | sort --files0-from .env",
+            "gh api .env | sort -m .env",
+            "gh api .env | sort -T .env",
+            "gh api .env | sort -o .env",
+            "gh api .env | sort .env",
+            "gh api .env | sort -rn .env",
+            "gh api .env | uniq -c .env",
+            "gh api .env | uniq .env out",
+            "gh api .env | head .env",
+            "gh api .env | tail -n 5 .env",
+            "gh api .env | wc -l .env",
+            "gh api .env | jq '.' .env",
             "gh api .env | tee /tmp/x",
             "gh api .env > \"$HOME/x\"",
             "gh api .env 1>&2",
@@ -12876,13 +12955,25 @@ mod api_endpoint_tests {
     }
 
     #[test]
-    fn a_peeled_keyword_reaches_the_real_verbs_exemption() {
+    fn a_peeled_keyword_changes_only_the_message() {
+        // Round 4: the peel must not reach a verb's exemption. Each leaks a
+        // canary in real bash, and each blocked before the peel existed.
         for command in [
+            "if true; then direnv exec . cat .env; fi",
+            "for x in 1; do direnv exec . cat .env; done",
+            "! direnv exec . cat .env",
+            "if true; then command direnv exec . cat .env; fi",
+            "if true; then echo .env; fi; cat \"$_\"",
+            "for x in 1; do stat .env; done; cat \"$_\"",
             "for f in 1; do ls .env; done",
             "if true; then stat .env; fi",
         ] {
-            assert_eq!(verdict(command).outcome, Outcome::Allow, "{command}");
+            assert_eq!(verdict(command).outcome, Outcome::Block, "{command}");
         }
+        let message = verdict("for x in 1; do cat .env; done")
+            .message
+            .unwrap_or_default();
+        assert!(message.contains("as an operand of `cat`"), "{message}");
     }
 
     #[test]
@@ -12946,6 +13037,15 @@ mod api_endpoint_tests {
             ("gh api /x | jq -f f '.'", false),
             ("gh api /x | jq '.' '.'", false),
             ("gh api /x | head -c 5", false),
+            (
+                "gh api /x | sort -r -n -k 2,3 -t ',' | uniq -c | tail -n 3",
+                true,
+            ),
+            ("gh api /x | sort -k 2,3,4", false),
+            ("gh api /x | sort -t ab", false),
+            ("gh api /x | sort --files0-from=f", false),
+            ("gh api /x | sort -rn", false),
+            ("gh api /x | uniq -c f", false),
             ("gh api /x;; gh api /y", false),
             ("gh api /x || gh api /y", false),
             ("gh api /x & gh api /y", false),
