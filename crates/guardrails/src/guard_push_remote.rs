@@ -3241,6 +3241,19 @@ mod tests {
                     Block,
                 ),
                 ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                // Review 9: a function body, and extglob patterns.
+                (
+                    "n=EDIT; x=ad; f(){ re$x \"$1\"; }; f ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; function f { re$x \"$1\"; }; f ${n}OR; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "shopt -s extglob; +(re)ad ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
                 ("[ -f x ] && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
                 (
                     "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",

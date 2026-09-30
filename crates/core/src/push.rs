@@ -1276,6 +1276,18 @@ impl Toplevels {
         if names_an_expansion || command.contains("${!") {
             return true;
         }
+        // A function defined in the same command runs its body in this
+        // shell once called, and that body is not a top-level command the
+        // name check above reads; `extglob` patterns (`+(re)ad`) name a
+        // builtin through a file the same way `r?ad` does (review 9).
+        static DEFINES_OR_EXTGLOB: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::Regex::new(r"[A-Za-z0-9_.:-]\s*\(\s*\)|\bfunction\s|extglob|[+@!]\(")
+                    .expect("pattern should compile")
+            });
+        if DEFINES_OR_EXTGLOB.is_match(command) {
+            return true;
+        }
         let command: String = command
             .chars()
             .filter(|c| !matches!(c, '\\' | '\'' | '"'))
