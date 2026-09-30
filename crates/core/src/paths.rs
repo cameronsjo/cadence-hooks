@@ -188,7 +188,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
 /// Open `path` for reading without blocking on a FIFO with no writer, and
 /// without letting a terminal device become the process's controlling
 /// terminal (`O_NOCTTY`). `O_NONBLOCK` has no effect on a regular file's reads.
-fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
