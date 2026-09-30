@@ -39,8 +39,24 @@ via GitHub's OIDC provider. A valid signature proves the artifact was produced b
 - **Identity:** `https://github.com/cameronsjo/cadence-hooks/.github/workflows/release.yml@refs/tags/vX.Y.Z`
 - **Issuer:** `https://token.actions.githubusercontent.com`
 
-Nothing else can mint a signature with that identity — not a fork, not a different
-workflow, not a manual upload.
+A fork, a different workflow, or a manual upload cannot mint a signature with that
+identity. What the identity itself proves is narrower: `release.yml` ran for some `v*`
+tag in this repository. It does not by itself prove the tagged commit is on `main` or
+passed CI. Two controls close that gap:
+
+- **Who can create a tag.** A tag ruleset on `v*` blocks tag creation, update, and
+  deletion for everyone except the release GitHub App. The App tags only from
+  `auto-tag.yml`, and only a commit that is the App's own merge of its
+  `chore(main): release X.Y.Z` PR (the nightly ship gate's merge). A tag pushed by
+  hand is refused, and a version bump that reaches `main` any other way is not tagged.
+- **What the release checks.** `release.yml` starts with a `verify` job that stops the
+  release unless the tagged commit is an ancestor of `main` and the `CI` workflow's
+  push run for that exact commit concluded `success`. Only the job that signs holds
+  `id-token: write`; the build jobs can read the repository and nothing else.
+
+Both controls live in this repository's settings and workflow, so they are only as strong
+as its write access. The signature binds an artifact to this workflow and tag; it is not
+an independent attestation that the controls ran.
 
 ## Verifying a release
 
