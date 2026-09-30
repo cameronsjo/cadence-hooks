@@ -31,10 +31,12 @@ def semver: if type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")
 def obj: (try fromjson catch null) | if type == "object" then . else null end;
 def vline: test("^version = \"[^\"]*\"$");
 # [package] version of a Cargo.toml, or null.
-def cargo_version: reduce split("\n")[] as $l ({sec: "", v: null};
+def cargo_version: reduce split("\n")[] as $l ({sec: "", v: null, w: null};
   if ($l | test("^\\s*\\[")) then .sec = ($l | gsub("\\s"; ""))
   elif .sec == "[package]" and .v == null and ($l | vline)
-  then .v = ($l | capture("^version = \"(?<v>[^\"]*)\"$").v) else . end) | .v;
+  then .v = ($l | capture("^version = \"(?<v>[^\"]*)\"$").v)
+  elif .sec == "[workspace.package]" and .w == null and ($l | vline)
+  then .w = ($l | capture("^version = \"(?<v>[^\"]*)\"$").v) else . end) | .v // .w;
 # Same line count; every changed line is a version line on both sides and
 # now reads the title version.
 def version_lines_only($b; $h; $v; $one):
@@ -52,7 +54,8 @@ def content_rule($name; $b; $h; $v):
   else ($b | obj) as $B | ($h | obj) as $H
   | if $B == null or $H == null then "not a JSON object on both sides"
     elif $name == "package.json" or $name == "manifest.json" then
-      if ($B | del(.version)) == ($H | del(.version)) then "" else "changed more than .version" end
+      if ($B | del(.version)) != ($H | del(.version)) then "changed more than .version"
+      elif $H.version != $v then "version is not the title version \($v)" else "" end
     elif $name == "package-lock.json" then
       if ($B | del(.version, .packages[""].version)) == ($H | del(.version, .packages[""].version))
       then "" else "changed more than the root version fields" end
@@ -63,6 +66,7 @@ def content_rule($name; $b; $h; $v):
       (($H | keys) - ($B | keys)) as $new
       | if ($new | length) != 1 or ($B | keys - ($H | keys) | length) != 0
         then "expected exactly one added key"
+        elif $new[0] != $v then "added key is not the title version \($v)"
         elif ($H | del(.[$new[0]])) != $B then "existing entries changed" else "" end
     else "no content rule" end end;
 '
