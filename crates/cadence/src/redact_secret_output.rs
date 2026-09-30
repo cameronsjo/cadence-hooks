@@ -81,7 +81,7 @@
 //! hook's real rewrite last-write-wins. Image output is never touched. Any
 //! doubt about a span (a non-char-boundary offset) abandons the rewrite: the
 //! failure mode is "no change", never corrupted output. Every pass is linear in
-//! the output size (every 5 MB adversarial shape measured at 0.34 s CPU or
+//! the output size (every 5 MB adversarial shape measured at 0.37 s CPU or
 //! less in a release build).
 //!
 //! **Escape:** `CADENCE_ALLOW_SECRET_OUTPUT` (truthy) passes output through
@@ -428,6 +428,7 @@ fn collect_mapped(original: &str, view: &View<'_>, names: &mut Names, spans: &mu
     inline_spans(t, names, &mut local);
     quoted_key_spans(t, names, &mut local);
     argv_flag_spans(t, &mut local);
+    npmrc_spans(t, &mut local);
     line_spans(t, names, &mut local);
     for s in local {
         if s.start >= s.end {
@@ -728,8 +729,13 @@ fn glued_strong(seg: &str) -> bool {
     {
         return false;
     }
-    if let Some(prefix) = seg.strip_suffix("key") {
-        return GLUED_KEY_PREFIXES.contains(&prefix);
+    // `…key`: strong when the prefix ENDS with a credential word
+    // (`openaiapi|key`, `awssecret|key`, `gcpprivate|key`); otherwise fall
+    // through, so `…apikey` still meets `STRONG_SUFFIXES`.
+    if let Some(prefix) = seg.strip_suffix("key")
+        && GLUED_KEY_PREFIXES.iter().any(|p| prefix.ends_with(p))
+    {
+        return true;
     }
     if let Some(prefix) = seg.strip_suffix("pass") {
         return !prefix.is_empty() && !NON_SECRET_PASS_PREFIXES.contains(&prefix);
@@ -1238,20 +1244,29 @@ static ARGV_FLAGS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
         // mysql family: `-pVALUE` (attached only; a bare `-p` prompts).
         ("mysql", r#"(?:^|\s)-p('[^'\n]*'|"[^"\n]*"|[^\s'"]\S*)"#),
         ("mariadb", r#"(?:^|\s)-p('[^'\n]*'|"[^"\n]*"|[^\s'"]\S*)"#),
-        // curl `-u user:VALUE` / `--user user:VALUE`.
+        // curl `-u user:VALUE`, a flag cluster ending in `u` (`-su`,
+        // `-fsSu`), or `--user user:VALUE`.
         (
             "curl",
-            r#"(?:^|\s)(?:-u|--user)[ \t=]*['"]?[^\s:'"]*:([^\s'"]+)"#,
+            r#"(?:^|\s)(?:-[A-Za-z]*u|--user)[ \t=]*['"]?[^\s:'"]*:([^\s'"]+)"#,
         ),
-        // `docker|podman|helm registry login -p VALUE`.
-        (" login", r"(?:^|\s)-p[ 	]+(\S+)"),
-        ("sshpass", r"(?:^|\s)-p[ 	]*(\S+)"),
-        ("redis-cli", r"(?:^|\s)-a[ 	]+(\S+)"),
-        ("smbclient", r"(?:^|\s)-U[ 	]*[^\s%]*%(\S+)"),
-        ("zip", r"(?:^|\s)-P[ 	]+(\S+)"),
+        // `docker|podman|helm registry login -p VALUE` / `-p=VALUE` / `-up V`.
+        (" login", r"(?:^|\s)-[a-zA-Z]*p(?:[ \t]+|=)(\S+)"),
+        ("sshpass", r"(?:^|\s)-p[ \t]*(\S+)"),
+        ("redis-cli", r"(?:^|\s)-a[ \t]+(\S+)"),
+        ("mongo", r"(?:^|\s)-p[ \t]+(\S+)"),
+        ("smbclient", r"(?:^|\s)-U[ \t]*[^\s%]*%(\S+)"),
+        ("zip", r"(?:^|\s)-P[ \t]+(\S+)"),
+        ("unzip", r"(?:^|\s)-P[ \t]+(\S+)"),
         ("7z", r"(?:^|\s)-p(\S+)"),
+        ("rar", r"(?:^|\s)-p(\S+)"),
         ("openssl", r"pass:(\S+)"),
         ("ngrok", r"authtoken[ \t]+(\S+)"),
+        (
+            "keytool",
+            r"(?:^|\s)-(?:src|dest)?(?:storepass|keypass)[ \t]+(\S+)",
+        ),
+        ("lftp", r"(?:^|\s)-u[ \t]+[^\s,]*,(\S+)"),
         // `htpasswd -b[other flags] FILE USER PASSWORD`.
         (
             "htpasswd",
@@ -1262,6 +1277,25 @@ static ARGV_FLAGS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     .map(|(cmd, re)| (cmd, Regex::new(re).expect("argv flag regex is valid")))
     .collect()
 });
+
+/// `.npmrc` registry credentials: `//host/:_authToken=V`, `:_auth=V`,
+/// `:_password=V` — any value but a `${VAR}` reference.
+static NPMRC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r":_(?:authToken|auth|password)[ 	]*=[ 	]*(\S+)").expect("npmrc regex is valid")
+});
+
+fn npmrc_spans(text: &str, spans: &mut Vec<Span>) {
+    if !text.contains(":_") {
+        return;
+    }
+    for caps in NPMRC.captures_iter(text) {
+        if let Some(v) = caps.get(1)
+            && maskable(v.as_str())
+        {
+            spans.push(named(v.start(), v.end()));
+        }
+    }
+}
 
 /// Flag values judged per command line before the rest is masked whole.
 const ARGV_FLAG_CAP: usize = 256;
@@ -2274,6 +2308,37 @@ mod tests {
             ("MASTERKEY=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
             ("SSHKEY: Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
             ("DBPASS=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            // Round 5 (#776 review 5).
+            ("OPENAIAPIKEY=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("{\"openaiapikey\": \"Zq9vKh7wR3xPq\"}\n", "Zq9vKh7wR3xPq"),
+            ("AWSSECRETKEY: Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("GCPPRIVATEKEY=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            (
+                "ya29.a0AfB_byFAKEc9Zq9vKh7wR3xPqL8mN2abcdEFGH\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("ya29.c.b0AaekZq9vKh7wR3xPqL8mN2abcd\n", "Zq9vKh7wR3xPq"),
+            (
+                "{\"access_token\": \"ya29.a0Zq9vKh7wR3xPqL8mN2abcd\"}\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            (
+                "//registry.npmjs.org/:_authToken=aaaa1111-Zq9vKh7wR3xPq\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("//reg.example.com/:_auth=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            (
+                "//reg.example.com/:_password=Zq9vKh7wR3xPq\n",
+                "Zq9vKh7wR3xPq",
+            ),
+            ("+ curl -su user:Zq9vKh7wR3xPq x\n", "Zq9vKh7wR3xPq"),
+            ("+ curl -fsSu user:Zq9vKh7wR3xPq x\n", "Zq9vKh7wR3xPq"),
+            ("+ mongosh -u u -p Zq9vKh7wR3xPq db\n", "Zq9vKh7wR3xPq"),
+            ("+ docker login -up Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("+ docker login -u u -p=Zq9vKh7wR3xPq r\n", "Zq9vKh7wR3xPq"),
+            ("+ unzip -P Zq9vKh7wR3xPq a.zip\n", "Zq9vKh7wR3xPq"),
+            ("+ keytool -storepass Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("+ lftp -u u,Zq9vKh7wR3xPq h\n", "Zq9vKh7wR3xPq"),
             ("ngrok authtoken Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
             ("+ htpasswd -b f user Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
         ];
@@ -2393,6 +2458,7 @@ mod tests {
             "GIT_ASKPASS=/usr/local/bin/askpass\nSSH_ASKPASS=/usr/bin/ssh-askpass\nuser.signingkey=ABCDEF1234567890\n",
             "mysql -uroot -P 3306 -p -h db\npsql -h db -p 5432 -U app\n",
             "curl -u admin:$ADMIN_PASSWORD https://x\n",
+            "//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}\nmonkey=1\nturnkey=yes\n",
             "apiVersion: v1\nkind: ConfigMap\ndata:\n  token_ttl: 1h\n  auth_mode: oidc\n  key_rotation: enabled\n  password_policy: strong\n",
             "  with:\n    token: ***\n    persist-credentials: false\n",
             "properties:\n  password:\n    type: string\n    minLength: 8\n",

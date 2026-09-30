@@ -234,6 +234,18 @@ pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
             end: m.end(),
         });
     }
+    for m in CLOUD_TOKEN_RE.find_iter(text) {
+        let kind = if m.as_str().starts_with("ya29.") {
+            "Google access token"
+        } else {
+            "Heroku token"
+        };
+        out.push(TokenSpan {
+            kind,
+            start: m.start(),
+            end: m.end(),
+        });
+    }
     out
 }
 
@@ -262,6 +274,14 @@ pub const JWT_KIND: &str = "JWT";
 static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
         .expect("jwt regex is valid")
+});
+
+/// Bare cloud CLI tokens (redactor-only, like JWTs): Google OAuth access
+/// tokens (`ya29.…`, printed by `gcloud auth print-access-token`) and Heroku
+/// API tokens (`HRKU-…`).
+static CLOUD_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"ya29\.[A-Za-z0-9_\-][A-Za-z0-9_.\-]{19,}|HRKU-[A-Za-z0-9_\-]{20,}")
+        .expect("cloud token regex is valid")
 });
 
 /// The END line of a private-key block, of every kind the `k7` header matches.

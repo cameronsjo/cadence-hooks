@@ -120,17 +120,23 @@ fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
         if depth < MAX_WRAPPER_DEPTH {
             let stripped = strip_group_wrappers(&segments[i].0);
             let mut children = child_scripts(argv, stripped);
-            children.extend(process_substitutions(stripped));
+            let login_sink = is_login_sink(argv);
+            if login_sink {
+                // Only the here-string child feeds the sink's stdin; every
+                // other child (an argv `$(…)`) is still judged.
+                let fed = here_string_bodies(stripped);
+                children.retain(|c| !fed.iter().any(|f| f.trim() == c.trim()));
+            } else {
+                children.extend(process_substitutions(stripped));
+            }
             // Every child is judged, wherever its output goes: an argument
             // can be printed by the command, a runner, `set -x` or a verbose
             // flag, and an allow list of "safe consumers" kept leaking
-            // (review round 4). The one exception is a command that takes the
-            // secret on stdin by design (`--password-stdin`, `--with-token`)
-            // fed by a here-string or process substitution.
-            if takes_secret_on_stdin(argv) && (stripped.contains("<<<") || stripped.contains("<("))
-            {
-                children.clear();
-            }
+            // (review round 4). The one exception: a login command that takes
+            // the secret on stdin by design (`docker login --password-stdin`,
+            // `gh auth login --with-token`), for the here-string or process
+            // substitution that feeds it — not for anything else in the line.
+
             for child in children {
                 if let Some(label) = exposed_in(&child, depth + 1) {
                     return Some(label);
@@ -277,23 +283,141 @@ fn producer(argv: &[String]) -> Option<&'static str> {
             (reads && field).then_some("vault read -field")
         }
         "aws" => {
-            let gets = rest.iter().any(|t| t == "secretsmanager")
-                && rest.iter().any(|t| t == "get-secret-value");
-            gets.then_some("aws secretsmanager get-secret-value")
+            let has = |w: &str| rest.iter().any(|t| t == w);
+            if has("secretsmanager") && has("get-secret-value") {
+                Some("aws secretsmanager get-secret-value")
+            } else if (has("ecr") || has("ecr-public")) && has("get-login-password") {
+                Some("aws ecr get-login-password")
+            } else if has("ssm")
+                && rest.iter().any(|t| t.starts_with("get-parameter"))
+                && has("--with-decryption")
+            {
+                Some("aws ssm get-parameter --with-decryption")
+            } else if rest
+                .windows(2)
+                .any(|w| w[0] == "configure" && w[1] == "get")
+                && rest.iter().any(|t| {
+                    let t = t.to_ascii_lowercase();
+                    t.contains("secret") || t.contains("token") || t.contains("password")
+                })
+            {
+                Some("aws configure get <secret>")
+            } else {
+                None
+            }
         }
+        "az" => {
+            let has3 = |a: &str, b: &str, c: &str| {
+                rest.windows(3).any(|w| w[0] == a && w[1] == b && w[2] == c)
+            };
+            if has3("keyvault", "secret", "show") {
+                Some("az keyvault secret show")
+            } else if rest
+                .windows(2)
+                .any(|w| w[0] == "account" && w[1] == "get-access-token")
+            {
+                Some("az account get-access-token")
+            } else {
+                None
+            }
+        }
+        "heroku" => rest
+            .iter()
+            .any(|t| t == "auth:token")
+            .then_some("heroku auth:token"),
+        "gopass" => rest
+            .iter()
+            .find(|t| !t.starts_with('-'))
+            .is_some_and(|t| matches!(t.as_str(), "show" | "cat"))
+            .then_some("gopass show"),
+        "bw" => (rest
+            .windows(2)
+            .any(|w| w[0] == "get" && matches!(w[1].as_str(), "password" | "totp" | "notes")))
+        .then_some("bw get password"),
+        "lpass" => (rest.iter().any(|t| t == "show")
+            && rest.iter().any(|t| {
+                matches!(t.as_str(), "--password" | "--notes") || t.starts_with("--field")
+            }))
+        .then_some("lpass show --password"),
+        "doppler" => (rest.windows(2).any(|w| w[0] == "secrets" && w[1] == "get")
+            && rest.iter().any(|t| t == "--plain"))
+        .then_some("doppler secrets get --plain"),
         "gcloud" => {
             let access = rest
                 .windows(3)
                 .any(|w| w[0] == "secrets" && w[1] == "versions" && w[2] == "access");
-            access.then_some("gcloud secrets versions access")
+            let token = rest.iter().any(|t| t == "auth")
+                && rest
+                    .iter()
+                    .any(|t| t == "print-access-token" || t == "print-identity-token");
+            if access {
+                Some("gcloud secrets versions access")
+            } else if token {
+                Some("gcloud auth print-access-token")
+            } else {
+                None
+            }
         }
+        // `pass show NAME`, and `pass NAME` (shorthand for show); the other
+        // subcommands list, edit or manage the store.
         "pass" => rest
             .iter()
             .find(|t| !t.starts_with('-'))
-            .is_some_and(|t| t == "show")
+            .is_some_and(|t| !PASS_SUBCOMMANDS.contains(&t.as_str()))
             .then_some("pass show"),
         _ => None,
     }
+}
+
+/// `pass` subcommands that do not print a secret.
+const PASS_SUBCOMMANDS: &[&str] = &[
+    "ls", "list", "find", "search", "grep", "insert", "add", "edit", "generate", "rm", "remove",
+    "delete", "mv", "rename", "cp", "copy", "git", "init", "help", "version",
+];
+
+/// A login command that takes its secret on stdin by design:
+/// `docker|podman|nerdctl|helm registry|oras … login --password-stdin` or
+/// `gh auth login --with-token`.
+fn is_login_sink(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let word = command_word(first);
+    let has = |w: &str| argv.iter().any(|t| t == w);
+    match word.as_ref() {
+        "docker" | "podman" | "nerdctl" | "helm" | "oras" | "buildah" | "skopeo" => {
+            has("login") && has("--password-stdin")
+        }
+        "gh" => has("auth") && has("login") && has("--with-token"),
+        _ => false,
+    }
+}
+
+/// Bodies of the `$(…)` a here-string (`<<< "$(…)"`) expands, which is what
+/// a login sink reads on stdin.
+fn here_string_bodies(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = segment;
+    while let Some(at) = rest.find("<<<") {
+        let after = rest[at + 3..].trim_start().trim_start_matches(['"', '\'']);
+        if let Some(body) = after.strip_prefix("$(") {
+            let mut depth = 1;
+            let end = body
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .map_or(body.len(), |(i, _)| i);
+            out.push(body[..end].to_string());
+        }
+        rest = &rest[at + 3..];
+    }
+    out
 }
 
 /// `kubectl get secret -o json|yaml` piped into `jq`/`yq`: the filter strips
@@ -564,6 +688,53 @@ mod tests {
             ),
             ("cat <(pass show x)", "pass show"),
             ("cat <<< \"$(op read op://v/i/f)\"", "op read"),
+            // Round 5: the stdin sink needs a real login command, and only
+            // its here-string is exempt.
+            (
+                "echo \"$(op read op://v/i/p)\" --password-stdin <<< x",
+                "op read",
+            ),
+            ("cat --with-token <<< \"$(op read op://v/i/p)\"", "op read"),
+            (
+                "tee /dev/stderr --password-stdin <<< \"$(op read op://v/i/p)\"",
+                "op read",
+            ),
+            ("cat <(op read op://v/i/p) --with-token", "op read"),
+            (
+                "docker login -u \"$(op read op://v/i/u)\" --password-stdin r <<< \"$(op read op://v/i/p)\"",
+                "op read",
+            ),
+            // Round 5 producers.
+            (
+                "gcloud auth print-access-token",
+                "gcloud auth print-access-token",
+            ),
+            (
+                "gcloud auth application-default print-access-token",
+                "gcloud auth print-access-token",
+            ),
+            ("heroku auth:token", "heroku auth:token"),
+            (
+                "aws configure get aws_secret_access_key",
+                "aws configure get <secret>",
+            ),
+            (
+                "aws ecr get-login-password --region x",
+                "aws ecr get-login-password",
+            ),
+            (
+                "aws ssm get-parameter --name /x --with-decryption",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            (
+                "az keyvault secret show --vault-name v -n x",
+                "az keyvault secret show",
+            ),
+            ("az account get-access-token", "az account get-access-token"),
+            ("pass db", "pass show"),
+            ("gopass show db", "gopass show"),
+            ("bw get password item", "bw get password"),
+            ("lpass show --password item", "lpass show --password"),
             ("printf \"%s\\n\" \"$(op read x)\"", "op read"),
             ("docker run -e T=\"$(op read x)\" alpine env", "op read"),
             // Round 4: every nested producer asks, whatever consumes it.
@@ -610,6 +781,11 @@ mod tests {
             "op read -o /tmp/f op://v/i/f",
             // A secret fed on stdin to a command that takes it there by design.
             "docker login --password-stdin <<< \"$(op read op://v/i/f)\"",
+            "gh auth login --with-token <<< \"$(op read op://v/i/t)\"",
+            "aws configure get region",
+            "aws ssm get-parameter --name /x",
+            "pass ls",
+            "pass",
             "gh auth login --with-token < <(op read op://v/i/f)",
             "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
             "vault kv get secret/x",
