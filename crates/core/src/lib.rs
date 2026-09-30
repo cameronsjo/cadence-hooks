@@ -89,6 +89,15 @@ pub enum HookEvent {
     /// changed — so the only output it accepts is
     /// `hookSpecificOutput.additionalContext`, delivered with the next request.
     PostModelSwitch,
+    /// PreModelSwitch — fires before Claude Code applies a switch the operator
+    /// requested (`/model <id>`, the `/model` picker, or an SDK `set_model`).
+    /// Requires Claude Code 2.1.251 or later. It can block the switch, and
+    /// `Outcome::Ask` renders as `permissionDecision: "ask"`, which the TUI
+    /// shows as a "Switch model?" confirm. **Measured on 2.1.285
+    /// (cameronsjo/cadence-hooks#989): with no human attached (`source: "sdk"`)
+    /// an `ask` is refused exactly like a `deny`** — so a check that means to
+    /// confirm, never block, must ask only on an interactive `source`.
+    PreModelSwitch,
 }
 
 impl HookEvent {
@@ -101,6 +110,7 @@ impl HookEvent {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
             HookEvent::PostModelSwitch => "PostModelSwitch",
+            HookEvent::PreModelSwitch => "PreModelSwitch",
         }
     }
 
@@ -114,6 +124,7 @@ impl HookEvent {
             "SessionStart" => Some(HookEvent::SessionStart),
             "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
             "PostModelSwitch" => Some(HookEvent::PostModelSwitch),
+            "PreModelSwitch" => Some(HookEvent::PreModelSwitch),
             _ => None,
         }
     }
@@ -133,6 +144,9 @@ impl HookEvent {
             HookEvent::UserPromptSubmit => r#"{"prompt":"test prompt"}"#,
             HookEvent::PostModelSwitch => {
                 r#"{"session_id":"test","hook_event_name":"PostModelSwitch","from_model":"claude-opus-5","to_model":"claude-sonnet-5","source":"command"}"#
+            }
+            HookEvent::PreModelSwitch => {
+                r#"{"session_id":"test","hook_event_name":"PreModelSwitch","from_model":"claude-opus-5-5","to_model":"claude-sonnet-5-5","requested_model":"claude-sonnet-5-5","source":"command"}"#
             }
         }
     }
@@ -161,7 +175,8 @@ pub enum Outcome {
     /// an `ask` decision prompts the user *even when a settings `allow` rule
     /// would otherwise auto-approve* — so a guard can force a confirmation on an
     /// operation it can neither prove safe (Allow) nor prove dangerous (Block).
-    /// PreToolUse only; never emitted by a PostToolUse hook.
+    /// PreToolUse and PreModelSwitch only (the latter renders the TUI's
+    /// "Switch model?" confirm); never emitted by a PostToolUse hook.
     Ask,
 }
 
@@ -4160,6 +4175,7 @@ mod tests {
         assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
         assert_eq!(HookEvent::UserPromptSubmit.name(), "UserPromptSubmit");
         assert_eq!(HookEvent::PostModelSwitch.name(), "PostModelSwitch");
+        assert_eq!(HookEvent::PreModelSwitch.name(), "PreModelSwitch");
     }
 
     #[test]
@@ -4178,20 +4194,21 @@ mod tests {
     fn from_name_rejects_an_unmodeled_event() {
         // Silence, not a defaulted event: a caller that guessed would emit a
         // `hookEventName` naming an event that never fired.
-        assert_eq!(HookEvent::from_name("PreModelSwitch"), None);
         assert_eq!(HookEvent::from_name("SessionEnd"), None);
+        assert_eq!(HookEvent::from_name("premodelswitch"), None);
         assert_eq!(HookEvent::from_name(""), None);
         assert_eq!(HookEvent::from_name("pretooluse"), None);
     }
 
     /// Every modeled event, so an added variant joins the enumerated tests
     /// instead of quietly skipping them.
-    const EVERY_EVENT: [HookEvent; 5] = [
+    const EVERY_EVENT: [HookEvent; 6] = [
         HookEvent::PreToolUse,
         HookEvent::PostToolUse,
         HookEvent::SessionStart,
         HookEvent::UserPromptSubmit,
         HookEvent::PostModelSwitch,
+        HookEvent::PreModelSwitch,
     ];
 
     #[test]
@@ -4222,6 +4239,40 @@ mod tests {
         assert!(input.from_model.is_some());
         assert!(input.to_model.is_some());
         assert_eq!(input.source.as_deref(), Some("command"));
+    }
+
+    #[test]
+    fn pre_model_switch_sample_carries_the_switch_fields() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::PreModelSwitch.sample_payload()).unwrap();
+        assert_eq!(input.hook_event_name.as_deref(), Some("PreModelSwitch"));
+        assert!(input.from_model.is_some());
+        assert!(input.to_model.is_some());
+        assert_eq!(input.source.as_deref(), Some("command"));
+    }
+
+    /// The probe-verified confirm shape (cameronsjo/cadence-hooks#989, Claude
+    /// Code 2.1.285): an `Ask` on PreModelSwitch must render as
+    /// `hookSpecificOutput.permissionDecision: "ask"` under the
+    /// `PreModelSwitch` event name, reason in `permissionDecisionReason`.
+    #[test]
+    fn ask_on_pre_model_switch_renders_the_probe_verified_confirm_shape() {
+        let out = render_output(
+            Outcome::Ask,
+            Some("confirm this"),
+            None,
+            HookEvent::PreModelSwitch,
+            None,
+        );
+        assert!(out.stderr.is_none());
+        let v: serde_json::Value = serde_json::from_str(&out.stdout.unwrap()).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreModelSwitch");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "confirm this"
+        );
+        assert_eq!(Outcome::Ask.code(), 0);
     }
 
     // --- model_matches (shared by guard-read-model and model-posture) ---

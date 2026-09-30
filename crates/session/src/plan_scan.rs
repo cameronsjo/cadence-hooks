@@ -112,6 +112,11 @@ pub(crate) struct InFlightPlan {
     pub(crate) rel_path: String,
     pub(crate) status: String,
     pub(crate) branch: Option<String>,
+    /// The frontmatter `approved_session_id:` [`crate::persist_plan`] records
+    /// for the session that approved the plan — how `plan-driver` binds a
+    /// session to its plan before falling back to `branch:`
+    /// (cameronsjo/cadence-hooks#989). `None` when absent or a placeholder.
+    pub(crate) approved_session_id: Option<String>,
 }
 
 /// The shared, fence-aware checkbox scan — the ONE body reader every checkbox
@@ -342,11 +347,16 @@ pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
             if !matches_in_flight_or_blocked(&facts.status) {
                 return None;
             }
+            let approved_session_id = crate::persist_plan::leading_frontmatter_block(&content)
+                .and_then(|block| frontmatter_value(block, "approved_session_id"))
+                .map(unquote)
+                .filter(|s| is_present(s));
             let file_name = path.file_name()?.to_str()?.to_string();
             Some(InFlightPlan {
                 rel_path: format!("docs/plans/{file_name}"),
                 status: facts.status,
                 branch: facts.branch,
+                approved_session_id,
                 path,
             })
         })
@@ -944,6 +954,13 @@ fn legacy_recommended_model(body: &str) -> Option<Tier> {
     visible_lines(body)
         .take_while(|line| !line.starts_with("## "))
         .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
+}
+
+/// The Driver tier recorded in the plan doc at `path` — [`recommended_tier`]
+/// over the same capped read the frontmatter scan uses. `None` on any read
+/// failure or when nothing settles the tier (fail-open, ADR-0001).
+pub(crate) fn plan_driver_tier(path: &Path) -> Option<Tier> {
+    recommended_tier(&read_capped(path)?)
 }
 
 /// Parse the plan's recommended Driver tier from its body, per the pinned

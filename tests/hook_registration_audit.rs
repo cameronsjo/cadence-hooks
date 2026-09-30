@@ -318,6 +318,11 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails guard-runbook-scrub",
         "cameronsjo/cadence-hooks#755",
     ),
+    // The PreModelSwitch confirm ships here first; its cadence-plugin hooks.json
+    // entry (a `PreModelSwitch` block) rides the follow-up monorepo wiring PR,
+    // which also needs an INTENTIONAL_CROSS_PLUGIN_HOOKS row (two-PR shape,
+    // cameronsjo/cadence-hooks#989).
+    ("session plan-driver", "cameronsjo/cadence-hooks#989"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -2481,7 +2486,11 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let event = if window.contains(", post") || window.contains("post)") {
+        // `pre_model_switch` first: `, pre_model_switch` also contains `, pre`.
+        let event = if window.contains(", pre_model_switch") || window.contains("pre_model_switch)")
+        {
+            "PreModelSwitch"
+        } else if window.contains(", post") || window.contains("post)") {
             "PostToolUse"
         } else if window.contains(", session") || window.contains("session)") {
             "SessionStart"

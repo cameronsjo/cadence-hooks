@@ -922,6 +922,17 @@ pub const HOOKS: &[HookEntry] = &[
         remote: RemotePolicy::Run,
         suppressible: false,
     },
+    HookEntry {
+        name: "plan-driver",
+        description: "Ask to confirm a /model switch (command or picker; never SDK, where ask refuses) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
+        namespace: "session",
+        events: &[HookEvent::PreModelSwitch],
+        // Remote: read-only against the repo; a cloud operator can still
+        // /model and answer the confirm (#989).
+        remote: RemotePolicy::Run,
+        // It asks, never nudges.
+        suppressible: false,
+    },
 ];
 
 /// Whether `.claude/cadence.json` may silence `hook`'s nudges. `false` for an
