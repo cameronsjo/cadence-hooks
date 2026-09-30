@@ -2554,6 +2554,24 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
+    /// A process substitution spends no expansion level, so a literal
+    /// substitution inside one is evaluated as before (#1266 review C2).
+    #[test]
+    fn a_substitution_inside_a_process_substitution_is_evaluated() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git $(echo reset) --hard))))",
+            "cat <(echo $(echo $(echo $(git `echo reset` --hard))))",
+            "cat <(echo $(echo $(echo $(git reset $(echo --hard)))))",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
     /// A 200 KB flood of process-substitution openers still reaches the
     /// dangerous tail, promptly. Generous for a debug build.
     #[test]

@@ -218,6 +218,10 @@ CORPUS="$WORK/corpus.tsv"
     printf '1266-wrap-sh\techo $(cat <(echo $(echo $(sh -c '"'"'cp d .env'"'"'))))\n'
     printf '1266-wrap-eval\tdiff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))\n'
     printf '1266-wrap-nested\ttrue >(echo "$(echo $(sh -c '"'"'sh -c '"'"'"'"'"'"'"'"'git reset --hard'"'"'"'"'"'"'"'"''"'"'))")\n'
+    # #1266 review round 3: a `<(…)` spends no level, so the substitutions
+    # inside one are evaluated as on main.
+    printf '1266-procsub-eval-sub\tcat <(echo $(echo $(echo $(git $(echo reset) --hard))))\n'
+    printf '1266-procsub-eval-glue\tdiff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))\n'
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling
@@ -275,6 +279,7 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-procsub-dquoted\techo "<(git reset --hard)"\n'
     printf 'allow-case-comment\tD=$(cd /tmp && pwd); git push origin main # just in case\n'
     printf 'allow-deep-plain\techo $(echo $(echo $(echo $(git status))))\n'
+    printf 'allow-case-operand\tD=$(cd /tmp && pwd); grep case x; git push origin main\n'
 } > "$STAY_ALLOWED"
 
 # --- consumers ---------------------------------------------------------------

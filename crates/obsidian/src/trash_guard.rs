@@ -38,6 +38,106 @@ fn is_destructive(command: &str) -> bool {
     is_destructive_at(command, 0)
 }
 
+thread_local! {
+    static RESCAN_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static RESCAN_SPENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Bytes the `eval`/`coproc`/`find -exec` re-scans of one judgement may read
+/// again (cameronsjo/cadence-hooks#1266 review C3). Each re-scan runs the
+/// whole `command_segments` walk on its operand, and a flood of
+/// `$(eval `/`<(eval ` lists that walk's segments by the dozen, each most of
+/// the command: re-reading every one cost 14–20 s at 200 KB, past the hook
+/// deadline, which fails open. A fixed allowance, not one per byte of the
+/// command: one re-scan of a 200 KB operand alone is most of the deadline.
+const RESCAN_ALLOWANCE: usize = 64 * 1024;
+
+thread_local! {
+    static JUDGED_SEGMENTS: std::cell::RefCell<Option<(String, std::rc::Rc<Vec<String>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`command_segments`] of `command`, read once per judgement: the
+/// destructive test, the operand walk, the sibling check and the redirect
+/// check each asked for the same walk, which on a 200 KB flood is most of
+/// the deadline (cameronsjo/cadence-hooks#1266 review C3). Only the command
+/// being judged is kept, and only while a [`RescanBudget`] is armed.
+fn segments_of(command: &str) -> std::rc::Rc<Vec<String>> {
+    let cached = JUDGED_SEGMENTS.with(|judged| {
+        judged
+            .borrow()
+            .as_ref()
+            .filter(|(text, _)| text == command)
+            .map(|(_, segments)| segments.clone())
+    });
+    if let Some(segments) = cached {
+        return segments;
+    }
+    let segments = std::rc::Rc::new(command_segments(command));
+    let armed = RESCAN_LEFT.with(|left| left.get().is_some());
+    JUDGED_SEGMENTS.with(|judged| {
+        let mut judged = judged.borrow_mut();
+        if armed && judged.is_none() {
+            *judged = Some((command.to_string(), segments.clone()));
+        }
+    });
+    segments
+}
+
+/// The re-scan allowance for one judgement, cleared when dropped.
+struct RescanBudget;
+
+impl RescanBudget {
+    fn arm() -> RescanBudget {
+        RESCAN_LEFT.with(|left| left.set(Some(RESCAN_ALLOWANCE)));
+        RESCAN_SPENT.with(|spent| spent.set(false));
+        JUDGED_SEGMENTS.with(|judged| *judged.borrow_mut() = None);
+        RescanBudget
+    }
+
+    /// Whether the allowance ran out, leaving a re-scan unread.
+    fn spent() -> bool {
+        RESCAN_SPENT.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for RescanBudget {
+    fn drop(&mut self) {
+        RESCAN_LEFT.with(|left| left.set(None));
+        JUDGED_SEGMENTS.with(|judged| *judged.borrow_mut() = None);
+    }
+}
+
+/// [`is_destructive_at`] on a script a segment re-executes, charged to the
+/// re-scan allowance. Past it the script is not read: it counts as
+/// destructive when its text could spell a deleting verb or a redirect
+/// ([`DELETING_SPELLINGS`], the [`eval_flood`] rule), so the guard refuses
+/// rather than grinding past its deadline.
+fn rescanned_destructive(script: &str, depth: usize) -> bool {
+    if rescan(script) {
+        is_destructive_at(script, depth)
+    } else {
+        DELETING_SPELLINGS.iter().any(|verb| script.contains(verb))
+    }
+}
+
+/// Charge a re-scan of `text`; `false`, and the allowance marked spent, when
+/// it does not fit. Unarmed, every re-scan fits.
+fn rescan(text: &str) -> bool {
+    RESCAN_LEFT.with(|left| match left.get() {
+        None => true,
+        Some(have) if have >= text.len() => {
+            left.set(Some(have - text.len()));
+            true
+        }
+        Some(_) => {
+            left.set(Some(0));
+            RESCAN_SPENT.with(|spent| spent.set(true));
+            false
+        }
+    })
+}
+
 /// Substrings that mark a deleting verb inside text the scan will not peel.
 const DELETING_SPELLINGS: &[&str] = &[
     "rm", "unlink", "shred", "truncate", "find", "git", "-delete", ">",
@@ -127,7 +227,7 @@ fn coproc_command(argv: &[String]) -> Option<&[String]> {
 
 /// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
 fn is_destructive_at(command: &str, depth: usize) -> bool {
-    for segment in command_segments(command) {
+    for segment in segments_of(command).iter().cloned() {
         // Compound scaffolding first: `for f in *.md; do rm $f; done` segments
         // as `do rm $f`, `case x in x) rm $f;; esac` as `case x in x) rm $f`,
         // and `f() { rm $f; }` as `f() { rm $f` — so without this the head word
@@ -147,12 +247,11 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // `eval` re-executes its operand, so scan that operand as a command in
         // its own right — the head word of the segment is `eval`, and the verb
         // it runs is invisible to a head test.
-        if verb == "eval"
-            && depth < MAX_NESTED_DEPTH
-            && argv.len() > 1
-            && is_destructive_at(&argv[1..].join(" "), depth + 1)
-        {
-            return true;
+        if verb == "eval" && depth < MAX_NESTED_DEPTH && argv.len() > 1 {
+            let script = argv[1..].join(" ");
+            if rescanned_destructive(&script, depth + 1) {
+                return true;
+            }
         }
         // `coproc` is a reserved word that runs a command, not a prefix with
         // flags, so the verb behind it is invisible to a head test. Its
@@ -160,9 +259,11 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         if verb == "coproc"
             && depth < MAX_NESTED_DEPTH
             && let Some(rest) = coproc_command(argv)
-            && is_destructive_at(&rest.join(" "), depth + 1)
         {
-            return true;
+            let script = rest.join(" ");
+            if rescanned_destructive(&script, depth + 1) {
+                return true;
+            }
         }
         // `find … -delete` — `find` alone is read-only; only `-delete`
         // destroys. Exec-family actions name another executable position, so
@@ -200,7 +301,7 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
                 if depth < MAX_NESTED_DEPTH
                     && child_scripts(action_argv, "")
                         .iter()
-                        .any(|script| is_destructive_at(script, depth + 1))
+                        .any(|script| rescanned_destructive(script, depth + 1))
                 {
                     return true;
                 }
@@ -474,7 +575,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     if command.len() > MAX_JUDGED_COMMAND_LEN {
         return false;
     }
-    let segments = command_segments(command);
+    let segments: Vec<String> = segments_of(command).to_vec();
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
     }
@@ -535,7 +636,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// unquoted redirections are skipped; `find` contributes its start paths. A
 /// deletion whose operands arrive on stdin (`xargs rm`) names none here.
 fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
-    for segment in command_segments(command) {
+    for segment in segments_of(command).iter().cloned() {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else {
@@ -563,17 +664,25 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
                 let action_argv = peel_command_runners(&argv[i + 1..]);
                 if depth < MAX_NESTED_DEPTH {
                     for script in child_scripts(action_argv, "") {
-                        deletion_operands(&script, depth + 1, out);
+                        if rescan(&script) {
+                            deletion_operands(&script, depth + 1, out);
+                        }
                     }
                 }
             }
         } else if verb == "eval" && depth < MAX_NESTED_DEPTH && argv.len() > 1 {
-            deletion_operands(&argv[1..].join(" "), depth + 1, out);
+            let script = argv[1..].join(" ");
+            if rescan(&script) {
+                deletion_operands(&script, depth + 1, out);
+            }
         } else if verb == "coproc"
             && depth < MAX_NESTED_DEPTH
             && let Some(rest) = coproc_command(argv)
         {
-            deletion_operands(&rest.join(" "), depth + 1, out);
+            let script = rest.join(" ");
+            if rescan(&script) {
+                deletion_operands(&script, depth + 1, out);
+            }
         }
     }
 }
@@ -693,7 +802,7 @@ const GLOB_CHARS: &[char] = &['*', '?', '[', '{', '$', '`'];
 /// path applies), so a deletion that follows can reach the vault through what
 /// it made: the physical check reads the disk before the link exists.
 fn sibling_reshapes_vault(command: &str, cwd: &str, vault: &str, home: Option<&str>) -> bool {
-    for segment in command_segments(command) {
+    for segment in segments_of(command).iter().cloned() {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else {
@@ -743,6 +852,10 @@ fn operands_touch_vault(
 ) -> bool {
     let mut operands = Vec::new();
     deletion_operands(command, 0, &mut operands);
+    // An operand the re-scan allowance left unread may name a vault path.
+    if RescanBudget::spent() {
+        return true;
+    }
     let mut calls = 0;
     let mut canonical_vault: Option<Option<String>> = None;
     for operand in operands {
@@ -832,6 +945,7 @@ fn check_destructive_in_vault_at(
         None => {}
     }
 
+    let _rescan = RescanBudget::arm();
     if is_destructive(command) {
         let cwd_in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
         let mut in_vault = cwd_in_vault && !deletions_all_outside_vault(command, &vault, meta);
@@ -900,7 +1014,7 @@ fn check_destructive_in_vault_at(
     // fails open (cameronsjo/cadence-hooks#1233). The verdict for a target
     // does not depend on which segment named it.
     let mut judged = std::collections::HashSet::new();
-    for segment in command_segments(command) {
+    for segment in segments_of(command).iter().cloned() {
         for target in clobber_redirect_targets(&segment)
             .into_iter()
             .flat_map(|target| with_brace_expansion(&target))
@@ -2059,6 +2173,34 @@ mod tests {
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
             );
+        }
+    }
+
+    /// An `eval` flood the re-scan allowance cannot read is judged from its
+    /// text inside the deadline: a deleting verb in it blocks, and a flood
+    /// with none is allowed (#1266 review C3).
+    #[test]
+    fn an_eval_substitution_flood_is_judged_promptly() {
+        let limit =
+            std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
+        for opener in ["<(eval ", "$(eval ", "eval $(eval "] {
+            let flood = opener.repeat(200 * 1024 / opener.len());
+            for (tail, want) in [
+                ("", cadence_hooks_core::Outcome::Allow),
+                (" ; rm note.md", cadence_hooks_core::Outcome::Block),
+            ] {
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    outcome_in_vault(&format!("{flood}{tail}")),
+                    want,
+                    "{opener:?}{tail:?}"
+                );
+                assert!(
+                    started.elapsed() < limit,
+                    "{opener:?}: {:?}",
+                    started.elapsed()
+                );
+            }
         }
     }
 

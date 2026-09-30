@@ -6514,9 +6514,9 @@ pub(crate) fn mentions_case_keyword(script: &str) -> bool {
     let mut quote: Option<Quote> = None;
     let mut i = 0;
     while i < chars.len() {
-        // `\case` is no keyword to bash, but that line then fails to parse
-        // rather than run, so it counts as one: either reading only turns
-        // scoping off.
+        // `\case` is no keyword to bash, but in command position that line
+        // fails to parse rather than run, so it counts as one: either
+        // reading only turns scoping off.
         if quote.is_none() && chars[i] == '\\' && chars.get(i + 1) == Some(&'c') {
             i += 1;
             continue;
@@ -6525,17 +6525,61 @@ pub(crate) fn mentions_case_keyword(script: &str) -> bool {
             i = next;
             continue;
         }
-        let word_start =
-            i == 0 || !(chars[i - 1].is_alphanumeric() || "_-./$=:@%+,".contains(chars[i - 1]));
-        if word_start
-            && chars[i..].starts_with(&['c', 'a', 's', 'e'])
+        if chars[i..].starts_with(&['c', 'a', 's', 'e'])
             && chars.get(i + 4).is_some_and(|c| c.is_whitespace())
+            && in_command_position(&chars, i)
         {
             return true;
         }
         i += 1;
     }
     false
+}
+
+/// Whether the word starting at `chars[at]` (or at the `\` just before it)
+/// is in command position: first on its line, or after `;`, `&`, `|`, `(`,
+/// `{`, or a `then`/`do`/`else`/`elif`/`if`/`while`/`until`/`!`/`time`
+/// word. `grep case x` has `case` as an operand, which is no keyword.
+fn in_command_position(chars: &[char], at: usize) -> bool {
+    let mut k = at;
+    if k > 0 && chars[k - 1] == '\\' {
+        k -= 1;
+    }
+    while k > 0 && matches!(chars[k - 1], ' ' | '\t') {
+        k -= 1;
+    }
+    if k == at && k > 0 {
+        // Glued to what precedes it: `xcase`, `$case`, `=case`.
+        return matches!(chars[k - 1], ';' | '&' | '|' | '(' | '{' | '\n' | '`');
+    }
+    let Some(&before) = k.checked_sub(1).and_then(|p| chars.get(p)) else {
+        return true;
+    };
+    // After a closing quote the scan may disagree with bash on where the
+    // quoted run ended (`$'\''`), so a `case` there counts: over-reading
+    // only turns scoping off.
+    if matches!(
+        before,
+        ';' | '&' | '|' | '(' | '{' | '\n' | '`' | '\'' | '"'
+    ) {
+        return true;
+    }
+    let end = k;
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '!') {
+        start -= 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    let word_starts_command = start == 0
+        || matches!(
+            chars[start - 1],
+            ' ' | '\t' | ';' | '&' | '|' | '(' | '{' | '\n'
+        );
+    word_starts_command
+        && matches!(
+            word.as_str(),
+            "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "!" | "time"
+        )
 }
 
 /// The text after each inner `(` a top-level segment leaves open at its end
@@ -8289,6 +8333,32 @@ pub fn command_segments(command: &str) -> Vec<String> {
 }
 
 thread_local! {
+    static FREE_LEVELS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One process-substitution level [`emit_segment`] reads without charging
+/// the wrapper depth, held while that body is read. At most
+/// [`MAX_WRAPPER_DEPTH`] are held at once.
+struct FreeLevel;
+
+impl FreeLevel {
+    fn take() -> Option<FreeLevel> {
+        FREE_LEVELS.with(|held| {
+            (held.get() < MAX_WRAPPER_DEPTH).then(|| {
+                held.set(held.get() + 1);
+                FreeLevel
+            })
+        })
+    }
+}
+
+impl Drop for FreeLevel {
+    fn drop(&mut self) {
+        FREE_LEVELS.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+thread_local! {
     static FLATTEN_WORK: std::cell::RefCell<Option<FlattenWork>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -8786,14 +8856,25 @@ fn emit_segment(
     // expanded there. The tagged copy is also the worse one: the word it
     // came from lost its quotes to [`tokenize`], and it sits one level deeper
     // with less depth budget.
+    //
+    // **A process substitution's body is read at this segment's depth.**
+    // Before `<(…)`/`>(…)` bodies were surfaced (cameronsjo/cadence-hooks#1233)
+    // their text sat in this segment, and every `$(…)` inside was expanded
+    // at the level its own nesting put it; charging a level for the `<(`
+    // pushed a third `$(…)` inside one past the bound, where it is listed
+    // but not read (#1266 review C2). The free levels are capped at
+    // [`MAX_WRAPPER_DEPTH`] per walk, so a flood of nested `<(` still ends.
     if depth < MAX_WRAPPER_DEPTH {
-        for body in substitution_bodies(&segment) {
+        for (body, procsub) in substitution_bodies_kinded(&segment) {
             if dedupe && body.starts_with(EXPANDED_MARK) {
                 continue;
             }
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
-            expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+            match procsub.then(FreeLevel::take).flatten() {
+                Some(_level) => expand_segments(&body, &mut scope, depth, out, dedupe),
+                None => expand_segments(&body, &mut scope, depth + 1, out, dedupe),
+            }
         }
     }
     //
@@ -8837,9 +8918,9 @@ fn emit_segment(
     let unread = if depth < MAX_WRAPPER_DEPTH {
         Vec::new()
     } else {
-        let mut unread = flattened_bodies(&segment, dedupe, false);
+        let mut unread = flattened_bodies(&segment, dedupe);
         for script in scripts_past_the_bound(&segment) {
-            let inner = flattened_bodies(&script, dedupe, true);
+            let inner = flattened_bodies(&script, dedupe);
             unread.push(script);
             unread.extend(inner);
         }
@@ -8908,13 +8989,8 @@ const FLATTEN_WORK_FLOOR: usize = 1 << 16;
 /// read are listed by [`fragments_of`] instead, and an armed caller sees
 /// [`ExpansionWork::spent`] and refuses. A text already listed in the same
 /// call is not listed again.
-fn flattened_bodies(segment: &str, dedupe: bool, unwrap: bool) -> Vec<String> {
-    let scripts = if unwrap {
-        wrapped_scripts(&executable_tokens(segment))
-    } else {
-        Vec::new()
-    };
-    if scripts.is_empty() && !runs_commands(segment) {
+fn flattened_bodies(segment: &str, dedupe: bool) -> Vec<String> {
+    if !runs_commands(segment) {
         return Vec::new();
     }
     let _scope = FLATTEN_WORK
@@ -8924,28 +9000,22 @@ fn flattened_bodies(segment: &str, dedupe: bool, unwrap: bool) -> Vec<String> {
         let mut work = work.borrow_mut();
         let work = work.as_mut().expect("started above");
         let mut out = Vec::new();
-        // Texts still to read: the segment, whose own words are already
-        // listed, then each wrapper script found on the way (`bash -c`,
-        // `eval`, every [`wrapped_scripts`] runner), whose segments are
-        // listed here because nothing else past the bound reads them
-        // (#1266 review: `cat <(echo $(echo $(echo $(bash -c 'git reset
-        // --hard'))))` listed the wrapper and never its script).
-        let mut texts = std::collections::VecDeque::from([(segment.to_string(), dedupe, false)]);
-        texts.extend(scripts.into_iter().map(|script| (script, false, true)));
+        // Texts still to read: the segment, then each wrapper script found in
+        // a listed level that runs substitutions of its own.
+        let mut texts = std::collections::VecDeque::from([(segment.to_string(), dedupe)]);
         let mut exhausted = false;
-        while let Some((text, dedupe, list_top)) = texts.pop_front() {
-            if exhausted {
+        while let Some((text, dedupe)) = texts.pop_front() {
+            if !flatten_text(work, &text, dedupe, &mut out, &mut texts) {
+                exhausted = true;
                 break;
             }
-            exhausted = !flatten_text(work, &text, dedupe, list_top, &mut out, &mut texts);
         }
         if exhausted {
             ExpansionWork::exhaust();
             if let Some(command) = work.command.take() {
                 let whole: Vec<char> = command.chars().collect();
-                let (mut spent, cap) = (0, 2 * whole.len());
                 for fragment in fragments_of(&whole, [(0, whole.len())]) {
-                    list_unwrapped(work, fragment, &mut out, &mut spent, cap);
+                    list_level(work, &fragment, true, &mut out, None);
                 }
             }
         }
@@ -8953,88 +9023,67 @@ fn flattened_bodies(segment: &str, dedupe: bool, unwrap: bool) -> Vec<String> {
     })
 }
 
-/// Most nested wrapper scripts [`list_unwrapped`] reads out of one
-/// fragment once the allowance is gone.
-const MAX_FALLBACK_UNWRAP: usize = 8;
-
-/// List `segment`, and the segments of every script it runs through a
-/// wrapper, nested up to [`MAX_FALLBACK_UNWRAP`] deep: the fallback
-/// reading. A level is read only while the scripts read so far, `spent`
-/// chars shared by the whole fallback, stay within `cap`: an `eval eval …`
-/// flood peels one word per level, and each level is a copy of the rest.
-fn list_unwrapped(
+/// List the segments of `text` not listed yet in this call. With `unwrap`,
+/// each one's wrapper scripts (`bash -c`, `eval`, every [`wrapped_scripts`]
+/// runner) are listed too, one level, as [`scripts_past_the_bound`] lists
+/// the scripts of the segment at the bound (#1266 review), and a script that
+/// runs substitutions is queued on `texts` for its own levels.
+///
+/// One level only: an `eval eval …` chain peels one word per level, each
+/// level a near-full copy that every guard then reads again. A wrapper
+/// nested in a wrapper is followed by the ordinary walk wherever it sits
+/// above the bound, which is where `<(…)` bodies no longer spend a level.
+fn list_level(
     work: &mut FlattenWork,
-    segment: String,
+    text: &str,
+    unwrap: bool,
     out: &mut Vec<String>,
-    spent: &mut usize,
-    cap: usize,
+    mut texts: Option<&mut std::collections::VecDeque<(String, bool)>>,
 ) {
-    let mut level = vec![segment];
-    for _ in 0..=MAX_FALLBACK_UNWRAP {
-        let size: usize = level.iter().map(String::len).sum();
-        if *spent > cap {
-            break;
+    for segment in split_segments(text).into_iter().map(unmark) {
+        if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
+            continue;
         }
-        *spent += size;
-        let mut next = Vec::new();
-        for segment in level {
-            if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
-                continue;
+        let scripts = if unwrap {
+            wrapped_scripts(&executable_tokens(&segment))
+        } else {
+            Vec::new()
+        };
+        out.push(segment);
+        for script in scripts {
+            list_level(work, &script, false, out, None);
+            if let Some(texts) = texts.as_deref_mut()
+                && runs_commands(&script)
+            {
+                texts.push_back((script, false));
             }
-            for script in wrapped_scripts(&executable_tokens(&segment)) {
-                next.extend(split_segments(&script).into_iter().map(unmark));
-            }
-            out.push(segment);
         }
-        if next.is_empty() {
-            break;
-        }
-        level = next;
     }
 }
 
 /// One text of [`flattened_bodies`]: every body level in it, collapsed and
-/// listed, and every wrapper script in what it lists queued on `texts`.
-/// With `list_top`, the text's own segments are listed first. `false` when
-/// the allowance ran out before the text was read.
+/// listed through [`list_level`]. `false` when the allowance ran out before
+/// the text was read.
 fn flatten_text(
     work: &mut FlattenWork,
     text: &str,
     dedupe: bool,
-    list_top: bool,
     out: &mut Vec<String>,
-    texts: &mut std::collections::VecDeque<(String, bool, bool)>,
+    texts: &mut std::collections::VecDeque<(String, bool)>,
 ) -> bool {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() > work.left || !ExpansionWork::charge(chars.len()) {
         return false;
     }
     work.left -= chars.len();
-    let mut list = |text: &str, work: &mut FlattenWork, out: &mut Vec<String>| {
-        for segment in split_segments(text).into_iter().map(unmark) {
-            if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
-                continue;
-            }
-            let tokens = executable_tokens(&segment);
-            for script in wrapped_scripts(&tokens) {
-                texts.push_back((script, false, true));
-            }
-            out.push(segment);
-        }
-    };
-    if list_top {
-        list(text, work, out);
-    }
     let mut pending = std::collections::VecDeque::new();
-    if runs_commands(text) {
-        let mut top = BodyRanges::default();
-        scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top));
-        pending.extend(
-            top.bodies
-                .into_iter()
-                .filter(|&(start, _)| !(dedupe && chars.get(start) == Some(&EXPANDED_MARK))),
-        );
-    }
+    let mut top = BodyRanges::default();
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top), None);
+    pending.extend(
+        top.bodies
+            .into_iter()
+            .filter(|&(start, _)| !(dedupe && chars.get(start) == Some(&EXPANDED_MARK))),
+    );
     while let Some((start, end)) = pending.pop_front() {
         if start >= end {
             continue;
@@ -9046,7 +9095,7 @@ fn flatten_text(
         work.left -= len;
         let body = &chars[start..end];
         let mut ranges = BodyRanges::default();
-        scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges));
+        scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges), None);
         let mut collapsed = String::with_capacity(len);
         let mut at = 0;
         for &(from, to) in &ranges.hidden {
@@ -9058,7 +9107,7 @@ fn flatten_text(
         if at < body.len() {
             collapsed.extend(&body[at..]);
         }
-        list(&collapsed, work, out);
+        list_level(work, &collapsed, true, out, Some(texts));
         pending.extend(
             ranges
                 .bodies
@@ -10494,6 +10543,15 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     scan_substitution_bodies(segment, &mut Vec::new())
 }
 
+/// [`substitution_bodies`], each paired with whether a process
+/// substitution (`<(…)`/`>(…)`) opened it rather than `$(…)` or a backtick.
+fn substitution_bodies_kinded(segment: &str) -> Vec<(String, bool)> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut kinds = Vec::new();
+    let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds));
+    bodies.into_iter().zip(kinds).collect()
+}
+
 /// [`substitution_bodies`], also recording in `starts` the char index where
 /// each CONFIDENTLY bounded body begins — a terminated `$(…)`, or a closed
 /// backtick span whose own quoting resolved — when the body holds no
@@ -10502,7 +10560,7 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
 /// keyed on `starts` treats every one of them as unknown.
 fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
-    scan_substitution_bodies_in(&chars, starts, None)
+    scan_substitution_bodies_in(&chars, starts, None, None)
 }
 
 /// Where [`scan_substitution_bodies_in`] found each body, as char ranges of
@@ -10524,6 +10582,7 @@ fn scan_substitution_bodies_in(
     chars: &[char],
     starts: &mut Vec<usize>,
     mut ranges: Option<&mut BodyRanges>,
+    mut kinds: Option<&mut Vec<bool>>,
 ) -> Vec<String> {
     let mut record = |body: (usize, usize), hidden: bool| {
         if let Some(ranges) = ranges.as_deref_mut() {
@@ -10588,6 +10647,9 @@ fn scan_substitution_bodies_in(
                     }
                     bodies.push(body);
                 }
+                if let Some(kinds) = kinds.as_deref_mut() {
+                    kinds.resize(bodies.len(), c != '$');
+                }
                 i = end;
                 continue;
             }
@@ -10622,6 +10684,12 @@ fn scan_substitution_bodies_in(
                 push_nonblank(&mut bodies, &chars[blind_end..]);
                 record((i + 2, blind_end - 1), false);
                 record((blind_end, chars.len()), false);
+            }
+            // A widened reading is not a body bash bounds the same way, and
+            // each is most of the text again: it spends a level like any
+            // other, or free levels would multiply the copies.
+            if let Some(kinds) = kinds.as_deref_mut() {
+                kinds.resize(bodies.len(), false);
             }
             break;
         }
@@ -10661,6 +10729,9 @@ fn scan_substitution_bodies_in(
             // any substitution inside it surfaces when that body is itself
             // re-scanned, and continuing the outer loop here would re-walk —
             // and could double-emit — the same text char by char.
+            if let Some(kinds) = kinds.as_deref_mut() {
+                kinds.resize(bodies.len(), false);
+            }
             if quoting_unterminated {
                 push_nonblank(&mut bodies, &chars[j + 1..]);
                 record((j + 1, chars.len()), false);
@@ -10678,6 +10749,9 @@ fn scan_substitution_bodies_in(
             continue;
         }
         i += 1;
+    }
+    if let Some(kinds) = kinds {
+        kinds.resize(bodies.len(), false);
     }
     bodies
 }
@@ -20101,20 +20175,72 @@ mod tests {
         }
     }
 
+    /// A process substitution does not spend a level, so the `$(…)`s inside
+    /// one are read where they were before its body was surfaced: a literal
+    /// substitution three levels in is evaluated (#1266 review C2).
+    #[test]
+    fn a_process_substitution_body_is_read_at_its_parent_s_depth() {
+        for (command, want) in [
+            (
+                "cat <(echo $(echo $(echo $(git $(echo reset) --hard))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(echo $(echo $(echo $(git `echo reset` --hard))))",
+                "git reset --hard",
+            ),
+            (
+                "diff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))",
+                "cp d .env",
+            ),
+            (
+                "echo \"$(true >(true >(echo $($(echo rm) note.md))))\"",
+                "rm note.md",
+            ),
+        ] {
+            let out = command_segments(command);
+            assert!(out.iter().any(|s| s == want), "{command:?}: {out:?}");
+        }
+    }
+
+    /// Out of allowance, every fragment is still listed, and each unwraps
+    /// its own wrapper: one flood cannot spend another's share (#1266 review
+    /// C1).
+    #[test]
+    fn two_eval_floods_past_the_bound_do_not_hide_a_later_command() {
+        let (open, close) = ("echo $(echo $(echo $(echo $(", "))))");
+        let pad = "A".repeat(20_000);
+        for dangerous in [
+            format!("X={pad} cp d .env"),
+            format!("git reset --hard {pad}"),
+            format!("bash -c 'cp d .env' {pad}"),
+        ] {
+            let command = format!(
+                "{open}{}true{close}; {open}{}:{close}; {open}{dangerous}{close}",
+                "eval ".repeat(2000),
+                "eval ".repeat(2000)
+            );
+            let out = command_segments(&command);
+            assert!(
+                out.iter()
+                    .any(|s| s.ends_with("cp d .env") || s.starts_with("git reset --hard")),
+                "{:.20}: {} segments",
+                dangerous,
+                out.len()
+            );
+        }
+    }
+
     /// Past the bound each level is read once, its own nested substitutions
     /// collapsed to their opener, so the operands around one are kept.
     #[test]
     fn flattened_bodies_reads_each_level_once_with_its_own_operands() {
         assert_eq!(
-            flattened_bodies(
-                "echo $(git push $(echo origin) main) `cp $(x) .env`",
-                false,
-                false
-            ),
+            flattened_bodies("echo $(git push $(echo origin) main) `cp $(x) .env`", false),
             ["git push $() main", "cp $() .env", "echo origin", "x"]
         );
         assert_eq!(
-            flattened_bodies("echo '$(rm a)' \"<(rm b)\" \"$(rm c)\"", false, false),
+            flattened_bodies("echo '$(rm a)' \"<(rm b)\" \"$(rm c)\"", false),
             ["rm c"]
         );
     }
@@ -20168,6 +20294,19 @@ mod tests {
             ("echo showcase lowercase", false),
             ("echo in_case", false),
             ("echo case", false),
+            ("grep case x", false),
+            ("grep \\case x", false),
+            ("echo \\case x", false),
+            (
+                "D=$(cd /tmp && pwd); grep case x; git push origin main",
+                false,
+            ),
+            ("true && case a in a) :;; esac", true),
+            ("true |\ncase a in a) :;; esac", true),
+            ("while true; do case a in a) break;; esac; done", true),
+            ("! case a in a) :;; esac", true),
+            ("echo `case x in x) true;; esac`", true),
+            ("echo $'\\'' case x in x) true;; esac", true),
         ] {
             assert_eq!(mentions_case_keyword(script), want, "{script:?}");
         }
