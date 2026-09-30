@@ -6,9 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-- **`guard-critical-grade` refuses applying `impact:critical` or `likelihood:critical` from a Bash `gh` call.** A PreToolUse check on `gh issue|pr create|edit` (`--label`, `-l`, `--add-label`, comma lists, repeated flags, `-l` glued or in a short cluster) and on `gh api` writes to issue and PR endpoints (`labels[]=` fields, `-F labels=@file`, `--input`). Label names match case-insensitively; removals, reads, `gh label create`, and titles or bodies that merely mention a Critical label pass, as does an explicit `-X GET`. A label value the shell computes (`$x`, a backtick) or a `gh api --input` body the guard cannot read blocks, since it cannot be proven safe. The ruling is `CADENCE_ALLOW_CRITICAL_GRADE=1` in the hook process env, so an inline prefix or an earlier `export` in the same command still blocks. **The hooks.json entry lands in a follow-up monorepo PR**, so the subcommand reaches no event until then. (cameronsjo/cadence-hooks#895)
-- **A `labeled` workflow downgrades a Critical grade set by someone off the allowlist.** `.github/workflows/critical-grade-labeled.yml` runs on `issues: labeled` and `pull_request_target: labeled` (no checkout, no third-party actions, `issues: write` and `pull-requests: write` only). When `impact:critical` or `likelihood:critical` lands from a sender outside the `CRITICAL_GRADERS` repo variable (comma-separated logins, defaulting to the repository owner), it removes the label, applies the axis's `high` value, and comments with actor, time, axis, and rationale. (cameronsjo/cadence-hooks#896)
-
 ## [0.115.0] - 2026-09-29
 
 ### Security
