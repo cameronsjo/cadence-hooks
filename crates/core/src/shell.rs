@@ -11842,7 +11842,7 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
             let at = argv[1..].iter().position(|word| {
                 matches!(
                     unescape_word(word).as_ref(),
-                    "rebase" | "bisect" | "submodule" | "filter-branch"
+                    "rebase" | "bisect" | "submodule" | "submodule--helper" | "filter-branch"
                 )
             })?;
             Some(&argv[1 + at..])
@@ -11864,7 +11864,8 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
             scripts: bisect_run_scripts(args),
             elsewhere: false,
         },
-        "submodule" => GitExec {
+        // The helper the `submodule` script calls takes the same `foreach`.
+        "submodule" | "submodule--helper" => GitExec {
             scripts: submodule_foreach_script(args).into_iter().collect(),
             elsewhere: true,
         },
@@ -20722,6 +20723,11 @@ mod tests {
             (
                 "git submodule foreach 'cat .env; pwd'",
                 vec!["cat .env; pwd"],
+                true,
+            ),
+            (
+                "git submodule--helper foreach 'cat .env'",
+                vec!["cat .env"],
                 true,
             ),
             (

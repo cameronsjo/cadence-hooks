@@ -3631,6 +3631,10 @@ mod tests {
             ),
             // submodule foreach and filter-branch run somewhere else.
             (
+                "git submodule--helper foreach 'git push origin main'",
+                vec![elsewhere("/repo")],
+            ),
+            (
                 "git submodule foreach 'git push origin main'",
                 vec![elsewhere("/repo")],
             ),
