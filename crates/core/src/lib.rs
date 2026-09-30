@@ -26,6 +26,7 @@ pub mod push;
 pub mod remote;
 pub mod shell;
 pub mod stdout;
+pub mod target_repo;
 pub mod time;
 pub mod transcript;
 pub mod worktree;
