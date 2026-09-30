@@ -40,9 +40,16 @@
 //! - a producer inside a script FILE (`bash scripts/x.sh`), which the command
 //!   text does not show. Producers inside `$(…)`, backticks, `<(…)`,
 //!   `sh -c`/`bash -c` and `eval` ARE judged (core's read-only
-//!   `child_scripts`), each against its own pipeline — so capturing a value
-//!   into a variable (`X=$(op read …)`) asks too: it is one `echo $X` from
-//!   the transcript;
+//!   `child_scripts`), each against its own pipeline — but only where the
+//!   child's output can reach the terminal: a wrapper that runs it, a printing
+//!   command (`echo`, `cat`, `diff`, …), or a bare assignment/`export`
+//!   (`X=$(op read …)` is one `echo $X` away). A substitution feeding another
+//!   command's argument or here-string (`curl -H "…$(op read …)"`,
+//!   `psql "…$(pass show …)"`, `docker login --password-stdin <<< "$(…)"`,
+//!   `TOKEN=$(op read …) gh api …`) is allowed;
+//! - `echo $(op read … | sha256sum)` asks: core's top-level splitter cuts the
+//!   substitution at its inner pipe, so the hash cannot be proven to contain
+//!   the value;
 //! - `kubectl get secret -o yaml|json`: the output carries key names, which
 //!   `redact-secret-output` masks;
 //! - `sops -d`: owned by `guard-sops-decrypt` (a hard block);
@@ -115,6 +122,15 @@ fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
             let stripped = strip_group_wrappers(&segments[i].0);
             let mut children = child_scripts(argv, stripped);
             children.extend(process_substitutions(stripped));
+            // A child whose output only feeds another command's argument or
+            // stdin (`curl -H "…$(op read …)"`, `psql "…$(pass show …)"`,
+            // `docker login --password-stdin <<< "$(op read …)"`) never
+            // reaches the terminal. Judge children only where their output can:
+            // a wrapper that runs them (`sh -c`, `eval`), a printing command,
+            // or a bare assignment (the value is one `echo $X` away).
+            if !children.is_empty() && !child_output_can_print(stripped) {
+                children.clear();
+            }
             for child in children {
                 if let Some(label) = exposed_in(&child, depth + 1) {
                     return Some(label);
@@ -131,6 +147,104 @@ fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Commands that print what they are given (as arguments or on stdin).
+const PRINTERS: &[&str] = &[
+    "echo", "printf", "print", "cat", "tac", "head", "tail", "less", "more", "diff", "grep",
+    "egrep", "fgrep", "rg", "awk", "sed", "jq", "yq", "sort", "uniq", "tee", "xxd", "od",
+    "hexdump", "base64", "column", "printenv", "nl", "fold", "cut", "tr", "strings", "rev",
+    "paste", "pr", "fmt", "expand", "logger",
+];
+
+/// Commands that run their child script with the terminal as its stdout.
+const WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "xargs", "watch", "source", ".",
+];
+
+/// Can the output of a child script in this segment reach the terminal?
+/// True for a wrapper that runs it, a printing command, an unknown command
+/// word (a variable or substitution), or a bare assignment / `export` (the
+/// value is stored for a later `echo $X`).
+fn child_output_can_print(segment: &str) -> bool {
+    let Some(word) = segment_command_word(segment) else {
+        return true;
+    };
+    let word = command_word(&word);
+    word.is_empty()
+        || word.starts_with(['$', '`', '(', '"', '\''])
+        || matches!(
+            word.as_ref(),
+            "export" | "local" | "declare" | "readonly" | "typeset"
+        )
+        || WRAPPERS.contains(&word.as_ref())
+        || PRINTERS.contains(&word.as_ref())
+}
+
+/// The command word of `segment` after its leading `NAME=value` assignments,
+/// read from the text so a value holding `$(…)`, quotes or backticks is
+/// skipped whole. `None` when the segment is assignments only.
+fn segment_command_word(segment: &str) -> Option<String> {
+    let mut rest = segment.trim_start();
+    loop {
+        let name_len = rest
+            .chars()
+            .take_while(|&c| c.is_ascii_alphanumeric() || c == '_')
+            .count();
+        let is_assignment = name_len > 0
+            && rest[..name_len].starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && rest[name_len..].starts_with('=');
+        if !is_assignment {
+            break;
+        }
+        rest = skip_word(&rest[name_len + 1..]).trim_start();
+    }
+    let word: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&'))
+        .collect();
+    (!word.is_empty()).then_some(word)
+}
+
+/// `text` after one shell word, honouring quotes, backticks and `$(…)`
+/// nesting (bounded by the text; an unclosed construct runs to the end).
+fn skip_word(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' && q != b'\'' {
+                    i += 1;
+                } else if b == q {
+                    quote = None;
+                } else if q == b'"' && b == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    depth += 1;
+                    i += 1;
+                }
+            }
+            None => match b {
+                b'\\' => i += 1,
+                b'"' | b'\'' | b'`' => quote = Some(b),
+                b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'(' if depth > 0 => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                c if depth == 0 && (c as char).is_ascii_whitespace() => break,
+                _ => {}
+            },
+        }
+        if quote.is_some() && depth > 0 && b == b')' {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    text.get(i.min(text.len())..).unwrap_or("")
 }
 
 /// Bodies of `<(…)` / `>(…)` process substitutions in `segment`, which core's
@@ -540,8 +654,8 @@ mod tests {
                 "X=$(security find-generic-password -s svc -w); echo $X",
                 "security find-*-password -w",
             ),
-            ("TOKEN=$(op read op://v/i/f) gh api user", "op read"),
             ("cat <(pass show x)", "pass show"),
+            ("cat <<< \"$(op read op://v/i/f)\"", "op read"),
             // The top-level splitter cuts `$(… | …)` at its inner pipe, so a
             // hash inside a substitution cannot be proven to contain the
             // value: ask rather than guess.
@@ -568,6 +682,13 @@ mod tests {
             "op read op://v/i/f | openssl dgst -sha256",
             "op read --out-file /tmp/f op://v/i/f",
             "op read -o /tmp/f op://v/i/f",
+            // Round 3: a substitution consumed as an argument or here-string
+            // of a non-printing command never reaches the terminal.
+            "TOKEN=$(op read op://v/i/f) gh api user",
+            "curl -H \"Authorization: Bearer $(op read op://v/i/f)\" https://x",
+            "psql \"postgres://u:$(pass show db)@h/db\"",
+            "docker login --password-stdin <<< \"$(op read op://v/i/f)\"",
+            "gh auth login --with-token < <(op read op://v/i/f)",
             "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
             "vault kv get secret/x",
             "pass ls",

@@ -81,7 +81,8 @@
 //! hook's real rewrite last-write-wins. Image output is never touched. Any
 //! doubt about a span (a non-char-boundary offset) abandons the rewrite: the
 //! failure mode is "no change", never corrupted output. Every pass is linear in
-//! the output size (a 5 MB adversarial line stays well under the deadline).
+//! the output size (every 5 MB adversarial shape measured at 0.32 s CPU or
+//! less in a release build).
 //!
 //! **Escape:** `CADENCE_ALLOW_SECRET_OUTPUT` (truthy) passes output through
 //! unmasked and records a bypass row, like `CADENCE_ALLOW_SOPS_DECRYPT`. The
@@ -302,10 +303,19 @@ fn unescape_window(view: &View<'_>, start: usize, end: usize, orig_len: usize) -
 
 /// The regions of `text` around backslashes, each bounded by its line and
 /// [`ESCAPE_WINDOW`], merged, on char boundaries.
-fn escape_windows(text: &str) -> Vec<(usize, usize)> {
+fn escape_windows(text: &str, mut settled: impl FnMut(usize) -> bool) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     for (p, _) in text.match_indices('\\') {
-        if out.last().is_some_and(|&(_, e)| p < e) {
+        if out.last().is_some_and(|&(_, e)| p < e) || settled(p) {
+            continue;
+        }
+        // Only an escape the decoded pass changes earns a window: a `\` before
+        // a newline (line continuation) or any other char decodes to itself,
+        // and re-scanning identical text finds nothing new.
+        if !matches!(
+            text.as_bytes().get(p + 1),
+            Some(b'n' | b'r' | b't' | b'"' | b'\\' | b'/')
+        ) {
             continue;
         }
         let mut lo = p.saturating_sub(ESCAPE_WINDOW);
@@ -338,27 +348,32 @@ pub fn redact(text: &str) -> Option<String> {
     let mut names = Names::default();
     let plain = strip_ansi(text);
     collect_mapped(text, &plain, &mut names, &mut spans);
-    for (start, end) in escape_windows(&plain.text) {
+    let plain_masks = merge(std::mem::take(&mut spans));
+    // An escape inside a plain-pass mask adds nothing when decoded: the text
+    // it could expose is masked already, and any pair beyond the mask that
+    // only decoding reveals has escapes of its own outside it, which still
+    // open a window (a window spans the whole line). Skipping these keeps
+    // dense escaped output (`"PASSWORD=x\n"…`, `\"PASSWORD=x\"…`) to one pass.
+    let mut cursor = 0usize;
+    let settled = |p: usize| {
+        let Some(o) = plain.orig(p) else {
+            return false;
+        };
+        while cursor < plain_masks.len() && plain_masks[cursor].end <= o {
+            cursor += 1;
+        }
+        plain_masks.get(cursor).is_some_and(|m| m.start <= o)
+    };
+    let windows = escape_windows(&plain.text, settled);
+    spans = plain_masks;
+    for (start, end) in windows {
         let window = unescape_window(&plain, start, end, text.len());
         collect_mapped(text, &window, &mut names, &mut spans);
     }
     if spans.is_empty() {
         return None;
     }
-    spans.sort_unstable_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
-    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
-    for span in spans {
-        if let Some(last) = merged.last_mut()
-            && span.start < last.end
-        {
-            last.end = last.end.max(span.end);
-            if let Label::Kind(_) = span.label {
-                last.label = span.label;
-            }
-            continue;
-        }
-        merged.push(span);
-    }
+    let merged = merge(spans);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
     for span in &merged {
@@ -376,6 +391,25 @@ pub fn redact(text: &str) -> Option<String> {
     }
     out.push_str(text.get(cursor..)?);
     (out != text).then_some(out)
+}
+
+/// Sort and merge overlapping spans; a token kind wins the label.
+fn merge(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_unstable_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span.start < last.end
+        {
+            last.end = last.end.max(span.end);
+            if let Label::Kind(_) = span.label {
+                last.label = span.label;
+            }
+            continue;
+        }
+        merged.push(span);
+    }
+    merged
 }
 
 /// Run every detector over `view` and map its spans back to `original`.
@@ -406,13 +440,25 @@ fn collect_mapped(original: &str, view: &View<'_>, names: &mut Names, spans: &mu
                 (start, char_end(original, last))
             }
         };
-        if start < end {
-            spans.push(Span {
-                start,
-                end,
-                label: s.label,
-            });
+        if start >= end {
+            continue;
         }
+        // Coalesce with the previous span when they touch: detectors emit in
+        // ascending order, so this keeps the vector (and its sort) small on
+        // dense output.
+        if let Some(last) = spans.last_mut()
+            && last.label == s.label
+            && start >= last.start
+            && start <= last.end
+        {
+            last.end = last.end.max(end);
+            continue;
+        }
+        spans.push(Span {
+            start,
+            end,
+            label: s.label,
+        });
     }
 }
 
@@ -522,6 +568,11 @@ pub enum Strength {
     /// (unquoted `name: value`, tables) the value must also look like a
     /// credential ([`secret_like`]).
     Weak,
+    /// A strong name whose last segment is metadata (`SECRET_TOKEN_URL`,
+    /// `API_KEY_ENV`, `adminPasswordKey`, `existingSecret`): masked unless the
+    /// value itself looks like metadata ([`metadata_value`]) — a URL, path,
+    /// number, reference, plain word or lowercase k8s-style name.
+    Meta,
 }
 
 /// Per-call memo of [`name_strength`], so a long run of the same name is
@@ -558,8 +609,7 @@ impl Names {
 /// one of these (case-insensitively), so most names skip the segment split.
 fn might_be_secret(name: &str) -> bool {
     const NEEDLES: &[&[u8]] = &[
-        b"secret", b"token", b"pass", b"pwd", b"cred", b"key", b"auth", b"cookie", b"docker",
-        b"dsn",
+        b"secret", b"token", b"pass", b"pw", b"cred", b"key", b"auth", b"cookie", b"docker", b"dsn",
     ];
     let bytes = name.as_bytes();
     NEEDLES
@@ -577,6 +627,10 @@ pub fn is_secret_name(name: &str) -> bool {
 /// `KEY_ID`, `SSH_AUTH_SOCK`, `PASSWORD_FILE`); URL userinfo is masked by its
 /// own rule, so a `_URL` exemption never exposes a password.
 pub fn name_strength(name: &str) -> Option<Strength> {
+    // Test runners' status words, and the shell's working-directory vars.
+    if matches!(name, "PASS" | "FAIL" | "OK" | "PWD" | "OLDPWD") {
+        return None;
+    }
     let all = segments(name);
     // Numeric segments (`API_KEY_2`) neither qualify nor terminate a name.
     let segs: Vec<&str> = all
@@ -584,9 +638,31 @@ pub fn name_strength(name: &str) -> Option<Strength> {
         .map(String::as_str)
         .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
         .collect();
-    let last = segs.last()?;
-    if METADATA_SUFFIXES.contains(last) {
-        return None;
+    let (&last, body) = segs.split_last()?;
+    // A metadata last segment describes the secret rather than holding it —
+    // unless the rest of the name is strong, where the VALUE decides (Meta).
+    // `…PasswordKey`/`…TokenKey` and `existingSecret` are references too.
+    let meta_suffix = METADATA_SUFFIXES.contains(&last)
+        || (last == "key"
+            && body
+                .last()
+                .is_some_and(|p| matches!(*p, "password" | "token")))
+        || (matches!(last, "secret" | "secrets") && body.last() == Some(&"existing"));
+    if meta_suffix {
+        return (classify(body) == Some(Strength::Strong)).then_some(Strength::Meta);
+    }
+    classify(&segs)
+}
+
+fn classify(segs: &[&str]) -> Option<Strength> {
+    // Whole-name directives that are not English words (redis, slapd).
+    if let [only] = segs
+        && matches!(
+            *only,
+            "requirepass" | "masterauth" | "rootpw" | "pass" | "pw"
+        )
+    {
+        return Some(Strength::Strong);
     }
     let mut weak = false;
     for (i, seg) in segs.iter().enumerate() {
@@ -606,12 +682,35 @@ pub fn name_strength(name: &str) -> Option<Strength> {
             },
             "auth" => weak = true,
             "pass" => weak |= prev.is_some(),
-            s if STRONG_WORDS.contains(&s) => return Some(Strength::Strong),
+            s if STRONG_WORDS.contains(&s) || glued_strong(s) => return Some(Strength::Strong),
             _ => {}
         }
     }
     weak.then_some(Strength::Weak)
 }
+
+/// A strong word glued to a prefix: `pgpassword`, `githubtoken`,
+/// `clientsecret`, `masterpassword`. `…token` is everywhere in package and
+/// type names (`jsonwebtoken`, `cancellationtoken`), so a glued `token`
+/// counts only after a credential-ish prefix.
+fn glued_strong(seg: &str) -> bool {
+    if let Some(prefix) = seg.strip_suffix("token") {
+        return GLUED_TOKEN_PREFIXES.contains(&prefix);
+    }
+    STRONG_SUFFIXES
+        .iter()
+        .any(|w| seg.len() > w.len() && seg.ends_with(w))
+}
+
+/// Prefixes that make a glued `…token` a credential name.
+const GLUED_TOKEN_PREFIXES: &[&str] = &[
+    "api", "auth", "access", "refresh", "github", "gh", "gitlab", "bearer", "session", "id",
+    "csrf", "oauth", "bot", "slack", "npm", "pypi", "ci", "deploy", "service", "secret", "client",
+    "user", "admin", "master", "root", "app", "personal", "private",
+];
+
+/// Word endings that make a glued segment strong.
+const STRONG_SUFFIXES: &[&str] = &["password", "passwd", "passwort", "secret", "apikey", "pwd"];
 
 /// Segments that make a name a STRONG secret name wherever they sit.
 const STRONG_WORDS: &[&str] = &[
@@ -661,10 +760,11 @@ fn maskable(value: &str) -> bool {
     {
         return false;
     }
-    // An auth scheme followed by a placeholder: `Bearer <token>`, `token ***`.
+    // An auth scheme followed by a placeholder or a variable reference:
+    // `Bearer <token>`, `token ***`, `Bearer $TOKEN`, `Bearer ${TOKEN}`.
     if let Some((scheme, rest)) = lower.split_once(' ')
         && matches!(scheme, "bearer" | "basic" | "token" | "digest")
-        && is_placeholder(rest.trim())
+        && (is_placeholder(rest.trim()) || is_var_ref(v[scheme.len()..].trim()))
     {
         return false;
     }
@@ -735,7 +835,7 @@ fn is_code_value(v: &str) -> bool {
     let body = v.trim_end_matches([',', ';']).trim();
     let typeish = !body.is_empty()
         && body.chars().all(|c| {
-            c.is_ascii_alphabetic() || matches!(c, '_' | ':' | '<' | '>' | '&' | '\'' | ' ')
+            c.is_ascii_alphabetic() || matches!(c, '_' | ':' | '<' | '>' | '&' | '\'' | ' ' | '|')
         });
     let punctuated = body.len() < v.len() || body.contains(['<', '&']) || body.contains("::");
     // `let token: String = get_token();` — a typed binding, not a value.
@@ -746,8 +846,16 @@ fn is_code_value(v: &str) -> bool {
                     || matches!(c, '_' | ':' | '<' | '>' | '&' | '\'' | ' ' | ',')
             })
     });
+    // `process.env.DB_PASSWORD,` / `config.get('token'),` — an expression
+    // closing an object-literal entry.
+    let expression = body.len() < v.len()
+        && body.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && (body.contains('.') || body.contains('('))
+        && !body.contains(' ');
     let lower = body.to_ascii_lowercase();
     binding
+        || expression
+        || v.starts_with('=')
         || (typeish && punctuated)
         || matches!(
             lower.as_str(),
@@ -755,18 +863,42 @@ fn is_code_value(v: &str) -> bool {
         )
 }
 
-/// The value test for the unquoted colon form (`name: value`), which is also
-/// how prose, schemas and source code read.
-fn colon_value_masks(strength: Strength, value: &str) -> bool {
+/// The value test for a name of `strength`. `colon` is the unquoted
+/// `name: value` form, which is also how prose, schemas and source code read.
+fn value_masks(strength: Strength, value: &str, colon: bool) -> bool {
     let v = value.trim();
-    match strength {
-        Strength::Strong => {
+    match (strength, colon) {
+        (Strength::Meta, _) => maskable(v) && !metadata_value(v),
+        (Strength::Strong, true) => {
             maskable(v)
                 && !PROSE_VALUES.contains(&v.to_ascii_lowercase().as_str())
                 && !is_code_value(v)
         }
-        Strength::Weak => secret_like(v),
+        (Strength::Weak, true) => secret_like(v),
+        (_, false) => maskable(v),
     }
+}
+
+/// Does `value` look like metadata rather than a credential: a URL, a path, a
+/// number, a reference (`$X`, `${X}`), a plain word, or a lowercase
+/// k8s/host-style name (`pg-auth`, `postgres-password`, `auth.example.com`)?
+fn metadata_value(value: &str) -> bool {
+    // Judge the first word: a mid-line value runs to the end of the line and
+    // may carry the closing `}`/`,` of the structure around it.
+    let v = value
+        .trim()
+        .split([' ', '\t', ',', '}', ')', ';'])
+        .next()
+        .unwrap_or("")
+        .trim_matches(['"', '\'']);
+    v.contains("://")
+        || v.starts_with(['/', '~', '$'])
+        || v.starts_with("./")
+        || v.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || v.chars().all(|c| c.is_ascii_alphabetic())
+        || v.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '/' | '_' | ':')
+        })
 }
 
 /// For a WEAK name in a prose-shaped form: the value must look like a
@@ -922,7 +1054,10 @@ fn json_pair_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             (value_start, m.end())
         };
         pos = ve.max(name_end + 1).max(m.start() + 1);
-        if vs <= ve && names.get(name).is_some() && maskable(&text[vs..ve]) {
+        if vs <= ve
+            && let Some(strength) = names.get(name)
+            && value_masks(strength, &text[vs..ve], false)
+        {
             spans.push(named(vs, ve));
         }
     }
@@ -936,7 +1071,9 @@ fn name_value_json_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
             continue;
         };
-        if names.get(name.as_str()).is_some() && maskable(value.as_str()) {
+        if let Some(strength) = names.get(name.as_str())
+            && value_masks(strength, value.as_str(), false)
+        {
             spans.push(named(value.start(), value.end()));
         }
     }
@@ -949,7 +1086,9 @@ fn env_string_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             continue;
         };
         let vs = m.start() + 1 + name.len() + 1;
-        if names.get(name).is_some() && maskable(value) {
+        if let Some(strength) = names.get(name)
+            && value_masks(strength, value, false)
+        {
             spans.push(named(vs, vs + value.len()));
         }
     }
@@ -982,10 +1121,15 @@ fn at_line_start(text: &str, at: usize) -> bool {
 fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     let mut done = 0;
     let mut eol_cache = (usize::MAX, 0);
+    let mut parens = Parens::default();
     for m in INLINE_EQ.find_iter(text) {
         let head = m.as_str();
         let start = m.end();
-        if start < done || at_line_start(text, m.start()) || text[start..].starts_with('=') {
+        // The name starts after the lead separator, which may be the `\n`
+        // ending the previous line: then this is a line-start form.
+        let name_at =
+            m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
+        if start < done || at_line_start(text, name_at) || text[start..].starts_with('=') {
             continue;
         }
         let Some(strength) = names.get(tail_name(&head[..head.len() - 1])) else {
@@ -993,6 +1137,20 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         };
         let lead = head.chars().next().filter(|c| !is_name_char(*c));
         let eol = line_end(text, start, &mut eol_cache);
+        // Inside a call's argument list (`Client(api_key=api_key, …)`): the
+        // value ends at `,`/`)`, and a bare identifier, attribute path or call
+        // there is code — a variable passed along, not a secret literal.
+        if parens.depth_at(text, name_at) > 0
+            && !matches!(text[start..].chars().next(), Some('"' | '\''))
+        {
+            let len = text[start..eol].find([',', ')']).unwrap_or(eol - start);
+            let value = &text[start..start + len];
+            done = start + len;
+            if !is_code_reference(value) && value_masks(strength, value, false) {
+                spans.push(named(start, start + len));
+            }
+            continue;
+        }
         let (vs, ve) = match text[start..eol].chars().next() {
             Some(q @ ('"' | '\'')) => {
                 let inner = &text[start + 1..eol];
@@ -1016,7 +1174,7 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             }
         };
         done = ve.max(start);
-        if maskable(&text[vs..ve]) {
+        if value_masks(strength, &text[vs..ve], false) {
             spans.push(named(vs, ve));
         }
     }
@@ -1025,7 +1183,9 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     for m in INLINE_COLON.find_iter(text) {
         let head = m.as_str();
         let start = m.end();
-        if start < done || at_line_start(text, m.start()) {
+        let name_at =
+            m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
+        if start < done || at_line_start(text, name_at) {
             continue;
         }
         let colon = head.rfind(':').unwrap_or(head.len());
@@ -1038,7 +1198,9 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             continue;
         }
         let quote = head.chars().next().filter(|c| matches!(c, '"' | '\''));
-        // `name: "value"` — the value carries its own quotes.
+        // After a label (`Error: token: …`, `main.go:5: token: …`) the value
+        // is a message: several words there are prose, not a credential.
+        let label = text[..name_at].trim_end_matches([' ', '\t']).ends_with(':');
         let (vs, ve, quoted) = match (quote, rest.chars().next()) {
             (Some(q), _) => (0, closing_quote(rest, q).unwrap_or(rest.len()), true),
             (None, Some(q @ ('"' | '\''))) => {
@@ -1050,9 +1212,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         done = start + ve;
         let value = &rest[vs..ve];
         let masks = if quoted {
-            maskable(value)
+            value_masks(strength, value, false)
+        } else if label && value.trim().contains(' ') {
+            false
         } else {
-            colon_value_masks(strength, value)
+            value_masks(strength, value, true)
         };
         if masks {
             spans.push(named(start + vs, start + ve));
@@ -1063,11 +1227,55 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
                 continue;
             };
-            if names.get(name.as_str()).is_some() && maskable(value.as_str()) {
+            if let Some(strength) = names.get(name.as_str())
+                && value_masks(strength, value.as_str(), false)
+            {
                 spans.push(named(value.start(), value.end()));
             }
         }
     }
+}
+
+/// Parenthesis depth on the current line at a byte offset, advanced
+/// incrementally across increasing offsets so a long line is scanned once.
+#[derive(Default)]
+struct Parens {
+    pos: usize,
+    depth: i32,
+}
+
+impl Parens {
+    fn depth_at(&mut self, text: &str, at: usize) -> i32 {
+        if at < self.pos {
+            *self = Parens::default();
+        }
+        for &b in &text.as_bytes()[self.pos..at] {
+            match b {
+                b'(' => self.depth += 1,
+                b')' => self.depth = (self.depth - 1).max(0),
+                b'\n' => self.depth = 0,
+                _ => {}
+            }
+        }
+        self.pos = at;
+        self.depth
+    }
+}
+
+/// A value that is code referring to something else: an identifier, an
+/// attribute path, or a call (`api_key=api_key`, `token=self.token`,
+/// `password=get_password()`).
+fn is_code_reference(value: &str) -> bool {
+    let v = value.trim();
+    let (head, call) = match v.split_once('(') {
+        Some((head, _)) => (head, v.ends_with(')')),
+        None => (v, false),
+    };
+    let ident = head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'));
+    ident && (call || head.len() == v.len())
 }
 
 fn leading_indent(line: &str) -> usize {
@@ -1087,8 +1295,10 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     // line — a 5 MB block would otherwise balloon the output).
     let mut block: Option<usize> = None;
     let mut body: Option<(usize, usize)> = None;
-    // Lines left in which a `value:` belongs to a secret `name:` just seen.
+    // Lines left in which a `value:` belongs to a secret `name:` just seen,
+    // and that name's strength.
     let mut pending_value = 0u8;
+    let mut pending_strength = Strength::Strong;
     // A `.netrc` `machine`/`default` block or a vault `Key  Value` table has
     // been seen: bare `password x` rows there are credentials, not prose.
     let mut table_context = false;
@@ -1113,11 +1323,12 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             }
         }
         let trimmed = line.trim_start();
-        if trimmed.starts_with("machine ")
-            || trimmed == "default"
-            || trimmed.starts_with("default ")
-            || (trimmed.starts_with("Key ") && trimmed.contains("Value"))
-        {
+        if trimmed.is_empty() {
+            continue;
+        }
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        let netrc = matches!(first_word, "machine" | "default");
+        if netrc || (first_word == "Key" && trimmed.contains("Value")) {
             table_context = true;
         }
         if pending_value > 0 {
@@ -1125,7 +1336,7 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             if let Some(head) = K8S_VALUE.find(line) {
                 let value = line[head.end()..].trim_end();
                 let (vs, ve) = unquote(head.end(), value);
-                if maskable(&line[vs..ve]) {
+                if value_masks(pending_strength, &line[vs..ve], false) {
                     spans.push(named(start + vs, start + ve));
                 }
                 pending_value = 0;
@@ -1135,14 +1346,16 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         if (trimmed.starts_with("name:") || trimmed.starts_with("- name:"))
             && let Some(caps) = K8S_NAME.captures(line)
         {
-            pending_value = if caps.get(1).is_some_and(|n| names.get(n.as_str()).is_some()) {
-                3
-            } else {
-                0
-            };
+            match caps.get(1).and_then(|n| names.get(n.as_str())) {
+                Some(strength) => {
+                    pending_value = 3;
+                    pending_strength = strength;
+                }
+                None => pending_value = 0,
+            }
             continue;
         }
-        if line.contains("machine ")
+        if netrc
             && let Some(caps) = NETRC_PASSWORD.captures(line)
             && let Some(value) = caps.get(1)
         {
@@ -1156,6 +1369,14 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let rest = &line[head.end()..];
         if sep == "=" && rest.starts_with('=') {
             continue; // `a == b`
+        }
+        // `token.c:12:5: warning …`, `secrets.yaml:4: …` — a diagnostic's
+        // `path:line:` prefix, not a name/value pair.
+        if sep == ":" && rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            if digits.starts_with(':') {
+                continue;
+            }
         }
         if rest.starts_with("//") {
             continue; // `https://…`
@@ -1175,10 +1396,16 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         }
         let (vs, ve) = unquote(value_start, value);
         let quoted = vs != value_start;
-        let masks = if sep == ":" && !quoted {
-            colon_value_masks(strength, &line[vs..ve])
+        // `token = get_token(request)` — a spaced `=` (source code, not an env
+        // line) whose value is a call, attribute path or `await …` expression.
+        let spaced = sep == "=" && line[..head.end() - 1].ends_with([' ', '\t']);
+        let code = spaced && !quoted && is_code_expression(&line[vs..ve]);
+        let masks = if code {
+            false
+        } else if sep == ":" && !quoted {
+            value_masks(strength, &line[vs..ve], true)
         } else {
-            maskable(&line[vs..ve])
+            value_masks(strength, &line[vs..ve], false)
         };
         if masks {
             spans.push(named(start + vs, start + ve));
@@ -1193,6 +1420,16 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 /// table (indented, two+ spaces apart, or inside a `.netrc`/vault table) —
 /// `Token expired` at the start of a line is prose.
 fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mut Vec<Span>) {
+    // Classify the first word before running the row regex: almost every
+    // line's first word is not a secret name, and the regex is the cost.
+    let first = line
+        .trim_start_matches([' ', '\t'])
+        .split([' ', '\t'])
+        .next()
+        .unwrap_or("");
+    if names.get(first) != Some(Strength::Strong) {
+        return;
+    }
     let Some(caps) = WS_ROW.captures(line) else {
         return;
     };
@@ -1209,7 +1446,9 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
     if value.as_str().contains("  ") || value.as_str().contains('\t') {
         return;
     }
-    let wide = gap.as_str().len() >= 2 || table;
+    // `requirepass x` (redis), `rootpw x` (slapd): directive names, not prose.
+    let directive = matches!(name.as_str(), "requirepass" | "masterauth" | "rootpw");
+    let wide = gap.as_str().len() >= 2 || table || directive;
     let tabular = if value.as_str().contains([' ', '\t']) {
         wide
     } else {
@@ -1222,6 +1461,27 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
     {
         spans.push(named(start + value.start(), start + value.end()));
     }
+}
+
+/// Right-hand side of a spaced source-code assignment: a call
+/// (`get_token(request)`, `std::env::var("X")?;`), an attribute or subscript
+/// path (`request.form['password']`), or `await`/`new` expression.
+fn is_code_expression(value: &str) -> bool {
+    let v = value.trim().trim_end_matches(';');
+    let ident_start = v.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    let call = ident_start
+        && v.split_once('(').is_some_and(|(callee, _)| {
+            callee
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))
+        })
+        && v.trim_end_matches(['?', '!']).ends_with(')');
+    let path = ident_start
+        && !v.contains(' ')
+        && v.contains(['.', '['])
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '\'' | '"'));
+    call || path || v.starts_with("await ") || v.starts_with("new ")
 }
 
 /// The span of `value` (which starts at `at`) to mask: inside its quotes when
@@ -1674,6 +1934,30 @@ mod tests {
             ("client_secret: 20240101\n", "20240101"),
             ("secret_key_base: abcdef\n", "abcdef"),
             ("Set-Cookie: theme=dark; Path=/\n", "dark"),
+            // Round 3 (#776 review 3): glued names, directives, Meta values,
+            // `.netrc` variants.
+            ("PGPASSWORD=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("+ PGPASSWORD=Zq9vKh7wR psql -h db\n", "Zq9vKh7wR"),
+            ("[\"PGPASSWORD=Zq9vKh7wR\"]\n", "Zq9vKh7wR"),
+            ("DBPASSWORD=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("GITHUBTOKEN=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("CLIENTSECRET=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("masterpassword: Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("MYSQL_PWD=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("requirepass Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("masterauth Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("rootpw Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("pass=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("pw=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("PW: Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("SECRET_TOKEN_URL=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("API_KEY_ENV=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("GITHUB_TOKEN_REF=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("DB_PASSWORD_USER=Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("password_source: Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("default login u password Zq9vKh7wR\n", "Zq9vKh7wR"),
+            ("machine\th\tlogin\tu\tpassword\tZq9vKh7wR\n", "Zq9vKh7wR"),
+            ("machine h password Zq9vKh7wR\\\n", "Zq9vKh7wR"),
         ];
         let mut cases = cases;
         for (input, canary) in round2 {
@@ -1772,6 +2056,20 @@ mod tests {
             "Use header Authorization: Bearer <token>\nkey: value\n",
             "  - Token: gho_************************************\n  - Token scopes: 'gist', 'read:org', 'repo'\n",
             "Config { host: \"db\", port: 5432, password: \"<hidden>\", token_ttl: 3600 }\n",
+            // Round 3 (#776 review 3) false positives.
+            "jsonwebtoken  <=8.5.1\nSeverity: high\n",
+            "make[1]: Entering directory '/src/tokens'\ntoken.c:12:5: warning: implicit declaration of function 'tokenize'\n",
+            "secrets.yaml:4: bad indentation\npassword.py:3:import bcrypt\n./token.go:10:2: undefined: foo\n",
+            "main.go:5: token: invalid character\nError: password: must be at least 8 characters\nerror: token: unexpected EOF while parsing\nValueError: secret_key: must be 32 bytes\n",
+            "Client(api_key=api_key, token=self.token, password=None)\n",
+            "def login(user, password=password_default):\n",
+            "    token = get_token(request)\nconst token = await getToken();\n    password = request.form['password']\n",
+            "src/config.ts:12:  password: process.env.DB_PASSWORD,\nsrc/config.ts:13:  token: config.get('token'),\n",
+            "  password: string | undefined;\n",
+            "auth:\n  existingSecret: pg-auth\n  secretKeys:\n    adminPasswordKey: postgres-password\n    userPasswordKey: password\n",
+            "  -H 'Authorization: Bearer $TOKEN'\n  -H \"Authorization: Bearer ${TOKEN}\"\n",
+            "PWD=/home/dev/app\nOLDPWD=/home/dev\n",
+            "TOKEN_URL=https://auth.example.com/oauth/token\nSECRET_NAME=prod/api\n",
             "apiVersion: v1\nkind: ConfigMap\ndata:\n  token_ttl: 1h\n  auth_mode: oidc\n  key_rotation: enabled\n  password_policy: strong\n",
             "  with:\n    token: ***\n    persist-credentials: false\n",
             "properties:\n  password:\n    type: string\n    minLength: 8\n",
@@ -1847,8 +2145,58 @@ mod tests {
             ("authoritative", false),
             ("", false),
         ];
+        // `true`: the name alone makes its value secret (Strong or Weak).
+        // `false`: not a secret name, or Meta (the value decides).
         for (name, want) in cases {
-            assert_eq!(is_secret_name(name), *want, "{name}");
+            let unconditional =
+                matches!(name_strength(name), Some(Strength::Strong | Strength::Weak));
+            assert_eq!(unconditional, *want, "{name}");
+        }
+        // Round 3: strong words glued to a prefix, and whole-name directives.
+        for name in [
+            "PGPASSWORD",
+            "DBPASSWORD",
+            "ADMINPASSWORD",
+            "masterpassword",
+            "GITHUBTOKEN",
+            "APITOKEN",
+            "AUTHTOKEN",
+            "ACCESSTOKEN",
+            "CLIENTSECRET",
+            "MYSQL_PWD",
+            "requirepass",
+            "masterauth",
+            "rootpw",
+            "pass",
+            "pw",
+            "PW",
+        ] {
+            assert_eq!(name_strength(name), Some(Strength::Strong), "{name}");
+        }
+        // Strong name, metadata suffix: the value decides.
+        for name in [
+            "SECRET_URL",
+            "SECRET_TOKEN_URL",
+            "API_KEY_ENV",
+            "GITHUB_TOKEN_REF",
+            "DB_PASSWORD_USER",
+            "TOKEN_VAULT",
+            "password_source",
+            "adminPasswordKey",
+            "credential.helper",
+        ] {
+            assert_eq!(name_strength(name), Some(Strength::Meta), "{name}");
+        }
+        for name in [
+            "PASS",
+            "FAIL",
+            "OK",
+            "PWD",
+            "OLDPWD",
+            "maxtoken",
+            "existingSecret",
+        ] {
+            assert_eq!(name_strength(name), None, "{name}");
         }
     }
 
@@ -1953,6 +2301,10 @@ mod tests {
                 "abcdefghijklmnopqrstuvwxyz_passwor=x\n".repeat(5 * MB / 37)
             ),
             "\"PASSWORD=x\\n".repeat(5 * MB / 13),
+            // Round 3: `.netrc` lines ending in a line-continuation backslash.
+            "machine h password x\\\n".repeat(5 * MB / 22),
+            "machine password x\\\n".repeat(5 * MB / 20),
+            "DB_PASSWORD=Zq9vKx7Wm3\\\n".repeat(5 * MB / 22),
             format!("'Authorization: {p}' ").repeat(5 * MB / 32),
             "token=".repeat(5 * MB / 6),
             "password: ".repeat(5 * MB / 10),

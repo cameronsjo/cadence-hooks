@@ -211,8 +211,11 @@ pub struct TokenSpan {
 /// and a split form has no byte-exact span to mask.
 pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
     let mut out = Vec::new();
-    for caps in TOKEN_RE.captures_iter(text) {
-        let Some((idx, m)) = (0..KINDS.len()).find_map(|i| caps.get(i + 1).map(|m| (i, m))) else {
+    // `find_iter` + a prefix lookup instead of `captures_iter`: capture
+    // resolution per match is the dominant cost on a dense run of near-misses
+    // (`sk-aaaa… sk-aaaa…`), and the prefix alone names the alternative.
+    for m in TOKEN_RE.find_iter(text) {
+        let Some(idx) = kind_index(m.as_str()) else {
             continue;
         };
         if (idx == 5 && !sk_boundary(text, m.start())) || !random_enough(idx, m.as_str()) {
@@ -232,6 +235,25 @@ pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
         });
     }
     out
+}
+
+/// Which [`TOKEN_RE`] alternative a match came from, by its prefix (the
+/// alternatives' prefixes are disjoint, so this agrees with the capture).
+fn kind_index(token: &str) -> Option<usize> {
+    let b = token.as_bytes();
+    Some(match b {
+        [b'g', b'h', b'p' | b'o' | b'u' | b's' | b'r', b'_', ..] => 0,
+        _ if token.starts_with("github_pat_") => 1,
+        _ if token.starts_with("AKIA") || token.starts_with("ASIA") => 2,
+        _ if token.starts_with("xox") => 3,
+        _ if token.starts_with("sk_live_") || token.starts_with("rk_live_") => 4,
+        _ if token.starts_with("sk-") => 5,
+        _ if token.starts_with("AIza") => 6,
+        _ if token.starts_with("-----BEGIN") => 7,
+        _ if token.starts_with("glpat-") => 8,
+        _ if token.starts_with("npm_") => 9,
+        _ => return None,
+    })
 }
 
 /// Kind name for a masked JWT (redactor-only, see [`direct_spans`]).
