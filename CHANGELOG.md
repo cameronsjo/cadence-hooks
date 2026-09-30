@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **`cadence record-scrub` judges the file it actually reads.** It opens the draft once, non-blocking, checks the opened handle is a regular file, and reads through the 16 MiB cap, so a path swapped for a FIFO or a larger file between a check and the read can neither stall it nor have other bytes hashed (cameronsjo/cadence-hooks#755 review follow-up).
+- **`platform-drift` names the stale side.** An installed binary newer than the plugin baseline now reports that the cadence plugin pin is behind and points at `claude plugin update cadence@workbench` then `/reload-plugins`, instead of telling the operator to `brew upgrade` a binary that is already ahead; an older binary keeps the upgrade text, and the daily gate token is unchanged (cameronsjo/cadence-hooks#1223).
 
 ## [0.120.0] - 2026-09-30
 
