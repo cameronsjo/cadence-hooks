@@ -223,6 +223,15 @@ CORPUS="$WORK/corpus.tsv"
     printf '1266-procsub-eval-sub\tcat <(echo $(echo $(echo $(git $(echo reset) --hard))))\n'
     printf '1266-procsub-eval-glue\tdiff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))\n'
     printf '1266-procsub-nest4-eval-sub\tcat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))\n'
+    # #1266 review round 4 C1: a `<(` the splitter cut open at a separator
+    # inside it still reads its `$(…)`s at the level they had on main.
+    printf '1266-open-procsub-semi\tcat <(cat <(cat <(echo $(git $(echo reset) --hard; true))))\n'
+    printf '1266-open-procsub-and\tcat <(cat <(cat <(echo $(cp d .$(echo env) && true))))\n'
+    printf '1266-open-procsub-pipe\ttrue >(true >(true >(echo $(git `echo reset` --hard | true))))\n'
+    # #1266 review round 4 C2: `case` after `f()`/`coproc`/`time -p`, or
+    # behind a nested quote a flat reader misreads.
+    printf '1266-case-fn-header\t(cd /tmp; f() case x in x) true;; esac; f; git push origin main)\n'
+    printf '1266-case-coproc\techo "$(echo '"'"'a"b'"'"')"; (cd /tmp; coproc case x in x) true;; esac; git push origin main)\n'
     # #1266 review round 3 C1: two eval floods spend the flatten allowance,
     # and a padded command after them is still listed.
     FLOOD_P='cat <(echo $(echo $(echo $(' FLOOD_Q='))))'
