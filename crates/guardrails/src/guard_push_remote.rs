@@ -658,7 +658,12 @@ fn push_locations_both_readings(
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
     for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
-        if !may_push(&raw) {
+        // Text only, not [`may_push`]: a git exec whose text spells no push
+        // (`git rebase -x "$CMD"`) is a push the walk above cannot resolve,
+        // refused wherever it is placed, so re-placing it adds no verdict —
+        // and asking `runs_a_git_exec` of every segment of a 200 KB flood
+        // cost the test deadline on the Windows runner.
+        if !mentions_push(&raw) {
             continue;
         }
         for push in push_locations(strip_group_wrappers(&raw), &dir) {
@@ -3161,6 +3166,9 @@ mod tests {
                 ("git submodule foreach \"$C\"", Block),
                 ("git re\\base --exe \"$CMD\" HEAD~1", Block),
                 ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
+                ("git ls-remote --exec=\"$C\" .", Block),
+                ("GIT_EDITOR=\"$E\" git commit", Block),
+                ("EDITOR=vim git rebase -i main", Allow),
                 ("git rebase -x 'git push origin main' HEAD~1", Allow),
                 ("git bisect run git push origin main", Allow),
                 ("git rebase -x 'make test' HEAD~1", Allow),

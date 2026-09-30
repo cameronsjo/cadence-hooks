@@ -11827,7 +11827,7 @@ pub struct GitExec {
     pub elsewhere: bool,
     /// git runs them at the top of the invocation's working tree, not in the
     /// directory it was started in (`rebase -x`, `bisect run`, `difftool -x`,
-    /// a rebase's sequence editor — measured under git 2.43 from a
+    /// an editor — measured under git 2.43 from a
     /// subdirectory). A walker that tracks a directory starts them there.
     pub at_toplevel: bool,
 }
@@ -11845,13 +11845,13 @@ const FILTER_BRANCH_SCRIPTS: &[&str] = &[
     "--tag-name-filter",
 ];
 
-/// Environment names whose value a `git rebase -i` runs as its editor, under
-/// a shell: the todo list's (`GIT_SEQUENCE_EDITOR`) and the general one it
-/// falls back to (measured under git 2.43).
+/// Environment names whose value git runs as an editor, under a shell: a
+/// rebase todo list's (`GIT_SEQUENCE_EDITOR`) and the general one every
+/// subcommand falls back to (measured under git 2.43).
 const GIT_EDITOR_ENV: &[&str] = &["GIT_SEQUENCE_EDITOR", "GIT_EDITOR", "VISUAL", "EDITOR"];
 
-/// Config keys whose value a `git rebase -i` runs as its editor, under a
-/// shell (compared lowercased, as git does).
+/// Config keys whose value git runs as an editor, under a shell (compared
+/// lowercased, as git does).
 const GIT_EDITOR_CONFIG: &[&str] = &["sequence.editor", "core.editor"];
 
 /// How one git subcommand spells the options whose value it runs as a
@@ -11899,6 +11899,17 @@ const DIFFTOOL_OPTIONS: ExecOptions = ExecOptions {
 /// local or `file://` remote.
 const UPLOAD_PACK_OPTIONS: ExecOptions = ExecOptions {
     exec_long: &["upload-pack"],
+    exec_short: None,
+    value_long: &[],
+    value_short: "",
+    glued_short: "",
+    stops_at_dashdash: false,
+};
+
+/// `git ls-remote`/`fetch-pack`, which also take `--exec` for
+/// `--upload-pack` (ls-remote's is a hidden alias; measured).
+const FETCH_PACK_OPTIONS: ExecOptions = ExecOptions {
+    exec_long: &["upload-pack", "exec"],
     exec_short: None,
     value_long: &[],
     value_short: "",
@@ -11964,18 +11975,21 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 ///   and a short cluster (`-ixCMD`, `-ix CMD`). A `--` that is another
 ///   option's value (`-X -- -x CMD`, `-s --`) does not end them. CMD runs
 ///   under a shell at the top of the working tree.
-/// - `rebase -i`'s editor: a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`/`VISUAL`/
-///   `EDITOR` assignment in front of the command, or a `-c sequence.editor=`/
-///   `-c core.editor=` global, runs under a shell at the top of the working
-///   tree. A `--config-env` one reads its value from the environment, so it
-///   comes back as that variable's expansion — a command no reading can name.
+/// - An editor, on ANY subcommand (`rebase -i`, `commit`, `pull
+///   --rebase=i`, …): a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`/`VISUAL`/`EDITOR`
+///   assignment in front of the command, or a `-c sequence.editor=`/`-c
+///   core.editor=` global, runs under a shell at the top of the working tree
+///   when git needs one. A `--config-env` one reads its value from the
+///   environment, so it comes back as that variable's expansion — a command
+///   no reading can name.
 /// - `bisect run CMD ARG…`: git quotes each word and hands the result to a
 ///   shell at the top of the working tree, so the words come back quoted
 ///   ([`quoted_script`]). Older gits joined them unquoted, so that reading is
 ///   surfaced too when it differs.
-/// - `submodule [--quiet] foreach [--recursive] CMD`: a single CMD runs under
-///   a shell, several words are exec'd as they are — in each submodule. The
-///   `submodule--helper` form also takes its flags after CMD.
+/// - `submodule [--quiet] foreach [--recursive] CMD ARG…`: git runs `sh -c
+///   'CMD "$@"' CMD ARG…` in each submodule, so CMD is shell text and each
+///   ARG a word ([`foreach_script`]). The `submodule--helper` form also
+///   takes its flags after CMD.
 /// - A chain of `bisect run`/`submodule foreach` words (`git bisect run git
 ///   bisect run CMD`) is read straight through to CMD, so no depth bound
 ///   stops a nesting that costs no escaping.
@@ -11983,9 +11997,10 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 ///   CMD`: `eval`'d with `GIT_DIR` exported. Every other option takes one
 ///   value word, except the four flags the script names.
 /// - `difftool -x`/`--extcmd CMD`: `eval`'d at the top of the working tree.
-/// - `fetch`/`ls-remote`/`pull`/`clone --upload-pack CMD` (and `clone -u`),
-///   `push --receive-pack`/`--exec CMD`, `archive --exec CMD`: run under a
-///   shell for a local remote, by the remote host for any other.
+/// - `fetch`/`ls-remote`/`pull`/`clone`/`fetch-pack --upload-pack CMD`
+///   (and `clone -u`, `ls-remote`/`fetch-pack --exec`), `push`/`send-pack
+///   --receive-pack`/`--exec CMD`, `archive --exec CMD`: run under a shell
+///   for a local remote, by the remote host for any other.
 ///
 /// Surfacing only ever adds a script to inspect: a misread option (a rebase
 /// `--onto -x`) costs a false block on a command git refuses, never a miss.
@@ -11999,81 +12014,91 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
         .unwrap_or(&[]);
     let verb = command_word(argv.first()?);
     let (globals, rest) = match verb.strip_prefix("git-") {
-        Some(_) => (&argv[..0], argv),
+        Some(_) => (&argv[..0], Some(argv)),
         // A global the grammar does not know stops the skip; the first word
-        // naming one of these subcommands is read instead, which can only add
-        // a script to inspect.
+        // naming one of these subcommands is read instead, and every word
+        // before it is read for an editor, which can only add a script to
+        // inspect.
         None if verb == "git" => {
             let rest = skip_runner_flags("git", &argv[1..]).or_else(|| {
                 let at = argv[1..].iter().position(|word| {
                     GIT_EXEC_SUBCOMMANDS.contains(&unescape_word(word).as_ref())
                 })?;
                 Some(&argv[1 + at..])
-            })?;
-            (&argv[1..argv.len() - rest.len()], rest)
+            });
+            let globals = match rest {
+                Some(rest) => &argv[1..argv.len() - rest.len()],
+                None => &argv[1..],
+            };
+            (globals, rest)
         }
         None => return None,
     };
-    let (subcommand, args) = rest.split_first()?;
+    // Any subcommand that needs an editor (`rebase -i`, `commit`, `pull
+    // --rebase=i`, `tag -a`, …) runs one of these under a shell; git only
+    // starts it when it needs one, so reading it on every subcommand
+    // over-reads, never misses.
+    let editors = editor_scripts(prefix, globals);
+    let editor_only = |editors: Vec<String>| {
+        (!editors.is_empty()).then_some(GitExec {
+            scripts: editors,
+            elsewhere: false,
+            at_toplevel: true,
+        })
+    };
+    let Some((subcommand, args)) = rest.and_then(<[String]>::split_first) else {
+        return editor_only(editors);
+    };
     let subcommand = if verb == "git" {
         unescape_word(subcommand).into_owned()
     } else {
         verb.trim_start_matches("git-").to_string()
     };
-    let exec = match subcommand.as_str() {
-        "rebase" => {
-            let mut scripts = exec_option_scripts(args, &REBASE_OPTIONS);
-            if rebase_is_interactive(args) {
-                scripts.extend(editor_scripts(prefix, globals));
-            }
-            GitExec {
-                scripts,
-                elsewhere: false,
-                at_toplevel: true,
-            }
-        }
+    let (scripts, elsewhere, at_toplevel) = match subcommand.as_str() {
+        "rebase" => (exec_option_scripts(args, &REBASE_OPTIONS), false, true),
         "bisect" => {
             let (scripts, elsewhere) = bisect_run_scripts(args);
-            GitExec {
-                scripts,
-                elsewhere,
-                at_toplevel: true,
-            }
+            (scripts, elsewhere, true)
         }
         // The helper the `submodule` script calls takes the same `foreach`.
-        "submodule" | "submodule--helper" => GitExec {
-            scripts: submodule_foreach_script(args, subcommand == "submodule--helper")
+        "submodule" | "submodule--helper" => (
+            submodule_foreach_script(args, subcommand == "submodule--helper")
                 .into_iter()
                 .collect(),
-            elsewhere: true,
-            at_toplevel: false,
-        },
-        "filter-branch" => GitExec {
-            scripts: filter_branch_scripts(args),
-            elsewhere: true,
-            at_toplevel: false,
-        },
-        "difftool" => GitExec {
-            scripts: exec_option_scripts(args, &DIFFTOOL_OPTIONS),
-            elsewhere: false,
-            at_toplevel: true,
-        },
-        "fetch" | "ls-remote" | "pull" | "clone" | "push" | "archive" => GitExec {
-            scripts: exec_option_scripts(
+            true,
+            false,
+        ),
+        "filter-branch" => (filter_branch_scripts(args), true, false),
+        "difftool" => (exec_option_scripts(args, &DIFFTOOL_OPTIONS), false, true),
+        "fetch" | "ls-remote" | "pull" | "clone" | "push" | "archive" | "fetch-pack"
+        | "send-pack" => (
+            exec_option_scripts(
                 args,
                 match subcommand.as_str() {
                     "clone" => &CLONE_OPTIONS,
-                    "push" => &PUSH_OPTIONS,
+                    "push" | "send-pack" => &PUSH_OPTIONS,
                     "archive" => &ARCHIVE_OPTIONS,
+                    "ls-remote" | "fetch-pack" => &FETCH_PACK_OPTIONS,
                     _ => &UPLOAD_PACK_OPTIONS,
                 },
             ),
-            elsewhere: true,
-            at_toplevel: false,
-        },
-        _ => return None,
+            true,
+            false,
+        ),
+        _ => return editor_only(editors),
     };
-    (!exec.scripts.is_empty()).then_some(exec)
+    if scripts.is_empty() {
+        return editor_only(editors);
+    }
+    // An editor beside a subcommand's own scripts takes their place: where
+    // it is the transports', that is a doubt, never a miss.
+    let mut scripts = scripts;
+    scripts.extend(editors);
+    Some(GitExec {
+        scripts,
+        elsewhere,
+        at_toplevel,
+    })
 }
 
 /// The subcommands [`git_exec`] reads.
@@ -12090,6 +12115,8 @@ const GIT_EXEC_SUBCOMMANDS: &[&str] = &[
     "clone",
     "push",
     "archive",
+    "fetch-pack",
+    "send-pack",
 ];
 
 /// Every command-valued option of one git subcommand, as `grammar` spells
@@ -12162,25 +12189,7 @@ fn exec_option_scripts(args: &[String], grammar: &ExecOptions) -> Vec<String> {
     out
 }
 
-/// Whether a `git rebase` runs interactively — `-i`/`--interactive` (any
-/// abbreviation, any cluster) or `--edit-todo` — and so starts an editor.
-/// Over-reads: a cluster letter after a value-taking one counts too.
-fn rebase_is_interactive(args: &[String]) -> bool {
-    args.iter().any(|raw| {
-        let word = unescape_word(raw);
-        match word.strip_prefix("--") {
-            Some(long) => {
-                !long.is_empty()
-                    && ("interactive".starts_with(long) || "edit-todo".starts_with(long))
-            }
-            None => word
-                .strip_prefix('-')
-                .is_some_and(|cluster| cluster.contains('i')),
-        }
-    })
-}
-
-/// The editor commands a `git rebase -i` runs: an editor assignment in
+/// The editor commands a git subcommand may run: an editor assignment in
 /// `prefix` (the words before `git`) and a `-c`/`--config-env` editor key in
 /// `globals`. See [`git_exec`].
 fn editor_scripts(prefix: &[String], globals: &[String]) -> Vec<String> {
@@ -12293,7 +12302,14 @@ fn without_helper_flags(words: &[String]) -> Vec<String> {
 /// single-word `submodule foreach` command is a shell script and ends the
 /// chain; so does anything else. `helper_stripped`: the
 /// `submodule--helper` flags were already dropped from `words`.
-fn follow_exec_chain(mut words: Vec<String>, mut helper_stripped: bool) -> (Vec<String>, bool) {
+/// `head_is_text`: the first word is shell text, not a command word — true
+/// after a `submodule foreach` link, which runs `sh -c 'CMD "$@"'`, and
+/// returned for the words the chain ends in ([`chain_script`]).
+fn follow_exec_chain(
+    mut words: Vec<String>,
+    mut helper_stripped: bool,
+    mut head_is_text: bool,
+) -> (Vec<String>, bool, bool) {
     let mut start = 0;
     let mut elsewhere = false;
     loop {
@@ -12331,6 +12347,7 @@ fn follow_exec_chain(mut words: Vec<String>, mut helper_stripped: bool) -> (Vec<
                     && words.len() > at + 1 =>
             {
                 start = at + 1;
+                head_is_text = false;
             }
             "submodule" | "submodule--helper" => {
                 let Some(skip) = foreach_command_at(&words[at..]) else {
@@ -12352,13 +12369,31 @@ fn follow_exec_chain(mut words: Vec<String>, mut helper_stripped: bool) -> (Vec<
                     start = at;
                 }
                 elsewhere = true;
+                head_is_text = true;
             }
             _ => break,
         }
         elsewhere |= peeled > 0 || globals > 0;
     }
     words.drain(..start);
-    (words, elsewhere)
+    (words, elsewhere, head_is_text)
+}
+
+/// The script the words a chain ends in run as ([`follow_exec_chain`]):
+/// each word quoted, except a `head_is_text` first word, which the shell
+/// reads as the text it is — `git submodule foreach 'rm .env #' x` runs
+/// `rm .env` (measured).
+fn chain_script(words: &[String], head_is_text: bool) -> Option<String> {
+    if !head_is_text {
+        return quoted_script(words);
+    }
+    let (head, rest) = words.split_first()?;
+    let head = unescape_word(head);
+    let script = match quoted_script(rest) {
+        Some(rest) => format!("{head} {rest}"),
+        None => head.into_owned(),
+    };
+    (!script.trim().is_empty()).then_some(script)
 }
 
 /// The command a `git bisect run CMD ARG…` runs, and whether a submodule
@@ -12371,8 +12406,8 @@ fn bisect_run_scripts(args: &[String]) -> (Vec<String>, bool) {
     if unescape_word(verb).as_ref() != "run" {
         return (Vec::new(), false);
     }
-    let (command, elsewhere) = follow_exec_chain(command.to_vec(), false);
-    let mut out: Vec<String> = quoted_script(&command).into_iter().collect();
+    let (command, elsewhere, head_is_text) = follow_exec_chain(command.to_vec(), false, false);
+    let mut out: Vec<String> = chain_script(&command, head_is_text).into_iter().collect();
     if let Some(joined) = joined_script(&command)
         && !out.contains(&joined)
     {
@@ -12392,7 +12427,10 @@ fn submodule_foreach_script(args: &[String], helper: bool) -> Option<String> {
     match command.as_slice() {
         [] => None,
         [single] => Some(unescape_word(single).into_owned()).filter(|s| !s.trim().is_empty()),
-        _ => quoted_script(&follow_exec_chain(command, helper).0),
+        _ => {
+            let (command, _, head_is_text) = follow_exec_chain(command, helper, true);
+            chain_script(&command, head_is_text)
+        }
     }
 }
 
@@ -21295,12 +21333,12 @@ mod tests {
             ),
             (
                 "git submodule--helper foreach 'cat .env' -- --quiet",
-                away(&["'cat .env' --quiet"]),
+                away(&["cat .env --quiet"]),
             ),
             // The `submodule` script hands trailing words to CMD (measured).
             (
                 "git submodule foreach 'cat .env' --quiet",
-                away(&["'cat .env' --quiet"]),
+                away(&["cat .env --quiet"]),
             ),
             // B5: a re-quoting chain is read through to its end.
             (
@@ -21380,6 +21418,41 @@ mod tests {
                 "git --config-env sequence.editor=ED rebase -i HEAD~1",
                 top(&["${ED}"]),
             ),
+            // Round 2: a foreach command is shell text, its args words.
+            (
+                "git submodule foreach 'rm .env #' x",
+                away(&["rm .env # x"]),
+            ),
+            (
+                "git submodule foreach 'cat .env;' x",
+                away(&["cat .env; x"]),
+            ),
+            (
+                "git submodule--helper foreach 'git push origin main #' x --quiet",
+                away(&["git push origin main # x"]),
+            ),
+            (
+                "git bisect run git submodule foreach 'rm .env #' x",
+                chain_away(&["rm .env # x"]),
+            ),
+            // Round 2: the pack commands' other spellings.
+            ("git ls-remote --exec=a .", away(&["a"])),
+            ("git fetch-pack --exec=a .", away(&["a"])),
+            ("git fetch-pack --upload-pack a .", away(&["a"])),
+            ("git send-pack --exec=a ../b main", away(&["a"])),
+            ("git send-pack --receive-pack a ../b main", away(&["a"])),
+            // Round 2: an editor on any subcommand.
+            ("GIT_EDITOR=a git commit", top(&["a"])),
+            ("GIT_SEQUENCE_EDITOR=a git pull --rebase=i", top(&["a"])),
+            ("GIT_SEQUENCE_EDITOR=a git rebase HEAD~1", top(&["a"])),
+            ("git -c core.editor=a commit -m x", top(&["a"])),
+            ("git -c core.editor=a rebase HEAD~1", top(&["a"])),
+            ("EDITOR=vim git rebase -i main", top(&["vim"])),
+            ("GIT_EDITOR=a git --no-such-global status", top(&["a"])),
+            (
+                "GIT_EDITOR=a git fetch --upload-pack=b .",
+                away(&["b", "a"]),
+            ),
         ] {
             assert_eq!(read(command), want, "{command:?}");
         }
@@ -21390,9 +21463,6 @@ mod tests {
             "git rebase -Xx HEAD~1",
             "git rebase -Sx HEAD~1",
             "git rebase -i HEAD~1",
-            "GIT_SEQUENCE_EDITOR=a git rebase HEAD~1",
-            "git -c core.editor=a rebase HEAD~1",
-            "git -c core.editor=a commit -m x",
             "git fetch -u origin",
             "git fetch origin main",
             "git push origin main",

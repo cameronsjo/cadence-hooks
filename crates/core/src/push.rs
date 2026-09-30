@@ -1035,29 +1035,40 @@ fn unresolvable_push(work_dir: &str, directory_unverified: bool) -> PushInvocati
     }
 }
 
-/// The top of the working tree `work_dir` is in, where git runs a rebase or
-/// bisect command ([`GitExec::at_toplevel`]): the nearest directory, from
-/// `work_dir` up, holding a `.git`, which is where git's own discovery stops.
-/// Read from the file system so no subprocess is spawned; when there is none
-/// and the walk may probe, git is asked (bounded). `None` when neither can
-/// say — a relative `work_dir`, a directory that is not there — and the
-/// caller keeps `work_dir` with a directory doubt. A `core.worktree` set in
-/// the repository's config moves the top where neither reading looks
-/// (cameronsjo/cadence-hooks#1231).
+/// The top of the working tree `work_dir` is in, where git runs a rebase,
+/// bisect, difftool or editor command ([`GitExec::at_toplevel`]). When the
+/// walk may probe, git is asked (bounded `rev-parse --show-toplevel`), which
+/// follows symlinks, a `.git` file and `core.worktree` as git itself does.
+/// Otherwise — or when git cannot answer — the directory is canonicalized
+/// and the nearest directory from it up holding a `.git` is taken, which is
+/// where git's own discovery stops. The directory is canonicalized FIRST: a
+/// lexical walk took `l3 -> /other/repo/sub` to the repository enclosing the
+/// link, not the one it points into (cameronsjo/cadence-hooks#1226 review).
+/// `None` when neither can say — a relative `work_dir`, a directory that is
+/// not there yet (`git clone … d && git -C d rebase -x …`) — and the caller
+/// keeps `work_dir` with a directory doubt.
 fn toplevel_of(work_dir: &str, probe: bool) -> Option<String> {
-    let path = std::path::Path::new(work_dir);
-    if path.is_absolute()
-        && let Some(top) = path.ancestors().find(|dir| dir.join(".git").exists())
+    if probe
+        && let GitOutput::Ok(top) = git_output_detailed(work_dir, &["rev-parse", "--show-toplevel"])
+        && !top.is_empty()
     {
-        return top.to_str().map(str::to_string);
+        return Some(top);
     }
-    if !probe {
+    let path = std::path::Path::new(work_dir);
+    if !path.is_absolute() {
         return None;
     }
-    match git_output_detailed(work_dir, &["rev-parse", "--show-toplevel"]) {
-        GitOutput::Ok(top) if !top.is_empty() => Some(top),
-        _ => None,
-    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let top = canonical
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())?
+        .to_str()?;
+    // Windows canonicalizes to a verbatim `\\?\C:\…` path; git and every
+    // other reader here take the plain drive form.
+    Some(match top.strip_prefix(r"\\?\") {
+        Some(plain) if !plain.starts_with("UNC\\") => plain.to_string(),
+        _ => top.to_string(),
+    })
 }
 
 /// More exec scripts than this on one git invocation are read as one push
@@ -3752,9 +3763,21 @@ mod tests {
     impl GitExecTree {
         fn new(name: &str) -> Self {
             let scratch = Scratch::new(&scratch_root(), name);
-            for dir in ["repo/.git", "repo/a/x/.git", "repo/x/.git", "other/.git"] {
+            for dir in [
+                "repo/.git",
+                "repo/a/x/.git",
+                "repo/x/.git",
+                "other/.git",
+                "other/sub",
+            ] {
                 std::fs::create_dir_all(scratch.path().join(dir)).expect("create scratch tree");
             }
+            // `repo/l3` points into `other`: git runs there, not in `repo`.
+            std::os::unix::fs::symlink(
+                scratch.path().join("other/sub"),
+                scratch.path().join("repo/l3"),
+            )
+            .expect("link into other");
             Self { scratch }
         }
 
@@ -3774,7 +3797,15 @@ mod tests {
             push_locations(&command, &format!("{root}{cwd}"))
                 .iter()
                 .map(|push| {
-                    let dir = push.work_dir.strip_prefix(&root).unwrap_or(&push.work_dir);
+                    // The top of a working tree comes back canonical.
+                    let canonical = std::fs::canonicalize(&root)
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dir = push
+                        .work_dir
+                        .strip_prefix(&canonical)
+                        .or_else(|| push.work_dir.strip_prefix(&root))
+                        .unwrap_or(&push.work_dir);
                     let dir: &'static str = Box::leak(dir.to_string().into_boxed_str());
                     let repository: Option<&'static str> = push
                         .repository
@@ -3865,11 +3896,22 @@ mod tests {
                 "/repo/a",
                 vec![resolved("/other")],
             ),
-            // No working tree above the directory: kept, with a doubt.
+            // A symlinked directory is where it points, not where it sits.
+            (
+                "git -C l3 rebase -x 'git push origin main' HEAD~1",
+                "/repo",
+                vec![resolved("/other")],
+            ),
             (
                 "git rebase -x 'git push origin main' HEAD~1",
-                "/nowhere",
-                vec![lost("/nowhere")],
+                "/repo/l3",
+                vec![resolved("/other")],
+            ),
+            // A directory not there yet has no top to find: a doubt.
+            (
+                "git -C cl rebase -x 'git push origin main' HEAD~1",
+                "/repo",
+                vec![lost("/repo/cl")],
             ),
             // Submodule foreach runs in each submodule: unchanged.
             (
@@ -3950,10 +3992,33 @@ mod tests {
                 vec![refused("/repo")],
             ),
             // Controls
+            // Round 2: an editor is read on any subcommand (over-read).
             (
                 "GIT_SEQUENCE_EDITOR='git push origin main' git rebase HEAD~1",
                 "/repo",
-                vec![],
+                vec![resolved("/repo")],
+            ),
+            (
+                "GIT_EDITOR='git push origin main' git commit",
+                "/repo/a",
+                vec![resolved("/repo")],
+            ),
+            ("EDITOR=vim git rebase -i main", "/repo", vec![]),
+            // Round 2: a foreach command is shell text; `ls-remote --exec`.
+            (
+                "git submodule foreach 'git push origin main #' x",
+                "/repo",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git ls-remote --exec='git push origin main' .",
+                "/repo",
+                vec![elsewhere("/repo")],
+            ),
+            (
+                "git send-pack --exec='git push origin main' ../b main",
+                "/repo",
+                vec![elsewhere("/repo")],
             ),
             ("git fetch -u origin", "/repo", vec![]),
             ("git difftool HEAD", "/repo", vec![]),
@@ -3961,6 +4026,15 @@ mod tests {
         for (command, cwd, want) in cases {
             assert_eq!(tree.found(command, cwd), want, "{command} (from {cwd})");
         }
+        // No working tree can be found above the directory: kept, with a
+        // directory doubt. A relative directory stands in for one: the
+        // scratch root may itself sit inside a checkout (CI's does), whose
+        // `.git` any absolute directory under it would find.
+        let found = push_locations("git rebase -x 'git push origin main' HEAD~1", "rel/dir");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].work_dir, "rel/dir", "{found:?}");
+        assert!(found[0].directory_unverified, "{found:?}");
+        assert!(!found[0].repository_unresolved, "{found:?}");
     }
 
     /// cameronsjo/cadence-hooks#1226: the nesting is bounded. A git exec
