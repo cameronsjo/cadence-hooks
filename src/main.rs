@@ -51,7 +51,7 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
         (
             Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
-        ) | (Some("session"), Some("declare" | "status" | "plans"))
+        ) | (Some("session"), Some("declare" | "status" | "plans" | "timer"))
             // `metrics grade` is a CLI action, not a hook. Bypassed it would
             // exit 0 having printed nothing, and an operator piping it to `jq`
             // reads the absent output as "no cold restarts" rather than "the
@@ -598,6 +598,19 @@ enum SessionCommands {
     WarnPlanReadyFlip,
     /// Block ExitPlanMode on a plan with no settled Panel: line; nudge on other missing stanzas (PreToolUse:ExitPlanMode)
     LintPlanShape,
+    /// Mark a long idle gap ("6 hours later…") on the next prompt; opt-in via CADENCE_AFK_GAP=1 (UserPromptSubmit)
+    NudgeAfkGap,
+    /// Wall-clock stopwatch: start, lap, or stop a named timer (stop logs to timers.jsonl)
+    Timer {
+        /// start | lap | stop
+        #[arg(value_enum)]
+        action: TimerActionArg,
+        /// Timer name (letters, digits, '-', '_', '.'); defaults to "default"
+        label: Option<String>,
+        /// Session id override (defaults to $CLAUDE_SESSION_ID)
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+    },
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -614,6 +627,25 @@ enum SessionCommands {
     Status,
     /// List this repo's in-flight and blocked plans — the detail behind the SessionStart pointer
     Plans,
+}
+
+/// `session timer`'s action, mapped onto the session crate's own enum so the
+/// library stays clap-free.
+#[derive(Clone, Copy, ValueEnum)]
+enum TimerActionArg {
+    Start,
+    Lap,
+    Stop,
+}
+
+impl From<TimerActionArg> for cadence_hooks_session::timer::TimerAction {
+    fn from(arg: TimerActionArg) -> Self {
+        match arg {
+            TimerActionArg::Start => Self::Start,
+            TimerActionArg::Lap => Self::Lap,
+            TimerActionArg::Stop => Self::Stop,
+        }
+    }
 }
 
 /// Returns the kebab-case hook name for the resolved subcommand.
@@ -741,10 +773,14 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
             SessionCommands::LintPlanShape => "lint-plan-shape",
-            // declare, status, and plans are CLI actions, not hooks — no
+            SessionCommands::NudgeAfkGap => "nudge-afk-gap",
+            // declare, status, plans, and timer are CLI actions, not hooks — no
             // hooks.json wiring and not subject to CADENCE_DISABLE (same
             // treatment as dismiss-main-branch-warn).
-            SessionCommands::Declare { .. } | SessionCommands::Status | SessionCommands::Plans => {
+            SessionCommands::Declare { .. }
+            | SessionCommands::Status
+            | SessionCommands::Plans
+            | SessionCommands::Timer { .. } => {
                 return None;
             }
         }),
@@ -769,6 +805,7 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let prompt = HookEvent::UserPromptSubmit;
     Some(match cmd {
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => CheckPlan::new(
@@ -1096,6 +1133,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             SessionCommands::LintPlanShape => CheckPlan::new(
                 Box::new(cadence_hooks_session::plan_guards::LintPlanShape),
                 pre,
+            ),
+            SessionCommands::NudgeAfkGap => CheckPlan::new(
+                Box::new(cadence_hooks_session::afk_gap::NudgeAfkGap),
+                prompt,
             ),
             _ => return None,
         },
@@ -1838,6 +1879,16 @@ fn main() {
             SessionCommands::Plans => {
                 process::exit(cadence_hooks_session::cli::run_plans().into());
             }
+            SessionCommands::Timer {
+                action,
+                label,
+                session_id,
+            } => {
+                process::exit(
+                    cadence_hooks_session::timer::run_timer(action.into(), label, session_id)
+                        .into(),
+                );
+            }
             // Hook checks dispatched above, through `check_plan`.
             _ => unreachable!("check subcommands dispatch through check_plan"),
         },
@@ -1944,6 +1995,8 @@ mod tests {
         // a read-only CLI action, and a bypass that silently printed nothing
         // would read as "no plans in flight" rather than "the command never ran".
         assert!(is_bypass_exempt(Some("session"), Some("plans")));
+        assert!(is_bypass_exempt(Some("session"), Some("timer")));
+        assert!(!is_bypass_exempt(Some("session"), Some("nudge-afk-gap")));
         // The one enforcement-path hook in the set (cadence-hooks#927).
         assert!(is_bypass_exempt(
             Some("guardrails"),
@@ -2159,6 +2212,7 @@ mod tests {
             "declare",
             "status",
             "plans",
+            "timer",
             "record-polish",
             "record-scrub",
             "redact-scan",

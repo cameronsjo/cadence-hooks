@@ -922,6 +922,15 @@ pub const HOOKS: &[HookEntry] = &[
         remote: RemotePolicy::Run,
         suppressible: false,
     },
+    HookEntry {
+        name: "nudge-afk-gap",
+        description: "Mark a long idle gap (\"6 hours later…\") on the next prompt; opt-in via CADENCE_AFK_GAP=1, threshold CADENCE_AFK_GAP_MINUTES (default 240) (UserPromptSubmit)",
+        namespace: "session",
+        events: &[HookEvent::UserPromptSubmit],
+        // Remote: its tool-activity stamp is written by persist-plan-approval, which self-disables in the cloud; running without it would read a long autonomous turn as idle.
+        remote: RemotePolicy::SelfDisable,
+        suppressible: false,
+    },
 ];
 
 /// Whether `.claude/cadence.json` may silence `hook`'s nudges. `false` for an
@@ -1427,6 +1436,7 @@ mod tests {
         "backstop-record",
         "backstop-warn",
         "persist-plan-approval",
+        "nudge-afk-gap",
     ];
 
     #[test]
