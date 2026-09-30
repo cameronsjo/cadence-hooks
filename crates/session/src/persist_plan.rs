@@ -379,7 +379,7 @@ pub fn run_injected_plan_persist(
         }
         InjectedScan::Plan(raw) => raw,
     };
-    let (body, suffix_lines) = split_trailing_suffix_lines(&raw_plan);
+    let (body, suffix_lines) = split_injected_prompt(&raw_plan);
     // Authenticity floor: the pointer must come from the harness-appended
     // trailing block and name a real transcript — see the doc comment. A
     // prefix match without it is definitive non-approval, same as NotInjected.
@@ -391,6 +391,7 @@ pub fn run_injected_plan_persist(
         &suffix_lines,
         input.session_id().unwrap_or_default(),
         &env.transcripts_root,
+        &env.plan_store_root,
         &body,
     ) else {
         let _ = cadence_hooks_core::markers::write_marker(&marker, "");
@@ -466,14 +467,71 @@ fn injected_first_prompt(head: &str) -> InjectedScan {
     InjectedScan::NoUserRowYet
 }
 
+/// Paragraph the harness appends AFTER the pointer and breakdown paragraphs
+/// when the operator approves with feedback (2.1.285 bundle, per the
+/// cadence-hooks#1255 gate review). It can span several lines, so it is cut
+/// at its start rather than popped line by line.
+const USER_FEEDBACK_PREFIX: &str = "\n\nUser feedback on this plan:";
+
+/// How many feedback-paragraph candidates [`split_injected_prompt`] tries
+/// before giving up, bounding the work a prompt full of the phrase can force.
+const MAX_FEEDBACK_CANDIDATES: usize = 8;
+
+/// [`split_trailing_suffix_lines`] for the injected prompt, tolerating an
+/// approve-with-feedback paragraph after the harness block: when the plain
+/// split finds no pointer, the prompt is cut at each
+/// [`USER_FEEDBACK_PREFIX`] in turn (left to right) and the first cut whose
+/// trailing block carries the pointer wins. Only text after the pointer is
+/// ever dropped, and the body that remains is still verified against the
+/// parent transcript, so this can only turn a miss into a verified match.
+fn split_injected_prompt(raw: &str) -> (String, Vec<&str>) {
+    let has_pointer = |suffix: &[&str]| {
+        suffix
+            .iter()
+            .any(|l| l.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX))
+    };
+    let plain = split_trailing_suffix_lines(raw);
+    if has_pointer(&plain.1) {
+        return plain;
+    }
+    raw.match_indices(USER_FEEDBACK_PREFIX)
+        .take(MAX_FEEDBACK_CANDIDATES)
+        .map(|(at, _)| split_trailing_suffix_lines(&raw[..at]))
+        .find(|(_, suffix)| has_pointer(suffix))
+        .unwrap_or(plain)
+}
+
+/// The path a pointer line names: everything after [`POINTER_PATH_LEAD`] up
+/// to the first `.jsonl` that ends a word, so a config dir with a space in
+/// it (a macOS home such as `/Users/Jane Doe`) survives. A line without the
+/// lead falls back to its first whitespace-free `.jsonl` token. Either way
+/// the FIRST candidate wins: a second path appended after the real one
+/// cannot override it.
+fn pointer_path(line: &str) -> Option<&str> {
+    let Some(at) = line.find(POINTER_PATH_LEAD) else {
+        return line
+            .split_whitespace()
+            .find(|token| token.ends_with(".jsonl"));
+    };
+    let rest = line[at + POINTER_PATH_LEAD.len()..].trim_start();
+    rest.match_indices(".jsonl")
+        .map(|(i, m)| i + m.len())
+        .find(|&end| rest[end..].chars().next().is_none_or(char::is_whitespace))
+        .map(|end| &rest[..end])
+}
+
+/// Text that introduces the path in the harness pointer paragraph.
+const POINTER_PATH_LEAD: &str = "transcript at:";
+
 /// The approving (parent) session id, parsed from the injected prompt's
 /// transcript-pointer paragraph — "…read the full transcript at:
 /// `<dir>/<session-id>.jsonl`".
 ///
 /// The caller hands over only the STRIPPED TRAILING SUFFIX LINES (never the
 /// plan body — untrusted prose that may legitimately quote, or maliciously
-/// plant, the pointer text), and the FIRST `.jsonl` token on the pointer line
-/// wins (a second path appended after the real one cannot override it).
+/// plant, the pointer text), and [`pointer_path`] takes the FIRST path on the
+/// pointer line (a second path appended after the real one cannot override
+/// it).
 ///
 /// The pointer line is still written by whoever wrote the first user message,
 /// so the path it names is checked against where Claude Code actually keeps
@@ -492,22 +550,29 @@ fn injected_first_prompt(head: &str) -> InjectedScan {
 ///   (its last [`PARENT_TRANSCRIPT_READ_MAX_BYTES`], streamed line by line)
 ///   holds a main-chain `ExitPlanMode` `tool_use` whose `input.plan`, after
 ///   the same suffix strip, is byte-identical to `body` (so it hashes to the
-///   body being persisted).
+///   body being persisted) — or, for a plan edited in the approval dialog
+///   (Ctrl+G), whose `input.planFilePath` names a plan-store file that now
+///   holds `body` ([`read_plan_store_file_within`] under `plan_store_root`:
+///   the same contained, no-follow, single-link, size-capped open).
+///
+/// **Trust boundary.** The evidence is that the parent session PROPOSED this
+/// plan: an `ExitPlanMode` call is recorded whether the operator approved or
+/// kept planning. Forging it needs a real session id plus that session's
+/// exact plan text, or write access to `<config_dir>`, which can rewrite the
+/// hooks themselves.
 ///
 /// `None` is non-approval, never an anonymous approval.
 fn parent_session_id_from_pointer_lines(
     suffix_lines: &[&str],
     own_session_id: &str,
     transcripts_root: &Path,
+    plan_store_root: &Path,
     body: &str,
 ) -> Option<String> {
     let pointer = suffix_lines
         .iter()
         .find(|l| l.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX))?;
-    let jsonl = pointer
-        .split_whitespace()
-        .find(|token| token.ends_with(".jsonl"))?;
-    let path = Path::new(jsonl);
+    let path = Path::new(pointer_path(pointer)?);
     if !path.is_absolute() {
         return None;
     }
@@ -516,7 +581,7 @@ fn parent_session_id_from_pointer_lines(
         return None;
     }
     let file = open_contained_plan(path, transcripts_root)?;
-    transcript_holds_plan(file, body).then(|| stem.to_string())
+    transcript_holds_plan(file, body, plan_store_root).then(|| stem.to_string())
 }
 
 /// Tail window [`transcript_holds_plan`] reads from a parent transcript. The
@@ -539,8 +604,9 @@ fn is_uuid_shaped(s: &str) -> bool {
 /// be a regular file with one link; when it is larger than
 /// [`PARENT_TRANSCRIPT_READ_MAX_BYTES`] only that tail is read, starting at
 /// the first whole line. Lines that do not mention `ExitPlanMode` are never
-/// parsed. Any read error is a miss.
-fn transcript_holds_plan(file: fs::File, body: &str) -> bool {
+/// parsed. Any read error is a miss. Each distinct `planFilePath` is read at
+/// most once, and at most [`MAX_PLAN_FILE_READS`] of them in all.
+fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> bool {
     use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
     let Ok(meta) = file.metadata() else {
         return false;
@@ -562,6 +628,10 @@ fn transcript_holds_plan(file: fs::File, body: &str) -> bool {
     let mut reader = std::io::BufReader::new(file.take(PARENT_TRANSCRIPT_READ_MAX_BYTES));
     let mut line = Vec::new();
     let mut first = true;
+    let mut plan_files = PlanFileCheck {
+        root: plan_store_root,
+        seen: std::collections::HashMap::new(),
+    };
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
@@ -581,15 +651,43 @@ fn transcript_holds_plan(file: fs::File, body: &str) -> bool {
         let Ok(row) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        if row_has_exit_plan_mode_for(&row, body) {
+        if row_has_exit_plan_mode_for(&row, body, &mut plan_files) {
             return true;
         }
     }
 }
 
+/// Cap on the distinct plan-store files one parent-transcript scan reads.
+const MAX_PLAN_FILE_READS: usize = 16;
+
+/// Memo of plan-store reads for one [`transcript_holds_plan`] scan.
+struct PlanFileCheck<'a> {
+    root: &'a Path,
+    seen: std::collections::HashMap<String, bool>,
+}
+
+impl PlanFileCheck<'_> {
+    /// Does the plan-store file at `path` hold `body` (after the suffix
+    /// strip)? A path outside the store, a symlink, a hardlink or an
+    /// oversized file reads as `false` ([`read_plan_store_file_within`]).
+    fn holds(&mut self, path: &str, body: &str) -> bool {
+        if let Some(&known) = self.seen.get(path) {
+            return known;
+        }
+        if self.seen.len() >= MAX_PLAN_FILE_READS {
+            return false;
+        }
+        let found = read_plan_store_file_within(path, self.root)
+            .is_some_and(|content| strip_trailing_suffix_lines_and_trim(&content) == body);
+        self.seen.insert(path.to_string(), found);
+        found
+    }
+}
+
 /// Is `row` a main-chain assistant row carrying an `ExitPlanMode` `tool_use`
-/// whose `input.plan` strips to `body`?
-fn row_has_exit_plan_mode_for(row: &Value, body: &str) -> bool {
+/// whose `input.plan` strips to `body`, or whose `input.planFilePath` names a
+/// plan-store file that does (an approval-dialog edit)?
+fn row_has_exit_plan_mode_for(row: &Value, body: &str, plan_files: &mut PlanFileCheck) -> bool {
     if row.get("type").and_then(Value::as_str) != Some("assistant")
         || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
     {
@@ -603,13 +701,15 @@ fn row_has_exit_plan_mode_for(row: &Value, body: &str) -> bool {
         return false;
     };
     items.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("tool_use")
-            && item.get("name").and_then(Value::as_str) == Some("ExitPlanMode")
-            && item
-                .get("input")
-                .and_then(|i| i.get("plan"))
-                .and_then(Value::as_str)
-                .is_some_and(|plan| strip_trailing_suffix_lines_and_trim(plan) == body)
+        if item.get("type").and_then(Value::as_str) != Some("tool_use")
+            || item.get("name").and_then(Value::as_str) != Some("ExitPlanMode")
+        {
+            return false;
+        }
+        let input = item.get("input");
+        let field = |key: &str| input.and_then(|i| i.get(key)).and_then(Value::as_str);
+        field("plan").is_some_and(|plan| strip_trailing_suffix_lines_and_trim(plan) == body)
+            || field("planFilePath").is_some_and(|path| plan_files.holds(path, body))
     })
 }
 
@@ -790,6 +890,10 @@ pub struct DestinationEnv {
     /// Claude Code's transcript store, `<config_dir>/projects`: the only
     /// place an approve-and-clear pointer may name (cadence-hooks#1255).
     pub transcripts_root: PathBuf,
+    /// Claude Code's plan store, `<config_dir>/plans`: where an approval
+    /// dialog edit (Ctrl+G) lands, read when the parent's recorded plan
+    /// predates that edit (cadence-hooks#1255 gate review).
+    pub plan_store_root: PathBuf,
     /// Would `enforce-worktree` block a commit in this checkout?
     pub worktree_first: fn(&Path) -> bool,
 }
@@ -810,6 +914,7 @@ impl DestinationEnv {
                 .join("cadence")
                 .join("plans"),
             transcripts_root: cadence_hooks_core::paths::claude_config_dir().join("projects"),
+            plan_store_root: cadence_hooks_core::paths::claude_config_dir().join("plans"),
             worktree_first: cadence_hooks_core::worktree::would_block_here,
         }
     }
@@ -3902,6 +4007,7 @@ mod tests {
             default_host: "github.com".into(),
             user_plans_dir: user_plans_dir.to_path_buf(),
             transcripts_root: test_transcripts_root().to_path_buf(),
+            plan_store_root: test_config_dir().join("plans"),
             worktree_first: |_| false,
         }
     }
@@ -3911,6 +4017,13 @@ mod tests {
     /// it is later run under will accept, without threading the dir through
     /// every call site.
     fn test_transcripts_root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| test_config_dir().join("projects"))
+    }
+
+    /// The stand-in `<config_dir>` behind [`test_transcripts_root`] and the
+    /// test plan store.
+    fn test_config_dir() -> &'static Path {
         static ROOT: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
         ROOT.get_or_init(|| TempDir::new().unwrap()).path()
     }
@@ -3921,6 +4034,21 @@ mod tests {
     /// Written through a rename so concurrent tests planting the same parent
     /// never read a half-written file.
     fn write_parent_transcript(root: &Path, parent_id: &str, plan: &str) -> PathBuf {
+        write_parent_transcript_with(root, parent_id, plan, None)
+    }
+
+    /// [`write_parent_transcript`] whose `ExitPlanMode` input also names a
+    /// `planFilePath`, as the current harness records it.
+    fn write_parent_transcript_with(
+        root: &Path,
+        parent_id: &str,
+        plan: &str,
+        plan_file: Option<&Path>,
+    ) -> PathBuf {
+        let mut input = serde_json::json!({"plan": plan});
+        if let Some(plan_file) = plan_file {
+            input["planFilePath"] = plan_file.to_string_lossy().into_owned().into();
+        }
         let dir = root.join("-test-project");
         fs::create_dir_all(&dir).unwrap();
         let rows = [
@@ -3933,7 +4061,7 @@ mod tests {
                 "message": {"role": "assistant", "content": [
                     {"type": "text", "text": "Here is the plan."},
                     {"type": "tool_use", "id": "toolu_01", "name": "ExitPlanMode",
-                     "input": {"plan": plan}},
+                     "input": input},
                 ]},
             }),
             serde_json::json!({
@@ -6070,6 +6198,59 @@ mod tests {
         }
     }
 
+    /// The gate review's `scen.py edited` flow end to end: the operator edits
+    /// the plan in the approval dialog (Ctrl+G, which writes the plan store)
+    /// and approves with clear-context. The child carries the edited plan,
+    /// the parent's `ExitPlanMode` input the original; the plan persists as
+    /// edited, attributed to the parent.
+    #[test]
+    fn injected_arm_persists_a_plan_edited_in_the_approval_dialog() {
+        let original = "# Legit Plan\n\nPanel: none — trivial\n\n- [ ] step one";
+        let edited = format!("{original}\n- [ ] step added in editor");
+        let plans = test_config_dir().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let plan_file = plans.join(format!("{}.md", unique_session_id("edited")));
+        fs::write(&plan_file, format!("{edited}\n")).unwrap();
+        let parent_id = "11111111-2222-3333-4444-5555555555d1";
+        let parent = write_parent_transcript_with(
+            test_transcripts_root(),
+            parent_id,
+            original,
+            Some(&plan_file),
+        );
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &format!(
+                "Implement the following plan:\n\n{edited}\n\nIf you need specific details from \
+                 before exiting plan mode, read the full transcript at: {}\n\nIf this plan can \
+                 be broken down into multiple independent tasks, consider using the TeamCreate tool.",
+                parent.display()
+            ),
+        );
+        let input = injected_input(&cwd, &transcript, &unique_session_id("child-edited"));
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(
+                &input,
+                "2026-09-30T00:00:00Z",
+                "2026-09-30",
+                "test-host",
+                &test_env(),
+            )
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "{:?}", r.message);
+        let doc =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-09-30-legit-plan.md")).unwrap();
+        assert!(doc.ends_with("- [ ] step added in editor\n"), "{doc}");
+        assert!(
+            doc.contains(&format!("approved_session_id: \"{parent_id}\"")),
+            "{doc}"
+        );
+    }
+
     #[test]
     fn injected_arm_targets_the_session_root_repo_from_a_no_repo_first_call() {
         // cadence-hooks#1021: the first tool call running outside any repo no
@@ -6193,7 +6374,8 @@ mod tests {
     /// and resolve it for the default child, `root` and body.
     fn resolve_pointer(pointer: &str, root: &Path) -> Option<String> {
         let line = format!("{POINTER_LEAD} {pointer}");
-        parent_session_id_from_pointer_lines(&[line.as_str()], CHILD_ID, root, POINTER_BODY)
+        let store = root.parent().unwrap().join("plans");
+        parent_session_id_from_pointer_lines(&[line.as_str()], CHILD_ID, root, &store, POINTER_BODY)
     }
 
     /// cadence-hooks#1255: the pointer is a claim written by whoever wrote the
@@ -6349,6 +6531,138 @@ mod tests {
         );
     }
 
+    /// Gate review of #1255: a plan edited in the approval dialog (Ctrl+G)
+    /// reaches the child as the EDITED text while the parent's recorded
+    /// `input.plan` predates the edit. The edit writes through to the plan
+    /// store, so the body is accepted when the `planFilePath` recorded by that
+    /// same call holds it, and only when that file is inside the store and
+    /// reached without a symlink or a hardlink.
+    #[test]
+    fn parent_pointer_accepts_an_approval_dialog_edit_via_the_plan_store() {
+        let store = TempDir::new().unwrap();
+        let root = store.path().join("projects");
+        let plans = store.path().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let outside = TempDir::new().unwrap();
+        let original = "# Pointer Plan\n\nDo it before the edit.";
+        // The dialog edit: the store file holds the body being persisted.
+        let edited = plans.join("edited.md");
+        fs::write(&edited, format!("{POINTER_BODY}\n")).unwrap();
+        let unedited = plans.join("unedited.md");
+        fs::write(&unedited, original).unwrap();
+        let foreign = outside.path().join("foreign.md");
+        fs::write(&foreign, POINTER_BODY).unwrap();
+        let mut cases: Vec<(&str, PathBuf, Option<&str>)> = vec![
+            (
+                "store file holds the edited body",
+                edited.clone(),
+                Some(PARENT_ID),
+            ),
+            ("store file holds another plan", unedited, None),
+            ("plan file outside the store", foreign.clone(), None),
+            (
+                "dotdot out of the store",
+                plans.join("../plans/../x/foreign.md"),
+                None,
+            ),
+            ("missing plan file", plans.join("missing.md"), None),
+        ];
+        #[cfg(unix)]
+        {
+            let linked = plans.join("linked.md");
+            std::os::unix::fs::symlink(&foreign, &linked).unwrap();
+            cases.push(("symlinked plan file", linked, None));
+            let hard = plans.join("hard.md");
+            fs::hard_link(&foreign, &hard).unwrap();
+            cases.push(("hardlinked plan file", hard, None));
+        }
+        for (i, (label, plan_file, want)) in cases.into_iter().enumerate() {
+            let parent_id = format!("11111111-2222-3333-4444-5555555555c{i}");
+            let want = want.map(|_| parent_id.as_str());
+            let transcript =
+                write_parent_transcript_with(&root, &parent_id, original, Some(&plan_file));
+            assert_eq!(
+                resolve_pointer(&transcript.display().to_string(), &root).as_deref(),
+                want,
+                "{label}: {}",
+                plan_file.display()
+            );
+        }
+    }
+
+    /// Gate review of #1255 (M-1, M-2): an approve-with-feedback paragraph
+    /// after the harness block, and a config dir with a space in its path,
+    /// no longer hide the pointer. The body stays the plan alone.
+    #[test]
+    fn injected_split_tolerates_feedback_and_a_spaced_config_dir() {
+        let store = TempDir::new().unwrap();
+        let root = store.path().join("my config").join("projects");
+        let real = write_parent_transcript(&root, PARENT_ID, POINTER_BODY);
+        let prompt = |tail: &str| {
+            format!(
+                "{POINTER_BODY}\n\n{POINTER_LEAD} {}\n\nIf this plan can be broken down into \
+                 tasks, use agents.{tail}",
+                real.display()
+            )
+        };
+        for (label, tail) in [
+            ("no feedback", String::new()),
+            (
+                "multi-line feedback",
+                "\n\nUser feedback on this plan: also add tests\n\nand docs".to_string(),
+            ),
+            (
+                "feedback quoting the phrase",
+                "\n\nUser feedback on this plan: see\n\nUser feedback on this plan: x".to_string(),
+            ),
+        ] {
+            let raw = prompt(&tail);
+            let (body, suffix) = split_injected_prompt(&raw);
+            assert_eq!(body, POINTER_BODY, "{label}");
+            assert_eq!(
+                parent_session_id_from_pointer_lines(
+                    &suffix,
+                    CHILD_ID,
+                    &root,
+                    &store.path().join("plans"),
+                    &body
+                )
+                .as_deref(),
+                Some(PARENT_ID),
+                "{label}"
+            );
+        }
+        // A feedback-shaped paragraph INSIDE the body, with no pointer after
+        // the cut, supplies nothing.
+        let raw = format!("{POINTER_BODY}\n\nUser feedback on this plan: x\n\nmore body");
+        let (_, suffix) = split_injected_prompt(&raw);
+        assert!(suffix.is_empty(), "{suffix:?}");
+    }
+
+    #[test]
+    fn pointer_path_takes_the_first_path_after_the_lead() {
+        for (line, want) in [
+            (
+                "read the full transcript at: /a/b c/x.jsonl",
+                Some("/a/b c/x.jsonl"),
+            ),
+            (
+                "read the full transcript at: /a/x.jsonl /b/y.jsonl",
+                Some("/a/x.jsonl"),
+            ),
+            (
+                "read the full transcript at: /a/x.jsonlz/y.jsonl",
+                Some("/a/x.jsonlz/y.jsonl"),
+            ),
+            ("read the full transcript at:/a/x.jsonl", Some("/a/x.jsonl")),
+            ("read the full transcript at: /a/x.txt", None),
+            ("drifted template: /a/x.jsonl", Some("/a/x.jsonl")),
+            ("no path here", None),
+        ] {
+            assert_eq!(pointer_path(line), want, "{line}");
+        }
+    }
+
     #[test]
     fn uuid_shape_is_exactly_8_4_4_4_12_hex() {
         for good in [PARENT_ID, "3F2B8C1E-9A4D-4E6F-8B7A-1C2D3E4F5A6B"] {
@@ -6385,7 +6699,13 @@ mod tests {
             "mid-body line stays in the body"
         );
         assert_eq!(
-            parent_session_id_from_pointer_lines(&suffix, CHILD_ID, &root, POINTER_BODY),
+            parent_session_id_from_pointer_lines(
+                &suffix,
+                CHILD_ID,
+                &root,
+                &store.path().join("plans"),
+                POINTER_BODY
+            ),
             None
         );
     }
@@ -6415,8 +6735,14 @@ mod tests {
             .unwrap()
             .trim_start();
         assert_eq!(
-            parent_session_id_from_pointer_lines(&suffix, CHILD_ID, test_transcripts_root(), body)
-                .as_deref(),
+            parent_session_id_from_pointer_lines(
+                &suffix,
+                CHILD_ID,
+                test_transcripts_root(),
+                &test_config_dir().join("plans"),
+                body
+            )
+            .as_deref(),
             Some(PARENT_ID)
         );
     }
