@@ -1258,7 +1258,7 @@ fn panic_stderr_text(
 /// Fail-open (ADR-0001): `log_bypass` swallows every I/O error. Privacy: only the
 /// hook label, the session id from the environment, and the cwd's repo basename.
 fn record_global_gate(kind: cadence_hooks_core::BypassKind, mechanism: &str, hook: Option<&str>) {
-    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+    let session_id = std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
     let cwd = std::env::current_dir()
@@ -1268,7 +1268,7 @@ fn record_global_gate(kind: cadence_hooks_core::BypassKind, mechanism: &str, hoo
         kind,
         mechanism,
         hook,
-        session.as_deref(),
+        session_id.as_deref(),
         cwd.as_deref(),
     ));
 }

@@ -50,6 +50,10 @@ const RECORDING: &[(&str, &[&str])] = &[
         &["crates/guardrails/src/warn_going_public.rs"],
     ),
     (
+        "CADENCE_ALLOW_CRITICAL_GRADE",
+        &["crates/guardrails/src/guard_critical_grade.rs"],
+    ),
+    (
         "CADENCE_BODY_BUDGET_PR",
         &["crates/guardrails/src/guard_body_budget.rs"],
     ),
