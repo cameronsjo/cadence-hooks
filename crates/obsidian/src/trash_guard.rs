@@ -1316,6 +1316,9 @@ mod tests {
     /// A symlink outside the vault that points into it is judged by where it
     /// lands, on real disk: the lexical path says "outside", the physical one
     /// says "vault".
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn deletion_from_vault_cwd_through_a_symlink_into_the_vault_blocks() {
         use cadence_hooks_core::git_fixtures::Scratch;
@@ -1510,6 +1513,9 @@ mod tests {
 
     /// The same, on real disk: an outside symlink into the vault, judged by its
     /// canonical parent, with the fixtures kept out of `/tmp`.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn deletion_from_outside_cwd_through_a_real_symlink_blocks() {
         use cadence_hooks_core::git_fixtures::Scratch;

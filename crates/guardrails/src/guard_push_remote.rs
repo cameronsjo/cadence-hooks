@@ -1891,6 +1891,9 @@ mod tests {
         });
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn push_moved_to_another_repository_is_judged_there() {
         use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
@@ -2070,6 +2073,9 @@ mod tests {
     /// dedupe dropped the child's copy and judged only the parent's, in the
     /// owned checkout. Every row runs from an owned checkout; `{other}` is an
     /// unowned one.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_child_push_is_judged_where_the_child_runs_it() {
         use cadence_hooks_core::Outcome::{Allow, Block};
@@ -2548,6 +2554,9 @@ mod tests {
     /// owned checkout. Each Block row was ALLOW on main; the clone rows were
     /// measured against real git with the unowned URL rewritten to a local
     /// bare repository, which received the push.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_push_hidden_by_a_clone_an_alias_or_find_is_judged() {
         use cadence_hooks_core::Outcome::{Allow, Block};
@@ -3088,6 +3097,9 @@ mod tests {
     /// cadence-hooks#1144 item 3: a push in a child script run somewhere
     /// else, with no top-level push segment and no literal `git push`, was
     /// allowed at the gate before the directory check ran.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_wrapped_push_in_another_repository_reaches_the_directory_check() {
         use cadence_hooks_core::Outcome::{Allow, Block};

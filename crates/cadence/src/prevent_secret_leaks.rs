@@ -11410,16 +11410,20 @@ mod tests {
         ] {
             assert_relative_envrc_read(command, cadence_hooks_core::Outcome::Block);
         }
-        // An absolute operand is immune to the cd rule, not to a swap.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".envrc");
-        std::fs::write(&path, "use flake\n").unwrap();
-        let path = path.to_string_lossy();
-        let result = SecretLeaksGuard::default().run(&make_bash_with_cwd(
-            &format!("mv x {path}; cat {path}"),
-            "/elsewhere",
-        ));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        // An absolute operand is immune to the cd rule, not to a swap. Unix
+        // only: a native Windows path loses its backslashes to shell escaping.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(".envrc");
+            std::fs::write(&path, "use flake\n").unwrap();
+            let path = path.to_string_lossy();
+            let result = SecretLeaksGuard::default().run(&make_bash_with_cwd(
+                &format!("mv x {path}; cat {path}"),
+                "/elsewhere",
+            ));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        }
     }
 
     #[test]

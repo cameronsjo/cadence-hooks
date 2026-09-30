@@ -93,9 +93,12 @@ pub fn glob_compiles(pattern: &str) -> bool {
 /// `file` relative to `root`, lexically normalized. `None` when the file is
 /// outside the root (a path glob then never matches).
 pub fn repo_relative(root: &Path, file: &str) -> Option<String> {
+    // `Path::is_absolute` also admits a Windows drive path (`C:/…`), which
+    // does not start with `/` and would otherwise read as repo-relative.
+    let absolute = file.starts_with('/') || Path::new(file).is_absolute();
     let file = crate::pathclass::normalize(file);
     let root = crate::pathclass::normalize(&root.to_string_lossy());
-    if !file.starts_with('/') {
+    if !absolute {
         return (!file.is_empty()).then_some(file);
     }
     let rest = file.strip_prefix(root.as_str())?.strip_prefix('/')?;
@@ -204,6 +207,23 @@ mod tests {
             ("/repo", None),
             // a traversal out of the root cannot spoof a docs path
             ("/repo/../etc/docs/a.md", None),
+        ];
+        for (file, want) in rows {
+            assert_eq!(repo_relative(root, file).as_deref(), *want, "{file}");
+        }
+    }
+
+    /// A Windows drive path is absolute: it is judged against the root, not
+    /// returned whole as if it were already repo-relative.
+    #[cfg(windows)]
+    #[test]
+    fn repo_relative_reads_a_drive_path_as_absolute() {
+        let root = Path::new(r"C:\repo");
+        let rows: &[(&str, Option<&str>)] = &[
+            (r"C:\repo\docs\a.md", Some("docs/a.md")),
+            ("C:/repo/docs/a.md", Some("docs/a.md")),
+            (r"C:\elsewhere\docs\a.md", None),
+            (r"docs\a.md", Some("docs/a.md")),
         ];
         for (file, want) in rows {
             assert_eq!(repo_relative(root, file).as_deref(), *want, "{file}");
