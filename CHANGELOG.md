@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.117.0] - 2026-09-30
+
 ### Added
 
 - **`.claude/cadence.json` now suppresses individual nudges per repo, with optional path scoping.** `"nudges": { "<hook>": { "suppress": true | ["glob", ...] } }` silences that hook's `Nudge` outcomes (globs match the tool call's file path, repo-relative when they contain `/`, basename otherwise; a Bash-shaped call has no path, so only `true` silences it). A new required `suppressible` field on every `HOOKS` entry marks the 35 advisory hooks that may be named; dispatch enforces it and only ever rewrites a `Nudge`, so a `Block` or `Ask`, and every protected or security-critical guard, is untouched whatever the config says. A malformed file, entry, or glob suppresses nothing and never blocks. `doctor` warns on an unknown hook name, rejects a key naming a block, a protected guard, or a non-suppressible hook, and reports malformed entries and globs. `"feedbackFooter": false` turns off the block footer. The `CADENCE_*` env toggles keep working: env or config suppresses. Config suppression is not written to `bypasses.jsonl` (configured structure, like `Exemption`). (cameronsjo/cadence-hooks#216)
