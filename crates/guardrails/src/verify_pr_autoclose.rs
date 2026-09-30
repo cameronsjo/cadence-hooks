@@ -592,6 +592,25 @@ enum Flow {
 /// matched `gh pr merge` inside an `echo` or a commit message. A command with
 /// both a create and a merge segment takes the create flow, as the substring
 /// order did.
+/// The directory `gh` ran in: the payload cwd after a leading `cd` chain,
+/// resolved to the repo it lands in, so `cd <nested> && gh pr create` from a
+/// meta-repo session reads the nested repo's origin, not the meta-repo's
+/// (cameronsjo/cadence-hooks#225). No payload cwd falls back to this
+/// process's directory (long-standing). `None` — a `cd` into somewhere no
+/// repo can be named — keeps the advisory quiet rather than reading the
+/// wrong repo.
+fn gh_work_dir(cmd: &str, cwd: Option<&str>) -> Option<String> {
+    match cwd {
+        Some(cwd) => cadence_hooks_core::target_repo::command_repo_dir(cmd, cwd),
+        None => Some(
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| ".".to_string()),
+        ),
+    }
+}
+
 fn flow_for(cmd: &str) -> Flow {
     let segments = gh_pr_segments(cmd);
     let has = |sub: &str| segments.iter().any(|t| gh_pr_subcommand(t) == Some(sub));
@@ -632,12 +651,10 @@ impl Check for VerifyPrAutoclose {
             return CheckResult::allow();
         }
 
-        // Resolve working directory
-        let cwd_fallback = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| ".".to_string());
-        let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+        let Some(cwd) = gh_work_dir(cmd, input.cwd.as_deref()) else {
+            return CheckResult::allow();
+        };
+        let cwd = cwd.as_str();
 
         // Get remote URL and parse it
         let Some(remote_url) = git_command(cwd, &["remote", "get-url", "origin"]) else {
@@ -1785,5 +1802,65 @@ mod tests {
             input.tool_response_stdout(),
             Some("https://github.com/owner/repo/pull/42")
         );
+    }
+
+    #[test]
+    fn gh_work_dir_reads_the_repo_a_leading_cd_moves_into() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/verify-pr-autoclose-scratch"),
+            "meta-cd",
+        );
+        let meta = s.path().join("meta");
+        let nested = meta.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&meta);
+        std::fs::write(meta.join(".gitignore"), "nested/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        init_repo(&nested);
+        let remote = |dir: &std::path::Path, slug: &str| {
+            let url = format!("https://github.com/o/{slug}.git");
+            git_in(dir, &["remote", "add", "origin", &url]);
+        };
+        remote(&meta, "meta");
+        remote(&nested, "nested");
+        let m = meta.to_str().unwrap();
+        let n = nested.to_str().unwrap();
+        // (label, command, cwd, expected origin slug: None = quiet)
+        let cases: Vec<(&str, String, &str, Option<&str>)> = vec![
+            (
+                "meta cwd, cd into the gitignored nested repo",
+                "cd nested && gh pr create --fill".into(),
+                m,
+                Some("o/nested"),
+            ),
+            (
+                "meta cwd, no cd: the meta repo (unchanged)",
+                "gh pr create --fill".into(),
+                m,
+                Some("o/meta"),
+            ),
+            (
+                "nested cwd, cd out to the meta repo",
+                format!("cd {m} && gh pr merge 3"),
+                n,
+                Some("o/meta"),
+            ),
+            (
+                "cd into a missing dir: quiet",
+                "cd nested/no-such && gh pr create --fill".into(),
+                m,
+                None,
+            ),
+        ];
+        for (label, command, cwd, want) in cases {
+            let slug = gh_work_dir(&command, Some(cwd)).map(|dir| {
+                let url = git_command(&dir, &["remote", "get-url", "origin"]).unwrap();
+                parse_remote(&url).unwrap().1
+            });
+            assert_eq!(slug.as_deref(), want, "{label}");
+        }
     }
 }

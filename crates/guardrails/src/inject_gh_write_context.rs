@@ -59,7 +59,15 @@ impl Check for InjectGhWriteContext {
         // The retargeted twin (cameronsjo/cadence-hooks#150): a write that DOES
         // name `-R other/repo` whose body carries a bare `#N`. Local only.
         let base_dir = input.cwd.as_deref().unwrap_or(".");
-        let bare_ref = cross_repo_bare_ref_nudge(command, base_dir, &|| origin_slug_of(base_dir));
+        // "This checkout's repo" is the one `gh` runs in — the cwd after a
+        // leading `cd` chain, so `cd <nested> && gh … -R <nested's slug>` from
+        // a meta-repo session compares against the nested repo's origin, not
+        // the meta-repo's (cameronsjo/cadence-hooks#225). A `cd` no repo can
+        // be named for yields no origin, and the advisory stays quiet.
+        let bare_ref = cross_repo_bare_ref_nudge(command, base_dir, &|| {
+            cadence_hooks_core::target_repo::command_repo_dir(command, base_dir)
+                .and_then(|dir| origin_slug_of(&dir))
+        });
 
         match (needs_context, bare_ref) {
             (false, None) => CheckResult::allow(),
@@ -364,6 +372,65 @@ mod tests {
             ("(#12) [#13]", vec![12, 13]),
         ] {
             assert_eq!(bare_refs(body), want, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn bare_ref_origin_is_the_repo_a_leading_cd_moves_into() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/inject-gh-write-context-scratch"),
+            "meta-cd",
+        );
+        let meta = s.path().join("meta");
+        let nested = meta.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&meta);
+        std::fs::write(meta.join(".gitignore"), "nested/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        init_repo(&nested);
+        for (dir, slug) in [(&meta, "meta"), (&nested, "nested")] {
+            let url = format!("https://github.com/o/{slug}.git");
+            git_in(dir, &["remote", "add", "origin", &url]);
+        }
+        // (label, command, nudges) — all run from the meta-repo cwd.
+        let table = [
+            (
+                "cd nested, posting to the nested repo itself: its own refs",
+                "cd nested && gh issue comment 5 -R o/nested --body 'see #7'",
+                false,
+            ),
+            (
+                "cd nested, posting to the meta repo: a cross-repo bare ref",
+                "cd nested && gh issue comment 5 -R o/meta --body 'see #7'",
+                true,
+            ),
+            (
+                "no cd, posting to the meta repo (unchanged)",
+                "gh issue comment 5 -R o/meta --body 'see #7'",
+                false,
+            ),
+            (
+                "no cd, posting to the nested repo (unchanged)",
+                "gh issue comment 5 -R o/nested --body 'see #7'",
+                true,
+            ),
+            (
+                "cd into a missing dir: no origin can be named, quiet",
+                "cd nested/no-such && gh issue comment 5 -R o/nested --body 'see #7'",
+                false,
+            ),
+        ];
+        for (label, command, nudges) in table {
+            let outcome = in_checkout(command, &meta).outcome;
+            let want = if nudges {
+                Outcome::Nudge
+            } else {
+                Outcome::Allow
+            };
+            assert_eq!(outcome, want, "{label}");
         }
     }
 }

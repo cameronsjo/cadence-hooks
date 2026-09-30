@@ -106,10 +106,23 @@ impl Check for WarnUntrackedFiles {
             return CheckResult::allow();
         }
 
-        // Get untracked files from git (respect cwd from hook payload)
+        // Judge the repo the command runs in: the payload cwd after a leading
+        // `cd` chain, so `cd <nested> && git commit` from a meta-repo session
+        // lists the nested repo's untracked files, not the meta-repo's
+        // (cameronsjo/cadence-hooks#225). A `cd` this cannot attribute to a
+        // repo leaves the guard quiet — it only advises (ADR-0001).
+        let repo_dir = match input.cwd.as_deref() {
+            Some(cwd) => match cadence_hooks_core::target_repo::command_repo_dir(command, cwd) {
+                Some(dir) => Some(dir),
+                None => return CheckResult::allow(),
+            },
+            None => None,
+        };
+
+        // Get untracked files from git (in the command's effective repo)
         let mut cmd = Command::new("git");
         cmd.args(["status", "--porcelain"]);
-        if let Some(dir) = input.cwd.as_deref()
+        if let Some(dir) = repo_dir.as_deref()
             && Path::new(dir).is_dir()
         {
             cmd.current_dir(dir);
@@ -140,9 +153,9 @@ impl Check for WarnUntrackedFiles {
         // The plan-tick pre-arm (cadence-hooks#691): the branch's in-flight
         // plan is modified but unstaged, and this commit takes only the index.
         if commit_takes_only_staged(command)
-            && let Some(cwd) = input.cwd.as_deref()
+            && let Some(dir) = repo_dir.as_deref()
             && let Some(plan) =
-                cadence_hooks_session::plan_guards::unstaged_plan_at_commit(cwd, &stdout)
+                cadence_hooks_session::plan_guards::unstaged_plan_at_commit(dir, &stdout)
             // `git commit <pathspec>` takes the named paths' working-tree
             // content, and a pathspec is indistinguishable from a flag value
             // here — so a command that names the plan file at all stays silent.
@@ -432,5 +445,93 @@ mod tests {
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("?? forgotten.rs"), "{msg}");
         assert!(msg.contains("not staged"), "{msg}");
+    }
+
+    /// Meta-repo `meta/` gitignoring `nested/`, an independent repo. Each has
+    /// one untracked file of its own, so a nudge names the repo it judged.
+    fn meta_with_nested(
+        tag: &str,
+    ) -> (
+        cadence_hooks_core::git_fixtures::Scratch,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/warn-untracked-scratch"),
+            tag,
+        );
+        let meta = s.path().join("meta");
+        let nested = meta.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&meta);
+        std::fs::write(meta.join(".gitignore"), "nested/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        init_repo(&nested);
+        std::fs::write(meta.join("meta_only.rs"), "x").unwrap();
+        std::fs::write(nested.join("nested_only.rs"), "x").unwrap();
+        (s, meta, nested)
+    }
+
+    #[test]
+    fn a_leading_cd_is_judged_against_the_repo_it_moves_into() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let (_s, meta, nested) = meta_with_nested("meta-cd");
+        let m = meta.to_str().unwrap();
+        let n = nested.to_str().unwrap();
+        // (label, command, cwd, expected: None = allow, Some(file) = nudge naming it)
+        let cases: Vec<(&str, String, &str, Option<&str>)> = vec![
+            (
+                "meta cwd, cd into the gitignored nested repo",
+                "cd nested && git commit -m x".into(),
+                m,
+                Some("nested_only.rs"),
+            ),
+            (
+                "meta cwd, no cd: the meta repo (unchanged)",
+                "git commit -m x".into(),
+                m,
+                Some("meta_only.rs"),
+            ),
+            (
+                "nested cwd, no cd: the nested repo (unchanged)",
+                "git commit -m x".into(),
+                n,
+                Some("nested_only.rs"),
+            ),
+            (
+                "nested cwd, cd out to the meta repo",
+                format!("cd {m} && git add -A"),
+                n,
+                Some("meta_only.rs"),
+            ),
+            (
+                "cd into a missing dir: cannot name the repo, quiet",
+                "cd nested/no-such && git commit -m x".into(),
+                m,
+                None,
+            ),
+        ];
+        for (label, command, cwd, want) in cases {
+            let result = WarnUntrackedFiles.run(&make_bash_with_cwd(&command, cwd));
+            match want {
+                None => assert_eq!(result.outcome, Outcome::Allow, "{label}"),
+                Some(file) => {
+                    assert_eq!(result.outcome, Outcome::Nudge, "{label}");
+                    let msg = result.message.unwrap_or_default();
+                    assert!(msg.contains(&format!("?? {file}")), "{label}: {msg}");
+                    let other = if file == "meta_only.rs" {
+                        "nested_only.rs"
+                    } else {
+                        "meta_only.rs"
+                    };
+                    assert!(
+                        !msg.contains(other),
+                        "{label}: judged the wrong repo: {msg}"
+                    );
+                }
+            }
+        }
     }
 }

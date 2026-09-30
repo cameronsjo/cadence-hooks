@@ -206,6 +206,30 @@ pub fn resolve_effective_repo(cwd: &Path, target: &Path, kind: TargetKind) -> Re
     RepoResolver::new().resolve(cwd, target, kind)
 }
 
+/// The directory whose repo a Bash `command` operates in: `cwd` after the
+/// command's leading `cd` chain ([`crate::shell::parse_work_dir`]), resolved
+/// to the innermost repo root — so `cd <nested> && git …` from a meta-repo
+/// session is judged against the nested repo, not the meta-repo.
+///
+/// - No `cd` in effect: `cwd` itself, unchanged (the long-standing reading).
+/// - A `cd` into a repo: that repo's root (a gitignored nested repo, a linked
+///   worktree, another checkout).
+/// - A `cd` into somewhere that is no repo, does not exist, or cannot be read
+///   ([`Resolution::NotARepo`] / [`Resolution::Ambiguous`]): `None`.
+///
+/// `None` means "cannot name the repo this command runs in". Only a guard that
+/// nudges may read it as quiet; a guard whose verdict relaxes on the repo must
+/// read it as "not exempt".
+pub fn command_repo_dir(command: &str, cwd: &str) -> Option<String> {
+    let work = crate::shell::parse_work_dir(command, cwd);
+    if work == cwd {
+        return Some(cwd.to_string());
+    }
+    resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir)
+        .resolved()
+        .map(|r| r.state.repo_root.to_string_lossy().into_owned())
+}
+
 fn relate(target: &GitState, cwd: Option<&GitState>) -> RepoRelation {
     let Some(cwd) = cwd else {
         return RepoRelation::CwdNotARepo;
@@ -576,5 +600,54 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = resolve_effective_repo(&meta, Path::new(&deep), TargetKind::File);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn command_repo_dir_keys_off_the_repo_a_leading_cd_moves_into() {
+        let (_s, meta, plugin) = meta_layout("command-dir");
+        std::fs::create_dir_all(meta.join("plain-dir")).unwrap();
+        let m = meta.to_str().unwrap();
+        let p = canon(&plugin).to_string_lossy().into_owned();
+        // (label, command, cwd, expected)
+        let cases: Vec<(&str, String, &str, Option<String>)> = vec![
+            (
+                "no cd: the cwd, unchanged",
+                "git status".into(),
+                m,
+                Some(m.into()),
+            ),
+            (
+                "meta cwd, cd into the gitignored nested repo",
+                "cd plugin && git status".into(),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "meta cwd, cd into a subdir of the nested repo",
+                format!("cd {}/src && git status", plugin.display()),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "nested cwd, cd out to the meta repo",
+                format!("cd {m} && git status"),
+                &p,
+                Some(canon(&meta).to_string_lossy().into_owned()),
+            ),
+            (
+                "cd into a missing dir: cannot say",
+                "cd no-such-dir && git status".into(),
+                m,
+                None,
+            ),
+        ];
+        for (label, command, cwd, want) in cases {
+            assert_eq!(command_repo_dir(&command, cwd), want, "{label}");
+        }
+        // A plain (non-repo) dir inside the meta repo resolves to the meta repo.
+        assert_eq!(
+            command_repo_dir("cd plain-dir && git status", m),
+            Some(canon(&meta).to_string_lossy().into_owned())
+        );
     }
 }

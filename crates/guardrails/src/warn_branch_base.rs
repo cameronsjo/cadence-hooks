@@ -15,7 +15,6 @@
 
 use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::gitstate::GitState;
-use cadence_hooks_core::shell::parse_work_dir;
 use cadence_hooks_core::worktree::would_block_here;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
@@ -160,7 +159,7 @@ fn is_main_branch(name: &str) -> bool {
 }
 
 /// The directory whose repo `command` operates in: the payload `cwd` after any
-/// leading `cd` chain ([`parse_work_dir`]), resolved to the innermost repo
+/// leading `cd` chain, resolved to the innermost repo
 /// root through [`cadence_hooks_core::target_repo`].
 ///
 /// - No `cd` in effect: the cwd itself (long-standing behavior; `.` with no cwd).
@@ -170,17 +169,10 @@ fn is_main_branch(name: &str) -> bool {
 ///   read: `None`, so the caller stays quiet rather than judging the wrong repo
 ///   (or, worse, the hook process's own directory).
 fn effective_repo_dir(command: &str, cwd: Option<&str>) -> Option<String> {
-    use cadence_hooks_core::target_repo::{TargetKind, resolve_effective_repo};
     let Some(cwd) = cwd else {
         return Some(".".to_string());
     };
-    let work = parse_work_dir(command, cwd);
-    if work == cwd {
-        return Some(cwd.to_string());
-    }
-    resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir)
-        .resolved()
-        .map(|r| r.state.repo_root.to_string_lossy().into_owned())
+    cadence_hooks_core::target_repo::command_repo_dir(command, cwd)
 }
 
 /// The current branch of the repo enclosing `cwd`, or `None` for a detached
