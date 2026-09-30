@@ -6499,17 +6499,24 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
 }
 
 /// Whether `script` may hold a `case` construct whose `pattern)` arms a
-/// subshell walk would read as closers: the word `case` in unquoted,
-/// uncommented text, followed by a blank. A quoted `"just in case"` or a
-/// `# in case` comment is not one, which a plain substring test counted
+/// subshell walk would read as closers: the whole word `case` anywhere in
+/// unquoted, uncommented text outside heredoc prose. A quoted
+/// `"just in case"`, a `# in case` comment or a commit message's heredoc
+/// body is not one, which a plain substring test counted
 /// (cameronsjo/cadence-hooks#1233 review). Double-quoted text is skipped
 /// whole because the splitter never cuts inside it, so its parens reach no
 /// subshell walk; a `case` inside an unquoted `$(…)` still counts.
+///
+/// No command-position test: bash takes `case` as a keyword after `f()`,
+/// `function f`, `coproc`, `time -p` and more, and each position the test
+/// missed restored a `cd` scope early (round-4 review C2). An operand such
+/// as `grep case x` counts too, which only turns scoping off — the walk then
+/// lets a subshell's `cd` leak, as it did before scoping existed.
 pub(crate) fn mentions_case_keyword(script: &str) -> bool {
     if !script.contains("case") {
         return false;
     }
-    let text = strip_comments(script);
+    let text = strip_comments(&strip_heredoc_bodies(script));
     let chars: Vec<char> = text.chars().collect();
     let mut quote: Option<Quote> = None;
     let mut i = 0;
@@ -6526,60 +6533,18 @@ pub(crate) fn mentions_case_keyword(script: &str) -> bool {
             continue;
         }
         if chars[i..].starts_with(&['c', 'a', 's', 'e'])
-            && chars.get(i + 4).is_some_and(|c| c.is_whitespace())
-            && in_command_position(&chars, i)
+            && chars
+                .get(i + 4)
+                .is_none_or(|&c| c.is_whitespace() || c == '\\')
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| chars[p].is_alphanumeric() || chars[p] == '_')
         {
             return true;
         }
         i += 1;
     }
     false
-}
-
-/// Whether the word starting at `chars[at]` (or at the `\` just before it)
-/// is in command position: first on its line, or after `;`, `&`, `|`, `(`,
-/// `{`, or a `then`/`do`/`else`/`elif`/`if`/`while`/`until`/`!`/`time`
-/// word. `grep case x` has `case` as an operand, which is no keyword.
-fn in_command_position(chars: &[char], at: usize) -> bool {
-    let mut k = at;
-    if k > 0 && chars[k - 1] == '\\' {
-        k -= 1;
-    }
-    while k > 0 && matches!(chars[k - 1], ' ' | '\t') {
-        k -= 1;
-    }
-    if k == at && k > 0 {
-        // Glued to what precedes it: `xcase`, `$case`, `=case`.
-        return matches!(chars[k - 1], ';' | '&' | '|' | '(' | '{' | '\n' | '`');
-    }
-    let Some(&before) = k.checked_sub(1).and_then(|p| chars.get(p)) else {
-        return true;
-    };
-    // After a closing quote the scan may disagree with bash on where the
-    // quoted run ended (`$'\''`), so a `case` there counts: over-reading
-    // only turns scoping off.
-    if matches!(
-        before,
-        ';' | '&' | '|' | '(' | '{' | '\n' | '`' | '\'' | '"'
-    ) {
-        return true;
-    }
-    let end = k;
-    let mut start = end;
-    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '!') {
-        start -= 1;
-    }
-    let word: String = chars[start..end].iter().collect();
-    let word_starts_command = start == 0
-        || matches!(
-            chars[start - 1],
-            ' ' | '\t' | ';' | '&' | '|' | '(' | '{' | '\n'
-        );
-    word_starts_command
-        && matches!(
-            word.as_str(),
-            "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "!" | "time"
-        )
 }
 
 /// The text after each inner `(` a top-level segment leaves open at its end
@@ -10753,11 +10718,17 @@ fn scan_substitution_bodies_in(
                 record((i + 2, blind_end - 1), false);
                 record((blind_end, chars.len()), false);
             }
-            // A widened reading is not a body bash bounds the same way, and
-            // each is most of the text again: it spends a level like any
-            // other, or free levels would multiply the copies.
+            // A `<(`/`>(` the scan could not close is still a process
+            // substitution to bash — typically the splitter cut it at a `;`
+            // or newline inside it — so its readings take the same free
+            // level a closed one does. Charging one pushed a `$(…)` behind
+            // three unclosed `<(` past the bound, where it was listed but
+            // never read (#1266 round-4 review C1). The free levels are
+            // capped at [`MAX_WRAPPER_DEPTH`] held at once, and each copy is
+            // charged to the shared expansion allowance, so a flood of
+            // unclosed openers still ends.
             if let Some(kinds) = kinds.as_deref_mut() {
-                kinds.resize(bodies.len(), false);
+                kinds.resize(bodies.len(), c != '$');
             }
             break;
         }
@@ -20370,14 +20341,18 @@ mod tests {
             ("echo 'case x in'", false),
             ("echo showcase lowercase", false),
             ("echo in_case", false),
-            ("echo case", false),
-            ("grep case x", false),
-            ("grep \\case x", false),
-            ("echo \\case x", false),
-            (
-                "D=$(cd /tmp && pwd); grep case x; git push origin main",
-                false,
-            ),
+            ("echo showcase case_x", false),
+            ("git commit -F- <<'E'\njust in case\nE\ngit push", false),
+            ("echo case", true),
+            ("grep case x", true),
+            ("grep \\case x", true),
+            ("f() case x in x) true;; esac", true),
+            ("function f case x in x) true;; esac", true),
+            ("function f () case x in x) true;; esac", true),
+            ("coproc case x in x) true;; esac", true),
+            ("time -p case x in x) true;; esac", true),
+            ("time -p -- case x in x) true;; esac", true),
+            ("cat <<E\n$(case x in x) true;; esac)\nE", true),
             ("true && case a in a) :;; esac", true),
             ("true |\ncase a in a) :;; esac", true),
             ("while true; do case a in a) break;; esac; done", true),
