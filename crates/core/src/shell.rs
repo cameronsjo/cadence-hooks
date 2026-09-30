@@ -8842,13 +8842,14 @@ fn emit_segment(
     // ends; past them the `$(…)`s inside are read through every `<(` in one
     // pass, at the level they had before.
     if depth < MAX_WRAPPER_DEPTH {
-        for (body, procsub) in substitution_bodies_kinded(&segment) {
+        for (body, kind) in substitution_bodies_kinded(&segment) {
             if dedupe && body.starts_with(EXPANDED_MARK) {
                 continue;
             }
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
-            match procsub.then(FreeLevel::take).flatten() {
+            let free = (kind == BodyKind::ProcSub).then(FreeLevel::take).flatten();
+            match free {
                 Some(_level) => expand_segments(&body, &mut scope, depth, out, dedupe),
                 None => {
                     expand_segments(&body, &mut scope, depth + 1, out, dedupe);
@@ -8856,7 +8857,7 @@ fn emit_segment(
                     // `$(…)`s inside are also read where they sat before
                     // bodies were surfaced: one pass through every `<(` to
                     // them, each read at this segment's next level.
-                    if procsub && ExpansionWork::charge(body.len()) {
+                    if kind != BodyKind::Plain && ExpansionWork::charge(body.len()) {
                         for inner in substitution_bodies_through_procsubs(&body) {
                             if dedupe && inner.starts_with(EXPANDED_MARK) {
                                 continue;
@@ -10574,9 +10575,19 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     scan_substitution_bodies(segment, &mut Vec::new())
 }
 
-/// [`substitution_bodies`], each paired with whether a process
-/// substitution (`<(…)`/`>(…)`) opened it rather than `$(…)` or a backtick.
-fn substitution_bodies_kinded(segment: &str) -> Vec<(String, bool)> {
+/// What opened a body [`substitution_bodies_kinded`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyKind {
+    /// A `$(…)` or a backtick span, closed or widened.
+    Plain,
+    /// A closed `<(…)`/`>(…)`.
+    ProcSub,
+    /// A reading of a `<(`/`>(` the scan found no terminator for.
+    OpenProcSub,
+}
+
+/// [`substitution_bodies`], each paired with what opened it.
+fn substitution_bodies_kinded(segment: &str) -> Vec<(String, BodyKind)> {
     let chars: Vec<char> = segment.chars().collect();
     let mut kinds = Vec::new();
     let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds), true);
@@ -10624,7 +10635,7 @@ fn scan_substitution_bodies_in(
     chars: &[char],
     starts: &mut Vec<usize>,
     mut ranges: Option<&mut BodyRanges>,
-    mut kinds: Option<&mut Vec<bool>>,
+    mut kinds: Option<&mut Vec<BodyKind>>,
     procsub_opens: bool,
 ) -> Vec<String> {
     let mut record = |body: (usize, usize), hidden: bool| {
@@ -10691,7 +10702,12 @@ fn scan_substitution_bodies_in(
                     bodies.push(body);
                 }
                 if let Some(kinds) = kinds.as_deref_mut() {
-                    kinds.resize(bodies.len(), c != '$');
+                    let kind = if c == '$' {
+                        BodyKind::Plain
+                    } else {
+                        BodyKind::ProcSub
+                    };
+                    kinds.resize(bodies.len(), kind);
                 }
                 i = end;
                 continue;
@@ -10728,17 +10744,23 @@ fn scan_substitution_bodies_in(
                 record((i + 2, blind_end - 1), false);
                 record((blind_end, chars.len()), false);
             }
-            // A `<(`/`>(` the scan could not close is still a process
-            // substitution to bash — typically the splitter cut it at a `;`
-            // or newline inside it — so its readings take the same free
-            // level a closed one does. Charging one pushed a `$(…)` behind
-            // three unclosed `<(` past the bound, where it was listed but
-            // never read (#1266 round-4 review C1). The free levels are
-            // capped at [`MAX_WRAPPER_DEPTH`] held at once, and each copy is
-            // charged to the shared expansion allowance, so a flood of
-            // unclosed openers still ends.
+            // A widened reading is not a body bash bounds the same way, and
+            // each is most of the text again: it spends a level like any
+            // other, or free levels would multiply the copies — an unclosed
+            // `<(eval ` flood took most of the hook deadline that way. One
+            // opened by a `<(`/`>(` is still a process substitution to bash
+            // (typically the splitter cut it at a `;` or newline inside it),
+            // so the `$(…)`s inside it are also read at the level they had
+            // before its body was surfaced: charging the level alone pushed
+            // a `$(…)` behind three unclosed `<(` past the bound, where it
+            // was listed but never read (#1266 round-4 review C1).
             if let Some(kinds) = kinds.as_deref_mut() {
-                kinds.resize(bodies.len(), c != '$');
+                let kind = if c == '$' {
+                    BodyKind::Plain
+                } else {
+                    BodyKind::OpenProcSub
+                };
+                kinds.resize(bodies.len(), kind);
             }
             break;
         }
@@ -10779,7 +10801,7 @@ fn scan_substitution_bodies_in(
             // re-scanned, and continuing the outer loop here would re-walk —
             // and could double-emit — the same text char by char.
             if let Some(kinds) = kinds.as_deref_mut() {
-                kinds.resize(bodies.len(), false);
+                kinds.resize(bodies.len(), BodyKind::Plain);
             }
             if quoting_unterminated {
                 push_nonblank(&mut bodies, &chars[j + 1..]);
@@ -10800,7 +10822,7 @@ fn scan_substitution_bodies_in(
         i += 1;
     }
     if let Some(kinds) = kinds {
-        kinds.resize(bodies.len(), false);
+        kinds.resize(bodies.len(), BodyKind::Plain);
     }
     bodies
 }
