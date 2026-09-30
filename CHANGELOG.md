@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The two macOS release binaries now build on GitHub-hosted `macos-latest` instead of the self-hosted `ci-guest` VM on the M1 Max.** Asset names, targets (`aarch64-apple-darwin`, and `x86_64-apple-darwin` cross-compiled from arm64) and the tap dispatch are unchanged; attestation and signing still run in the hosted `ubuntu-latest` release job. This frees the M1 Max's second VM slot for the private runner pool (cameronsjo/homelab#1034).
+
 ## [0.117.0] - 2026-09-30
 
 ### Added
