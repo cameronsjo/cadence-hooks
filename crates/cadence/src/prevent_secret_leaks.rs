@@ -681,11 +681,31 @@ fn segment_env_reads_at(
     } else {
         0
     };
+    // The files an api call reads into its request are judged behind a
+    // keyword too (`! gh api x -F k=@.env`): this only adds blocks.
+    let keyword_api_reads: Vec<(String, String)> = if lead > peel {
+        resolve_command(&tokens[lead..])
+            .map(|(cmd, argv)| {
+                api_file_values(&cmd, argv)
+                    .into_iter()
+                    .filter_map(|(_, file)| dangerous_secret_operand(file, Filename::Known))
+                    .map(|value| (cmd.to_string(), value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let (tokens, globs, fixed) = (&tokens[peel..], &globs[peel..], &fixed[peel..]);
     let mut found = {
         let _live = LiveScope::set(substitutions_live(segment));
         segment_direct_reads(tokens, globs, fixed, context)
     };
+    for read in keyword_api_reads {
+        if !found.contains(&read) {
+            found.push(read);
+        }
+    }
     // A group closer glued to the last word — `{ (cat .env)}` — tokenizes as
     // `.env)}`, a name no secret pattern matches, while bash reads `.env`
     // (cameronsjo/cadence-hooks#1103). Judge the wrapper-stripped view too; the
@@ -12965,6 +12985,13 @@ mod api_endpoint_tests {
             "if true; then command direnv exec . cat .env; fi",
             "if true; then echo .env; fi; cat \"$_\"",
             "for x in 1; do stat .env; done; cat \"$_\"",
+            // Round 5: an api call's request files behind a keyword.
+            "! gh api x -F k=@.env",
+            "if true; then gh api x --input=.env; fi",
+            "while true; do gh api x -F k=@.env; done",
+            "! tea api x -F k=@.env",
+            "if true; then tea api x --data=@.env; fi",
+            "for p in 1; do gh api x --field k=@prod.env; done",
             "for f in 1; do ls .env; done",
             "if true; then stat .env; fi",
         ] {
