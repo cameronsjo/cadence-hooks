@@ -1564,6 +1564,7 @@ fn doctor_prune_apply_refuses_when_the_registry_cannot_be_listed() {
 
 // ── doctor --prune process gate (cameronsjo/cadence-hooks#902) ──────────────
 
+#[cfg(unix)]
 /// An executable `ps` stand-in that prints `lines` and exits `code`.
 fn fake_ps(dir: &std::path::Path, lines: &[&str], code: i32) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -1574,8 +1575,10 @@ fn fake_ps(dir: &std::path::Path, lines: &[&str], code: i32) -> std::path::PathB
     path
 }
 
+#[cfg(unix)]
 const ONE_CLAUDE: &[&str] = &["  4242 claude claude --resume"];
 
+#[cfg(unix)]
 #[test]
 fn doctor_prune_apply_refuses_an_unregistered_claude_process() {
     // No registry record at all (a session outside any repo never registers),
@@ -1624,6 +1627,7 @@ fn doctor_prune_apply_with_no_processes_still_prunes() {
     assert!(pinned.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_prune_apply_force_overrides_the_process_gate() {
     let (home, config, metrics, _pinned, three_days, one_day) = live_prune_fixture();
@@ -1637,6 +1641,7 @@ fn doctor_prune_apply_force_overrides_the_process_gate() {
     assert!(!three_days.exists() && !one_day.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_prune_limits_keep_everything_for_a_process_no_record_vouches_for() {
     // One vouching record, two claude processes: the second is invisible to the
@@ -1658,6 +1663,7 @@ fn doctor_prune_limits_keep_everything_for_a_process_no_record_vouches_for() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_prune_limits_proceed_when_every_process_is_registered() {
     let (home, config, metrics, _pinned, three_days, one_day) = live_prune_fixture();

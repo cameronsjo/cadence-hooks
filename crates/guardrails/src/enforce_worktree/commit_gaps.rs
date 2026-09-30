@@ -535,6 +535,9 @@ mod tests {
         );
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_the_command_makes_is_unknown_and_blocks() {
         table(
@@ -602,6 +605,9 @@ mod tests {
         );
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_repository_the_command_makes_is_not_judged_as_a_missing_target() {
         // The guard's own recipes stay allowed from a primary.
@@ -684,6 +690,9 @@ mod tests {
         );
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_command_past_the_plain_walk_trusts_only_absolute_creation_paths() {
         table(
