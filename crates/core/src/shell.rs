@@ -6500,35 +6500,45 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
 
 /// Whether `script` may hold a `case` construct whose `pattern)` arms a
 /// subshell walk would read as closers: the whole word `case` anywhere in
-/// unquoted, uncommented text outside heredoc prose. A quoted
+/// the script outside comments and heredoc prose, and outside quotes when
+/// the quoting is plain enough to read confidently. A quoted
 /// `"just in case"`, a `# in case` comment or a commit message's heredoc
 /// body is not one, which a plain substring test counted
-/// (cameronsjo/cadence-hooks#1233 review). Double-quoted text is skipped
-/// whole because the splitter never cuts inside it, so its parens reach no
-/// subshell walk; a `case` inside an unquoted `$(…)` still counts.
+/// (cameronsjo/cadence-hooks#1233 review).
 ///
 /// No command-position test: bash takes `case` as a keyword after `f()`,
 /// `function f`, `coproc`, `time -p` and more, and each position the test
 /// missed restored a `cd` scope early (round-4 review C2). An operand such
 /// as `grep case x` counts too, which only turns scoping off — the walk then
 /// lets a subshell's `cd` leak, as it did before scoping existed.
+///
+/// Quotes are honoured only in text with no substitution, ANSI-C or locale
+/// string, or backslash: a flat quote reader misreads `"$(echo 'a"b')"`,
+/// and the phantom quote it opens would hide every later `case`. With any
+/// of those present, a quoted `case` counts as well.
 pub(crate) fn mentions_case_keyword(script: &str) -> bool {
     if !script.contains("case") {
         return false;
     }
     let text = strip_comments(&strip_heredoc_bodies(script));
     let chars: Vec<char> = text.chars().collect();
+    if !has_case_word(&chars, false) {
+        return false;
+    }
+    let plain = !["$(", "`", "<(", ">(", "$'", "$\"", "\\"]
+        .iter()
+        .any(|syntax| text.contains(syntax));
+    !plain || has_case_word(&chars, true)
+}
+
+/// Whether the whole word `case` appears in `chars`, skipping quoted runs
+/// when `honour_quotes`. A quote still open at the end is a misreading, so
+/// it counts as a `case` there.
+fn has_case_word(chars: &[char], honour_quotes: bool) -> bool {
     let mut quote: Option<Quote> = None;
     let mut i = 0;
     while i < chars.len() {
-        // `\case` is no keyword to bash, but in command position that line
-        // fails to parse rather than run, so it counts as one: either
-        // reading only turns scoping off.
-        if quote.is_none() && chars[i] == '\\' && chars.get(i + 1) == Some(&'c') {
-            i += 1;
-            continue;
-        }
-        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+        if honour_quotes && let Some(next) = scan_quote_syntax(chars, i, &mut quote) {
             i = next;
             continue;
         }
@@ -6544,7 +6554,7 @@ pub(crate) fn mentions_case_keyword(script: &str) -> bool {
         }
         i += 1;
     }
-    false
+    quote.is_some()
 }
 
 /// The text after each inner `(` a top-level segment leaves open at its end
@@ -20236,6 +20246,28 @@ mod tests {
                 "echo \"$(true >(true >(echo $($(echo rm) note.md))))\"",
                 "rm note.md",
             ),
+            // A `<(` the splitter cut open at a `;`, `&&`, `|` or newline
+            // inside it is still free (#1266 round-4 review C1).
+            (
+                "cat <(cat <(cat <(echo $(git $(echo reset) --hard; true))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(cat <(cat <(echo $(git `echo reset` --hard && true))))",
+                "git reset --hard",
+            ),
+            (
+                "true >(true >(true >(echo $(cp d .$(echo env) | true))))",
+                "cp d .env",
+            ),
+            (
+                "cat <(cat <(cat <(cat <(echo $(git $(echo reset) --hard\ntrue)))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <<E\nx $(cat <(cat <(echo $(git $(echo reset) --hard && true))))\nE",
+                "git reset --hard",
+            ),
             // Past the free levels, the `$(…)`s are read through every `<(`.
             (
                 "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
@@ -20353,6 +20385,19 @@ mod tests {
             ("time -p case x in x) true;; esac", true),
             ("time -p -- case x in x) true;; esac", true),
             ("cat <<E\n$(case x in x) true;; esac)\nE", true),
+            // A flat quote reader misreads nested quotes (round-4 C2).
+            (
+                "echo \"$(echo 'a\"b')\"; (f() case x in x) true;; esac)",
+                true,
+            ),
+            (
+                "echo \"$(echo \"'\")\"; (coproc case x in x) :;; esac)",
+                true,
+            ),
+            (
+                "git commit -m \"fix the case x in y\" && echo $(date)",
+                true,
+            ),
             ("true && case a in a) :;; esac", true),
             ("true |\ncase a in a) :;; esac", true),
             ("while true; do case a in a) break;; esac; done", true),
