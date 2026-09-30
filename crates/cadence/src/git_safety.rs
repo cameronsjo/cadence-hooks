@@ -2562,6 +2562,7 @@ mod tests {
             "cat <(echo $(echo $(echo $(git $(echo reset) --hard))))",
             "cat <(echo $(echo $(echo $(git `echo reset` --hard))))",
             "cat <(echo $(echo $(echo $(git reset $(echo --hard)))))",
+            "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
         ] {
             let result = GitSafetyGuard.run(&make_bash_input(command));
             assert_eq!(

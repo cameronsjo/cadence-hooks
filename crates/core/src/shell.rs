@@ -20265,6 +20265,15 @@ mod tests {
                 "echo \"$(true >(true >(echo $($(echo rm) note.md))))\"",
                 "rm note.md",
             ),
+            // Past the free levels, the `$(…)`s are read through every `<(`.
+            (
+                "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(cat <(cat <(cat <(cat <(cat <(echo $(echo $(cp d .$(echo env)))))))))",
+                "cp d .env",
+            ),
         ] {
             let out = command_segments(command);
             assert!(out.iter().any(|s| s == want), "{command:?}: {out:?}");

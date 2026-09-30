@@ -222,6 +222,14 @@ CORPUS="$WORK/corpus.tsv"
     # inside one are evaluated as on main.
     printf '1266-procsub-eval-sub\tcat <(echo $(echo $(echo $(git $(echo reset) --hard))))\n'
     printf '1266-procsub-eval-glue\tdiff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))\n'
+    printf '1266-procsub-nest4-eval-sub\tcat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))\n'
+    # #1266 review round 3 C1: two eval floods spend the flatten allowance,
+    # and a padded command after them is still listed.
+    FLOOD_P='cat <(echo $(echo $(echo $(' FLOOD_Q='))))'
+    FLOOD_EVAL=$(printf 'eval %.0s' $(seq 1000))
+    FLOOD_PAD=$(printf 'A%.0s' $(seq 5000))
+    printf '1266-two-floods-write\t%s\n' "$FLOOD_P${FLOOD_EVAL}true$FLOOD_Q; $FLOOD_P${FLOOD_EVAL}:$FLOOD_Q; ${FLOOD_P}X=$FLOOD_PAD cp d .env$FLOOD_Q"
+    printf '1266-two-floods-reset\t%s\n' "$FLOOD_P${FLOOD_EVAL}true$FLOOD_Q; $FLOOD_P${FLOOD_EVAL}:$FLOOD_Q; ${FLOOD_P}git reset --hard $FLOOD_PAD$FLOOD_Q"
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling
@@ -280,6 +288,7 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-case-comment\tD=$(cd /tmp && pwd); git push origin main # just in case\n'
     printf 'allow-deep-plain\techo $(echo $(echo $(echo $(git status))))\n'
     printf 'allow-case-operand\tD=$(cd /tmp && pwd); grep case x; git push origin main\n'
+    printf 'allow-case-escaped-operand\tD=$(cd /tmp && pwd); grep \\case x; git push origin main\n'
 } > "$STAY_ALLOWED"
 
 # --- consumers ---------------------------------------------------------------
