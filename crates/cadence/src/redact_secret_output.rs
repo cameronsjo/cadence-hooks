@@ -16,10 +16,15 @@
 //! wrong shape (or `updatedMCPToolOutput`) is silently ignored and the raw
 //! output is used, so the shape here must stay exactly that object.
 //!
-//! **Policy: when unsure, mask.** Over-masking costs readability; a miss leaks
-//! a secret that cannot be recalled. So every rule below errs toward masking,
-//! and the only values left alone are ones that cannot be a secret (empty,
-//! `true`/`false`/`null`, already masked).
+//! **Policy: when unsure, mask — except where the shape is also prose.** A miss
+//! leaks a secret that cannot be recalled, so data shapes (`NAME=value`,
+//! quoted values, JSON, headers) spare only values that cannot be a secret
+//! (empty, `true`/`false`/`null`, already masked). The unquoted `name: value`
+//! and `name value` shapes are also how test runners, prose and source code
+//! read (`--- PASS: TestFoo (0.00s)`, `Token expired`, `password: String,`), so
+//! there the value must look like a credential ([`secret_like`]), and a bare
+//! `PASS` is a status word, not a name. A corpus test holds everyday output
+//! (test runners, builds, git over code, listings, error prose) at zero masks.
 //!
 //! **Views.** Every detector runs twice: on the output with ANSI CSI sequences
 //! removed (`grep --color`, coloured logs), and — when the output carries a
@@ -87,6 +92,8 @@
 //!   `decision: "block"` from a grouped sibling, are unprobed.
 //! - A payload Claude Code cannot deliver as valid JSON (a lone surrogate)
 //!   fails the parse, and the raw output stands.
+//! - A token printed in an encoded form (base64 of a `ghp_…`), and names
+//!   spelled with non-ASCII letters (`PASSWÖRD=…`), are not recognized.
 //! - Anything the model reconstructs from the command text itself.
 
 use crate::credential_scan::{self, PEM_END_RE, PEM_KIND};
@@ -474,7 +481,21 @@ static NETRC_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn secret(name: &str) -> bool {
-    name.len() <= MAX_NAME && is_secret_name(name)
+    name.len() <= MAX_NAME && might_be_secret(name) && is_secret_name(name)
+}
+
+/// Cheap substring prefilter for [`is_secret_name`]: every segment it accepts
+/// contains one of these, so a name without any is rejected without the
+/// segment split (the hot path on long runs of ordinary assignments).
+fn might_be_secret(name: &str) -> bool {
+    const NEEDLES: &[&[u8]] = &[
+        b"secret", b"token", b"pass", b"pwd", b"cred", b"key", b"auth", b"cookie", b"docker",
+        b"dsn",
+    ];
+    let lower = name.as_bytes().to_ascii_lowercase();
+    NEEDLES
+        .iter()
+        .any(|n| lower.windows(n.len()).any(|w| w == *n))
 }
 
 fn json_pair_spans(text: &str, spans: &mut Vec<Span>) {
@@ -594,7 +615,12 @@ fn inline_spans(text: &str, spans: &mut Vec<Span>) {
             None => rest.trim_end().len(),
         };
         done = start + len;
-        if worth_masking(&rest[..len]) {
+        let plausible = if quote.is_some() || is_header_name(name.as_str()) {
+            worth_masking(&rest[..len])
+        } else {
+            secret_like(&rest[..len])
+        };
+        if plausible {
             spans.push(named(start, start + len));
         }
     }
@@ -670,7 +696,7 @@ fn line_spans(text: &str, spans: &mut Vec<Span>) {
             if let Some(caps) = WS_ROW.captures(line)
                 && let (Some(name), Some(value)) = (caps.get(1), caps.get(2))
                 && secret(name.as_str())
-                && worth_masking(value.as_str())
+                && secret_like(value.as_str())
             {
                 spans.push(named(start + value.start(), start + value.end()));
             }
@@ -697,7 +723,13 @@ fn line_spans(text: &str, spans: &mut Vec<Span>) {
             continue;
         }
         let (vs, ve) = unquote(value_start, value);
-        if worth_masking(&line[vs..ve]) {
+        let quoted = vs != value_start;
+        let plausible = if sep.as_str() == ":" && !quoted && !is_header_name(name.as_str()) {
+            secret_like(&line[vs..ve])
+        } else {
+            worth_masking(&line[vs..ve])
+        };
+        if plausible {
             spans.push(named(start + vs, start + ve));
         }
     }
@@ -737,6 +769,40 @@ fn closing_quote(inner: &str, q: char) -> Option<usize> {
     None
 }
 
+/// An HTTP credential header (`Authorization`, `Cookie`, `Set-Cookie`,
+/// `Proxy-Authorization`): its value has spaces (`Bearer …`) by design, so the
+/// [`secret_like`] shape test does not apply.
+fn is_header_name(name: &str) -> bool {
+    segments(name)
+        .iter()
+        .any(|s| s == "authorization" || s == "cookie")
+}
+
+/// The stricter test for the **unquoted colon** and **table-row** forms, which
+/// are also how prose, test runners and source code read (`Token expired`,
+/// `--- PASS: TestFoo (0.00s)`, `password: String,`). The value must look like
+/// a credential: one word of at least 8 characters that is not a plain word,
+/// a number, a duration, a boolean, or an identifier/type expression. The `=`
+/// form, quoted values and header values keep the plain [`worth_masking`]
+/// test: those shapes are data, not prose.
+fn secret_like(value: &str) -> bool {
+    let v = value.trim().trim_end_matches([',', ';']);
+    if !worth_masking(v) || v.chars().any(char::is_whitespace) || v.chars().count() < 8 {
+        return false;
+    }
+    let all = |f: fn(char) -> bool| v.chars().all(f);
+    let plain_word = all(|c| c.is_ascii_alphabetic())
+        && (all(|c| c.is_ascii_lowercase())
+            || all(|c| c.is_ascii_uppercase())
+            || v.chars().skip(1).all(|c| c.is_ascii_lowercase()));
+    let number = all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'));
+    let duration = v.starts_with(|c: char| c.is_ascii_digit())
+        && all(|c| c.is_ascii_digit() || matches!(c, '.' | 'n' | 's' | 'u' | 'µ' | 'm' | 'h'));
+    let code =
+        all(|c| c.is_ascii_alphabetic() || matches!(c, '_' | ':' | '<' | '>' | '&' | '\'' | '.'));
+    !(plain_word || number || duration || code)
+}
+
 /// Could `value` be a secret? Only values that cannot be one are spared:
 /// empty, a boolean/null, or already masked. Everything else is masked — code,
 /// references and short numbers included (see the module doc's policy).
@@ -762,7 +828,6 @@ const SECRET_WORDS: &[&str] = &[
     "passwd",
     "passphrase",
     "pwd",
-    "pass",
     "credential",
     "credentials",
     "creds",
@@ -975,6 +1040,8 @@ pub fn is_secret_name(name: &str) -> bool {
             // not a secret at all.
             "key" | "keys" => prev.is_some_and(|p| !NON_SECRET_KEY_QUALIFIERS.contains(&p)),
             "token" => prev.is_none_or(|p| !TOKEN_COUNT_QUALIFIERS.contains(&p)),
+            // `DB_PASS` yes; a bare `PASS` is a test runner's status word.
+            "pass" => prev.is_some(),
             s => SECRET_WORDS.contains(&s),
         }
     })
@@ -1219,6 +1286,44 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(masked(&input), want, "{input:?}");
+        }
+    }
+
+    /// Everyday output that must come through with ZERO masks: test runners
+    /// (whose PASS/FAIL lines are the result the model needs), build tools,
+    /// git over ordinary code that names `password`/`token`, cluster and file
+    /// listings, and error prose.
+    #[test]
+    fn false_positive_corpus_is_untouched() {
+        let corpus: &[&str] = &[
+            // go test -v
+            "=== RUN   TestFoo\n--- PASS: TestFoo (0.00s)\n=== RUN   TestTokenRefresh\n--- FAIL: TestTokenRefresh (0.01s)\n    auth_test.go:42: token expired\nPASS\nFAIL\nok  \tgithub.com/acme/pkg\t0.123s\nFAIL\tgithub.com/acme/auth\t0.456s\n",
+            // cargo test
+            "running 3 tests\ntest auth::tests::token_roundtrip ... ok\ntest auth::tests::password_hash ... FAILED\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            // pytest -v
+            "tests/test_auth.py::test_token_refresh PASSED                  [ 50%]\ntests/test_auth.py::test_password_reset FAILED                 [100%]\nE   AssertionError: password must be 8 characters\n=========== 1 failed, 1 passed in 0.12s ===========\n",
+            // jest / vitest / npm test
+            " PASS  src/auth.test.ts\n  ✓ refreshes the token (5 ms)\n FAIL  src/password.test.ts\n  ✕ rejects a short password (3 ms)\nTests:       1 failed, 1 passed, 2 total\nTime:        1.234 s\n",
+            " ✓ src/token.test.ts (3 tests) 12ms\n Test Files  1 passed (1)\n      Tests  3 passed (3)\n   Duration  512ms\n",
+            "> acme@1.0.0 test\n> vitest run\n\nnpm ERR! Test failed.  See above for more details.\n",
+            // make
+            "make: Entering directory '/src/app'\ncc -O2 -c token.c -o token.o\nmake: *** [Makefile:12: all] Error 1\n",
+            // automake
+            "PASS: test_foo\nFAIL: test_bar\nPASS: test_baz\n# PASS:  2\n# FAIL:  1\n",
+            // git log / status / diff of ordinary code
+            "commit 3f786850e387550fdab836ed7e6dc881de23001b\nAuthor: Dev <dev@example.com>\nDate:   Tue Sep 30 12:00:00 2026 +0000\n\n    fix: token refresh after password change\n\n    auth: handle expired token\n",
+            "On branch main\nChanges not staged for commit:\n\tmodified:   src/auth/token.rs\n\tmodified:   src/auth/password.rs\n",
+            "diff --git a/src/auth.rs b/src/auth.rs\n@@ -1,6 +1,8 @@\n-    let token = get_token();\n+    let token = get_token()?;\n+    if password.is_empty() {\n+        return Err(Error::InvalidPassword);\n+    }\n     max_tokens: 4096,\n+    token_count=12\n+    pub password: String,\n+    token: Option<String>,\n+    password: &str,\n+    auth: AuthConfig,\n",
+            "max_tokens: 4096\ntoken_count=12\ntoken_type: bearer\npassword_min_length: 8\n",
+            // docker ps / kubectl get pods / ls -l
+            "CONTAINER ID   IMAGE          COMMAND       CREATED       STATUS       PORTS     NAMES\n3f786850e387   nginx:1.27     \"nginx -g…\"   2 hours ago   Up 2 hours   80/tcp    web\n",
+            "NAME                    READY   STATUS    RESTARTS   AGE\ntoken-service-7d9f8     1/1     Running   0          3d\n",
+            "-rw-r--r--  1 dev staff  1234 Sep 30 12:00 token.rs\ndrwxr-xr-x  3 dev staff    96 Sep 30 12:00 password\n",
+            // error prose
+            "Error: Token expired\nInvalid password\npassword must be 8 characters\nToken expired\nauth: permission denied\ntoken: expired\npassword: required\n",
+        ];
+        for input in corpus {
+            assert_eq!(redact(input), None, "masked something in {input:?}");
         }
     }
 
