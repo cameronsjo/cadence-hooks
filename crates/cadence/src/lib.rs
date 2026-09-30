@@ -35,6 +35,8 @@ pub mod prevent_secret_push;
 pub mod prevent_secret_writes;
 /// Record that `/polish` ran on this branch (writes a branch-scoped marker). CLI action.
 pub mod record_polish;
+/// Record that a runbook's content passed the secret scrub (writes a content-hash marker). CLI action.
+pub mod record_scrub;
 pub mod redact_external_content;
 /// Shared secret file patterns for both secret guards.
 pub mod secret_patterns;

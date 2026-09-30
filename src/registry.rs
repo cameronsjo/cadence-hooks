@@ -556,6 +556,15 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "guard-runbook-scrub",
+        description: "Block an unscrubbed write into $CADENCE_RUNBOOKS_DIR (content-hash scrub marker)",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: inert unless CADENCE_RUNBOOKS_DIR is set; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "guard-op-vault-scan",
         description: "Block uninvited 1Password vault enumeration (op item list)",
         namespace: "guardrails",
@@ -944,6 +953,7 @@ pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "guard-gh-write",
     "guard-op-vault-scan",
     "guard-sops-decrypt",
+    "guard-runbook-scrub",
     "guard-browser-device",
     "guard-dotfiles",
     "enforce-worktree",
