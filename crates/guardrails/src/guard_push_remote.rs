@@ -658,11 +658,14 @@ fn push_locations_both_readings(
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
     for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
-        // Text only, not [`may_push`]: a git exec whose text spells no push
-        // (`git rebase -x "$CMD"`) is a push the walk above cannot resolve,
-        // refused wherever it is placed, so re-placing it adds no verdict —
-        // and asking `runs_a_git_exec` of every segment of a 200 KB flood
-        // cost the test deadline on the Windows runner.
+        // Text only, not [`may_push`]: a git exec whose text spells no push —
+        // `git rebase -x "$CMD"`, a nested `git q` under an outer
+        // `-c alias.q=push` — reaches this guard only through the walk above,
+        // which reports it as a push it cannot resolve, as it would at the
+        // top level; prevent-secret-push refuses it. Re-placing it per
+        // segment adds no verdict, and asking `runs_a_git_exec` of every
+        // segment of a 200 KB flood cost the test deadline on the Windows
+        // runner.
         if !mentions_push(&raw) {
             continue;
         }
@@ -3167,7 +3170,19 @@ mod tests {
                 ("git re\\base --exe \"$CMD\" HEAD~1", Block),
                 ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
                 ("git ls-remote --exec=\"$C\" .", Block),
-                ("GIT_EDITOR=\"$E\" git commit", Block),
+                ("GIT_EDITOR=\"$E\" git commit", Allow),
+                ("E=x; GIT_EDITOR=\"$E\" git commit", Block),
+                ("EDITOR=\"$HOME/bin/vim\" git commit", Allow),
+                ("git -c core.editor=\"$EDITOR\" commit", Allow),
+                ("EDITOR=$VISUAL git status", Allow),
+                (
+                    "git submodule foreach 'git \"$@\" #' push origin main",
+                    Block,
+                ),
+                (
+                    "git -c alias.q=push rebase -x 'git q origin main' HEAD~1",
+                    Block,
+                ),
                 ("EDITOR=vim git rebase -i main", Allow),
                 ("git rebase -x 'git push origin main' HEAD~1", Allow),
                 ("git bisect run git push origin main", Allow),

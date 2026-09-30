@@ -2143,6 +2143,12 @@ mod tests {
             "git submodule foreach 'git push origin main'",
             "git filter-branch --env-filter 'git push origin main' HEAD",
             "git rebase -x \"$CMD\" HEAD~1",
+            // Review 3: an outer alias reaching the nested git, and a
+            // foreach command's positional parameters.
+            "git -c alias.q=push rebase -x 'git q origin main' HEAD~1",
+            "git -c alias.q=push bisect run git q origin main",
+            "git submodule foreach 'eval \"$@\" #' 'git push origin main'",
+            "git submodule foreach 'git \"$@\" #' push origin main",
         ] {
             assert_blocks(&fx.run(command), &["could not resolve"]);
         }

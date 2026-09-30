@@ -308,11 +308,13 @@ struct Walk<'a> {
     gh_hosts: &'a GhHosts,
     /// Working-tree tops already found this walk ([`toplevel_of`]).
     toplevels: &'a Toplevels,
+    /// The whole command, for [`assigns_a_variable`].
+    command: &'a str,
 }
 
 impl<'a> Walk<'a> {
     fn for_command(
-        command: &str,
+        command: &'a str,
         probe_config: bool,
         gh_hosts: &'a GhHosts,
         toplevels: &'a Toplevels,
@@ -322,6 +324,7 @@ impl<'a> Walk<'a> {
             trusts_known_commands: !may_redefine_known_commands(command),
             gh_hosts,
             toplevels,
+            command,
         }
     }
 }
@@ -329,7 +332,12 @@ impl<'a> Walk<'a> {
 /// Working-tree tops one walk has found, by directory, and how many git
 /// probes it spent finding them ([`toplevel_of`]).
 #[derive(Debug, Default)]
-struct Toplevels(std::cell::RefCell<(usize, std::collections::HashMap<String, Option<String>>)>);
+struct Toplevels {
+    found: std::cell::RefCell<(usize, std::collections::HashMap<String, Option<String>>)>,
+    /// Per variable name: whether the command assigns it
+    /// ([`assigns_a_variable`]).
+    assigned: std::cell::RefCell<std::collections::HashMap<String, bool>>,
+}
 
 /// Git probes one walk may spend finding working-tree tops; past it the file
 /// system alone answers. A 200 KB `GIT_EDITOR=a git status; …` flood asked
@@ -1081,7 +1089,7 @@ fn toplevel_of(work_dir: &str, probe: bool) -> Option<String> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let top = canonical
         .ancestors()
-        .find(|dir| dir.join(".git").exists())?
+        .find(|dir| is_a_git_marker(&dir.join(".git")))?
         .to_str()?;
     // Windows canonicalizes to a verbatim `\\?\C:\…` path; git and every
     // other reader here take the plain drive form.
@@ -1091,11 +1099,96 @@ fn toplevel_of(work_dir: &str, probe: bool) -> Option<String> {
     })
 }
 
+/// Whether one of `script`'s commands is a git invocation whose subcommand
+/// is an alias in `aliases` that is, or can hide, a push
+/// ([`alias_is_plain_push`], [`alias_hides_a_push`]).
+fn nested_git_runs_an_alias(script: &str, aliases: &[(String, Option<String>)]) -> bool {
+    crate::shell::command_segments(script)
+        .iter()
+        .any(|segment| {
+            let tokens = crate::shell::executable_tokens(segment);
+            let argv = peel_command_runners(crate::shell::strip_compound_heads(&tokens));
+            let Some(first) = argv.first() else {
+                return false;
+            };
+            if command_word(first) != "git" {
+                return false;
+            }
+            crate::shell::skip_runner_flags("git", &argv[1..])
+                .and_then(<[String]>::first)
+                .is_some_and(|subcommand| {
+                    alias_is_plain_push(aliases, subcommand)
+                        || alias_hides_a_push(aliases, subcommand)
+                })
+        })
+}
+
+/// More distinct variable names than this read by unreadable editors in one
+/// walk are all taken as assigned: each costs a scan of the whole command.
+const MAX_ASSIGNED_LOOKUPS: usize = 16;
+
+/// Whether `command` assigns a variable `script` expands — `NAME=…`,
+/// `export`/`readonly`/`declare`/`typeset`/`local NAME`, `read … NAME` —
+/// anywhere, nested scripts included (a text match, so it over-reads). A
+/// self-referential `NAME="$NAME…"` keeps what the session inherited and
+/// does not count.
+fn assigns_a_variable(command: &str, name: &str) -> bool {
+    let name = regex::escape(name);
+    let assignment = regex::Regex::new(&format!(
+        r#"(?:^|[\s;&|(){{}}'"`])(?:(?:export|readonly|local|declare|typeset)\s+(?:-\w+\s+)*)?{name}\+?=(["']?\$\{{?{name}\b)?"#
+    ));
+    let declared = regex::Regex::new(&format!(
+        r"\b(?:export|readonly|local|declare|typeset|read)\b[^;&|\n]*\b{name}\b"
+    ));
+    let (Ok(assignment), Ok(declared)) = (assignment, declared) else {
+        return true;
+    };
+    assignment
+        .captures_iter(command)
+        .any(|found| found.get(1).is_none())
+        || declared.is_match(command)
+}
+
+/// Whether `path` is a `.git` git's discovery accepts: a directory holding
+/// `HEAD`, `objects/` and `refs/`, or a file starting `gitdir:` (a linked
+/// worktree or submodule). An empty or stray `.git` is passed over, as git
+/// passes over it.
+fn is_a_git_marker(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    if path.is_dir() {
+        return path.join("HEAD").is_file()
+            && path.join("objects").is_dir()
+            && path.join("refs").is_dir();
+    }
+    let mut head = [0u8; 7];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| &head == b"gitdir:")
+}
+
 impl Toplevels {
+    /// Whether the command assigns any variable `script` expands
+    /// ([`assigns_a_variable`]), once per name per walk.
+    fn assigns(&self, command: &str, script: &str) -> bool {
+        static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("pattern should compile")
+        });
+        let mut known = self.assigned.borrow_mut();
+        NAME.captures_iter(script).any(|found| {
+            let name = &found[1];
+            if let Some(&assigned) = known.get(name) {
+                return assigned;
+            }
+            let assigned = known.len() >= MAX_ASSIGNED_LOOKUPS || assigns_a_variable(command, name);
+            known.insert(name.to_string(), assigned);
+            assigned
+        })
+    }
+
     /// [`toplevel_of`], once per directory per walk, and with at most
     /// [`MAX_TOPLEVEL_PROBES`] git probes.
     fn of(&self, work_dir: &str, probe: bool) -> Option<String> {
-        let mut cache = self.0.borrow_mut();
+        let mut cache = self.found.borrow_mut();
         let (probes, found) = &mut *cache;
         if let Some(top) = found.get(work_dir) {
             return top.clone();
@@ -1186,12 +1279,29 @@ fn collect_git_exec_pushes(
         repository: inherited.repository || exec.elsewhere || exported,
         directory: inherited.directory || unreadable_dir || lost_toplevel,
     };
+    // An editor whose command is an expansion is the program the session
+    // inherited (`EDITOR="$HOME/bin/vim"`) unless the command itself assigns
+    // what it expands (cameronsjo/cadence-hooks#1226 review 3).
+    let unreadable = |script: &String| {
+        runs_an_unreadable_command(script)
+            && (!exec.editors.contains(script) || walk.toplevels.assigns(walk.command, script))
+    };
+    // A nested `git q` whose alias the outer `-c alias.q=…` exports
+    // (`GIT_CONFIG_PARAMETERS`, measured) is a push this walk cannot read.
+    let aliases = match argv.split_first() {
+        Some((first, operands)) if command_word(first) == "git" => {
+            git_globals(operands, segment_dir, known_ok).aliases
+        }
+        _ => Vec::new(),
+    };
+    let runs_an_outer_alias =
+        |script: &String| !aliases.is_empty() && nested_git_runs_an_alias(script, &aliases);
     if depth >= MAX_WRAPPER_DEPTH
         || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS
         || exec
             .scripts
             .iter()
-            .any(|script| runs_an_unreadable_command(script))
+            .any(|script| unreadable(script) || runs_an_outer_alias(script))
     {
         out.push(unresolvable_push(&work_dir, doubt.directory));
     }
@@ -3800,15 +3910,19 @@ mod tests {
     impl GitExecTree {
         fn new(name: &str) -> Self {
             let scratch = Scratch::new(&scratch_root(), name);
-            for dir in [
-                "repo/.git",
-                "repo/a/x/.git",
-                "repo/x/.git",
-                "other/.git",
-                "other/sub",
-            ] {
+            for dir in ["repo", "repo/a/x", "repo/x", "other"] {
+                let git = scratch.path().join(dir).join(".git");
+                for inner in ["objects", "refs"] {
+                    std::fs::create_dir_all(git.join(inner)).expect("create scratch tree");
+                }
+                std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+            }
+            // An empty `.git` git passes over, and one a worktree's file names.
+            for dir in ["other/sub", "repo/bad/.git", "repo/wt"] {
                 std::fs::create_dir_all(scratch.path().join(dir)).expect("create scratch tree");
             }
+            std::fs::write(scratch.path().join("repo/wt/.git"), "gitdir: /elsewhere\n")
+                .expect("write worktree marker");
             // `repo/l3` points into `other`: git runs there, not in `repo`.
             std::os::unix::fs::symlink(
                 scratch.path().join("other/sub"),
@@ -4018,15 +4132,51 @@ mod tests {
                 "/repo",
                 vec![elsewhere("/repo")],
             ),
+            // Review 3: an editor that is an expansion is the inherited program,
+            // unless the command assigns what it expands.
             (
                 "GIT_SEQUENCE_EDITOR=\"$ED\" git rebase -i HEAD~1",
                 "/repo",
+                vec![],
+            ),
+            (
+                "ED='git push origin main'; GIT_SEQUENCE_EDITOR=\"$ED\" git rebase -i HEAD~1",
+                "/repo",
                 vec![refused("/repo")],
+            ),
+            ("GIT_EDITOR=\"$E\" git commit", "/repo", vec![]),
+            (
+                "export E=x; GIT_EDITOR=\"$E\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
+            ("EDITOR=\"$HOME/bin/vim\" git commit", "/repo", vec![]),
+            ("EDITOR=\"$EDITOR\" git commit", "/repo", vec![]),
+            ("EDITOR=\"${EDITOR:-vim}\" git commit", "/repo", vec![]),
+            ("EDITOR=\"$(which vim)\" git commit", "/repo", vec![]),
+            ("EDITOR=$VISUAL git status", "/repo", vec![]),
+            (
+                "GIT_EDITOR='git push origin main' git status",
+                "/repo",
+                vec![],
             ),
             (
                 "git --config-env=core.editor=ED rebase -i HEAD~1",
                 "/repo",
-                vec![refused("/repo")],
+                vec![],
+            ),
+            ("git -c core.editor=\"$EDITOR\" commit", "/repo", vec![]),
+            // Review 3 (L1): git passes over an empty `.git`, and takes a
+            // worktree's `gitdir:` file.
+            (
+                "git rebase -x 'git push origin main' HEAD~1",
+                "/repo/bad",
+                vec![resolved("/repo")],
+            ),
+            (
+                "git rebase -x 'git push origin main' HEAD~1",
+                "/repo/wt",
+                vec![resolved("/repo/wt")],
             ),
             // Controls
             // Round 2: an editor is read on any subcommand (over-read).
@@ -4072,6 +4222,38 @@ mod tests {
         assert_eq!(found[0].work_dir, "rel/dir", "{found:?}");
         assert!(found[0].directory_unverified, "{found:?}");
         assert!(!found[0].repository_unresolved, "{found:?}");
+
+        // Review 3: a push a foreach command's positional parameters run,
+        // and a nested `git q` an outer `-c alias.q=push` defines, is found
+        // and refused.
+        for command in [
+            "git submodule foreach 'eval \"$@\" #' 'git push --force origin main'",
+            "git submodule foreach 'eval \"$@\"' 'git push origin main'",
+            "git submodule foreach 'sh -c \"$1\"' 'git push origin main'",
+            "git submodule foreach 'git \"$@\" #' push origin main",
+            "git -c alias.q=push rebase -x 'git q origin main' HEAD~1",
+            "git -c alias.q=push bisect run git q origin main",
+            "git --config-env=alias.q=Q rebase -x 'git q origin main' HEAD~1",
+            "git -c alias.q='!git push' rebase -x 'git q' HEAD~1",
+        ] {
+            let found = tree.found(command, "/repo");
+            assert!(!found.is_empty(), "{command}: {found:?}");
+            assert!(
+                found
+                    .iter()
+                    .all(|(_, repository_unresolved, unresolved, _)| {
+                        *repository_unresolved && *unresolved
+                    }),
+                "{command}: {found:?}"
+            );
+        }
+        // Controls: an outer alias the nested git does not use.
+        for command in [
+            "git -c alias.q=push rebase -x 'make test' HEAD~1",
+            "git -c alias.st=status rebase -x 'git st' HEAD~1",
+        ] {
+            assert_eq!(tree.found(command, "/repo"), vec![], "{command}");
+        }
     }
 
     /// cameronsjo/cadence-hooks#1226: the nesting is bounded. A git exec

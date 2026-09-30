@@ -11830,6 +11830,11 @@ pub struct GitExec {
     /// an editor — measured under git 2.43 from a
     /// subdirectory). A walker that tracks a directory starts them there.
     pub at_toplevel: bool,
+    /// Which of [`GitExec::scripts`] are an editor, which git starts only
+    /// when it needs one. A walker judging one whose command is an expansion
+    /// tells an inherited program (`EDITOR="$HOME/bin/vim"`) from a value
+    /// the same command wrote.
+    pub editors: Vec<String>,
 }
 
 /// `filter-branch` options whose value it `eval`s (git 2.43's
@@ -12034,25 +12039,32 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
         }
         None => return None,
     };
-    // Any subcommand that needs an editor (`rebase -i`, `commit`, `pull
-    // --rebase=i`, `tag -a`, …) runs one of these under a shell; git only
-    // starts it when it needs one, so reading it on every subcommand
-    // over-reads, never misses.
-    let editors = editor_scripts(prefix, globals);
+    // A subcommand that can start an editor ([`may_start_an_editor`]) runs
+    // one of these under a shell; git only starts it when it needs one, so
+    // reading it there over-reads, never misses. A subcommand that cannot
+    // start one (`status`, `log`) is not read, and neither is anything once
+    // no subcommand can be found — except that, not knowing it, every
+    // editor is read.
     let editor_only = |editors: Vec<String>| {
-        (!editors.is_empty()).then_some(GitExec {
-            scripts: editors,
+        (!editors.is_empty()).then(|| GitExec {
+            scripts: editors.clone(),
             elsewhere: false,
             at_toplevel: true,
+            editors,
         })
     };
     let Some((subcommand, args)) = rest.and_then(<[String]>::split_first) else {
-        return editor_only(editors);
+        return editor_only(editor_scripts(prefix, globals));
     };
     let subcommand = if verb == "git" {
         unescape_word(subcommand).into_owned()
     } else {
         verb.trim_start_matches("git-").to_string()
+    };
+    let editors = if may_start_an_editor(&subcommand, args) {
+        editor_scripts(prefix, globals)
+    } else {
+        Vec::new()
     };
     let (scripts, elsewhere, at_toplevel) = match subcommand.as_str() {
         "rebase" => (exec_option_scripts(args, &REBASE_OPTIONS), false, true),
@@ -12062,9 +12074,7 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
         }
         // The helper the `submodule` script calls takes the same `foreach`.
         "submodule" | "submodule--helper" => (
-            submodule_foreach_script(args, subcommand == "submodule--helper")
-                .into_iter()
-                .collect(),
+            submodule_foreach_script(args, subcommand == "submodule--helper"),
             true,
             false,
         ),
@@ -12093,12 +12103,43 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // An editor beside a subcommand's own scripts takes their place: where
     // it is the transports', that is a doubt, never a miss.
     let mut scripts = scripts;
-    scripts.extend(editors);
+    scripts.extend(editors.iter().cloned());
     Some(GitExec {
         scripts,
         elsewhere,
         at_toplevel,
+        editors,
     })
+}
+
+/// Whether a git subcommand can start an editor: `commit`, `merge`, `tag`,
+/// `rebase`, `pull`, `revert`, `cherry-pick`, `notes`, `am`, `send-email`,
+/// and `config -e`, `branch --edit-description`, `add -e/-p/-i`, `replace
+/// --edit` (any abbreviation of the long flag). See [`git_exec`].
+fn may_start_an_editor(subcommand: &str, args: &[String]) -> bool {
+    let has = |short: &[char], long: &[&str]| {
+        args.iter().any(|raw| {
+            let word = unescape_word(raw);
+            match word.strip_prefix("--") {
+                Some(name) => {
+                    let name = name.split('=').next().unwrap_or(name);
+                    !name.is_empty() && long.iter().any(|option| option.starts_with(name))
+                }
+                None => word
+                    .strip_prefix('-')
+                    .is_some_and(|cluster| cluster.chars().any(|c| short.contains(&c))),
+            }
+        })
+    };
+    match subcommand {
+        "commit" | "merge" | "tag" | "rebase" | "pull" | "revert" | "cherry-pick" | "notes"
+        | "am" | "send-email" => true,
+        "config" => has(&['e'], &["edit"]),
+        "branch" => has(&[], &["edit-description"]),
+        "add" => has(&['e', 'p', 'i'], &["edit", "patch", "interactive"]),
+        "replace" => has(&[], &["edit"]),
+        _ => false,
+    }
 }
 
 /// The subcommands [`git_exec`] reads.
@@ -12379,21 +12420,154 @@ fn follow_exec_chain(
     (words, elsewhere, head_is_text)
 }
 
-/// The script the words a chain ends in run as ([`follow_exec_chain`]):
+/// The scripts the words a chain ends in run as ([`follow_exec_chain`]):
 /// each word quoted, except a `head_is_text` first word, which the shell
 /// reads as the text it is — `git submodule foreach 'rm .env #' x` runs
-/// `rm .env` (measured).
-fn chain_script(words: &[String], head_is_text: bool) -> Option<String> {
+/// `rm .env` (measured). git runs that text as `sh -c 'HEAD "$@"' HEAD ARG…`,
+/// so a positional parameter in it (`"$@"`, `$*`, `$1`–`$9`, `${…}`) is an
+/// argument: it is substituted with the quoted arguments, and the arguments
+/// are surfaced, joined as `eval` joins them, as a script of their own as
+/// well — `foreach 'eval "$@" #' 'git push origin main'` pushes
+/// (cameronsjo/cadence-hooks#1226 review 3).
+fn chain_script(words: &[String], head_is_text: bool) -> Vec<String> {
     if !head_is_text {
-        return quoted_script(words);
+        return quoted_script(words).into_iter().collect();
     }
-    let (head, rest) = words.split_first()?;
-    let head = unescape_word(head);
-    let script = match quoted_script(rest) {
-        Some(rest) => format!("{head} {rest}"),
-        None => head.into_owned(),
+    let Some((head, rest)) = words.split_first() else {
+        return Vec::new();
     };
-    (!script.trim().is_empty()).then_some(script)
+    let head = unescape_word(head);
+    let args = quoted_script(rest);
+    let positional = positional_parameters_in(&head);
+    let head = if positional {
+        substitute_positional_parameters(&head, rest)
+    } else {
+        head.into_owned()
+    };
+    let script = match &args {
+        Some(args) => format!("{head} {args}"),
+        None => head,
+    };
+    let mut out: Vec<String> = Some(script)
+        .filter(|script| !script.trim().is_empty())
+        .into_iter()
+        .collect();
+    if positional && let Some(args) = joined_script(rest) {
+        out.push(args);
+    }
+    out
+}
+
+/// Whether shell text reads a positional parameter: `$@`, `$*`, `$1`–`$9`,
+/// or any `${…}` (which may name one).
+fn positional_parameters_in(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.windows(2).any(|pair| {
+        pair[0] == b'$' && (matches!(pair[1], b'@' | b'*' | b'{') || pair[1].is_ascii_digit())
+    })
+}
+
+/// Arguments [`substitute_positional_parameters`] substitutes for `"$@"`.
+const MAX_SUBSTITUTED_ARGS: usize = 64;
+
+/// The spellings [`substitute_positional_parameters`] replaces, and which
+/// argument each names (`None`: every one).
+const POSITIONAL_SPELLINGS: &[(&str, Option<usize>)] = &[
+    ("${@}", None),
+    ("${*}", None),
+    ("$@", None),
+    ("$*", None),
+    ("${1}", Some(1)),
+    ("${2}", Some(2)),
+    ("${3}", Some(3)),
+    ("${4}", Some(4)),
+    ("${5}", Some(5)),
+    ("${6}", Some(6)),
+    ("${7}", Some(7)),
+    ("${8}", Some(8)),
+    ("${9}", Some(9)),
+    ("$1", Some(1)),
+    ("$2", Some(2)),
+    ("$3", Some(3)),
+    ("$4", Some(4)),
+    ("$5", Some(5)),
+    ("$6", Some(6)),
+    ("$7", Some(7)),
+    ("$8", Some(8)),
+    ("$9", Some(9)),
+];
+
+/// `text` with each positional parameter replaced by the arguments it
+/// names, quoted: `"$@"`/`$@`/`"$*"`/`$*` (and their `${…}` spellings) by
+/// every argument, `"$N"`/`$N`/`${N}` by the Nth. `$0` is the text itself
+/// and left alone. One pass over `text`, so a parameter spelled inside an
+/// argument is never substituted again; past four arguments' worth of
+/// growth `text` is kept as it is (the arguments are surfaced on their own
+/// by [`chain_script`]), so a 200 KB `"$@"` flood stays linear.
+fn substitute_positional_parameters(text: &str, args: &[String]) -> String {
+    // `"$@"` reads at most the first [`MAX_SUBSTITUTED_ARGS`] arguments: the
+    // whole list is surfaced joined on its own ([`chain_script`]), and a
+    // 200 KB argument list substituted into every spelling doubled the work
+    // of each walk over it.
+    let all = quoted_script(&args[..args.len().min(MAX_SUBSTITUTED_ARGS)]).unwrap_or_default();
+    let nth = |n: usize| {
+        args.get(n - 1)
+            .map(|word| shell_quoted_word(&unescape_word(word)))
+            .unwrap_or_default()
+    };
+    let budget = text.len() + 4 * all.len() + 1024;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(['$', '"']) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let mut matched = None;
+        for quoted in [true, false] {
+            let body = if quoted {
+                match rest.strip_prefix('"') {
+                    Some(body) => body,
+                    None => continue,
+                }
+            } else {
+                rest
+            };
+            for &(spelling, value) in POSITIONAL_SPELLINGS {
+                let Some(after) = body.strip_prefix(spelling) else {
+                    continue;
+                };
+                let after = if quoted {
+                    match after.strip_prefix('"') {
+                        Some(after) => after,
+                        None => continue,
+                    }
+                } else {
+                    after
+                };
+                let value = value.map_or_else(|| all.clone(), nth);
+                matched = Some((value, rest.len() - after.len()));
+                break;
+            }
+            if matched.is_some() {
+                break;
+            }
+        }
+        match matched {
+            Some((value, used)) => {
+                out.push_str(&value);
+                rest = &rest[used..];
+                if out.len() > budget {
+                    return text.to_string();
+                }
+            }
+            None => {
+                let c = rest.chars().next().unwrap_or('$');
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The command a `git bisect run CMD ARG…` runs, and whether a submodule
@@ -12407,7 +12581,7 @@ fn bisect_run_scripts(args: &[String]) -> (Vec<String>, bool) {
         return (Vec::new(), false);
     }
     let (command, elsewhere, head_is_text) = follow_exec_chain(command.to_vec(), false, false);
-    let mut out: Vec<String> = chain_script(&command, head_is_text).into_iter().collect();
+    let mut out = chain_script(&command, head_is_text);
     if let Some(joined) = joined_script(&command)
         && !out.contains(&joined)
     {
@@ -12417,16 +12591,21 @@ fn bisect_run_scripts(args: &[String]) -> (Vec<String>, bool) {
 }
 
 /// The command a `git submodule … foreach … CMD` runs. See [`git_exec`].
-fn submodule_foreach_script(args: &[String], helper: bool) -> Option<String> {
-    let at = foreach_command_at(args)?;
+fn submodule_foreach_script(args: &[String], helper: bool) -> Vec<String> {
+    let Some(at) = foreach_command_at(args) else {
+        return Vec::new();
+    };
     let command = if helper {
         without_helper_flags(&args[at..])
     } else {
         args[at..].to_vec()
     };
     match command.as_slice() {
-        [] => None,
-        [single] => Some(unescape_word(single).into_owned()).filter(|s| !s.trim().is_empty()),
+        [] => Vec::new(),
+        [single] => Some(unescape_word(single).into_owned())
+            .filter(|s| !s.trim().is_empty())
+            .into_iter()
+            .collect(),
         _ => {
             let (command, _, head_is_text) = follow_exec_chain(command, helper, true);
             chain_script(&command, head_is_text)
@@ -21449,9 +21628,28 @@ mod tests {
             ("git -c core.editor=a rebase HEAD~1", top(&["a"])),
             ("EDITOR=vim git rebase -i main", top(&["vim"])),
             ("GIT_EDITOR=a git --no-such-global status", top(&["a"])),
+            ("GIT_EDITOR=a git fetch --upload-pack=b .", away(&["b"])),
+            // Review 3: only a subcommand that can start an editor reads one.
+            ("GIT_EDITOR=a git config -e", top(&["a"])),
+            ("GIT_EDITOR=a git add -p", top(&["a"])),
+            ("GIT_EDITOR=a git branch --edit-desc", top(&["a"])),
+            ("GIT_EDITOR=a git tag -a v1", top(&["a"])),
+            // Review 3: a positional parameter in a foreach command's text
+            // is its arguments.
             (
-                "GIT_EDITOR=a git fetch --upload-pack=b .",
-                away(&["b", "a"]),
+                "git submodule foreach 'eval \"$@\" #' 'cat .env'",
+                away(&["eval 'cat .env' # 'cat .env'", "cat .env"]),
+            ),
+            (
+                "git submodule foreach 'sh -c \"$1\"' 'cat .env'",
+                away(&["sh -c 'cat .env' 'cat .env'", "cat .env"]),
+            ),
+            (
+                "git submodule foreach 'git \"$@\" #' push origin main",
+                away(&[
+                    "git push origin main # push origin main",
+                    "push origin main",
+                ]),
             ),
         ] {
             assert_eq!(read(command), want, "{command:?}");
@@ -21463,6 +21661,10 @@ mod tests {
             "git rebase -Xx HEAD~1",
             "git rebase -Sx HEAD~1",
             "git rebase -i HEAD~1",
+            "GIT_EDITOR=a git status",
+            "git -c core.editor=a log",
+            "GIT_EDITOR=a git branch -d x",
+            "GIT_EDITOR=a git config --get x",
             "git fetch -u origin",
             "git fetch origin main",
             "git push origin main",
@@ -21504,6 +21706,9 @@ mod tests {
             nested = format!("git rebase -x {} HEAD~1", quote(&nested));
         }
         has(&nested, "rm .env");
+        // Review 3: a foreach command's positional parameters.
+        has("git submodule foreach 'eval \"$@\" #' 'rm .env'", "rm .env");
+        has("git submodule foreach 'sh -c \"$1\"' 'rm .env'", "rm .env");
     }
 
     #[test]
