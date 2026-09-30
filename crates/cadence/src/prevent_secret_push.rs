@@ -10,15 +10,13 @@
 //! **Trigger and range come from core.** [`push_invocations`] finds every push
 //! the command runs (wrappers, `-C`, substitutions, refspecs). This module owns
 //! the range and the scan. The range for a named source is
-//! `git rev-list <src> --not --remotes=<dest>` (positive ref BEFORE `--not`:
-//! the other order negates the ref too and scans nothing), where `<dest>` is
-//! the configured remote the push goes to — the push's repository argument, or
-//! for a bare push `branch.<b>.pushRemote` / `remote.pushDefault` /
-//! `branch.<b>.remote` / `origin`. A URL, a remote this command rewrites, or a
-//! remote whose tracking refs another remote's fetch refspec writes falls back
-//! to every remote-tracking ref (`--remotes`). `--all` widens to every branch,
-//! `--mirror` (flag or `remote.<dest>.mirror`) to every ref, `--tags` adds
-//! every tag. `tag <name>` reads as `refs/tags/<name>`, `@` as `HEAD`.
+//! `git rev-list <src> --not --remotes` (positive ref BEFORE `--not`: the other
+//! order negates the ref too and scans nothing): a commit reachable from ANY
+//! remote-tracking ref reads as published, so a fork flow (a branch based on
+//! `upstream/main` pushed to `origin`) does not re-scan upstream's history.
+//! `--all`/`--branches` widen to every branch, `--mirror` (flag or
+//! `remote.<dest>.mirror`) to every ref, `--tags` adds every tag. `tag <name>`
+//! reads as `refs/tags/<name>`, `@` as `HEAD`.
 //!
 //! **Scan.** One `git log -p -U0 --cc --root` over the outbound range, so a
 //! secret added and then removed inside the range is still seen (a net diff
@@ -26,10 +24,16 @@
 //! introduces that no parent had. Content goes through
 //! [`crate::credential_scan`] (the #1022 token shapes) and
 //! [`scan_secret_values`]; names go through [`is_blocked`]. A second pass reads
-//! the same commits' MESSAGES through the same text scanner, and annotated tag
-//! objects the push publishes (`--tags`, `--mirror`, `--follow-tags` /
-//! `push.followTags`, a named tag) are read raw, header and message. The block
-//! message carries short sha, path and pattern name, never the value.
+//! the same commits as RAW objects (`git cat-file --batch`, header and
+//! message, never re-encoded by an `encoding` header or
+//! `i18n.logOutputEncoding`) through the same text scanner. Every named source
+//! is read by its UNPEELED object, whatever its ref path or a raw sha: a tag
+//! object is scanned raw and must tag a commit. Annotated tags `--tags`,
+//! `--mirror` and `--follow-tags`/`push.followTags` publish are read the same
+//! way, and every ref name the push writes (both sides of each refspec, the
+//! current branch of a bare push, every ref a widening flag enumerates) goes
+//! through the text scanner too. The block message carries short sha, path
+//! and pattern name, never the value; a ref name carrying one is withheld.
 //!
 //! **Every spawn reads the objects the push sends.** Replace refs are off
 //! (`--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS`), and the patch pass pins
@@ -42,45 +46,73 @@
 //! invocation, an unreadable or unsafe source, a source or tag that is not a
 //! commit (a tree or blob publishes content no patch shows), a nested tag, a
 //! submodule push (`--recurse-submodules=on-demand|only`, the same in
-//! `push.recurseSubmodules`, or `submodule.recurse`), a failed, unavailable or
-//! timed-out git spawn, a range over [`MAX_COMMITS`], a patch over
-//! [`MAX_LOG_BYTES`], too many refspecs, an unparseable diff header — all
-//! block, and the message says which. Only a genuinely empty range allows.
+//! `push.recurseSubmodules`, or `submodule.recurse`) in a repository that has
+//! submodules (a top-level `.gitmodules` or a gitlink in the index), a failed,
+//! unavailable or timed-out git spawn, a range over [`MAX_COMMITS`], a patch
+//! over [`MAX_LOG_BYTES`], too many refspecs, an unparseable diff header —
+//! all block, and the message says which. Only a genuinely empty range
+//! allows. `git send-pack` and `git http-push` (and their `git-<name>`
+//! executables) publish without `git push` and always block.
 //!
 //! **Aliases.** A `git <sub>` whose subcommand is not a builtin is looked up in
-//! the repository's config (`alias.<sub>`, following alias-of-alias); one whose
-//! value names `push` or starts with `!` blocks as unresolved, as does one this
-//! same command writes with `git config`.
+//! the repository's config (`alias.<sub>`, following alias-of-alias, past any
+//! global options an alias value opens with). It blocks as unresolved when:
+//! its value names `push` or `send-pack` or starts with `!`; an alias opens
+//! with an option this cannot follow or holds options only; this same command
+//! writes it with `git config`; the subcommand word carries `$` or a backtick;
+//! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
+//! `GIT_DIR=`, `GIT_WORK_TREE=`, `HOME=` or `XDG_CONFIG_HOME=` anywhere in the
+//! command, an `include.path`/`includeIf` mention, `--git-dir`, `--work-tree`,
+//! `--config-env`, `-c include*`, or a directory it cannot resolve); the probe
+//! itself fails or times out; or `help.autocorrect` is set to run a guess
+//! (anything but `0`/`false`/`never`/`show`/`prompt`) and the subcommand is
+//! neither an alias nor a `git-<sub>` on `PATH` or in git's exec-path.
+//! Builtins skip all of it.
 //!
-//! **Bounded.** Every git spawn goes through `run_bounded_capped` (process-group
-//! kill, stdout cap, shared hook deadline). The commit cap is applied to git
-//! itself (`rev-list -n`), so an entire first-push history is never buffered.
+//! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
+//! (process-group kill, stdout cap, shared hook deadline, stdin written from
+//! its own thread). The commit cap is applied to git itself (`rev-list -n`),
+//! so an entire first-push history is never buffered.
 //!
 //! **Deliberately allowed** (each documented, none silent):
 //! - `--dry-run`/`-n` pushes and pure deletions (nothing is published);
-//! - commits already reachable from the destination remote's tracking refs
-//!   (or from ANY remote-tracking ref when the destination is a URL or cannot
-//!   be named — a commit only on a fork then reads as published);
-//! - **every file of a repository checked out under a `cadence-hooks` path
-//!   component** — a whole-repo exemption from the content scan (the
-//!   `prevent-secret-writes` one), because this repository's sources hold
-//!   hundreds of fake tokens in unit tests. A known residual: any checkout
-//!   under such a component, or a path below one, is content-exempt. Names
-//!   and messages are still checked;
+//! - commits already reachable from ANY remote-tracking ref. That trusts,
+//!   as published: a commit that is only on ANOTHER remote (a private
+//!   upstream's history pushed to a public fork reads as already out); a
+//!   remote-tracking ref that is stale, or was fabricated or moved by an
+//!   EARLIER command (`git update-ref refs/remotes/...`, a fetch refspec
+//!   writing another remote's refs) — only this command's own text is read;
+//!   and a push whose real destination differs from its name
+//!   (`remote.<name>.pushurl`, `url.<base>.pushInsteadOf`);
+//! - **every file of a repository whose top-level path has a
+//!   `cadence-hooks` component** — a whole-repo exemption from the content
+//!   scan (the `prevent-secret-writes` one), because this repository's
+//!   sources hold hundreds of fake tokens in unit tests. It keys on the
+//!   repository's own location only: a `cadence-hooks/` directory inside any
+//!   other repository is scanned. A known residual: any other checkout under
+//!   such a component is content-exempt. Names and messages are still
+//!   checked;
 //! - a secret-*named* check skipped for a safe-template name (a
 //!   [`crate::secret_patterns::SAFE_SUFFIXES`] suffix: `.example`,
 //!   `.template`, `.sample`, `.defaults`, `.test`, `.ci`, `.pub`). Their
 //!   CONTENT is still scanned;
 //! - deleting a secret-named file (removal publishes no content);
-//! - secrets outside the corpus (no entropy scan; token *grammar* only).
+//! - a submodule-recursing push in a repository with no submodules;
+//! - secrets outside the corpus (no entropy scan; token *grammar* only), and
+//!   Git LFS content: only the pointer file is in the commit, so the object
+//!   the LFS pre-push hook uploads is never scanned.
 //!
-//! **Over-blocks on purpose:** `--tags` re-reads every tag, published or not.
+//! **Over-blocks on purpose:** `--tags` re-reads every tag and `--mirror`
+//! every ref, published or not; `--follow-tags` re-reads every annotated tag
+//! reachable from what is pushed, including tags the remote already has.
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
-//! `git subtree push`, a `git-<name>` executable on `PATH`, a push inside a
-//! script file; a git config key written by the same command through anything
-//! but `git config`/`git remote` (an editor, a redirect into `.git/config`);
-//! an alias in a directory the walk cannot follow (the hook's cwd is probed).
+//! `git subtree push`, a `git-<name>` executable on `PATH` other than
+//! `send-pack`/`http-push`, a push inside a script file; a git config key
+//! written by the same command through anything but `git config`/`git remote`
+//! (an editor, a redirect into `.git/config`); a pushed commit on another
+//! branch that adds a submodule the index and top-level `.gitmodules` do not
+//! show.
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
 //! allows AND records a bypass row.
@@ -94,7 +126,7 @@ use cadence_hooks_core::push::{PushInvocation, is_safe_ref, push_invocations};
 use cadence_hooks_core::shell::{
     GitSpawn, UNRESOLVABLE_DIR, command_segments_with_dirs, command_word,
     contains_ignoring_ascii_case, executable_tokens, peel_command_runners, resolve_cd_target,
-    run_bounded_capped, skip_git_global_options, unescape_word,
+    run_bounded_capped_input, skip_git_global_options, unescape_word,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
@@ -134,8 +166,8 @@ const MAX_ALIAS_DEPTH: usize = 10;
 type Exempt = fn(&str) -> bool;
 
 /// One git answer, with the four outcomes kept apart.
-enum Git {
-    Ok(String),
+enum Git<T = String> {
+    Ok(T),
     /// The stdout cap was reached.
     Capped,
     /// git ran and exited non-zero (the code, when it had one).
@@ -155,6 +187,22 @@ enum Budget {
 }
 
 fn git(work_dir: &str, args: &[&str], max_stdout: usize, budget: Budget) -> Git {
+    match git_bytes(work_dir, args, max_stdout, budget, None) {
+        Git::Ok(bytes) => Git::Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Git::Capped => Git::Capped,
+        Git::Failed(code) => Git::Failed(code),
+        Git::Down => Git::Down,
+    }
+}
+
+/// [`git`] with raw stdout and optional stdin (`cat-file --batch`).
+fn git_bytes(
+    work_dir: &str,
+    args: &[&str],
+    max_stdout: usize,
+    budget: Budget,
+    input: Option<Vec<u8>>,
+) -> Git<Vec<u8>> {
     let cap = |full: Duration| match budget {
         Budget::Probe => full.min(SPAWN_CAP),
         Budget::Scan => full,
@@ -179,10 +227,8 @@ fn git(work_dir: &str, args: &[&str], max_stdout: usize, budget: Budget) -> Git 
         .arg("-C")
         .arg(work_dir)
         .args(args);
-    match run_bounded_capped(&mut cmd, timeout, Some(max_stdout)) {
-        GitSpawn::Completed(out) if out.status.success() => {
-            Git::Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
+    match run_bounded_capped_input(&mut cmd, timeout, Some(max_stdout), input) {
+        GitSpawn::Completed(out) if out.status.success() => Git::Ok(out.stdout),
         GitSpawn::Completed(out) => Git::Failed(out.status.code()),
         // The stdout cap kills the child, so its status says nothing; the
         // length says whether the cap was the reason.
@@ -213,19 +259,6 @@ fn sane(text: &str) -> String {
         .collect()
 }
 
-/// A delimiter no object can contain: 128 random bits from the process's
-/// randomly seeded hasher. Used where git prints free text (a message, a tag)
-/// between records, so a crafted message cannot forge a record boundary.
-fn nonce() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let state = std::collections::hash_map::RandomState::new();
-    let mut a = state.build_hasher();
-    a.write_u8(1);
-    let mut b = state.build_hasher();
-    b.write_u8(2);
-    format!("@@cadence-{:016x}{:016x}@@", a.finish(), b.finish())
-}
-
 /// What else the command does that changes what a push publishes, read from
 /// its text: config it writes with `git config`/`git remote` (before the push
 /// runs, so the repository probe cannot see it) and `-c` globals. A mention
@@ -243,9 +276,15 @@ struct CommandHints {
 /// its subcommand on.
 struct GitCall {
     dir: String,
+    /// The directory could not be followed (`cd "$D"`, `-C "$D"`, a
+    /// backtick): `dir` is a stand-in, so an alias probe there proves nothing.
+    dir_unresolved: bool,
     globals: Vec<String>,
     rest: Vec<String>,
 }
+
+/// Plumbing that publishes objects without `git push`.
+const RAW_PUSH_COMMANDS: &[&str] = &["send-pack", "http-push"];
 
 fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
     if !contains_ignoring_ascii_case(command, "git") {
@@ -256,27 +295,48 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         let tokens = executable_tokens(&segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else { continue };
-        if command_word(first) != "git" {
+        let word = command_word(first);
+        // `git-send-pack` run as its own executable is the same push.
+        let dashed = word
+            .strip_prefix("git-")
+            .filter(|sub| RAW_PUSH_COMMANDS.contains(sub));
+        if word != "git" && dashed.is_none() {
             continue;
         }
-        let rest = skip_git_global_options(&argv[1..]);
-        let globals = &argv[1..argv.len() - rest.len()];
+        let mut dir_unresolved = &*dir == UNRESOLVABLE_DIR || dir.contains(['$', '`']);
         let mut at = if &*dir == UNRESOLVABLE_DIR {
             cwd.to_string()
         } else {
             dir.to_string()
         };
+        if let Some(sub) = dashed {
+            out.push(GitCall {
+                dir: at,
+                dir_unresolved,
+                globals: Vec::new(),
+                rest: std::iter::once(sub.to_string())
+                    .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
+                    .collect(),
+            });
+            continue;
+        }
+        let rest = skip_git_global_options(&argv[1..]);
+        let globals = &argv[1..argv.len() - rest.len()];
         let mut words = globals.iter();
         while let Some(word) = words.next() {
             if unescape_word(word) == "-C"
                 && let Some(value) = words.next()
-                && !value.contains(['$', '`'])
             {
-                at = resolve_cd_target(value, &at);
+                if value.contains(['$', '`']) {
+                    dir_unresolved = true;
+                } else {
+                    at = resolve_cd_target(value, &at);
+                }
             }
         }
         out.push(GitCall {
             dir: at,
+            dir_unresolved,
             globals: globals
                 .iter()
                 .map(|w| unescape_word(w).into_owned())
@@ -409,13 +469,72 @@ fn read_config(dir: &str, regex: &str) -> Result<Vec<(String, String)>, Stop> {
     }
 }
 
-/// Does the alias `name` (following alias-of-alias) run a push, or a shell
-/// command that can? `aliases` maps lowercased name → value.
-fn alias_runs_push(aliases: &HashMap<String, String>, name: &str) -> bool {
+/// What the repository's config says about a subcommand that is not a
+/// builtin: its aliases (lowercased name → value) and whether
+/// `help.autocorrect` would run a guessed command.
+#[derive(Default)]
+struct AliasConfig {
+    aliases: HashMap<String, String>,
+    autocorrect: bool,
+}
+
+fn alias_config(dir: &str) -> Result<AliasConfig, Stop> {
+    let mut out = AliasConfig::default();
+    for (key, value) in read_config(dir, "^(alias\\..*|help\\.autocorrect)$")? {
+        if key == "help.autocorrect" {
+            // git: `0`/`false`, `never`, `show` and `prompt` never run a guess
+            // unattended; every other value (a delay, `immediate`, a negative
+            // number, `true`) does. The last value wins.
+            out.autocorrect = !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off" | "never" | "show" | "prompt"
+            );
+        } else if let Some(name) = key.strip_prefix("alias.") {
+            out.aliases.insert(name.to_ascii_lowercase(), value);
+        }
+    }
+    Ok(out)
+}
+
+/// Is there a `git-<name>` executable on `PATH` or in git's exec-path (where
+/// most builtins also sit as links)? git runs one before it would
+/// autocorrect, so such a subcommand is not a guess. The exec-path is asked
+/// once per process; if git cannot answer, only `PATH` counts (stricter).
+fn external_subcommand_exists(dir: &str, name: &str) -> bool {
+    static EXEC_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return false;
+    }
+    let file = format!("git-{name}");
+    let exec_path =
+        EXEC_PATH.get_or_init(|| match git(dir, &["--exec-path"], 4096, Budget::Probe) {
+            Git::Ok(path) if !path.trim().is_empty() => Some(path.trim().into()),
+            _ => None,
+        });
+    if exec_path.as_ref().is_some_and(|d| d.join(&file).is_file()) {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(&file).is_file()))
+}
+
+/// Why the alias `name` (following alias-of-alias) may run a push, if it may:
+/// its value names `push`, `send-pack` or `http-push`, runs a shell (`!`),
+/// opens with an option this cannot follow, or reaches a subcommand
+/// `help.autocorrect` would guess at.
+fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static str> {
+    const PUSHES: &str = "is an alias that can run a push (its value names `push` or \
+                          `send-pack`, or runs a shell command)";
     let mut name = name.to_string();
     for _ in 0..MAX_ALIAS_DEPTH {
-        let Some(value) = aliases.get(&name) else {
-            return false;
+        let Some(value) = cfg.aliases.get(&name) else {
+            if cfg.autocorrect && !external_subcommand_exists(dir, &name) {
+                return Some(
+                    "is not a known command, and `help.autocorrect` would run git's guess \
+                     at it (which may be `push`)",
+                );
+            }
+            return None;
         };
         // git splits an alias with its own quoting, so `pu\sh` and `p"u"sh`
         // are `push` to it.
@@ -424,25 +543,57 @@ fn alias_runs_push(aliases: &HashMap<String, String>, name: &str) -> bool {
             .filter(|c| !matches!(c, '\\' | '"' | '\''))
             .collect::<String>()
             .to_ascii_lowercase();
-        if plain.trim_start().starts_with('!') || plain.contains("push") {
-            return true;
+        if plain.trim_start().starts_with('!')
+            || plain.contains("push")
+            || plain.contains("send-pack")
+        {
+            return Some(PUSHES);
         }
-        match plain.split_whitespace().next() {
-            Some(next) if !BUILTINS.contains(&next) => name = next.to_string(),
-            _ => return false,
+        // An alias may open with git's global options (`-c a.b=c x`,
+        // `--paginate x`); its subcommand is the first word after them.
+        let words: Vec<String> = plain.split_whitespace().map(str::to_string).collect();
+        let rest = skip_git_global_options(&words);
+        match rest.first() {
+            // Options only: git 2.43 refuses it as empty, but nothing here
+            // vouches for every git, which could take the next word.
+            None => {
+                return Some("is an alias of git options only, with no subcommand of its own");
+            }
+            // An option this walk cannot classify: fail closed.
+            Some(next) if next.starts_with('-') => {
+                return Some("is an alias opening with an option this guard cannot follow");
+            }
+            Some(next) if BUILTINS.contains(&next.as_str()) => return None,
+            Some(next) => name = next.clone(),
         }
     }
-    true // a chain this deep is not something to vouch for
+    Some("is an alias chain too deep to follow")
 }
 
-/// Why an alias the command runs may hide a push, if one may.
-fn hidden_alias_push(calls: &[GitCall], hints: &CommandHints) -> Option<String> {
-    let mut probed: HashMap<String, HashMap<String, String>> = HashMap::new();
+/// Why a `git` call the command makes may publish objects this guard cannot
+/// scan, if one may: a raw push command, a subcommand word it cannot read, or
+/// an alias (or autocorrected guess) that can push.
+fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> Option<String> {
+    let mut probed: HashMap<String, Result<AliasConfig, String>> = HashMap::new();
+    let mut command_blind: Option<Option<&'static str>> = None;
+    let mut judged: std::collections::HashSet<(String, String)> = Default::default();
     for call in calls {
         let Some(sub) = call.rest.first() else {
             continue;
         };
         let sub = sub.to_ascii_lowercase();
+        if RAW_PUSH_COMMANDS.contains(&sub.as_str()) {
+            return Some(format!(
+                "`git {sub}` publishes objects without `git push`, which this guard cannot scan"
+            ));
+        }
+        if sub.contains(['$', '`']) {
+            return Some(format!(
+                "`git {}` names its subcommand through an expansion this guard cannot \
+                 resolve",
+                sane(&sub)
+            ));
+        }
         if sub.starts_with('-') || BUILTINS.contains(&sub.as_str()) {
             continue;
         }
@@ -452,27 +603,90 @@ fn hidden_alias_push(calls: &[GitCall], hints: &CommandHints) -> Option<String> 
                 sane(&sub)
             ));
         }
+        let blind = *command_blind.get_or_insert_with(|| command_probe_blind(command));
+        if let Some(why) = alias_probe_blind(blind, call) {
+            return Some(format!(
+                "`git {}` may be an alias this guard cannot resolve ({why})",
+                sane(&sub)
+            ));
+        }
         if !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES {
             return Some(format!(
                 "`git {}` may be an alias, in more directories than this guard will probe",
                 sane(&sub)
             ));
         }
-        let aliases = probed.entry(call.dir.clone()).or_insert_with(|| {
-            // An unreadable config is not a detected push: nothing to judge.
-            read_config(&call.dir, "^alias\\.")
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(k, v)| Some((k.strip_prefix("alias.")?.to_ascii_lowercase(), v)))
-                .collect()
+        let cfg = probed.entry(call.dir.clone()).or_insert_with(|| {
+            alias_config(&call.dir).map_err(|stop| match stop {
+                Stop::Refused(why) => why,
+                Stop::Found(_) => String::new(),
+            })
         });
-        if alias_runs_push(aliases, &sub) {
-            return Some(format!(
-                "`git {}` is an alias that can run a push (its value names `push` or runs a \
-                 shell command)",
-                sane(&sub)
-            ));
+        let cfg = match cfg {
+            Ok(cfg) => cfg,
+            Err(why) => {
+                return Some(format!("`git {}` may be an alias, and {why}", sane(&sub)));
+            }
+        };
+        // One verdict per (directory, subcommand): a long command repeating
+        // one call costs one walk, not one per repetition.
+        if !judged.insert((call.dir.clone(), sub.clone())) {
+            continue;
         }
+        if let Some(why) = alias_runs_push(cfg, &call.dir, &sub) {
+            return Some(format!("`git {}` {why}", sane(&sub)));
+        }
+    }
+    None
+}
+
+/// Why no repository probe can see the config this command's git calls
+/// read, judged once from the whole text: an env assignment (or export) of
+/// git's config or repository location, or a config include. Plain
+/// substrings, so a mention anywhere counts — stricter, never looser.
+fn command_probe_blind(command: &str) -> Option<&'static str> {
+    const ENV: &[&str] = &[
+        "GIT_CONFIG",
+        "GIT_DIR=",
+        "GIT_WORK_TREE=",
+        "HOME=",
+        "XDG_CONFIG_HOME=",
+    ];
+    if ENV.iter().any(|name| command.contains(name)) {
+        return Some("the command sets git's config or repository environment");
+    }
+    if contains_ignoring_ascii_case(command, "include.path")
+        || contains_ignoring_ascii_case(command, "includeif")
+    {
+        return Some("the command names a config include");
+    }
+    None
+}
+
+/// Why the repository probe cannot see the config a `git` call reads, if it
+/// cannot: the command redirects git's config or repository through env or
+/// options the probe does not carry, or the call's directory is unknown.
+fn alias_probe_blind(command_blind: Option<&'static str>, call: &GitCall) -> Option<&'static str> {
+    if command_blind.is_some() {
+        return command_blind;
+    }
+    let mut globals = call.globals.iter();
+    while let Some(word) = globals.next() {
+        let lower = word.to_ascii_lowercase();
+        let redirects = ["--git-dir", "--work-tree", "--config-env"]
+            .iter()
+            .any(|opt| lower == *opt || lower.starts_with(&format!("{opt}=")));
+        let include = lower == "-c"
+            && globals
+                .clone()
+                .next()
+                .is_some_and(|v| v.to_ascii_lowercase().starts_with("include"));
+        if redirects || include {
+            return Some("a git option redirects its config or repository");
+        }
+    }
+    if call.dir_unresolved {
+        return Some("its directory cannot be resolved");
     }
     None
 }
@@ -489,8 +703,8 @@ struct Range {
     tags: bool,
     /// `--follow-tags`/`push.followTags`.
     follow_tags: bool,
-    /// What is already published: `--remotes=<dest>` or `--remotes`.
-    negate: String,
+    /// The ref names the refspecs write, for the name scan.
+    names: Vec<String>,
 }
 
 /// The local sides the push names, vetted and normalized: `tag <name>` →
@@ -542,23 +756,43 @@ fn sources_of(inv: &PushInvocation) -> Result<Vec<String>, Stop> {
     Ok(sources)
 }
 
+/// git's boolean reading of a config value: `false`/`no`/`off`, an empty
+/// value and any integer equal to zero are false; everything else — `true`,
+/// `yes`, `on`, any other integer, and values git would reject — reads true,
+/// the stricter side for every key this guard reads.
 fn truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "yes" | "on" | "1"
-    )
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "false" | "no" | "off" | "") {
+        return false;
+    }
+    value.parse::<i64>() != Ok(0)
 }
 
 /// Config keys the range depends on, read in one spawn.
 const RANGE_CONFIG: &str = "^(push\\.(followtags|recursesubmodules)|submodule\\.recurse|\
-    remote\\..*\\.(mirror|fetch|url)|remote\\.pushdefault|branch\\..*\\.(remote|pushremote))$";
+    remote\\..*\\.mirror|remote\\.pushdefault|branch\\..*\\.(remote|pushremote))$";
 
-/// The configured remote this push goes to, when it can be named.
+/// The branch `HEAD` names, when it names one.
+fn current_branch(work_dir: &str) -> Option<String> {
+    match git(
+        work_dir,
+        &["symbolic-ref", "-q", "--short", "HEAD"],
+        4096,
+        Budget::Probe,
+    ) {
+        Git::Ok(b) if !b.trim().is_empty() => Some(b.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// The configured remote this push goes to, for `remote.<dest>.mirror`: the
+/// push's repository argument, or for a bare push `branch.<b>.pushRemote` /
+/// `remote.pushDefault` / `branch.<b>.remote` / `origin`.
 fn destination_remote(
     inv: &PushInvocation,
     cfg: &[(String, String)],
-    work_dir: &str,
-) -> Option<String> {
+    branch: Option<&str>,
+) -> String {
     let get = |key: &str| {
         cfg.iter()
             .rev()
@@ -566,62 +800,39 @@ fn destination_remote(
             .map(|(_, v)| v.clone())
     };
     if let Some(repo) = &inv.repository {
-        return Some(repo.clone());
+        return repo.clone();
     }
-    let branch = match git(
-        work_dir,
-        &["symbolic-ref", "-q", "--short", "HEAD"],
-        4096,
-        Budget::Probe,
-    ) {
-        Git::Ok(b) => Some(b.trim().to_string()),
-        _ => None,
-    };
-    let per_branch = |key: &str| {
-        branch
-            .as_deref()
-            .and_then(|b| get(&format!("branch.{b}.{key}")))
-    };
+    let per_branch = |key: &str| branch.and_then(|b| get(&format!("branch.{b}.{key}")));
     per_branch("pushremote")
         .or_else(|| get("remote.pushdefault"))
         .or_else(|| per_branch("remote"))
-        .or_else(|| Some("origin".to_string()))
+        .unwrap_or_else(|| "origin".to_string())
 }
 
-/// `--remotes=<name>` when `name` is a configured remote whose tracking refs
-/// only it writes; `--remotes` otherwise.
-fn negation_for(name: Option<&str>, inv: &PushInvocation, cfg: &[(String, String)]) -> String {
-    let all = "--remotes".to_string();
-    // The command rewrites where the push goes: the probe's answer is stale.
-    if !inv.config_remotes.is_empty()
-        || !inv.config_destinations.is_empty()
-        || inv.destination_unreadable
-    {
-        return all;
+/// Does the repository have submodules a recursive push could publish: a
+/// `.gitmodules` at the top, or a gitlink (mode 160000) in the index?
+fn has_submodules(work_dir: &str) -> Result<bool, Stop> {
+    let top = repository_root(work_dir)?;
+    if std::path::Path::new(&top).join(".gitmodules").exists() {
+        return Ok(true);
     }
-    let Some(name) = name else { return all };
-    if name.is_empty() || name.contains(['*', '?', '[', '\\', ':']) || name.starts_with('-') {
-        return all;
+    match git(
+        work_dir,
+        &["ls-files", "-s", "-z"],
+        MAX_LOG_BYTES,
+        Budget::Scan,
+    ) {
+        Git::Ok(text) => Ok(text.split('\0').any(|entry| entry.starts_with("160000 "))),
+        Git::Capped => Err(Stop::Refused(
+            "the index is too large to check for submodules".into(),
+        )),
+        Git::Failed(_) => Err(Stop::Refused(
+            "git could not read the index to check for submodules".into(),
+        )),
+        Git::Down => Err(Stop::Refused(
+            "git was unavailable or timed out checking for submodules".into(),
+        )),
     }
-    let configured = cfg.iter().any(|(k, _)| k == &format!("remote.{name}.url"));
-    if !configured {
-        return all; // a URL, or a remote this command adds
-    }
-    // Another remote whose fetch refspec writes under refs/remotes/<name>/
-    // would make those refs say "published" about commits the destination
-    // never received.
-    let ours = format!("refs/remotes/{name}/");
-    let hijacked = cfg.iter().any(|(k, v)| {
-        k.starts_with("remote.")
-            && k.ends_with(".fetch")
-            && k != &format!("remote.{name}.fetch")
-            && v.split_once(':')
-                .is_some_and(|(_, dst)| dst.starts_with(&ours))
-    });
-    if hijacked {
-        return all;
-    }
-    format!("--remotes={name}")
 }
 
 fn range_of(inv: &PushInvocation, hints: &CommandHints) -> Result<Option<Range>, Stop> {
@@ -635,7 +846,8 @@ fn range_of(inv: &PushInvocation, hints: &CommandHints) -> Result<Option<Range>,
     };
 
     // Submodule commits live in other repositories: nothing here can scan them.
-    // The flag overrides config; among config sources any one is enough.
+    // The flag overrides config; among config sources any one is enough. Only
+    // a repository that has submodules can recurse into one.
     let unscannable = |v: &str| {
         !matches!(
             v.to_ascii_lowercase().as_str(),
@@ -655,19 +867,23 @@ fn range_of(inv: &PushInvocation, hints: &CommandHints) -> Result<Option<Range>,
                     .then(|| "set by this command".to_string())
             }),
     };
-    if let Some(value) = recurse {
+    if let Some(value) = recurse
+        && has_submodules(&inv.work_dir)?
+    {
         return Err(Stop::Refused(format!(
             "the push recurses into submodules (`{}`), whose commits this guard cannot scan",
             sane(&value)
         )));
     }
 
-    let dest = destination_remote(inv, &cfg, &inv.work_dir);
-    let negate = negation_for(dest.as_deref(), inv, &cfg);
-    let remote_mirror = dest
-        .as_deref()
-        .is_some_and(|d| get_bool(&format!("remote.{d}.mirror")));
-    let mirror = inv.mirror || remote_mirror || hints.mirror;
+    let implicit = inv.refspecs.iter().all(|r| r.implicit);
+    let branch = if inv.repository.is_none() || implicit {
+        current_branch(&inv.work_dir)
+    } else {
+        None
+    };
+    let dest = destination_remote(inv, &cfg, branch.as_deref());
+    let mirror = inv.mirror || get_bool(&format!("remote.{dest}.mirror")) || hints.mirror;
     let follow_tags = inv
         .follow_tags
         .unwrap_or_else(|| get_bool("push.followtags") || hints.follow_tags);
@@ -675,7 +891,7 @@ fn range_of(inv: &PushInvocation, hints: &CommandHints) -> Result<Option<Range>,
     let widened = inv.all_or_mirror || mirror || inv.tags;
     // The implicit `HEAD` is not published by a push that widens: `--tags`
     // pushes only tags, `--all`/`--mirror` their own ref sets.
-    let sources: Vec<String> = if widened && inv.refspecs.iter().all(|r| r.implicit) {
+    let sources: Vec<String> = if widened && implicit {
         Vec::new()
     } else {
         sources
@@ -683,13 +899,25 @@ fn range_of(inv: &PushInvocation, hints: &CommandHints) -> Result<Option<Range>,
     if sources.is_empty() && !widened {
         return Ok(None); // nothing but deletions: nothing is published
     }
+    // Every ref name the push writes on the remote, for the name scan: both
+    // sides of each refspec, and the current branch for a bare push.
+    let mut names: Vec<String> = inv
+        .refspecs
+        .iter()
+        .filter(|r| !r.is_delete && !r.implicit)
+        .flat_map(|r| [r.source.clone(), r.destination.clone()])
+        .flatten()
+        .collect();
+    if implicit && !widened {
+        names.extend(branch);
+    }
     Ok(Some(Range {
         sources,
         branches: inv.all_or_mirror && !inv.mirror,
         mirror,
         tags: inv.tags,
         follow_tags,
-        negate,
+        names,
     }))
 }
 
@@ -707,7 +935,9 @@ fn range_args(range: &Range) -> Vec<&str> {
             args.push("--tags");
         }
     }
-    args.extend(["--not", range.negate.as_str()]);
+    // Reachable from ANY remote-tracking ref reads as published — see the
+    // module docs for what that trusts.
+    args.extend(["--not", "--remotes"]);
     args
 }
 
@@ -761,19 +991,28 @@ fn sources_are_commits(work_dir: &str, range: &Range) -> Result<(), Stop> {
     }
 }
 
-/// The outbound commit count, capped. Second value: the range held more than
-/// [`MAX_COMMITS`].
-fn outbound(work_dir: &str, range: &Range) -> Result<(usize, bool), Stop> {
+/// The outbound commits, newest first, capped at [`MAX_COMMITS`]. Second
+/// value: the range held more than that.
+fn outbound(work_dir: &str, range: &Range) -> Result<(Vec<String>, bool), Stop> {
     let limit = (MAX_COMMITS + 1).to_string();
     let mut args: Vec<&str> = vec!["rev-list", "-n", &limit];
     args.extend(range_args(range));
     args.push("--");
     match git(work_dir, &args, (MAX_COMMITS + 2) * 66, Budget::Probe) {
         Git::Ok(text) => {
-            let count = text.lines().filter(|l| !l.trim().is_empty()).count();
-            Ok((count.min(MAX_COMMITS), count > MAX_COMMITS))
+            let mut shas: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            let over = shas.len() > MAX_COMMITS;
+            shas.truncate(MAX_COMMITS);
+            Ok((shas, over))
         }
-        Git::Capped => Ok((MAX_COMMITS, true)),
+        Git::Capped => Err(Stop::Refused(format!(
+            "the range is too large to fully scan (over {MAX_COMMITS} commits)"
+        ))),
         Git::Failed(_) => Err(Stop::Refused(format!(
             "git could not resolve the outbound range for {}",
             describe(range)
@@ -886,7 +1125,8 @@ struct FileState {
 }
 
 /// Judge one commit's patch text (the output of the `git log -p` pass).
-fn scan_patch(output: &str, toplevel: &str, exempt: Exempt, hits: &mut Vec<Hit>) {
+/// `exempt_repo` skips the content scan (names are still judged).
+fn scan_patch(output: &str, exempt_repo: bool, hits: &mut Vec<Hit>) {
     let mut sha = String::new();
     let mut file = FileState::default();
     let mut cols = 0usize;
@@ -920,8 +1160,7 @@ fn scan_patch(output: &str, toplevel: &str, exempt: Exempt, hits: &mut Vec<Hit>)
             });
             return;
         }
-        let absolute = format!("{}/{}", toplevel.trim_end_matches('/'), path);
-        if f.added.is_empty() || exempt(&absolute) {
+        if f.added.is_empty() || exempt_repo {
             return;
         }
         if let Some(what) = scan_text(&f.added) {
@@ -1026,6 +1265,7 @@ fn scan_commits(work_dir: &str, range: &Range, exempt: Exempt) -> Result<Vec<Hit
         "--text",
         "--no-notes",
         "--no-show-signature",
+        "--encoding=UTF-8",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--format=%x01%H",
@@ -1035,7 +1275,10 @@ fn scan_commits(work_dir: &str, range: &Range, exempt: Exempt) -> Result<Vec<Hit
     match git(work_dir, &args, MAX_LOG_BYTES, Budget::Scan) {
         Git::Ok(text) => {
             let mut hits = Vec::new();
-            scan_patch(&text, &toplevel, exempt, &mut hits);
+            // The exemption keys on the repository's own location, never on a
+            // path inside it: a `cadence-hooks/` directory in any other
+            // repository is scanned like the rest.
+            scan_patch(&text, exempt(&toplevel), &mut hits);
             Ok(hits)
         }
         Git::Capped => Err(Stop::Refused(format!(
@@ -1051,48 +1294,85 @@ fn scan_commits(work_dir: &str, range: &Range, exempt: Exempt) -> Result<Vec<Hit
     }
 }
 
-/// The outbound commits' messages, through the same text scanner. Kept apart
-/// from the patch parse: a message is free text that could otherwise pose as
-/// patch structure.
-fn scan_messages(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
-    let delimiter = nonce();
-    let format = format!("--format={delimiter}%H%n%B");
-    let limit = MAX_COMMITS.to_string();
-    let mut args: Vec<&str> = vec![
-        "log",
-        "-n",
-        &limit,
-        "--no-color",
-        "--no-notes",
-        "--no-show-signature",
-        &format,
-    ];
-    args.extend(range_args(range));
-    args.push("--");
-    let text = match git(work_dir, &args, MAX_MESSAGE_BYTES, Budget::Scan) {
-        Git::Ok(t) => t,
-        Git::Capped => {
-            return Err(Stop::Refused(
-                "the outbound commit messages are too large to scan".into(),
-            ));
-        }
-        Git::Failed(_) => {
-            return Err(Stop::Refused(
-                "git could not read the outbound commit messages".into(),
-            ));
-        }
+/// One object read raw through `git cat-file --batch`.
+struct RawObject {
+    sha: String,
+    kind: String,
+    body: String,
+}
+
+/// Read `names` (object names or ref names, one per line) raw, in order, in
+/// ONE `git cat-file --batch`. Raw means what the push sends: no encoding
+/// header or `i18n.logOutputEncoding` re-encodes a message on this path.
+/// Size-framed, so object content cannot pose as a record boundary. A name
+/// that does not resolve, and any output this cannot frame, refuses.
+fn read_objects(work_dir: &str, names: &[String], what: &str) -> Result<Vec<RawObject>, Stop> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = names.join("\n").into_bytes();
+    input.push(b'\n');
+    let out = match git_bytes(
+        work_dir,
+        &["cat-file", "--batch"],
+        MAX_MESSAGE_BYTES,
+        Budget::Scan,
+        Some(input),
+    ) {
+        Git::Ok(out) => out,
+        Git::Capped => return Err(Stop::Refused(format!("the {what} are too large to scan"))),
+        Git::Failed(_) => return Err(Stop::Refused(format!("git could not read the {what}"))),
         Git::Down => {
-            return Err(Stop::Refused(
-                "git was unavailable or timed out reading the outbound commit messages".into(),
-            ));
+            return Err(Stop::Refused(format!(
+                "git was unavailable or timed out reading the {what}"
+            )));
         }
     };
+    let unreadable = || Stop::Refused(format!("git's answer for the {what} could not be read"));
+    let mut objects = Vec::with_capacity(names.len());
+    let mut at = 0;
+    while at < out.len() {
+        let end = out[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| at + i)
+            .ok_or_else(unreadable)?;
+        let header = String::from_utf8_lossy(&out[at..end]).into_owned();
+        let parts: Vec<&str> = header.split(' ').collect();
+        let [sha, kind, size] = parts.as_slice() else {
+            return Err(Stop::Refused(format!(
+                "git could not resolve one of the {what} (`{}`)",
+                sane(&header)
+            )));
+        };
+        let size: usize = size.parse().map_err(|_| unreadable())?;
+        let body_end = end
+            .checked_add(1 + size)
+            .filter(|&e| e < out.len())
+            .ok_or_else(unreadable)?;
+        objects.push(RawObject {
+            sha: sha.to_string(),
+            kind: kind.to_string(),
+            body: String::from_utf8_lossy(&out[end + 1..body_end]).into_owned(),
+        });
+        // Each object is followed by one LF.
+        at = body_end + 1;
+    }
+    if objects.len() != names.len() {
+        return Err(unreadable());
+    }
+    Ok(objects)
+}
+
+/// The outbound commits' raw objects — header and message — through the
+/// same text scanner. Kept apart from the patch parse: a message is free
+/// text that could otherwise pose as patch structure.
+fn scan_messages(work_dir: &str, shas: &[String]) -> Result<Vec<Hit>, Stop> {
     let mut hits = Vec::new();
-    // Every fragment is scanned whole; the delimiter cannot be forged.
-    for record in text.split(delimiter.as_str()) {
-        if let Some(what) = scan_text(record) {
+    for object in read_objects(work_dir, shas, "outbound commit messages")? {
+        if let Some(what) = scan_text(&object.body) {
             hits.push(Hit {
-                sha: record.chars().take(8).collect(),
+                sha: object.sha.chars().take(8).collect(),
                 path: "(commit message)".into(),
                 what,
             });
@@ -1101,37 +1381,104 @@ fn scan_messages(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
     Ok(hits)
 }
 
-/// Every tag object and non-commit ref the push publishes: each tag object is
-/// read raw (header and message) and must peel straight to a commit.
-fn scan_tag_objects(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
-    let mut hits = Vec::new();
-    // Unfiltered: `--mirror` (every ref), `--tags`, and named sources.
+/// A ref name as shown in a finding: withheld when it carries the secret.
+fn shown(name: &str) -> String {
+    if scan_text(name).is_some() {
+        "(ref name withheld)".to_string()
+    } else {
+        sane(name)
+    }
+}
+
+/// One ref the push publishes, as `for-each-ref` or `cat-file` resolved it.
+struct PublishedRef {
+    name: String,
+    sha: String,
+    kind: String,
+}
+
+/// Enumerate refs matching `patterns` (every ref when empty), after
+/// `filters`. Ref names hold no space or newline, so the line format needs
+/// no delimiter.
+fn list_refs(
+    work_dir: &str,
+    patterns: &[String],
+    filters: &[String],
+) -> Result<Vec<PublishedRef>, Stop> {
+    let mut args: Vec<&str> = vec![
+        "for-each-ref",
+        "--format=%(objectname) %(objecttype) %(refname)",
+    ];
+    args.extend(filters.iter().map(String::as_str));
+    args.extend(patterns.iter().map(String::as_str));
+    let text = match git(work_dir, &args, MAX_TAG_BYTES, Budget::Scan) {
+        Git::Ok(t) => t,
+        Git::Capped => return Err(Stop::Refused("there are too many refs to scan".into())),
+        Git::Failed(_) => return Err(Stop::Refused("git could not list the refs".into())),
+        Git::Down => {
+            return Err(Stop::Refused(
+                "git was unavailable or timed out listing the refs".into(),
+            ));
+        }
+    };
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(sha), Some(kind), Some(name)) => Ok(PublishedRef {
+                    name: name.to_string(),
+                    sha: sha.to_string(),
+                    kind: kind.to_string(),
+                }),
+                _ => Err(Stop::Refused("git's ref listing could not be read".into())),
+            }
+        })
+        .collect()
+}
+
+/// Every ref and tag object the push publishes beyond its commits, and every
+/// ref name it writes: each tag object is read raw (header and message) and
+/// must peel straight to a commit; a ref naming anything but a commit or a
+/// tag is refused; each name goes through the text scanner.
+fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
+    let mut refs: Vec<PublishedRef> = Vec::new();
+    // Named sources, by the object each one resolves to — whatever the ref's
+    // path, or a raw sha: its UNPEELED type decides.
     let named: Vec<String> = range
         .sources
         .iter()
         .filter(|s| *s != "HEAD")
-        .flat_map(|s| {
-            if s.starts_with("refs/") {
-                vec![s.clone()]
-            } else {
-                vec![format!("refs/{s}"), format!("refs/tags/{s}")]
-            }
-        })
+        .cloned()
         .collect();
+    for (name, object) in named
+        .iter()
+        .zip(read_objects(work_dir, &named, "pushed refs")?)
+    {
+        refs.push(PublishedRef {
+            name: name.clone(),
+            sha: object.sha,
+            kind: object.kind,
+        });
+    }
     let covers_tags = range.mirror || range.tags;
     if range.mirror {
-        scan_refs(work_dir, &[], &[], &mut hits)?;
+        refs.extend(list_refs(work_dir, &[], &[])?);
     } else {
-        let mut patterns: Vec<String> = named;
+        let mut patterns: Vec<String> = Vec::new();
+        if range.branches {
+            patterns.push("refs/heads".into());
+        }
         if range.tags {
             patterns.push("refs/tags".into());
         }
         if !patterns.is_empty() {
-            scan_refs(work_dir, &patterns, &[], &mut hits)?;
+            refs.extend(list_refs(work_dir, &patterns, &[])?);
         }
     }
     // `--follow-tags`: annotated tags reachable from what is pushed, whether
-    // or not their commit is new — the tag object itself is.
+    // or not their commit is new — the tag object itself is. A lightweight
+    // tag is not followed.
     if range.follow_tags && !covers_tags {
         let merged: Vec<String> = if range.branches {
             Vec::new() // every branch: every tag is a candidate
@@ -1143,90 +1490,80 @@ fn scan_tag_objects(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
                 .collect()
         };
         if range.branches || !merged.is_empty() {
-            scan_refs(work_dir, &["refs/tags".to_string()], &merged, &mut hits)?;
+            refs.extend(
+                list_refs(work_dir, &["refs/tags".to_string()], &merged)?
+                    .into_iter()
+                    .filter(|r| r.kind == "tag"),
+            );
+        }
+    }
+
+    let mut hits = Vec::new();
+    let mut names: Vec<&str> = range.names.iter().map(String::as_str).collect();
+    names.extend(refs.iter().map(|r| r.name.as_str()));
+    for name in names {
+        if let Some(what) = scan_text(name) {
+            hits.push(Hit {
+                sha: "ref".into(),
+                path: "(pushed ref name)".into(),
+                what,
+            });
+        }
+    }
+    let mut tags: Vec<(String, String)> = Vec::new();
+    for r in &refs {
+        match r.kind.as_str() {
+            "commit" => {}
+            "tag" => {
+                if !tags.iter().any(|(_, sha)| *sha == r.sha) {
+                    tags.push((r.name.clone(), r.sha.clone()));
+                }
+            }
+            other => hits.push(Hit {
+                sha: "ref".into(),
+                path: shown(&r.name),
+                what: format!("points at a {}, which this guard cannot scan", sane(other)),
+            }),
+        }
+    }
+    let shas: Vec<String> = tags.iter().map(|(_, sha)| sha.clone()).collect();
+    for ((name, _), object) in tags
+        .iter()
+        .zip(read_objects(work_dir, &shas, "tag objects")?)
+    {
+        // The header's `type` line: a tag of a tag carries a second message
+        // this read never sees, a tag of a tree or blob publishes content no
+        // patch shows.
+        let target = object
+            .body
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .find_map(|l| l.strip_prefix("type "));
+        if target != Some("commit") {
+            hits.push(Hit {
+                sha: "tag".into(),
+                path: shown(name),
+                what: format!(
+                    "tags a {}, which this guard cannot scan",
+                    sane(target.unwrap_or("unreadable object"))
+                ),
+            });
+        }
+        if let Some(what) = scan_text(&object.body) {
+            hits.push(Hit {
+                sha: "tag".into(),
+                path: shown(name),
+                what,
+            });
         }
     }
     Ok(hits)
 }
 
-fn scan_refs(
-    work_dir: &str,
-    patterns: &[String],
-    filters: &[String],
-    hits: &mut Vec<Hit>,
-) -> Result<(), Stop> {
-    let delimiter = nonce();
-    let format = format!(
-        "--format={delimiter}%(objecttype) %(refname)%0a\
-         %(if:equals=tag)%(objecttype)%(then)%(raw)%(end)"
-    );
-    let mut args: Vec<&str> = vec!["for-each-ref", &format];
-    args.extend(filters.iter().map(String::as_str));
-    args.extend(patterns.iter().map(String::as_str));
-    let text = match git(work_dir, &args, MAX_TAG_BYTES, Budget::Scan) {
-        Git::Ok(t) => t,
-        Git::Capped => {
-            return Err(Stop::Refused(
-                "the tag objects are too large to scan".into(),
-            ));
-        }
-        Git::Failed(_) => return Err(Stop::Refused("git could not read the tags".into())),
-        Git::Down => {
-            return Err(Stop::Refused(
-                "git was unavailable or timed out reading the tags".into(),
-            ));
-        }
-    };
-    for record in text.split(delimiter.as_str()) {
-        let (head, body) = record.split_once('\n').unwrap_or((record, ""));
-        let (kind, name) = head.split_once(' ').unwrap_or((head, ""));
-        let name = sane(name);
-        match kind {
-            "" if record.trim().is_empty() => continue,
-            "commit" => continue,
-            "tag" => {
-                // The header's `type` line: a tag of a tag carries a second
-                // message this read never sees, a tag of a tree or blob
-                // publishes content no patch shows.
-                let target = body
-                    .lines()
-                    .take_while(|l| !l.is_empty())
-                    .find_map(|l| l.strip_prefix("type "));
-                if target != Some("commit") {
-                    hits.push(Hit {
-                        sha: "tag".into(),
-                        path: name.clone(),
-                        what: format!(
-                            "tags a {}, which this guard cannot scan",
-                            sane(target.unwrap_or("unreadable object"))
-                        ),
-                    });
-                }
-            }
-            other => {
-                hits.push(Hit {
-                    sha: "ref".into(),
-                    path: name.clone(),
-                    what: format!("points at a {}, which this guard cannot scan", sane(other)),
-                });
-                continue;
-            }
-        }
-        if let Some(what) = scan_text(record) {
-            hits.push(Hit {
-                sha: "tag".into(),
-                path: name,
-                what,
-            });
-        }
-    }
-    Ok(())
-}
-
 fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
     let calls = git_calls(command, cwd);
     let hints = command_hints(&calls);
-    if let Some(why) = hidden_alias_push(&calls, &hints) {
+    if let Some(why) = hidden_alias_push(command, &calls, &hints) {
         return Err(Stop::Refused(format!(
             "{why}, so what it publishes could not be resolved"
         )));
@@ -1246,18 +1583,18 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             continue;
         };
         sources_are_commits(&inv.work_dir, &range)?;
-        let (count, over) = outbound(&inv.work_dir, &range)?;
-        let mut hits = if count == 0 {
+        let (shas, over) = outbound(&inv.work_dir, &range)?;
+        let mut hits = if shas.is_empty() {
             Vec::new()
         } else {
             let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
             if hits.len() <= MAX_HITS {
-                hits.extend(scan_messages(&inv.work_dir, &range)?);
+                hits.extend(scan_messages(&inv.work_dir, &shas)?);
             }
             hits
         };
         if hits.len() <= MAX_HITS {
-            hits.extend(scan_tag_objects(&inv.work_dir, &range)?);
+            hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
         }
         if !hits.is_empty() {
             return Err(Stop::Found(hits));
@@ -2193,7 +2530,8 @@ mod tests {
         fx.git(&["config", "alias.x", "-c a.b=c y"]);
         fx.git(&["config", "alias.pp", "push"]);
         fx.git(&["config", "alias.p2", "--paginate pp"]);
-        // Options only: the caller's next word becomes the subcommand.
+        // Options only: git 2.43 refuses it ("empty alias"), so refusing it
+        // too costs nothing, and an older git may splice the next word in.
         fx.git(&["config", "alias.opts", "-c a.b=c"]);
         fx.git(&["config", "alias.lg2", "-c color.ui=never log --oneline"]);
         for cmd in [
@@ -2358,9 +2696,10 @@ mod tests {
         for cmd in [
             format!("git send-pack {remote} main"),
             format!("git -C . send-pack {remote} main"),
+            format!("git-send-pack {remote} main"),
             "git http-push https://example.invalid/r.git main".to_string(),
         ] {
-            assert_blocks(&fx.run(&cmd), &["send-pack"]);
+            assert_blocks(&fx.run(&cmd), &["publishes objects without `git push`"]);
         }
         fx.git(&["config", "alias.sp", &format!("send-pack {remote}")]);
         assert_blocks(&fx.run("git sp main"), &["alias"]);
@@ -2432,6 +2771,8 @@ mod tests {
         for value in ["1", "immediate", "-1", "true", "10"] {
             fx.git(&["config", "help.autocorrect", value]);
             assert_blocks(&fx.run("git psuh origin main"), &["autocorrect"]);
+            // A real command outside the builtin list is not a guess.
+            assert_allows(&fx.run("git hash-object README.md"));
         }
         for value in ["0", "false", "never", "show", "prompt"] {
             fx.git(&["config", "help.autocorrect", value]);

@@ -2991,7 +2991,12 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // resolves an unambiguous abbreviation. Over-matching here only
             // widens the range a caller scans, so an ambiguous prefix git would
             // reject costs nothing.
-            if abbreviates("all", name) || abbreviates("mirror", name) {
+            // `--branches` is git's alias of `--all` (2.44+ spells it in `-h`);
+            // no other push option starts with `b`, so any prefix selects it.
+            if abbreviates("all", name)
+                || abbreviates("mirror", name)
+                || abbreviates("branches", name)
+            {
                 scan.all_or_mirror = true;
             }
             // `--tags` widens the same way and is tracked separately — see the
@@ -3020,9 +3025,16 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             if abbreviates("mirror", name) {
                 scan.mirror = true;
             }
+            // `--fol` is the shortest unambiguous `--follow-tags`: git rejects
+            // `--fo` as ambiguous with `--force-if-includes` (measured, 2.43),
+            // and the same holds for `--no-fo` against `--no-force-if-includes`.
             match name {
-                "follow-tags" => scan.follow_tags = Some(true),
-                "no-follow-tags" => scan.follow_tags = Some(false),
+                _ if name.len() >= 3 && abbreviates("follow-tags", name) => {
+                    scan.follow_tags = Some(true);
+                }
+                _ if name.len() >= 6 && abbreviates("no-follow-tags", name) => {
+                    scan.follow_tags = Some(false);
+                }
                 "no-recurse-submodules" => scan.recurse_submodules = Some("no".to_string()),
                 _ if name.starts_with("recu") && abbreviates("recurse-submodules", name) => {
                     scan.recurse_submodules = inline

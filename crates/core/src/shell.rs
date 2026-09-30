@@ -4613,6 +4613,21 @@ pub fn run_bounded_capped(
     timeout: std::time::Duration,
     max_stdout: Option<usize>,
 ) -> GitSpawn {
+    run_bounded_capped_input(cmd, timeout, max_stdout, None)
+}
+
+/// [`run_bounded_capped`] that hands `input` to the child on stdin (for
+/// `git cat-file --batch`). The bytes are written from their own thread, so
+/// a child that stops reading can neither stall this call past its bound nor
+/// deadlock against its own full stdout; the process-group kill on every
+/// give-up path closes the pipe under a writer still blocked on it. `None`
+/// keeps stdin null.
+pub fn run_bounded_capped_input(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    max_stdout: Option<usize>,
+    input: Option<Vec<u8>>,
+) -> GitSpawn {
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -4625,10 +4640,14 @@ pub fn run_bounded_capped(
     // timeout. Strictly better than the unbounded 20-30s hang it replaces.
     const DRAIN_FLOOR: Duration = Duration::from_millis(100);
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env("GIT_OPTIONAL_LOCKS", "0");
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .env("GIT_OPTIONAL_LOCKS", "0");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -4639,6 +4658,13 @@ pub fn run_bounded_capped(
         Ok(child) => child,
         Err(_) => return GitSpawn::SpawnFailed,
     };
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Dropping the handle at the end sends EOF.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+    }
 
     // The reader appends into a shared sink so the parent can read the bytes
     // collected so far without joining. The `Sender` is moved into the reader
@@ -13263,6 +13289,35 @@ mod tests {
             run_bounded_capped(&mut cmd, std::time::Duration::from_secs(10), Some(3)),
             GitSpawn::Truncated(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_reaches_stdin_and_a_child_ignoring_it_still_times_out() {
+        // More than a pipe buffer, echoed back through the drained stdout.
+        let input = vec![b'x'; 256 * 1024];
+        let mut cmd = Command::new("cat");
+        match run_bounded_capped_input(
+            &mut cmd,
+            std::time::Duration::from_secs(10),
+            None,
+            Some(input.clone()),
+        ) {
+            GitSpawn::Completed(out) => assert_eq!(out.stdout, input),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // A child that never reads stdin cannot hold the call past its bound.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let result = run_bounded_capped_input(
+            &mut cmd,
+            std::time::Duration::from_millis(200),
+            None,
+            Some(input),
+        );
+        assert!(matches!(result, GitSpawn::TimedOut), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[cfg(unix)]

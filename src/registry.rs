@@ -166,7 +166,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "prevent-secret-push",
-        description: "Block a git push that would publish a secret-named file or credential token",
+        description: "Block a git push that would publish a secret-named file, a credential token, or a commit or tag message or ref name carrying one",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
         // Remote: security guard; the cloud VM still needs it.
