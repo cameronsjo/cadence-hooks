@@ -242,6 +242,38 @@ fn polish_dir_from(override_dir: Option<String>, config_dir: &Path) -> (PathBuf,
     (dir, private)
 }
 
+/// The scrub marker for content with SHA-256 `digest` (cameronsjo/cadence-hooks#755),
+/// under the same private config-dir directory as the polish marker
+/// ([`polish_dir`]). `digest` is always [`scrub_digest`]'s lowercase hex, so it
+/// is safe as a filename component; the result is a direct child of the dir.
+///
+/// Keyed on content alone, deliberately: the gate's question is "was *this
+/// text* scrubbed?", and a draft scrubbed at one path and promoted to another
+/// carries the same bytes. Any change to the content is a key-miss.
+pub fn scrub_marker(digest: &str) -> PathBuf {
+    polish_dir().join(format!("scrub-{digest}"))
+}
+
+/// Lowercase-hex SHA-256 of `bytes` — the key [`scrub_marker`] files a scrubbed
+/// document under. Cryptographic on purpose (unlike [`hash_of`]): the marker
+/// grants an allow, so a second document must not be craftable to collide
+/// with a scrubbed one.
+pub fn scrub_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// True when a scrub marker for `digest` exists as a regular file in a
+/// **private** marker directory. A degraded (plantable) directory or a symlink
+/// squatting the name is never evidence, so either reads as absent and the
+/// runbook gate keeps blocking.
+pub fn scrub_marker_present(digest: &str) -> bool {
+    if !polish_dir_is_private() {
+        return false;
+    }
+    std::fs::symlink_metadata(scrub_marker(digest)).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// The legacy (pre-config-dir) polish marker directory, read for one release
 /// so markers recorded before the move still count. `None` under a
 /// `CADENCE_MARKER_DIR` override (the new dir *is* the legacy dir there) and

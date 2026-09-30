@@ -328,6 +328,15 @@ enum CadenceCommands {
         #[arg(long)]
         validate_config: bool,
     },
+    /// Record that a runbook draft passed the secret scrub: writes a marker keyed
+    /// on the SHA-256 of the file's bytes, which `guardrails guard-runbook-scrub`
+    /// honors. CLI action; it trusts its caller to have run `scrub.py` check mode
+    /// to exit 0 first. Exit: 0 recorded, 1 nothing recorded, 2 usage error.
+    RecordScrub {
+        /// The scrubbed draft whose exact content is being vouched for
+        #[arg(long, value_name = "PATH")]
+        file: String,
+    },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     /// Exit: 0 recorded, 1 nothing recorded (detached HEAD, not a repo, write failed),
     /// 2 usage error.
@@ -445,6 +454,8 @@ enum GuardrailsCommands {
     GuardOpVaultScan,
     /// Block a sops decrypt whose plaintext is not consumed by an allowed tool
     GuardSopsDecrypt,
+    /// Block an unscrubbed Write/Edit (or any Bash write) into $CADENCE_RUNBOOKS_DIR
+    GuardRunbookScrub,
     /// Warn when bare curl (aliased to curlie) is used with custom headers
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
@@ -636,6 +647,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             // hooks.json wiring and not subject to CADENCE_DISABLE (same
             // treatment as declare / status / dismiss-*).
             CadenceCommands::RecordPolish { .. } => return None,
+            CadenceCommands::RecordScrub { .. } => return None,
             CadenceCommands::RedactScan { .. } => return None,
         }),
         Commands::Guardrails(g) => Some(match g {
@@ -671,6 +683,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
+            GuardrailsCommands::GuardRunbookScrub => "guard-runbook-scrub",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
@@ -954,6 +967,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::GuardSopsDecrypt => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_sops_decrypt::SopsDecryptGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardRunbookScrub => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_runbook_scrub::RunbookScrubGuard),
                 pre,
             ),
             GuardrailsCommands::WarnCurlAlias => CheckPlan::new(
@@ -1660,6 +1677,14 @@ fn main() {
                 let code = cadence_hooks_cadence::record_polish::run_record(
                     repo_root, branch, scope, arm, arm_model, arm_report, fresh, skip,
                 );
+                if code != 0 {
+                    process::exit(code.into());
+                }
+            }
+            CadenceCommands::RecordScrub { file } => {
+                // CLI action: 0 recorded, 1 nothing recorded (unreadable file,
+                // degraded marker dir, write failed). Gates no tool call.
+                let code = cadence_hooks_cadence::record_scrub::run_record(&file);
                 if code != 0 {
                     process::exit(code.into());
                 }

@@ -140,6 +140,9 @@ fn writer_targets(segment: &str) -> Vec<String> {
             }
             targets
         }
+        // cameronsjo/cadence-hooks#755: the destination (last operand) plus
+        // every file or directory a flag names for rsync to write into.
+        "rsync" => rsync_write_targets(args),
         "dd" => args
             .iter()
             .filter_map(|t| t.strip_prefix("of="))
@@ -220,6 +223,111 @@ fn writer_targets(segment: &str) -> Vec<String> {
         "perl" => inplace_file_operands(argv, InplaceGrammar::Perl),
         _ => Vec::new(),
     }
+}
+
+/// rsync options whose value is a separate token; the value is never the
+/// destination operand.
+const RSYNC_VALUE_FLAGS: &[&str] = &[
+    "-e",
+    "--rsh",
+    "-f",
+    "--filter",
+    "--exclude",
+    "--include",
+    "--exclude-from",
+    "--include-from",
+    "--files-from",
+    "--rsync-path",
+    "--password-file",
+    "--out-format",
+    "--timeout",
+    "--contimeout",
+    "--bwlimit",
+    "--port",
+    "--max-size",
+    "--min-size",
+    "--max-delete",
+    "-B",
+    "--block-size",
+    "-M",
+    "--remote-option",
+    "--chmod",
+    "--chown",
+    "--usermap",
+    "--groupmap",
+    "--iconv",
+    "--checksum-choice",
+    "--cc",
+    "--compress-choice",
+    "--zc",
+    "--compress-level",
+    "--zl",
+    "--sockopts",
+    "--info",
+    "--debug",
+    "--suffix",
+    "--stop-at",
+    "--stop-after",
+    "--modify-window",
+    "--address",
+    "--protocol",
+    "--read-batch",
+    "--copy-dest",
+    "--compare-dest",
+    "--link-dest",
+];
+
+/// rsync options that name a path rsync itself writes: a log, a batch file, or
+/// a directory it stages or backs files up into.
+const RSYNC_WRITE_FLAGS: &[&str] = &[
+    "--log-file",
+    "--write-batch",
+    "--only-write-batch",
+    "--backup-dir",
+    "--partial-dir",
+    "-T",
+    "--temp-dir",
+];
+
+/// What an `rsync` invocation writes (cameronsjo/cadence-hooks#755): its last
+/// operand (the destination; a `host:path` remote one is harmless to judge by
+/// name) and the value of every flag in [`RSYNC_WRITE_FLAGS`], spelled as a
+/// separate token or `--flag=value`. An option this table does not know is
+/// read as a bare flag, so its value can only become a candidate operand —
+/// the over-inclusive direction.
+fn rsync_write_targets(args: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut operands: Vec<&String> = Vec::new();
+    let mut i = 0;
+    while let Some(t) = args.get(i) {
+        i += 1;
+        if t == "--" {
+            operands.extend(&args[i..]);
+            break;
+        }
+        if !t.starts_with('-') || t == "-" {
+            operands.push(t);
+            continue;
+        }
+        if let Some((name, value)) = t.split_once('=') {
+            if RSYNC_WRITE_FLAGS.contains(&name) {
+                targets.push(value.to_string());
+            }
+            continue;
+        }
+        if RSYNC_WRITE_FLAGS.contains(&t.as_str()) {
+            if let Some(v) = args.get(i) {
+                targets.push(v.clone());
+            }
+            i += 1;
+        } else if RSYNC_VALUE_FLAGS.contains(&t.as_str()) {
+            i += 1;
+        }
+    }
+    if let Some(last) = operands.pop() {
+        targets.push(last.clone());
+    }
+    targets
 }
 
 /// Which option grammar [`inplace_file_operands`] reads.
@@ -365,6 +473,59 @@ fn substituted_texts(segment: &str) -> Vec<String> {
     }
 }
 
+/// Every file one [`command_segments`] segment writes by redirect or writer
+/// verb: the segment itself, its group-wrapper-stripped view, and the redirects
+/// a re-parsed substitution spells. The one candidate list both
+/// [`matched_secret_write_target`] and [`bash_write_targets`] judge, so the two
+/// can never disagree about what a command writes.
+fn segment_write_candidates(segment: &str) -> Vec<String> {
+    // A group closer glued to the last word — `{ (cp x .env)}`, `{ (echo
+    // hi > .env)}` — reads as the target `.env)}` while bash writes
+    // `.env` (cameronsjo/cadence-hooks#1103). The wrapper-stripped view is
+    // judged as well; it only adds candidates.
+    let trimmed = segment.trim();
+    let unwrapped = strip_group_wrappers(trimmed);
+    let unwrapped =
+        (trimmed.starts_with(['(', '{']) && unwrapped != trimmed).then(|| unwrapped.to_string());
+    let substituted = substituted_texts(segment);
+    std::iter::once(segment)
+        .chain(unwrapped.as_deref())
+        .flat_map(|view| {
+            redirect_targets(view)
+                .into_iter()
+                .chain(writer_targets(view))
+        })
+        .chain(substituted.iter().flat_map(|text| redirect_targets(text)))
+        .collect()
+}
+
+/// Every file path a Bash command would write, delete, or replace, as the
+/// shell spells it (unexpanded: a `$VAR`, `~`, or glob stays literal): the
+/// redirect targets and writer-verb operands of every [`command_segments`]
+/// segment, plus those of the commands a `sed`/`awk` program runs.
+///
+/// The same parse `prevent-secret-writes` judges by *name*, exposed for a
+/// guard that judges by *location* (`guard-runbook-scrub`,
+/// cameronsjo/cadence-hooks#755), so a second guard never grows a second
+/// write-target parser. Over-inclusive by the same rules — an ambiguous word
+/// becomes a candidate rather than being dropped.
+pub fn bash_write_targets(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_write_targets(command, 0, &mut out);
+    out
+}
+
+fn collect_write_targets(command: &str, depth: usize, out: &mut Vec<String>) {
+    for segment in command_segments(command) {
+        out.extend(segment_write_candidates(&segment));
+        if depth < PROGRAM_COMMAND_DEPTH {
+            for inner in program_commands(&segment) {
+                collect_write_targets(&inner, depth + 1, out);
+            }
+        }
+    }
+}
+
 /// How deep [`matched_secret_write_target`] follows a command a sed/awk
 /// program runs into another such command.
 const PROGRAM_COMMAND_DEPTH: usize = 3;
@@ -425,25 +586,7 @@ fn matched_secret_write_target_at(command: &str, depth: usize) -> Option<String>
     // `sh -c '…'` is still seen. Targets are judged by the shared
     // component-based classifier, so `settings.environment` stays clean (#86).
     for segment in command_segments(command) {
-        // A group closer glued to the last word — `{ (cp x .env)}`, `{ (echo
-        // hi > .env)}` — reads as the target `.env)}` while bash writes
-        // `.env` (cameronsjo/cadence-hooks#1103). The wrapper-stripped view is
-        // judged as well; it only adds candidates.
-        let trimmed = segment.trim();
-        let unwrapped = strip_group_wrappers(trimmed);
-        let unwrapped = (trimmed.starts_with(['(', '{']) && unwrapped != trimmed)
-            .then(|| unwrapped.to_string());
-        let substituted = substituted_texts(&segment);
-        let candidates: Vec<String> = std::iter::once(&segment)
-            .chain(unwrapped.as_ref())
-            .flat_map(|view| {
-                redirect_targets(view)
-                    .into_iter()
-                    .chain(writer_targets(view))
-            })
-            .chain(substituted.iter().flat_map(|text| redirect_targets(text)))
-            .collect();
-        if let Some(target) = candidates
+        if let Some(target) = segment_write_candidates(&segment)
             .into_iter()
             // Every token here is a redirection target or a writer verb's
             // operand, so the shell has already told us it names a file — the
