@@ -656,6 +656,18 @@ mod tests {
                 "op read",
             ),
             (
+                "podman run -i --rm alpine sh -c cat login --password-stdin <<< \"$(op read op://v/i/p)\"",
+                "op read",
+            ),
+            (
+                "docker exec -i c sh -c cat login --password-stdin <<< \"$(op read op://v/i/p)\"",
+                "op read",
+            ),
+            (
+                "docker --config <(op read op://v/i/q) login --password-stdin r <<< x",
+                "op read",
+            ),
+            (
                 "docker login -u \"$(op read p)\" --password-stdin r <<< \"$(op read p)\"",
                 "op read",
             ),
@@ -663,8 +675,7 @@ mod tests {
                 "gh auth login --with-token --hostname \"$(op read p)\" <<< \"$(op read p)\"",
                 "op read",
             ),
-            // Round 5: the stdin sink needs a real login command, and only
-            // its here-string is exempt.
+            // Round 5 fake stdin sinks (still ask with no exemption at all).
             (
                 "echo \"$(op read op://v/i/p)\" --password-stdin <<< x",
                 "op read",
