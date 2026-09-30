@@ -320,6 +320,15 @@ pub const HOOKS: &[HookEntry] = &[
         remote: RemotePolicy::Run,
     },
     HookEntry {
+        name: "guard-critical-grade",
+        description: "Block applying impact:critical / likelihood:critical labels without a human ruling",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: a label-write guard like guard-gh-write; cloud sessions carry
+        // the same token, so the same preventive control applies (#1197).
+        remote: RemotePolicy::Run,
+    },
+    HookEntry {
         name: "guard-git-init",
         description: "Nudge to scaffold and confirm license after git init or gh repo create",
         namespace: "guardrails",
@@ -922,6 +931,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ),
         ("guardrails", "warn-stale-pr-body") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr ready 5"}}"#,
+        ),
+        // guard-critical-grade only engages on a gh call that applies a label;
+        // the generic sample would allow without judging anything.
+        ("guardrails", "guard-critical-grade") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue edit 12 --add-label impact:critical"}}"#,
         ),
         // guard-body-budget only engages on a gh posting subcommand carrying a
         // body flag; the generic PreToolUse sample (`git status`) would allow

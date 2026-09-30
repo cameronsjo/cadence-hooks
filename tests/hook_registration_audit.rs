@@ -320,6 +320,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-agent-dispatch",
         "cameronsjo/cadence-hooks#606",
     ),
+    // PreToolUse on Bash with single-rule `if:` entries (`Bash(gh issue *)`,
+    // `Bash(gh pr *)`, `Bash(gh api *)`); lands in the cadence-guardrails
+    // hooks.json in the cadence monorepo follow-up.
+    (
+        "guardrails guard-critical-grade",
+        "cameronsjo/cadence-hooks#895",
+    ),
     // PreToolUse on Bash with single-rule `if:` entries (`Bash(glab *)`,
     // `Bash(tea *)`); lands in the cadence-guardrails hooks.json in the
     // cadence monorepo follow-up.
