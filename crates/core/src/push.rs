@@ -1253,8 +1253,9 @@ impl Toplevels {
         if command.contains("$'") {
             return true;
         }
-        // A command whose name is an expansion (`c=read; $c …`) may be any
-        // builtin at all (review 7).
+        // A command whose name is an expansion (`c=read; $c …`) or a
+        // filename pattern (`r?ad` matching a file named `read`) may be any
+        // builtin at all (reviews 7, 8).
         // (A segment that only assigns, `n=$(…)`, runs nothing.)
         static ASSIGNS_ONLY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*\+?=").expect("pattern should compile")
@@ -1264,9 +1265,15 @@ impl Toplevels {
             crate::shell::peel_command_runners(crate::shell::strip_compound_heads(&tokens))
                 .iter()
                 .find(|word| !ASSIGNS_ONLY.is_match(word))
-                .is_some_and(|first| first.contains(['$', '`']))
+                .is_some_and(|first| {
+                    // `[`/`[[` are the test command, not a pattern.
+                    !matches!(first.as_str(), "[" | "[[")
+                        && first.contains(['$', '`', '*', '?', '['])
+                })
         });
-        if names_an_expansion {
+        // An indirect expansion (`${!m:=…}`) binds whatever name `m`
+        // holds, however that name was built (review 8).
+        if names_an_expansion || command.contains("${!") {
             return true;
         }
         let command: String = command

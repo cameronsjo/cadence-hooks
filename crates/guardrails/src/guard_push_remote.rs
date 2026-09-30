@@ -3226,7 +3226,22 @@ mod tests {
                     "n=EDIT; c=read; $c -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
                 ),
+                // Review 8: an indirect binding, and a builtin reached by a
+                // filename pattern.
+                (
+                    "n=EDIT; m=${n}OR; : \"${!m:=x}\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; r?ad ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; [r]ead ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
                 ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("[ -f x ] && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
                 (
                     "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
