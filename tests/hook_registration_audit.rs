@@ -292,10 +292,6 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
 const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
-    // PreToolUse on Bash with a single-rule `if: Bash(git *)` entry in the
-    // `cadence` plugin's hooks.json, beside the sibling secret guards; lands in
-    // the cadence monorepo wiring follow-up (Task B of the #237 plan).
-    ("cadence prevent-secret-push", "cameronsjo/cadence#1280"),
     // Deliberately unwired, not awaiting a wiring PR: the per-tool-call
     // `PostToolUse: *` registration was removed as a trial while the hook's
     // cost is evaluated (cadence plugin CHANGELOG, cameronsjo/cadence-hooks#902).
@@ -329,7 +325,11 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     "cadence git-safety",            // catches force-push, reset --hard, etc.
     "cadence prevent-secret-writes", // catches writes to .env, credentials, etc.
     "cadence prevent-secret-leaks",  // catches reads of secrets
-    "cadence warn-docs-update",      // catches gh pr create
+    // Unfiltered so aliased (`git pp`), wrapped (`sh -c`, `xargs`) and dashed
+    // (`git-push`, `exec -a`) pushes reach it: an `if: Bash(git push*)` glob
+    // would drop exactly the forms the guard resolves (cadence-hooks#890).
+    "cadence prevent-secret-push",
+    "cadence warn-docs-update", // catches gh pr create
     // Wired on a PostToolUse `*` matcher: it reacts to plan approval, which it
     // recognizes from the payload rather than the tool name, and a PostToolUse
     // `if:` cannot carry the alternation that would narrow it.

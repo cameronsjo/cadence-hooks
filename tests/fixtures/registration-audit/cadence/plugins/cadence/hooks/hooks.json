@@ -106,7 +106,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/git-safety cadence/prevent-secret-writes cadence/prevent-secret-leaks cadence/warn-docs-update",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/git-safety cadence/prevent-secret-writes cadence/prevent-secret-push cadence/prevent-secret-leaks cadence/warn-docs-update",
             "timeout": 10
           },
           {
