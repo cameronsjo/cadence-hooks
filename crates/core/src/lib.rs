@@ -2066,16 +2066,19 @@ pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>,
 /// (cameronsjo/cadence-hooks#776). Shared by the single-check path and the
 /// `group` merge so the two cannot drift.
 pub fn updated_tool_output_envelope(event: HookEvent, output: &serde_json::Value) -> String {
-    updated_tool_output_json(event, output, None, None)
+    updated_tool_output_json(event, output, None)
 }
 
-/// [`updated_tool_output_envelope`] with optional `additionalContext` and a
-/// PostToolUse `decision: "block"` reason.
+/// [`updated_tool_output_envelope`] with an optional `additionalContext`.
+///
+/// Deliberately never carries a top-level `decision: "block"`: the pairing of
+/// `decision` with `updatedToolOutput` is undocumented and unprobed, and if
+/// Claude Code dropped the rewrite beside it the model would get the raw
+/// output. A sibling's block reason rides `additionalContext` instead.
 pub fn updated_tool_output_json(
     event: HookEvent,
     output: &serde_json::Value,
     context: Option<&str>,
-    block_reason: Option<&str>,
 ) -> String {
     let mut specific = serde_json::Map::new();
     specific.insert("hookEventName".into(), event.name().into());
@@ -2083,16 +2086,7 @@ pub fn updated_tool_output_json(
     if let Some(context) = context {
         specific.insert("additionalContext".into(), context.into());
     }
-    let mut top = serde_json::Map::new();
-    if let Some(reason) = block_reason {
-        top.insert("decision".into(), "block".into());
-        top.insert("reason".into(), reason.into());
-    }
-    top.insert(
-        "hookSpecificOutput".into(),
-        serde_json::Value::Object(specific),
-    );
-    serde_json::Value::Object(top).to_string()
+    serde_json::json!({ "hookSpecificOutput": specific }).to_string()
 }
 
 /// [`render_output`] for a whole [`CheckResult`], plus the exit code to use.
@@ -2100,9 +2094,9 @@ pub fn updated_tool_output_json(
 /// A result carrying [`CheckResult::updated_tool_output`] on PostToolUse
 /// renders the output-replacement envelope with exit 0 — **including a
 /// `Block`**. The tool already ran, so an exit 2 would discard stdout and the
-/// raw output would reach the model; a PostToolUse block is expressed instead
-/// as top-level `decision: "block"` + `reason` beside the rewrite. A Nudge's
-/// message rides as `additionalContext`. Everything else renders exactly as
+/// raw output would reach the model. The block's (or a Nudge's) message rides
+/// as `additionalContext`, never as `decision: "block"` (see
+/// [`updated_tool_output_json`]). Everything else renders exactly as
 /// [`render_output`] does.
 fn render_check_result(
     result: &CheckResult,
@@ -2113,35 +2107,17 @@ fn render_check_result(
         && event == HookEvent::PostToolUse
         && result.outcome != Outcome::Ask
     {
-        let message = result.message.as_deref().filter(|m| !m.is_empty());
-        let stdout = match (result.outcome, message) {
-            (Outcome::Block, _) => {
-                let reason = apply_feedback_footer(
-                    Outcome::Block,
-                    &display::clamp_hook_output(
-                        message.unwrap_or(""),
-                        display::HOOK_OUTPUT_BUDGET_UTF16,
-                        None,
-                    ),
-                    footer,
-                );
-                updated_tool_output_json(event, output, None, Some(&reason))
-            }
-            (Outcome::Nudge, Some(msg)) => updated_tool_output_json(
-                event,
-                output,
-                Some(&display::clamp_hook_output(
-                    msg,
-                    display::HOOK_OUTPUT_BUDGET_UTF16,
-                    None,
-                )),
-                None,
-            ),
-            _ => updated_tool_output_json(event, output, None, None),
-        };
+        let context = result
+            .message
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|msg| {
+                let msg = display::clamp_hook_output(msg, display::HOOK_OUTPUT_BUDGET_UTF16, None);
+                apply_feedback_footer(result.outcome, &msg, footer)
+            });
         return (
             RenderedOutput {
-                stdout: Some(stdout),
+                stdout: Some(updated_tool_output_json(event, output, context.as_deref())),
                 stderr: None,
             },
             0,

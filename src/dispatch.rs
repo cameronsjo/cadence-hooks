@@ -776,27 +776,27 @@ fn merge_group_output(
 
     // An output rewrite (cameronsjo/cadence-hooks#776) from any member. On
     // PostToolUse it survives a sibling Block: the tool already ran, so exit 2
-    // would discard stdout and hand the model the raw output. The block is
-    // then carried as `decision: "block"` in the exit-0 envelope instead.
+    // would discard stdout and hand the model the raw output. The block's
+    // reason rides `additionalContext` in the exit-0 envelope — never as
+    // `decision: "block"` beside the rewrite, a pairing that is undocumented.
     // First one wins; each rewriter sees the original output.
     let rewrite = results.iter().find_map(|r| r.updated_tool_output.as_ref());
     if event == HookEvent::PostToolUse
         && let Some(output) = rewrite
         && results.iter().any(|r| r.outcome == Outcome::Block)
     {
-        let blocks: Vec<&str> = results
+        let mut parts: Vec<&str> = results
             .iter()
             .filter(|r| r.outcome == Outcome::Block)
             .filter_map(|r| r.message.as_deref())
             .collect();
-        let reason = join_within_budget(&blocks);
-        let ctx = (!context.is_empty()).then(|| join_within_budget(&context));
+        parts.extend(context.iter().copied());
+        let ctx = (!parts.is_empty()).then(|| join_within_budget(&parts));
         return GroupOutput {
             stdout: Some(cadence_hooks_core::updated_tool_output_json(
                 event,
                 output,
                 ctx.as_deref(),
-                Some(&reason),
             )),
             stderr: None,
             code: 0,
@@ -1285,8 +1285,8 @@ mod tests {
         ));
         assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
         assert_eq!(v["hookSpecificOutput"]["additionalContext"], "note");
-        // A sibling Block on PostToolUse keeps the rewrite: exit 0 with
-        // `decision: "block"` beside the masked output (exit 2 would hand the
+        // A sibling Block on PostToolUse keeps the rewrite: exit 0, the block
+        // reason in additionalContext, no `decision` (exit 2 would hand the
         // model the raw output).
         let blocked = merge_group_output(
             HookEvent::PostToolUse,
@@ -1295,8 +1295,11 @@ mod tests {
         );
         assert_eq!(blocked.code, 0);
         let v = parse_stdout(&blocked);
-        assert_eq!(v["decision"], "block");
-        assert_eq!(v["reason"], "no");
+        assert!(
+            v.get("decision").is_none(),
+            "no undocumented decision beside a rewrite"
+        );
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "no");
         assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
         // PreToolUse has no output to rewrite: a block stays exit 2.
         let pre = merge_group_output(
@@ -1316,7 +1319,12 @@ mod tests {
         let (stdout, stderr) =
             cadence_hooks_core::render_result(&beside_block.result, HookEvent::PostToolUse);
         let v: serde_json::Value = serde_json::from_str(&stdout.expect("stdout")).unwrap();
-        assert_eq!(v["decision"], "block");
+        assert!(v.get("decision").is_none());
+        assert!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some_and(|c| c.starts_with('b'))
+        );
         assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
         assert_eq!(stderr, None);
         // A plain allow still renders nothing.

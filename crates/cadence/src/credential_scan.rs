@@ -167,7 +167,19 @@ fn accepts(idx: usize, token: &str, orig: &str, offset: usize) -> bool {
         return false;
     }
     // sk- also needs a random-looking body: prose can resemble it.
-    !(idx == 5 && !looks_random(&token[3..]))
+    random_enough(idx, token)
+}
+
+/// The randomness gate for the shapes a placeholder can take: `sk-` (prose),
+/// and GitLab/npm tokens, whose documented placeholders
+/// (`glpat-xxxxxxxxxxxxxxxxxxxx`, `npm_XXXX…`) fit the length rule.
+fn random_enough(idx: usize, token: &str) -> bool {
+    match idx {
+        5 => looks_random(&token[3..]),
+        8 => looks_random(&token["glpat-".len()..]),
+        9 => looks_random(&token["npm_".len()..]),
+        _ => true,
+    }
 }
 
 /// One credential token found by [`direct_spans`]: its kind and its byte
@@ -203,7 +215,7 @@ pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
         let Some((idx, m)) = (0..KINDS.len()).find_map(|i| caps.get(i + 1).map(|m| (i, m))) else {
             continue;
         };
-        if idx == 5 && !(sk_boundary(text, m.start()) && looks_random(&m.as_str()[3..])) {
+        if (idx == 5 && !sk_boundary(text, m.start())) || !random_enough(idx, m.as_str()) {
             continue;
         }
         out.push(TokenSpan {
@@ -342,6 +354,21 @@ mod tests {
     }
     fn kinds(text: &str) -> Vec<&'static str> {
         scan(text).iter().map(|h| h.kind).collect()
+    }
+
+    #[test]
+    fn gitlab_and_npm_need_a_random_body() {
+        let glpat = ["gl", "pat-"].concat();
+        let npm = ["np", "m_"].concat();
+        for placeholder in [
+            glpat.clone() + &"x".repeat(20),
+            npm.clone() + &"X".repeat(36),
+        ] {
+            assert!(kinds(&placeholder).is_empty(), "{placeholder}");
+            assert!(direct_spans(&placeholder).is_empty(), "{placeholder}");
+        }
+        assert_eq!(kinds(&(glpat + &alnum(20))), vec!["GitLab token"]);
+        assert_eq!(kinds(&(npm + &alnum(36))), vec!["npm token"]);
     }
 
     #[test]

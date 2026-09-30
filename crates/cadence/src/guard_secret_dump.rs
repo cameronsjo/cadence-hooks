@@ -37,13 +37,12 @@
 //! silent, and the same command without the hash asks.
 //!
 //! **Deliberately allowed (not asked about):**
-//! - a producer inside a command substitution (`X=$(security … -w)`,
-//!   `gh … --token "$(op read …)"`): the value is captured, not printed. Only
-//!   top-level segments are judged, which is also why
-//! - a producer inside a shell wrapper (`bash -c '…'`) or a script is unseen —
-//!   the wrapper and substitution readers in `core::shell` return both kinds
-//!   of child together, and splitting them is a parser change this guard does
-//!   not make;
+//! - a producer inside a script FILE (`bash scripts/x.sh`), which the command
+//!   text does not show. Producers inside `$(…)`, backticks, `<(…)`,
+//!   `sh -c`/`bash -c` and `eval` ARE judged (core's read-only
+//!   `child_scripts`), each against its own pipeline — so capturing a value
+//!   into a variable (`X=$(op read …)`) asks too: it is one `echo $X` from
+//!   the transcript;
 //! - `kubectl get secret -o yaml|json`: the output carries key names, which
 //!   `redact-secret-output` masks;
 //! - `sops -d`: owned by `guard-sops-decrypt` (a hard block);
@@ -55,7 +54,7 @@
 //! Fails open (ADR-0001): no command means allow.
 
 use cadence_hooks_core::shell::{
-    command_word, is_redirect_token, peel_command_runners,
+    MAX_WRAPPER_DEPTH, child_scripts, command_word, is_redirect_token, peel_command_runners,
     split_segments_with_ops_joining_redirects, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -93,7 +92,17 @@ fn ask_message(producer: &str) -> String {
 /// The label of the first bare-value producer whose stdout reaches the
 /// transcript, or `None`.
 pub fn first_exposed_dump(command: &str) -> Option<&'static str> {
-    let segments = split_segments_with_ops_joining_redirects(command);
+    exposed_in(command, 0)
+}
+
+/// [`first_exposed_dump`] over one script, recursing into every child script
+/// the shell runs from a segment — `$(…)`, backticks, `<(…)`, `sh -c`/`bash
+/// -c`, `eval` — via core's read-only `child_scripts`, up to
+/// `MAX_WRAPPER_DEPTH`. A producer inside a substitution is judged against its
+/// own pipeline: `$(op read … | sha256sum)` is contained, `X=$(op read …)`
+/// is not.
+fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
+    let segments = split_segments_with_ops_joining_redirects(script);
     let argvs: Vec<Vec<String>> = segments
         .iter()
         .map(|(segment, _)| {
@@ -102,6 +111,16 @@ pub fn first_exposed_dump(command: &str) -> Option<&'static str> {
         })
         .collect();
     for (i, argv) in argvs.iter().enumerate() {
+        if depth < MAX_WRAPPER_DEPTH {
+            let stripped = strip_group_wrappers(&segments[i].0);
+            let mut children = child_scripts(argv, stripped);
+            children.extend(process_substitutions(stripped));
+            for child in children {
+                if let Some(label) = exposed_in(&child, depth + 1) {
+                    return Some(label);
+                }
+            }
+        }
         let Some(label) =
             producer(argv).or_else(|| structured_secret_filtered(&segments, &argvs, i))
         else {
@@ -112,6 +131,44 @@ pub fn first_exposed_dump(command: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Bodies of `<(…)` / `>(…)` process substitutions in `segment`, which core's
+/// `child_scripts` does not return. Outside single quotes only; an unclosed
+/// body (the splitter may have cut the segment at a `|` inside it) runs to
+/// the end — erring toward judging more, never less.
+fn process_substitutions(segment: &str) -> Vec<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::new();
+    let mut in_single = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'\'' => in_single = !in_single,
+            b'<' | b'>' if !in_single && bytes[i + 1] == b'(' => {
+                let body_start = i + 2;
+                let mut depth = 1;
+                let mut j = body_start;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let body_end = if depth == 0 { j - 1 } else { bytes.len() };
+                if let Some(body) = segment.get(body_start..body_end) {
+                    out.push(body.to_string());
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Does the pipeline starting at segment `start` keep the producer's stdout
@@ -469,6 +526,26 @@ mod tests {
                 "gcloud secrets versions access",
             ),
             ("pass show x", "pass show"),
+            // Round 2: producers inside substitutions and wrappers.
+            ("echo $(op read op://v/i/f)", "op read"),
+            (
+                "echo \"$(kubectl get secret s -o jsonpath={.data.p} | base64 -d)\"",
+                "kubectl get secret -o jsonpath",
+            ),
+            ("echo `pass show x`", "pass show"),
+            ("sh -c 'pass show x'", "pass show"),
+            ("bash -c 'op read op://v/i/f'", "op read"),
+            ("eval 'vault kv get -field=p secret/x'", "vault read -field"),
+            (
+                "X=$(security find-generic-password -s svc -w); echo $X",
+                "security find-*-password -w",
+            ),
+            ("TOKEN=$(op read op://v/i/f) gh api user", "op read"),
+            ("cat <(pass show x)", "pass show"),
+            // The top-level splitter cuts `$(… | …)` at its inner pipe, so a
+            // hash inside a substitution cannot be proven to contain the
+            // value: ask rather than guess.
+            ("echo $(op read op://v/i/f | sha256sum)", "op read"),
         ];
         for (command, want) in cases {
             assert_eq!(first_exposed_dump(command), Some(*want), "{command}");
@@ -494,9 +571,6 @@ mod tests {
             "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
             "vault kv get secret/x",
             "pass ls",
-            // Captured by substitution: never printed.
-            "TOKEN=$(op read op://v/i/f) gh api user",
-            "export PW=\"$(security find-generic-password -s svc -w)\"",
             // Output names its values: the redactor's job.
             "kubectl get secret app -o yaml",
             "kubectl get secret app -o json",
