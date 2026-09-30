@@ -311,35 +311,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
-    // PostToolUse on Write/Edit/MultiEdit with `if: Write(*/.github/workflows/*)`
-    // style single rules; the wiring lands in the cadence monorepo follow-up.
-    ("cadence audit-runner-pool", "cameronsjo/cadence-hooks#1072"),
-    // PreToolUse on Agent (and Task), single-rule matchers; lands in the
-    // cadence-guardrails hooks.json in the cadence monorepo follow-up.
-    (
-        "guardrails warn-agent-dispatch",
-        "cameronsjo/cadence-hooks#606",
-    ),
-    // PreToolUse on Bash with single-rule `if:` entries (`Bash(gh issue *)`,
-    // `Bash(gh pr *)`, `Bash(gh api *)`); lands in the cadence-guardrails
-    // hooks.json in the cadence monorepo follow-up.
-    (
-        "guardrails guard-critical-grade",
-        "cameronsjo/cadence-hooks#895",
-    ),
-    // PreToolUse on Bash with single-rule `if:` entries (`Bash(glab *)`,
-    // `Bash(tea *)`); lands in the cadence-guardrails hooks.json in the
-    // cadence monorepo follow-up.
-    (
-        "guardrails guard-forge-write",
-        "cameronsjo/cadence-hooks#355",
-    ),
-    // SessionStart entry in the cadence-obsidian hooks.json; lands in the
-    // cadence monorepo follow-up.
-    (
-        "obsidian trash-guard-liveness",
-        "cameronsjo/cadence-hooks#797",
-    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -493,6 +464,8 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     // Wired as two single-rule `if:` entries (`Bash(*git push*)` and
     // `Bash(*gh pr merge*)`) because `if:` alternation is unsupported.
     "guardrails warn-stacked-base-delete",
+    // Wired as two single-rule `if:` entries (`Bash(glab *)`, `Bash(tea *)`).
+    "guardrails guard-forge-write",
     "metrics log-polish-nudge",
     "session guard",
 ];

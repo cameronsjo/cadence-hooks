@@ -315,7 +315,7 @@ mod tests {
     use crate::git_fixtures::{Scratch, git_in, init_repo};
 
     fn scratch(tag: &str) -> Scratch {
-        Scratch::new(
+        Scratch::outside_checkout(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-target-repo-scratch"),
             tag,
         )
