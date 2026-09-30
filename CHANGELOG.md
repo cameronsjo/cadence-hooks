@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.116.0] - 2026-09-30
+
 ### Added
 
 - **Bypass provenance now covers the whole escape-hatch class, not just `enforce-worktree` and `warn-main-branch`.** `CADENCE_BYPASS=1` and a `CADENCE_DISABLE` that switches a hook off each write a `global_bypass` / `global_disable` row to `bypasses.jsonl` at the `main.rs` gate (hook label, session, repo basename only; write errors fail open). `CADENCE_SKIP_OVERSHARE_AUDIT`, `CADENCE_ALLOW_SUBAGENT_FROM_MAIN`, `CADENCE_ALLOW_BRANCH_INTENT`, `CADENCE_NO_OUTRO_BACKSTOP` (the `backstop-warn` half) and `CADENCE_GOING_PUBLIC_IGNORE` record an `env_switch` row when they actually suppressed a nudge. `enforcement-status` adds one SessionStart line with the repo's active dismissal count and the last 24h of bypasses used, by kind. A new `tests/bypass_provenance_coverage.rs` fails on any escape-hatch variable that is neither recording nor listed as deliberately not a bypass. `Exemption` and `EffortSkip` kinds are not added: both are configured structure, not an operator stepping outside a guard. (cameronsjo/cadence-hooks#223)
