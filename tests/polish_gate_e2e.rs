@@ -70,7 +70,7 @@ fn gate(marker_dir: &Path, cwd: &Path, command: &str) -> Output {
 /// `feat/a` carrying a code change on top — so the gate's branch diff
 /// touches code on `feat/a`.
 fn repo(tag: &str) -> (Scratch, PathBuf, PathBuf) {
-    let scratch = Scratch::new(&scratch_root(), tag);
+    let scratch = Scratch::outside_checkout(&scratch_root(), tag);
     let repo = scratch.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git_in(&repo, &["init", "-q", "-b", "main"]);

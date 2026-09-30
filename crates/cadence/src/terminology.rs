@@ -820,7 +820,7 @@ mod tests {
         std::path::PathBuf,
     ) {
         use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
-        let s = Scratch::new(
+        let s = Scratch::outside_checkout(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/terminology-meta-scratch"),
             tag,
         );
