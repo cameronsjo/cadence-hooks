@@ -3179,6 +3179,25 @@ mod tests {
                     Block,
                 ),
                 ("source ./e.sh; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 5: a name or `.` split by quotes or a backslash.
+                (
+                    "declare \"EDI\"\"TOR=git push\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "printf -v EDI\\TOR x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "read -r EDI''TOR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("\\. ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                ("'.' ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                (
+                    "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
                 ("GIT_EDITOR='git -C {other} push' git checkout -p", Block),
                 ("GIT_EDITOR='git -C {other} push' git stash push -p", Block),
                 ("GIT_EDITOR='git -C {other} push' git config edit", Block),

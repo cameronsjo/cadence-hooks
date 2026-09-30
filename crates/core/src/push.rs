@@ -1245,6 +1245,19 @@ impl Toplevels {
         {
             return true;
         }
+        // The name matches below run over the command with quotes and
+        // backslashes removed, as the shell removes them: `declare
+        // "EDI""TOR=…"`, `printf -v EDI\TOR`, `\. ./e` set or source as
+        // the plain spelling does. ANSI-C quoting (`$'\x45DITOR'`) can spell
+        // any name, so it is not read at all.
+        if command.contains("$'") {
+            return true;
+        }
+        let command: String = command
+            .chars()
+            .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+            .collect();
+        let command = command.as_str();
         // A sourced file or an `eval` can set any of them unseen.
         static RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?:^|[\s;&|(){}])(?:source|eval|\.)(?:\s|$)")
