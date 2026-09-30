@@ -292,6 +292,10 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
 const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
+    // PreToolUse on Bash with a single-rule `if: Bash(git *)` entry in the
+    // `cadence` plugin's hooks.json, beside the sibling secret guards; lands in
+    // the cadence monorepo wiring follow-up (Task B of the #237 plan).
+    ("cadence prevent-secret-push", "cameronsjo/cadence#1280"),
     // Deliberately unwired, not awaiting a wiring PR: the per-tool-call
     // `PostToolUse: *` registration was removed as a trial while the hook's
     // cost is evaluated (cadence plugin CHANGELOG, cameronsjo/cadence-hooks#902).

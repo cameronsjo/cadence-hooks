@@ -176,6 +176,7 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     "guard-gh-write",
     "guard-op-vault-scan",
     "guard-sops-decrypt",
+    "prevent-secret-push",
     "guard-browser-device",
     "guard-dotfiles",
     "guard-read-model",

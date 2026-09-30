@@ -303,7 +303,7 @@ fn scan_patch(output: &str, toplevel: &str, exempt: Exempt, hits: &mut Vec<Hit>)
 
     let flush = |sha: &str, file: &mut FileState, hits: &mut Vec<Hit>| {
         let f = std::mem::take(file);
-        if hits.len() >= MAX_HITS + 1 {
+        if hits.len() > MAX_HITS {
             return;
         }
         if f.unreadable {
@@ -858,8 +858,14 @@ mod tests {
         // Bulk-create commits cheaply through fast-import.
         let mut stream = String::new();
         for i in 0..(MAX_COMMITS + 5) {
+            // Only the first commit names its parent; the rest continue the branch.
+            let from = if i == 0 {
+                "from refs/heads/main^0\n"
+            } else {
+                ""
+            };
             stream.push_str(&format!(
-                "commit refs/heads/main\ncommitter t <t@t> {} +0000\ndata 1\nc\nfrom refs/heads/main^0\nM 100644 inline f{i}.txt\ndata 2\nx\n\n",
+                "commit refs/heads/main\ncommitter t <t@t> {} +0000\ndata 1\nc\n{from}M 100644 inline f{i}.txt\ndata 2\nx\n\n",
                 1_700_000_000 + i
             ));
         }
@@ -1005,5 +1011,66 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+    }
+
+    #[test]
+    fn header_path_reads_plain_spaced_and_quoted_paths() {
+        for (rest, want) in [
+            ("a/x.txt b/x.txt", Some("x.txt")),
+            ("a/my dir/a b.txt b/my dir/a b.txt", Some("my dir/a b.txt")),
+            ("\"a/q\\\"x.txt\" \"b/q\\\"x.txt\"", Some("q\"x.txt")),
+            ("a/x.txt b/y.txt", None),
+            ("nonsense", None),
+            ("", None),
+        ] {
+            assert_eq!(header_path(rest).as_deref(), want, "{rest}");
+        }
+    }
+
+    #[test]
+    fn spaced_and_odd_paths_are_scanned() {
+        let fx = Fx::new("spaces");
+        fx.commit("my dir/a b.txt", &format!("{}\n", aws_key()), "spaced");
+        assert_blocks(&fx.run("git push origin main"), &["my dir/a b.txt"]);
+        let fx = Fx::new("unicode");
+        fx.commit("caf\u{e9}/k.txt", &format!("{}\n", aws_key()), "u");
+        assert_blocks(&fx.run("git push origin main"), &["caf\u{e9}/k.txt"]);
+    }
+
+    #[test]
+    fn over_cap_range_still_names_a_secret_in_the_newest_commits() {
+        let fx = Fx::new("overcap-hit");
+        let mut stream = String::new();
+        for i in 0..(MAX_COMMITS + 5) {
+            let from = if i == 0 {
+                "from refs/heads/main^0\n"
+            } else {
+                ""
+            };
+            stream.push_str(&format!(
+                "commit refs/heads/main\ncommitter t <t@t> {} +0000\ndata 1\nc\n{from}M 100644 inline f{i}.txt\ndata 2\nx\n\n",
+                1_700_000_000 + i
+            ));
+        }
+        stream.push_str(&format!(
+            "commit refs/heads/main\ncommitter t <t@t> 1800000000 +0000\ndata 1\nc\nM 100644 inline leak.txt\ndata {}\n{}\n\n",
+            aws_key().len() + 1,
+            aws_key()
+        ));
+        let mut child = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(&fx.work)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_blocks(&fx.run("git push origin main"), &["leak.txt"]);
     }
 }

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`prevent-secret-push` blocks a `git push` whose outbound commits add a secret-named file or a credential token.** A new `cadence` PreToolUse Bash guard reads every push the command runs through `core::push::push_invocations` (wrappers, `-C`, substitutions, refspecs), resolves the outbound range per source with `rev-list <ref> --not --remotes` (`--all`/`--mirror` widen to every ref, `--tags` adds every tag and reads annotated tag messages), and scans one `git log -p --cc --text` over it so a secret added then removed inside the range is still caught. Content goes through the #1022 credential shapes and the value corpus, names through the `secret_patterns` file rules; the message names short sha, path and pattern, never the value. It fails closed on an unresolved push, an unsafe or unreadable refspec source, a failed, missing or timed-out git spawn, more than 200 commits, an over-8 MiB patch, and an unreadable diff header, with every git spawn bounded and the commit cap applied inside `rev-list -n`. Deliberately allowed: `--dry-run`, pure deletions, commits already on any remote-tracking ref, added lines under a `cadence-hooks` path component or a safe-template name. `CADENCE_ALLOW_SECRET_PUSH=1` (hook environment) allows a would-be block and records a bypass row. Registered security-critical and protected; the plugin `hooks.json` entry follows in cameronsjo/cadence#1280. (cameronsjo/cadence-hooks#890)
+
 ## [0.117.0] - 2026-09-30
 
 ### Added
