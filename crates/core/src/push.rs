@@ -1253,6 +1253,22 @@ impl Toplevels {
         if command.contains("$'") {
             return true;
         }
+        // A command whose name is an expansion (`c=read; $c …`) may be any
+        // builtin at all (review 7).
+        // (A segment that only assigns, `n=$(…)`, runs nothing.)
+        static ASSIGNS_ONLY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*\+?=").expect("pattern should compile")
+        });
+        let names_an_expansion = crate::shell::split_segments(command).iter().any(|segment| {
+            let tokens = crate::shell::executable_tokens(segment);
+            crate::shell::peel_command_runners(crate::shell::strip_compound_heads(&tokens))
+                .iter()
+                .find(|word| !ASSIGNS_ONLY.is_match(word))
+                .is_some_and(|first| first.contains(['$', '`']))
+        });
+        if names_an_expansion {
+            return true;
+        }
         let command: String = command
             .chars()
             .filter(|c| !matches!(c, '\\' | '\'' | '"'))
@@ -1263,7 +1279,7 @@ impl Toplevels {
         // `printf -v`, …): the name it binds may be built by a brace
         // expansion or another variable (`declare {ED,X}ITOR=…`,
         // `printf -v "${n}OR"`) that no text match can follow, so any such
-        // builtin in command position, or any brace group, refuses
+        // builtin, or any brace group, refuses
         // (cameronsjo/cadence-hooks#1226 review 6).
         static BRACE_GROUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?:^|[^$])\{[^{}\s]*,[^{}]*\}").expect("pattern should compile")
@@ -1271,15 +1287,21 @@ impl Toplevels {
         if BRACE_GROUP.is_match(command) {
             return true;
         }
-        static RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            // In command position only, so a `.` operand (`git add .`) is
-            // not the `.` builtin.
-            regex::Regex::new(
-                r"(?:^|[\n;&|(){}]|\b(?:then|do|else|elif|exec|command|builtin|time|!)\s)\s*(?:source|eval|\.|declare|typeset|local|export|readonly|read|mapfile|readarray|getopts|unset|printf)(?:\s|$)",
-            )
+        // The builtins are matched as words anywhere: no fixed list of
+        // command-position anchors holds (`IFS= read`, `command -p read`),
+        // and a word in a message costs only a refusal (review 7). `.` is
+        // matched in command position only, so a `.` operand (`git add .`)
+        // is not the `.` builtin.
+        static BINDS_OR_RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+            || {
+                regex::Regex::new(concat!(
+                    r"\b(?:source|eval|declare|typeset|local|export|readonly|read|mapfile|readarray|getopts|unset|printf)\b",
+                    r"|(?:^|[\n;&|(){}!]|\b(?:then|do|else|elif|exec|command|builtin|time)\s)\s*\.(?:\s|$)",
+                ))
                 .expect("pattern should compile")
-        });
-        if RUNS_TEXT.is_match(command) {
+            },
+        );
+        if BINDS_OR_RUNS_TEXT.is_match(command) {
             return true;
         }
         let mut known = self.assigned.borrow_mut();

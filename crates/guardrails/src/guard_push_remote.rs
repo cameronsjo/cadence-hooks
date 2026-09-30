@@ -3208,6 +3208,25 @@ mod tests {
                     Block,
                 ),
                 ("git add . && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                // Review 7: builtins reached past any fixed anchor list, or
+                // named by an expansion.
+                (
+                    "n=EDIT; IFS= read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; command -p read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; ! read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; c=read; $c -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
                 (
                     "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
