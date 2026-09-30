@@ -1349,7 +1349,7 @@ mod tests {
     use super::*;
     use crate::secret_patterns::is_secret_scan_exempt;
     use cadence_hooks_core::Outcome;
-    use cadence_hooks_core::git_fixtures::{Scratch, git_in};
+    use cadence_hooks_core::git_fixtures::Scratch;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
     use std::path::{Path, PathBuf};
 
@@ -1359,6 +1359,48 @@ mod tests {
     }
     fn gh_token() -> String {
         format!("{}{}", "ghp_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")
+    }
+
+    /// Fixture git, isolated from the machine's system and global config (a
+    /// developer's `push.followTags`, `commit.gpgSign` or aliases must not
+    /// change a fixture) and from leaked discovery variables.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = git_cmd(dir, args).output().unwrap();
+        assert!(out.status.success(), "git {args:?} in {dir:?}: {out:?}");
+    }
+
+    fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .current_dir(dir);
+        cmd
+    }
+
+    /// Run fixture git with `input` on stdin, returning trimmed stdout.
+    fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = git_cmd(dir, args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// A work repo with a bare `origin` that already holds `main`, so
@@ -1390,7 +1432,18 @@ mod tests {
             git_in(&work, &["init", "-q", "-b", "main"]);
             git_in(&work, &["config", "user.email", "t@t"]);
             git_in(&work, &["config", "user.name", "t"]);
-            git_in(&work, &["config", "commit.gpgsign", "false"]);
+            // The guard's own spawns read the machine's global config; local
+            // values pin every key that changes a verdict.
+            for (key, value) in [
+                ("commit.gpgSign", "false"),
+                ("tag.gpgSign", "false"),
+                ("push.followTags", "false"),
+                ("push.recurseSubmodules", "no"),
+                ("submodule.recurse", "false"),
+                ("help.autocorrect", "0"),
+            ] {
+                git_in(&work, &["config", key, value]);
+            }
             git_in(
                 &work,
                 &["remote", "add", "origin", remote.to_str().unwrap()],
@@ -1647,9 +1700,7 @@ mod tests {
                 1_700_000_000 + i
             ));
         }
-        let mut child = std::process::Command::new("git")
-            .args(["fast-import", "--quiet"])
-            .current_dir(&fx.work)
+        let mut child = git_cmd(&fx.work, &["fast-import", "--quiet"])
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -1788,18 +1839,8 @@ mod tests {
     fn remote_dir_is_untouched_by_scanning() {
         let fx = Fx::new("readonly");
         fx.commit("s.txt", &format!("{}\n", aws_key()), "s");
-        let _ = fx.run("git push origin main");
-        let out = std::process::Command::new("git")
-            .args([
-                "-C",
-                fx.remote.to_str().unwrap(),
-                "rev-list",
-                "--all",
-                "--count",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+        assert_blocks(&fx.run("git push origin main"), &["s.txt"]);
+        assert_eq!(git_out(&fx.remote, &["rev-list", "--all", "--count"]), "1");
     }
 
     #[test]
@@ -1846,9 +1887,7 @@ mod tests {
             aws_key().len() + 1,
             aws_key()
         ));
-        let mut child = std::process::Command::new("git")
-            .args(["fast-import", "--quiet"])
-            .current_dir(&fx.work)
+        let mut child = git_cmd(&fx.work, &["fast-import", "--quiet"])
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -1865,11 +1904,7 @@ mod tests {
 
     /// Run `git` in `dir` with stdin, returning trimmed stdout.
     fn git_out(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
+        let out = git_cmd(dir, args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
@@ -1943,8 +1978,16 @@ mod tests {
         assert_allows(&fx.run("git lg -1"));
         assert_allows(&fx.run("git status"));
         // Probing is bounded: past the cap an unknown subcommand is refused.
-        let many = (0..=MAX_ALIAS_PROBES)
-            .map(|i| format!("git -C /nonexistent-{i} zz"))
+        let dirs: Vec<PathBuf> = (0..=MAX_ALIAS_PROBES)
+            .map(|i| {
+                let d = fx.work.join(format!("d{i}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        let many = dirs
+            .iter()
+            .map(|d| format!("git -C {} zz", d.display()))
             .collect::<Vec<_>>()
             .join("; ");
         assert_blocks(&fx.run(&many), &["more directories"]);
@@ -2007,24 +2050,32 @@ mod tests {
     }
 
     #[test]
-    fn only_the_destination_remotes_tracking_refs_count_as_published() {
-        let fx = Fx::new("otherremote");
+    fn a_commit_on_any_remote_reads_as_published_so_fork_flows_push() {
+        // Fork flow: `upstream` history carries a fixture token; a branch
+        // based on `upstream/main` goes to `origin`, which never had it.
+        let fx = Fx::new("forkflow");
         let upstream = fx._scratch.path().join("upstream.git");
+        let seed = fx._scratch.path().join("seed");
         std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
         git_in(&upstream, &["init", "-q", "--bare", "-b", "main"]);
+        git_in(&seed, &["init", "-q", "-b", "main"]);
+        for (key, value) in [("user.email", "t@t"), ("user.name", "t")] {
+            git_in(&seed, &["config", key, value]);
+        }
+        std::fs::write(seed.join("fx.txt"), format!("{}\n", aws_key())).unwrap();
+        git_in(&seed, &["add", "fx.txt"]);
+        git_in(&seed, &["commit", "-q", "-m", "fixture"]);
+        git_in(&seed, &["push", "-q", upstream.to_str().unwrap(), "main"]);
         fx.git(&["remote", "add", "upstream", upstream.to_str().unwrap()]);
-        fx.commit("s.txt", &format!("{}\n", aws_key()), "secret");
-        // On upstream (so refs/remotes/upstream/main has it), not on origin.
-        fx.git(&["push", "-q", "upstream", "main"]);
-        assert_blocks(&fx.run("git push origin main"), &["s.txt"]);
-        // The bare push resolves its remote the way git does.
-        fx.git(&["branch", "-q", "--set-upstream-to=origin/main"]);
-        assert_blocks(&fx.run("git push"), &["s.txt"]);
-        // Pushing to the remote that has it: nothing new.
-        assert_allows(&fx.run("git push upstream main"));
-        // A URL destination keeps trusting every remote-tracking ref.
-        let url = format!("git push {} main", fx.remote.display());
-        assert_allows(&fx.run(&url));
+        fx.git(&["fetch", "-q", "upstream"]);
+        fx.git(&["checkout", "-q", "-b", "feat", "upstream/main"]);
+        fx.commit("clean.txt", "fine\n", "clean");
+        assert_allows(&fx.run("git push origin feat"));
+        assert_allows(&fx.run("git push -u origin feat"));
+        // A new secret on top of the fork branch is still outbound.
+        fx.commit("new.txt", &format!("{}\n", gh_token()), "new");
+        assert_blocks(&fx.run("git push origin feat"), &["new.txt"]);
     }
 
     #[test]
@@ -2041,14 +2092,24 @@ mod tests {
         fx.git(&["config", "push.followTags", "true"]);
         assert_blocks(&fx.run("git push origin main"), &["v5"]);
         assert_allows(&fx.run("git push --no-follow-tags origin main"));
-        // `tags/X` names the tag.
-        assert_blocks(&fx.run("git push origin tags/v5"), &["v5"]);
+        // With followTags off again, only resolving the NAMED source can find
+        // the tag: `tags/X` and `tag X` both name it.
+        fx.git(&["config", "push.followTags", "false"]);
+        assert_allows(&fx.run("git push origin main"));
+        assert_blocks(&fx.run("git push origin tags/v5"), &["v5", "GitHub token"]);
+        assert_blocks(&fx.run("git push origin tag v5"), &["v5", "GitHub token"]);
     }
 
     #[test]
     fn recurse_submodules_that_push_them_blocks() {
         let fx = Fx::new("submods");
         fx.commit("a.txt", "clean\n", "clean");
+        // Recursion only matters when the repository has submodules.
+        fx.commit(
+            ".gitmodules",
+            "[submodule \"s\"]\n\tpath = s\n\turl = ../s\n",
+            "modules",
+        );
         for cmd in [
             "git push --recurse-submodules=on-demand origin main",
             "git push --recurse-submodules on-demand origin main",
@@ -2121,5 +2182,297 @@ mod tests {
         let fx = Fx::new("ctlpath");
         fx.commit("x\ty.txt", &format!("{}\n", aws_key()), "tab");
         assert_blocks(&fx.run("git push origin main"), &["x?y.txt"]);
+    }
+
+    // --- review round 2 (cadence-hooks#890) --------------------------------
+
+    #[test]
+    fn alias_values_opening_with_global_options_are_followed() {
+        let fx = Fx::new("aliasopts");
+        fx.git(&["config", "alias.y", "push"]);
+        fx.git(&["config", "alias.x", "-c a.b=c y"]);
+        fx.git(&["config", "alias.pp", "push"]);
+        fx.git(&["config", "alias.p2", "--paginate pp"]);
+        // Options only: the caller's next word becomes the subcommand.
+        fx.git(&["config", "alias.opts", "-c a.b=c"]);
+        fx.git(&["config", "alias.lg2", "-c color.ui=never log --oneline"]);
+        for cmd in [
+            "git x origin main",
+            "git p2 origin main",
+            "git opts push origin main",
+        ] {
+            assert_blocks(&fx.run(cmd), &["alias"]);
+        }
+        assert_allows(&fx.run("git lg2 -1"));
+    }
+
+    #[test]
+    fn alias_probe_refuses_config_and_env_it_cannot_see() {
+        let fx = Fx::new("aliasredirect");
+        for cmd in [
+            "GIT_CONFIG_GLOBAL=/tmp/x git zz origin main",
+            "GIT_CONFIG_COUNT=1 git zz",
+            "HOME=/tmp/x git zz",
+            "XDG_CONFIG_HOME=/tmp/x git zz",
+            "GIT_DIR=/tmp/x/.git git zz",
+            "GIT_WORK_TREE=/tmp/x git zz",
+            "git --git-dir=/tmp/x/.git zz",
+            "git --work-tree /tmp/x zz",
+            "git --config-env=alias.zz=V zz",
+            "git -c include.path=/tmp/x zz",
+            "git -c includeIf.onbranch:main.path=/tmp/x zz",
+            "git -c INCLUDE.PATH=/tmp/x zz",
+            "cd \"$D\" && git zz",
+            "git -C \"$D\" zz",
+            "git -C `pwd` zz",
+        ] {
+            assert_blocks(&fx.run(cmd), &["alias"]);
+        }
+        // Builtins are unaffected.
+        for cmd in [
+            "HOME=/tmp/x git status",
+            "GIT_DIR=.git git log -1",
+            "git -c include.path=/tmp/x status",
+            "cd \"$D\" && git status",
+        ] {
+            assert_allows(&fx.run(cmd));
+        }
+    }
+
+    #[test]
+    fn unresolvable_subcommand_word_blocks() {
+        let fx = Fx::new("subvar");
+        for cmd in [
+            "git $X origin main",
+            "git ${X} origin main",
+            "git `echo push` origin main",
+            "git \"$(echo pu)sh\" origin main",
+        ] {
+            assert_blocks(&fx.run(cmd), &["resolve"]);
+        }
+    }
+
+    /// Write a raw commit object on top of HEAD and move `main` to it.
+    fn raw_commit(fx: &Fx, extra_header: &str, message: &str) {
+        let tree = git_out(&fx.work, &["rev-parse", "HEAD^{tree}"]);
+        let parent = git_out(&fx.work, &["rev-parse", "HEAD"]);
+        let body = format!(
+            "tree {tree}\nparent {parent}\nauthor t <t@t> 1700000000 +0000\n\
+             committer t <t@t> 1700000000 +0000\n{extra_header}\n{message}\n"
+        );
+        let sha = git_stdin(
+            &fx.work,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            body.as_bytes(),
+        );
+        fx.git(&["update-ref", "refs/heads/main", &sha]);
+    }
+
+    #[test]
+    fn commit_messages_are_read_raw_not_re_encoded() {
+        // An encoding header makes `%B` transcode the message into garbage.
+        let fx = Fx::new("msgenc");
+        raw_commit(&fx, "encoding UTF-16LE", &format!("deploy {}", gh_token()));
+        assert_blocks(
+            &fx.run("git push origin main"),
+            &["commit message", "GitHub token"],
+        );
+        // So does the repository's output encoding.
+        let fx = Fx::new("msgout");
+        fx.git(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("x {}", gh_token()),
+        ]);
+        fx.git(&["config", "i18n.logOutputEncoding", "UTF-16"]);
+        assert_blocks(
+            &fx.run("git push origin main"),
+            &["commit message", "GitHub token"],
+        );
+        // A token in a commit header is published too.
+        let fx = Fx::new("msghdr");
+        raw_commit(&fx, &format!("x-note {}", gh_token()), "clean");
+        assert_blocks(&fx.run("git push origin main"), &["GitHub token"]);
+    }
+
+    #[test]
+    fn truthy_follows_git_bool_semantics() {
+        for value in ["true", "yes", "on", "1", "2", "-1", "TRUE", " On "] {
+            assert!(truthy(value), "{value:?}");
+        }
+        for value in ["false", "no", "off", "0", "", "NO", "00"] {
+            assert!(!truthy(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn an_integer_mirror_setting_widens_the_push() {
+        let fx = Fx::new("mirrorint");
+        fx.git(&["checkout", "-q", "-b", "side"]);
+        fx.commit("side.txt", &format!("{}\n", aws_key()), "side");
+        fx.git(&["checkout", "-q", "main"]);
+        fx.git(&["config", "remote.origin.mirror", "2"]);
+        assert_blocks(&fx.run("git push origin"), &["side.txt"]);
+    }
+
+    /// Point a branch at a non-commit, which `update-ref` refuses: a loose
+    /// ref file written directly (the files backend reads it as-is).
+    fn force_ref(fx: &Fx, name: &str, sha: &str) {
+        let path = fx.work.join(".git").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{sha}\n")).unwrap();
+    }
+
+    #[test]
+    fn tag_objects_reached_by_sha_or_a_non_tag_ref_are_scanned() {
+        let fx = Fx::new("tagsha");
+        fx.git(&["tag", "-a", "vt", "-m", &format!("note {}", gh_token())]);
+        let tag = git_out(&fx.work, &["rev-parse", "refs/tags/vt"]);
+        fx.git(&["tag", "-d", "vt"]);
+        force_ref(&fx, "refs/heads/tb", &tag);
+        fx.git(&["update-ref", "refs/remotes/x/v1", &tag]);
+        for cmd in [
+            format!("git push origin {tag}:refs/tags/vt"),
+            "git push origin tb".to_string(),
+            "git push origin refs/heads/tb:refs/heads/tb".to_string(),
+            "git push origin refs/remotes/x/v1:refs/tags/v1".to_string(),
+            "git push --all origin".to_string(),
+        ] {
+            assert_blocks(&fx.run(&cmd), &["GitHub token"]);
+        }
+        // A tag of a tree reached through a branch is refused.
+        let fx = Fx::new("tagtree");
+        fx.git(&["tag", "-a", "tt", "-m", "t", "HEAD^{tree}"]);
+        let tag = git_out(&fx.work, &["rev-parse", "refs/tags/tt"]);
+        fx.git(&["tag", "-d", "tt"]);
+        force_ref(&fx, "refs/heads/tt", &tag);
+        assert_blocks(&fx.run("git push --all origin"), &["tree"]);
+    }
+
+    #[test]
+    fn send_pack_and_http_push_are_unscannable_pushes() {
+        let fx = Fx::new("sendpack");
+        let remote = fx.remote.display().to_string();
+        for cmd in [
+            format!("git send-pack {remote} main"),
+            format!("git -C . send-pack {remote} main"),
+            "git http-push https://example.invalid/r.git main".to_string(),
+        ] {
+            assert_blocks(&fx.run(&cmd), &["send-pack"]);
+        }
+        fx.git(&["config", "alias.sp", &format!("send-pack {remote}")]);
+        assert_blocks(&fx.run("git sp main"), &["alias"]);
+    }
+
+    #[test]
+    fn ref_names_carrying_a_token_block_without_echoing_it() {
+        let fx = Fx::new("refname");
+        let name = format!("fix-{}", gh_token());
+        fx.git(&["branch", &name]);
+        for cmd in [
+            format!("git push origin {name}"),
+            format!("git push origin main:refs/heads/{name}"),
+            "git push --all origin".to_string(),
+            "git push --mirror origin".to_string(),
+        ] {
+            let r = fx.run(&cmd);
+            assert_blocks(&r, &["GitHub token"]);
+            assert!(
+                !r.message.as_deref().unwrap().contains(&gh_token()),
+                "{cmd}"
+            );
+        }
+        fx.git(&["checkout", "-q", &name]);
+        assert_blocks(&fx.run("git push -u origin"), &["GitHub token"]);
+        let fx = Fx::new("tagname");
+        fx.git(&["tag", &format!("v-{}", gh_token())]);
+        assert_blocks(&fx.run("git push --tags origin"), &["GitHub token"]);
+        assert_allows(&fx.run("git push origin main"));
+    }
+
+    #[test]
+    fn the_exemption_keys_on_the_repository_toplevel_only() {
+        let fx = Fx::new("exempt-sub");
+        assert!(!is_secret_scan_exempt(fx.work.to_str().unwrap()));
+        fx.commit("cadence-hooks/x.txt", &format!("{}\n", aws_key()), "subdir");
+        let input = make_bash_with_cwd("git push origin main", fx.work.to_str().unwrap());
+        assert_blocks(
+            &PreventSecretPushGuard.run_with(&input, None, is_secret_scan_exempt),
+            &["cadence-hooks/x.txt"],
+        );
+    }
+
+    #[test]
+    fn branches_and_follow_tags_abbreviations_are_read() {
+        let fx = Fx::new("abbrev");
+        fx.git(&["checkout", "-q", "-b", "side"]);
+        fx.commit("side.txt", &format!("{}\n", aws_key()), "side");
+        fx.git(&["checkout", "-q", "main"]);
+        for cmd in [
+            "git push --branches origin",
+            "git push --br origin",
+            "git push --b origin",
+        ] {
+            assert_blocks(&fx.run(cmd), &["side.txt"]);
+        }
+        let fx = Fx::new("abbrev-follow");
+        fx.git(&["tag", "-a", "v7", "-m", &format!("n {}", gh_token())]);
+        assert_blocks(&fx.run("git push --fol origin main"), &["v7"]);
+        assert_blocks(&fx.run("git push --follow origin main"), &["v7"]);
+        fx.git(&["config", "push.followTags", "true"]);
+        assert_allows(&fx.run("git push --no-fol origin main"));
+        assert_allows(&fx.run("git push --no-follow origin main"));
+    }
+
+    #[test]
+    fn help_autocorrect_refuses_an_unknown_subcommand() {
+        let fx = Fx::new("autocorrect");
+        for value in ["1", "immediate", "-1", "true", "10"] {
+            fx.git(&["config", "help.autocorrect", value]);
+            assert_blocks(&fx.run("git psuh origin main"), &["autocorrect"]);
+        }
+        for value in ["0", "false", "never", "show", "prompt"] {
+            fx.git(&["config", "help.autocorrect", value]);
+            assert_allows(&fx.run("git psuh origin main"));
+        }
+    }
+
+    #[test]
+    fn a_failed_alias_probe_blocks() {
+        let fx = Fx::new("probefail");
+        let missing = fx._scratch.path().join("no-such-dir");
+        assert_blocks(
+            &fx.run(&format!("git -C {} zz", missing.display())),
+            &["config"],
+        );
+        // A config git cannot parse.
+        let config = fx.work.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[broken\n");
+        std::fs::write(&config, text).unwrap();
+        assert_blocks(&fx.run("git zz"), &["config"]);
+        assert_allows(&fx.run("echo hi"));
+    }
+
+    #[test]
+    fn recursion_without_submodules_allows_and_with_a_gitlink_blocks() {
+        let fx = Fx::new("nosubs");
+        fx.commit("a.txt", "clean\n", "clean");
+        assert_allows(&fx.run("git push --recurse-submodules=on-demand origin main"));
+        fx.git(&["config", "submodule.recurse", "true"]);
+        assert_allows(&fx.run("git push origin main"));
+        fx.git(&["config", "push.recurseSubmodules", "only"]);
+        assert_allows(&fx.run("git push origin main"));
+        // A gitlink in the index, with no .gitmodules.
+        let head = git_out(&fx.work, &["rev-parse", "HEAD"]);
+        fx.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},sub"),
+        ]);
+        assert_blocks(&fx.run("git push origin main"), &["submodules"]);
     }
 }

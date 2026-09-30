@@ -5057,6 +5057,30 @@ mod tests {
     }
 
     #[test]
+    fn branches_and_follow_tags_abbreviations_are_read_like_git() {
+        // `--branches` is an alias of `--all`; `--b` is unique among push's
+        // options. `--fo`/`--no-fo` are ambiguous with `--force-if-includes`
+        // (git refuses them), so `--fol`/`--no-fol` are the shortest spellings.
+        for (command, all, follow) in [
+            ("git push --branches origin", true, None),
+            ("git push --br origin", true, None),
+            ("git push --b origin", true, None),
+            ("git push --fol origin main", false, Some(true)),
+            ("git push --follow origin main", false, Some(true)),
+            ("git push --no-fol origin main", false, Some(false)),
+            ("git push --no-follow-t origin main", false, Some(false)),
+            ("git push --fo origin main", false, None),
+            ("git push --no-fo origin main", false, None),
+            ("git push --force origin main", false, None),
+        ] {
+            let found = only(command, "/repo");
+            assert_eq!(found.all_or_mirror, all, "{command}");
+            assert_eq!(found.follow_tags, follow, "{command}");
+            assert!(!found.mirror, "{command}");
+        }
+    }
+
+    #[test]
     fn two_pushes_in_one_chain_are_both_reported() {
         let found = push_invocations(
             "git push origin main; git -C /other push origin topic",
