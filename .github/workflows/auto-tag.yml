@@ -5,8 +5,8 @@ on:
     branches: [main]
     paths: [Cargo.toml]
 
-permissions:
-  contents: write
+# Deny by default; the job grants what it needs.
+permissions: {}
 
 # Serialize runs. Each run produces a unique artifact (a distinct git tag,
 # release, or formula update) so cancel-in-progress is false — we want
@@ -19,6 +19,15 @@ jobs:
   tag:
     name: Tag version bump
     runs-on: ubuntu-latest
+    # RELEASE_APP_PRIVATE_KEY lives only in the `release` environment, whose
+    # deployment policy allows `main` and `v*` tags (ADR-0044 (i)). The `v*`
+    # tag ruleset lets only this App create a tag, so this job is the one
+    # path to a release.
+    environment: release
+    # GITHUB_TOKEN only reads; the tag push authenticates with the App token.
+    permissions:
+      contents: read # clone the repo and resolve existing tags
+      pull-requests: read # find the release PR that produced this commit
     steps:
       - name: Generate Forge Bellows token
         id: app-token
@@ -36,28 +45,87 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
 
+      # `persist-credentials: false`: no token is written into .git/config.
+      # The checkout reads with the job's `contents: read` GITHUB_TOKEN; the
+      # App token goes to the push step alone.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Extract version and check for existing tag
         id: check
         run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          set -euo pipefail
+          # [workspace.package] is the first `version =` line in Cargo.toml.
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          # Anchored charset check: a version carrying a newline would
+          # otherwise forge $GITHUB_OUTPUT keys.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Cargo.toml version is missing or not X.Y.Z: ${VERSION}"
+            exit 1
+          fi
           TAG="v${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
+          # Random delimiter, so even a loosened check cannot close the block
+          # and start a new key.
+          DELIM="EOF_$(openssl rand -hex 16)"
+          {
+            printf 'tag<<%s\n%s\n%s\n' "$DELIM" "$TAG" "$DELIM"
+            printf 'version<<%s\n%s\n%s\n' "$DELIM" "$VERSION" "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG already exists; nothing to tag."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Only the ship gate's merge releases. A version bump that reached main
+      # any other way (a hand-merged PR, a feature PR that bumps Cargo.toml)
+      # is not tagged: the commit must be the squash merge of a
+      # `chore(main): release <version>` PR opened and merged by the App.
+      - name: Require a gated release merge
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          VERSION: ${{ steps.check.outputs.version }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$APP_SLUG" =~ ^[a-z0-9-]+$ ]] || { echo "::error::bad app slug"; exit 1; }
+          bot="${APP_SLUG}[bot]"
+          title="chore(main): release ${VERSION}"
+          # GitHub links a merge commit to its PR shortly after the push, so
+          # an empty answer is retried; an API error still fails at once.
+          pr=''
+          for attempt in 1 2 3 4 5 6; do
+            pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" | jq -r --arg t "$title" --arg bot "$bot" \
+              '[.[] | select(.merged_at != null and .title == $t and .user.login == $bot)] | first | .number // ""')"
+            [[ -z "$pr" ]] || break
+            echo "No matching PR linked to ${HEAD_SHA} yet (attempt ${attempt}/6)."
+            sleep 10
+          done
+          [[ "$pr" =~ ^[0-9]+$ ]] || { echo "::error::${HEAD_SHA} is not the merge of a '${title}' PR opened by ${bot}; not tagging"; exit 1; }
+          merged_by="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --jq '.merged_by.login // ""')"
+          [[ "$merged_by" == "$bot" ]] || { echo "::error::#${pr} was merged by '${merged_by}', not ${bot} (the ship gate); not tagging"; exit 1; }
+          echo "#${pr} was merged by the ship gate; tagging."
+
+      # The App token reaches git through GIT_CONFIG_* environment variables,
+      # so it lands in neither .git/config, a remote URL git would echo in an
+      # error, nor the process argument list (forgectl auto-tag.yml pattern).
       - name: Create and push tag
         if: steps.check.outputs.exists == 'false'
         env:
           TAG: ${{ steps.check.outputs.tag }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          set -euo pipefail
           git tag "$TAG"
-          git push origin "$TAG"
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 | tr -d '\n')"
+          # Actions masks the raw token, not its base64 form; mask that too.
+          echo "::add-mask::${AUTH_HEADER}"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH_HEADER}" \
+            git push "https://github.com/${GITHUB_REPOSITORY}.git" -- "refs/tags/${TAG}:refs/tags/${TAG}"

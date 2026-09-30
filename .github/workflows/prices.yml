@@ -7,9 +7,12 @@ name: Prices
 # - `check`: offline, on every PR and push that touches the table or its
 #   generator. Runs the generator's unit tests and `--check`.
 # - `refresh`: network, weekly and on manual dispatch only. Regenerates the
-#   table and opens a PR when a rate moved. `workflow_dispatch` only appears
-#   once this file is on the default branch, so the first dispatch happens
-#   after merge, before the first cron fires.
+#   table from the third-party page and uploads it. Holds no token.
+# - `open-pr`: `release` environment. Mints the Forge Bellows token and opens
+#   a PR from `refresh`'s artifact when a rate moved. It never parses the page,
+#   so the page's parser never shares a job with the App key (security review
+#   I-1). `workflow_dispatch` only appears once this file is on the default
+#   branch, so the first dispatch happens after merge, before the first cron.
 
 on:
   push:
@@ -32,8 +35,7 @@ on:
     - cron: "17 8 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   check:
@@ -41,6 +43,8 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,19 +63,86 @@ jobs:
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One refresh at a time; a second queued run would only race the first
-    # to the same PR.
-    concurrency:
-      group: prices-refresh
-      cancel-in-progress: false
+    permissions:
+      contents: read
+    outputs:
+      drift: ${{ steps.drift.outputs.drift }}
+      base_sha: ${{ steps.drift.outputs.base_sha }}
     # Deliberately no ANTHROPIC_API_KEY or other secret in this job's env: the
     # generator's output becomes a public PR body, and log masking does not
     # cover PR bodies.
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      # --allow-removals: retired rows do leave the page, and without the flag
+      # the job would fail every week from then on. Removed rows are kept and
+      # named in a NOTE instead.
+      - name: Regenerate from the pricing page
+        run: |
+          python3 scripts/generate-prices.py --refresh --allow-removals \
+            --body-file "$RUNNER_TEMP/prices-body.md"
+
+      - name: Check for drift
+        id: drift
+        run: |
+          set -euo pipefail
+          # The commit the table was generated on; the PR commit's parent.
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- crates/metrics/prices.json; then
+            echo "No price drift."
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/prices/crates/metrics"
+          cp crates/metrics/prices.json "$RUNNER_TEMP/prices/crates/metrics/"
+          cp "$RUNNER_TEMP/prices-body.md" "$RUNNER_TEMP/prices/body.md"
+          echo "drift=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the new table
+        if: steps.drift.outputs.drift == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prices
+          path: ${{ runner.temp }}/prices/
+          retention-days: 1
+          if-no-files-found: error
+
+  open-pr:
+    name: Open price PR
+    needs: refresh
+    if: needs.refresh.outputs.drift == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One refresh PR at a time; a second queued run would only race the first
+    # to the same PR.
+    concurrency:
+      group: prices-refresh
+      cancel-in-progress: false
+    # RELEASE_APP_PRIVATE_KEY lives only in the `release` environment, whose
+    # deployment policy allows `main` and `v*` tags (ADR-0044 (i)).
+    environment: release
+    permissions:
+      contents: read # sparse checkout of .github/scripts
+    steps:
+      # main's own copy of the commit script.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download the new table
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prices
+          path: ${{ runner.temp }}/prices
+
       # A GITHUB_TOKEN-authored PR spawns no `pull_request` workflows, and the
       # ruleset requires no checks, so a price PR would be mergeable with zero
-      # tests run. The Forge Bellows app token is minted exactly as in
-      # auto-tag.yml so the PR runs CI like any other.
+      # tests run. The Forge Bellows App token makes the PR run CI like any
+      # other.
       - name: Generate Forge Bellows token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -81,62 +152,34 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      # No persisted credentials: the generator runs with no token in
-      # .git/config, and the push below names its credential explicitly.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-
       # A refresh PR left unreviewed would otherwise be joined by a new one
       # every Monday. Only this app's same-repo PRs count: anyone can open a
       # fork PR with a matching branch name, and that must not suppress the
-      # refresh.
-      - name: Skip while a refresh PR is open
-        id: open
+      # refresh. The commit goes through the REST API (commit-via-api.sh), so
+      # this job runs no git push and no repo code beyond that script.
+      - name: Open a PR unless one is open
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ needs.refresh.outputs.base_sha }}
         run: |
-          count=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+          set -euo pipefail
+          count=$(gh pr list --repo "$REPO" --state open --limit 100 \
             --json headRefName,isCrossRepository,author |
             jq --arg author "app/${APP_SLUG}" \
               '[.[] | select((.isCrossRepository | not) and .author.login == $author and (.headRefName | startswith("chore/prices-refresh-")))] | length')
-          echo "count=$count" >> "$GITHUB_OUTPUT"
           if [ "$count" != "0" ]; then
             echo "A refresh PR is already open; skipping."
-          fi
-
-      # --allow-removals: retired rows do leave the page, and without the flag
-      # the job would fail every week from then on. Removed rows are kept and
-      # named in a NOTE instead.
-      - name: Regenerate from the pricing page
-        if: steps.open.outputs.count == '0'
-        run: |
-          python3 scripts/generate-prices.py --refresh --allow-removals \
-            --body-file "$RUNNER_TEMP/prices-body.md"
-
-      - name: Open a PR when a rate moved
-        if: steps.open.outputs.count == '0'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          if git diff --quiet -- crates/metrics/prices.json; then
-            echo "No price drift."
             exit 0
           fi
-          bot="${APP_SLUG}[bot]"
-          bot_id=$(gh api "/users/${bot}" --jq .id)
-          git config user.name "$bot"
-          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          jq -e 'type == "object"' "$RUNNER_TEMP/prices/crates/metrics/prices.json" > /dev/null \
+            || { echo "::error::prices.json artifact is not a JSON object"; exit 1; }
           # The run id keeps a same-day re-dispatch from colliding with a
           # branch an earlier run left behind.
           branch="chore/prices-refresh-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
-          git switch -c "$branch"
-          git add crates/metrics/prices.json
-          git commit -m "chore(metrics): refresh prices.json from the published pricing table"
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$branch"
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
-            --title "chore(metrics): refresh prices.json from the published pricing table" \
-            --body-file "$RUNNER_TEMP/prices-body.md"
+          title="chore(metrics): refresh prices.json from the published pricing table"
+          BRANCH="$branch" FILES_DIR="$RUNNER_TEMP/prices" MESSAGE="$title" \
+            bash .github/scripts/commit-via-api.sh crates/metrics/prices.json
+          gh pr create --repo "$REPO" --base main --head "$branch" \
+            --title "$title" --body-file "$RUNNER_TEMP/prices/body.md"

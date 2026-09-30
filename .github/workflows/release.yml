@@ -4,10 +4,9 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+# Deny by default; each job grants what it needs. Only `release` can request
+# an OIDC token, so only it can sign as this workflow (security review I-6).
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,9 +19,70 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A `v*` tag names a release, and the signing identity below is
+  # `release.yml@refs/tags/v*`. The tag ruleset lets only the Forge Bellows App
+  # create one, and auto-tag.yml does that after a gated merge. This job is
+  # the second check: the tagged commit must be on main and CI's push run for
+  # it must have succeeded. Nothing builds or signs until it passes.
+  verify:
+    name: Verify tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read # compare the tagged commit with main
+      actions: read # read CI's workflow runs
+    steps:
+      - name: Tagged commit is on main with green CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # CI is identified by its workflow file, not by "any green check":
+          # another app or workflow's success must not stand in for it.
+          CI_WORKFLOW: ci.yml
+          # CI takes about 5 minutes; 45 leaves room for a queue.
+          POLL_SECONDS: 30
+          POLL_LIMIT: 90
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::github.sha is not 40-hex"; exit 1; }
+
+          # Resolve the branch by its full ref first, so a tag named `main`
+          # cannot stand in for it. `<main>...SHA` is `behind` or `identical`
+          # exactly when SHA is an ancestor of main (or main itself).
+          main_sha="$(gh api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve refs/heads/main"; exit 1; }
+          status="$(gh api "repos/${REPO}/compare/${main_sha}...${SHA}" --jq .status)"
+          case "$status" in
+            behind | identical) echo "${SHA} is on main (${status})." ;;
+            *) echo "::error::${SHA} is not an ancestor of main (compare status: ${status})"; exit 1 ;;
+          esac
+
+          for ((i = 1; i <= POLL_LIMIT; i++)); do
+            # The newest push-event run of CI on main for exactly this commit.
+            run="$(gh api "repos/${REPO}/actions/workflows/${CI_WORKFLOW}/runs?head_sha=${SHA}&event=push&branch=main&per_page=100" \
+              | jq -c '.workflow_runs | if type == "array" then (sort_by(.created_at) | last // {}) else error("not an array") end')"
+            state="$(jq -r '"\(.status // "none")/\(.conclusion // "none")"' <<< "$run")"
+            case "$state" in
+              completed/success)
+                echo "CI run $(jq -r .html_url <<< "$run") succeeded for ${SHA}."
+                exit 0 ;;
+              completed/*)
+                echo "::error::CI ($(jq -r .html_url <<< "$run")) concluded ${state#completed/} for ${SHA}; not releasing."
+                exit 1 ;;
+            esac
+            echo "CI for ${SHA} is ${state} (poll ${i}/${POLL_LIMIT})."
+            sleep "$POLL_SECONDS"
+          done
+          echo "::error::CI never completed for ${SHA} within the poll limit; not releasing."
+          exit 1
+
   build:
     name: Build ${{ matrix.name }}
+    needs: verify
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -51,15 +111,17 @@ jobs:
             target: x86_64-pc-windows-msvc
             use-cross: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross
-        run: cargo install cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Build release binary
         # Force bash so the conditional runs the same on the Windows runner,
@@ -102,7 +164,7 @@ jobs:
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ARCHIVE }}
@@ -110,17 +172,31 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
+    # The only job that can sign: cosign and both attestations run here, in
+    # release.yml itself, so the certificate identity stays this file at the
+    # tag. It holds no App key; the tap update is its own job below.
+    permissions:
+      contents: write # create the GitHub release and upload its assets
+      id-token: write # keyless cosign and attestation signing
+      attestations: write # store the attestations
+    outputs:
+      sha_macos_x86_64: ${{ steps.shas.outputs.sha_macos_x86_64 }}
+      sha_macos_aarch64: ${{ steps.shas.outputs.sha_macos_aarch64 }}
+      sha_linux_x86_64: ${{ steps.shas.outputs.sha_linux_x86_64 }}
+      sha_linux_aarch64: ${{ steps.shas.outputs.sha_linux_aarch64 }}
     steps:
       # Checkout + toolchain are needed for the CycloneDX SBOM step below — the
       # release job otherwise only consumes the build job's artifacts.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
 
@@ -133,7 +209,7 @@ jobs:
       # per-crate aggregation needed. One platform-independent file ships.
       - name: Generate SBOM (CycloneDX)
         run: |
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
           cargo cyclonedx --format json
           SBOM="cadence-hooks-${GITHUB_REF_NAME}.cdx.json"
           # cargo-cyclonedx writes <package>.cdx.json next to the manifest;
@@ -143,7 +219,7 @@ jobs:
           echo "SBOM=${SBOM}" >> "${GITHUB_ENV}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
@@ -152,7 +228,7 @@ jobs:
       # Attest the SBOM against the binaries it describes. Complements (does not
       # replace) the build-provenance attestation above.
       - name: Attest SBOM
-        uses: actions/attest-sbom@v4
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
@@ -160,7 +236,7 @@ jobs:
           sbom-path: ${{ env.SBOM }}
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       # Detached keyless signature over checksums.txt — one signature covers
       # every artifact by hash (goreleaser convention). Gives an offline,
@@ -171,7 +247,7 @@ jobs:
         run: cosign sign-blob --yes --bundle checksums.txt.cosign.bundle checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
           files: |
@@ -181,23 +257,45 @@ jobs:
             checksums.txt.cosign.bundle
             ${{ env.SBOM }}
 
-      - name: Clean up beta prereleases
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release list --limit 50 | grep "${VERSION}-beta" | awk '{print $1}' | while read -r tag; do
-            gh release delete "$tag" --yes --cleanup-tag || true
-          done
-
       - name: Parse checksums for Homebrew
         id: shas
         run: |
+          set -euo pipefail
           for platform in macos-x86_64 macos-aarch64 linux-x86_64 linux-aarch64; do
-            SHA=$(grep "${platform}" checksums.txt | awk '{print $1}')
+            SHA="$(awk -v p="$platform" 'index($2, p) {print $1}' checksums.txt)"
             KEY=$(echo "$platform" | tr '-' '_')
+            [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no sha256 for ${platform} in checksums.txt"; exit 1; }
             echo "sha_${KEY}=${SHA}" >> "$GITHUB_OUTPUT"
           done
+
+  # The App key is minted here, away from the build tooling and the signing
+  # job: this job checks out nothing and runs one pinned action plus `gh`. It
+  # receives only the four checksums (security review I-1).
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # RELEASE_APP_PRIVATE_KEY lives only in the `release` environment, whose
+    # deployment policy allows `main` and `v*` tags (ADR-0044 (i)).
+    environment: release
+    permissions: {}
+    steps:
+      - name: Check checksums
+        env:
+          SHAS: >-
+            ${{ needs.release.outputs.sha_macos_x86_64 }}
+            ${{ needs.release.outputs.sha_macos_aarch64 }}
+            ${{ needs.release.outputs.sha_linux_x86_64 }}
+            ${{ needs.release.outputs.sha_linux_aarch64 }}
+        run: |
+          set -euo pipefail
+          n=0
+          for sha in $SHAS; do
+            [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::not a sha256: ${sha}"; exit 1; }
+            n=$((n + 1))
+          done
+          [[ "$n" == 4 ]] || { echo "::error::expected 4 checksums, got ${n}"; exit 1; }
 
       - name: Generate Forge Bellows token
         id: app-token
@@ -215,11 +313,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ github.ref_name }}
-          SHA_MACOS_X86_64: ${{ steps.shas.outputs.sha_macos_x86_64 }}
-          SHA_MACOS_AARCH64: ${{ steps.shas.outputs.sha_macos_aarch64 }}
-          SHA_LINUX_X86_64: ${{ steps.shas.outputs.sha_linux_x86_64 }}
-          SHA_LINUX_AARCH64: ${{ steps.shas.outputs.sha_linux_aarch64 }}
+          SHA_MACOS_X86_64: ${{ needs.release.outputs.sha_macos_x86_64 }}
+          SHA_MACOS_AARCH64: ${{ needs.release.outputs.sha_macos_aarch64 }}
+          SHA_LINUX_X86_64: ${{ needs.release.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_AARCH64: ${{ needs.release.outputs.sha_linux_aarch64 }}
         run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag is not vX.Y.Z: ${VERSION}"; exit 1; }
           gh api repos/cameronsjo/homebrew-tap/dispatches \
             -f event_type=update-formula \
             -f "client_payload[formula]=cadence-hooks" \

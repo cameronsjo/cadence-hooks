@@ -1,0 +1,143 @@
+name: Ship
+
+# Nightly verified merge of the release PR (cadence-ecosystem ADR-0044).
+# Rendered from cadence-ecosystem scripts/release/ship.yml.tmpl by
+# render-ship.py; edit the template, not this file.
+#
+# The gate job reads and decides with GITHUB_TOKEN. Only when it says go does
+# the merge job mint a Forge Bellows App token and merge, pinned to the head
+# SHA the gate verified. Publishing is unchanged: the merge push fires the
+# repo's existing tag and release workflows.
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the gate only; never merge
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ship
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout, tags, releases, file contents at base and head
+      pull-requests: read # release PR, its commits and files
+      checks: read # check runs and check suites at head
+      statuses: read # combined commit status at head
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      pr: ${{ steps.gate.outputs.pr }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      title: ${{ steps.gate.outputs.title }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      # The default branch's copy of the gate, never the PR's: the PR is the
+      # thing under test and must not supply its own verifier.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Run gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: cameronsjo/cadence-hooks
+          BRANCH: main
+          BOT_LOGIN: "artificer-forge-bellows[bot]"
+          TAG_PREFIX: "v"
+          EVENT_NAME: ${{ github.event_name }}
+          SHIP_NIGHTLY: ${{ vars.SHIP_NIGHTLY }}
+          ALLOWLIST: |
+            Cargo.toml
+            Cargo.lock
+            CHANGELOG.md
+          REQUIRED_CHECKS: ""
+        run: bash .github/scripts/ship-gate.sh
+
+      - name: Summary
+        if: always()
+        env:
+          GO: ${{ steps.gate.outputs.go }}
+          PR: ${{ steps.gate.outputs.pr }}
+          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
+          REASON: ${{ steps.gate.outputs.reason }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # backticks are Markdown, not command substitution
+          printf 'ship gate: reason=`%s` go=`%s` pr=`%s` head=`%s` dry_run=`%s`\n' \
+            "${REASON:-none}" "${GO:-none}" "${PR:-none}" "${HEAD_SHA:-none}" "${DRY_RUN:-false}" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  merge:
+    name: Merge
+    needs: gate
+    # A schedule run has no inputs, so `inputs.dry_run != true` holds there.
+    # The ref check keeps a dispatch from a stale branch from merging.
+    # The ref check is hygiene only: a branch's copy of this file can drop it.
+    if: needs.gate.outputs.go == 'true' && inputs.dry_run != true && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # ADR-0044 (i) puts RELEASE_APP_PRIVATE_KEY only in the `release`
+    # environment, with a deployment policy of `main` and `v*` tags.
+    # Once the key is there and the repo-level copy is deleted, GitHub
+    # enforces the policy server-side and a workflow edited on another branch
+    # cannot read the key. While a repo-level copy exists, this line protects
+    # nothing: GitHub creates a missing environment with no policy.
+    environment: release
+    permissions: {}
+    steps:
+      # Scoped to this repo (the action's default) with only the two
+      # permissions a merge needs. ADR-0044 (i) lists every job that may hold
+      # the key; this one mints only after the gate has passed.
+      - name: Generate Forge Bellows token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Merge release PR at the verified head
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: cameronsjo/cadence-hooks
+          PR: ${{ needs.gate.outputs.pr }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          TITLE: ${{ needs.gate.outputs.title }}
+          REASON: ${{ needs.gate.outputs.reason }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title_re='^chore(\(main\))?: release v?[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::pr is not a number"; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::head_sha is not 40-hex"; exit 1; }
+          [[ "$TITLE" =~ $title_re ]] || { echo "::error::title is not a release title"; exit 1; }
+          [[ "$REASON" == go ]] || { echo "::error::gate reason is not go"; exit 1; }
+          [[ "$ACTOR" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]] || { echo "::error::unexpected actor login"; exit 1; }
+          # The squash commit on main is the tamper-evident audit record
+          # (non_fast_forward and deletion rules); the PR comment is a copy.
+          MSG="$(printf 'Merged by the ship gate (ADR-0044).\n\nRun: %s\nGate-Reason: %s\nVerified-Head: %s\nEvent: %s\nActor: %s\n' \
+            "$RUN_URL" "$REASON" "$HEAD_SHA" "$EVENT" "$ACTOR")"
+          # `sha` makes GitHub refuse the merge if the head moved after the gate.
+          gh api -X PUT "repos/${REPO}/pulls/${PR}/merge" \
+            -f sha="$HEAD_SHA" -f merge_method=squash \
+            -f commit_title="${TITLE} (#${PR})" -f commit_message="$MSG"
+          # shellcheck disable=SC2016 # backticks are Markdown, not command substitution
+          BODY="$(printf 'Merged by the ship gate (ADR-0044).\n\n- event: `%s`\n- actor: `%s`\n- run: %s\n- head: `%s`\n- reason: `%s`\n' \
+            "$EVENT" "$ACTOR" "$RUN_URL" "$HEAD_SHA" "$REASON")"
+          gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY" > /dev/null
+          echo "Merged #${PR} at ${HEAD_SHA}."
