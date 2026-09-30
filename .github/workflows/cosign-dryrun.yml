@@ -56,17 +56,15 @@ jobs:
           printf '%s  %s\n' "$(printf 'dryrun' | sha256sum | cut -d' ' -f1)" cadence-hooks-dryrun.tar.gz > checksums.txt
           cat checksums.txt
 
-      - name: Sign with --new-bundle-format=false (fallbacks recorded)
+      - name: Sign legacy variants
         run: |
           set -x
-          if cosign sign-blob --yes --new-bundle-format=false --bundle checksums.txt.legacy.bundle checksums.txt; then
-            echo "VARIANT=new-bundle-format=false"
-          elif cosign sign-blob --yes --new-bundle-format=false --use-signing-config=false --bundle checksums.txt.legacy.bundle checksums.txt; then
-            echo "VARIANT=new-bundle-format=false+use-signing-config=false"
-          else
-            echo "VARIANT=NONE (legacy signing failed)"; exit 1
-          fi
-          head -c 400 checksums.txt.legacy.bundle; echo
+          # A: --new-bundle-format=false alone (run 1 showed this still emits v0.3 protobuf)
+          cosign sign-blob --yes --new-bundle-format=false --bundle checksums.txt.legacyA.bundle checksums.txt
+          head -c 120 checksums.txt.legacyA.bundle; echo
+          # B: also disable TUF signing config, which otherwise forces the new format
+          cosign sign-blob --yes --new-bundle-format=false --use-signing-config=false --bundle checksums.txt.legacy.bundle checksums.txt
+          head -c 120 checksums.txt.legacy.bundle; echo
 
       - name: Dump bundle (fallback evidence)
         if: always()
@@ -80,3 +78,4 @@ jobs:
           path: |
             checksums.txt
             checksums.txt.legacy.bundle
+            checksums.txt.legacyA.bundle
