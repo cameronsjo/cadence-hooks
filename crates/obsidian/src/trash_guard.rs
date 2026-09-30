@@ -227,7 +227,7 @@ fn coproc_command(argv: &[String]) -> Option<&[String]> {
 
 /// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
 fn is_destructive_at(command: &str, depth: usize) -> bool {
-    for segment in segments_of(command).iter().cloned() {
+    for segment in segments_of(command).iter() {
         // Compound scaffolding first: `for f in *.md; do rm $f; done` segments
         // as `do rm $f`, `case x in x) rm $f;; esac` as `case x in x) rm $f`,
         // and `f() { rm $f; }` as `f() { rm $f` — so without this the head word
@@ -235,7 +235,7 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // wrapper hunt inside `command_segments` runs the SAME
         // `executable_tokens`, so a shell wrapper in those bodies is expanded
         // rather than hidden (#528 review E).
-        let tokens = executable_tokens(&segment);
+        let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
         if head_deletes(argv) {
             return true;
@@ -636,8 +636,8 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// unquoted redirections are skipped; `find` contributes its start paths. A
 /// deletion whose operands arrive on stdin (`xargs rm`) names none here.
 fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
-    for segment in segments_of(command).iter().cloned() {
-        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+    for segment in segments_of(command).iter() {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else {
             continue;
@@ -802,8 +802,8 @@ const GLOB_CHARS: &[char] = &['*', '?', '[', '{', '$', '`'];
 /// path applies), so a deletion that follows can reach the vault through what
 /// it made: the physical check reads the disk before the link exists.
 fn sibling_reshapes_vault(command: &str, cwd: &str, vault: &str, home: Option<&str>) -> bool {
-    for segment in segments_of(command).iter().cloned() {
-        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+    for segment in segments_of(command).iter() {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else {
             continue;
@@ -818,7 +818,7 @@ fn sibling_reshapes_vault(command: &str, cwd: &str, vault: &str, home: Option<&s
             }),
             _ => false,
         };
-        if !makes_link || is_inert_segment(argv, &segment) {
+        if !makes_link || is_inert_segment(argv, segment) {
             continue;
         }
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
@@ -1014,8 +1014,8 @@ fn check_destructive_in_vault_at(
     // fails open (cameronsjo/cadence-hooks#1233). The verdict for a target
     // does not depend on which segment named it.
     let mut judged = std::collections::HashSet::new();
-    for segment in segments_of(command).iter().cloned() {
-        for target in clobber_redirect_targets(&segment)
+    for segment in segments_of(command).iter() {
+        for target in clobber_redirect_targets(segment)
             .into_iter()
             .flat_map(|target| with_brace_expansion(&target))
         {
