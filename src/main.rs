@@ -598,6 +598,8 @@ enum SessionCommands {
     WarnPlanReadyFlip,
     /// Block ExitPlanMode on a plan with no settled Panel: line; nudge on other missing stanzas (PreToolUse:ExitPlanMode)
     LintPlanShape,
+    /// Ask to confirm a /model switch away from the in-flight plan's Driver family (PreModelSwitch)
+    PlanDriver,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -741,6 +743,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
             SessionCommands::LintPlanShape => "lint-plan-shape",
+            SessionCommands::PlanDriver => "plan-driver",
             // declare, status, and plans are CLI actions, not hooks — no
             // hooks.json wiring and not subject to CADENCE_DISABLE (same
             // treatment as dismiss-main-branch-warn).
@@ -769,6 +772,7 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let pre_model_switch = HookEvent::PreModelSwitch;
     Some(match cmd {
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => CheckPlan::new(
@@ -1096,6 +1100,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             SessionCommands::LintPlanShape => CheckPlan::new(
                 Box::new(cadence_hooks_session::plan_guards::LintPlanShape),
                 pre,
+            ),
+            SessionCommands::PlanDriver => CheckPlan::new(
+                Box::new(cadence_hooks_session::plan_driver::PlanDriver),
+                pre_model_switch,
             ),
             _ => return None,
         },
