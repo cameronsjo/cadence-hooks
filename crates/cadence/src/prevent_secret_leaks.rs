@@ -310,7 +310,11 @@ struct ScanContext {
     /// The `gh api`/`tea api` endpoint exemption may apply: the command
     /// mentions `api`, its words split as bash splits them
     /// ([`tokenizer_word_boundaries_match_bash`]), and nothing in it may rebind
-    /// the client ([`api_client_may_be_rebound`]) (#1237).
+    /// the client ([`api_client_may_be_rebound`]) (#1237). Nor may it mention
+    /// `$_` or `${_`: bash sets `$_` to the last argument of the previous
+    /// command, so `gh api .env; cat "$_"` reads the exempted endpoint as a
+    /// file. Which segment a `$_` binds to is not modeled — any mention drops
+    /// the exemption.
     api_endpoint_trusted: bool,
 }
 
@@ -5519,6 +5523,8 @@ fn bash_leaks_secrets_within(
                 .iter()
                 .any(|t| is_assignment_word(t) && t.starts_with("GIT_")),
             api_endpoint_trusted: command.contains("api")
+                && !command.contains("$_")
+                && !command.contains("${_")
                 && tokenizer_word_boundaries_match_bash(command)
                 && !api_client_may_be_rebound(command),
         };
@@ -12366,6 +12372,20 @@ mod api_endpoint_tests {
             // The exemption is one word of one segment.
             "gh api /x; cat .env",
             "gh api .env | cat .env",
+            // `$_` is the previous command's last argument: the endpoint.
+            "gh api .env; cat \"$_\"",
+            "tea api --login s .env; grep . \"$_\"",
+            "for p in 1; do gh api .env; done; cat \"$_\"",
+            "gh api .env; while read l; do echo $l; done < \"$_\"",
+            "gh api .env && cat \"$_\"",
+            "gh api .env || cat \"$_\"",
+            "gh api .env | cat \"$_\"",
+            "gh api .env\ncat \"$_\"",
+            "gh api .env; x=$_; cat \"$x\"",
+            "gh api .env; cat \"${_}\"",
+            "gh api .env; mapfile -t a < \"$_\"; echo \"${a[@]}\"",
+            "gh api .env; exec 3<$_; cat <&3",
+            "trap 'cat \"$_\"' DEBUG; gh api .env; true",
             "for p in 1; do gh api \"/r?p=$p\" --input .env; done",
         ] {
             assert_eq!(verdict(command).outcome, Outcome::Block, "{command}");
