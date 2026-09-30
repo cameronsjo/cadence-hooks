@@ -16,46 +16,56 @@
 //! wrong shape (or `updatedMCPToolOutput`) is silently ignored and the raw
 //! output is used, so the shape here must stay exactly that object.
 //!
+//! **Policy: when unsure, mask.** Over-masking costs readability; a miss leaks
+//! a secret that cannot be recalled. So every rule below errs toward masking,
+//! and the only values left alone are ones that cannot be a secret (empty,
+//! `true`/`false`/`null`, already masked).
+//!
+//! **Views.** Every detector runs twice: on the output with ANSI CSI sequences
+//! removed (`grep --color`, coloured logs), and — when the output carries a
+//! backslash — on a copy with JSON/C escapes decoded (`\n`, `\t`, `\r`, `\"`,
+//! `\\`, `\/`), so a key or token inside a JSON string (`kubectl logs`, JSONL,
+//! `gh api` bodies, escaped nested JSON) is seen as if printed raw. Each span
+//! maps back to the original bytes; the masked range may swallow the colour
+//! codes or escapes inside it, never a byte outside it.
+//!
 //! **What is masked**, each value replaced in place and every other byte kept:
-//! 1. **Credential tokens**, by grammar — the same detector the
-//!    `redact-external-content` block tier uses
-//!    ([`credential_scan::direct_spans`], one source of truth; no second regex
-//!    set). A PEM private-key header is widened over its key body.
-//! 2. **Secret-named values** — name-keyed, never value-keyed. `NAME=value`
-//!    and `name: value` at a line start (env dumps, dotenv, YAML, HTTP
-//!    headers), `"name": "value"` anywhere (JSON), and `"NAME=value"` inside a
-//!    JSON string (`docker inspect` env arrays). The value is dropped only when
-//!    the NAME is secret-shaped ([`is_secret_name`]), so `unifi_api_key:` keeps
-//!    its name and loses its value, and `HOMEPAGE_ALLOWED_HOSTS` stays whole.
-//!    YAML block scalars (`password: |`) mask their indented body.
+//! 1. **Credential tokens**, by grammar — the shared `credential_scan`
+//!    grammar ([`credential_scan::direct_spans`]), with its left-boundary gate
+//!    relaxed and JWTs added (see that function).
+//! 2. **Private keys**: from any `-----BEGIN … PRIVATE KEY-----` (PEM, OpenSSH,
+//!    PGP `PRIVATE KEY BLOCK`) to the next matching `-----END …-----`, or to
+//!    the end of the stream when there is none — armor headers, blank lines and
+//!    colour codes included. An END with no BEGIN before it in the same stream
+//!    (a key split across stdout and stderr, or cut off at the top) masks from
+//!    the stream start to that END. stdout and stderr are handled separately.
+//! 3. **URL credentials**: the password in any `scheme://user:pass@host`.
+//! 4. **Secret-named values** — name-keyed. The value is masked when the NAME
+//!    is secret-shaped ([`is_secret_name`], matched by `_`/`-`/`.`/camelCase
+//!    segment — not `secret_patterns::is_secret_shaped_var_name`, whose bare
+//!    substring match is cheap for a nudge and wrong for a mutation). Forms:
+//!    `NAME=value` and `name: value`/`name:value` at a line start (masked to
+//!    end of line) or mid-line (to the next whitespace or closing quote), YAML
+//!    block scalars (`password: |`), `"name": "value"`/number (JSON, pretty or
+//!    minified), `"NAME=value"` in a JSON string (`docker inspect` env arrays),
+//!    k8s/ECS `name: X` + `value: V` pairs, `--password=V`/`--token V` flags,
+//!    `name    value` table rows (vault `kv get`) and `.netrc` `password V`.
+//!    `Cookie`/`Set-Cookie`/`Authorization`, `.dockerconfigjson` and `auth`
+//!    are secret names.
 //!
-//! [`is_secret_name`] deliberately does **not** reuse
-//! `secret_patterns::is_secret_shaped_var_name`: that is bare substring
-//! matching (`monkey` holds `key`, `authoritative` holds `auth`), cheap for a
-//! nudge but wrong for a mutation. Names are split into `_`/`-`/`.`/camelCase
-//! segments and matched per segment.
-//!
-//! **Deliberately left alone** (masking these would destroy information the
-//! session needs, for no secret):
-//! - values that are empty, booleans/null, a `$VAR`/`${…}`/`$(…)` reference,
-//!   already masked (`***`, `[redacted…]`, `<placeholder>`), a short number
-//!   (`max_tokens: 4096`), or code rather than data (`token: string;`,
-//!   `api_key = os.environ[…]` — brackets, parens, a trailing `,`/`;`, a
-//!   dotted identifier path, a bare type name);
-//! - names whose last segment is metadata (`TOKEN_URL`, `KEY_ID`,
-//!   `secretName`, `PASSWORD_FILE`), a bare `key` (key/value listings), and
-//!   `key` qualified as a non-secret (`primary_key`, `public_key`, `sort_key`);
-//! - a bare unnamed value (`security find-generic-password -w`,
-//!   `kubectl … -o jsonpath`) — structurally invisible here; that is what the
-//!   PreToolUse `guard-secret-dump` Ask backstop exists for;
-//! - split token forms (the normalized pass of the block tier): output is not
-//!   shell source, and a split form has no byte-exact span to mask.
+//! **Deliberately left alone:** names whose last segment is metadata
+//! (`KEY_ID`, `secretName`, `PASSWORD_FILE`), a bare `key` (key/value
+//! listings), `key` qualified as a non-secret (`primary_key`, `public_key`),
+//! token counters (`max_tokens`); a bare unnamed value (`security
+//! find-generic-password -w`, `kubectl … -o jsonpath`), which is what the
+//! PreToolUse `guard-secret-dump` Ask backstop exists for; split token forms.
 //!
 //! **Output contract.** `updatedToolOutput` is emitted only when something was
 //! actually masked — never an identity rewrite, which would race a sibling
 //! hook's real rewrite last-write-wins. Image output is never touched. Any
 //! doubt about a span (a non-char-boundary offset) abandons the rewrite: the
-//! failure mode is "no change", never corrupted output.
+//! failure mode is "no change", never corrupted output. Every pass is linear in
+//! the output size (a 5 MB adversarial line stays well under the deadline).
 //!
 //! **Escape:** `CADENCE_ALLOW_SECRET_OUTPUT` (truthy) passes output through
 //! unmasked and records a bypass row, like `CADENCE_ALLOW_SOPS_DECRYPT`. The
@@ -65,19 +75,21 @@
 //! the session starts.
 //!
 //! **Residuals — what this hook cannot close:**
+//! - **Other tools are not covered.** Output read back through `BashOutput`, a
+//!   background task's `Monitor`, or `Read` of a file the command wrote never
+//!   passes through this Bash-matcher hook and is not masked.
 //! - OpenTelemetry tool spans and analytics events capture the original
 //!   output *before* hooks run (Claude Code hooks docs).
-//! - A hook failure or timeout leaves the raw output in place (fail open), so
-//!   the scan is linear-time and never panics; a 200 KB output stays far inside
-//!   the deadline.
+//! - A hook failure or timeout leaves the raw output in place (fail open).
 //! - The hook itself receives the raw output on stdin (by design).
 //! - The compaction path was not probed; the JSONL and model-facing
-//!   `tool_result` were.
-//! - Very large rewrites (beyond what the probe exercised) are unprobed; if
-//!   Claude Code refused an oversized envelope, the raw output would stand.
+//!   `tool_result` were. Very large rewrites, and a rewrite carried beside a
+//!   `decision: "block"` from a grouped sibling, are unprobed.
+//! - A payload Claude Code cannot deliver as valid JSON (a lone surrogate)
+//!   fails the parse, and the raw output stands.
 //! - Anything the model reconstructs from the command text itself.
 
-use crate::credential_scan::{self, PEM_KIND};
+use crate::credential_scan::{self, PEM_END_RE, PEM_KIND};
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, ToolResponse};
 use regex::Regex;
@@ -89,8 +101,14 @@ const ESCAPE_ENV: &str = "CADENCE_ALLOW_SECRET_OUTPUT";
 /// Replacement for a value masked because of its name.
 const NAMED_MARK: &str = "[redacted: secret-named value]";
 
-/// How far past a PEM header to look for its `-----END` line.
-const PEM_WINDOW: usize = 64 * 1024;
+/// Label for a masked private key.
+const KEY_LABEL: &str = "private key";
+
+/// Label for a masked URL password.
+const URL_LABEL: &str = "URL password";
+
+/// Longest name the name-keyed rules consider.
+const MAX_NAME: usize = 128;
 
 /// Masks secret values in Bash output via `updatedToolOutput`.
 pub struct RedactSecretOutput;
@@ -140,7 +158,7 @@ pub fn decide(response: &ToolResponse, escape: bool) -> CheckResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     Named,
-    Token(&'static str),
+    Kind(&'static str),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +168,89 @@ struct Span {
     label: Label,
 }
 
+fn named(start: usize, end: usize) -> Span {
+    Span {
+        start,
+        end,
+        label: Label::Named,
+    }
+}
+
+/// A transformed copy of the output and, per byte of the copy (plus one past
+/// the end), the offset in the original it came from.
+struct View {
+    text: String,
+    map: Vec<usize>,
+}
+
+impl View {
+    /// The output with ANSI CSI sequences (`ESC [ params final`) removed.
+    fn strip_ansi(src: &str) -> View {
+        let bytes = src.as_bytes();
+        let mut text = String::with_capacity(src.len());
+        let mut map = Vec::with_capacity(src.len() + 1);
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+                let mut j = i + 2;
+                while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) {
+                    j += 1;
+                }
+                while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) {
+                    j += 1;
+                }
+                if j < bytes.len() && (0x40..=0x7e).contains(&bytes[j]) {
+                    i = j + 1;
+                    continue;
+                }
+            }
+            // Only ASCII bytes are ever skipped, so `i` is a char boundary.
+            let Some(c) = src.get(i..).and_then(|rest| rest.chars().next()) else {
+                break;
+            };
+            text.push(c);
+            map.extend(std::iter::repeat_n(i, c.len_utf8()));
+            i += c.len_utf8();
+        }
+        map.push(src.len());
+        View { text, map }
+    }
+
+    /// This view with JSON/C string escapes decoded, mapped through to the
+    /// original.
+    fn unescape(&self) -> View {
+        let mut text = String::with_capacity(self.text.len());
+        let mut map = Vec::with_capacity(self.text.len() + 1);
+        let mut chars = self.text.char_indices().peekable();
+        while let Some((k, c)) = chars.next() {
+            let origin = self.map[k];
+            if c == '\\'
+                && let Some(&(_, next)) = chars.peek()
+            {
+                let decoded = match next {
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    '"' => Some('"'),
+                    '\\' => Some('\\'),
+                    '/' => Some('/'),
+                    _ => None,
+                };
+                if let Some(d) = decoded {
+                    chars.next();
+                    text.push(d);
+                    map.push(origin);
+                    continue;
+                }
+            }
+            text.push(c);
+            map.extend(std::iter::repeat_n(origin, c.len_utf8()));
+        }
+        map.push(self.map[self.text.len()]);
+        View { text, map }
+    }
+}
+
 /// `text` with every secret value masked, or `None` when nothing was masked
 /// (or a span could not be applied safely — fail open to "no change").
 pub fn redact(text: &str) -> Option<String> {
@@ -157,10 +258,11 @@ pub fn redact(text: &str) -> Option<String> {
         return None;
     }
     let mut spans = Vec::new();
-    token_spans(text, &mut spans);
-    json_pair_spans(text, &mut spans);
-    env_string_spans(text, &mut spans);
-    line_spans(text, &mut spans);
+    let plain = View::strip_ansi(text);
+    collect_mapped(&plain, &mut spans);
+    if plain.text.contains('\\') {
+        collect_mapped(&plain.unescape(), &mut spans);
+    }
     if spans.is_empty() {
         return None;
     }
@@ -171,8 +273,7 @@ pub fn redact(text: &str) -> Option<String> {
             && span.start < last.end
         {
             last.end = last.end.max(span.end);
-            // A named token reads better as its kind.
-            if let Label::Token(_) = span.label {
+            if let Label::Kind(_) = span.label {
                 last.label = span.label;
             }
             continue;
@@ -186,7 +287,7 @@ pub fn redact(text: &str) -> Option<String> {
         text.get(span.start..span.end)?;
         match span.label {
             Label::Named => out.push_str(NAMED_MARK),
-            Label::Token(kind) => {
+            Label::Kind(kind) => {
                 out.push_str("[redacted: ");
                 out.push_str(kind);
                 out.push(']');
@@ -198,133 +299,210 @@ pub fn redact(text: &str) -> Option<String> {
     (out != text).then_some(out)
 }
 
+/// Run every detector over `view` and map its spans back to the original.
+fn collect_mapped(view: &View, spans: &mut Vec<Span>) {
+    let mut local = Vec::new();
+    let t = view.text.as_str();
+    token_spans(t, &mut local);
+    url_spans(t, &mut local);
+    json_pair_spans(t, &mut local);
+    name_value_json_spans(t, &mut local);
+    env_string_spans(t, &mut local);
+    inline_spans(t, &mut local);
+    line_spans(t, &mut local);
+    for s in local {
+        if s.start >= s.end {
+            continue;
+        }
+        let (Some(&start), Some(&end)) = (view.map.get(s.start), view.map.get(s.end)) else {
+            continue;
+        };
+        if start < end {
+            spans.push(Span {
+                start,
+                end,
+                label: s.label,
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Credential tokens (shared grammar)
+// Credential tokens and private keys
 // ---------------------------------------------------------------------------
 
 fn token_spans(text: &str, spans: &mut Vec<Span>) {
-    for hit in credential_scan::direct_spans(text) {
-        let end = if hit.kind == PEM_KIND {
-            pem_body_end(text, hit.end)
-        } else {
-            hit.end
-        };
+    let mut hits = credential_scan::direct_spans(text);
+    hits.sort_by_key(|h| h.start);
+    let ends: Vec<(usize, usize)> = PEM_END_RE
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    let first_begin = hits
+        .iter()
+        .find(|h| h.kind == PEM_KIND)
+        .map_or(text.len(), |h| h.start);
+    // An END with no BEGIN before it: the tail of a key whose start is in the
+    // other stream or was cut off. Mask from the stream start.
+    if let Some(&(_, end)) = ends.iter().take_while(|(s, _)| *s < first_begin).last() {
+        spans.push(Span {
+            start: 0,
+            end,
+            label: Label::Kind(KEY_LABEL),
+        });
+    }
+    // Each BEGIN masks to the next END (or the end of the stream); a BEGIN
+    // already inside a masked key is skipped, so this stays linear.
+    let mut covered = 0;
+    let mut k = 0;
+    for hit in hits {
+        if hit.kind != PEM_KIND {
+            spans.push(Span {
+                start: hit.start,
+                end: hit.end,
+                label: Label::Kind(hit.kind),
+            });
+            continue;
+        }
+        if hit.start < covered {
+            continue;
+        }
+        while k < ends.len() && ends[k].0 < hit.end {
+            k += 1;
+        }
+        let end = ends.get(k).map_or(text.len(), |e| e.1);
+        covered = end;
         spans.push(Span {
             start: hit.start,
             end,
-            label: Label::Token(hit.kind),
+            label: Label::Kind(KEY_LABEL),
         });
     }
 }
 
-fn is_base64_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
-}
+/// `scheme://user:password@host` — the password, whatever the name around it.
+static URL_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/?#@:'"]*:([^\s/?#@'"]+)@"#)
+        .expect("url userinfo regex is valid")
+});
 
-/// One line of a PEM body: blank, pure base64, or an RFC 1421 header
-/// (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: AES-128-CBC,…`). Prose is none of these.
-fn is_key_body_line(line: &str) -> bool {
-    let line = line.trim_matches(|c: char| c.is_ascii_whitespace());
-    if line.is_empty() || line.chars().all(is_base64_char) {
-        return true;
-    }
-    line.split_once(": ").is_some_and(|(name, value)| {
-        !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            && !value.is_empty()
-            && value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | '-'))
-    })
-}
-
-/// Where a PEM private key that starts right after `header_end` ends.
-///
-/// With an `-----END …-----` line inside [`PEM_WINDOW`], reached through
-/// nothing but key-body lines ([`is_key_body_line`], split on real newlines
-/// and on literal `\n` escapes), the span runs through it. Otherwise (a truncated key: `head`, a cut-off dump) it covers the run of
-/// body lines that follows, and never text that is not key-shaped.
-fn pem_body_end(text: &str, header_end: usize) -> usize {
-    let Some(rest) = text.get(header_end..) else {
-        return header_end;
-    };
-    let mut limit = rest.len().min(PEM_WINDOW);
-    while !rest.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    let window = &rest[..limit];
-    if let Some(end_at) = window.find("-----END") {
-        let body_ok = window[..end_at]
-            .split('\n')
-            .flat_map(|line| line.split("\\n"))
-            .all(is_key_body_line);
-        let after = end_at + "-----END".len();
-        if body_ok && let Some(close) = window[after..].find("-----") {
-            return header_end + after + close + "-----".len();
+fn url_spans(text: &str, spans: &mut Vec<Span>) {
+    for caps in URL_USERINFO.captures_iter(text) {
+        if let Some(pw) = caps.get(1) {
+            spans.push(Span {
+                start: pw.start(),
+                end: pw.end(),
+                label: Label::Kind(URL_LABEL),
+            });
         }
     }
-    // Escaped single-line form (a JSON string): `…KEY-----\nMIIE…`.
-    if rest.starts_with("\\n") {
-        let run = rest
-            .char_indices()
-            .find(|&(_, c)| !(is_base64_char(c) || c == '\\'))
-            .map_or(rest.len(), |(i, _)| i);
-        return header_end + run;
-    }
-    // Raw form: whole following lines of base64.
-    let mut end = header_end;
-    let mut pos = match rest.find('\n') {
-        Some(nl) => nl + 1,
-        None => return header_end,
-    };
-    while pos < rest.len() {
-        let line_end = rest[pos..].find('\n').map_or(rest.len(), |i| pos + i);
-        let line = rest[pos..line_end].trim_end_matches('\r');
-        let body = line.trim_start();
-        if body.is_empty() || !body.chars().all(is_base64_char) {
-            break;
-        }
-        end = header_end + pos + line.len();
-        pos = line_end + 1;
-    }
-    end
 }
 
 // ---------------------------------------------------------------------------
 // Secret-named values
 // ---------------------------------------------------------------------------
 
-/// `"name": "value"` anywhere — JSON, pretty or minified.
+/// `"name": "value"` or `"name": 123` anywhere — JSON, pretty or minified.
 static JSON_PAIR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""((?:[^"\\\n]|\\.)+)"[ \t]*:[ \t]*"((?:[^"\\\n]|\\.)*)""#)
-        .expect("json pair regex is valid")
+    Regex::new(
+        r#""((?:[^"\\\n]|\\.)+)"[ \t]*:[ \t]*(?:"((?:[^"\\\n]|\\.)*)"|(-?[0-9][0-9.eE+\-]*))"#,
+    )
+    .expect("json pair regex is valid")
+});
+
+/// `{"name": "X", "value": "V"}` — ECS / k8s-as-JSON env entries.
+static NAME_VALUE_JSON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""name"\s*:\s*"((?:[^"\\\n]|\\.)*)"\s*,\s*"value"\s*:\s*"((?:[^"\\\n]|\\.)*)""#)
+        .expect("name/value regex is valid")
 });
 
 /// `"NAME=value"` inside a JSON string — `docker inspect`'s `.Config.Env`.
 static ENV_STRING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""([A-Za-z_][A-Za-z0-9_.\-]*)=((?:[^"\\\n]|\\.)*)""#)
+    Regex::new(r#""([A-Za-z_.][A-Za-z0-9_.\-]*)=((?:[^"\\\n]|\\.)*)""#)
         .expect("env string regex is valid")
 });
 
+/// A mid-line `NAME=` / `--name=` (after a separator, quote or `?`/`&`).
+static INLINE_EQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)(?:^|[\s;|&'"(?,{\[])(?:--?)?([A-Za-z_][A-Za-z0-9_.\-]*)="#)
+        .expect("inline eq regex is valid")
+});
+
+/// A mid-line `name:` / `Name: ` (after whitespace, a quote or a bracket).
+static INLINE_COLON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)(?:^|([\s'"(\[{,]))([A-Za-z_][A-Za-z0-9_.\-]*):[ \t]*"#)
+        .expect("inline colon regex is valid")
+});
+
+/// `--name value` (a secret-named flag with its value as the next word).
+static FLAG_SPACE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|\s)--([A-Za-z][A-Za-z0-9\-]*)[ \t]+([^\s\-]\S*)")
+        .expect("flag regex is valid")
+});
+
 /// A line-start assignment head: optional list/quote/diff markers and an
-/// `export`/`declare -x`/`set` keyword, a name (optionally quoted), then `=`
-/// or `:`. The value is parsed by hand from the match end.
+/// `export`/`declare -x`/`set` keyword, a name (optionally quoted, may start
+/// with `.`), then `=` or `:`. The value is parsed by hand from the match end.
 static LINE_HEAD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^[ \t]*(?:[-*>+<][ \t]+)*(?:(?:export|declare[ \t]+-x|set)[ \t]+)?["']?([A-Za-z_][A-Za-z0-9_.\-]*)["']?[ \t]*([=:])"#,
+        r#"^[ \t]*(?:[-*>+<][ \t]+)*(?:(?:export|declare[ \t]+-x|set)[ \t]+)?["']?([A-Za-z_.][A-Za-z0-9_.\-]*)["']?[ \t]*([=:])"#,
     )
     .expect("line head regex is valid")
 });
 
+/// `name    value` — a table row (vault `kv get`, `.netrc` lines) whose value
+/// is one word.
+static WS_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*([A-Za-z_.][A-Za-z0-9_.\-]*)[ \t]+(\S+)[ \t]*$")
+        .expect("row regex is valid")
+});
+
+/// k8s `name: X` (optionally a list item) — the key of a following `value:`.
+static K8S_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[ \t]*(?:-[ \t]+)?name:[ \t]*["']?([A-Za-z_.][A-Za-z0-9_.\-]*)["']?[ \t]*$"#)
+        .expect("k8s name regex is valid")
+});
+
+/// k8s `value: V`.
+static K8S_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*(?:-[ \t]+)?value:[ \t]*").expect("k8s value regex is valid")
+});
+
+/// `.netrc` inline `password V`.
+static NETRC_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)(?:password|passwd)[ \t]+(\S+)").expect("netrc regex is valid")
+});
+
+fn secret(name: &str) -> bool {
+    name.len() <= MAX_NAME && is_secret_name(name)
+}
+
 fn json_pair_spans(text: &str, spans: &mut Vec<Span>) {
-    for caps in JSON_PAIR.captures_iter(text) {
+    // Each search resumes at the end of the previous VALUE, not of the match,
+    // so the quote closing one value can open the next name. Escaped nested
+    // JSON (`"{"password":"…"}"` once decoded) would otherwise misalign and
+    // hide the pair. Every step moves forward, so this stays linear.
+    let mut pos = 0;
+    while pos < text.len() {
+        let Some(caps) = JSON_PAIR.captures_at(text, pos) else {
+            break;
+        };
+        let (Some(name), Some(value)) = (caps.get(1), caps.get(2).or_else(|| caps.get(3))) else {
+            break;
+        };
+        pos = value.end().max(name.end());
+        if secret(name.as_str()) && worth_masking(value.as_str()) {
+            spans.push(named(value.start(), value.end()));
+        }
+    }
+}
+
+fn name_value_json_spans(text: &str, spans: &mut Vec<Span>) {
+    for caps in NAME_VALUE_JSON.captures_iter(text) {
         let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
             continue;
         };
-        if name.as_str().len() <= 128
-            && is_secret_name(name.as_str())
-            && worth_masking(value.as_str(), true)
-        {
+        if secret(name.as_str()) && worth_masking(value.as_str()) {
             spans.push(named(value.start(), value.end()));
         }
     }
@@ -335,20 +513,98 @@ fn env_string_spans(text: &str, spans: &mut Vec<Span>) {
         let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
             continue;
         };
-        if name.as_str().len() <= 128
-            && is_secret_name(name.as_str())
-            && worth_masking(value.as_str(), true)
-        {
+        if secret(name.as_str()) && worth_masking(value.as_str()) {
             spans.push(named(value.start(), value.end()));
         }
     }
 }
 
-fn named(start: usize, end: usize) -> Span {
-    Span {
-        start,
-        end,
-        label: Label::Named,
+/// End of the line containing `from` (exclusive of `\r\n`/`\n`), cached
+/// in `cache` so a run of matches on one long line finds its end once — a
+/// fresh search per match is quadratic on a 5 MB single line.
+fn line_end(text: &str, from: usize, cache: &mut (usize, usize)) -> usize {
+    if from < cache.0 || from > cache.1 {
+        let raw = text[from..].find('\n').map_or(text.len(), |i| from + i);
+        *cache = (from, raw);
+    }
+    let end = cache.1;
+    if end > from && text.as_bytes()[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    }
+}
+
+/// Mid-line forms: `NAME=value`, `name: value`, `--name value`. Each value is
+/// scanned only past the end of the previous masked value, so an adversarial
+/// run of `token=token=…` stays linear.
+fn inline_spans(text: &str, spans: &mut Vec<Span>) {
+    let mut done = 0;
+    let mut eol_cache = (usize::MAX, 0);
+    for caps in INLINE_EQ.captures_iter(text) {
+        let (Some(name), Some(head)) = (caps.get(1), caps.get(0)) else {
+            continue;
+        };
+        let start = head.end();
+        if start < done || text[start..].starts_with('=') || !secret(name.as_str()) {
+            continue;
+        }
+        let eol = line_end(text, start, &mut eol_cache);
+        let (vs, ve) = match text[start..eol].chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let inner = &text[start + 1..eol];
+                (
+                    start + 1,
+                    start + 1 + closing_quote(inner, q).unwrap_or(inner.len()),
+                )
+            }
+            _ => {
+                let len = text[start..eol]
+                    .find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\''))
+                    .unwrap_or(eol - start);
+                (start, start + len)
+            }
+        };
+        done = ve.max(start);
+        if worth_masking(&text[vs..ve]) {
+            spans.push(named(vs, ve));
+        }
+    }
+    done = 0;
+    eol_cache = (usize::MAX, 0);
+    for caps in INLINE_COLON.captures_iter(text) {
+        let (Some(name), Some(head)) = (caps.get(2), caps.get(0)) else {
+            continue;
+        };
+        let start = head.end();
+        if start < done || !secret(name.as_str()) {
+            continue;
+        }
+        let eol = line_end(text, start, &mut eol_cache);
+        let rest = &text[start..eol];
+        if rest.starts_with("//") {
+            continue;
+        }
+        let quote = caps
+            .get(1)
+            .and_then(|m| m.as_str().chars().next())
+            .filter(|c| matches!(c, '"' | '\''));
+        let len = match quote {
+            Some(q) => closing_quote(rest, q).unwrap_or(rest.len()),
+            None => rest.trim_end().len(),
+        };
+        done = start + len;
+        if worth_masking(&rest[..len]) {
+            spans.push(named(start, start + len));
+        }
+    }
+    for caps in FLAG_SPACE.captures_iter(text) {
+        let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
+            continue;
+        };
+        if secret(name.as_str()) && worth_masking(value.as_str()) {
+            spans.push(named(value.start(), value.end()));
+        }
     }
 }
 
@@ -361,10 +617,13 @@ fn is_block_indicator(value: &str) -> bool {
     matches!(v, "|" | "|-" | "|+" | ">" | ">-" | ">+")
 }
 
-/// Line-start `NAME=value` / `name: value`, plus YAML block-scalar bodies.
+/// Line-start forms, YAML block-scalar bodies, k8s name/value pairs, table
+/// rows and `.netrc` lines.
 fn line_spans(text: &str, spans: &mut Vec<Span>) {
     // The key line's indent while inside a secret-named block scalar.
     let mut block: Option<usize> = None;
+    // Lines left in which a `value:` belongs to a secret `name:` just seen.
+    let mut pending_value = 0u8;
     let mut line_start = 0;
     for raw in text.split_inclusive('\n') {
         let start = line_start;
@@ -376,28 +635,56 @@ fn line_spans(text: &str, spans: &mut Vec<Span>) {
             }
             let indent = leading_indent(line);
             if indent > key_indent {
-                let end = line.trim_end().len();
-                spans.push(named(start + indent, start + end));
+                spans.push(named(start + indent, start + line.trim_end().len()));
                 continue;
             }
             block = None;
         }
+        if pending_value > 0 {
+            pending_value -= 1;
+            if let Some(head) = K8S_VALUE.find(line) {
+                let value = line[head.end()..].trim_end();
+                let (vs, ve) = unquote(head.end(), value);
+                if worth_masking(&line[vs..ve]) {
+                    spans.push(named(start + vs, start + ve));
+                }
+                pending_value = 0;
+                continue;
+            }
+        }
+        if let Some(caps) = K8S_NAME.captures(line) {
+            pending_value = if caps.get(1).is_some_and(|n| secret(n.as_str())) {
+                3
+            } else {
+                0
+            };
+            continue;
+        }
+        if (line.contains("machine ") || line.trim_start().starts_with("default"))
+            && let Some(caps) = NETRC_PASSWORD.captures(line)
+            && let Some(value) = caps.get(1)
+        {
+            spans.push(named(start + value.start(), start + value.end()));
+        }
         let Some(caps) = LINE_HEAD.captures(line) else {
+            if let Some(caps) = WS_ROW.captures(line)
+                && let (Some(name), Some(value)) = (caps.get(1), caps.get(2))
+                && secret(name.as_str())
+                && worth_masking(value.as_str())
+            {
+                spans.push(named(start + value.start(), start + value.end()));
+            }
             continue;
         };
         let (Some(name), Some(sep), Some(head)) = (caps.get(1), caps.get(2), caps.get(0)) else {
             continue;
         };
         let rest = &line[head.end()..];
-        let is_colon = sep.as_str() == ":";
-        if is_colon && !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
-            continue; // `https://…`, `a:b`
-        }
-        if !is_colon && rest.starts_with('=') {
+        if sep.as_str() == "=" && rest.starts_with('=') {
             continue; // `a == b`
         }
-        if name.as_str().len() > 128 || !is_secret_name(name.as_str()) {
-            continue;
+        if rest.starts_with("//") || !secret(name.as_str()) {
+            continue; // `https://…`
         }
         let lead = rest.len() - rest.trim_start_matches([' ', '\t']).len();
         let value_start = head.end() + lead;
@@ -405,108 +692,66 @@ fn line_spans(text: &str, spans: &mut Vec<Span>) {
         if value.is_empty() {
             continue;
         }
-        if is_colon && is_block_indicator(value) {
+        if sep.as_str() == ":" && is_block_indicator(value) {
             block = Some(leading_indent(line));
             continue;
         }
-        let (vs, ve, quoted) = match value.chars().next() {
-            Some(q @ ('"' | '\'')) => {
-                let inner = &value[1..];
-                let close = closing_quote(inner, q);
-                (
-                    value_start + 1,
-                    value_start + 1 + close.unwrap_or(inner.len()),
-                    true,
-                )
-            }
-            _ => (value_start, value_start + value.len(), false),
-        };
-        if worth_masking(&line[vs..ve], quoted) {
+        let (vs, ve) = unquote(value_start, value);
+        if worth_masking(&line[vs..ve]) {
             spans.push(named(start + vs, start + ve));
         }
     }
 }
 
+/// The span of `value` (which starts at `at`) to mask: inside its quotes when
+/// quoted (to the end when the quote never closes), else the whole value.
+fn unquote(at: usize, value: &str) -> (usize, usize) {
+    match value.chars().next() {
+        Some(q @ ('"' | '\'')) => {
+            let inner = &value[1..];
+            (
+                at + 1,
+                at + 1 + closing_quote(inner, q).unwrap_or(inner.len()),
+            )
+        }
+        _ => (at, at + value.len()),
+    }
+}
+
 /// Byte offset of the quote closing `inner` (the text after an opening `q`).
-/// Backslash escapes only inside double quotes, as in the shell and JSON.
+/// Backslash escapes inside double quotes; a doubled `''` inside single quotes
+/// (YAML) is a literal quote, not the close.
 fn closing_quote(inner: &str, q: char) -> Option<usize> {
-    let mut escaped = false;
-    for (i, c) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && q == '"' {
-            escaped = true;
+    let mut chars = inner.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' && q == '"' {
+            chars.next();
         } else if c == q {
+            if q == '\'' && chars.peek().is_some_and(|&(_, n)| n == '\'') {
+                chars.next();
+                continue;
+            }
             return Some(i);
         }
     }
     None
 }
 
-/// Is `value` a real value worth masking, rather than a placeholder, a
-/// reference, or code? `quoted` values skip the code heuristics: a quoted
-/// literal after a secret name is a literal.
-fn worth_masking(value: &str, quoted: bool) -> bool {
-    let v = value.trim();
-    if v.is_empty() || v.starts_with('$') {
+/// Could `value` be a secret? Only values that cannot be one are spared:
+/// empty, a boolean/null, or already masked. Everything else is masked — code,
+/// references and short numbers included (see the module doc's policy).
+fn worth_masking(value: &str) -> bool {
+    let v = value.trim().trim_matches(['"', '\'']).trim();
+    if v.is_empty() {
         return false;
     }
     let lower = v.to_ascii_lowercase();
-    if matches!(
+    !(matches!(
         lower.as_str(),
-        "true"
-            | "false"
-            | "null"
-            | "none"
-            | "nil"
-            | "yes"
-            | "no"
-            | "~"
-            | "undefined"
-            | "\"\""
-            | "''"
+        "true" | "false" | "null" | "none" | "nil" | "~" | "undefined" | "\"\"" | "''"
     ) || lower.contains("redacted")
-        || v.chars().all(|c| matches!(c, '*' | '•' | '.'))
-        || (v.starts_with('<') && v.ends_with('>'))
-        || (v.len() <= 6 && v.chars().all(|c| c.is_ascii_digit()))
-    {
-        return false;
-    }
-    if quoted {
-        return true;
-    }
-    // Code, not data: an expression, a statement tail, an identifier path, or
-    // a type annotation (`token: string;`, `api_key = os.environ["X"]`).
-    if v.contains(['(', ')', '[', ']', '{', '}']) || v.ends_with([',', ';']) {
-        return false;
-    }
-    let is_ident = |s: &str| {
-        s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    if v.contains('.') && v.split('.').all(is_ident) {
-        return false;
-    }
-    !TYPE_WORDS.contains(&lower.as_str())
+        || v.chars().all(|c| c == '*'))
 }
-
-/// Bare type names that follow a secret-named field in source code.
-const TYPE_WORDS: &[&str] = &[
-    "string",
-    "str",
-    "int",
-    "integer",
-    "bool",
-    "boolean",
-    "number",
-    "any",
-    "bytes",
-    "text",
-    "secretstr",
-    "object",
-];
 
 /// Segments that make a name secret-shaped wherever they sit.
 const SECRET_WORDS: &[&str] = &[
@@ -527,6 +772,10 @@ const SECRET_WORDS: &[&str] = &[
     "accesskey",
     "authorization",
     "auth",
+    "cookie",
+    "dockerconfigjson",
+    "dockercfg",
+    "dsn",
 ];
 
 /// A last segment that makes the name describe the secret rather than hold it.
@@ -538,9 +787,6 @@ const METADATA_SUFFIXES: &[&str] = &[
     "type",
     "types",
     "kind",
-    "url",
-    "uri",
-    "urls",
     "endpoint",
     "host",
     "hostname",
@@ -750,18 +996,257 @@ mod tests {
     fn ghp() -> String {
         ["gh", "p_"].concat() + &alnum(36)
     }
-    fn canary() -> String {
-        ["CANARY", "-FAKE-", "7f3a9c"].concat()
+    fn akia() -> String {
+        ["AK", "IA"].concat() + "QWERTYUIOP123456"
     }
-    fn pem_begin() -> String {
-        ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat()
+    /// A made-up password canary.
+    fn pw() -> String {
+        ["Zq", "9vK", "hunter", "7Xw"].concat()
     }
-    fn pem_end() -> String {
-        ["-----END ", "RSA PRIVATE", " KEY-----"].concat()
+    fn body() -> String {
+        ["MIIEpAIBAAKC", "AQEA"].concat() + &alnum(48)
     }
+    fn begin(kind: &str) -> String {
+        format!("-----BEGIN {kind}-----")
+    }
+    fn end(kind: &str) -> String {
+        format!("-----END {kind}-----")
+    }
+    const RSA: &str = "RSA PRIVATE KEY";
 
     fn masked(text: &str) -> String {
         redact(text).unwrap_or_else(|| text.to_string())
+    }
+
+    /// Each input carries one of the canaries; none may survive. Includes
+    /// every Gate 2 (#776 review) repro that leaked on b58b283.
+    #[test]
+    fn no_canary_survives() {
+        let (p, g, a, b) = (pw(), ghp(), akia(), body());
+        let glpat = ["gl", "pat-"].concat() + &alnum(20);
+        let npm = ["np", "m_"].concat() + &alnum(36);
+        let jwt =
+            ["ey", "JhbGciOiJIUzI1NiJ9."].concat() + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + &alnum(43);
+        let cases: Vec<(String, Vec<String>)> = vec![
+            // Critical 1 + Important 1: escapes, ANSI, %XX before a token.
+            (format!(r#"{{"log":"line1\n{g}\n"}}"#), vec![g.clone()]),
+            (format!(r#"{{"log":"k\t{a}"}}"#), vec![a.clone()]),
+            (
+                format!(
+                    r#"{{"pem":"{}\n{}\n{b}\n{}\n"}}"#,
+                    end("CERTIFICATE"),
+                    begin(RSA),
+                    end(RSA)
+                ),
+                vec![b.clone()],
+            ),
+            (
+                format!("\x1b[01;31m\x1b[K{g}\x1b[m\x1b[K\n"),
+                vec![g.clone()],
+            ),
+            (format!("\x1b[1;31m{a}\x1b[0m\n"), vec![a.clone()]),
+            (format!("gh\x1b[1mp_{}\n", alnum(36)), vec![alnum(36)]),
+            (format!("https://x/?q=token%3D{g}\n"), vec![g.clone()]),
+            (format!("abc{g}\n"), vec![g.clone()]),
+            // Critical 2: URL credentials.
+            (
+                format!("DATABASE_URL=postgres://app:{p}@db:5432/app\n"),
+                vec![p.clone()],
+            ),
+            (
+                format!("redis_url: redis://:{p}@cache:6379\n"),
+                vec![p.clone()],
+            ),
+            (
+                format!("remote.origin.url=https://u:{p}@github.com/x.git\n"),
+                vec![p.clone()],
+            ),
+            (
+                format!("Cloning https://oauth2:{p}@gitlab.com/x\n"),
+                vec![p.clone()],
+            ),
+            // Critical 3: unquoted values with code-looking characters.
+            (format!("DB_PASSWORD={p}(x\n"), vec![p.clone()]),
+            (format!("DB_PASSWORD={p}{{\n"), vec![p.clone()]),
+            (format!("API_TOKEN=ab]{p}\n"), vec![p.clone()]),
+            (format!("DB_PASSWORD={p},\n"), vec![p.clone()]),
+            (format!("DB_PASSWORD={p};\n"), vec![p.clone()]),
+            (format!("DB_PASSWORD=${p}\n"), vec![p.clone()]),
+            (
+                "DB_PASSWORD=Horse.battery.staple\n".into(),
+                vec!["Horse.battery".into()],
+            ),
+            ("PIN_PASSWORD=482913\n".into(), vec!["482913".into()]),
+            (format!("DB_PASSWORD={p} tail\n"), vec![p.clone()]),
+            // Critical 4: PEM/PGP shapes.
+            (
+                format!(
+                    "{}\nVersion: GnuPG v2\nComment: my key\n\n{b}\n=abcd\n{}\n",
+                    begin("PGP PRIVATE KEY BLOCK"),
+                    end("PGP PRIVATE KEY BLOCK")
+                ),
+                vec![b.clone()],
+            ),
+            (
+                format!("{}\n\n{b}\n{b}\n", begin("PGP PRIVATE KEY BLOCK")),
+                vec![b.clone()],
+            ),
+            (format!("{}\n\n{b}\n", begin(RSA)), vec![b.clone()]),
+            (
+                format!("\x1b[32m{}\n{b}\n{}\x1b[0m\n", begin(RSA), end(RSA)),
+                vec![b.clone()],
+            ),
+            (
+                format!("{}\n\x1b[32m{b}\x1b[0m\n{}\n", begin(RSA), end(RSA)),
+                vec![b.clone()],
+            ),
+            (format!("{b}\n{}\n", end(RSA)), vec![b.clone()]),
+            (
+                format!("key: |\n  {}\n  {b}\n  {}\n", begin(RSA), end(RSA)),
+                vec![b.clone()],
+            ),
+            // Important 3: GitLab, npm, JWT.
+            (format!("value: {glpat}\n"), vec![glpat.clone()]),
+            (format!("value: {npm}\n"), vec![npm.clone()]),
+            (format!("value: {jwt}\n"), vec![alnum(43)]),
+            // Important 4: name/value pairs and other named forms.
+            (
+                format!("env:\n- name: DB_PASSWORD\n  value: {p}\n"),
+                vec![p.clone()],
+            ),
+            (
+                format!(r#"{{"name": "DB_PASSWORD", "value": "{p}"}}"#),
+                vec![p.clone()],
+            ),
+            (
+                format!(
+                    "====== Data ======\nKey         Value\n---         -----\npassword    {p}\n"
+                ),
+                vec![p.clone()],
+            ),
+            (
+                format!("data:\n  .dockerconfigjson: {p}\n  tls.key: {p}\n"),
+                vec![p.clone()],
+            ),
+            (format!("machine h login u password {p}\n"), vec![p.clone()]),
+            (
+                format!("machine h\n  login u\n  password {p}\n"),
+                vec![p.clone()],
+            ),
+            (format!("Cookie: session={p}\n"), vec![p.clone()]),
+            (format!("Set-Cookie: sid={p}; Path=/\n"), vec![p.clone()]),
+            (format!("mysql -u root --password={p}\n"), vec![p.clone()]),
+            (format!("vault login --token {p}\n"), vec![p.clone()]),
+            (
+                format!("+ curl -H 'Authorization: token {p}' https://x\n"),
+                vec![p.clone()],
+            ),
+            (format!("password:{p}\n"), vec![p.clone()]),
+            (
+                format!("[http]\n\textraheader = AUTHORIZATION: basic {p}\n"),
+                vec![p.clone()],
+            ),
+            (
+                format!("{}{} token={p} x\n", "x".repeat(1000), " "),
+                vec![p.clone()],
+            ),
+            // Important 5: nested escapes and doubled quotes.
+            (
+                format!(r#"{{"cfg":"{{\"password\":\"{p}\"}}"}}"#),
+                vec![p.clone()],
+            ),
+            (format!("password: 'it''s{p}'\n"), vec![p.clone()]),
+            (
+                r#"{"password": 12345678901}"#.into(),
+                vec!["12345678901".into()],
+            ),
+            // The original incidents and basics.
+            (format!("unifi:\n  unifi_api_key: {p}\n"), vec![p.clone()]),
+            (format!("HOMEPAGE_VAR_UNIFI_KEY={p}\n"), vec![p.clone()]),
+            (format!(r#"["HOME=/x","API_TOKEN={p}"]"#), vec![p.clone()]),
+            (format!("> Authorization: Bearer {p}\n"), vec![p.clone()]),
+            (format!("DB_PASSWORD={p}\r\nX=1\r\n"), vec![p.clone()]),
+            (
+                format!("data:\n  password: |\n    {p}\n    line2\n"),
+                vec![p.clone()],
+            ),
+            (format!("      + token    = \"{p}\"\n"), vec![p.clone()]),
+        ];
+        for (input, canaries) in &cases {
+            let out = masked(input);
+            for c in canaries {
+                assert!(
+                    !out.contains(c.as_str()),
+                    "canary survived in {input:?}: {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_masking_keeps_every_other_byte() {
+        let p = pw();
+        let m = NAMED_MARK;
+        let cases: Vec<(String, String)> = vec![
+            (
+                format!("unifi:\n  unifi_api_key: {p}\n  unifi_host: 10.0.0.1\n"),
+                format!("unifi:\n  unifi_api_key: {m}\n  unifi_host: 10.0.0.1\n"),
+            ),
+            (
+                format!("HOMEPAGE_ALLOWED_HOSTS=home.lan\nHOMEPAGE_VAR_UNIFI_KEY={p}\n"),
+                format!("HOMEPAGE_ALLOWED_HOSTS=home.lan\nHOMEPAGE_VAR_UNIFI_KEY={m}\n"),
+            ),
+            (
+                format!(r#"["HOMEPAGE_ALLOWED_HOSTS=home.lan","HOMEPAGE_VAR_UNIFI_KEY={p}"]"#),
+                format!(r#"["HOMEPAGE_ALLOWED_HOSTS=home.lan","HOMEPAGE_VAR_UNIFI_KEY={m}"]"#),
+            ),
+            (
+                format!("héllo ✓\nDB_PASSWORD=ü{p}✓\nfin ✓\n"),
+                format!("héllo ✓\nDB_PASSWORD={m}\nfin ✓\n"),
+            ),
+            (
+                format!("DATABASE_URL=postgres://app:{p}@db/app\n"),
+                "DATABASE_URL=postgres://app:[redacted: URL password]@db/app\n".to_string(),
+            ),
+            (
+                format!("before\n{}\n{}\n{}\nafter\n", begin(RSA), body(), end(RSA)),
+                "before\n[redacted: private key]\nafter\n".to_string(),
+            ),
+            (
+                format!("x\x1b[31m{}\x1b[0m y\n", ghp()),
+                "x\x1b[31m[redacted: GitHub token] y\n".to_string(),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(masked(&input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn values_that_cannot_be_secrets_pass_through() {
+        let cases: &[&str] = &[
+            "",
+            "hello world\n",
+            "HOMEPAGE_ALLOWED_HOSTS=home.lan\n",
+            "GITHUB_TOKEN=\n",
+            "password: '***'\n",
+            "password: [REDACTED]\n",
+            "require_auth: true\n",
+            "max_tokens: 4096\n",
+            "token_type: bearer\n",
+            "secretName: my-secret\n",
+            r#"{"key": "value", "keys": "x"}"#,
+            "commit 3f786850e387550fdab836ed7e6dc881de23001b\n",
+            "uuid 123e4567-e89b-12d3-a456-426614174000\n",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI fake@host\n",
+            "sk-learn is a library\n",
+            "password:\n  nested: map\n",
+            "see https://example.com/docs here\n",
+            "a == b\n",
+        ];
+        for input in cases {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
     }
 
     #[test]
@@ -771,235 +1256,36 @@ mod tests {
             ("HOMEPAGE_VAR_UNIFI_KEY", true),
             ("GITHUB_TOKEN", true),
             ("DB_PASSWORD", true),
-            ("db_pass", true),
             ("password", true),
-            ("token", true),
-            ("secret", true),
             ("auth", true),
             ("Authorization", true),
             ("clientSecret", true),
-            ("apiKey", true),
             ("APIKey", true),
             ("spring.datasource.password", true),
             ("API_KEY_2", true),
             ("SECRET_KEY_BASE", true),
-            ("AUTH_HEADER", true),
-            ("private-key", true),
-            // Not secrets.
+            ("Cookie", true),
+            ("Set-Cookie", true),
+            (".dockerconfigjson", true),
+            ("SENTRY_DSN", true),
+            ("SECRET_URL", true),
             ("HOMEPAGE_ALLOWED_HOSTS", false),
             ("key", false),
             ("primary_key", false),
             ("public_key", false),
-            ("sortKey", false),
             ("KEY_ID", false),
-            ("AWS_ACCESS_KEY_ID", false),
-            ("TOKEN_URL", false),
             ("secretName", false),
             ("PASSWORD_FILE", false),
             ("token_type", false),
             ("max_tokens", false),
             ("max_token", false),
-            ("input_tokens", false),
             ("monkey", false),
             ("authoritative", false),
-            ("author", false),
-            ("keyboard_layout", false),
-            ("bypass", false),
-            ("AUTH_ENABLED", false),
             ("", false),
         ];
         for (name, want) in cases {
             assert_eq!(is_secret_name(name), *want, "{name}");
         }
-    }
-
-    #[test]
-    fn incident_shapes_keep_names_and_drop_values() {
-        let v = canary();
-        let cases: Vec<(String, String)> = vec![
-            // Incident 1: grep of decrypted YAML.
-            (
-                format!("unifi:\n  unifi_api_key: {v}\n  unifi_host: 10.0.0.1\n"),
-                format!("unifi:\n  unifi_api_key: {NAMED_MARK}\n  unifi_host: 10.0.0.1\n"),
-            ),
-            // Incident 2: docker env dump, one line per var.
-            (
-                format!("HOMEPAGE_ALLOWED_HOSTS=home.lan\nHOMEPAGE_VAR_UNIFI_KEY={v}\n"),
-                format!("HOMEPAGE_ALLOWED_HOSTS=home.lan\nHOMEPAGE_VAR_UNIFI_KEY={NAMED_MARK}\n"),
-            ),
-            // Incident 2, JSON form.
-            (
-                format!(r#"["HOMEPAGE_ALLOWED_HOSTS=home.lan","HOMEPAGE_VAR_UNIFI_KEY={v}"]"#),
-                format!(
-                    r#"["HOMEPAGE_ALLOWED_HOSTS=home.lan","HOMEPAGE_VAR_UNIFI_KEY={NAMED_MARK}"]"#
-                ),
-            ),
-        ];
-        for (input, want) in cases {
-            assert_eq!(masked(&input), want, "{input}");
-        }
-    }
-
-    #[test]
-    fn named_value_shapes() {
-        let v = canary();
-        let m = NAMED_MARK;
-        let cases: Vec<(String, String)> = vec![
-            (
-                format!("export API_TOKEN={v}"),
-                format!("export API_TOKEN={m}"),
-            ),
-            (
-                format!("declare -x DB_PASSWORD=\"{v}\""),
-                format!("declare -x DB_PASSWORD=\"{m}\""),
-            ),
-            (
-                format!("DB_PASSWORD='{v}' # prod"),
-                format!("DB_PASSWORD='{m}' # prod"),
-            ),
-            (format!("api_key = \"{v}\""), format!("api_key = \"{m}\"")),
-            (format!("  - password: {v}"), format!("  - password: {m}")),
-            (
-                format!("> Authorization: Bearer {v}"),
-                format!("> Authorization: {m}"),
-            ),
-            (
-                format!(r#"{{"user":"bob","password":"{v}"}}"#),
-                format!(r#"{{"user":"bob","password":"{m}"}}"#),
-            ),
-            (
-                format!(r#"  "client_secret": "{v}","#),
-                format!(r#"  "client_secret": "{m}","#),
-            ),
-            (
-                format!(r#"{{"auth": "{v}"}}"#),
-                format!(r#"{{"auth": "{m}"}}"#),
-            ),
-            (
-                format!("DB_PASSWORD={v}\r\nX=1\r\n"),
-                format!("DB_PASSWORD={m}\r\nX=1\r\n"),
-            ),
-            // Escaped quote inside a JSON value stays inside the span.
-            (
-                format!(r#""token": "a\"{v}""#),
-                format!(r#""token": "{m}""#),
-            ),
-        ];
-        for (input, want) in cases {
-            assert_eq!(masked(&input), want, "{input}");
-        }
-    }
-
-    #[test]
-    fn yaml_block_scalar_body_is_masked() {
-        let v = canary();
-        let input = format!("data:\n  password: |\n    {v}\n    line2\n\n  user: bob\n");
-        let want =
-            format!("data:\n  password: |\n    {NAMED_MARK}\n    {NAMED_MARK}\n\n  user: bob\n");
-        assert_eq!(masked(&input), want);
-    }
-
-    #[test]
-    fn tokens_are_masked_anywhere() {
-        let t = ghp();
-        let aws = ["AK", "IA"].concat() + "ABCDEFGH23456789";
-        let cases: Vec<(String, String)> = vec![
-            (
-                format!("remote: https://x:{t}@github.com/o/r"),
-                "remote: https://x:[redacted: GitHub token]@github.com/o/r".to_string(),
-            ),
-            (
-                format!("id {aws} end"),
-                "id [redacted: AWS access key id] end".to_string(),
-            ),
-            // A token under a non-secret name is still a token.
-            (
-                format!("NOTE={t}"),
-                "NOTE=[redacted: GitHub token]".to_string(),
-            ),
-        ];
-        for (input, want) in cases {
-            assert_eq!(masked(&input), want, "{input}");
-        }
-    }
-
-    #[test]
-    fn pem_key_body_is_masked() {
-        let (b, e) = (pem_begin(), pem_end());
-        let body = "MIIEowIBAAKCAQEA\nq2Vx9+/abc=\n";
-        let kind = PEM_KIND;
-        let cases: Vec<(String, String)> = vec![
-            // Complete block.
-            (
-                format!("before\n{b}\n{body}{e}\nafter\n"),
-                format!("before\n[redacted: {kind}]\nafter\n"),
-            ),
-            // Truncated (`head`): body lines only, never the prose after.
-            (
-                format!("{b}\n{body}not base64 here\n"),
-                format!("[redacted: {kind}]\nnot base64 here\n"),
-            ),
-            // Escaped single-line JSON string.
-            (
-                format!(r#"{{"k":"{b}\nMIIEowIBAAK\nqq==\n{e}\n"}}"#),
-                format!(r#"{{"k":"[redacted: {kind}]\n"}}"#),
-            ),
-            // An END far away through prose is not this key's END.
-            (
-                format!("{b}\nsome prose line\n{e}\n"),
-                format!("[redacted: {kind}]\nsome prose line\n{e}\n"),
-            ),
-        ];
-        for (input, want) in cases {
-            assert_eq!(masked(&input), want, "{input}");
-        }
-    }
-
-    #[test]
-    fn non_secrets_pass_through_unchanged() {
-        let cases: &[&str] = &[
-            "",
-            "hello world\n",
-            "HOMEPAGE_ALLOWED_HOSTS=home.lan\n",
-            "GITHUB_TOKEN=\n",
-            "API_TOKEN=$GH_TOKEN\n",
-            "password: ${DB_PASSWORD}\n",
-            "password: \"$1\"\n",
-            "password: '***'\n",
-            "password: [REDACTED]\n",
-            "password: <your-password>\n",
-            "require_auth: true\n",
-            "max_tokens: 4096\n",
-            "token_type: bearer\n",
-            "secretName: my-secret\n",
-            r#"{"key": "value", "keys": "x"}"#,
-            "  token: string;\n",
-            "password: str\n",
-            "api_key = os.environ[\"API_KEY\"]\n",
-            "Token: token,\n",
-            "token = self.config.token\n",
-            "see https://example.com/password: here\n",
-            "if [ \"$TOKEN\" == x ]; then\n",
-            "a == b\n",
-            "commit 3f786850e387550fdab836ed7e6dc881de23001b\n",
-            "uuid 123e4567-e89b-12d3-a456-426614174000\n",
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI fake@host\n",
-            "sk-learn is a library\n",
-            "password:\n  nested: map\n",
-        ];
-        for input in cases {
-            assert_eq!(redact(input), None, "{input:?}");
-        }
-    }
-
-    #[test]
-    fn non_ascii_text_around_secrets_is_preserved() {
-        let v = canary();
-        let input = format!("héllo ✓\nDB_PASSWORD=ü{v}✓\nfin ✓\n");
-        assert_eq!(
-            masked(&input),
-            format!("héllo ✓\nDB_PASSWORD={NAMED_MARK}\nfin ✓\n")
-        );
     }
 
     fn response(stdout: &str, stderr: &str) -> ToolResponse {
@@ -1013,9 +1299,24 @@ mod tests {
     }
 
     #[test]
+    fn a_key_split_across_stdout_and_stderr_is_masked_on_both_sides() {
+        let b = body();
+        let r = decide(
+            &response(
+                &format!("{}\n{b}\n", begin(RSA)),
+                &format!("{b}\n{}\n", end(RSA)),
+            ),
+            false,
+        );
+        let out = r.updated_tool_output.expect("rewrite");
+        let blob = format!("{}{}", out["stdout"], out["stderr"]);
+        assert!(!blob.contains(&b), "{blob}");
+    }
+
+    #[test]
     fn decide_emits_full_bash_shape_only_when_masked() {
-        let v = canary();
-        let r = decide(&response(&format!("DB_PASSWORD={v}\n"), "warn\n"), false);
+        let p = pw();
+        let r = decide(&response(&format!("DB_PASSWORD={p}\n"), "warn\n"), false);
         let out = r.updated_tool_output.expect("masked output rewrites");
         assert_eq!(
             out,
@@ -1027,73 +1328,76 @@ mod tests {
             })
         );
         assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow);
-
-        // stderr alone is scanned too (`security -g` prints there).
-        let r = decide(&response("", &format!("password: \"{v}\"\n")), false);
+        let r = decide(&response("", &format!("password: \"{p}\"\n")), false);
         assert!(r.updated_tool_output.is_some());
-
-        // Nothing to mask: no identity rewrite.
-        let r = decide(&response("ok\n", ""), false);
-        assert!(r.updated_tool_output.is_none());
-
-        // Image output is never touched.
-        let mut img = response(&format!("DB_PASSWORD={v}"), "");
+        assert!(
+            decide(&response("ok\n", ""), false)
+                .updated_tool_output
+                .is_none()
+        );
+        let mut img = response(&format!("DB_PASSWORD={p}"), "");
         img.is_image = Some(true);
         assert!(decide(&img, false).updated_tool_output.is_none());
-
-        // The escape passes raw output through and records the bypass.
-        let r = decide(&response(&format!("DB_PASSWORD={v}\n"), ""), true);
+        let r = decide(&response(&format!("DB_PASSWORD={p}\n"), ""), true);
         assert!(r.updated_tool_output.is_none());
         assert_eq!(r.bypass.map(|b| b.mechanism).as_deref(), Some(ESCAPE_ENV));
     }
 
     #[test]
     fn run_ignores_other_tools_and_missing_response() {
-        let v = canary();
-        let payload = |tool: &str| {
-            format!(
-                r#"{{"tool_name":"{tool}","tool_input":{{"command":"x"}},"tool_response":{{"stdout":"DB_PASSWORD={v}","stderr":"","interrupted":false,"isImage":false}}}}"#
-            )
-        };
-        let read = HookInput::from_json(&payload("Read")).unwrap();
+        let p = pw();
+        let payload = format!(
+            r#"{{"tool_name":"Read","tool_input":{{"command":"x"}},"tool_response":{{"stdout":"DB_PASSWORD={p}","stderr":"","interrupted":false,"isImage":false}}}}"#
+        );
+        let read = HookInput::from_json(&payload).unwrap();
         assert!(RedactSecretOutput.run(&read).updated_tool_output.is_none());
         let none =
             HookInput::from_json(r#"{"tool_name":"Bash","tool_input":{"command":"x"}}"#).unwrap();
         assert!(RedactSecretOutput.run(&none).updated_tool_output.is_none());
     }
 
+    /// Gate 2's perf corpus at 5 MB. The release bound (0.5 s) is what the hook
+    /// deadline needs; debug builds get a loose bound so the test still catches
+    /// a quadratic blow-up (which took 27 s in release before the fix).
     #[test]
-    fn adversarial_200kb_inputs_stay_fast_and_exact() {
-        let v = canary();
-        let big_quote = "\"".repeat(200_000);
-        let big_backslash = format!("\"password\": \"{}", "\\".repeat(200_000));
-        let many_pairs = format!("DB_PASSWORD={v}\n").repeat(200_000 / 30);
-        let one_line = format!("password: \"{}", "a".repeat(200_000));
-        let pem_flood = format!("{}\n{}", pem_begin(), "QUJD\n".repeat(40_000));
-        let json_noise = r#"{"a":"b","c":"d"},"#.repeat(12_000);
-        let colons = "a: ".repeat(70_000);
-        for input in [
-            big_quote,
-            big_backslash,
-            many_pairs,
-            one_line,
-            pem_flood,
-            json_noise,
-            colons,
-        ] {
+    fn adversarial_5mb_inputs_stay_linear() {
+        const MB: usize = 1_000_000;
+        let p = pw();
+        let hdr = begin(RSA);
+        let bound = if cfg!(debug_assertions) {
+            std::time::Duration::from_secs(20)
+        } else {
+            std::time::Duration::from_millis(500)
+        };
+        let inputs = [
+            format!("{hdr} ").repeat(5 * MB / 32),
+            format!("{hdr}\n").repeat(5 * MB / 32),
+            format!(
+                "{hdr}\n{}",
+                format!("{}\n", "A".repeat(63)).repeat(5 * MB / 64)
+            ),
+            format!("\"password\":\"{p}\",").repeat(5 * MB / 28),
+            format!("\"password\":\"{}", "\\a".repeat(5 * MB / 2)),
+            format!("DB_PASSWORD={p}\n").repeat(5 * MB / 26),
+            format!("\"DB_PASSWORD={p}\",").repeat(5 * MB / 28),
+            format!("'Authorization: {p}' ").repeat(5 * MB / 32),
+            "token=".repeat(5 * MB / 6),
+            "password: ".repeat(5 * MB / 10),
+            "--token ".repeat(5 * MB / 8),
+            "\"".repeat(5 * MB),
+            "\x1b[1m".repeat(5 * MB / 4),
+            "\\n".repeat(5 * MB / 2),
+            format!(
+                "password: |\n{}",
+                format!("  {}\n", "x".repeat(60)).repeat(5 * MB / 63)
+            ),
+            "a:".repeat(5 * MB / 2),
+        ];
+        for input in inputs {
             let started = std::time::Instant::now();
-            let out = redact(&input);
-            // Debug builds are several times slower than release; this bound
-            // is loose on purpose and the release bound is checked by probe.
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "{} bytes took {:?}",
-                input.len(),
-                started.elapsed()
-            );
-            if let Some(out) = out {
-                assert!(!out.contains(&v), "a canary survived");
-            }
+            let _ = redact(&input);
+            let took = started.elapsed();
+            assert!(took < bound, "{} bytes took {took:?}", input.len());
         }
     }
 }

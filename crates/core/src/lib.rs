@@ -2041,14 +2041,14 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    let rendered = render_check_result(result, event, feedback_footer().as_deref());
+    let (rendered, code) = render_check_result(result, event, feedback_footer().as_deref());
     if let Some(out) = rendered.stdout {
         crate::outln!("{out}");
     }
     if let Some(err) = rendered.stderr {
         eprint!("{err}");
     }
-    process::exit(result.outcome.code());
+    process::exit(code);
 }
 
 /// What [`emit_and_exit`] would write for `result`, as `(stdout, stderr)`,
@@ -2058,7 +2058,7 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
 /// and has to merge their outputs into the single response one hook process
 /// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
 pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
-    let rendered = render_check_result(result, event, feedback_footer().as_deref());
+    let (rendered, _) = render_check_result(result, event, feedback_footer().as_deref());
     (rendered.stdout, rendered.stderr)
 }
 
@@ -2066,40 +2066,95 @@ pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>,
 /// (cameronsjo/cadence-hooks#776). Shared by the single-check path and the
 /// `group` merge so the two cannot drift.
 pub fn updated_tool_output_envelope(event: HookEvent, output: &serde_json::Value) -> String {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": event.name(),
-            "updatedToolOutput": output,
-        }
-    })
-    .to_string()
+    updated_tool_output_json(event, output, None, None)
 }
 
-/// [`render_output`] for a whole [`CheckResult`]: an `Allow` carrying
-/// [`CheckResult::updated_tool_output`] renders the output-replacement
-/// envelope; everything else renders exactly as before. Never unclamped
-/// context: the replacement is tool output, not injected context, so the
-/// additionalContext budget does not apply to it.
+/// [`updated_tool_output_envelope`] with optional `additionalContext` and a
+/// PostToolUse `decision: "block"` reason.
+pub fn updated_tool_output_json(
+    event: HookEvent,
+    output: &serde_json::Value,
+    context: Option<&str>,
+    block_reason: Option<&str>,
+) -> String {
+    let mut specific = serde_json::Map::new();
+    specific.insert("hookEventName".into(), event.name().into());
+    specific.insert("updatedToolOutput".into(), output.clone());
+    if let Some(context) = context {
+        specific.insert("additionalContext".into(), context.into());
+    }
+    let mut top = serde_json::Map::new();
+    if let Some(reason) = block_reason {
+        top.insert("decision".into(), "block".into());
+        top.insert("reason".into(), reason.into());
+    }
+    top.insert(
+        "hookSpecificOutput".into(),
+        serde_json::Value::Object(specific),
+    );
+    serde_json::Value::Object(top).to_string()
+}
+
+/// [`render_output`] for a whole [`CheckResult`], plus the exit code to use.
+///
+/// A result carrying [`CheckResult::updated_tool_output`] on PostToolUse
+/// renders the output-replacement envelope with exit 0 — **including a
+/// `Block`**. The tool already ran, so an exit 2 would discard stdout and the
+/// raw output would reach the model; a PostToolUse block is expressed instead
+/// as top-level `decision: "block"` + `reason` beside the rewrite. A Nudge's
+/// message rides as `additionalContext`. Everything else renders exactly as
+/// [`render_output`] does.
 fn render_check_result(
     result: &CheckResult,
     event: HookEvent,
     footer: Option<&str>,
-) -> RenderedOutput {
-    if result.outcome == Outcome::Allow
-        && let Some(output) = &result.updated_tool_output
+) -> (RenderedOutput, i32) {
+    if let Some(output) = &result.updated_tool_output
+        && event == HookEvent::PostToolUse
+        && result.outcome != Outcome::Ask
     {
-        return RenderedOutput {
-            stdout: Some(updated_tool_output_envelope(event, output)),
-            stderr: None,
+        let message = result.message.as_deref().filter(|m| !m.is_empty());
+        let stdout = match (result.outcome, message) {
+            (Outcome::Block, _) => {
+                let reason = apply_feedback_footer(
+                    Outcome::Block,
+                    &display::clamp_hook_output(
+                        message.unwrap_or(""),
+                        display::HOOK_OUTPUT_BUDGET_UTF16,
+                        None,
+                    ),
+                    footer,
+                );
+                updated_tool_output_json(event, output, None, Some(&reason))
+            }
+            (Outcome::Nudge, Some(msg)) => updated_tool_output_json(
+                event,
+                output,
+                Some(&display::clamp_hook_output(
+                    msg,
+                    display::HOOK_OUTPUT_BUDGET_UTF16,
+                    None,
+                )),
+                None,
+            ),
+            _ => updated_tool_output_json(event, output, None, None),
         };
+        return (
+            RenderedOutput {
+                stdout: Some(stdout),
+                stderr: None,
+            },
+            0,
+        );
     }
-    render_output(
+    let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
         result.block_metadata.as_ref(),
         event,
         footer,
-    )
+    );
+    (rendered, result.outcome.code())
 }
 
 /// The generic fallback payload for fire-and-forget loggers ([`MetricsInput`]

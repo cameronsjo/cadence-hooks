@@ -7,9 +7,12 @@
 //!
 //! - `security find-generic-password|find-internet-password … -w` (macOS
 //!   Keychain: prints the password and nothing else);
-//! - `kubectl get secret … -o jsonpath=…|go-template=…|template=…` (no key name
-//!   in the output);
-//! - `op read op://…` and `op item get … --reveal` (1Password: a bare value).
+//! - `kubectl get secret … -o jsonpath|go-template|template|custom-columns`,
+//!   `--template`, and `-o json|yaml` piped into `jq`/`yq` (the filter strips
+//!   the key names the redactor masks by);
+//! - `op read op://…` and `op item get … --reveal` (1Password);
+//! - `vault read|kv get -field=…`, `aws secretsmanager get-secret-value`,
+//!   `gcloud secrets versions access`, `pass show`.
 //!
 //! `Ask`, never `Block`: both motivating incidents were legitimate work, and
 //! the prompt is its own escape hatch — so no bypass or dismiss exists.
@@ -20,7 +23,9 @@
 //! The value never reaches the transcript, and the guard says nothing, when:
 //! - a segment in the pipeline sends stdout to a file (`> f`, `>> f`, `&> f`,
 //!   `1> f`, `>/dev/null`) — not `>&2`, `/dev/stdout`, `/dev/stderr`,
-//!   `/dev/tty`, which still reach the terminal;
+//!   `/dev/tty`, `/dev/fd/*`, `/dev/pts/*` or `/proc/*/fd/*`, which still
+//!   reach the terminal. A `tee` anywhere downstream counts as printing,
+//!   whatever follows it;
 //! - a downstream segment is a **terminal sink**: a hash (`shasum`,
 //!   `sha256sum`, `md5sum`, `md5`, `b2sum`, `cksum`, `openssl dgst|sha*|md5`),
 //!   `wc`, or `grep`/`egrep`/`fgrep`/`rg` with `-c`/`-q`/`-l`/`-L` (or their
@@ -97,7 +102,9 @@ pub fn first_exposed_dump(command: &str) -> Option<&'static str> {
         })
         .collect();
     for (i, argv) in argvs.iter().enumerate() {
-        let Some(label) = producer(argv) else {
+        let Some(label) =
+            producer(argv).or_else(|| structured_secret_filtered(&segments, &argvs, i))
+        else {
             continue;
         };
         if !pipeline_contains_it(&segments, &argvs, i) {
@@ -117,6 +124,11 @@ fn pipeline_contains_it(
     let mut i = start;
     loop {
         let argv = &argvs[i];
+        // `tee` prints to its own file operands (`/dev/stderr`, `/dev/tty`)
+        // as well as down the pipe: whatever follows it, treat it as printing.
+        if i > start && argv.first().is_some_and(|w| command_word(w) == "tee") {
+            return false;
+        }
         if stdout_to_file(argv) {
             return true;
         }
@@ -154,9 +166,16 @@ fn producer(argv: &[String]) -> Option<&'static str> {
             (gets && secret && bare_output_format(rest)).then_some("kubectl get secret -o jsonpath")
         }
         "op" => {
-            let to_file = rest
-                .iter()
-                .any(|t| t == "-o" || t == "--out-file" || t.starts_with("--out-file="));
+            // `-o`/`--out-file` keeps the value off the terminal only when the
+            // target is a real file, not `/dev/stdout` and friends.
+            let to_file = rest.iter().enumerate().any(|(i, t)| {
+                let target = if t == "-o" || t == "--out-file" {
+                    rest.get(i + 1).map(String::as_str)
+                } else {
+                    t.strip_prefix("--out-file=")
+                };
+                target.is_some_and(|f| !f.is_empty() && !is_terminal_path(f))
+            });
             let reads = rest.iter().any(|t| t == "read")
                 && rest.iter().any(|t| t.starts_with("op://"))
                 && !to_file;
@@ -170,8 +189,77 @@ fn producer(argv: &[String]) -> Option<&'static str> {
                 None
             }
         }
+        "vault" => {
+            let reads = rest.first().is_some_and(|t| t == "read")
+                || rest.windows(2).any(|w| w[0] == "kv" && w[1] == "get");
+            let field = rest
+                .iter()
+                .any(|t| t == "-field" || t.starts_with("-field=") || t.starts_with("--field"));
+            (reads && field).then_some("vault read -field")
+        }
+        "aws" => {
+            let gets = rest.iter().any(|t| t == "secretsmanager")
+                && rest.iter().any(|t| t == "get-secret-value");
+            gets.then_some("aws secretsmanager get-secret-value")
+        }
+        "gcloud" => {
+            let access = rest
+                .windows(3)
+                .any(|w| w[0] == "secrets" && w[1] == "versions" && w[2] == "access");
+            access.then_some("gcloud secrets versions access")
+        }
+        "pass" => rest
+            .iter()
+            .find(|t| !t.starts_with('-'))
+            .is_some_and(|t| t == "show")
+            .then_some("pass show"),
         _ => None,
     }
+}
+
+/// `kubectl get secret -o json|yaml` piped into `jq`/`yq`: the filter strips
+/// the key names the redactor would mask by, so the value comes out bare.
+fn structured_secret_filtered(
+    segments: &[(String, Option<&'static str>)],
+    argvs: &[Vec<String>],
+    start: usize,
+) -> Option<&'static str> {
+    let argv = &argvs[start];
+    if argv.first().is_none_or(|w| command_word(w) != "kubectl") {
+        return None;
+    }
+    let rest = &argv[1..];
+    let structured = rest.iter().any(|t| t == "get")
+        && rest.iter().any(|t| names_secret_resource(t))
+        && output_format(rest).is_some_and(|f| f == "json" || f == "yaml");
+    if !structured {
+        return None;
+    }
+    let mut i = start;
+    while segments[i].1 == Some("|") && i + 1 < argvs.len() {
+        i += 1;
+        if argvs[i]
+            .first()
+            .is_some_and(|w| matches!(command_word(w).as_ref(), "jq" | "yq" | "gojq" | "jaq"))
+        {
+            return Some("kubectl get secret -o json|yaml | jq");
+        }
+    }
+    None
+}
+
+/// The `-o`/`--output` value, whichever spelling.
+fn output_format(rest: &[String]) -> Option<&str> {
+    rest.iter().enumerate().find_map(|(i, t)| {
+        if t == "-o" || t == "--output" {
+            rest.get(i + 1).map(String::as_str)
+        } else if let Some(v) = t.strip_prefix("--output=") {
+            Some(v)
+        } else {
+            t.strip_prefix("-o")
+                .map(|v| v.strip_prefix('=').unwrap_or(v))
+        }
+    })
 }
 
 /// `secret`, `secrets`, `secret/<name>`, or a comma list naming one.
@@ -182,25 +270,18 @@ fn names_secret_resource(token: &str) -> bool {
     })
 }
 
-/// A `-o`/`--output` value that prints bare field values.
+/// An output mode that prints bare field values: `-o jsonpath|go-template|
+/// template|custom-columns…` in any spelling, or `--template`.
 fn bare_output_format(rest: &[String]) -> bool {
     let is_bare = |value: &str| {
-        ["jsonpath", "go-template", "template"]
+        ["jsonpath", "go-template", "template", "custom-columns"]
             .iter()
             .any(|f| value.starts_with(f))
     };
-    rest.iter().enumerate().any(|(i, t)| {
-        let next = rest.get(i + 1).map(String::as_str);
-        if t == "-o" || t == "--output" {
-            next.is_some_and(is_bare)
-        } else if let Some(v) = t.strip_prefix("--output=") {
-            is_bare(v)
-        } else if let Some(v) = t.strip_prefix("-o") {
-            is_bare(v.strip_prefix('=').unwrap_or(v))
-        } else {
-            false
-        }
-    })
+    output_format(rest).is_some_and(is_bare)
+        || rest
+            .iter()
+            .any(|t| t == "--template" || t.starts_with("--template="))
 }
 
 /// Does `argv` redirect its stdout to a file (so nothing reaches the
@@ -240,11 +321,12 @@ fn stdout_to_file(argv: &[String]) -> bool {
     false
 }
 
+/// A path that is the terminal, not a file: writing there prints.
 fn is_terminal_path(target: &str) -> bool {
-    matches!(
-        target,
-        "/dev/stdout" | "/dev/stderr" | "/dev/tty" | "/dev/fd/1" | "/dev/fd/2"
-    )
+    matches!(target, "/dev/stdout" | "/dev/stderr" | "/dev/tty")
+        || target.starts_with("/dev/fd/")
+        || target.starts_with("/dev/pts/")
+        || (target.starts_with("/proc/") && target.contains("/fd/"))
 }
 
 /// A consumer whose output cannot carry the value: a hash, a count, or a
@@ -338,6 +420,55 @@ mod tests {
             ("echo x | shasum; op read op://v/i/f", "op read"),
             // grep that prints matching lines is not a sink.
             ("op read op://v/i/f | grep -i abc", "op read"),
+            // Gate 2 (#776 review): tee and terminal paths print.
+            (
+                "security find-generic-password -s svc -w | tee /dev/stderr | sha256sum",
+                "security find-*-password -w",
+            ),
+            (
+                "security find-generic-password -s svc -w | tee x | docker login --password-stdin",
+                "security find-*-password -w",
+            ),
+            (
+                "security find-generic-password -s svc -w > /proc/self/fd/1",
+                "security find-*-password -w",
+            ),
+            (
+                "security find-generic-password -s svc -w >/dev/fd/1",
+                "security find-*-password -w",
+            ),
+            ("op read op://v/i/f -o /dev/stdout", "op read"),
+            ("op read op://v/i/f --out-file /dev/stdout", "op read"),
+            ("op read op://v/i/f --out-file=/dev/stdout", "op read"),
+            ("op read op://v/i/f -o /dev/stderr", "op read"),
+            // Gate 2: more bare-value producers.
+            (
+                "kubectl get secret s --template='{{.data.p}}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret s -o custom-columns=P:.data.p",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret s -o json | jq -r .data.p | base64 -d",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret s -o yaml | yq .data.p",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            ("vault kv get -field=password secret/x", "vault read -field"),
+            ("vault read -field=value secret/x", "vault read -field"),
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query SecretString --output text",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "gcloud secrets versions access latest --secret=x",
+                "gcloud secrets versions access",
+            ),
+            ("pass show x", "pass show"),
         ];
         for (command, want) in cases {
             assert_eq!(first_exposed_dump(command), Some(*want), "{command}");
@@ -360,6 +491,9 @@ mod tests {
             "op read op://v/i/f | openssl dgst -sha256",
             "op read --out-file /tmp/f op://v/i/f",
             "op read -o /tmp/f op://v/i/f",
+            "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
+            "vault kv get secret/x",
+            "pass ls",
             // Captured by substitution: never printed.
             "TOKEN=$(op read op://v/i/f) gh api user",
             "export PW=\"$(security find-generic-password -s svc -w)\"",

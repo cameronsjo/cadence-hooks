@@ -50,6 +50,8 @@ const KINDS: &[&str] = &[
     "API key (sk- shape)",
     "Google API key",
     "Private key PEM header",
+    "GitLab token",
+    "npm token",
 ];
 
 static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -62,6 +64,8 @@ static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"|(?P<k5>sk-[A-Za-z0-9_-]{20,})",
         r"|(?P<k6>AIza[A-Za-z0-9_-]{35})",
         r"|(?P<k7>-----BEGIN[A-Z ]*PRIVATE ?KEY(?: ?BLOCK)?-----)",
+        r"|(?P<k8>glpat-[A-Za-z0-9_-]{20,})",
+        r"|(?P<k9>npm_[A-Za-z0-9]{36,})",
     ))
     .expect("credential regex is valid")
 });
@@ -84,8 +88,10 @@ fn looks_random(s: &str) -> bool {
 
 /// Known token prefixes, for the one plain-space join (see [`normalize`]).
 static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|[sr]k_live_|sk-|AIza)")
-        .expect("prefix regex is valid")
+    Regex::new(
+        r"^(?:gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|[sr]k_live_|sk-|AIza|glpat-|npm_)",
+    )
+    .expect("prefix regex is valid")
 });
 
 /// Copy of `text` with shell-concatenation seams removed, so a split token
@@ -150,8 +156,8 @@ fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
-/// The per-match gates shared by [`scan`] and [`direct_spans`], so the block
-/// tier and the output redactor can never disagree about what is a token.
+/// The block tier's per-match gates. [`direct_spans`] (the output redactor)
+/// deliberately relaxes the boundary half; see its doc.
 fn accepts(idx: usize, token: &str, orig: &str, offset: usize) -> bool {
     // Left boundary, judged in the ORIGINAL text so a token fused onto a
     // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
@@ -175,27 +181,77 @@ pub struct TokenSpan {
 
 /// Every credential token written **as-is** in `text`, as byte ranges, with no
 /// hit cap. For `redact-secret-output` (cameronsjo/cadence-hooks#776), which
-/// must mask each token in place: the normalized pass is skipped because a
-/// command's output is not shell source, so a split form is not a token there
-/// and its offsets could not be masked byte-exactly anyway. Same regex and
-/// same gates as [`scan`] — one source of truth for token grammar.
+/// masks each token in place. Same [`TOKEN_RE`] grammar as [`scan`] (the
+/// block tiers: `redact-external-content`, `prevent-secret-push`), with three
+/// deliberate differences, all toward masking more, because a redactor's miss
+/// leaks a secret while its false positive only costs readability:
+///
+/// - **No left-boundary gate** except for the `sk-` shape, whose prefix prose
+///   can form (`task-…`, `risk-…`). A token glued to a JSON escape (`\n` +
+///   token), an ANSI colour code or a `%3D` is still a token here.
+/// - For `sk-`, a letter right after a backslash, or the end of a `%XX` escape,
+///   counts as a boundary.
+/// - **JWTs** (`eyJ…` three base64url segments) are masked. They stay out of
+///   [`TOKEN_RE`] because an example JWT in a doc or test fixture would start
+///   blocking pushes; masking one in output costs nothing.
+///
+/// The normalized (split-token) pass is skipped: output is not shell source,
+/// and a split form has no byte-exact span to mask.
 pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
     let mut out = Vec::new();
     for caps in TOKEN_RE.captures_iter(text) {
-        let Some((idx, m)) =
-            (0..KINDS.len()).find_map(|i| caps.name(&format!("k{i}")).map(|m| (i, m)))
-        else {
+        let Some((idx, m)) = (0..KINDS.len()).find_map(|i| caps.get(i + 1).map(|m| (i, m))) else {
             continue;
         };
-        if accepts(idx, m.as_str(), text, m.start()) {
-            out.push(TokenSpan {
-                kind: KINDS[idx],
-                start: m.start(),
-                end: m.end(),
-            });
+        if idx == 5 && !(sk_boundary(text, m.start()) && looks_random(&m.as_str()[3..])) {
+            continue;
         }
+        out.push(TokenSpan {
+            kind: KINDS[idx],
+            start: m.start(),
+            end: m.end(),
+        });
+    }
+    for m in JWT_RE.find_iter(text) {
+        out.push(TokenSpan {
+            kind: JWT_KIND,
+            start: m.start(),
+            end: m.end(),
+        });
     }
     out
+}
+
+/// Kind name for a masked JWT (redactor-only, see [`direct_spans`]).
+pub const JWT_KIND: &str = "JWT";
+
+static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+        .expect("jwt regex is valid")
+});
+
+/// The END line of a private-key block, of every kind the `k7` header matches.
+pub static PEM_END_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----END[A-Z ]*PRIVATE ?KEY(?: ?BLOCK)?-----").expect("pem end regex is valid")
+});
+
+/// Left boundary for the `sk-` shape in the redactor: the block-tier rule,
+/// except that an escape letter (`\n`) or a `%XX` escape ends a word.
+fn sk_boundary(text: &str, offset: usize) -> bool {
+    let before = &text[..offset];
+    let mut rev = before.chars().rev();
+    let Some(prev) = rev.next() else {
+        return true;
+    };
+    if !(prev.is_ascii_alphanumeric() || prev == '_' || prev == '-') {
+        return true;
+    }
+    let prev2 = rev.next();
+    if prev2 == Some('\\') {
+        return true;
+    }
+    let prev3 = rev.next();
+    prev3 == Some('%') && prev.is_ascii_hexdigit() && prev2.is_some_and(|c| c.is_ascii_hexdigit())
 }
 
 /// Kind name of the PEM private-key header, for callers that extend its span
@@ -207,9 +263,7 @@ fn scan_one(scan: &str, orig: &str, map: Option<&[usize]>, out: &mut Vec<CredHit
         if out.len() >= MAX_HITS {
             return;
         }
-        let Some((idx, m)) =
-            (0..KINDS.len()).find_map(|i| caps.name(&format!("k{i}")).map(|m| (i, m)))
-        else {
+        let Some((idx, m)) = (0..KINDS.len()).find_map(|i| caps.get(i + 1).map(|m| (i, m))) else {
             continue;
         };
         let s = m.as_str();
