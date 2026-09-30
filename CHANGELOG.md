@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`prevent-secret-push`'s `help.autocorrect` check no longer caches a failed command-list probe.** It asks git for `--list-cmds=builtins,main` (and searches `PATH` itself instead of `others`, whose PATH scan could overrun the 2 s probe on a loaded Windows host), and a probe that fails is asked again on the next call instead of leaving every builtin reading as unknown for the rest of the process (which refused `git hash-object` under an autocorrect config).
 - **`cadence record-scrub` judges the file it actually reads.** It opens the draft once, non-blocking, checks the opened handle is a regular file, and reads through the 16 MiB cap, so a path swapped for a FIFO or a larger file between a check and the read can neither stall it nor have other bytes hashed (cameronsjo/cadence-hooks#755 review follow-up).
 
 ## [0.120.0] - 2026-09-30
