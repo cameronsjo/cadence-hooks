@@ -924,11 +924,11 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "plan-driver",
-        description: "Ask to confirm a /model switch (command or picker; never SDK, where ask refuses) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
+        description: "Ask to confirm a /model switch (command or picker, attended TUI only: CLAUDE_CODE_ENTRYPOINT=cli and CLAUDE_CODE_SESSION_ATTENDED=1, never -p, stream-json, SDK or CLAUDE_CODE_REMOTE, where an ask refuses the switch) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
         namespace: "session",
         events: &[HookEvent::PreModelSwitch],
-        // Remote: read-only against the repo; a cloud operator can still
-        // /model and answer the confirm (#989).
+        // Remote: read-only; the check self-silences under CLAUDE_CODE_REMOTE,
+        // where a streamed /model cannot answer an ask and would be refused (#989).
         remote: RemotePolicy::Run,
         // It asks, never nudges.
         suppressible: false,

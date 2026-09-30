@@ -16,12 +16,18 @@
 //! driver (every plan on a shared-main repo says `branch: main`), or none
 //! records one, the check is silent — it never picks a driver by guess.
 //!
-//! **Interactive sources only.** Measured on Claude Code 2.1.285: an `ask`
-//! on a `source: "sdk"` switch is refused exactly like a `deny` ("Model
-//! switch blocked by a PreModelSwitch hook"), because no human is there to
-//! confirm. So the check asks only on `command` (`/model <id>`) and `picker`
-//! (the `/model` menu); every other source, including an unknown future one,
-//! is silent. That keeps the "never blocks" promise.
+//! **Attended interactive switches only.** Measured on Claude Code 2.1.285:
+//! with no human attached an `ask` is refused exactly like a `deny` ("Model
+//! switch blocked by a PreModelSwitch hook"). That covers an SDK `set_model`
+//! (`source: "sdk"`) **and** a `/model` typed into `claude -p` or sent as a
+//! stream-json user message (remote and cloud sessions), both of which report
+//! `source: "command"` — so `source` alone does not prove a human. The payload
+//! carries no discriminator; the hook's environment does. The TUI runs hooks
+//! with `CLAUDE_CODE_ENTRYPOINT=cli` and `CLAUDE_CODE_SESSION_ATTENDED=1`,
+//! while `-p` and stream-json runs carry `sdk-cli` and `0`. The check asks
+//! only when both positive values are present, `CLAUDE_CODE_REMOTE` is unset,
+//! and `source` is `command` or `picker`; any absent or unknown signal is
+//! silent. That keeps the "never blocks" promise.
 //!
 //! **No payload or plan text reaches the output.** The reason names the two
 //! families through [`Tier::as_str`] — a closed enum — and is otherwise
@@ -191,6 +197,14 @@ fn decide(
     CheckResult::ask(confirm_message(driver, target, drops))
 }
 
+/// True only on the positive attended-TUI signal (see the module docs). Takes
+/// an env reader so tests never depend on the process environment.
+fn human_attached(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env("CLAUDE_CODE_ENTRYPOINT").as_deref() == Some("cli")
+        && env("CLAUDE_CODE_SESSION_ATTENDED").as_deref() == Some("1")
+        && env("CLAUDE_CODE_REMOTE").is_none_or(|v| v.is_empty())
+}
+
 /// True when this payload is an operator switch a human can confirm.
 fn is_interactive_pre_switch(input: &HookInput) -> bool {
     input.hook_event_name.as_deref() == Some("PreModelSwitch")
@@ -201,7 +215,7 @@ fn is_interactive_pre_switch(input: &HookInput) -> bool {
 }
 
 pub fn run_plan_driver(input: &HookInput) -> CheckResult {
-    if !is_interactive_pre_switch(input) {
+    if !is_interactive_pre_switch(input) || !human_attached(&|k| std::env::var(k).ok()) {
         return CheckResult::allow();
     }
     // Cheap payload gate before any git spawn or directory scan.
@@ -428,6 +442,42 @@ mod tests {
                 is_interactive_pre_switch(&input),
                 *judged,
                 "{event:?}/{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_attached_table() {
+        // (entrypoint, attended, remote, attended?) — observed values from the
+        // 2.1.285 hook-env probe: TUI = cli/1; `-p` and stream-json = sdk-cli/0.
+        type Row<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, bool);
+        let cases: &[Row] = &[
+            (Some("cli"), Some("1"), None, true),
+            (Some("cli"), Some("1"), Some(""), true),
+            (Some("sdk-cli"), Some("0"), None, false),
+            (Some("cli"), Some("0"), None, false),
+            (Some("sdk-cli"), Some("1"), None, false),
+            (Some("cli"), None, None, false),
+            (None, Some("1"), None, false),
+            (None, None, None, false),
+            (Some("cli"), Some("1"), Some("true"), false),
+            (Some("CLI"), Some("1"), None, false),
+            (Some("cli"), Some("true"), None, false),
+        ];
+        for (entry, attended, remote, want) in cases {
+            let env = |k: &str| {
+                match k {
+                    "CLAUDE_CODE_ENTRYPOINT" => *entry,
+                    "CLAUDE_CODE_SESSION_ATTENDED" => *attended,
+                    "CLAUDE_CODE_REMOTE" => *remote,
+                    _ => None,
+                }
+                .map(str::to_string)
+            };
+            assert_eq!(
+                human_attached(&env),
+                *want,
+                "{entry:?}/{attended:?}/{remote:?}"
             );
         }
     }
