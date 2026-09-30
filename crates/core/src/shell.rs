@@ -8311,6 +8311,35 @@ thread_local! {
     static FREE_LEVELS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    static OPEN_PROCSUB_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set while [`emit_segment`] reads an unclosed `<(`/`>(`'s own body, whose
+/// `$(…)`s the pass through every `<(` has already read; restored on drop.
+struct OpenProcSubRead(bool);
+
+impl OpenProcSubRead {
+    fn active() -> bool {
+        OPEN_PROCSUB_READ.with(std::cell::Cell::get)
+    }
+
+    fn enter() -> Self {
+        Self(OPEN_PROCSUB_READ.with(|flag| flag.replace(true)))
+    }
+
+    /// The `$(…)` bodies that pass reads are fresh text of their own.
+    fn leave() -> Self {
+        Self(OPEN_PROCSUB_READ.with(|flag| flag.replace(false)))
+    }
+}
+
+impl Drop for OpenProcSubRead {
+    fn drop(&mut self) {
+        OPEN_PROCSUB_READ.with(|flag| flag.set(self.0));
+    }
+}
+
 /// One process-substitution level [`emit_segment`] reads without charging
 /// the wrapper depth, held while that body is read. At most
 /// [`MAX_WRAPPER_DEPTH`] are held at once.
@@ -8352,12 +8381,83 @@ struct FlattenWork {
     left: usize,
     listed: std::collections::HashSet<String>,
     command: Option<String>,
+    /// Each text the pass through every `<(` has read, and the shallowest
+    /// level it was read at: an unclosed `<(`'s readings are near-copies of
+    /// one another, so the same bodies came back once per copy.
+    through: std::collections::HashMap<String, usize>,
+    /// Bytes of body the pass through every `<(` may still expand. Each
+    /// unclosed `<(` in a flood hands it a near-copy of the rest of the
+    /// command, so without a cap of its own it re-read the input a few dozen
+    /// times.
+    through_left: usize,
+}
+
+/// The text [`FlattenWork::first_through_read`] keys a body by: without its
+/// trailing closers and blanks. A widened substitution is read twice, as the
+/// rest of the text and as the text up to its last `)`, and the two differ
+/// only by those closers, which open and run nothing.
+fn through_key(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c == ')' || c.is_whitespace())
 }
 
 /// Restores the enclosing call's [`FlattenWork`] when dropped.
 struct FlattenScope(Option<FlattenWork>);
 
 impl FlattenWork {
+    /// Whether `text` has not yet been read by the pass through every `<(`
+    /// at `depth` or shallower in this call, recording it if not. A read at a
+    /// shallower level expands at least as much, so a repeat adds nothing.
+    fn first_through_read(text: &str, depth: usize) -> bool {
+        let text = through_key(text);
+        FLATTEN_WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            let Some(work) = work.as_mut() else {
+                return true;
+            };
+            match work.through.get_mut(text) {
+                Some(seen) if *seen <= depth => false,
+                Some(seen) => {
+                    *seen = depth;
+                    true
+                }
+                None => {
+                    work.through.insert(text.to_string(), depth);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Whether the pass through every `<(` has read `text` at `depth` or
+    /// shallower in this call.
+    fn through_read_by(text: &str, depth: usize) -> bool {
+        let text = through_key(text);
+        FLATTEN_WORK.with(|work| {
+            work.borrow()
+                .as_ref()
+                .and_then(|work| work.through.get(text))
+                .is_some_and(|&seen| seen <= depth)
+        })
+    }
+
+    /// Spend `n` bytes of the pass-through allowance; `false` once it cannot
+    /// cover them. Outside [`command_segments`] there is no allowance.
+    fn charge_through(n: usize) -> bool {
+        FLATTEN_WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            let Some(work) = work.as_mut() else {
+                return true;
+            };
+            match work.through_left.checked_sub(n) {
+                Some(rest) => {
+                    work.through_left = rest;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
     fn start(command: &str) -> FlattenScope {
         let fresh = FlattenWork {
             left: FLATTEN_WORK_FACTOR
@@ -8365,6 +8465,10 @@ impl FlattenWork {
                 .saturating_add(FLATTEN_WORK_FLOOR),
             listed: std::collections::HashSet::new(),
             command: Some(command.to_string()),
+            through: std::collections::HashMap::new(),
+            through_left: THROUGH_WORK_FACTOR
+                .saturating_mul(command.len())
+                .saturating_add(FLATTEN_WORK_FLOOR),
         };
         FlattenScope(FLATTEN_WORK.with(|work| work.replace(Some(fresh))))
     }
@@ -8846,21 +8950,56 @@ fn emit_segment(
             if dedupe && body.starts_with(EXPANDED_MARK) {
                 continue;
             }
+            // Inside an unclosed `<(`'s own reading, a `$(…)` the pass
+            // through every `<(` already read one level up is the same text
+            // again, one level deeper: reading it twice doubled a flood.
+            if kind == BodyKind::Plain
+                && OpenProcSubRead::active()
+                && FlattenWork::through_read_by(&body, depth + 1)
+            {
+                continue;
+            }
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
             let free = (kind == BodyKind::ProcSub).then(FreeLevel::take).flatten();
             match free {
                 Some(_level) => expand_segments(&body, &mut scope, depth, out, dedupe),
                 None => {
-                    expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+                    // Inside an unclosed `<(`'s own reading, every `$(…)` it
+                    // holds was already read by the pass below at a
+                    // shallower level; a nested unclosed `<(` there repeats
+                    // that pass on most of the same text, once per level.
+                    let through = match kind {
+                        BodyKind::Plain => false,
+                        BodyKind::ProcSub => true,
+                        BodyKind::OpenProcSub => !OpenProcSubRead::active(),
+                    };
+                    {
+                        let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
+                        expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+                    }
                     // Past the free levels a nested `<(` spends one, so the
                     // `$(…)`s inside are also read where they sat before
                     // bodies were surfaced: one pass through every `<(` to
                     // them, each read at this segment's next level.
-                    if kind != BodyKind::Plain && ExpansionWork::charge(body.len()) {
+                    if through
+                        && FlattenWork::first_through_read(&body, depth)
+                        && ExpansionWork::charge(body.len())
+                    {
+                        let _fresh = OpenProcSubRead::leave();
                         for inner in substitution_bodies_through_procsubs(&body) {
                             if dedupe && inner.starts_with(EXPANDED_MARK) {
                                 continue;
+                            }
+                            if !FlattenWork::first_through_read(&inner, depth + 1) {
+                                continue;
+                            }
+                            if !FlattenWork::charge_through(inner.len()) {
+                                // Past the allowance the body is still listed
+                                // as written, not evaluated; a guard that
+                                // arms the expansion allowance refuses.
+                                ExpansionWork::exhaust();
+                                break;
                             }
                             let mut scope = assignments.child();
                             expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
@@ -8952,6 +9091,11 @@ fn scripts_past_the_bound(segment: &str) -> Vec<String> {
 /// floor under that, before it stops reading deeper levels.
 const FLATTEN_WORK_FACTOR: usize = 2;
 const FLATTEN_WORK_FLOOR: usize = 1 << 16;
+
+/// Bytes of body the pass through every `<(` in [`emit_segment`] may expand
+/// per byte of the command, over [`FLATTEN_WORK_FLOOR`]: room for the one
+/// pass a real command needs, with its widened readings.
+const THROUGH_WORK_FACTOR: usize = 4;
 
 /// Every substitution body in `segment`, at every nesting level, each read
 /// with the substitutions nested in it collapsed to their bare opener
