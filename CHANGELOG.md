@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`prevent-secret-push`'s `help.autocorrect` check no longer caches a failed command-list probe.** It asks git for `--list-cmds=builtins,main` (and searches `PATH` itself instead of `others`, whose PATH scan could overrun the 2 s probe on a loaded Windows host), and a probe that fails is asked again on the next call instead of leaving every builtin reading as unknown for the rest of the process (which refused `git hash-object` under an autocorrect config). A `git-<name>` on `PATH` counts only when it is an executable file in an absolute directory, as git itself requires, so a planted non-executable `git-psuh` or a relative `PATH` entry no longer passes a `git psuh` git would autocorrect to `push`.
 - **`cadence record-scrub` judges the file it actually reads.** It opens the draft once, non-blocking, checks the opened handle is a regular file, and reads through the 16 MiB cap, so a path swapped for a FIFO or a larger file between a check and the read can neither stall it nor have other bytes hashed (cameronsjo/cadence-hooks#755 review follow-up).
 
+### Added
+
+- **`session guard` counts every nudge it fires in `guard_nudges.jsonl`.** Each branch-switch, blanket-staging, or lane-collision nudge appends one row (`check`, `tool`, `sessionId`, `peerCount`, `repo`) to the metrics dir, so whether any of them earns a block tier can be decided from counts. The row is the only side effect: no context is added, and a write failure is a silent no-op (cameronsjo/cadence-hooks#272).
+- **`session guard` nudges on a Bash command that writes into a live peer's declared lane.** It reuses `enforce-worktree`'s subprocess tree-mutation walk (#234), so a `sed -i`, `tee`, `>`/`>>`/`2>` redirect, or a package-manager verb whose directory lands in a peer's `touching` path now warns just as an `Edit`/`Write` there does, including through `cd`, `sh -c` and `$(…)`. It only adds nudges, and an allowed command is never blocked. A target the walk cannot resolve is not warned about: a relative `$VAR/…` path, `cp`/`mv`/`install`, `python -c`, and the walk's other documented misses (cameronsjo/cadence-hooks#272).
+
 ## [0.120.0] - 2026-09-30
 
 ### Added
