@@ -2070,6 +2070,7 @@ mod tests {
             "cat <(echo $(echo $(echo $(rm note.md))))",
             "echo $(echo $(echo $(echo $(echo $(rm note.md)))))",
             "cat <(cat <(cat <(cat <(cat <(rm note.md)))))",
+            "x=$(cat <(echo $(echo $(bash -c \"rm note.md\"))))",
         ] {
             assert_eq!(
                 outcome_in_vault(command),

@@ -213,6 +213,11 @@ CORPUS="$WORK/corpus.tsv"
     printf '1267-dollar-8\techo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(cp d .env))))))))\n'
     printf '1267-backtick-inner\techo $(echo $(echo $(echo `cat .env`)))\n'
     printf '1267-procsub-5\tcat <(cat <(cat <(cat <(cat <(cp d .env)))))\n'
+    # #1266 review: a wrapper script past the bound is unwrapped too.
+    printf '1266-wrap-bash\tcat <(echo $(echo $(echo $(bash -c '"'"'git reset --hard'"'"'))))\n'
+    printf '1266-wrap-sh\techo $(cat <(echo $(echo $(sh -c '"'"'cp d .env'"'"'))))\n'
+    printf '1266-wrap-eval\tdiff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))\n'
+    printf '1266-wrap-nested\ttrue >(echo "$(echo $(sh -c '"'"'sh -c '"'"'"'"'"'"'"'"'git reset --hard'"'"'"'"'"'"'"'"''"'"'))")\n'
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling

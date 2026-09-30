@@ -2697,6 +2697,8 @@ mod tests {
             "echo $(echo $(echo $(echo `cp d .env`)))",
             "cat <(cat <(cat <(cat <(cat <(cp d .env)))))",
             "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(mv d .env))))))))",
+            "echo $(cat <(echo $(echo $(sh -c 'cp d .env'))))",
+            "diff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))",
         ] {
             let result = SecretWritesGuard::default().run(&make_bash(command));
             assert_eq!(

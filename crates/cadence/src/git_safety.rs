@@ -2537,6 +2537,9 @@ mod tests {
             "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(git reset --hard))))))))",
             "echo $(echo $(echo $(echo `git reset --hard`)))",
             "cat <(cat <(cat <(cat <(cat <(git reset --hard)))))",
+            "cat <(echo $(echo $(echo $(bash -c 'git reset --hard'))))",
+            "echo \"$(true >(true >(echo $(eval 'git reset --hard'))))\"",
+            "sh -c 'true >(echo $(bash -c '\"'\"'eval '\"'\"'\"'\"'\"'\"'\"'\"'git reset --hard'\"'\"'\"'\"'\"'\"'\"'\"''\"'\"'))'",
         ] {
             let result = GitSafetyGuard.run(&make_bash_input(command));
             assert_eq!(
