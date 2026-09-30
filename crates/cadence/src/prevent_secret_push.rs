@@ -597,8 +597,8 @@ fn external_subcommand_exists(dir: &str, name: &str) -> bool {
 }
 
 /// Whether `path` (a `PATH` value) holds a `git-<name>` git would run as
-/// `git <name>`: an executable regular file, as git's own `is_executable`
-/// asks, in an absolute directory. A non-executable `git-psuh` is not a
+/// `git <name>`: a regular file with the owner execute bit, which is the
+/// one bit git's own `is_executable` tests, in an absolute directory. A non-executable `git-psuh` is not a
 /// command, so git still autocorrects `git psuh` to `push`; a relative or
 /// empty entry resolves against wherever git runs, which is not this hook's
 /// directory, so it is not trusted (stricter).
@@ -613,7 +613,7 @@ fn path_runs_git_command(path: &std::ffi::OsStr, name: &str) -> bool {
 fn is_executable_file(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o100 != 0)
 }
 
 #[cfg(not(unix))]
@@ -2990,6 +2990,14 @@ mod tests {
             !path_runs_git_command(&path, "psuh"),
             "a 0644 file is not a command"
         );
+        // git tests the owner bit alone: group/other execute is not enough.
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o011)).unwrap();
+        assert!(
+            !path_runs_git_command(&path, "psuh"),
+            "0011 is not a command"
+        );
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o100)).unwrap();
+        assert!(path_runs_git_command(&path, "psuh"));
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(path_runs_git_command(&path, "psuh"));
         // A relative or empty entry is not trusted, even when it holds one.
