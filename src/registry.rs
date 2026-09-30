@@ -165,6 +165,15 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "prevent-secret-push",
+        description: "Block a git push that would publish a secret-named file, a credential token, or a commit or tag message or ref name carrying one",
+        namespace: "cadence",
+        events: &[HookEvent::PreToolUse],
+        // Remote: security guard; the cloud VM still needs it.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "memory-guard",
         description: "Enforce MEMORY.md line limits",
         namespace: "cadence",
@@ -928,6 +937,7 @@ pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
 pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
+    "prevent-secret-push",
     "git-safety",
     "guard-push-remote",
     "guard-gh-dangerous",

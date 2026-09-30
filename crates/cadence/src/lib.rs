@@ -29,6 +29,8 @@ pub mod nudge_polish_before_pr;
 pub mod platform_drift;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
+/// Block a `git push` that would publish a secret (pre-push scan).
+pub mod prevent_secret_push;
 /// Block writing or deleting secrets (.env, credentials, private keys).
 pub mod prevent_secret_writes;
 /// Record that `/polish` ran on this branch (writes a branch-scoped marker). CLI action.

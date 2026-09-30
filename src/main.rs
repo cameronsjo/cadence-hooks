@@ -254,6 +254,8 @@ enum CadenceCommands {
     PreventSecretLeaks,
     /// Guard against writing/editing/deleting secrets
     PreventSecretWrites,
+    /// Block a git push that would publish a secret (pre-push scan)
+    PreventSecretPush,
     /// Enforce MEMORY.md line limits
     MemoryGuard,
     /// Block dangerous git operations
@@ -612,6 +614,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::OrphanedTodos => "orphaned-todos",
             CadenceCommands::PreventSecretLeaks => "prevent-secret-leaks",
             CadenceCommands::PreventSecretWrites => "prevent-secret-writes",
+            CadenceCommands::PreventSecretPush => "prevent-secret-push",
             CadenceCommands::MemoryGuard => "memory-guard",
             CadenceCommands::GitSafety => "git-safety",
             CadenceCommands::LineEndings => "line-endings",
@@ -771,6 +774,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 Box::new(
                     cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard::default(),
                 ),
+                pre,
+            ),
+            CadenceCommands::PreventSecretPush => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::prevent_secret_push::PreventSecretPushGuard),
                 pre,
             ),
             CadenceCommands::MemoryGuard => CheckPlan::new(

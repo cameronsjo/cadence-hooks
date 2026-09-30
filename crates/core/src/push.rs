@@ -94,6 +94,16 @@ pub struct PushInvocation {
     /// `--dry-run`/`-n`: git contacts the remote but publishes nothing, so a
     /// content guard may allow. Matched exactly — see the module docs.
     pub dry_run: bool,
+    /// `--mirror` alone, of the two [`PushInvocation::all_or_mirror`] spellings:
+    /// every ref under `refs/`, where `--all` is only `refs/heads`. Read only
+    /// by a caller that tells the two apart (`prevent-secret-push`).
+    pub mirror: bool,
+    /// `--follow-tags` (`Some(true)`) or `--no-follow-tags` (`Some(false)`),
+    /// the last one written; `None` leaves `push.followTags` in charge.
+    pub follow_tags: Option<bool>,
+    /// The last `--recurse-submodules` value written (`--no-recurse-submodules`
+    /// reads `no`); `None` leaves `push.recurseSubmodules` in charge.
+    pub recurse_submodules: Option<String>,
     /// This walk saw something it cannot model well enough to scan a COMPLETE
     /// range, so a caller must refuse rather than scan a subset — the plan's
     /// "never silently scan a subset and exit 0".
@@ -986,6 +996,9 @@ fn collect_push_invocations(
                 all_or_mirror: false,
                 tags: false,
                 dry_run: false,
+                mirror: false,
+                follow_tags: None,
+                recurse_submodules: None,
                 unresolved: true,
                 repository_unresolved: true,
                 directory_unverified: segment_directory,
@@ -2841,6 +2854,9 @@ fn push_invocation_of(
             all_or_mirror: false,
             tags: false,
             dry_run: false,
+            mirror: false,
+            follow_tags: None,
+            recurse_submodules: None,
             unresolved: true,
             repository_unresolved: globals.foreign_redirect,
             directory_unverified: globals.unreadable_dir,
@@ -2885,6 +2901,9 @@ fn push_invocation_of(
         all_or_mirror: scan.all_or_mirror,
         tags: scan.tags,
         dry_run: scan.dry_run,
+        mirror: scan.mirror,
+        follow_tags: scan.follow_tags,
+        recurse_submodules: scan.recurse_submodules,
         unresolved: globals.foreign_redirect
             || globals.unreadable_dir
             || (implicit && globals.push_config_override),
@@ -2910,6 +2929,9 @@ struct PushWordScan {
     tags: bool,
     dry_run: bool,
     delete_flag: bool,
+    mirror: bool,
+    follow_tags: Option<bool>,
+    recurse_submodules: Option<String>,
 }
 
 /// Walk the words AFTER `push`, separating options from positionals.
@@ -2925,6 +2947,9 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
         tags: false,
         dry_run: false,
         delete_flag: false,
+        mirror: false,
+        follow_tags: None,
+        recurse_submodules: None,
     };
     let mut positionals = 0usize;
     let mut options_ended = false;
@@ -2966,7 +2991,12 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // resolves an unambiguous abbreviation. Over-matching here only
             // widens the range a caller scans, so an ambiguous prefix git would
             // reject costs nothing.
-            if abbreviates("all", name) || abbreviates("mirror", name) {
+            // `--branches` is git's alias of `--all` (2.44+ spells it in `-h`);
+            // no other push option starts with `b`, so any prefix selects it.
+            if abbreviates("all", name)
+                || abbreviates("mirror", name)
+                || abbreviates("branches", name)
+            {
                 scan.all_or_mirror = true;
             }
             // `--tags` widens the same way and is tracked separately — see the
@@ -2988,6 +3018,30 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             }
             if name == "delete" {
                 scan.delete_flag = true;
+            }
+            // Recorded for a caller that tells `--mirror` from `--all`, and
+            // that follows tags or submodules; none of the three changes a
+            // field above.
+            if abbreviates("mirror", name) {
+                scan.mirror = true;
+            }
+            // `--fol` is the shortest unambiguous `--follow-tags`: git rejects
+            // `--fo` as ambiguous with `--force-if-includes` (measured, 2.43),
+            // and the same holds for `--no-fo` against `--no-force-if-includes`.
+            match name {
+                _ if name.len() >= 3 && abbreviates("follow-tags", name) => {
+                    scan.follow_tags = Some(true);
+                }
+                _ if name.len() >= 6 && abbreviates("no-follow-tags", name) => {
+                    scan.follow_tags = Some(false);
+                }
+                "no-recurse-submodules" => scan.recurse_submodules = Some("no".to_string()),
+                _ if name.starts_with("recu") && abbreviates("recurse-submodules", name) => {
+                    scan.recurse_submodules = inline
+                        .map(str::to_string)
+                        .or_else(|| words.get(index + 1).map(|w| unescape_word(w).into_owned()));
+                }
+                _ => {}
             }
             let takes_separate_value =
                 inline.is_none() && crate::shell::long_option_takes_separate_value(name);
@@ -4964,6 +5018,78 @@ mod tests {
         let followed = only("git push --follow-tags origin main", "/repo");
         assert!(!followed.tags);
         assert!(!only("git push origin main", "/repo").tags);
+    }
+
+    #[test]
+    fn mirror_follow_tags_and_recurse_submodules_are_recorded() {
+        for (command, mirror, follow, recurse) in [
+            ("git push origin main", false, None, None),
+            ("git push --mirror origin", true, None, None),
+            ("git push --mirr origin", true, None, None),
+            ("git push --all origin", false, None, None),
+            (
+                "git push --follow-tags origin main",
+                false,
+                Some(true),
+                None,
+            ),
+            (
+                "git push --follow-tags --no-follow-tags origin main",
+                false,
+                Some(false),
+                None,
+            ),
+            (
+                "git push --recurse-submodules=on-demand origin main",
+                false,
+                None,
+                Some("on-demand"),
+            ),
+            (
+                "git push --recurse-submodules check origin main",
+                false,
+                None,
+                Some("check"),
+            ),
+            (
+                "git push --no-recurse-submodules origin main",
+                false,
+                None,
+                Some("no"),
+            ),
+        ] {
+            let found = only(command, "/repo");
+            assert_eq!(found.mirror, mirror, "{command}");
+            assert_eq!(found.follow_tags, follow, "{command}");
+            assert_eq!(found.recurse_submodules.as_deref(), recurse, "{command}");
+        }
+        // The value word is still consumed, so it is not read as a refspec.
+        let found = only("git push --recurse-submodules check origin main", "/repo");
+        assert_eq!(found.repository.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn branches_and_follow_tags_abbreviations_are_read_like_git() {
+        // `--branches` is an alias of `--all`; `--b` is unique among push's
+        // options. `--fo`/`--no-fo` are ambiguous with `--force-if-includes`
+        // (git refuses them), so `--fol`/`--no-fol` are the shortest spellings.
+        for (command, all, follow) in [
+            ("git push --branches origin", true, None),
+            ("git push --br origin", true, None),
+            ("git push --b origin", true, None),
+            ("git push --fol origin main", false, Some(true)),
+            ("git push --follow origin main", false, Some(true)),
+            ("git push --no-fol origin main", false, Some(false)),
+            ("git push --no-follow-t origin main", false, Some(false)),
+            ("git push --fo origin main", false, None),
+            ("git push --no-fo origin main", false, None),
+            ("git push --force origin main", false, None),
+        ] {
+            let found = only(command, "/repo");
+            assert_eq!(found.all_or_mirror, all, "{command}");
+            assert_eq!(found.follow_tags, follow, "{command}");
+            assert!(!found.mirror, "{command}");
+        }
     }
 
     #[test]
