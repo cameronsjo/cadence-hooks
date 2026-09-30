@@ -2478,8 +2478,19 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
         // argument lands four lines down — which is how `cadence
         // platform-drift` dropped out of this map entirely, unnoticed because
         // the consuming assertion skips any command it cannot find.
+        // A top-level item (column-0 `fn`/`}`/doc comment) also ends the window:
+        // the last arm's window must not spill past its dispatch function into
+        // unrelated code, where an argument like `, session_id` reads as an event.
         let arm_end = ((i + 1)..lines.len())
-            .find(|k| is_command_arm_line(lines[*k]) || lines[*k].contains("=> match"))
+            .find(|k| {
+                let l = lines[*k];
+                is_command_arm_line(l)
+                    || l.contains("=> match")
+                    || l.starts_with("fn ")
+                    || l.starts_with("pub fn ")
+                    || l.starts_with("}")
+                    || l.starts_with("///")
+            })
             .unwrap_or(lines.len());
         let window: String = lines[i..arm_end]
             .join(" ")

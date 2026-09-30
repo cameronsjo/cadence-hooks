@@ -34,7 +34,7 @@ use cadence_hooks_core::shell::{
     command_segments, command_word, contains_ignoring_ascii_case, executable_tokens,
     peel_command_runners,
 };
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -250,6 +250,8 @@ impl GoingPublicGuard {
         // `gh` process, never this hook, and it only "worked" before because
         // it hid the whole segment — the redaction terms the list may never
         // relieve (#793) included. The relief list is the session environment.
+        // Set when `CADENCE_GOING_PUBLIC_IGNORE` alone kept a term from firing.
+        let mut ignore_ridden = false;
         for segment in command_segments(command) {
             let all_tokens = executable_tokens(&segment);
             let tokens = peel_command_runners(&all_tokens);
@@ -285,6 +287,9 @@ impl GoingPublicGuard {
             if let Some(term) = find_match(&haystack, &terms, &ignore) {
                 return CheckResult::nudge(nudge_message(&term));
             }
+            if !ignore.is_empty() && find_match(&haystack, &terms, &[]).is_some() {
+                ignore_ridden = true;
+            }
             // The redaction term source, read through the tier that owns it
             // (cadence-hooks#793). Deliberately NOT relieved by
             // `CADENCE_GOING_PUBLIC_IGNORE`: softening authority follows
@@ -295,6 +300,11 @@ impl GoingPublicGuard {
             }
         }
 
+        if ignore_ridden {
+            return CheckResult::allow_bypassed(BypassProvenance::env_switch(
+                "CADENCE_GOING_PUBLIC_IGNORE",
+            ));
+        }
         CheckResult::allow()
     }
 }
@@ -625,6 +635,26 @@ mod tests {
     }
 
     // --- IGNORE relief ---
+
+    #[test]
+    fn ignore_relief_records_provenance_only_when_it_relieved_a_hit() {
+        let ridden = GoingPublicGuard.run_with(
+            &make_bash("gh repo create sonarr-cfg --public"),
+            "",
+            "sonarr",
+        );
+        assert_eq!(
+            ridden.bypass.expect("relief ridden").mechanism,
+            "CADENCE_GOING_PUBLIC_IGNORE"
+        );
+        // An ignore list that relieved nothing is not a bypass event.
+        let idle = GoingPublicGuard.run_with(
+            &make_bash("gh repo create plain-name --public"),
+            "",
+            "sonarr",
+        );
+        assert!(idle.bypass.is_none());
+    }
 
     #[test]
     fn ignore_relieves_concrete_term() {

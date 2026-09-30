@@ -1554,10 +1554,12 @@ pub struct BlockMetadata {
 
 /// Why a guard allowed an operation it would otherwise have acted on.
 ///
-/// v1 distinguishes a time-bounded `dismiss-*` snooze from a per-guard
-/// environment switch. Future kinds (`GlobalBypass`/`GlobalDisable` for the
-/// `main.rs` gates, `Exemption`, `EffortSkip`) extend this as the remaining
-/// bypass surface opts in — see the deferred follow-up.
+/// Distinguishes a time-bounded `dismiss-*` snooze, a per-guard environment
+/// switch, and the two process-wide gates in `main.rs` (`CADENCE_BYPASS`,
+/// `CADENCE_DISABLE`), which short-circuit before the dispatch seam and so are
+/// recorded at the gate itself rather than through [`CheckResult::bypass`].
+/// `Exemption` and `EffortSkip` remain unreserved: they are configured
+/// structure, not an operator stepping outside a guard (cadence-hooks#223).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassKind {
     /// A `cadence-hooks guardrails dismiss-*` snooze marker was active.
@@ -1565,6 +1567,10 @@ pub enum BypassKind {
     /// A per-guard environment switch (e.g. `CADENCE_ALLOW_MAIN`,
     /// `CADENCE_NO_ENFORCE_WORKTREE`) suppressed the guard.
     EnvSwitch,
+    /// `CADENCE_BYPASS=1` skipped enforcement process-wide (recorded in `main.rs`).
+    GlobalBypass,
+    /// `CADENCE_DISABLE` named this hook and switched it off (recorded in `main.rs`).
+    GlobalDisable,
 }
 
 impl BypassKind {
@@ -1574,6 +1580,8 @@ impl BypassKind {
         match self {
             BypassKind::Dismissal => "dismissal",
             BypassKind::EnvSwitch => "env_switch",
+            BypassKind::GlobalBypass => "global_bypass",
+            BypassKind::GlobalDisable => "global_disable",
         }
     }
 }
@@ -1600,6 +1608,21 @@ pub struct BypassProvenance {
     pub expires_at: Option<i64>,
     /// The session id that armed the dismissal, when the sidecar recorded it.
     pub armed_by_session: Option<String>,
+}
+
+impl BypassProvenance {
+    /// Provenance for a per-guard environment switch named `mechanism`
+    /// (e.g. `CADENCE_ALLOW_BRANCH_INTENT`). No reason, expiry, or arming
+    /// session: an env var has nowhere to author them.
+    pub fn env_switch(mechanism: impl Into<String>) -> Self {
+        Self {
+            kind: BypassKind::EnvSwitch,
+            mechanism: mechanism.into(),
+            reason: None,
+            expires_at: None,
+            armed_by_session: None,
+        }
+    }
 }
 
 /// Result of running a single check.
@@ -3472,6 +3495,8 @@ mod tests {
         // Metrics records key off these; a rename would silently break greps.
         assert_eq!(BypassKind::Dismissal.as_str(), "dismissal");
         assert_eq!(BypassKind::EnvSwitch.as_str(), "env_switch");
+        assert_eq!(BypassKind::GlobalBypass.as_str(), "global_bypass");
+        assert_eq!(BypassKind::GlobalDisable.as_str(), "global_disable");
     }
 
     // --- JSON deserialization ---

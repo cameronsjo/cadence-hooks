@@ -42,7 +42,7 @@
 
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::git_command;
-use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
 
 /// Count the worktrees in `git worktree list --porcelain` output.
@@ -135,14 +135,15 @@ fn assess_spawn(
     already_warned: bool,
     allowed: bool,
 ) -> CheckResult {
-    if allowed
-        || already_warned
-        || isolation_worktree
-        || read_only_type
-        || !in_main
-        || !worktree_exists
-    {
+    if already_warned || isolation_worktree || read_only_type || !in_main || !worktree_exists {
         return CheckResult::allow();
+    }
+    // The env switch is the only thing standing between this spawn and the
+    // nudge, so it is the bypass being ridden (cadence-hooks#223).
+    if allowed {
+        return CheckResult::allow_bypassed(BypassProvenance::env_switch(
+            "CADENCE_ALLOW_SUBAGENT_FROM_MAIN",
+        ));
     }
     CheckResult::nudge(warn_message())
 }
@@ -238,6 +239,27 @@ mod tests {
     use cadence_hooks_core::test_builders::{make_agent, make_bash};
 
     // --- assess_spawn (pure decision) ---
+
+    #[test]
+    fn env_switch_records_provenance_only_when_it_suppressed_a_nudge() {
+        let ridden = assess_spawn(true, true, false, false, false, true);
+        assert_eq!(ridden.outcome, Outcome::Allow);
+        assert_eq!(
+            ridden.bypass.expect("bypass ridden").mechanism,
+            "CADENCE_ALLOW_SUBAGENT_FROM_MAIN"
+        );
+        // Not in main: the nudge would never have fired, so no bypass row.
+        assert!(
+            assess_spawn(false, true, false, false, false, true)
+                .bypass
+                .is_none()
+        );
+        assert!(
+            assess_spawn(true, true, false, false, false, false)
+                .bypass
+                .is_none()
+        );
+    }
 
     #[test]
     fn all_conditions_met_warns() {

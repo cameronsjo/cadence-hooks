@@ -37,7 +37,7 @@ use crate::identity;
 use crate::registry;
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::git_command;
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
 
 /// Substantive-token stoplist: conventional-commit type prefixes and a few
@@ -91,11 +91,6 @@ impl Check for WarnBranchIntent {
             return CheckResult::allow();
         }
 
-        // Per-repo / user-global opt-out.
-        if is_branch_intent_allowed() {
-            return CheckResult::allow();
-        }
-
         // Gate 3 pre-check: no record, or a blank/absent intent → allow WITHOUT
         // writing the marker (the session may declare intent later and deserves
         // one evaluation then).
@@ -109,6 +104,16 @@ impl Check for WarnBranchIntent {
             .is_some_and(|i| !i.is_empty());
         if !has_intent {
             return CheckResult::allow();
+        }
+
+        // Per-repo / user-global opt-out. Checked only once a declared intent
+        // exists — the point where the nudge could apply — so the provenance row
+        // names a bypass that actually stood in front of a guard, and the git
+        // work below is still skipped (cadence-hooks#223).
+        if is_branch_intent_allowed() {
+            return CheckResult::allow_bypassed(BypassProvenance::env_switch(
+                "CADENCE_ALLOW_BRANCH_INTENT",
+            ));
         }
 
         // Full evaluation: resolve git state, assess, then write the marker so
@@ -706,8 +711,38 @@ mod tests {
         dir
     }
 
+    /// `CADENCE_ALLOW_BRANCH_INTENT` is process-global: every test that runs the
+    /// full `run()` path holds this, so a set value cannot leak into a peer.
+    static INTENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_records_provenance_when_the_env_switch_suppresses_the_nudge() {
+        let _lock = INTENT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let repo = init_stale_feature_repo();
+        let cwd = repo.path().to_string_lossy().to_string();
+        let dir = registry::sessions_dir(&cwd).expect("sessions dir");
+        seed_record(
+            &dir,
+            "run-bypass",
+            "feat/unrelated-diagram",
+            Some("docs/kanban-migration cadence-hooks#243"),
+            STARTED,
+        );
+        let input = edit_input("run-bypass", &cwd);
+        // SAFETY: serialized by INTENT_ENV_LOCK; removed before returning.
+        unsafe { std::env::set_var("CADENCE_ALLOW_BRANCH_INTENT", "1") };
+        let result = WarnBranchIntent.run(&input);
+        unsafe { std::env::remove_var("CADENCE_ALLOW_BRANCH_INTENT") };
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert_eq!(
+            result.bypass.expect("bypass recorded").mechanism,
+            "CADENCE_ALLOW_BRANCH_INTENT"
+        );
+    }
+
     #[test]
     fn run_nudges_on_real_stale_unrelated_branch_via_gitstate() {
+        let _lock = INTENT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // End-to-end coverage of the #164 migration: `run()` resolves the live
         // current branch through `GitState` (the `run_intent`/`assess` seams
         // inject a branch and bypass it). A real repo whose HEAD is a stale

@@ -23,7 +23,7 @@ use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, skip_transparent_prefixes,
     unescape_word,
 };
-use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
+use cadence_hooks_core::{BlockMetadata, BypassProvenance, Check, CheckResult, HookInput};
 
 /// The human-only labels, lowercase (GitHub matches label names case-insensitively).
 const CRITICAL_LABELS: &[&str] = &["impact:critical", "likelihood:critical"];
@@ -308,6 +308,10 @@ impl Check for GuardCriticalGrade {
         }
         let ruling = std::env::var(RULING_ENV).is_ok_and(|v| v == "1");
         let Some(finding) = judge(command, ruling) else {
+            // The ruling let a Critical grade through: record it (#223).
+            if ruling && judge(command, false).is_some() {
+                return CheckResult::allow_bypassed(BypassProvenance::env_switch(RULING_ENV));
+            }
             return CheckResult::allow();
         };
         let fix =
