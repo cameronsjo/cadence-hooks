@@ -10878,9 +10878,16 @@ fn scan_substitution_bodies_in(
             // tail downstream — it is the quote-blind reading plus its post-`)`
             // text that actually surfaces the hidden command. Both are emitted
             // for completeness; do not assume the quote-aware one is load-bearing.
-            push_nonblank(&mut bodies, &chars[i + 2..]);
+            let blind = scan_substitution_body(chars, i + 2, false);
+            // When the quote-blind reading closes on the text's last char,
+            // the quote-aware one is that same text plus its `)`: a copy
+            // that holds no other command, and every nested level of a
+            // closed-but-deep flood made one.
+            if !matches!(blind, Ok((_, end)) if end == chars.len()) {
+                push_nonblank(&mut bodies, &chars[i + 2..]);
+            }
             record((i + 2, chars.len()), true);
-            if let Ok((blind_body, blind_end)) = scan_substitution_body(chars, i + 2, false) {
+            if let Ok((blind_body, blind_end)) = blind {
                 if !blind_body.trim().is_empty() {
                     bodies.push(blind_body);
                 }
