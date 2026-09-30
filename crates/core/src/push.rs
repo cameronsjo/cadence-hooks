@@ -4083,9 +4083,8 @@ mod tests {
                 "/repo",
                 vec![elsewhere("/repo")],
             ),
-            // Review 3/4: an editor that expands only the session's own
-            // editor variables is the inherited program, unless the command
-            // assigns one; any other name may have been set anywhere.
+            // Reviews 3–10: an editor whose command name is an expansion is
+            // never read as the session's own program; it is unresolvable.
             (
                 "GIT_SEQUENCE_EDITOR=\"$EDITOR\" git rebase -i HEAD~1",
                 "/repo",
@@ -4200,8 +4199,8 @@ mod tests {
                 "/repo/wt",
                 vec![resolved("/repo/wt")],
             ),
-            // Controls
-            // Round 2: an editor is read on any subcommand (over-read).
+            // Round 2: an editor is read on any subcommand that may start
+            // one (over-read).
             (
                 "GIT_SEQUENCE_EDITOR='git push origin main' git rebase HEAD~1",
                 "/repo",

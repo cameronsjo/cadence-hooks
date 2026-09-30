@@ -11830,11 +11830,6 @@ pub struct GitExec {
     /// an editor — measured under git 2.43 from a
     /// subdirectory). A walker that tracks a directory starts them there.
     pub at_toplevel: bool,
-    /// Which of [`GitExec::scripts`] are an editor, which git starts only
-    /// when it needs one. A walker judging one whose command is an expansion
-    /// tells an inherited program (`EDITOR="$HOME/bin/vim"`) from a value
-    /// the same command wrote.
-    pub editors: Vec<String>,
     /// A script reads its arguments through a positional parameter
     /// (`"$@"`, `$1`) that was substituted, which a `shift`, `set --`,
     /// quoting or a function's own arguments can make wrong: a walker judging
@@ -11986,8 +11981,9 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 ///   and a short cluster (`-ixCMD`, `-ix CMD`). A `--` that is another
 ///   option's value (`-X -- -x CMD`, `-s --`) does not end them. CMD runs
 ///   under a shell at the top of the working tree.
-/// - An editor, on ANY subcommand (`rebase -i`, `commit`, `pull
-///   --rebase=i`, …): a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`/`VISUAL`/`EDITOR`
+/// - An editor, on any subcommand that may start one
+///   ([`may_start_an_editor`]: `rebase`, `commit`, `pull`, an alias or
+///   unknown subcommand, …): a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`/`VISUAL`/`EDITOR`
 ///   assignment in front of the command, or a `-c sequence.editor=`/`-c
 ///   core.editor=` global, runs under a shell at the top of the working tree
 ///   when git needs one. A `--config-env` one reads its value from the
@@ -12055,11 +12051,10 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // no subcommand can be found — except that, not knowing it, every
     // editor is read.
     let editor_only = |editors: Vec<String>| {
-        (!editors.is_empty()).then(|| GitExec {
-            scripts: editors.clone(),
+        (!editors.is_empty()).then_some(GitExec {
+            scripts: editors,
             elsewhere: false,
             at_toplevel: true,
-            editors,
             opaque: false,
         })
     };
@@ -12116,12 +12111,11 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // An editor beside a subcommand's own scripts takes their place: where
     // it is the transports', that is a doubt, never a miss.
     let mut scripts = scripts;
-    scripts.extend(editors.iter().cloned());
+    scripts.extend(editors);
     Some(GitExec {
         scripts,
         elsewhere,
         at_toplevel,
-        editors,
         opaque,
     })
 }
