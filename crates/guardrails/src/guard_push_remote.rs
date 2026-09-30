@@ -9,7 +9,7 @@ use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    parse_work_dir, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -41,6 +41,15 @@ fn mentions_push(command: &str) -> bool {
     let bytes = command.as_bytes();
     bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"push"))
         || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+}
+
+/// Can the command push? [`mentions_push`], or a git invocation that runs a
+/// command of its own (`git rebase -x "$CMD"`, `git bisect run "$R"`, `git
+/// submodule foreach "$C"`), whose push the text need not spell
+/// (cameronsjo/cadence-hooks#1226). Asked of the tokenized command, not of
+/// words in it, so an escaped or abbreviated spelling is not a way past.
+fn may_push(command: &str) -> bool {
+    mentions_push(command) || runs_a_git_exec(command)
 }
 
 /// Check if a URL's owner is in the allowed list.
@@ -649,7 +658,7 @@ fn push_locations_both_readings(
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
     for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
-        if !mentions_push(&raw) {
+        if !may_push(&raw) {
             continue;
         }
         for push in push_locations(strip_group_wrappers(&raw), &dir) {
@@ -711,7 +720,7 @@ impl Check for PushRemoteGuard {
 fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<CheckResult> {
     let command = input.command()?;
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
-    if !mentions_push(&command) {
+    if !may_push(&command) {
         return None;
     }
     let cwd_fallback = std::env::current_dir()
@@ -746,7 +755,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // extraction, and work-dir resolution all judge the same command.
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
     let command = command.as_ref();
-    if !mentions_push(command) {
+    if !may_push(command) {
         return CheckResult::allow();
     }
     // The structural gate. A tokenized push in command position is the
@@ -3147,7 +3156,11 @@ mod tests {
                 ("git bisect run git -C {other} push origin main", Block),
                 ("git submodule foreach 'git push origin main'", Block),
                 ("git filter-branch --env-filter 'git push' HEAD", Block),
-                ("git rebase -x \"$CMD\" HEAD~1 # push", Block),
+                ("git rebase -x \"$CMD\" HEAD~1", Block),
+                ("git bisect run \"$R\"", Block),
+                ("git submodule foreach \"$C\"", Block),
+                ("git re\\base --exe \"$CMD\" HEAD~1", Block),
+                ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
                 ("git rebase -x 'git push origin main' HEAD~1", Allow),
                 ("git bisect run git push origin main", Allow),
                 ("git rebase -x 'make test' HEAD~1", Allow),
