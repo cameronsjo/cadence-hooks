@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.118.0] - 2026-09-30
+
 ### Added
 
 - **`doctor`'s inert-permission lint now covers `permissions.ask`, `settings.local.json` and the project's settings, and flags redirect rows.** It still reports a `*` before a trailing `:*` (`Bash(rm /var/log/*:*)`), the class measured inert, and now also a row on an output redirect (`Bash(> path)`), which is checked against `Edit` rules only; each finding carries a fix hint. A `*` in the space-wildcard form (`Bash(git * main)`) is a real glob and is not reported. `allow` rows are not reported. Reporting only; whether the retained deny rows fire on a compound command (`cd x && rm -rf y`) is still unverified and needs a live-session probe. (cameronsjo/cadence-hooks#578)
