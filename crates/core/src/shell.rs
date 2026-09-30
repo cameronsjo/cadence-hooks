@@ -8863,7 +8863,9 @@ fn emit_segment(
     // at the level its own nesting put it; charging a level for the `<(`
     // pushed a third `$(…)` inside one past the bound, where it is listed
     // but not read (#1266 review C2). The free levels are capped at
-    // [`MAX_WRAPPER_DEPTH`] per walk, so a flood of nested `<(` still ends.
+    // [`MAX_WRAPPER_DEPTH`] held at once, so a flood of nested `<(` still
+    // ends; past them the `$(…)`s inside are read through every `<(` in one
+    // pass, at the level they had before.
     if depth < MAX_WRAPPER_DEPTH {
         for (body, procsub) in substitution_bodies_kinded(&segment) {
             if dedupe && body.starts_with(EXPANDED_MARK) {
@@ -8873,7 +8875,22 @@ fn emit_segment(
             let mut scope = assignments.child();
             match procsub.then(FreeLevel::take).flatten() {
                 Some(_level) => expand_segments(&body, &mut scope, depth, out, dedupe),
-                None => expand_segments(&body, &mut scope, depth + 1, out, dedupe),
+                None => {
+                    expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+                    // Past the free levels a nested `<(` spends one, so the
+                    // `$(…)`s inside are also read where they sat before
+                    // bodies were surfaced: one pass through every `<(` to
+                    // them, each read at this segment's next level.
+                    if procsub && ExpansionWork::charge(body.len()) {
+                        for inner in substitution_bodies_through_procsubs(&body) {
+                            if dedupe && inner.starts_with(EXPANDED_MARK) {
+                                continue;
+                            }
+                            let mut scope = assignments.child();
+                            expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+                        }
+                    }
+                }
             }
         }
     }
@@ -9015,12 +9032,51 @@ fn flattened_bodies(segment: &str, dedupe: bool) -> Vec<String> {
             if let Some(command) = work.command.take() {
                 let whole: Vec<char> = command.chars().collect();
                 for fragment in fragments_of(&whole, [(0, whole.len())]) {
-                    list_level(work, &fragment, true, &mut out, None);
+                    list_unwrapped(work, fragment, &mut out);
                 }
             }
         }
         out
     })
+}
+
+/// Most nested wrapper scripts [`list_unwrapped`] reads out of one
+/// fragment once the allowance is gone.
+const MAX_FALLBACK_UNWRAP: usize = 8;
+
+/// The fallback reading of one fragment: its own segments, always listed,
+/// then the segments of every script they run through a wrapper, nested up
+/// to [`MAX_FALLBACK_UNWRAP`] deep while those levels stay within twice the
+/// fragment's own length. An `eval eval …` chain peels one word per level,
+/// each level a near-full copy, so the levels need a cap; each fragment has
+/// its own, so one flood cannot spend the share of a command after it
+/// (#1266 review C1).
+fn list_unwrapped(work: &mut FlattenWork, fragment: String, out: &mut Vec<String>) {
+    let cap = 2 * fragment.len();
+    let mut spent = 0;
+    let mut level = vec![fragment];
+    for unwrapped in 0..=MAX_FALLBACK_UNWRAP {
+        if unwrapped > 0 {
+            spent += level.iter().map(String::len).sum::<usize>();
+            if spent > cap {
+                break;
+            }
+        }
+        let mut next = Vec::new();
+        for text in level {
+            for segment in split_segments(&text).into_iter().map(unmark) {
+                if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
+                    continue;
+                }
+                next.extend(wrapped_scripts(&executable_tokens(&segment)));
+                out.push(segment);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
 }
 
 /// List the segments of `text` not listed yet in this call. With `unwrap`,
@@ -9078,7 +9134,7 @@ fn flatten_text(
     work.left -= chars.len();
     let mut pending = std::collections::VecDeque::new();
     let mut top = BodyRanges::default();
-    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top), None);
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top), None, true);
     pending.extend(
         top.bodies
             .into_iter()
@@ -9095,7 +9151,7 @@ fn flatten_text(
         work.left -= len;
         let body = &chars[start..end];
         let mut ranges = BodyRanges::default();
-        scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges), None);
+        scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges), None, true);
         let mut collapsed = String::with_capacity(len);
         let mut at = 0;
         for &(from, to) in &ranges.hidden {
@@ -10548,8 +10604,17 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
 fn substitution_bodies_kinded(segment: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = segment.chars().collect();
     let mut kinds = Vec::new();
-    let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds));
+    let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds), true);
     bodies.into_iter().zip(kinds).collect()
+}
+
+/// The `$(…)` and backtick bodies of `text` with every `<(…)`/`>(…)` in it
+/// read as plain text, however deeply nested: what the scan found before
+/// process substitutions opened bodies of their own. One pass, not one per
+/// nesting level.
+fn substitution_bodies_through_procsubs(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), None, None, false)
 }
 
 /// [`substitution_bodies`], also recording in `starts` the char index where
@@ -10560,7 +10625,7 @@ fn substitution_bodies_kinded(segment: &str) -> Vec<(String, bool)> {
 /// keyed on `starts` treats every one of them as unknown.
 fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
-    scan_substitution_bodies_in(&chars, starts, None, None)
+    scan_substitution_bodies_in(&chars, starts, None, None, true)
 }
 
 /// Where [`scan_substitution_bodies_in`] found each body, as char ranges of
@@ -10577,12 +10642,15 @@ struct BodyRanges {
 }
 
 /// [`scan_substitution_bodies`] over `chars`, also recording each body's
-/// range in `ranges` when asked.
+/// range in `ranges` when asked. Without `procsub_opens`, a `<(`/`>(` opens
+/// no body: its text is read as part of the surrounding text, so the `$(…)`s
+/// and backticks inside it are bodies of this text.
 fn scan_substitution_bodies_in(
     chars: &[char],
     starts: &mut Vec<usize>,
     mut ranges: Option<&mut BodyRanges>,
     mut kinds: Option<&mut Vec<bool>>,
+    procsub_opens: bool,
 ) -> Vec<String> {
     let mut record = |body: (usize, usize), hidden: bool| {
         if let Some(ranges) = ranges.as_deref_mut() {
@@ -10637,7 +10705,7 @@ fn scan_substitution_bodies_in(
         // word-start test narrows it. Inside `(( … ))` arithmetic `<(` is a
         // comparison, which this reads as a body anyway: that surfaces more
         // than bash runs, never less.
-        let opens = c == '$' || (quote.is_none() && matches!(c, '<' | '>'));
+        let opens = c == '$' || (procsub_opens && quote.is_none() && matches!(c, '<' | '>'));
         if opens && chars.get(i + 1) == Some(&'(') {
             if let Ok((body, end)) = scan_substitution_body(chars, i + 2, true) {
                 record((i + 2, end - 1), true);
