@@ -12130,7 +12130,7 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
 /// segments (`git -C d push origin main; …`) skips the full parse: some word
 /// is quoted or escaped, names an editor setting (`EDITOR`, `VISUAL`,
 /// `core.editor`, …), names a subcommand that runs a command of its own or
-/// a dashed `git-` executable, or is an option that could be a transport's
+/// a dashed `git-` executable (by any path), or is an option that could be a transport's
 /// command option (`--u…`, `--r…`, `--e…`, a short cluster with `u`).
 fn may_carry_git_exec(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
@@ -12138,7 +12138,8 @@ fn may_carry_git_exec(tokens: &[String]) -> bool {
         token.contains(['\\', '\'', '"', '$', '`'])
             || lower.contains("editor")
             || lower.contains("visual")
-            || lower.starts_with("git-")
+            // `git-rebase`, `/usr/lib/git-core/git-rebase`, `git-rebase.exe`.
+            || lower.contains("git-")
             || matches!(
                 token.as_str(),
                 "rebase"

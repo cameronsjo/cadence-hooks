@@ -2158,6 +2158,14 @@ mod tests {
         ] {
             assert_blocks(&fx.run(command), &["could not resolve"]);
         }
+        // Review 10: a dashed git program reached by path is read, and its
+        // nested push scanned.
+        for command in [
+            "/usr/lib/git-core/git-rebase -i -x 'git push origin main' HEAD~1",
+            "/usr/lib/git-core/git-bisect run git push origin main",
+        ] {
+            assert_blocks(&fx.run(command), &[]);
+        }
         // Its raw text names the subcommand through `$@`, which the block
         // says in its own words.
         assert_blocks(
