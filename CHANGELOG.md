@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Guards can now resolve the effective repo of a target instead of the payload cwd's repo, and a session opened in a meta-repo is judged against the nested repo it works in.** A new `cadence_hooks_core::target_repo` primitive returns the innermost git repo containing a file or directory and how it relates to the cwd's repo (same checkout, other worktree, nested, enclosing, foreign), finds a gitignored nested repo the same as a tracked one, and reports `Ambiguous` rather than guessing for a `..` it cannot resolve, an over-long path, redirected git discovery, or a `.git` it cannot read. `terminology`'s cadence-hooks source exemption now keys off the edited file's repo (a nested `cadence-hooks/` checkout under a meta-repo cwd was blocked because the outer repo's name was consulted; an unrelated or enclosing repo named `cadence-hooks` still is), and `warn-branch-base` judges the repo a leading `cd` moves into and stays quiet when that directory does not exist instead of reading the hook process's own directory. (cameronsjo/cadence-hooks#225)
+
 ## [0.116.0] - 2026-09-30
 
 ### Added

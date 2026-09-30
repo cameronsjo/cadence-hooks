@@ -3,7 +3,6 @@
 //! Detects prohibited terms and suggests neutral alternatives.
 //! Case-insensitive with word-boundary matching to avoid false positives.
 
-use cadence_hooks_core::paths::{find_git_root, is_within, resolve_git_common_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use glob::{MatchOptions, Pattern};
 use regex::RegexSet;
@@ -118,6 +117,53 @@ pub fn check_terminology(content: &str) -> TerminologyResult {
     TerminologyResult { blocks, nudges }
 }
 
+/// True when `path` is inside the cadence-hooks repo's own source, judged
+/// against the repo that actually contains `path` (cameronsjo/cadence-hooks#225).
+///
+/// The repo is identified by its PRIMARY checkout dir name via the git common
+/// dir, so linked worktrees (whose own dir isn't named cadence-hooks) still
+/// qualify while an unrelated repo merely nested under a cadence-hooks-named
+/// ancestor does not. Resolution goes through
+/// [`cadence_hooks_core::target_repo`], which finds the innermost repo — so a
+/// session whose cwd is a **meta-repo** gitignoring a nested `cadence-hooks/`
+/// checkout is judged against that checkout, not the outer repo.
+///
+/// **Only ever relaxes, so it fails closed.** Not exempt on: a `..` in the path
+/// (defense in depth, as before), a missing cwd, an unresolvable or ambiguous
+/// target, a repo that is not named cadence-hooks, and any relation other than
+/// the session's own checkout/worktree or a repo nested in the cwd repo's tree.
+/// An unrelated ([`Foreign`](RepoRelation::Foreign)) or enclosing repo never
+/// exempts — that would let a session outside the workspace self-grant with
+/// `git init x/cadence-hooks` (#139). A nested repo additionally must be
+/// affirmatively gitignored by the cwd repo (the meta-repo shape, checked last
+/// because it spawns `git`).
+fn targets_cadence_hooks_source(path: &str, cwd: &str) -> bool {
+    use cadence_hooks_core::target_repo::{
+        RepoRelation, TargetKind, nested_is_gitignored, resolve_effective_repo,
+    };
+    if path.split('/').any(|c| c == "..") {
+        return false;
+    }
+    let resolution = resolve_effective_repo(Path::new(cwd), Path::new(path), TargetKind::File);
+    let Some(repo) = resolution.resolved() else {
+        return false;
+    };
+    let named_cadence_hooks = repo
+        .state
+        .git_common_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "cadence-hooks");
+    if !named_cadence_hooks {
+        return false;
+    }
+    match repo.relation {
+        RepoRelation::SameCheckout | RepoRelation::SameRepoOtherWorktree => true,
+        RepoRelation::Nested => nested_is_gitignored(repo),
+        RepoRelation::Enclosing | RepoRelation::Foreign | RepoRelation::CwdNotARepo => false,
+    }
+}
+
 /// Paths that legitimately contain prohibited terms: this repo's own source,
 /// hook scripts, rules files, and CLAUDE.md docs.
 ///
@@ -144,27 +190,12 @@ fn is_excluded_path(path: &str, cwd: Option<&str>) -> bool {
         return true;
     }
 
-    // `cadence-hooks` repo source — only when the edit targets a file inside the
-    // ACTIVE checkout and that checkout is genuinely the cadence-hooks repo. The
-    // repo is identified by its PRIMARY checkout dir name via the git common dir
-    // (`resolve_git_common_dir().parent().file_name()`), so the exemption still
-    // works for linked worktrees (whose own dir isn't named cadence-hooks) and
-    // rejects unrelated repos merely nested under a cadence-hooks-named ancestor.
-    // Every failure path falls through to `false` → the block stands (fail-safe).
-    // Canonicalize before naming the primary checkout: a linked worktree's common
-    // dir is `<primary>/.git/worktrees/wt/../..`, and `Path::file_name` returns
-    // None for a `..`-terminated path — so the raw parent name would miss the
-    // worktree case. The dir exists (resolve_git_common_dir verified HEAD), so
-    // canonicalize succeeds; every failure path short-circuits to a block.
+    // `cadence-hooks` repo source — only when the EFFECTIVE repo of the edited
+    // file (the innermost repo containing it, not the cwd's) is genuinely the
+    // cadence-hooks repo and belongs to the session's own workspace. See
+    // `targets_cadence_hooks_source`; every failure path is "not exempt".
     if let Some(cwd) = cwd
-        && let Some(root) = find_git_root(cwd)
-        && is_within(path, &root)
-        && let Some(common) = resolve_git_common_dir(&root)
-        && let Ok(canon) = std::fs::canonicalize(&common)
-        && canon
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n == "cadence-hooks")
+        && targets_cadence_hooks_source(path, cwd)
     {
         return true;
     }
@@ -771,6 +802,110 @@ mod tests {
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
             cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    // --- #225: the exemption judges the target's repo, not the cwd's ---
+
+    /// A real-git meta-repo (outside the temp root, so carve-outs do not
+    /// interfere): `meta/` gitignores `<nested>/`, itself a real repo. Returns
+    /// (scratch guard, meta root, nested root).
+    fn meta_with_nested(
+        tag: &str,
+        nested: &str,
+        ignore_it: bool,
+    ) -> (
+        cadence_hooks_core::git_fixtures::Scratch,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/terminology-meta-scratch"),
+            tag,
+        );
+        let meta = s.path().join("meta");
+        let inner = meta.join(nested);
+        std::fs::create_dir_all(&inner).unwrap();
+        init_repo(&meta);
+        if ignore_it {
+            std::fs::write(meta.join(".gitignore"), format!("{nested}/\n")).unwrap();
+            git_in(&meta, &["add", ".gitignore"]);
+            git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        }
+        init_repo(&inner);
+        (s, meta, inner)
+    }
+
+    fn outcome_for(target: &std::path::Path, cwd: &std::path::Path) -> cadence_hooks_core::Outcome {
+        let input = write_with_cwd(target, BLOCK_VIOLATIONS[0].0, &cwd.to_string_lossy());
+        TerminologyGuard.run(&input).outcome
+    }
+
+    #[test]
+    fn meta_repo_cwd_exempts_a_gitignored_nested_cadence_hooks_checkout() {
+        let (_s, meta, inner) = meta_with_nested("meta-ok", "cadence-hooks", true);
+        assert_eq!(
+            outcome_for(&inner.join("crates/x/src/foo.rs"), &meta),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn meta_repo_nested_exemption_table_of_denials() {
+        // (label, nested dir name, gitignored by the meta repo, target rel to
+        // meta root). Every row must stay Block: the exemption relaxes, so
+        // anything short of "genuine, named, ignored, in-workspace" is denied.
+        let cases = [
+            (
+                "nested repo not named cadence-hooks",
+                "other-tool",
+                true,
+                "other-tool/src/foo.rs",
+            ),
+            (
+                "named right but NOT gitignored by the parent",
+                "cadence-hooks",
+                false,
+                "cadence-hooks/src/foo.rs",
+            ),
+            (
+                "dot-dot traversal into the nested repo",
+                "cadence-hooks",
+                true,
+                "cadence-hooks/../cadence-hooks/foo.rs",
+            ),
+        ];
+        for (label, nested, ignored, rel) in cases {
+            let (_s, meta, _inner) = meta_with_nested("meta-deny", nested, ignored);
+            assert_eq!(
+                outcome_for(&meta.join(rel), &meta),
+                cadence_hooks_core::Outcome::Block,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cadence_hooks_named_repo_outside_the_session_workspace_is_not_exempt() {
+        // Foreign: cwd is one repo, the target sits in an unrelated repo that
+        // happens to be named cadence-hooks — the #139 self-grant, one hop over.
+        let (_s, meta, _inner) = meta_with_nested("foreign-a", "sub", true);
+        let (_s2, _meta2, elsewhere) = meta_with_nested("foreign-b", "cadence-hooks", true);
+        assert_eq!(
+            outcome_for(&elsewhere.join("src/foo.rs"), &meta),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn a_nested_cwd_editing_the_enclosing_repo_is_not_exempt() {
+        // Session opened INSIDE cadence-hooks, editing the outer meta repo
+        // (which is not cadence-hooks): the outer repo's name decides.
+        let (_s, meta, inner) = meta_with_nested("enclosing", "cadence-hooks", true);
+        assert_eq!(
+            outcome_for(&meta.join("notes.md"), &inner),
+            cadence_hooks_core::Outcome::Block
         );
     }
 

@@ -54,7 +54,9 @@ const DISCOVERY_ENV: [&str; 4] = [
 pub enum TargetKind {
     /// A file (possibly not yet created): the repo is the one enclosing it.
     File,
-    /// A directory (a package-manager verb's cwd, a `cd` target).
+    /// An existing directory (a package-manager verb's cwd, a `cd` target). A
+    /// directory that does not exist is [`Ambiguity::MissingDir`]: a shell
+    /// never gets there, so the enclosing repo is not the command's repo.
     Dir,
 }
 
@@ -101,6 +103,8 @@ impl EffectiveRepo {
 pub enum Ambiguity {
     /// Empty target or a NUL byte.
     BadTarget,
+    /// A [`TargetKind::Dir`] target that does not exist.
+    MissingDir,
     /// A `..` in a path the filesystem cannot resolve.
     UnresolvableParentDir,
     /// Longer than the OS can resolve.
@@ -115,7 +119,7 @@ pub enum Ambiguity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     /// The innermost repo containing the target.
-    Resolved(EffectiveRepo),
+    Resolved(Box<EffectiveRepo>),
     /// Definitely no repo encloses the target.
     NotARepo,
     /// Cannot say — fail closed where the verdict relaxes on the repo.
@@ -128,7 +132,7 @@ impl Resolution {
     /// only on an affirmative answer.
     pub fn resolved(&self) -> Option<&EffectiveRepo> {
         match self {
-            Resolution::Resolved(r) => Some(r),
+            Resolution::Resolved(r) => Some(r.as_ref()),
             _ => None,
         }
     }
@@ -182,11 +186,11 @@ impl RepoResolver {
         };
         let cwd_state = self.state(cwd);
         let relation = relate(&state, cwd_state.as_ref());
-        Resolution::Resolved(EffectiveRepo {
+        Resolution::Resolved(Box::new(EffectiveRepo {
             state,
             cwd_state,
             relation,
-        })
+        }))
     }
 
     fn state(&mut self, dir: &Path) -> Option<GitState> {
@@ -248,7 +252,10 @@ fn start_dir(cwd: &Path, target: &Path, kind: TargetKind) -> Result<PathBuf, Amb
                 .unwrap_or(canonical),
         });
     }
-    // Missing target: physically resolve the longest existing prefix (so a
+    if kind == TargetKind::Dir {
+        return Err(Ambiguity::MissingDir);
+    }
+    // Missing file target: physically resolve the longest existing prefix (so a
     // `..` inside it is settled by the filesystem), then ascend lexically
     // through the missing tail. A `..` in the missing tail has no physical
     // reading, so the answer is "cannot say".
@@ -268,8 +275,7 @@ fn start_dir(cwd: &Path, target: &Path, kind: TargetKind) -> Result<PathBuf, Amb
         return Err(Ambiguity::UnresolvableParentDir);
     }
     let base = std::fs::canonicalize(&prefix).map_err(|_| Ambiguity::UnresolvableParentDir)?;
-    // A file target's own name is the last missing component; a dir target's
-    // missing components are all directories that do not exist yet.
+    // The last missing component is the file's own name.
     let mut dir = base;
     if !dir.is_dir() {
         dir = dir.parent().map(Path::to_path_buf).unwrap_or(dir);
@@ -333,7 +339,7 @@ mod tests {
 
     fn resolved(r: Resolution) -> EffectiveRepo {
         match r {
-            Resolution::Resolved(e) => e,
+            Resolution::Resolved(e) => *e,
             other => panic!("expected Resolved, got {other:?}"),
         }
     }
@@ -495,6 +501,10 @@ mod tests {
         assert_eq!(
             resolve_effective_repo(&meta, &dotdot, TargetKind::File),
             Resolution::Ambiguous(Ambiguity::UnresolvableParentDir)
+        );
+        assert_eq!(
+            resolve_effective_repo(&meta, &meta.join("no/such/dir"), TargetKind::Dir),
+            Resolution::Ambiguous(Ambiguity::MissingDir)
         );
         assert_eq!(
             resolve_effective_repo(&meta, Path::new(""), TargetKind::File),
