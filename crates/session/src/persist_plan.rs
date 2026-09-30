@@ -113,6 +113,10 @@ const INJECTED_SCAN_MARKER_KIND: &str = "persist-plan-injected";
 /// SessionStart-attachment rows many times over.
 const INJECTED_HEAD_READ_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Cap on the persisted path as rendered into the nudge: long enough that no
+/// real path is cut, short enough to bound what a crafted one can carry.
+const MAX_NUDGE_PATH_DISPLAY: usize = 4096;
+
 /// Cap on the generated slug's length (before the date prefix).
 const MAX_SLUG_LEN: usize = 60;
 
@@ -302,14 +306,21 @@ pub fn run_persist_plan_approval(
 /// and retry, which made whichever repo a later incidental call ran in the
 /// target (cadence-hooks#1021).
 ///
-/// **Authenticity floor** (security review of this change): a bare prefix
-/// match is NOT an approval. The persist requires the harness's trailing
-/// transcript-pointer paragraph, parsed from the STRIPPED SUFFIX LINES only
-/// (never the plan body, which is untrusted prose that may legitimately quote
-/// the pointer text), naming a transcript file that exists on this machine
-/// with a well-formed session-id stem. A prompt that merely starts with
-/// `Implement the following plan:` — a headless launch interpolating fetched
-/// content, or an operator pasting a plan by hand — persists nothing.
+/// **Authenticity floor** (security review of this change,
+/// cadence-hooks#1255): a bare prefix match is NOT an approval, and neither is
+/// a pointer line alone. Whoever writes the first user message also writes
+/// its trailing lines, so the pointer paragraph is only a claim. The persist
+/// requires that claim to check out against the approving session's own
+/// record: the pointer (parsed from the STRIPPED SUFFIX LINES only, never the
+/// plan body) must name an absolute path to a regular file inside Claude
+/// Code's transcript store (`<config_dir>/projects`, opened without
+/// following any symlink below it), whose stem is a UUID other than this
+/// session's own id, and that transcript must hold an `ExitPlanMode`
+/// `tool_use` whose plan is this exact body. See
+/// [`parent_session_id_from_pointer_lines`]. A prompt that merely starts with
+/// `Implement the following plan:` and ends with a pointer-shaped line (a
+/// headless launch interpolating fetched content, a plan pasted by hand, a
+/// pointer at a repo-committed `.jsonl`) persists nothing.
 ///
 /// Same fail-open posture as the approval arm: a subagent context, an unsafe
 /// session id, an unreadable transcript, or any persist-pipeline failure
@@ -372,14 +383,19 @@ pub fn run_injected_plan_persist(
     // Authenticity floor: the pointer must come from the harness-appended
     // trailing block and name a real transcript — see the doc comment. A
     // prefix match without it is definitive non-approval, same as NotInjected.
-    let Some(approving) = parent_session_id_from_pointer_lines(&suffix_lines) else {
-        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
-        return CheckResult::allow();
-    };
     if body.is_empty() {
         let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         return CheckResult::allow();
     }
+    let Some(approving) = parent_session_id_from_pointer_lines(
+        &suffix_lines,
+        input.session_id().unwrap_or_default(),
+        &env.transcripts_root,
+        &body,
+    ) else {
+        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+        return CheckResult::allow();
+    };
     // Definitive verdict: bound the scan to this one fire even if the persist
     // below declines (opt-out, hash already on disk). Those are stable
     // conditions a retry would only re-litigate, and the destination keys on
@@ -454,16 +470,37 @@ fn injected_first_prompt(head: &str) -> InjectedScan {
 /// transcript-pointer paragraph — "…read the full transcript at:
 /// `<dir>/<session-id>.jsonl`".
 ///
-/// Hardened per the security review of this change: the caller hands over
-/// only the STRIPPED TRAILING SUFFIX LINES (never the plan body — untrusted
-/// prose that may legitimately quote, or maliciously plant, the pointer
-/// text), the FIRST `.jsonl` token on the pointer line wins (a second path
-/// appended after the real one cannot override it), the named file must
-/// exist on this machine (a stat, never a read — the id is taken from the
-/// path's stem, not the file), and the stem must pass
-/// [`identity::is_safe_session_id`]. `None` on any miss — the caller treats
-/// that as non-approval, not as an anonymous approval.
-fn parent_session_id_from_pointer_lines(suffix_lines: &[&str]) -> Option<String> {
+/// The caller hands over only the STRIPPED TRAILING SUFFIX LINES (never the
+/// plan body — untrusted prose that may legitimately quote, or maliciously
+/// plant, the pointer text), and the FIRST `.jsonl` token on the pointer line
+/// wins (a second path appended after the real one cannot override it).
+///
+/// The pointer line is still written by whoever wrote the first user message,
+/// so the path it names is checked against where Claude Code actually keeps
+/// transcripts, and the file is read for the approval itself
+/// (cadence-hooks#1255). All must hold, else `None`:
+///
+/// - the path is absolute and lies under `transcripts_root`
+///   (`<config_dir>/projects`), reached with no symlink at any level below
+///   that root ([`open_contained_plan`]'s walk: `O_NOFOLLOW | O_NONBLOCK` on
+///   Unix), so a relative path, a repo-committed `.jsonl`, or a link out of
+///   the store never counts;
+/// - its stem is UUID-shaped ([`is_uuid_shaped`]), as every Claude Code
+///   session id is, and is not `own_session_id`: a session cannot approve
+///   its own injected prompt;
+/// - the opened handle is a regular, single-link file, and the transcript
+///   (its last [`PARENT_TRANSCRIPT_READ_MAX_BYTES`], streamed line by line)
+///   holds a main-chain `ExitPlanMode` `tool_use` whose `input.plan`, after
+///   the same suffix strip, is byte-identical to `body` (so it hashes to the
+///   body being persisted).
+///
+/// `None` is non-approval, never an anonymous approval.
+fn parent_session_id_from_pointer_lines(
+    suffix_lines: &[&str],
+    own_session_id: &str,
+    transcripts_root: &Path,
+    body: &str,
+) -> Option<String> {
     let pointer = suffix_lines
         .iter()
         .find(|l| l.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX))?;
@@ -471,11 +508,107 @@ fn parent_session_id_from_pointer_lines(suffix_lines: &[&str]) -> Option<String>
         .split_whitespace()
         .find(|token| token.ends_with(".jsonl"))?;
     let path = Path::new(jsonl);
-    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+    if !path.is_absolute() {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    identity::is_safe_session_id(stem).then(|| stem.to_string())
+    if !is_uuid_shaped(stem) || stem.eq_ignore_ascii_case(own_session_id) {
+        return None;
+    }
+    let file = open_contained_plan(path, transcripts_root)?;
+    transcript_holds_plan(file, body).then(|| stem.to_string())
+}
+
+/// Tail window [`transcript_holds_plan`] reads from a parent transcript. The
+/// approving `ExitPlanMode` call is the parent session's last act, so a
+/// window at the END covers it however long the parent ran, and bounds the
+/// once-per-session read (the scan marker) on a transcript of any size.
+const PARENT_TRANSCRIPT_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `8-4-4-4-12` hex digits: the shape of every Claude Code session id.
+fn is_uuid_shaped(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// Does the already-opened parent transcript record an `ExitPlanMode` call
+/// for exactly `body`? Only the handle is read, never the path again. It must
+/// be a regular file with one link; when it is larger than
+/// [`PARENT_TRANSCRIPT_READ_MAX_BYTES`] only that tail is read, starting at
+/// the first whole line. Lines that do not mention `ExitPlanMode` are never
+/// parsed. Any read error is a miss.
+fn transcript_holds_plan(file: fs::File, body: &str) -> bool {
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || !single_link(&meta) {
+        return false;
+    }
+    let mut file = file;
+    let skip_partial = meta.len() > PARENT_TRANSCRIPT_READ_MAX_BYTES;
+    if skip_partial
+        && file
+            .seek(SeekFrom::Start(meta.len() - PARENT_TRANSCRIPT_READ_MAX_BYTES))
+            .is_err()
+    {
+        return false;
+    }
+    let mut reader = std::io::BufReader::new(file.take(PARENT_TRANSCRIPT_READ_MAX_BYTES));
+    let mut line = Vec::new();
+    let mut first = true;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if std::mem::take(&mut first) && skip_partial {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        if !text.contains("\"ExitPlanMode\"") {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if row_has_exit_plan_mode_for(&row, body) {
+            return true;
+        }
+    }
+}
+
+/// Is `row` a main-chain assistant row carrying an `ExitPlanMode` `tool_use`
+/// whose `input.plan` strips to `body`?
+fn row_has_exit_plan_mode_for(row: &Value, body: &str) -> bool {
+    if row.get("type").and_then(Value::as_str) != Some("assistant")
+        || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    let Some(items) = row
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("tool_use")
+            && item.get("name").and_then(Value::as_str) == Some("ExitPlanMode")
+            && item
+                .get("input")
+                .and_then(|i| i.get("plan"))
+                .and_then(Value::as_str)
+                .is_some_and(|plan| strip_trailing_suffix_lines_and_trim(plan) == body)
+    })
 }
 
 /// Shared persist tail for both recognition paths: resolve the destination
@@ -652,6 +785,9 @@ pub struct DestinationEnv {
     pub default_host: String,
     /// The user-scoped fallback directory, `<config_dir>/cadence/plans`.
     pub user_plans_dir: PathBuf,
+    /// Claude Code's transcript store, `<config_dir>/projects`: the only
+    /// place an approve-and-clear pointer may name (cadence-hooks#1255).
+    pub transcripts_root: PathBuf,
     /// Would `enforce-worktree` block a commit in this checkout?
     pub worktree_first: fn(&Path) -> bool,
 }
@@ -671,6 +807,7 @@ impl DestinationEnv {
             user_plans_dir: cadence_hooks_core::paths::claude_config_dir()
                 .join("cadence")
                 .join("plans"),
+            transcripts_root: cadence_hooks_core::paths::claude_config_dir().join("projects"),
             worktree_first: cadence_hooks_core::worktree::would_block_here,
         }
     }
@@ -915,7 +1052,10 @@ fn qualify_entries(entries: &[AllowEntry], env: &DestinationEnv) -> Vec<AllowEnt
 /// every platform: it is a separator on Windows and a literal elsewhere, so a
 /// value that means one path on one machine means another on the next. A
 /// `.git` component (any case) is refused too: plans never go in git's own
-/// directory.
+/// directory. Every component is also held to [`is_plain_path_name`]'s
+/// charset (cadence-hooks#1254): the value comes from a repo's committed
+/// settings, the hook creates the directory, and the path is echoed into the
+/// nudge, so a newline or other control byte in it is prompt injection.
 fn is_plain_relative(relative: &str) -> bool {
     use std::path::Component;
     if relative.contains('\\') {
@@ -926,12 +1066,24 @@ fn is_plain_relative(relative: &str) -> bool {
     for component in path.components() {
         match component {
             Component::Normal(name) if name.eq_ignore_ascii_case(".git") => return false,
+            Component::Normal(name) if !name.to_str().is_some_and(is_plain_path_name) => {
+                return false;
+            }
             Component::Normal(_) => normal += 1,
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
         }
     }
     normal > 0
+}
+
+/// One path component a plans dir or an adopted plan file may use: non-empty
+/// and made only of `[A-Za-z0-9._-]` (cadence-hooks#1254).
+fn is_plain_path_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
@@ -1107,6 +1259,8 @@ fn plan_store_relative_names<'p>(
 }
 
 /// Open `path` only if it names a file inside `plan_store_root`.
+/// The approve-and-clear pointer check reuses it with the transcript store
+/// (`<config_dir>/projects`) as the root (cadence-hooks#1255).
 ///
 /// **Unix (the guarantee).** Only the store ROOT is canonicalized (it may
 /// itself be a symlink, e.g. `~/.claude` pointing elsewhere) and opened as a
@@ -1803,7 +1957,13 @@ fn adoptable_own_write(input: &HookInput, plans_dir: &Path, body: &str) -> Optio
     if path.parent()?.canonicalize().ok()? != plans_dir {
         return None;
     }
-    let adopted = plans_dir.join(path.file_name()?);
+    // The name is echoed into the nudge; one outside the plain charset is not
+    // adopted, so the hook writes its own copy under its own name (#1254).
+    let name = path.file_name()?;
+    if !name.to_str().is_some_and(is_plain_path_name) {
+        return None;
+    }
+    let adopted = plans_dir.join(name);
     if !fs::symlink_metadata(&adopted).ok()?.file_type().is_file() {
         return None;
     }
@@ -2176,9 +2336,12 @@ fn persist_and_nudge(
         recommended_tier.map(Tier::as_str),
     ));
 
+    // The path is the one interpolation here that is not static: the plans
+    // dir and an adopted name are charset-checked upstream, but the checkout
+    // root above them is not, so the render is sanitized too (#1254).
     let mut nudge = format!(
         "Approved plan persisted to {} (approved in {approved_label}).",
-        path.display()
+        identity::sanitize_field(&path.display().to_string(), MAX_NUDGE_PATH_DISPLAY)
     );
     // The announcement is owed by the session that approved the plan, so
     // only a same-session approval carries it. On an approve-and-clear pickup
