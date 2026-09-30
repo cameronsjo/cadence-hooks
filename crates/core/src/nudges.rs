@@ -85,6 +85,11 @@ pub fn glob_match(pattern: &str, rel_path: &str) -> bool {
     }
 }
 
+/// Whether `pattern` compiles; `doctor` reports the ones that do not.
+pub fn glob_compiles(pattern: &str) -> bool {
+    Pattern::new(pattern).is_ok()
+}
+
 /// `file` relative to `root`, lexically normalized. `None` when the file is
 /// outside the root (a path glob then never matches).
 pub fn repo_relative(root: &Path, file: &str) -> Option<String> {
@@ -129,6 +134,15 @@ pub fn load_nudges(root: &Path) -> SectionLoad<NudgesConfig> {
 pub fn feedback_footer_setting(root: &Path) -> Option<bool> {
     let content = read_untrusted_config(&root.join(CADENCE_CONFIG_REL))?;
     parse_jsonc(&content)?.get("feedbackFooter")?.as_bool()
+}
+
+/// True when `feedbackFooter` is present but not a boolean — the value is
+/// ignored at runtime (footer stays on), so `doctor` says so.
+pub fn feedback_footer_is_malformed(root: &Path) -> bool {
+    read_untrusted_config(&root.join(CADENCE_CONFIG_REL))
+        .and_then(|content| parse_jsonc(&content))
+        .and_then(|value| value.get("feedbackFooter").map(|v| !v.is_boolean()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -245,6 +259,11 @@ mod tests {
         ] {
             let dir = write_cfg(body);
             assert_eq!(feedback_footer_setting(dir.path()), want, "{body}");
+            assert_eq!(
+                feedback_footer_is_malformed(dir.path()),
+                body.contains("\"no\"") || body.contains(": 0"),
+                "{body}"
+            );
         }
     }
 }

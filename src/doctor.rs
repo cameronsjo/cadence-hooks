@@ -3886,6 +3886,109 @@ fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
     })
 }
 
+/// Findings for the `nudges` map and `feedbackFooter` of `<root>/.claude/cadence.json`
+/// (cameronsjo/cadence-hooks#216, ADR-0002 §3), one `Warning` per problem.
+///
+/// Runtime ignores each of these silently and toward MORE nudging, so a repo
+/// that believes a nudge is suppressed would never learn otherwise. Reported:
+/// a key naming no registered hook; a key naming a hard block, a
+/// `PROTECTED_GUARDS` member, or any hook the registry does not mark
+/// `suppressible` (rejected — a repo config can never silence one); a glob
+/// that does not compile; and the loader's own warnings for malformed entries.
+/// Advisory only, never an error. Pure over the repo root.
+fn nudges_config_findings(root: &Path) -> Vec<Finding> {
+    use cadence_hooks_core::{bypass, nudges};
+    let path = root.join(cadence_hooks_core::config::CADENCE_CONFIG_REL);
+    let finding = |snippet: &str, diagnosis: String, remediation: &str| Finding {
+        severity: Severity::Warning,
+        blocker: Blocker::No,
+        plugin: "cadence-hooks".to_string(),
+        file: path.clone(),
+        line: None,
+        snippet: snippet.to_string(),
+        diagnosis,
+        remediation: remediation.to_string(),
+    };
+    let load = nudges::load_nudges(root);
+    let mut findings: Vec<Finding> = load
+        .warnings
+        .iter()
+        .map(|warning| {
+            finding(
+                "nudges",
+                format!("{warning} — the nudge stays live"),
+                "fix the `nudges` entry: `{ \"<hook>\": { \"suppress\": true | [\"glob\", ...] } }`",
+            )
+        })
+        .collect();
+    for (name, rule) in load.config.iter() {
+        // Names are repo-controlled and land in operator output: keep the echo
+        // to the charset a hook name uses.
+        let shown: String = name
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        let entry = crate::registry::HOOKS.iter().find(|h| h.name == name);
+        if entry.is_none() {
+            findings.push(finding(
+                &shown,
+                format!(
+                    "`nudges.{shown}` names no registered hook — ignored, nothing is suppressed"
+                ),
+                "use a hook name from `cadence-hooks list`",
+            ));
+            continue;
+        }
+        if bypass::is_protected(name) || crate::registry::is_security_critical(name) {
+            findings.push(finding(
+                &shown,
+                format!(
+                    "`nudges.{shown}` names a protected security guard — REJECTED: a repo \
+                     config can never silence one"
+                ),
+                "remove the entry; a guard's own per-repo softening lives in its section",
+            ));
+            continue;
+        }
+        if !crate::registry::is_suppressible(name) {
+            findings.push(finding(
+                &shown,
+                format!(
+                    "`nudges.{shown}` names a hook that is not a suppressible nudge (a block, \
+                     a logger, or a state hook) — REJECTED, nothing is suppressed"
+                ),
+                "remove the entry; only advisory hooks marked suppressible can be named",
+            ));
+            continue;
+        }
+        if let nudges::Suppress::Paths(globs) = &rule.suppress {
+            for glob in globs.iter().filter(|g| !nudges::glob_compiles(g)) {
+                let g: String = glob.chars().take(64).filter(|c| !c.is_control()).collect();
+                findings.push(finding(
+                    &shown,
+                    format!("`nudges.{shown}` glob `{g}` does not compile — it never matches"),
+                    "fix the glob",
+                ));
+            }
+        }
+    }
+    if nudges::feedback_footer_is_malformed(root) {
+        findings.push(finding(
+            "feedbackFooter",
+            "`feedbackFooter` is not a boolean — ignored, the footer stays on".to_string(),
+            "set `\"feedbackFooter\": false` to hide the footer, or remove the key",
+        ));
+    }
+    findings
+}
+
 /// Guardrails identity health from the USER settings.json: is
 /// `CADENCE_ALLOWED_OWNERS` set, and are the retired `GIT_GUARDRAILS_ALLOWED_*`
 /// keys still lying around (cameronsjo/cadence-hooks#275)?
@@ -4269,6 +4372,7 @@ pub fn run(
         if let Some(finding) = cadence_config_parse_finding(&repo_root) {
             findings.push(finding);
         }
+        findings.extend(nudges_config_findings(&repo_root));
     }
 
     // Project-scope installs for other projects are not wired here: their
@@ -8750,6 +8854,75 @@ mod tests {
         let findings = legacy_config_findings(dir.path());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].snippet, "redaction.json");
+    }
+
+    #[test]
+    fn nudges_findings_table() {
+        let rows: &[(&str, &[&str])] = &[
+            // clean: a valid suppressible nudge, with and without globs
+            (r#"{"nudges":{"warn-overshare":{"suppress":true}}}"#, &[]),
+            (
+                r#"{"nudges":{"warn-overshare":{"suppress":["docs/**"]}}}"#,
+                &[],
+            ),
+            (r#"{"feedbackFooter":false}"#, &[]),
+            (r#"{}"#, &[]),
+            // rejected: a protected guard, a hard block, a state hook, a logger
+            (
+                r#"{"nudges":{"git-safety":{"suppress":true}}}"#,
+                &["REJECTED"],
+            ),
+            (
+                r#"{"nudges":{"enforce-worktree":{"suppress":true}}}"#,
+                &["REJECTED"],
+            ),
+            (
+                r#"{"nudges":{"terminology":{"suppress":true}}}"#,
+                &["REJECTED"],
+            ),
+            (
+                r#"{"nudges":{"log-session":{"suppress":true}}}"#,
+                &["REJECTED"],
+            ),
+            // unknown name
+            (
+                r#"{"nudges":{"warn-nothing":{"suppress":true}}}"#,
+                &["names no registered hook"],
+            ),
+            // a glob that does not compile
+            (
+                r#"{"nudges":{"warn-overshare":{"suppress":["[oops"]}}}"#,
+                &["does not compile"],
+            ),
+            // malformed entry and section shapes
+            (
+                r#"{"nudges":{"warn-overshare":{"suppress":"yes"}}}"#,
+                &["invalid shape"],
+            ),
+            (r#"{"nudges":[]}"#, &["not an object"]),
+            (r#"{"feedbackFooter":"off"}"#, &["not a boolean"]),
+        ];
+        for (body, wants) in rows {
+            let dir = seed_claude(&[("cadence.json", body)]);
+            let findings = nudges_config_findings(dir.path());
+            assert_eq!(
+                findings.len(),
+                wants.len(),
+                "{body}: {:?}",
+                findings
+                    .iter()
+                    .map(|f| f.diagnosis.clone())
+                    .collect::<Vec<_>>()
+            );
+            for (f, want) in findings.iter().zip(wants.iter()) {
+                assert!(f.diagnosis.contains(want), "{body}: {}", f.diagnosis);
+                assert_eq!(f.severity, Severity::Warning);
+                assert!(matches!(f.blocker, Blocker::No));
+            }
+        }
+        // no file at all
+        let empty = tempfile::tempdir().unwrap();
+        assert!(nudges_config_findings(empty.path()).is_empty());
     }
 
     #[test]
