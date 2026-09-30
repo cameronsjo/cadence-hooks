@@ -75,6 +75,10 @@ enum FileType {
     Command,
     /// A plugin-distributed agent definition (`<plugin>/agents/*.md`).
     Agent,
+    /// An agent definition outside a plugin (`.claude/agents/*.md`): honours
+    /// every field, but `skills`/`mcpServers` are still ignored when the
+    /// definition spawns a teammate.
+    ProjectAgent,
     /// A living plan (`docs/plans/*.md`).
     Plan,
     Other,
@@ -265,6 +269,8 @@ fn classify_path(path: &str) -> FileType {
         FileType::Command
     } else if is_markdown && is_plugin_agent(prefix, &segments) {
         FileType::Agent
+    } else if is_markdown && is_definition_of("agents", prefix, &segments) {
+        FileType::ProjectAgent
     } else if is_markdown && is_plan_path(&segments) {
         FileType::Plan
     } else {
@@ -693,27 +699,62 @@ fn introduced_force_loads(path: &str, content: &str) -> Vec<String> {
         .collect()
 }
 
-/// Agent files inside a plugin (#615): `hooks`, `mcpServers` and
-/// `permissionMode` are accepted and silently ignored there. A NUDGE, not a
-/// block: the file is otherwise valid, and the same agent copied to
-/// `.claude/agents/` honours all three. `skills`/`mcpServers` on teammate
-/// definitions are not checked — whether a definition is dispatched as a
-/// teammate is not visible from the file.
-fn check_agent(content: &str) -> CheckResult {
+/// Does this agent description say the definition is dispatched as a team
+/// teammate? The file shows no dispatch mode, so the description is the only
+/// signal, and it is the same one `scripts/lint-agent-tools.py`'s
+/// `teammate-ignored-field` keys on: the words "teammate" or "agent team(s)".
+/// A definition that is a teammate without saying so is not caught.
+fn describes_teammate(description: &str) -> bool {
+    static TEAMMATE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\bteammates?\b|\bagent[- ]teams?\b").expect("static regex")
+    });
+    TEAMMATE.is_match(description)
+}
+
+/// Agent definitions (#615), by distribution surface. A NUDGE, not a block:
+/// the file is otherwise valid.
+///
+/// - Plugin agents (`plugin == true`): `hooks`, `mcpServers` and
+///   `permissionMode` are accepted and silently ignored. The same agent copied
+///   to `.claude/agents/` honours all three.
+/// - Any agent whose description names teammate use: `skills` and
+///   `mcpServers` are ignored when a definition spawns a teammate, which
+///   loads both from settings only.
+fn check_agent(content: &str, plugin: bool) -> CheckResult {
     let Some(fields) = extract_frontmatter(content) else {
         return CheckResult::allow();
     };
-    let ignored: Vec<&str> = ["hooks", "mcpServers", "permissionMode"]
-        .into_iter()
-        .filter(|f| fields.iter().any(|(k, _)| k == f))
-        .collect();
-    if ignored.is_empty() {
-        return CheckResult::allow();
+    let has = |f: &str| fields.iter().any(|(k, _)| k == f);
+    let mut notes = Vec::new();
+    if plugin {
+        let ignored: Vec<&str> = ["hooks", "mcpServers", "permissionMode"]
+            .into_iter()
+            .filter(|f| has(f))
+            .collect();
+        if !ignored.is_empty() {
+            notes.push(format!(
+                "Plugin-distributed agents silently ignore {} — the field is accepted but has no effect. Drop it, or ship the agent to .claude/agents/ where it is honoured.",
+                ignored.join(", ")
+            ));
+        }
     }
-    CheckResult::nudge(format!(
-        "Plugin-distributed agents silently ignore {} — the field is accepted but has no effect. Drop it, or ship the agent to .claude/agents/ where it is honoured.",
-        ignored.join(", ")
-    ))
+    if field_full_text(content, "description").is_some_and(|d| describes_teammate(&d)) {
+        let ignored: Vec<&str> = ["skills", "mcpServers"]
+            .into_iter()
+            .filter(|f| has(f))
+            .collect();
+        if !ignored.is_empty() {
+            notes.push(format!(
+                "This agent's description names teammate use, and a definition that spawns a teammate has its {} ignored — teammates load skills and MCP servers from project/user settings only. Move it there, or drop the field.",
+                ignored.join(", ")
+            ));
+        }
+    }
+    if notes.is_empty() {
+        CheckResult::allow()
+    } else {
+        CheckResult::nudge(notes.join(" "))
+    }
 }
 
 /// Does a FENCED code block whose first non-blank line is `provenance:` appear
@@ -890,7 +931,8 @@ impl Check for ValidateSkillFrontmatter {
 
         match file_type {
             FileType::Plan => return check_plan(literal, &content),
-            FileType::Agent => return check_agent(&content),
+            FileType::Agent => return check_agent(&content, true),
+            FileType::ProjectAgent => return check_agent(&content, false),
             _ => {}
         }
 
@@ -994,7 +1036,7 @@ impl Check for ValidateSkillFrontmatter {
                     );
                 }
             }
-            FileType::Agent | FileType::Plan | FileType::Other => {}
+            FileType::Agent | FileType::ProjectAgent | FileType::Plan | FileType::Other => {}
         }
 
         // `@skills/` force-load syntax (#614): skill and command bodies only,
@@ -2358,7 +2400,115 @@ mod tests {
     #[test]
     fn project_agent_dir_is_not_a_plugin_agent() {
         // `.claude/agents/` honours all three fields — a warning would be false.
-        assert_eq!(classify_path("/repo/.claude/agents/r.md"), FileType::Other);
+        assert_eq!(
+            classify_path("/repo/.claude/agents/r.md"),
+            FileType::ProjectAgent
+        );
+    }
+
+    // ---- #615: teammate `skills:`/`mcpServers:` ----
+
+    fn project_agent() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        let path = as_hook_path(&root.join(".claude/agents/reviewer.md"));
+        (dir, path)
+    }
+
+    #[test]
+    fn teammate_ignored_fields_table() {
+        let (_p, plugin_path) = plugin_agent();
+        let (_q, project_path) = project_agent();
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // (name, surface, frontmatter, expected nudge needles; empty = allow)
+            (
+                "project teammate skills",
+                "project",
+                "description: A teammate reviewer\nskills: a",
+                &["skills", "teammate"],
+            ),
+            (
+                "project teammate mcp",
+                "project",
+                "description: teammate\nmcpServers: x",
+                &["mcpServers"],
+            ),
+            (
+                "plugin teammate skills",
+                "plugin",
+                "description: A teammate reviewer\nskills: a",
+                &["skills"],
+            ),
+            (
+                "plugin both halves",
+                "plugin",
+                "description: teammate\nskills: a\nhooks:\n  x: y",
+                &["skills", "hooks"],
+            ),
+            (
+                "agent-team phrase",
+                "project",
+                "description: Reviewer that runs as an agent team member\nskills: a",
+                &["skills"],
+            ),
+            (
+                "no teammate wording",
+                "project",
+                "description: Reviews code\nskills: a",
+                &[],
+            ),
+            (
+                "teammate wording, no fields",
+                "project",
+                "description: A teammate reviewer\nmodel: opus",
+                &[],
+            ),
+            (
+                "word boundary",
+                "project",
+                "description: Reviews steammates data\nskills: a",
+                &[],
+            ),
+            (
+                "block scalar description",
+                "project",
+                "description: >\n  Runs as a teammate\nskills: a",
+                &["skills"],
+            ),
+            (
+                "project hooks are honoured",
+                "project",
+                "description: Reviews\nhooks:\n  x: y\npermissionMode: plan",
+                &[],
+            ),
+        ];
+        for (name, surface, fm, needles) in cases {
+            let path = if *surface == "plugin" {
+                &plugin_path
+            } else {
+                &project_path
+            };
+            let content = format!("---\nname: r\n{fm}\n---\nbody");
+            let r = ValidateSkillFrontmatter.run(&make_write_input(path, &content));
+            if needles.is_empty() {
+                assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow, "{name}");
+            } else {
+                assert_eq!(r.outcome, cadence_hooks_core::Outcome::Nudge, "{name}");
+                let m = r.message.unwrap();
+                for n in *needles {
+                    assert!(m.contains(n), "{name}: {m}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn project_agent_classifies_and_never_blocks_on_missing_frontmatter() {
+        let (_q, project_path) = project_agent();
+        assert_eq!(classify_path(&project_path), FileType::ProjectAgent);
+        let r = ValidateSkillFrontmatter.run(&make_write_input(&project_path, "no frontmatter"));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     // ---- #607: living-plan frontmatter ----

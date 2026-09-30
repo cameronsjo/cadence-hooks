@@ -6463,12 +6463,14 @@ mod tests {
         (config, installs)
     }
 
+    type Installs = Vec<(String, PathBuf)>;
+
     fn rule_tree_fixture(
         tmp: &Path,
         deployed: &[(&str, &str)],
         cadence_src: &[(&str, &str)],
         workbench_src: &[(&str, &str)],
-    ) -> (PathBuf, Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
+    ) -> (PathBuf, Installs, Installs) {
         let put = |root: &Path, files: &[(&str, &str)]| {
             for (rel, text) in files {
                 let path = root.join(rel);
