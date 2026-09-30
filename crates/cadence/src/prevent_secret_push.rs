@@ -51,8 +51,15 @@
 //! unavailable or timed-out git spawn, a range over [`MAX_COMMITS`], a patch
 //! over [`MAX_LOG_BYTES`], too many refspecs, an unparseable diff header —
 //! all block, and the message says which. Only a genuinely empty range
-//! allows. `git send-pack` and `git http-push` (and their `git-<name>`
-//! executables) publish without `git push` and always block.
+//! allows. `git send-pack`, `git http-push` and the remote helpers
+//! (`git remote-<transport>`, never the builtin `git remote`), with their
+//! `git-<name>` executables, publish without `git push` and always block; so
+//! do a dashed `git-push` executable and an `exec -a` naming a `git`-prefixed
+//! argv[0] (git dispatches on it), which this does not model. So do a named
+//! source spelled as a full-length object id that a ref is also named like
+//! (git pushes the ref, `rev-parse` would read the object) and an outbound
+//! commit whose `encoding` header is not UTF-8, US-ASCII or ISO-8859-* (a
+//! token in it need not be ASCII bytes).
 //!
 //! **Aliases.** A `git <sub>` whose subcommand is not a builtin is looked up in
 //! the repository's config (`alias.<sub>`, following alias-of-alias, past any
@@ -61,9 +68,11 @@
 //! with an option this cannot follow or holds options only; this same command
 //! writes it with `git config`; the subcommand word carries `$` or a backtick;
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
-//! `GIT_DIR=`, `GIT_WORK_TREE=`, `HOME=` or `XDG_CONFIG_HOME=` anywhere in the
-//! command, an `include.path`/`includeIf` mention, `--git-dir`, `--work-tree`,
-//! `--config-env`, `-c include*`, or a directory it cannot resolve); the probe
+//! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
+//! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
+//! quotes and backslashes removed, an `include.path`/`includeIf` mention,
+//! `--git-dir`, `--work-tree`, `--config-env`, `-c include*`, or a directory
+//! it cannot resolve); the probe
 //! itself fails or times out; or `help.autocorrect` is set to run a guess
 //! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
 //! neither an alias nor a command `git --list-cmds` knows.
@@ -104,15 +113,21 @@
 //!
 //! **Over-blocks on purpose:** `--tags` re-reads every tag and `--mirror`
 //! every ref, published or not; `--follow-tags` re-reads every annotated tag
-//! reachable from what is pushed, including tags the remote already has.
+//! reachable from what is pushed, including tags the remote already has. A
+//! submodule-recursing push in a repository whose index is too large to list
+//! (over ~300k entries) is refused as too large to check for submodules.
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than
-//! `send-pack`/`http-push`, a push inside a script file; a git config key
+//! `send-pack`/`http-push`/`push`/`remote-*`, a push inside a script file, a
+//! push nested in another git command's exec string (`git rebase -x`,
+//! `git bisect run`, `git submodule foreach`, `git filter-branch` filters;
+//! the git-safety hook blocks `git rebase` in sessions); a git config key
 //! written by the same command through anything but `git config`/`git remote`
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show.
+//! show. The `help.autocorrect` existence check asks git with the hook's own
+//! `PATH`, which may differ from the command's.
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
 //! allows AND records a bypass row.
@@ -281,10 +296,46 @@ struct GitCall {
     dir_unresolved: bool,
     globals: Vec<String>,
     rest: Vec<String>,
+    /// git runs under a name that picks its subcommand: a dashed `git-push`
+    /// executable, or `exec -a <name>` (git dispatches on argv[0]).
+    renamed: bool,
 }
 
 /// Plumbing that publishes objects without `git push`.
 const RAW_PUSH_COMMANDS: &[&str] = &["send-pack", "http-push"];
+
+/// A subcommand that publishes objects this guard cannot scan: raw push
+/// plumbing, or a remote helper (`remote-https`, `remote-ext`, ...), which
+/// takes `push` commands on stdin. The builtin `git remote` is not one.
+fn unscannable_push(sub: &str) -> bool {
+    RAW_PUSH_COMMANDS.contains(&sub) || sub.starts_with("remote-")
+}
+
+/// Does `exec`'s own option list (`-a NAME`, `-aNAME`, `-ca NAME`) set argv[0]
+/// to a `git`-prefixed name, or to one this cannot read? git dispatches on
+/// argv[0], so `exec -a git-push git origin b` pushes.
+fn exec_renames_git(args: &[String]) -> bool {
+    let mut words = args.iter().map(|w| unescape_word(w));
+    while let Some(word) = words.next() {
+        let Some(flags) = word
+            .strip_prefix('-')
+            .filter(|f| !f.is_empty() && *f != "-")
+        else {
+            return false;
+        };
+        if let Some(at) = flags.find('a') {
+            let name = match &flags[at + 1..] {
+                "" => match words.next() {
+                    Some(name) => name.into_owned(),
+                    None => return false,
+                },
+                attached => attached.to_string(),
+            };
+            return name.contains(['$', '`']) || command_word(&name).starts_with("git");
+        }
+    }
+    false
+}
 
 fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
     if !contains_ignoring_ascii_case(command, "git") {
@@ -296,11 +347,13 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else { continue };
         let word = command_word(first);
-        // `git-send-pack` run as its own executable is the same push.
+        // `git-send-pack` or `git-push` run as its own executable is the same
+        // push.
         let dashed = word
             .strip_prefix("git-")
-            .filter(|sub| RAW_PUSH_COMMANDS.contains(sub));
-        if word != "git" && dashed.is_none() {
+            .filter(|sub| *sub == "push" || unscannable_push(sub));
+        let exec_renamed = word == "exec" && exec_renames_git(&argv[1..]);
+        if word != "git" && dashed.is_none() && !exec_renamed {
             continue;
         }
         let mut dir_unresolved = &*dir == UNRESOLVABLE_DIR || dir.contains(['$', '`']);
@@ -309,6 +362,16 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         } else {
             dir.to_string()
         };
+        if exec_renamed {
+            out.push(GitCall {
+                dir: at,
+                dir_unresolved,
+                globals: Vec::new(),
+                rest: vec!["exec -a".to_string()],
+                renamed: true,
+            });
+            continue;
+        }
         if let Some(sub) = dashed {
             out.push(GitCall {
                 dir: at,
@@ -317,6 +380,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
                 rest: std::iter::once(sub.to_string())
                     .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
                     .collect(),
+                renamed: sub == "push",
             });
             continue;
         }
@@ -342,6 +406,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
                 .map(|w| unescape_word(w).into_owned())
                 .collect(),
             rest: rest.iter().map(|w| unescape_word(w).into_owned()).collect(),
+            renamed: false,
         });
     }
     out
@@ -593,7 +658,14 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             continue;
         };
         let sub = sub.to_ascii_lowercase();
-        if RAW_PUSH_COMMANDS.contains(&sub.as_str()) {
+        if call.renamed {
+            return Some(format!(
+                "`{}` runs git under a name that picks its subcommand (a dashed `git-push`, or \
+                 `exec -a`), a push this guard cannot scan",
+                if sub == "push" { "git-push" } else { "exec -a" }
+            ));
+        }
+        if unscannable_push(&sub) {
             return Some(format!(
                 "`git {sub}` publishes objects without `git push`, which this guard cannot scan"
             ));
@@ -652,29 +724,37 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
 }
 
 /// Why no repository probe can see the config this command's git calls
-/// read, judged once from the whole text: an env assignment (or export) of
-/// git's config or repository location, or a config include. Plain
-/// substrings, so a mention anywhere counts — stricter, never looser.
+/// read, judged once from the whole text: the name of an env variable that
+/// moves git's config, repository or exec path (set by an assignment, or by
+/// `read`, `printf -v`, `declare` and an `export`, so the bare name counts),
+/// `HOME=`, or a config include. Plain substrings of the text with quotes and
+/// backslashes removed (`GIT_"DIR"=` is `GIT_DIR=` to the shell), so a
+/// mention anywhere counts — stricter, never looser.
 fn command_probe_blind(command: &str) -> Option<&'static str> {
     const ENV: &[&str] = &[
         "GIT_CONFIG",
-        "GIT_DIR=",
-        "GIT_COMMON_DIR=",
-        "GIT_WORK_TREE=",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_EXEC_PATH",
+        "XDG_CONFIG_HOME",
         "HOME=",
-        "XDG_CONFIG_HOME=",
     ];
-    if ENV.iter().any(|name| command.contains(name)) {
+    let plain: String = command
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    if ENV.iter().any(|name| plain.contains(name)) {
         return Some("the command sets git's config or repository environment");
     }
-    if contains_ignoring_ascii_case(command, "include.path")
-        || contains_ignoring_ascii_case(command, "includeif")
+    if contains_ignoring_ascii_case(&plain, "include.path")
+        || contains_ignoring_ascii_case(&plain, "includeif")
     {
         return Some("the command names a config include");
     }
     // Set by `-c` or an earlier `git config` in the same command, autocorrect
     // is invisible to the on-disk probe but turns `git psuh` into a push.
-    if contains_ignoring_ascii_case(command, "help.autocorrect") {
+    if contains_ignoring_ascii_case(&plain, "help.autocorrect") {
         return Some("the command sets `help.autocorrect`");
     }
     None
@@ -1005,6 +1085,50 @@ fn sources_are_commits(work_dir: &str, range: &Range) -> Result<(), Stop> {
              tree or blob, whose content this guard cannot scan)",
             describe(range)
         ))),
+    }
+}
+
+/// git push matches a refspec source against ref NAMES before reading it as
+/// an object id, while `rev-parse` and `cat-file` take a full-length hex name
+/// as the object: a ref named like one (`refs/heads/<hex>`, `refs/tags/<hex>`,
+/// `refs/remotes/<hex>/HEAD`) makes the scan read a different commit than the
+/// push sends. One bounded `for-each-ref` over every such name; any match, or
+/// no answer, refuses.
+fn hex_sources_are_not_ref_names(work_dir: &str, range: &Range) -> Result<(), Stop> {
+    let hex: Vec<&String> = range
+        .sources
+        .iter()
+        .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    let Some(first) = hex.first() else {
+        return Ok(());
+    };
+    let patterns: Vec<String> = hex
+        .iter()
+        .flat_map(|h| {
+            [
+                format!("refs/{h}"),
+                format!("refs/*/{h}"),
+                format!("refs/*/*/{h}"),
+                format!("refs/remotes/{h}/HEAD"),
+            ]
+        })
+        .collect();
+    let mut args = vec!["for-each-ref", "--count=1", "--format=%(refname)"];
+    args.extend(patterns.iter().map(String::as_str));
+    match git(work_dir, &args, 64 * 1024, Budget::Probe) {
+        Git::Ok(out) if out.trim().is_empty() => Ok(()),
+        Git::Ok(_) | Git::Capped => Err(Stop::Refused(format!(
+            "a ref is named like an object id the push names (`{}`): git pushes the ref, \
+             while this guard would read the object",
+            sane(first)
+        ))),
+        Git::Failed(_) => Err(Stop::Refused(
+            "git could not list the refs named like an object id the push names".into(),
+        )),
+        Git::Down => Err(Stop::Refused(
+            "git was unavailable or timed out listing refs named like an object id".into(),
+        )),
     }
 }
 
@@ -1386,6 +1510,7 @@ fn read_objects(work_dir: &str, names: &[String], what: &str) -> Result<Vec<RawO
 /// text that could otherwise pose as patch structure.
 fn scan_messages(work_dir: &str, shas: &[String]) -> Result<Vec<Hit>, Stop> {
     let mut hits = Vec::new();
+    let mut unreadable: Option<String> = None;
     for object in read_objects(work_dir, shas, "outbound commit messages")? {
         if let Some(what) = scan_text(&object.body) {
             hits.push(Hit {
@@ -1393,9 +1518,35 @@ fn scan_messages(work_dir: &str, shas: &[String]) -> Result<Vec<Hit>, Stop> {
                 path: "(commit message)".into(),
                 what,
             });
+        } else if unreadable.is_none() {
+            unreadable = unscannable_encoding(&object.body);
         }
     }
-    Ok(hits)
+    match unreadable {
+        Some(encoding) if hits.is_empty() => Err(Stop::Refused(format!(
+            "a commit message in encoding `{}` cannot be scanned (its token bytes need not be \
+             ASCII)",
+            sane(&encoding)
+        ))),
+        _ => Ok(hits),
+    }
+}
+
+/// A raw commit's `encoding` header, when it names one whose bytes the text
+/// scanner cannot read as-is: anything but UTF-8, US-ASCII or ISO-8859-*
+/// (all ASCII-compatible, so a token keeps its bytes).
+fn unscannable_encoding(body: &str) -> Option<String> {
+    let header = body.split("\n\n").next().unwrap_or(body);
+    let encoding = header
+        .lines()
+        .find_map(|line| line.strip_prefix("encoding "))?
+        .trim();
+    let lower = encoding.to_ascii_lowercase();
+    let readable = matches!(
+        lower.as_str(),
+        "utf-8" | "utf8" | "us-ascii" | "ascii" | "latin1" | "latin-1"
+    ) || lower.starts_with("iso-8859-");
+    (!readable).then(|| encoding.to_string())
 }
 
 /// A ref name as shown in a finding: withheld when it carries the secret.
@@ -1600,6 +1751,7 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             continue;
         };
         sources_are_commits(&inv.work_dir, &range)?;
+        hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
         let (shas, over) = outbound(&inv.work_dir, &range)?;
         let mut hits = if shas.is_empty() {
             Vec::new()
