@@ -1,0 +1,82 @@
+# THROWAWAY dry run for cadence-hooks#1235 (cosign-installer v4.1.2 / cosign v3).
+# Never merge. Branch is deleted after evidence is collected.
+name: cosign-dryrun
+
+on:
+  push:
+    branches: [claude/gambit-cosign-dryrun]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sign-default:
+    name: Sign (release.yml command, default format)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign version
+        run: cosign version
+
+      - name: Dummy checksums.txt
+        run: |
+          printf '%s  %s\n' "$(printf 'dryrun' | sha256sum | cut -d' ' -f1)" cadence-hooks-dryrun.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Sign checksums with Cosign (keyless)
+        run: cosign sign-blob --yes --bundle checksums.txt.cosign.bundle checksums.txt
+
+      - name: Dump bundle (fallback evidence)
+        run: |
+          echo "BEGIN_B64_CHECKSUMS"; base64 -w0 checksums.txt; echo; echo "END_B64_CHECKSUMS"
+          echo "BEGIN_B64_BUNDLE"; base64 -w0 checksums.txt.cosign.bundle; echo; echo "END_B64_BUNDLE"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cosign-dryrun-default
+          path: |
+            checksums.txt
+            checksums.txt.cosign.bundle
+
+  sign-legacy:
+    name: Sign (legacy bundle format probe)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: sign-blob --help
+        run: cosign version && cosign sign-blob --help
+
+      - name: Dummy checksums.txt
+        run: |
+          printf '%s  %s\n' "$(printf 'dryrun' | sha256sum | cut -d' ' -f1)" cadence-hooks-dryrun.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Sign with --new-bundle-format=false (fallbacks recorded)
+        run: |
+          set -x
+          if cosign sign-blob --yes --new-bundle-format=false --bundle checksums.txt.legacy.bundle checksums.txt; then
+            echo "VARIANT=new-bundle-format=false"
+          elif cosign sign-blob --yes --new-bundle-format=false --use-signing-config=false --bundle checksums.txt.legacy.bundle checksums.txt; then
+            echo "VARIANT=new-bundle-format=false+use-signing-config=false"
+          else
+            echo "VARIANT=NONE (legacy signing failed)"; exit 1
+          fi
+          head -c 400 checksums.txt.legacy.bundle; echo
+
+      - name: Dump bundle (fallback evidence)
+        if: always()
+        run: |
+          echo "BEGIN_B64_BUNDLE"; base64 -w0 checksums.txt.legacy.bundle || true; echo; echo "END_B64_BUNDLE"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cosign-dryrun-legacy
+          path: |
+            checksums.txt
+            checksums.txt.legacy.bundle
