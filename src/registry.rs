@@ -922,6 +922,15 @@ pub const HOOKS: &[HookEntry] = &[
         remote: RemotePolicy::Run,
         suppressible: false,
     },
+    HookEntry {
+        name: "nudge-afk-gap",
+        description: "Mark a long idle gap (\"6 hours later…\") on the next prompt; opt-in via CADENCE_AFK_GAP=1, threshold CADENCE_AFK_GAP_MINUTES (default 240) (UserPromptSubmit)",
+        namespace: "session",
+        events: &[HookEvent::UserPromptSubmit],
+        // Remote: writes only its own per-session stamp under the metrics state dir; a lost stamp (fresh VM) is silent.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
 ];
 
 /// Whether `.claude/cadence.json` may silence `hook`'s nudges. `false` for an
