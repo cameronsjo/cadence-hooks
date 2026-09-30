@@ -744,10 +744,9 @@ fn stdin_hang_findings(
 /// Why a `Bash(...)` permission row can never fire, or `None` when this lint
 /// has no complaint (cameronsjo/cadence-hooks#578, cadence-ecosystem#566).
 ///
-/// Two classes, both measured on Claude Code 2.1.273 (#566). A `*` anywhere in
-/// the matched text other than a trailing `:*` suffix or a trailing ` *` word
-/// wildcard is compared literally, so the row matches nothing (`rm /var/log/*:*`,
-/// `chmod -R 777 /*:*`, `dd of=/dev/*:*`). And a row on an output redirect
+/// Two classes, both measured on Claude Code 2.1.273 (#566). In a row with the
+/// legacy `:*` suffix, a `*` before the suffix is compared literally, so the row
+/// matches nothing (`rm /var/log/*:*`, `chmod -R 777 /*:*`, `dd of=/dev/*:*`). And a row on an output redirect
 /// (`Bash(> path)`) never sees the redirect, which is checked against `Edit`
 /// rules only. A row this reports is inert; a row it does not report is NOT
 /// thereby known to fire on a compound command (`cd x && rm -rf ~/y`) — that
@@ -760,16 +759,13 @@ fn inert_bash_row_reason(row: &str) -> Option<&'static str> {
             "a redirect target is checked against Edit rules, never Bash rules, so this row never fires",
         );
     }
-    if inner == "*" {
-        return None;
-    }
-    let prefix = inner
-        .strip_suffix(":*")
-        .or_else(|| inner.strip_suffix(" *"))
-        .unwrap_or(inner);
-    prefix.contains('*').then_some(
-        "a `*` inside an argument is not a glob (only a trailing `:*` or ` *` is), so this row matches nothing",
-    )
+    // Only the measured class (cadence-ecosystem#566, 2.1.273): a `*` before a
+    // legacy `:*` suffix. The space-wildcard form (`Bash(git * main)`) globs at
+    // any position, so a `*` in a row without `:*` is not flagged.
+    let prefix = inner.strip_suffix(":*")?;
+    prefix
+        .contains('*')
+        .then_some("a `*` before a trailing `:*` is not a glob, so this row matches nothing")
 }
 
 /// One advisory finding per inert `permissions.deny` / `permissions.ask` row in
@@ -9674,8 +9670,9 @@ mod tests {
             ("Bash(chmod -R 777 /*:*)", true),
             ("Bash(rm /var/log/*:*)", true),
             ("Bash(rm -rf /var/log/*:*)", true),
-            ("Bash(rm -rf /var/log/*)", true),
-            ("Bash(rm * /tmp/x *)", true),
+            ("Bash(rm -rf /var/log/*)", false),
+            ("Bash(rm * /tmp/x *)", false),
+            ("Bash(git * main)", false),
             ("Bash(> /var/log/*:*)", true),
             ("Bash(>> /var/log/x)", true),
             ("Bash(> /etc/passwd)", true),
