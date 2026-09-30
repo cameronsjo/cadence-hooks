@@ -286,10 +286,14 @@ pub(super) fn all_owned_with(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn roots() -> Vec<PathBuf> {
         vec![PathBuf::from("/tmp")]
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn scratch_exemption_table() {
         // (path, exempt?) — code under a temp root is exempt; anything that
@@ -332,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn scratch_exemption_refuses_a_symlink_out_of_the_root() {
         let outside = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();

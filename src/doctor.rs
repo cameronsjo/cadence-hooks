@@ -1137,6 +1137,244 @@ fn rules_drift_finding(config_dir: &Path, installs: &[(String, PathBuf)]) -> Opt
     })
 }
 
+/// Which side of a deployed rule file moved relative to its upstream twin.
+///
+/// Judged from content alone, by trimmed non-blank line sets, because the
+/// cache holds only the current pin and no history: a deployed line the
+/// upstream does not carry is local work; an upstream line the deployed file
+/// lacks is upstream progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RuleDrift {
+    /// Upstream has content the deployed copy lacks and the deployed copy adds
+    /// nothing. Upstream is newer; a resync is safe.
+    UpstreamAhead,
+    /// The deployed copy carries content upstream lacks and upstream adds
+    /// nothing. The deployed copy was edited; a resync destroys that work.
+    DeployedAhead,
+    /// Each side carries lines the other lacks. A resync destroys local work
+    /// and a bare re-add misses upstream changes.
+    Diverged,
+}
+
+/// Direction of drift between `deployed` and `upstream`, or `None` when they
+/// hold the same trimmed non-blank lines (a whitespace- or order-only
+/// difference is not drift worth a nag).
+fn classify_rule_drift(deployed: &str, upstream: &str) -> Option<RuleDrift> {
+    if deployed == upstream {
+        return None;
+    }
+    let lines = |t: &str| -> std::collections::HashSet<String> {
+        t.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (d, u) = (lines(deployed), lines(upstream));
+    match (
+        d.difference(&u).next().is_some(),
+        u.difference(&d).next().is_some(),
+    ) {
+        (false, true) => Some(RuleDrift::UpstreamAhead),
+        (true, false) => Some(RuleDrift::DeployedAhead),
+        (true, true) => Some(RuleDrift::Diverged),
+        // Same line set, different bytes (whitespace or ordering only).
+        (false, false) => None,
+    }
+}
+
+/// Bounds for the deployed-rules walk: a runaway or hostile tree cannot make
+/// `doctor` slow.
+const RULES_WALK_MAX_DEPTH: usize = 4;
+const RULES_WALK_MAX_FILES: usize = 400;
+/// Names listed per finding before "+N more".
+const RULES_DRIFT_NAMED: usize = 6;
+
+/// `.md` files under `root` as `(relative path with `/` separators, content)`.
+/// Symlinks and non-regular files are skipped; the walk is depth- and
+/// count-bounded and yields nothing when `root` is absent.
+fn rule_files(root: &Path) -> Vec<(String, String)> {
+    fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, String)>) {
+        if depth > RULES_WALK_MAX_DEPTH || out.len() >= RULES_WALK_MAX_FILES {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if kind.is_dir() {
+                walk(&entry.path(), &child, depth + 1, out);
+            } else if kind.is_file()
+                && name.ends_with(".md")
+                && out.len() < RULES_WALK_MAX_FILES
+                && let Some(content) =
+                    cadence_hooks_core::paths::read_untrusted_config(&entry.path())
+            {
+                out.push((child, content));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", 0, &mut out);
+    out
+}
+
+/// One deployed rule surface and where its upstream copies live inside a
+/// plugin install dir. `cadence` deploys flat; `workbench` flattens the
+/// `user/` and `project/` tiers into one tree (a rule keeps its path under
+/// its tier, so `project/languages/rust.md` deploys as `languages/rust.md`).
+struct RuleSurface {
+    /// Directory under `<config>/rules/`.
+    deployed: &'static str,
+    /// Plugin whose install dirs ship the upstream copies.
+    plugin: &'static str,
+    /// Source roots inside an install dir.
+    sources: &'static [&'static str],
+    /// Deployed-relative file the older single-file check already owns.
+    skip: Option<&'static str>,
+}
+
+const RULE_SURFACES: &[RuleSurface] = &[
+    RuleSurface {
+        deployed: "cadence",
+        plugin: "cadence",
+        sources: &["rules"],
+        skip: Some("cadence-rules.md"),
+    },
+    RuleSurface {
+        deployed: "workbench",
+        plugin: "cadence-rules",
+        sources: &["rules/user", "rules/project"],
+        skip: None,
+    },
+];
+
+/// Direction-aware drift findings for the deployed rule trees against the
+/// pinned plugin copies (cameronsjo/cadence-hooks#688). Report-only: nothing
+/// is written.
+///
+/// `installs_for` maps a plugin name to its pinned install dirs. A deployed
+/// file matches when any install's twin is byte-identical. A deployed file with
+/// no upstream twin is machine-local and exempt, as is an upstream file never
+/// deployed (a partial `--select` install). Silent when the deployed surface or
+/// every install's source is absent.
+fn rules_tree_drift_findings(
+    config_dir: &Path,
+    installs_for: &dyn Fn(&str) -> Vec<(String, PathBuf)>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for surface in RULE_SURFACES {
+        let deployed_root = config_dir.join("rules").join(surface.deployed);
+        let deployed = rule_files(&deployed_root);
+        if deployed.is_empty() {
+            continue;
+        }
+        let installs = installs_for(surface.plugin);
+        // Upstream twins per deployed-relative path, one entry per install.
+        let mut upstream: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut label = String::new();
+        for (l, dir) in &installs {
+            for src in surface.sources {
+                for (rel, content) in rule_files(&dir.join(src)) {
+                    if label.is_empty() {
+                        label.clone_from(l);
+                    }
+                    upstream.entry(rel).or_default().push(content);
+                }
+            }
+        }
+        if upstream.is_empty() {
+            continue;
+        }
+        let mut by_direction: std::collections::BTreeMap<RuleDrift, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (rel, content) in &deployed {
+            if surface.skip == Some(rel.as_str()) {
+                continue;
+            }
+            let Some(twins) = upstream.get(rel) else {
+                continue;
+            };
+            if twins.iter().any(|t| t == content) {
+                continue;
+            }
+            // Judge against the first pin; every twin differs from deployed.
+            if let Some(direction) = classify_rule_drift(content, &twins[0]) {
+                by_direction.entry(direction).or_default().push(rel.clone());
+            }
+        }
+        for (direction, files) in by_direction {
+            let shown: Vec<&str> = files
+                .iter()
+                .take(RULES_DRIFT_NAMED)
+                .map(String::as_str)
+                .collect();
+            let more = files.len().saturating_sub(RULES_DRIFT_NAMED);
+            let mut names = shown.join(", ");
+            if more > 0 {
+                names.push_str(&format!(", +{more} more"));
+            }
+            let (diagnosis, remediation) = match direction {
+                RuleDrift::UpstreamAhead => (
+                    format!(
+                        "{} deployed {} rule file(s) are behind the pinned {} plugin (upstream is newer, deployed adds nothing): {names}",
+                        files.len(),
+                        surface.deployed,
+                        surface.plugin,
+                    ),
+                    "resync is safe: re-run /cadence-rules:init-all (or the plugin's copy step). \
+                     If a dotfiles manager tracks these files, update its source too"
+                        .to_string(),
+                ),
+                RuleDrift::DeployedAhead => (
+                    format!(
+                        "{} deployed {} rule file(s) carry content the pinned {} plugin lacks (deployed was edited): {names}",
+                        files.len(),
+                        surface.deployed,
+                        surface.plugin,
+                    ),
+                    "do NOT resync yet, it would destroy the local edit: re-add the change \
+                     upstream first, wait for the re-pin, then resync"
+                        .to_string(),
+                ),
+                RuleDrift::Diverged => (
+                    format!(
+                        "{} deployed {} rule file(s) diverged from the pinned {} plugin (each side has lines the other lacks): {names}",
+                        files.len(),
+                        surface.deployed,
+                        surface.plugin,
+                    ),
+                    "diff each file, move the deliberate local lines upstream, then resync"
+                        .to_string(),
+                ),
+            };
+            findings.push(Finding {
+                severity: Severity::Warning,
+                blocker: Blocker::No,
+                plugin: label.clone(),
+                file: deployed_root.clone(),
+                line: None,
+                snippet: format!("rules/{}", surface.deployed),
+                diagnosis,
+                remediation,
+            });
+        }
+    }
+    findings
+}
+
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
 /// `report_skew` is forwarded to [`scan_hooks_json`] — see its doc comment.
 fn scan_plugin_dir(
@@ -4338,6 +4576,10 @@ pub fn run(
             &cadence_hooks_core::paths::claude_config_dir(),
             &user_scope_installs(&plugins.join("installed_plugins.json"), "cadence"),
         ));
+        findings.extend(rules_tree_drift_findings(
+            &cadence_hooks_core::paths::claude_config_dir(),
+            &|plugin| user_scope_installs(&plugins.join("installed_plugins.json"), plugin),
+        ));
 
         for (marketplace, install_dir, declared_repo) in
             known_marketplace_sources(&plugins.join("known_marketplaces.json"))
@@ -6219,6 +6461,183 @@ mod tests {
             })
             .collect();
         (config, installs)
+    }
+
+    type Installs = Vec<(String, PathBuf)>;
+
+    fn rule_tree_fixture(
+        tmp: &Path,
+        deployed: &[(&str, &str)],
+        cadence_src: &[(&str, &str)],
+        workbench_src: &[(&str, &str)],
+    ) -> (PathBuf, Installs, Installs) {
+        let put = |root: &Path, files: &[(&str, &str)]| {
+            for (rel, text) in files {
+                let path = root.join(rel);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+        };
+        let config = tmp.join("cfg");
+        fs::create_dir_all(&config).unwrap();
+        put(&config.join("rules"), deployed);
+        let cad = tmp.join("cache/workbench/cadence/v0");
+        let wb = tmp.join("cache/workbench/cadence-rules/v0");
+        fs::create_dir_all(&cad).unwrap();
+        fs::create_dir_all(&wb).unwrap();
+        put(&cad.join("rules"), cadence_src);
+        put(&wb.join("rules"), workbench_src);
+        (
+            config,
+            vec![("cadence@workbench".to_string(), cad)],
+            vec![("cadence-rules@workbench".to_string(), wb)],
+        )
+    }
+
+    fn tree_findings(
+        config: &Path,
+        cad: &[(String, PathBuf)],
+        wb: &[(String, PathBuf)],
+    ) -> Vec<Finding> {
+        rules_tree_drift_findings(config, &|plugin| match plugin {
+            "cadence" => cad.to_vec(),
+            _ => wb.to_vec(),
+        })
+    }
+
+    #[test]
+    fn classify_rule_drift_table() {
+        let cases: &[(&str, &str, &str, Option<RuleDrift>)] = &[
+            ("identical", "a\nb\n", "a\nb\n", None),
+            ("whitespace only", "a\n\nb\n", "a\nb  \n", None),
+            ("reordered", "b\na\n", "a\nb\n", None),
+            (
+                "upstream added",
+                "a\n",
+                "a\nb\n",
+                Some(RuleDrift::UpstreamAhead),
+            ),
+            (
+                "deployed added",
+                "a\nb\n",
+                "a\n",
+                Some(RuleDrift::DeployedAhead),
+            ),
+            ("both", "a\nx\n", "a\ny\n", Some(RuleDrift::Diverged)),
+        ];
+        for (name, deployed, upstream, want) in cases {
+            assert_eq!(classify_rule_drift(deployed, upstream), *want, "{name}");
+        }
+    }
+
+    #[test]
+    fn rules_tree_drift_directions_are_reported_per_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, cad, wb) = rule_tree_fixture(
+            tmp.path(),
+            &[
+                ("workbench/git-workflow.md", "a\n"),
+                ("workbench/languages/rust.md", "a\nlocal\n"),
+                ("workbench/mermaid.md", "a\nx\n"),
+                ("workbench/same.md", "same\n"),
+                ("workbench/languages/machine-only.md", "mine\n"),
+                ("cadence/extra.md", "a\n"),
+            ],
+            &[("extra.md", "a\nnew\n")],
+            &[
+                ("user/git-workflow.md", "a\nb\n"),
+                ("project/languages/rust.md", "a\n"),
+                ("project/mermaid.md", "a\ny\n"),
+                ("user/same.md", "same\n"),
+                ("project/dockerfile.md", "never deployed\n"),
+            ],
+        );
+        let findings = tree_findings(&config, &cad, &wb);
+        let joined: Vec<String> = findings
+            .iter()
+            .map(|f| format!("{} | {}", f.plugin, f.diagnosis))
+            .collect();
+        assert_eq!(findings.len(), 4, "{joined:#?}");
+        let has = |needles: &[&str]| {
+            joined
+                .iter()
+                .any(|line| needles.iter().all(|n| line.contains(n)))
+        };
+        assert!(has(&[
+            "cadence-rules@workbench",
+            "behind",
+            "git-workflow.md"
+        ]));
+        assert!(has(&["edited", "languages/rust.md"]));
+        assert!(has(&["diverged", "mermaid.md"]));
+        assert!(has(&["cadence@workbench", "behind", "extra.md"]));
+        for f in &findings {
+            assert_eq!(f.severity, Severity::Warning);
+            assert_eq!(f.blocker, Blocker::No);
+            assert!(
+                !f.diagnosis.contains("machine-only"),
+                "local-only is exempt"
+            );
+            assert!(!f.diagnosis.contains("dockerfile"), "undeployed is exempt");
+            assert!(!f.diagnosis.contains("same.md"));
+        }
+        let ahead = findings
+            .iter()
+            .find(|f| f.diagnosis.contains("edited"))
+            .unwrap();
+        assert!(
+            ahead.remediation.contains("re-add"),
+            "{}",
+            ahead.remediation
+        );
+    }
+
+    #[test]
+    fn rules_tree_drift_is_quiet_when_dir_or_cache_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No rules dir at all.
+        let (config, cad, wb) = rule_tree_fixture(tmp.path(), &[], &[("x.md", "a\n")], &[]);
+        assert!(tree_findings(&config, &cad, &wb).is_empty());
+        // Deployed rules but no installs / empty cache.
+        let (config, _, _) = rule_tree_fixture(tmp.path(), &[("workbench/x.md", "a\n")], &[], &[]);
+        assert!(tree_findings(&config, &[], &[]).is_empty());
+        // Nonexistent config dir.
+        assert!(tree_findings(&tmp.path().join("nope"), &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn rules_tree_drift_never_mutates_and_leaves_single_file_check_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, cad, wb) = rule_tree_fixture(
+            tmp.path(),
+            &[("cadence/cadence-rules.md", "old\n")],
+            &[("cadence-rules.md", "new\n")],
+            &[],
+        );
+        assert!(tree_findings(&config, &cad, &wb).is_empty());
+        let after = fs::read_to_string(config.join("rules/cadence/cadence-rules.md")).unwrap();
+        assert_eq!(after, "old\n");
+    }
+
+    #[test]
+    fn rules_tree_drift_caps_named_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..10).map(|i| format!("r{i}.md")).collect();
+        let dep: Vec<(String, &str)> = names
+            .iter()
+            .map(|n| (format!("workbench/{n}"), "a\n"))
+            .collect();
+        let src: Vec<(String, &str)> = names
+            .iter()
+            .map(|n| (format!("user/{n}"), "a\nb\n"))
+            .collect();
+        let dep_ref: Vec<(&str, &str)> = dep.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+        let src_ref: Vec<(&str, &str)> = src.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+        let (config, cad, wb) = rule_tree_fixture(tmp.path(), &dep_ref, &[], &src_ref);
+        let findings = tree_findings(&config, &cad, &wb);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.starts_with("10 deployed"));
+        assert!(findings[0].diagnosis.contains("+4 more"));
     }
 
     #[test]

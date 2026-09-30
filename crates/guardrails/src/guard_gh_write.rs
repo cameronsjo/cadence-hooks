@@ -8881,6 +8881,9 @@ mod tests {
     /// `pushd`/`popd` pair. Every row is `(command, run from the owned
     /// checkout?, blocks?)`; each allow has a twin that really runs in the
     /// unowned checkout (or reads something else) and still blocks.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn known_shapes_that_stay_in_the_checkout_are_not_unresolvable() {
         let owned = origin_checkout("https://github.com/cameronsjo/x.git");
@@ -9196,6 +9199,9 @@ mod tests {
     /// `eval`, `builtin cd`, and a `cd` inside a compound. From an owned
     /// checkout each ran the write in the unowned one (checked with a real
     /// `bash` `pwd` canary) and was allowed.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn gh_write_follows_every_directory_change_form() {
         let owned = origin_checkout("https://github.com/cameronsjo/x.git");
@@ -9279,6 +9285,9 @@ mod tests {
     /// leaves the write's directory unknown. From an owned checkout each
     /// unowned row exited 0 before (checked with a real `env`/`sudo` canary
     /// for the directory forms). `{O}`/`{U}` are the owned/unowned checkouts.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn gh_write_follows_a_runner_directory_change() {
         let owned = origin_checkout("https://github.com/cameronsjo/x.git");
@@ -9357,6 +9366,9 @@ mod tests {
     /// keep the top-level directory, so from an owned checkout an unowned
     /// `-C`/`-D` directory was never judged. Verified against a real
     /// `env -C` / `sudo -D` canary that the inner command runs in DIR.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn gh_write_follows_a_runner_directory_change_into_a_wrapped_shell() {
         let owned = origin_checkout("https://github.com/cameronsjo/x.git");

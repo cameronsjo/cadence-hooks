@@ -64,7 +64,35 @@ impl Scratch {
             !tag.contains(['/', '\\']) && !tag.contains(".."),
             "tag must not contain a path separator or `..`: {tag:?}"
         );
-        let dir = resolve_scratch_dir(root, tag);
+        Self::create(resolve_scratch_dir(root, tag))
+    }
+
+    /// Like [`Scratch::new`], but always outside the checkout: under the
+    /// [`SCRATCH_ROOT_OVERRIDE_ENV`] root or `$XDG_CACHE_HOME`, namespaced by
+    /// `root`'s final component. For a fixture whose test asserts that a path
+    /// sits in NO git repo: `new`'s default `target/` root lies inside the
+    /// cadence-hooks checkout on CI, so such an assertion held only where a
+    /// worktree run had already relocated the fixture (cadence-hooks#1214).
+    pub fn outside_checkout(root: &Path, tag: &str) -> Self {
+        assert!(
+            !tag.contains(['/', '\\']) && !tag.contains(".."),
+            "tag must not contain a path separator or `..`: {tag:?}"
+        );
+        let namespace = root
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| std::ffi::OsString::from("scratch"));
+        let base = std::env::var_os(SCRATCH_ROOT_OVERRIDE_ENV)
+            .map(PathBuf::from)
+            .or_else(xdg_cache_home)
+            .expect("an XDG cache home or the scratch-root override");
+        Self::create(
+            base.join(namespace)
+                .join(format!("{tag}-{}", std::process::id())),
+        )
+    }
+
+    fn create(dir: PathBuf) -> Self {
         let _ = std::fs::remove_dir_all(&dir);
         // `escapes_carveout` is purely lexical — it blesses `$XDG_CACHE_HOME`
         // (or the override) without checking it's writable. On a read-only

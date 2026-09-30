@@ -4990,6 +4990,9 @@ destinations = ["me/*", "them/exact"]
         });
     }
 
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn scratch_code_writes_skip_the_identity_scan_but_prose_does_not() {
         // (tool, path, expected). The `.md`/`.txt`/no-extension rows are the
