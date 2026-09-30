@@ -1337,11 +1337,14 @@ mod tests {
         }
         let vault_s = vault.to_string_lossy().into_owned();
         let outside_s = outside.to_string_lossy().into_owned();
+        #[cfg(unix)]
         let alias_s = base.join("vault-alias").to_string_lossy().into_owned();
         let judge = |command: &str, vault: &str| {
             check_destructive_in_vault(command, vault, vault, &RealFs).outcome
         };
-        use cadence_hooks_core::Outcome::{Allow, Block};
+        use cadence_hooks_core::Outcome::Allow;
+        #[cfg(unix)]
+        use cadence_hooks_core::Outcome::Block;
         assert_eq!(judge(&format!("rm {outside_s}/plain.txt"), &vault_s), Allow);
         #[cfg(unix)]
         {

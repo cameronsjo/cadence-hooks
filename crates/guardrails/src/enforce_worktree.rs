@@ -11809,6 +11809,7 @@ mod tests {
         // guard failed open. Over-limit ancestors now skip the stat.
         let base = Path::new(env!("CARGO_MANIFEST_DIR"));
         let deep = base.join("a/".repeat(100_000)).join("x");
+        #[cfg(not(windows))]
         let start = std::time::Instant::now();
         assert_eq!(nearest_existing_ancestor(&deep), base);
         // Unix only: Windows' extended-length cap still stats ~100 KB paths.

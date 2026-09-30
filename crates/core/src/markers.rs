@@ -2140,6 +2140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn polish_marker_present_false_on_a_degraded_shared_base() {
         // cadence-hooks#565: a co-tenant who plants the predictable marker on
         // the shared fail-open base must not satisfy the gate. Degrade the dir
@@ -2155,7 +2156,6 @@ mod tests {
         let hashed = base
             .path()
             .join(format!("cadence-hooks-{:x}", hasher.finish()));
-        #[cfg(unix)]
         std::os::unix::fs::symlink(elsewhere.path(), &hashed).unwrap();
         with_marker_dir(base.path(), || {
             assert!(!marker_dir_is_private(), "precondition: degraded base");
@@ -2171,6 +2171,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     fn polish_marker_path_exists(root: &str, branch: &str) -> bool {
         polish_marker(root, branch).is_file()
     }

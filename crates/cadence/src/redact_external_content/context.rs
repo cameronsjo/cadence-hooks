@@ -332,6 +332,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn scratch_exemption_refuses_a_symlink_out_of_the_root() {
         let outside = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
