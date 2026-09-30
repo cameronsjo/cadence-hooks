@@ -2160,6 +2160,7 @@ mod tests {
             "status",
             "plans",
             "record-polish",
+            "record-scrub",
             "redact-scan",
             "grade",
         ];

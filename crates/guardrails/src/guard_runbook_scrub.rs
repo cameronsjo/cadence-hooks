@@ -16,7 +16,7 @@
 //! - **Bash** writing into the directory — a redirect or a writer verb (`tee`,
 //!   `cp`/`mv`/`install`/`ln`, `rsync`, `dd`, `truncate`, `touch`, `rm`,
 //!   `sed -i`, …), as `prevent-secret-writes` parses them
-//!   ([`bash_write_targets`]) — blocks outright: the bytes a command writes
+//!   ([`segment_write_targets`]) — blocks outright: the bytes a command writes
 //!   are not knowable before it runs, so there is nothing to match a marker
 //!   against. The message points at the Write-tool path.
 //! - An MCP-style move/copy (`tool_input.destination`) into the directory
@@ -30,24 +30,37 @@
 //! volume on macOS. A Bash target's glob component (`*`, `?`, `[`, `{`)
 //! matches any single directory name; a `~` or `$HOME` / `$CADENCE_RUNBOOKS_DIR`
 //! is expanded; a relative target is judged against the payload `cwd`, the
-//! whole-command `cd` reading ([`parse_work_dir`]) and every per-segment one
-//! ([`segment_work_dirs`]), keeping the sharpest verdict.
+//! whole-command `cd` reading ([`parse_work_dir`]) and the directory its own
+//! segment runs in ([`command_segments_with_dirs`]), keeping the sharpest verdict.
+//!
+//! **A command that names the directory may only read it.** When the command
+//! text spells the directory (its configured, lexical, physical, or `~/` form,
+//! on a path boundary, or `$CADENCE_RUNBOOKS_DIR` / `${CADENCE_RUNBOOKS_DIR…`
+//! as an expansion), it also blocks on: any write target anywhere (other than
+//! `/dev/null` and the standard streams); a target whose location the hook
+//! cannot read (another variable, a substitution, `~user`, `**`, a relative
+//! target after an unreadable `cd`); and any program outside a short read-only
+//! list ([`READ_ONLY_PROGRAMS`]) — which is what catches the writers the
+//! parser cannot see (`python -c`, `tar -x -C`, `git -C`, `mkdir`, `xargs cp`
+//! fed on stdin, `unzip -d`, …).
+//!
+//! A Bash command carrying more target-plus-directory text than
+//! [`JUDGE_BUDGET`] is refused as too large to judge, so a flood cannot run
+//! out the hook deadline (which fails open).
 //!
 //! **Deliberately allowed (documented, not overlooked):**
-//! - A Bash target whose location depends on something the hook cannot see —
-//!   an environment variable other than the two above, a command
-//!   substitution, `~user`, a `**` globstar, or a relative target after a `cd`
-//!   the walk cannot resolve — blocks only when the command text names the
-//!   directory (its configured, lexical, physical, or `~/` spelling, or the
-//!   `CADENCE_RUNBOOKS_DIR` variable). Blocking every `> "$OUT"` in every
-//!   session would make the guard unusable; a command that routes a write into
-//!   the vault through an opaque variable *and* never spells the vault is the
-//!   residual.
-//! - Interpreters that write by themselves (`python -c "open(…,'w')"`,
-//!   `node -e`, a script file) are opaque, as they are to
-//!   `prevent-secret-writes`.
+//! - A command that never spells the directory and writes through a location
+//!   the hook cannot read: `> "$OUT"`, `cd "$D" && … > f`, a directory spelled
+//!   in pieces (`D=vault; … $BASE/$D/Runbooks`), or a program whose writes are
+//!   invisible (`python script.py`, `tar -x` from inside a symlinked parent).
+//!   Blocking every such command in every session would make the guard
+//!   unusable.
+//! - Reads of the directory by the listed read-only programs, including a
+//!   `find` without `-exec`/`-ok`/`-delete`/`-fprint*`/`-fls`.
 //! - A hard link: writing a file *outside* the directory that shares an inode
 //!   with a runbook is judged by its own path.
+//! - Unicode-normalization and non-ASCII case variants of the directory's
+//!   spelling (only ASCII case is folded).
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
@@ -59,13 +72,16 @@
 //! `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK` (truthy, read from the hook process's own
 //! environment), which allows *and* records a bypass row.
 
-use cadence_hooks_cadence::prevent_secret_writes::bash_write_targets;
+use cadence_hooks_cadence::prevent_secret_writes::{segment_command_argv, segment_write_targets};
 use cadence_hooks_core::markers;
-use cadence_hooks_core::shell::{UNRESOLVABLE_DIR, parse_work_dir, segment_work_dirs};
+use cadence_hooks_core::shell::{
+    UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir,
+};
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 /// The directory the guard protects. Unset or blank → the guard is inert.
 pub const DIR_ENV: &str = "CADENCE_RUNBOOKS_DIR";
@@ -76,6 +92,14 @@ const ESCAPE_ENV: &str = "CADENCE_ALLOW_UNSCRUBBED_RUNBOOK";
 
 /// Symlink hops [`physical`] follows before giving up (Linux's `MAXSYMLINKS`).
 const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Bytes of target-plus-directory text [`bash_write_into`] judges before it
+/// refuses the command as too large. A real command spends a few hundred to a
+/// few thousand (each target is charged its own length plus every directory
+/// it is judged in); reaching this takes thousands of write targets or a
+/// multi-kilobyte `cd` chain, and keeps a 200 KB adversarial command well
+/// inside the hook deadline.
+const JUDGE_BUDGET: usize = 256 * 1024;
 
 /// Longest target text echoed into a block message.
 const MAX_ECHO: usize = 200;
@@ -143,7 +167,7 @@ impl PathShape {
     /// The physical reading: the leading literal run resolved on disk
     /// ([`physical`]), the rest folded lexically. `None` when the walk cannot
     /// finish (a symlink loop) — the lexical reading still stands.
-    fn physical(&self) -> Option<Vec<Comp>> {
+    fn physical(&self, resolver: &Resolver) -> Option<Vec<Comp>> {
         let split = self
             .0
             .iter()
@@ -156,7 +180,7 @@ impl PathShape {
                 _ => prefix.push(".."),
             }
         }
-        let resolved = physical(&prefix)?;
+        let resolved = resolver.physical(&prefix)?;
         let mut comps: Vec<Comp> = path_names(&resolved).into_iter().map(Comp::Lit).collect();
         comps.extend(self.0[split..].iter().cloned());
         Some(PathShape(comps).lexical())
@@ -164,8 +188,8 @@ impl PathShape {
 
     /// True when either reading of this path is the directory `dir` (given as
     /// its possible spellings) or anything beneath it.
-    fn lands_in(&self, dirs: &[Vec<String>]) -> bool {
-        let readings = std::iter::once(self.lexical()).chain(self.physical());
+    fn lands_in(&self, dirs: &[Vec<String>], resolver: &Resolver) -> bool {
+        let readings = std::iter::once(self.lexical()).chain(self.physical(resolver));
         readings
             .into_iter()
             .any(|comps| dirs.iter().any(|dir| reaches(&comps, dir)))
@@ -198,33 +222,88 @@ fn path_names(path: &Path) -> Vec<String> {
 /// applied to the directory reached so far — what the kernel resolves — while
 /// a component that does not exist yet is appended as spelled (a Write may
 /// create it). `None` on a symlink loop past [`MAX_SYMLINK_HOPS`].
+///
+/// Linear in the path: the buffer grows in place, and once a component is
+/// missing nothing below it can be a symlink, so the walk stops asking the
+/// filesystem until a `..` climbs back out of the missing part.
 fn physical(path: &Path) -> Option<PathBuf> {
+    physical_walk(path).map(|(resolved, _)| resolved)
+}
+
+/// [`physical`], plus whether the resolved path's last component is missing
+/// on disk (so nothing appended below it can be a symlink).
+fn physical_walk(path: &Path) -> Option<(PathBuf, bool)> {
     let mut pending: Vec<std::ffi::OsString> = Vec::new();
     push_components(&mut pending, path);
     let mut resolved = PathBuf::from("/");
+    // How many trailing components of `resolved` do not exist on disk.
+    let mut missing = 0usize;
     let mut hops = 0;
     while let Some(name) = pending.pop() {
         if name == ".." {
             resolved.pop();
+            missing = missing.saturating_sub(1);
             continue;
         }
-        let next = resolved.join(&name);
-        match std::fs::symlink_metadata(&next) {
+        resolved.push(&name);
+        if missing > 0 {
+            missing += 1;
+            continue;
+        }
+        match std::fs::symlink_metadata(&resolved) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
                     return None;
                 }
-                let target = std::fs::read_link(&next).ok()?;
+                let target = std::fs::read_link(&resolved).ok()?;
+                resolved.pop();
                 if target.has_root() {
                     resolved = PathBuf::from("/");
                 }
                 push_components(&mut pending, &target);
             }
-            _ => resolved = next,
+            Ok(_) => {}
+            // Missing, or unreadable to this user — which the writer, running
+            // as the same user, cannot traverse either.
+            Err(_) => missing = 1,
         }
     }
-    Some(resolved)
+    Some((resolved, missing > 0))
+}
+
+/// [`physical`] with each distinct parent directory walked once per run.
+///
+/// A command with thousands of targets in a handful of directories would
+/// otherwise re-walk (and re-`stat`) the same directory chain per target. The
+/// final component is still looked up every time, since it may itself be a
+/// symlink (a file link pointing into the protected dir).
+#[derive(Default)]
+struct Resolver {
+    parents: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<(PathBuf, bool)>>>,
+}
+
+impl Resolver {
+    fn physical(&self, path: &Path) -> Option<PathBuf> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return physical(path);
+        };
+        let resolved_parent = self
+            .parents
+            .borrow_mut()
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| physical_walk(parent))
+            .clone();
+        let (mut out, parent_missing) = resolved_parent?;
+        out.push(name);
+        if parent_missing {
+            return Some(out);
+        }
+        match std::fs::symlink_metadata(&out) {
+            Ok(meta) if meta.file_type().is_symlink() => physical(path),
+            _ => Some(out),
+        }
+    }
 }
 
 /// Push `path`'s components onto a pop-from-the-end work stack, so the first
@@ -270,7 +349,7 @@ impl RunbooksDir {
             })
             .collect();
         let mut spellings = vec![lexical.clone()];
-        if let Some(phys) = shape.physical() {
+        if let Some(phys) = shape.physical(&Resolver::default()) {
             let phys: Vec<String> = phys
                 .into_iter()
                 .filter_map(|c| match c {
@@ -294,7 +373,10 @@ impl RunbooksDir {
             return None;
         }
         let mut mentions: BTreeSet<String> = BTreeSet::new();
-        mentions.insert(DIR_ENV.to_ascii_lowercase());
+        // The variable counts only as an expansion: its bare name in prose (a
+        // commit message about this guard) names nothing.
+        mentions.insert(format!("${}", DIR_ENV.to_ascii_lowercase()));
+        mentions.insert(format!("${{{}", DIR_ENV.to_ascii_lowercase()));
         mentions.insert(raw.trim_end_matches('/').to_ascii_lowercase());
         for s in &spellings {
             let joined = format!("/{}", s.join("/")).to_ascii_lowercase();
@@ -314,14 +396,33 @@ impl RunbooksDir {
         })
     }
 
+    /// Does the command text spell the directory? A path spelling counts
+    /// only on a path boundary, so `…/Runbooks-old` or `/other/vault/Runbooks`
+    /// does not name `/vault/Runbooks`.
     fn named_in(&self, command: &str) -> bool {
         let lower = command.to_ascii_lowercase();
-        self.mentions.iter().any(|m| lower.contains(m.as_str()))
+        let path_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+        self.mentions.iter().any(|m| {
+            lower.match_indices(m.as_str()).any(|(at, _)| {
+                let before = lower[..at].chars().next_back();
+                let after = lower[at + m.len()..].chars().next();
+                let open_before = m.starts_with('$') || !before.is_some_and(path_char);
+                let open_after = if m.starts_with('$') {
+                    !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                } else {
+                    !after.is_some_and(|c| path_char(c) && c != '/')
+                };
+                open_before && open_after
+            })
+        })
     }
 
     /// Expand `$CADENCE_RUNBOOKS_DIR` / `$HOME` (bare or braced, on an
     /// identifier boundary) and a leading `~`/`~/` in a shell word.
     fn expand(&self, word: &str) -> String {
+        if !word.contains(['$', '~']) {
+            return word.to_string();
+        }
         let mut text = word.to_string();
         for (name, value) in [
             (DIR_ENV, Some(self.value.as_str())),
@@ -395,25 +496,27 @@ enum Landing {
 
 /// Where a Bash write target lands, judged against every directory the
 /// command may run it in.
-fn bash_target_landing(target: &str, work_dirs: &[String], dir: &RunbooksDir) -> Landing {
+fn bash_target_landing(
+    target: &str,
+    work_dirs: &[&str],
+    dir: &RunbooksDir,
+    resolver: &Resolver,
+) -> Landing {
     let text = dir.expand(target);
+    // `~user` (the only `~` form left after expansion) is someone's home.
     let mut unknown = text.starts_with('~');
-    let bases: Vec<Option<&str>> = if text.starts_with('/') {
-        vec![None]
+    let bases: &[&str] = if text.starts_with('/') {
+        &["/"]
     } else {
-        work_dirs.iter().map(|d| Some(d.as_str())).collect()
+        work_dirs
     };
     for base in bases {
-        let comps = match base {
-            Some(d) if d == UNRESOLVABLE_DIR => {
-                unknown = true;
-                continue;
-            }
-            Some(d) => absolute(&text, d, true),
-            None => absolute(&text, "/", true),
-        };
-        let shape = PathShape(comps);
-        if shape.lands_in(&dir.spellings) {
+        if *base == UNRESOLVABLE_DIR {
+            unknown = true;
+            continue;
+        }
+        let shape = PathShape(absolute(&text, base, true));
+        if shape.lands_in(&dir.spellings, resolver) {
             return Landing::Inside;
         }
         unknown |= shape.has_opaque();
@@ -425,40 +528,174 @@ fn bash_target_landing(target: &str, work_dirs: &[String], dir: &RunbooksDir) ->
     }
 }
 
-/// The first Bash write target that lands in the directory, or that may and
-/// the command names the directory.
-fn bash_write_into(command: &str, cwd: &str, dir: &RunbooksDir) -> Option<String> {
-    let targets = bash_write_targets(command);
-    if targets.is_empty() {
+/// The first Bash write target that lands in the directory — or, failing
+/// that, one whose location the hook cannot read when the command names the
+/// directory. Each segment's targets are judged in the directory that segment
+/// runs in ([`command_segments_with_dirs`]), the payload `cwd`, and the
+/// whole-command `cd` reading ([`parse_work_dir`]), keeping the sharpest
+/// verdict.
+///
+/// Each judgment costs time linear in the target and the directories it is
+/// judged in, and a flood of long `cd` chains and targets multiplies the two.
+/// Past [`JUDGE_BUDGET`] bytes of judged text the command is refused as too
+/// large to judge (the over-block direction): the hook deadline fails open,
+/// so running out the clock must not be a way through.
+fn bash_write_into(command: &str, cwd: &str, dir: &RunbooksDir) -> Option<BashFinding> {
+    let whole = parse_work_dir(command, cwd);
+    let mut judged: HashSet<(String, Rc<str>)> = HashSet::new();
+    let mut unknown: Option<String> = None;
+    let mut any_write: Option<String> = None;
+    let mut writer: Option<String> = None;
+    let mut spent = 0usize;
+    let resolver = Resolver::default();
+    for (segment, seg_dir) in command_segments_with_dirs(command, cwd) {
+        if writer.is_none() {
+            writer = unvetted_program(&segment_command_argv(&segment));
+        }
+        for target in segment_write_targets(&segment) {
+            if !judged.insert((target.clone(), seg_dir.clone())) {
+                continue;
+            }
+            spent += target.len() + seg_dir.len() + cwd.len() + whole.len();
+            if spent > JUDGE_BUDGET {
+                return Some(BashFinding::TooLarge);
+            }
+            let mut bases: Vec<&str> = vec![&seg_dir, cwd, &whole];
+            bases.dedup();
+            match bash_target_landing(&target, &bases, dir, &resolver) {
+                Landing::Inside => return Some(BashFinding::Target(target)),
+                Landing::Unknown => {
+                    unknown.get_or_insert(target);
+                }
+                Landing::Outside => {
+                    if !is_stream_sink(&target) {
+                        any_write.get_or_insert(target);
+                    }
+                }
+            }
+        }
+    }
+    // A command that names the directory may read it, and nothing else: any
+    // write it makes, and any program whose writes the parser cannot see
+    // (an interpreter, `tar -x`, `git`, `mkdir`, …), is refused.
+    if !dir.named_in(command) {
         return None;
     }
-    let mut work_dirs: BTreeSet<String> = BTreeSet::new();
-    work_dirs.insert(cwd.to_string());
-    work_dirs.insert(parse_work_dir(command, cwd));
-    for seg in segment_work_dirs(command, cwd) {
-        work_dirs.insert(seg.dir.to_string());
-    }
-    let work_dirs: Vec<String> = work_dirs.into_iter().collect();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut maybe: Option<&String> = None;
-    for target in &targets {
-        if !seen.insert(target.as_str()) {
-            continue;
-        }
-        match bash_target_landing(target, &work_dirs, dir) {
-            Landing::Inside => return Some(target.clone()),
-            Landing::Unknown => {
-                maybe.get_or_insert(target);
-            }
-            Landing::Outside => {}
-        }
-    }
-    maybe.filter(|_| dir.named_in(command)).cloned()
+    unknown
+        .or(any_write)
+        .map(BashFinding::Target)
+        .or_else(|| writer.map(BashFinding::Program))
+}
+
+/// Programs a command naming the runbooks directory may run: each only reads
+/// its operands, or writes nothing but standard output. Matched on the peeled
+/// command word ([`segment_command_argv`]), byte-exact, because this list
+/// grants an allow. `find` qualifies only without a writing or exec action.
+const READ_ONLY_PROGRAMS: &[&str] = &[
+    "cat",
+    "ls",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "egrep",
+    "fgrep",
+    "stat",
+    "file",
+    "diff",
+    "cmp",
+    "du",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
+    "test",
+    "[",
+    "[[",
+    "echo",
+    "printf",
+    "pwd",
+    "cd",
+    "pushd",
+    "popd",
+    "true",
+    "false",
+    ":",
+    "less",
+    "more",
+    "bat",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shasum",
+    "b2sum",
+    "cksum",
+    "cut",
+    "tr",
+    "nl",
+    "column",
+    "tac",
+    "rev",
+    "jq",
+    "find",
+];
+
+/// `find` actions that write, delete, or run another program.
+const FIND_WRITING_ACTIONS: &[&str] = &[
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+];
+
+/// The command word of `argv` when it is a program outside
+/// [`READ_ONLY_PROGRAMS`] (or a `find` with a writing action). `None` for an
+/// empty or assignment-only segment.
+fn unvetted_program(argv: &[String]) -> Option<String> {
+    let word = argv
+        .iter()
+        .find(|w| !is_assignment(w))
+        .map(|w| command_word(w).into_owned())?;
+    let vetted = READ_ONLY_PROGRAMS.contains(&word.as_str())
+        && (word != "find"
+            || !argv
+                .iter()
+                .any(|a| FIND_WRITING_ACTIONS.contains(&a.as_str())));
+    (!vetted).then_some(word)
+}
+
+/// `NAME=value`: a shell variable assignment, not a program.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// A redirect target that is a stream, not a file: `/dev/null`, the standard
+/// streams, the terminal, or a descriptor duplication (`&1`).
+fn is_stream_sink(target: &str) -> bool {
+    target.starts_with('&')
+        || matches!(
+            target,
+            "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty" | "/dev/fd/1" | "/dev/fd/2"
+        )
+}
+
+/// Why a Bash command is refused.
+#[derive(Debug, PartialEq, Eq)]
+enum BashFinding {
+    /// This write target lands inside, or may and the command names the dir.
+    Target(String),
+    /// The command names the dir and runs this program, whose writes the
+    /// parser cannot see.
+    Program(String),
+    /// The command is past [`JUDGE_BUDGET`].
+    TooLarge,
 }
 
 /// True when a Write-tool path lands in the directory.
 fn file_path_lands_in(path: &str, cwd: &str, dir: &RunbooksDir) -> bool {
-    PathShape(absolute(path, cwd, false)).lands_in(&dir.spellings)
+    PathShape(absolute(path, cwd, false)).lands_in(&dir.spellings, &Resolver::default())
 }
 
 fn echo(text: &str) -> String {
@@ -598,7 +835,24 @@ impl RunbookScrubGuard {
                 let Some(command) = input.command() else {
                     return CheckResult::allow();
                 };
-                bash_write_into(command, &cwd, &dir).map(|target| bash_block(&target))
+                bash_write_into(command, &cwd, &dir).map(|finding| match finding {
+                    BashFinding::Target(target) => bash_block(&target),
+                    BashFinding::Program(program) => format!(
+                        "🚫 BLOCKED: guard-runbook-scrub: this command names the runbooks \
+                         directory ($CADENCE_RUNBOOKS_DIR) and runs `{}`, whose writes cannot \
+                         be seen before it runs. A command that names the directory may only \
+                         read it (cat, ls, grep, head, find without -exec/-delete, …).\n   \
+                         {FIX_AND_ESCAPE}",
+                        echo(&program)
+                    ),
+                    BashFinding::TooLarge => format!(
+                        "🚫 BLOCKED: guard-runbook-scrub: this command carries too many write \
+                         targets and directory changes to judge whether one lands in the \
+                         runbooks directory ($CADENCE_RUNBOOKS_DIR), so it is refused rather \
+                         than waved through.\n   \
+                         If it does not write a runbook, split it into smaller commands.\n   {FIX_AND_ESCAPE}"
+                    ),
+                })
             }
             _ => None,
         };
@@ -847,14 +1101,56 @@ mod tests {
                 format!("cd \"$(echo {rb})\" && echo x > a.md"),
                 Outcome::Block,
             ),
+            // A trailing redirect no longer hides the destination.
+            (format!("cp draft.md {rb}/ 2>/dev/null"), Outcome::Block),
+            (
+                format!("sudo -n cp draft.md {rb}/ > /dev/null 2>&1"),
+                Outcome::Block,
+            ),
+            // `${VAR:-default}`: the parser reads the default; the name blocks.
+            (
+                "echo x > ${CADENCE_RUNBOOKS_DIR:-/nonexistent}/a".to_string(),
+                Outcome::Block,
+            ),
+            // Naming the dir: any write, or any program outside the read-only
+            // list, blocks — these are the writers the parser cannot see.
+            (format!("cp {rb}/a.md {}/copy.md", f.work), Outcome::Block),
+            (format!("ls {rb} > {}/listing.txt", f.work), Outcome::Block),
+            (format!("echo {rb}/ | xargs cp draft.md"), Outcome::Block),
+            (format!("tar -xf x.tar -C {rb}"), Outcome::Block),
+            (
+                format!("python3 -c \"open('{rb}/a.md','w')\""),
+                Outcome::Block,
+            ),
+            (format!("git -C {rb} init"), Outcome::Block),
+            (format!("mkdir {rb}/sub"), Outcome::Block),
+            (format!("unzip x.zip -d {rb}"), Outcome::Block),
+            (format!("find {rb} -name '*.md' -delete"), Outcome::Block),
+            (
+                format!("find {rb} -name '*.md' -exec sh -c 'x' \\;"),
+                Outcome::Block,
+            ),
+            // Naming the dir to read it stays allowed.
+            (format!("cat {rb}/a.md"), Outcome::Allow),
+            (format!("grep -rn term {rb} | head -20"), Outcome::Allow),
+            (format!("ls -la {rb} 2>/dev/null"), Outcome::Allow),
+            (format!("find {rb} -name '*.md' | wc -l"), Outcome::Allow),
+            (format!("R={rb}; cat \"$R\"/a.md"), Outcome::Allow),
             // Outside the dir: unaffected.
             (format!("echo x > {}/a.md", f.work), Outcome::Allow),
             ("echo x > draft.md".to_string(), Outcome::Allow),
-            (format!("cp {rb}/a.md {}/copy.md", f.work), Outcome::Allow),
-            (format!("cat {rb}/a.md"), Outcome::Allow),
-            (format!("grep -r term {rb}"), Outcome::Allow),
-            (format!("ls {rb} > {}/listing.txt", f.work), Outcome::Allow),
+            (
+                "python3 script.py && git commit -m x".to_string(),
+                Outcome::Allow,
+            ),
+            // A sibling or look-alike path does not name the dir.
             (format!("echo x > {rb}-old/a.md"), Outcome::Allow),
+            (format!("cp x /elsewhere{rb}"), Outcome::Allow),
+            // The variable's bare name in prose is not an expansion.
+            (
+                "git commit -m 'guard reads CADENCE_RUNBOOKS_DIR'".to_string(),
+                Outcome::Allow,
+            ),
             // An opaque variable in a command that never names the dir.
             ("echo x > \"$OUT\"".to_string(), Outcome::Allow),
             ("cd \"$D\" && echo x > a.md".to_string(), Outcome::Allow),
@@ -920,6 +1216,32 @@ mod tests {
     }
 
     #[test]
+    fn a_flood_past_the_judge_budget_is_refused_not_waved_through() {
+        let f = fixture("judge-budget");
+        // Each relative `cd` lengthens the directory every later target is
+        // judged in; nothing here names the runbooks dir.
+        let flood = (0..12_000)
+            .map(|i| format!("cd d && echo>f{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let input = make_bash_with_cwd(&flood, &f.work);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bash_write_into(
+                &flood,
+                &f.work,
+                &RunbooksDir::resolve(Some(&f.runbooks), None, "/").unwrap()
+            ),
+            Some(BashFinding::TooLarge)
+        );
+        assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // A short command outside the dir stays well under the budget.
+        let small = make_bash_with_cwd("cd d && echo x > f", &f.work);
+        assert_eq!(outcome(&small, Some(&f.runbooks), &[]), Outcome::Allow);
+    }
+
+    #[test]
     fn the_root_is_never_a_runbooks_directory() {
         let input = with_cwd(make_write("/etc/x", "b"), "/");
         assert_eq!(outcome(&input, Some("/"), &[]), Outcome::Allow);
@@ -979,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_loop_does_not_hang_or_allow() {
+    fn a_symlink_loop_terminates_and_falls_back_to_the_lexical_reading() {
         let f = fixture("a-symlink-loop-does-not-hang-or-allow");
         #[cfg(unix)]
         {
