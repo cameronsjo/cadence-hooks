@@ -766,7 +766,7 @@ fn collect_push_invocations(
     // the directory state each open one started from, and the closes the
     // previous segment left to apply. Off for a script with a `case`, whose
     // `pattern)` arms read as closers this walk cannot tell from real ones.
-    let mut scopes_subshells = !script.contains("case");
+    let mut scopes_subshells = !crate::shell::mentions_case_keyword(script);
     let mut subshells: Vec<(String, bool)> = Vec::new();
     let mut pending_closes = 0;
     for (segment, _next_op) in split_segments_with_ops(script) {
@@ -962,6 +962,21 @@ fn collect_push_invocations(
                     out,
                 );
             }
+        } else if segment.contains("push")
+            && child_scripts_but_git_exec(argv, segment)
+                .iter()
+                .any(|child| {
+                    crate::shell::command_segments(child)
+                        .iter()
+                        .any(|inner| !crate::shell::git_push_segments(inner).is_empty())
+                })
+        {
+            // Past the depth bound the children are not walked, but a push
+            // in one still runs: `cat <(echo $(echo $(echo $(git push origin
+            // main))))` nests it one level past what this walk follows
+            // (cameronsjo/cadence-hooks#1233 review). It is reported as a push
+            // this walk cannot place, so fail-closed callers refuse it.
+            out.push(unresolvable_push(&segment_dir, segment_directory));
         }
         if let Some(exec) = git_exec(&tokens) {
             collect_git_exec_pushes(
@@ -4580,6 +4595,49 @@ mod tests {
             );
             assert!(!pushes.is_empty(), "{opener:?}");
         }
+    }
+
+    /// A push nested one level past what this walk follows still runs, and
+    /// reads as a push it cannot place (#1233 review C1, #1267).
+    #[test]
+    fn a_push_nested_past_the_walk_depth_is_unresolvable() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(git push origin main))))))",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(
+                pushes.iter().any(|push| push.unresolved),
+                "{command:?}: {pushes:?}"
+            );
+        }
+        let quiet = push_invocations("cat <(echo $(echo $(echo $(git status))))", "/repo");
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// The word `case` in a comment or a quoted message leaves the subshell
+    /// scoping on, so a `$(cd …)` idiom does not strand its flag on the
+    /// parent's push (#1233 review I1). A real `case` still turns it off.
+    #[test]
+    fn a_case_mention_outside_a_case_keeps_subshell_scoping() {
+        for command in [
+            "D=$(cd /tmp && pwd); git push origin main # just in case",
+            "D=$(cd /tmp && pwd); git commit -m \"just in case\"; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+        let pushes = push_invocations(
+            "D=$(cd /tmp && pwd); case x in x) true;; esac; git push origin main",
+            "/repo",
+        );
+        assert!(
+            pushes.iter().all(|push| push.directory_unverified),
+            "{pushes:?}"
+        );
     }
 
     #[test]

@@ -2523,6 +2523,34 @@ mod tests {
         }
     }
 
+    /// A command nested past the expansion depth still reaches the guard,
+    /// whatever mix of substitutions holds it (#1233 review C1, #1267).
+    #[test]
+    fn a_dangerous_git_command_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git reset --hard))))",
+            "diff <(git diff) <(echo $(echo $(echo $(git reset --hard))))",
+            "echo $(echo $(cat <(echo $(git reset --hard))))",
+            "x=$(cat <(echo $(echo $(git reset --hard))))",
+            "(( 1<(2+$(echo $(echo $(git reset --hard)))) ))",
+            "echo $(echo $(echo $(echo $(git reset --hard))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(git reset --hard))))))))",
+            "echo $(echo $(echo $(echo `git reset --hard`)))",
+            "cat <(cat <(cat <(cat <(cat <(git reset --hard)))))",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "echo $(echo $(echo $(echo $(git status))))",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
     /// A 200 KB flood of process-substitution openers still reaches the
     /// dangerous tail, promptly. Generous for a debug build.
     #[test]

@@ -201,6 +201,18 @@ CORPUS="$WORK/corpus.tsv"
     printf '1233-procsub-in-dquoted-subst\techo "$(cat <(cp d .env))"\n'
     printf '1233-procsub-unterminated\tcat <(cp d .env\n'
     printf '1233-ctl-dquoted\techo "<(cp d .env)"\n'
+    # #1233 review C1 / #1267: a command nested past the expansion depth,
+    # with a `<(…)` spending one level or four plain `$(…)` levels.
+    printf '1233-deep-procsub-reset\tcat <(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-diff-reset\tdiff <(git diff) <(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-inner-procsub\techo $(echo $(cat <(echo $(git reset --hard))))\n'
+    printf '1233-deep-assign\tx=$(cat <(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-write\tcat <(echo $(echo $(echo $(cp d .env))))\n'
+    printf '1233-deep-arith\t(( 1<(2+$(echo $(echo $(git reset --hard)))) ))\n'
+    printf '1267-dollar-4\techo $(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1267-dollar-8\techo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(cp d .env))))))))\n'
+    printf '1267-backtick-inner\techo $(echo $(echo $(echo `cat .env`)))\n'
+    printf '1267-procsub-5\tcat <(cat <(cat <(cat <(cat <(cp d .env)))))\n'
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling
@@ -256,6 +268,8 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-procsub-diff\tdiff <(sort a) <(sort b)\n'
     printf 'allow-procsub-while\twhile read l; do echo "$l"; done < <(git ls-files)\n'
     printf 'allow-procsub-dquoted\techo "<(git reset --hard)"\n'
+    printf 'allow-case-comment\tD=$(cd /tmp && pwd); git push origin main # just in case\n'
+    printf 'allow-deep-plain\techo $(echo $(echo $(echo $(git status))))\n'
 } > "$STAY_ALLOWED"
 
 # --- consumers ---------------------------------------------------------------

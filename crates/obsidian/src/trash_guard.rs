@@ -2062,6 +2062,23 @@ mod tests {
         }
     }
 
+    /// A delete nested past the expansion depth still reaches the guard
+    /// (#1233 review C1, #1267).
+    #[test]
+    fn a_delete_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(rm note.md))))",
+            "echo $(echo $(echo $(echo $(echo $(rm note.md)))))",
+            "cat <(cat <(cat <(cat <(cat <(rm note.md)))))",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
     /// A process substitution runs its body in the parent's directory
     /// (cameronsjo/cadence-hooks#1233); quoted, it is literal text.
     #[test]

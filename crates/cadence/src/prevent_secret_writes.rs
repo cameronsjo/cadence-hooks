@@ -2687,6 +2687,26 @@ mod tests {
         }
     }
 
+    /// A write nested past the expansion depth still reaches the guard
+    /// (#1233 review C1, #1267).
+    #[test]
+    fn a_write_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(cp d .env))))",
+            "echo $(echo $(echo $(echo $(echo $(cp d .env)))))",
+            "echo $(echo $(echo $(echo `cp d .env`)))",
+            "cat <(cat <(cat <(cat <(cat <(cp d .env)))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(mv d .env))))))))",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
     /// A process substitution runs its body, so a writer there writes
     /// (cameronsjo/cadence-hooks#1233). Quoted, it is literal text.
     #[test]
