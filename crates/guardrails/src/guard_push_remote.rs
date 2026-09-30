@@ -3194,6 +3194,20 @@ mod tests {
                 ),
                 ("\\. ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
                 ("'.' ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 6: a name built by brace or parameter expansion.
+                (
+                    "declare {ED,X}ITOR=x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "read {ED,}ITOR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; printf -v \"${n}OR\" x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("git add . && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
                 (
                     "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,

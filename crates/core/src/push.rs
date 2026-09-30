@@ -1258,9 +1258,25 @@ impl Toplevels {
             .filter(|c| !matches!(c, '\\' | '\'' | '"'))
             .collect();
         let command = command.as_str();
-        // A sourced file or an `eval` can set any of them unseen.
+        // A sourced file or an `eval` can set any of them unseen, and so can
+        // a builtin that binds a variable by name (`declare`, `read`,
+        // `printf -v`, …): the name it binds may be built by a brace
+        // expansion or another variable (`declare {ED,X}ITOR=…`,
+        // `printf -v "${n}OR"`) that no text match can follow, so any such
+        // builtin in command position, or any brace group, refuses
+        // (cameronsjo/cadence-hooks#1226 review 6).
+        static BRACE_GROUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?:^|[^$])\{[^{}\s]*,[^{}]*\}").expect("pattern should compile")
+        });
+        if BRACE_GROUP.is_match(command) {
+            return true;
+        }
         static RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?:^|[\s;&|(){}])(?:source|eval|\.)(?:\s|$)")
+            // In command position only, so a `.` operand (`git add .`) is
+            // not the `.` builtin.
+            regex::Regex::new(
+                r"(?:^|[\n;&|(){}]|\b(?:then|do|else|elif|exec|command|builtin|time|!)\s)\s*(?:source|eval|\.|declare|typeset|local|export|readonly|read|mapfile|readarray|getopts|unset|printf)(?:\s|$)",
+            )
                 .expect("pattern should compile")
         });
         if RUNS_TEXT.is_match(command) {
@@ -4250,6 +4266,23 @@ mod tests {
                 vec![refused("/repo")],
             ),
             ("GIT_EDITOR=\"$VISUAL\" git commit", "/repo", vec![]),
+            // A `.` operand is not the `.` builtin.
+            (
+                "git add . && GIT_EDITOR=\"$EDITOR\" git commit",
+                "/repo",
+                vec![],
+            ),
+            (
+                "true && . ./e && GIT_EDITOR=\"$EDITOR\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
+            // A positional read the substitution does not spell.
+            (
+                "git submodule foreach 'eval \"${@:1}\" #' 'git push origin main'",
+                "/repo",
+                vec![refused("/repo"), elsewhere("/repo")],
+            ),
             (
                 "export E=x; GIT_EDITOR=\"$E\" git commit",
                 "/repo",

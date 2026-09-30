@@ -12533,12 +12533,13 @@ fn chain_script(words: &[String], head_is_text: bool) -> (Vec<String>, bool) {
         None => head.to_string(),
     };
     let positional = positional_parameters_in(&raw);
+    // Any read of a positional parameter is a reading this walk cannot
+    // trust, whether or not the substitution recognized its spelling
+    // (`${@:2}`) or kept the text past its budget.
+    let substituted = reads_a_positional_parameter(&raw);
     let mut scripts = Vec::new();
-    let mut substituted = false;
     if positional {
-        let head = substitute_positional_parameters(&raw, rest);
-        substituted = head != raw;
-        scripts.push(with_args(&head));
+        scripts.push(with_args(&substitute_positional_parameters(&raw, rest)));
     }
     // The text as written is surfaced as well: the substitution cannot
     // follow `shift`, `set --`, quoting or a function's own arguments, so
@@ -12555,6 +12556,24 @@ fn chain_script(words: &[String], head_is_text: bool) -> (Vec<String>, bool) {
         out.push(args);
     }
     (out, substituted)
+}
+
+/// Whether shell text reads a positional parameter itself — `$@`, `$*`,
+/// `$1`–`$9`, or a `${…}` whose name is one of them — as opposed to
+/// [`positional_parameters_in`], which also counts every named `${…}`.
+fn reads_a_positional_parameter(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &byte)| {
+        byte == b'$'
+            && match bytes.get(i + 1) {
+                Some(b'@' | b'*' | b'1'..=b'9') => true,
+                Some(b'{') => matches!(
+                    bytes.get(i + 2),
+                    Some(b'@' | b'*' | b'1'..=b'9' | b'#' | b'!')
+                ),
+                _ => false,
+            }
+    })
 }
 
 /// Whether shell text reads a positional parameter: `$@`, `$*`, `$1`–`$9`,
