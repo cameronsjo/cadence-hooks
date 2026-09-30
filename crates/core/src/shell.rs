@@ -12019,6 +12019,9 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 /// hooks path) and an exported editor are outside the command text and not
 /// read here (cameronsjo/cadence-hooks#1231).
 pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
+    if !may_carry_git_exec(tokens) {
+        return None;
+    }
     let argv = peel_command_runners(strip_compound_heads(tokens));
     let prefix = tokens
         .get(..tokens.len().saturating_sub(argv.len()))
@@ -12120,6 +12123,35 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
         at_toplevel,
         editors,
         opaque,
+    })
+}
+
+/// A cheap superset test for [`git_exec`], so a flood of plain git
+/// segments (`git -C d push origin main; …`) skips the full parse: some word
+/// is quoted or escaped, names an editor setting (`EDITOR`, `VISUAL`,
+/// `core.editor`, …), names a subcommand that runs a command of its own or
+/// a dashed `git-` executable, or is an option that could be a transport's
+/// command option (`--u…`, `--r…`, `--e…`, a short cluster with `u`).
+fn may_carry_git_exec(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        let lower = token.to_ascii_lowercase();
+        token.contains(['\\', '\'', '"', '$', '`'])
+            || lower.contains("editor")
+            || lower.contains("visual")
+            || lower.starts_with("git-")
+            || matches!(
+                token.as_str(),
+                "rebase"
+                    | "bisect"
+                    | "submodule"
+                    | "submodule--helper"
+                    | "filter-branch"
+                    | "difftool"
+            )
+            || token
+                .strip_prefix("--")
+                .is_some_and(|name| name.starts_with(['u', 'r', 'e']))
+            || (token.starts_with('-') && !token.starts_with("--") && token.contains('u'))
     })
 }
 

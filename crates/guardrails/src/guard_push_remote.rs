@@ -3171,9 +3171,9 @@ mod tests {
                 ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
                 ("git ls-remote --exec=\"$C\" .", Block),
                 ("GIT_EDITOR=\"$E\" git commit", Block),
-                ("GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("GIT_EDITOR=\"$EDITOR\" git commit", Block),
                 ("GIT_EDITOR=\"$EDITOR\" git status", Allow),
-                ("GIT_EDITOR=\"${EDITOR:-vim}\" git commit", Allow),
+                ("GIT_EDITOR=\"${EDITOR:-vim}\" git commit", Block),
                 (
                     "GIT_EDITOR=\"${EDITOR:-git push origin main}\" git commit",
                     Block,
@@ -3207,7 +3207,7 @@ mod tests {
                     "n=EDIT; printf -v \"${n}OR\" x; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
                 ),
-                ("git add . && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("git add . && GIT_EDITOR=\"$EDITOR\" git commit", Block),
                 // Review 7: builtins reached past any fixed anchor list, or
                 // named by an expansion.
                 (
@@ -3240,7 +3240,7 @@ mod tests {
                     "n=EDIT; [r]ead ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
                 ),
-                ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Block),
                 // Review 9: a function body, and extglob patterns.
                 (
                     "n=EDIT; x=ad; f(){ re$x \"$1\"; }; f ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
@@ -3254,7 +3254,7 @@ mod tests {
                     "shopt -s extglob; +(re)ad ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
                 ),
-                ("[ -f x ] && GIT_EDITOR=\"$EDITOR\" git commit", Allow),
+                ("[ -f x ] && GIT_EDITOR=\"$EDITOR\" git commit", Block),
                 (
                     "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
                     Block,
@@ -3265,9 +3265,9 @@ mod tests {
                 ("GIT_EDITOR='git -C {other} push' git ci", Block),
                 ("GIT_EDITOR='git -C {other} push' git log", Allow),
                 ("E=x; GIT_EDITOR=\"$E\" git commit", Block),
-                ("EDITOR=\"$HOME/bin/vim\" git commit", Allow),
-                // Review 4: only a plain inherited `$NAME` is the session's
-                // editor; anything the command can set or cannot read is not.
+                ("EDITOR=\"$HOME/bin/vim\" git commit", Block),
+                // Review 10: an editor that is an expansion is never read as
+                // the session's own — each carve-out tried had a way around it.
                 (
                     "GIT_EDITOR='$(echo git push origin main)' git commit",
                     Block,
@@ -3295,13 +3295,13 @@ mod tests {
                 ),
                 (
                     "EDITOR=\"$EDITOR\"; GIT_EDITOR=\"$EDITOR\" git commit",
-                    Allow,
+                    Block,
                 ),
                 (
                     "git submodule foreach 'shift; eval \"$@\" #' x 'git push origin main'",
                     Block,
                 ),
-                ("git -c core.editor=\"$EDITOR\" commit", Allow),
+                ("git -c core.editor=\"$EDITOR\" commit", Block),
                 ("EDITOR=$VISUAL git status", Allow),
                 (
                     "git submodule foreach 'git \"$@\" #' push origin main",

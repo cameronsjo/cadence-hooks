@@ -308,8 +308,6 @@ struct Walk<'a> {
     gh_hosts: &'a GhHosts,
     /// Working-tree tops already found this walk ([`toplevel_of`]).
     toplevels: &'a Toplevels,
-    /// The whole command, for [`assigns_a_variable`].
-    command: &'a str,
 }
 
 impl<'a> Walk<'a> {
@@ -324,7 +322,6 @@ impl<'a> Walk<'a> {
             trusts_known_commands: !may_redefine_known_commands(command),
             gh_hosts,
             toplevels,
-            command,
         }
     }
 }
@@ -334,9 +331,6 @@ impl<'a> Walk<'a> {
 #[derive(Debug, Default)]
 struct Toplevels {
     found: std::cell::RefCell<(usize, std::collections::HashMap<String, Option<String>>)>,
-    /// Per variable name: whether the command assigns it
-    /// ([`assigns_a_variable`]).
-    assigned: std::cell::RefCell<std::collections::HashMap<String, bool>>,
 }
 
 /// Git probes one walk may spend finding working-tree tops; past it the file
@@ -1123,78 +1117,6 @@ fn nested_git_runs_an_alias(script: &str, aliases: &[(String, Option<String>)]) 
         })
 }
 
-/// More distinct variable names than this read by unreadable editors in one
-/// walk are all taken as assigned: each costs a scan of the whole command.
-const MAX_ASSIGNED_LOOKUPS: usize = 16;
-
-/// Whether `command` may set the variable `name` an editor expands, so the
-/// editor is not simply the program the session inherited. A text match
-/// that over-reads: every mention of `name` other than a plain `$NAME` or
-/// `${NAME}` expansion counts — `NAME=…`, `for NAME in`, `printf -v NAME`,
-/// `read NAME`, `export NAME`, an appending `NAME="$NAME;…"` — and so does
-/// any `${NAME` operator (`${NAME:=…}`, `${NAME:-…}`) but a one-word
-/// default (`${EDITOR:-vim}`), which can supply the value. Only an exact self-reference, `NAME="$NAME"` (or `$NAME`,
-/// `${NAME}`, quoted or not), keeps what the session inherited and does not
-/// count.
-fn assigns_a_variable(command: &str, name: &str) -> bool {
-    let Ok(mention) = regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))) else {
-        return true;
-    };
-    // `NAME="$NAME"`, `NAME=${NAME}`, `NAME="${NAME:-vim}"`: the whole value
-    // is the inherited one (or a one-word default), and the word ends there.
-    let Ok(self_reference) = regex::Regex::new(&format!(
-        r#"^=("?)\$(?:{name}|\{{{name}(?::?-[A-Za-z0-9_./+-]+)?\}})"#,
-        name = regex::escape(name)
-    )) else {
-        return true;
-    };
-    let one_word_default = |after: &str| {
-        after
-            .strip_prefix(":-")
-            .or_else(|| after.strip_prefix('-'))
-            .and_then(|rest| rest.split_once('}'))
-            .is_some_and(|(word, _)| {
-                !word.is_empty()
-                    && word.chars().all(|c| {
-                        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '+' | '-')
-                    })
-            })
-    };
-    mention.find_iter(command).any(|found| {
-        let before = &command[..found.start()];
-        let after = &command[found.end()..];
-        if before.ends_with("${") {
-            // `${NAME}`, or a default that is one plain word
-            // (`${EDITOR:-vim}`); any other operator can supply the command.
-            return !(after.starts_with('}') || one_word_default(after));
-        }
-        if before.ends_with('$') {
-            return false;
-        }
-        // `--config-env=core.editor=NAME` reads the variable, it does not
-        // set it.
-        let words: Vec<&str> = before.split_whitespace().rev().take(2).collect();
-        let reads_it = before.ends_with('=')
-            && (words
-                .first()
-                .is_some_and(|word| word.starts_with("--config-env="))
-                || words.get(1).is_some_and(|word| *word == "--config-env"));
-        if reads_it {
-            return false;
-        }
-        !self_reference.captures(after).is_some_and(|found| {
-            let quote = found.get(1).map_or("", |q| q.as_str());
-            let Some(tail) = after[found.get(0).map_or(0, |m| m.end())..].strip_prefix(quote)
-            else {
-                return false;
-            };
-            tail.chars()
-                .next()
-                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
-        })
-    })
-}
-
 /// Whether `path` is a `.git` git's discovery accepts: a directory holding
 /// `HEAD`, `objects/` and `refs/`, or a file starting `gitdir:` (a linked
 /// worktree or submodule). An empty or stray `.git` is passed over, as git
@@ -1213,128 +1135,6 @@ fn is_a_git_marker(path: &std::path::Path) -> bool {
 }
 
 impl Toplevels {
-    /// Whether the command assigns any variable `script` expands
-    /// ([`assigns_a_variable`]), once per name per walk.
-    fn assigns(&self, command: &str, script: &str) -> bool {
-        static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("pattern should compile")
-        });
-        // Only a plain named expansion is the inherited program: a command
-        // substitution, a backquote, or a positional or special parameter
-        // (`$1`, `$@`, `${#…}`) is text this walk cannot read.
-        static OPAQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"\$\(|`|\$\{?[^A-Za-z_{]|\$\{[^A-Za-z_]")
-                .expect("pattern should compile")
-        });
-        if OPAQUE.is_match(script) {
-            return true;
-        }
-        // Only the variables that name the session's own editor, or its
-        // home, are read as inherited; any other name is one the command, a
-        // sourced file or an earlier call may have set.
-        const INHERITED: &[&str] = &[
-            "EDITOR",
-            "VISUAL",
-            "GIT_EDITOR",
-            "GIT_SEQUENCE_EDITOR",
-            "HOME",
-        ];
-        if NAME
-            .captures_iter(script)
-            .any(|found| !INHERITED.contains(&&found[1]))
-        {
-            return true;
-        }
-        // The name matches below run over the command with quotes and
-        // backslashes removed, as the shell removes them: `declare
-        // "EDI""TOR=…"`, `printf -v EDI\TOR`, `\. ./e` set or source as
-        // the plain spelling does. ANSI-C quoting (`$'\x45DITOR'`) can spell
-        // any name, so it is not read at all.
-        if command.contains("$'") {
-            return true;
-        }
-        // A command whose name is an expansion (`c=read; $c …`) or a
-        // filename pattern (`r?ad` matching a file named `read`) may be any
-        // builtin at all (reviews 7, 8).
-        // (A segment that only assigns, `n=$(…)`, runs nothing.)
-        static ASSIGNS_ONLY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*\+?=").expect("pattern should compile")
-        });
-        let names_an_expansion = crate::shell::split_segments(command).iter().any(|segment| {
-            let tokens = crate::shell::executable_tokens(segment);
-            crate::shell::peel_command_runners(crate::shell::strip_compound_heads(&tokens))
-                .iter()
-                .find(|word| !ASSIGNS_ONLY.is_match(word))
-                .is_some_and(|first| {
-                    // `[`/`[[` are the test command, not a pattern.
-                    !matches!(first.as_str(), "[" | "[[")
-                        && first.contains(['$', '`', '*', '?', '['])
-                })
-        });
-        // An indirect expansion (`${!m:=…}`) binds whatever name `m`
-        // holds, however that name was built (review 8).
-        if names_an_expansion || command.contains("${!") {
-            return true;
-        }
-        // A function defined in the same command runs its body in this
-        // shell once called, and that body is not a top-level command the
-        // name check above reads; `extglob` patterns (`+(re)ad`) name a
-        // builtin through a file the same way `r?ad` does (review 9).
-        static DEFINES_OR_EXTGLOB: std::sync::LazyLock<regex::Regex> =
-            std::sync::LazyLock::new(|| {
-                regex::Regex::new(r"[A-Za-z0-9_.:-]\s*\(\s*\)|\bfunction\s|extglob|[+@!]\(")
-                    .expect("pattern should compile")
-            });
-        if DEFINES_OR_EXTGLOB.is_match(command) {
-            return true;
-        }
-        let command: String = command
-            .chars()
-            .filter(|c| !matches!(c, '\\' | '\'' | '"'))
-            .collect();
-        let command = command.as_str();
-        // A sourced file or an `eval` can set any of them unseen, and so can
-        // a builtin that binds a variable by name (`declare`, `read`,
-        // `printf -v`, …): the name it binds may be built by a brace
-        // expansion or another variable (`declare {ED,X}ITOR=…`,
-        // `printf -v "${n}OR"`) that no text match can follow, so any such
-        // builtin, or any brace group, refuses
-        // (cameronsjo/cadence-hooks#1226 review 6).
-        static BRACE_GROUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?:^|[^$])\{[^{}\s]*,[^{}]*\}").expect("pattern should compile")
-        });
-        if BRACE_GROUP.is_match(command) {
-            return true;
-        }
-        // The builtins are matched as words anywhere: no fixed list of
-        // command-position anchors holds (`IFS= read`, `command -p read`),
-        // and a word in a message costs only a refusal (review 7). `.` is
-        // matched in command position only, so a `.` operand (`git add .`)
-        // is not the `.` builtin.
-        static BINDS_OR_RUNS_TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
-            || {
-                regex::Regex::new(concat!(
-                    r"\b(?:source|eval|declare|typeset|local|export|readonly|read|mapfile|readarray|getopts|unset|printf)\b",
-                    r"|(?:^|[\n;&|(){}!]|\b(?:then|do|else|elif|exec|command|builtin|time)\s)\s*\.(?:\s|$)",
-                ))
-                .expect("pattern should compile")
-            },
-        );
-        if BINDS_OR_RUNS_TEXT.is_match(command) {
-            return true;
-        }
-        let mut known = self.assigned.borrow_mut();
-        NAME.captures_iter(script).any(|found| {
-            let name = &found[1];
-            if let Some(&assigned) = known.get(name) {
-                return assigned;
-            }
-            let assigned = known.len() >= MAX_ASSIGNED_LOOKUPS || assigns_a_variable(command, name);
-            known.insert(name.to_string(), assigned);
-            assigned
-        })
-    }
-
     /// [`toplevel_of`], once per directory per walk, and with at most
     /// [`MAX_TOPLEVEL_PROBES`] git probes.
     fn of(&self, work_dir: &str, probe: bool) -> Option<String> {
@@ -1429,13 +1229,13 @@ fn collect_git_exec_pushes(
         repository: inherited.repository || exec.elsewhere || exported,
         directory: inherited.directory || unreadable_dir || lost_toplevel,
     };
-    // An editor whose command is an expansion is the program the session
-    // inherited (`EDITOR="$HOME/bin/vim"`) unless the command itself assigns
-    // what it expands (cameronsjo/cadence-hooks#1226 review 3).
-    let unreadable = |script: &String| {
-        runs_an_unreadable_command(script)
-            && (!exec.editors.contains(script) || walk.toplevels.assigns(walk.command, script))
-    };
+    // A command whose name is an expansion cannot be read — an editor
+    // included. An editor spelled `"$EDITOR"` in the command is usually the
+    // session's own, but every way this walk tried to tell that from a value
+    // the same command binds (trap bodies, functions, aliases, `read` with a
+    // built name, …) had another way around it, so it reads as unresolvable
+    // too (cameronsjo/cadence-hooks#1226 reviews 3–10).
+    let unreadable = |script: &String| runs_an_unreadable_command(script);
     // A nested `git q` whose alias the outer `-c alias.q=…` exports
     // (`GIT_CONFIG_PARAMETERS`, measured) is a push this walk cannot read.
     let aliases = match argv.split_first() {
@@ -4289,7 +4089,7 @@ mod tests {
             (
                 "GIT_SEQUENCE_EDITOR=\"$EDITOR\" git rebase -i HEAD~1",
                 "/repo",
-                vec![],
+                vec![refused("/repo")],
             ),
             (
                 "GIT_SEQUENCE_EDITOR=\"$ED\" git rebase -i HEAD~1",
@@ -4306,12 +4106,16 @@ mod tests {
                 "/repo",
                 vec![refused("/repo")],
             ),
-            ("GIT_EDITOR=\"$VISUAL\" git commit", "/repo", vec![]),
+            (
+                "GIT_EDITOR=\"$VISUAL\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
             // A `.` operand is not the `.` builtin.
             (
                 "git add . && GIT_EDITOR=\"$EDITOR\" git commit",
                 "/repo",
-                vec![],
+                vec![refused("/repo")],
             ),
             (
                 "true && . ./e && GIT_EDITOR=\"$EDITOR\" git commit",
@@ -4329,9 +4133,21 @@ mod tests {
                 "/repo",
                 vec![refused("/repo")],
             ),
-            ("EDITOR=\"$HOME/bin/vim\" git commit", "/repo", vec![]),
-            ("EDITOR=\"$EDITOR\" git commit", "/repo", vec![]),
-            ("EDITOR=\"${EDITOR:-vim}\" git commit", "/repo", vec![]),
+            (
+                "EDITOR=\"$HOME/bin/vim\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
+            (
+                "EDITOR=\"$EDITOR\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
+            (
+                "EDITOR=\"${EDITOR:-vim}\" git commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
             // Review 4: a command substitution is text this walk cannot
             // read, whatever it usually prints.
             (
@@ -4355,7 +4171,7 @@ mod tests {
             (
                 "git --config-env=core.editor=EDITOR rebase -i HEAD~1",
                 "/repo",
-                vec![],
+                vec![refused("/repo")],
             ),
             (
                 "GIT_EDITOR='git push origin main' git ci",
@@ -4367,7 +4183,11 @@ mod tests {
                 "/repo",
                 vec![resolved("/repo")],
             ),
-            ("git -c core.editor=\"$EDITOR\" commit", "/repo", vec![]),
+            (
+                "git -c core.editor=\"$EDITOR\" commit",
+                "/repo",
+                vec![refused("/repo")],
+            ),
             // Review 3 (L1): git passes over an empty `.git`, and takes a
             // worktree's `gitdir:` file.
             (
