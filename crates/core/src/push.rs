@@ -1108,7 +1108,6 @@ fn collect_git_exec_pushes(
         return;
     }
     for script in &exec.scripts {
-        eprintln!("DBG depth={depth} script={script}");
         collect_push_invocations(script, &work_dir, depth + 1, doubt, walk, writes, out);
     }
 }

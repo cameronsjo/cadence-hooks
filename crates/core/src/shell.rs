@@ -11834,7 +11834,7 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     let verb = command_word(argv.first()?);
     let rest = match verb.strip_prefix("git-") {
-        Some(_) => &argv[..],
+        Some(_) => argv,
         // A global the grammar does not know stops the skip; the first word
         // naming one of these subcommands is read instead, which can only add
         // a script to inspect.
