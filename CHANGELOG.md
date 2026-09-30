@@ -6,10 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.118.0] - 2026-09-30
+
 ### Added
 
+- **`doctor`'s inert-permission lint now covers `permissions.ask`, `settings.local.json` and the project's settings, and flags redirect rows.** It still reports a `*` before a trailing `:*` (`Bash(rm /var/log/*:*)`), the class measured inert, and now also a row on an output redirect (`Bash(> path)`), which is checked against `Edit` rules only; each finding carries a fix hint. A `*` in the space-wildcard form (`Bash(git * main)`) is a real glob and is not reported. `allow` rows are not reported. Reporting only; whether the retained deny rows fire on a compound command (`cd x && rm -rf y`) is still unverified and needs a live-session probe. (cameronsjo/cadence-hooks#578)
 - **`rules validate-frontmatter` also nudges on `skills:`/`mcpServers:` in an agent that describes teammate use (cameronsjo/cadence-hooks#615).** A definition that spawns a team teammate has both fields ignored, and the file shows no dispatch mode, so the signal is the description naming a "teammate" or "agent team" (the same keying as `lint-agent-tools.py`'s `teammate-ignored-field`). It applies to plugin agents and to `.claude/agents/` definitions, which are now classified so the teammate check can reach them; the plugin-only `hooks`/`mcpServers`/`permissionMode` nudge is unchanged and `.claude/agents/` still honours those. An agent that is a teammate without saying so is not caught.
 - **`doctor` reports direction-aware drift for the deployed rule trees (cameronsjo/cadence-hooks#688).** `<config>/rules/cadence` and `<config>/rules/workbench` are compared file by file against the pinned `cadence` and `cadence-rules` plugin copies, and each differing file is classified from content alone: upstream-ahead (resync is safe), deployed-ahead (a local edit; re-add it upstream before resyncing) or diverged. Machine-local files with no upstream twin and upstream files never deployed are exempt, the check only reads, and it stays silent when the rules dir or the plugin cache is absent. `cadence-rules.md` stays with the existing single-file check.
+
+### Changed
+
+- **The two macOS release binaries now build on GitHub-hosted `macos-latest` instead of the self-hosted `ci-guest` VM on the M1 Max.** Asset names, targets (`aarch64-apple-darwin`, and `x86_64-apple-darwin` cross-compiled from arm64) and the tap dispatch are unchanged; attestation and signing still run in the hosted `ubuntu-latest` release job. This frees the M1 Max's second VM slot for the private runner pool (cameronsjo/homelab#1034).
 
 ### Fixed
 

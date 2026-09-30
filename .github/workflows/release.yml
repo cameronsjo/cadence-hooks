@@ -94,16 +94,15 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use-cross: true
-          # Both macOS targets build on the M1 Max fleet's `ghr-cadence-hooks`
-          # account. `os` is an array here and a string elsewhere, which
-          # `runs-on: ${{ matrix.os }}` accepts — a label set and a single label
-          # are both valid runs-on values.
+          # Both macOS targets build on the GitHub-hosted `macos-latest` image,
+          # which is free for this public repo and runs on arm64.
+          # x86_64-apple-darwin cross-compiles from it with the stock Xcode SDK.
           - name: macos-x86_64
-            os: [self-hosted, macOS, ARM64]
+            os: macos-latest
             target: x86_64-apple-darwin
             use-cross: false
           - name: macos-aarch64
-            os: [self-hosted, macOS, ARM64]
+            os: macos-latest
             target: aarch64-apple-darwin
             use-cross: false
           - name: windows-x86_64
