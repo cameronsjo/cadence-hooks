@@ -195,7 +195,8 @@ pub struct PushInvocation {
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let gh_hosts = GhHosts::for_command(command);
-    let walk = Walk::for_command(command, true, &gh_hosts);
+    let toplevels = Toplevels::default();
+    let walk = Walk::for_command(command, true, &gh_hosts, &toplevels);
     let mut writes = Vec::new();
     collect_push_invocations(
         command,
@@ -220,7 +221,8 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let gh_hosts = GhHosts::for_command(command);
-    let walk = Walk::for_command(command, false, &gh_hosts);
+    let toplevels = Toplevels::default();
+    let walk = Walk::for_command(command, false, &gh_hosts, &toplevels);
     let mut writes = Vec::new();
     collect_push_invocations(
         command,
@@ -304,17 +306,35 @@ struct Walk<'a> {
     trusts_known_commands: bool,
     /// The hosts a `gh repo clone OWNER/REPO` may clone from.
     gh_hosts: &'a GhHosts,
+    /// Working-tree tops already found this walk ([`toplevel_of`]).
+    toplevels: &'a Toplevels,
 }
 
 impl<'a> Walk<'a> {
-    fn for_command(command: &str, probe_config: bool, gh_hosts: &'a GhHosts) -> Self {
+    fn for_command(
+        command: &str,
+        probe_config: bool,
+        gh_hosts: &'a GhHosts,
+        toplevels: &'a Toplevels,
+    ) -> Self {
         Self {
             probe_config,
             trusts_known_commands: !may_redefine_known_commands(command),
             gh_hosts,
+            toplevels,
         }
     }
 }
+
+/// Working-tree tops one walk has found, by directory, and how many git
+/// probes it spent finding them ([`toplevel_of`]).
+#[derive(Debug, Default)]
+struct Toplevels(std::cell::RefCell<(usize, std::collections::HashMap<String, Option<String>>)>);
+
+/// Git probes one walk may spend finding working-tree tops; past it the file
+/// system alone answers. A 200 KB `GIT_EDITOR=a git status; …` flood asked
+/// git once per segment and ran past the hook deadline.
+const MAX_TOPLEVEL_PROBES: usize = 4;
 
 /// The hosts `gh` may resolve a bare `OWNER/REPO` against anywhere in one
 /// command: the inherited `GH_HOST` (else github.com), plus every literal
@@ -1071,6 +1091,23 @@ fn toplevel_of(work_dir: &str, probe: bool) -> Option<String> {
     })
 }
 
+impl Toplevels {
+    /// [`toplevel_of`], once per directory per walk, and with at most
+    /// [`MAX_TOPLEVEL_PROBES`] git probes.
+    fn of(&self, work_dir: &str, probe: bool) -> Option<String> {
+        let mut cache = self.0.borrow_mut();
+        let (probes, found) = &mut *cache;
+        if let Some(top) = found.get(work_dir) {
+            return top.clone();
+        }
+        let probe = probe && *probes < MAX_TOPLEVEL_PROBES;
+        *probes += usize::from(probe);
+        let top = toplevel_of(work_dir, probe);
+        found.insert(work_dir.to_string(), top.clone());
+        top
+    }
+}
+
 /// More exec scripts than this on one git invocation are read as one push
 /// that cannot be resolved rather than walked: the count is the command's to
 /// choose, and each costs a walk (and, for a bare push, a config probe).
@@ -1138,7 +1175,7 @@ fn collect_git_exec_pushes(
     // the `-C`/cwd directory: from `R/a`, `git rebase -x 'cd x && git push'`
     // pushes from `R/x`, never `R/a/x` (measured, git 2.43).
     let (work_dir, lost_toplevel) = if exec.at_toplevel && !exec.elsewhere {
-        match toplevel_of(&work_dir, walk.probe_config) {
+        match walk.toplevels.of(&work_dir, walk.probe_config) {
             Some(top) => (top, false),
             None => (work_dir, true),
         }
