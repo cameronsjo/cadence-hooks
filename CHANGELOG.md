@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **`redact-external-content` gains a credential-token tier that blocks outgoing bodies carrying GitHub, AWS, Slack, Stripe, `sk-`, Google API keys or PEM private-key headers, including forms split by whitespace, quotes, backslashes or `+`.** The block names the token type, line and offset but never the token, and the identity bypass does not apply. (cameronsjo/cadence-hooks#1022)
+
 ## [0.115.0] - 2026-09-29
 
 ### Security
