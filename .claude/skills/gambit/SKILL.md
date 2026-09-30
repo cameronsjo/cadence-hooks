@@ -24,6 +24,8 @@ This repo's code is the guards: it decides allow and block for shell commands, p
   - `crates/metrics/prices.json`: `python3 scripts/generate-prices.py --check`.
   - `tests/fixtures/registration-audit/`: snapshot of the cadence monorepo's plugin `hooks.json` files. Refresh with `bash scripts/refresh-registration-audit-fixture.sh`; `fixture_manifests_match_the_monorepo_default_branch` fails when it drifts.
   - `Cargo.lock` workspace version lines: moved only by `scripts/prepare-release.sh`. Never hand-edit.
+- The registration audit's sibling leg reads a local cadence checkout. Point it at a detached clone of cadence `main` with `CADENCE_AUDIT_WORKSPACE_ROOT` rather than the session's working clone. Once a wiring PR lands in cadence, every open branch here fails `pending_wiring_hooks_are_still_unwired`, `bash_hooks_have_if_filter` and `fixture_manifests_match_the_monorepo_default_branch` on that leg locally until the audit update merges. CI has no sibling checkout, so those three are expected local reds, not regressions (2026-09-30, #1241).
+- `guard_push_remote::tests::a_long_push_flood_is_judged_before_the_deadline` asserts under 2 s on a debug build and sits near that bound on the Windows runner. Any per-segment work added to the push walk shows there first: measure it in a debug build against `origin/main`, since release timings hide it. #1230 ran 2.05 s until `git_exec` got a cheap prefilter.
 
 ## Change log and release
 
@@ -62,4 +64,8 @@ This repo's code is the guards: it decides allow and block for shell commands, p
 
 ## Environment
 
+- The session's disk allowance fills after about three cargo `target/` directories (a debug plus release build is ~8 GB per worktree). Delete `target/` from any worktree whose PR is reviewed, and never keep a second release build around for a manifest regen longer than the regen (2026-09-30).
+
 ## Lessons
+
+- 2026-09-30, #1230: nine adversarial rounds each found a new way to bind an editor variable the push walk treated as inherited (`$EDITOR`): split-quoted names, brace and parameter-built names, `read`/`printf -v`/`declare`, `${!ref}`, filename patterns, functions, extglob, traps, aliases. The allow only relaxed a false block (`GIT_EDITOR="$EDITOR" git commit`), so it was cut: any editor written into the command whose name is an expansion reads as unresolvable. Next time a carve-out for "the session's own value" appears in a shell-reading guard, cut it at the second bypass round.
