@@ -9,7 +9,7 @@ use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    parse_work_dir, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -41,6 +41,15 @@ fn mentions_push(command: &str) -> bool {
     let bytes = command.as_bytes();
     bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"push"))
         || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+}
+
+/// Can the command push? [`mentions_push`], or a git invocation that runs a
+/// command of its own (`git rebase -x "$CMD"`, `git bisect run "$R"`, `git
+/// submodule foreach "$C"`), whose push the text need not spell
+/// (cameronsjo/cadence-hooks#1226). Asked of the tokenized command, not of
+/// words in it, so an escaped or abbreviated spelling is not a way past.
+fn may_push(command: &str) -> bool {
+    mentions_push(command) || runs_a_git_exec(command)
 }
 
 /// Check if a URL's owner is in the allowed list.
@@ -649,6 +658,14 @@ fn push_locations_both_readings(
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
     for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        // Text only, not [`may_push`]: a git exec whose text spells no push —
+        // `git rebase -x "$CMD"`, a nested `git q` under an outer
+        // `-c alias.q=push` — reaches this guard only through the walk above,
+        // which reports it as a push it cannot resolve, as it would at the
+        // top level; prevent-secret-push refuses it. Re-placing it per
+        // segment adds no verdict, and asking `runs_a_git_exec` of every
+        // segment of a 200 KB flood cost the test deadline on the Windows
+        // runner.
         if !mentions_push(&raw) {
             continue;
         }
@@ -711,7 +728,7 @@ impl Check for PushRemoteGuard {
 fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<CheckResult> {
     let command = input.command()?;
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
-    if !mentions_push(&command) {
+    if !may_push(&command) {
         return None;
     }
     let cwd_fallback = std::env::current_dir()
@@ -746,7 +763,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // extraction, and work-dir resolution all judge the same command.
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
     let command = command.as_ref();
-    if !mentions_push(command) {
+    if !may_push(command) {
         return CheckResult::allow();
     }
     // The structural gate. A tokenized push in command position is the
@@ -3114,6 +3131,190 @@ mod tests {
                 ("f(){ git -C {other} push origin main; }; f", Block),
                 ("bash -c 'git -C . push origin main'", Allow),
                 ("bash -c 'echo push'", Allow),
+            ] {
+                let command = command.replace("{other}", &other);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
+    /// own exec argument is judged where it runs. `submodule foreach` and
+    /// `filter-branch` run it where this guard cannot follow, so they refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_nested_in_a_git_exec_argument_is_judged() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let other = checkout_with_origin("https://github.com/evil/y.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                (
+                    "git rebase -x 'cd {other} && git push origin main' HEAD~1",
+                    Block,
+                ),
+                ("git rebase --exec='git -C {other} push' HEAD~1", Block),
+                (
+                    "git -C {other} rebase -x 'git push origin main' HEAD~1",
+                    Block,
+                ),
+                ("git bisect run git -C {other} push origin main", Block),
+                ("git submodule foreach 'git push origin main'", Block),
+                ("git filter-branch --env-filter 'git push' HEAD", Block),
+                ("git rebase -x \"$CMD\" HEAD~1", Block),
+                ("git bisect run \"$R\"", Block),
+                ("git submodule foreach \"$C\"", Block),
+                ("git re\\base --exe \"$CMD\" HEAD~1", Block),
+                ("bash -c 'git rebase -x \"$CMD\" HEAD~1'", Block),
+                ("git ls-remote --exec=\"$C\" .", Block),
+                ("GIT_EDITOR=\"$E\" git commit", Block),
+                ("GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                ("GIT_EDITOR=\"$EDITOR\" git status", Allow),
+                ("GIT_EDITOR=\"${EDITOR:-vim}\" git commit", Block),
+                (
+                    "GIT_EDITOR=\"${EDITOR:-git push origin main}\" git commit",
+                    Block,
+                ),
+                ("source ./e.sh; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 5: a name or `.` split by quotes or a backslash.
+                (
+                    "declare \"EDI\"\"TOR=git push\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "printf -v EDI\\TOR x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "read -r EDI''TOR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("\\. ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                ("'.' ./e; GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 6: a name built by brace or parameter expansion.
+                (
+                    "declare {ED,X}ITOR=x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "read {ED,}ITOR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; printf -v \"${n}OR\" x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("git add . && GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 7: builtins reached past any fixed anchor list, or
+                // named by an expansion.
+                (
+                    "n=EDIT; IFS= read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; command -p read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; ! read -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; c=read; $c -r ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                // Review 8: an indirect binding, and a builtin reached by a
+                // filename pattern.
+                (
+                    "n=EDIT; m=${n}OR; : \"${!m:=x}\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; r?ad ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; [r]ead ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("cd src && GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                // Review 9: a function body, and extglob patterns.
+                (
+                    "n=EDIT; x=ad; f(){ re$x \"$1\"; }; f ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "n=EDIT; function f { re$x \"$1\"; }; f ${n}OR; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "shopt -s extglob; +(re)ad ${n}OR <<< x; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("[ -f x ] && GIT_EDITOR=\"$EDITOR\" git commit", Block),
+                (
+                    "declare $'EDI\\x54OR=x'; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                ("GIT_EDITOR='git -C {other} push' git checkout -p", Block),
+                ("GIT_EDITOR='git -C {other} push' git stash push -p", Block),
+                ("GIT_EDITOR='git -C {other} push' git config edit", Block),
+                ("GIT_EDITOR='git -C {other} push' git ci", Block),
+                ("GIT_EDITOR='git -C {other} push' git log", Allow),
+                ("E=x; GIT_EDITOR=\"$E\" git commit", Block),
+                ("EDITOR=\"$HOME/bin/vim\" git commit", Block),
+                // Review 10: an editor that is an expansion is never read as
+                // the session's own — each carve-out tried had a way around it.
+                (
+                    "GIT_EDITOR='$(echo git push origin main)' git commit",
+                    Block,
+                ),
+                ("GIT_EDITOR=\"`cat f`\" git commit", Block),
+                (
+                    "set -- 'git push origin main'; GIT_EDITOR=\"$1\" git commit",
+                    Block,
+                ),
+                (
+                    "for E in 'git push origin main'; do GIT_EDITOR=\"$E\" git commit; done",
+                    Block,
+                ),
+                (
+                    "E=\"$E;git push origin main\"; GIT_EDITOR=\"$E\" git commit",
+                    Block,
+                ),
+                (
+                    "printf -v E 'git push origin main'; GIT_EDITOR=\"$E\" git commit",
+                    Block,
+                ),
+                (
+                    "GIT_EDITOR=\"${E:-git push origin main}\" git commit",
+                    Block,
+                ),
+                (
+                    "EDITOR=\"$EDITOR\"; GIT_EDITOR=\"$EDITOR\" git commit",
+                    Block,
+                ),
+                (
+                    "git submodule foreach 'shift; eval \"$@\" #' x 'git push origin main'",
+                    Block,
+                ),
+                ("git -c core.editor=\"$EDITOR\" commit", Block),
+                ("EDITOR=$VISUAL git status", Allow),
+                (
+                    "git submodule foreach 'git \"$@\" #' push origin main",
+                    Block,
+                ),
+                (
+                    "git -c alias.q=push rebase -x 'git q origin main' HEAD~1",
+                    Block,
+                ),
+                ("EDITOR=vim git rebase -i main", Allow),
+                ("git rebase -x 'git push origin main' HEAD~1", Allow),
+                ("git bisect run git push origin main", Allow),
+                ("git rebase -x 'make test' HEAD~1", Allow),
             ] {
                 let command = command.replace("{other}", &other);
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
