@@ -142,7 +142,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers | run |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed | run |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target | run |
-| `warn-agent-dispatch` | PreToolUse (Agent, Task) | Advisory only. Warn on a non-fork dispatch with no `model`, a `model` on a fork dispatch (ignored by the platform), a brief that asks the subagent to execute commands without naming a scrubbed/isolated HOME, and a teammate spawn (`name`) whose agent definition's `tools:` omits `SendMessage` (or whose `disallowedTools` names it). Never echoes the prompt | run |
+| `warn-agent-dispatch` | PreToolUse (Agent, Task) | Advisory only. Warn on a non-fork dispatch with no `model`, a `model` on a fork dispatch (ignored by the platform), and a brief that asks the subagent to execute commands without naming a scrubbed/isolated HOME. Never echoes the prompt | run |
 | `warn-subagent-worktree` | PreToolUse (Agent, Task) | Warn when dispatching a subagent from main while a sibling worktree exists | self-disable |
 | `enforcement-status` | SessionStart | Report when `CADENCE_BYPASS=1` or `CADENCE_DISABLE` names a protected guard | run |
 | `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) | run |

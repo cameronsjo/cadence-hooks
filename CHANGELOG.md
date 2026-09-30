@@ -6,10 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added
-
-- **`warn-agent-dispatch` nudges on a teammate spawn whose agent definition cannot use `SendMessage`.** An Agent call carrying a `name` (or the deprecated `team_name`) launches a teammate, whose result never returns as a tool result; when the `subagent_type`'s definition grants a `tools:` list without `SendMessage`, or lists it under `disallowedTools`, the teammate can never report or answer a `shutdown_request`. The definition is resolved by its `name:` frontmatter — a `plugin:agent` in the newest cached copy of the plugin, any other in the project's `.claude/agents/` (`CLAUDE_PROJECT_DIR`, then the payload `cwd` and its ancestors) before the user's `<config>/agents/` — and a definition that cannot be found, or that inherits every tool, stays silent. Advisory only (cameronsjo/cadence-hooks#606).
-
 ### Security
 
 - **Every push guard now sees a `git push` that another git command runs through its own exec argument.** `core` re-reads as commands the value of `git rebase -x`/`--exec` (any abbreviation or short cluster git accepts, repeatable), the tail of `git bisect run`, the command of `git submodule foreach` (and `submodule--helper foreach`), and each `git filter-branch` `--setup`/`--*-filter` value, so `prevent-secret-push`, `guard-push-remote`, `warn-stacked-base-delete` and `nudge-upgrade-after-push` judge the nested push, and every other guard sees the nested command. A push run in each submodule or under `filter-branch`'s exported `GIT_DIR`, or under an exported `--git-dir`/`-c` global, reads as one whose repository cannot be known; a command whose name is an expansion (`-x "$CMD"`), more than 16 exec scripts, or nesting past the wrapper depth reads as a push that cannot be resolved, so fail-closed guards refuse it (cameronsjo/cadence-hooks#1226).
