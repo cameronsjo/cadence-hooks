@@ -169,9 +169,201 @@ jobs:
           path: ${{ env.ARCHIVE }}
           retention-days: 1
 
+  # Developer ID signing + notarization for the two macOS binaries
+  # (cameronsjo/cadence-hooks#280). It runs between `build` and `release`, so
+  # checksums.txt, the cosign bundle, both attestations and the Homebrew
+  # checksums all cover the SIGNED tarballs. It re-packs each tarball under
+  # the same artifact name, so `release` needs no other change.
+  #
+  # No unsigned fallback: a missing or unusable certificate, a Team ID that
+  # does not match, or a notarization that is not Accepted fails this job,
+  # and `release` never runs. The import-and-sign steps are lifted from
+  # cameronsjo/forgectl's release.yml and the notarize step from
+  # cameronsjo/minute, so the secret names match 1:1 across the three repos.
+  #
+  # GitHub-hosted, as in forgectl: codesign could not use the imported
+  # identity on the self-hosted fleet runner there (forgectl v0.17.0-v0.17.2).
+  sign-macos:
+    name: Sign + notarize macOS
+    needs: build
+    # The workflow only fires on `v*` tags; this repeats it at the job that
+    # holds the Apple key.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    timeout-minutes: 60
+    # APPLE_* secrets live only in the `macos-signing` environment, whose
+    # deployment policy allows tag `v*` alone (no branch) and which has no
+    # repo-level copies. Not `release`: that environment must also admit
+    # `main` for auto-tag, prepare-release, prices and ship.
+    environment: macos-signing
+    # Artifact download and upload use the runner's own token, so this job
+    # needs no GITHUB_TOKEN scope. It checks out nothing.
+    permissions: {}
+    steps:
+      - name: Download macOS archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: macos-*
+          path: unsigned
+          merge-multiple: true
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # errexit so a failed `security import` fails the step: without it
+          # the trailing `rm -f` (always exit 0) would mask the failure.
+          set -euo pipefail
+          # No certificate is a failed release, never an unsigned one.
+          : "${APPLE_CERTIFICATE_P12:?APPLE_CERTIFICATE_P12 is not set in the macos-signing environment}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is not set in the macos-signing environment}"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$(security list-keychains -d user | tr -d '"')"
+
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+          # A Developer ID identity is only valid to codesign when its issuer
+          # chain resolves. Add the Developer ID G2 intermediate to the
+          # ephemeral keychain, pinned by SHA-256 so a substituted download
+          # cannot become a trusted issuer.
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          curl -fsSL -o "$CA_PATH" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $CA_PATH" | shasum -a 256 -c -
+          security add-certificates -k "$KEYCHAIN_PATH" "$CA_PATH"
+          rm -f "$CA_PATH"
+
+          # Fail here, not at codesign: `find-identity` exits 0 whatever it
+          # finds, so assert a positive match on the identity name.
+          IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+          case "$IDENTITIES" in
+            *"Developer ID Application"*) ;;
+            *)
+              echo "$IDENTITIES"
+              security list-keychains -d user
+              echo "::error::certificate imported but no valid Developer ID Application identity"
+              exit 1 ;;
+          esac
+          echo "$IDENTITIES" | tail -1
+
+          # Name the keychain explicitly on every codesign call rather than
+          # depending on the search list (forgectl v0.17.1).
+          echo "SIGN_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Sign binaries
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${SIGN_KEYCHAIN:?import step did not export a keychain}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is not set in the macos-signing environment}"
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p signed notarize
+          for name in macos-x86_64 macos-aarch64; do
+            ARCHIVE="cadence-hooks-${VERSION}-${name}.tar.gz"
+            [[ -f "unsigned/${ARCHIVE}" ]] || { echo "::error::missing unsigned/${ARCHIVE}"; exit 1; }
+            mkdir -p "work/${name}"
+            tar -xzf "unsigned/${ARCHIVE}" -C "work/${name}"
+            BIN="work/${name}/cadence-hooks"
+            codesign --keychain "$SIGN_KEYCHAIN" --sign "Developer ID Application" --options runtime --timestamp --force "$BIN"
+            codesign --verify --strict --verbose=2 "$BIN"
+            # The signature must carry this team's identity and the hardened
+            # runtime notarization requires; anything else fails the release.
+            codesign --verify --strict \
+              -R "=anchor apple generic and certificate leaf[subject.OU] = \"${APPLE_TEAM_ID}\"" "$BIN"
+            DETAILS="$(codesign -dv "$BIN" 2>&1)"
+            grep -q '(runtime)' <<< "$DETAILS" || { echo "$DETAILS"; echo "::error::${name}: hardened runtime flag missing"; exit 1; }
+            cp "$BIN" "notarize/cadence-hooks-${name}"
+            # Same archive name and layout as the build job's tarball.
+            tar -czf "signed/${ARCHIVE}" -C "work/${name}" cadence-hooks
+          done
+
+      # Notarize both binaries in one submission. A bare Mach-O cannot be
+      # stapled, so the tarballs ship notarized-unstapled and Gatekeeper checks
+      # the ticket online. The profile is stored in the ephemeral keychain, so
+      # the cleanup step below removes it with the certificate.
+      - name: Configure notarytool credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_ID:?APPLE_ID is not set in the macos-signing environment}"
+          : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD is not set in the macos-signing environment}"
+          xcrun notarytool store-credentials cadence-hooks-notary \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --keychain "$SIGN_KEYCHAIN"
+
+      - name: Submit for notarization
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent notarize "$RUNNER_TEMP/notarize.zip"
+          # --wait blocks until Apple finishes; --timeout caps it. The status
+          # is read from JSON so an `Invalid` or `Rejected` verdict fails the
+          # job whatever notarytool's exit code is.
+          RESULT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --keychain-profile cadence-hooks-notary \
+            --keychain "$SIGN_KEYCHAIN" \
+            --wait \
+            --timeout 40m \
+            --output-format json)"
+          echo "$RESULT"
+          STATUS="$(jq -r '.status // ""' <<< "$RESULT")"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            ID="$(jq -r '.id // ""' <<< "$RESULT")"
+            if [[ -n "$ID" ]]; then
+              xcrun notarytool log "$ID" --keychain-profile cadence-hooks-notary --keychain "$SIGN_KEYCHAIN" || true
+            fi
+            echo "::error::notarization status is '${STATUS}', not Accepted"
+            exit 1
+          fi
+
+      # Replace each macOS artifact in place, so `release` downloads the
+      # signed tarball under the name it already expects.
+      - name: Upload signed macos-x86_64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-x86_64
+          path: signed/cadence-hooks-${{ github.ref_name }}-macos-x86_64.tar.gz
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload signed macos-aarch64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-aarch64
+          path: signed/cadence-hooks-${{ github.ref_name }}-macos-aarch64.tar.gz
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+      # The ephemeral keychain holds the Developer ID private key and the
+      # notary profile. Delete it whether or not the job succeeded.
+      - name: Delete signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+
   release:
     name: Create Release
-    needs: [verify, build]
+    # sign-macos replaces the two macOS artifacts with signed tarballs, so
+    # every checksum, signature and attestation below covers signed binaries.
+    needs: [verify, build, sign-macos]
     runs-on: ubuntu-latest
     # The only job that can sign: cosign and both attestations run here, in
     # release.yml itself, so the certificate identity stays this file at the
