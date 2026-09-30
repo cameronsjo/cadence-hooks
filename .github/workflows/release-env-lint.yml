@@ -1,0 +1,24 @@
+name: Release environment lint
+
+# Refuses any workflow that names the `release` environment under a
+# pull_request_target, workflow_run, or issue_comment trigger (cadence-ecosystem
+# ADR-0044 (i)). Vendored from cadence-ecosystem scripts/release/.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  lint:
+    name: release-env-lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - run: bash .github/scripts/lint-release-env.sh

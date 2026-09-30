@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`nudges` path globs match on Windows.** A drive path (`C:\repo\docs\a.md`) did not start with `/`, so it was read as already repo-relative and never matched a glob such as `docs/**`; an absolute file path is now judged against the repo root on every platform. Windows CI also runs the suite again: tests that build POSIX shell strings from native temp paths, or rely on Unix-only temp roots and symlinks, are scoped to Unix.
 
+### Security
+
+- **Releases ship on the nightly verified merge (cadence-ecosystem ADR-0044).** `prepare-release.yml` keeps one `chore(main): release X.Y.Z` PR current from `[Unreleased]` (`### Fixed` only is a patch, anything else a minor), and `ship.yml` merges it only when the vendored ship gate verifies the PR's author, signed commits, and version-only diff with green CI. The release commit is made through the REST API so GitHub signs it, and `CHANGELOG.md` gains a `## [X.Y.Z] - DATE` heading under a kept `## [Unreleased]` instead of renaming it, so the diff only adds lines. Hand-opened `chore(release): X` PRs are retired.
+- **`release.yml` refuses a tag whose commit is not on `main` with a green `CI` push run.** A new first `verify` job checks both before anything builds or signs, polling CI for up to 45 minutes. Permissions are per job: `build` reads only, and only `release` holds `id-token`, `attestations`, and `contents: write`. Every action is pinned by SHA, and `cross` and `cargo-cyclonedx` install at pinned versions. The Homebrew tap update moves to its own `homebrew` job, the only job in `release.yml` that holds the App key, which receives just the four checksums. The beta-prerelease cleanup step is removed; existing beta tags stay.
+- **The App private key never shares a job with third-party code.** `auto-tag.yml` tags only a commit that is the App's own merge of its `chore(main): release X.Y.Z` PR, so a version bump that reaches `main` any other way no longer releases. It grants `GITHUB_TOKEN` read only, stops persisting credentials in `.git/config`, pushes the tag through `GIT_CONFIG_*` headers, and checks the `Cargo.toml` version against an anchored `X.Y.Z` pattern before writing it to `$GITHUB_OUTPUT`. `prices.yml` parses the pricing page in a job with no token and opens the PR from its artifact in a separate job. Every job that mints the key names the `release` environment. `SECURITY.md` now states what the signing identity proves and which controls cover the rest.
+
 ## [0.117.0] - 2026-09-30
 
 ### Added
