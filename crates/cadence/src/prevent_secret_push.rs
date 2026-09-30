@@ -2585,6 +2585,14 @@ mod tests {
             "cd \"$D\" && git zz",
             "git -C \"$D\" zz",
             "git -C `pwd` zz",
+            "GIT_EXEC_PATH=/tmp/x git zz",
+            "export GIT_\"DIR\"=/tmp/x; git zz",
+            "export 'GIT_DIR'=/tmp/x; git zz",
+            "export GIT_DIR\\=/tmp/x; git zz",
+            "export H\"OME\"=/tmp/x; git zz",
+            "read GIT_DIR <<< /tmp/x; export GIT_DIR; git zz",
+            "printf -v GIT_WORK_TREE /tmp/x; export GIT_WORK_TREE; git zz",
+            "declare -x XDG_CONFIG_HOME=/tmp/x; git zz",
         ] {
             assert_blocks(&fx.run(cmd), &["alias"]);
         }
@@ -2595,6 +2603,8 @@ mod tests {
             "git -c include.path=/tmp/x status",
             "git -c help.autocorrect=1 status",
             "cd \"$D\" && git status",
+            "GIT_EXEC_PATH=/tmp/x git status",
+            "read GIT_DIR <<< /tmp/x; export GIT_DIR; git log -1",
         ] {
             assert_allows(&fx.run(cmd));
         }
@@ -2838,5 +2848,117 @@ mod tests {
             &format!("160000,{head},sub"),
         ]);
         assert_blocks(&fx.run("git push origin main"), &["submodules"]);
+    }
+
+    #[test]
+    fn dashed_git_push_and_an_exec_renamed_git_are_unscannable_pushes() {
+        let fx = Fx::new("dashedpush");
+        for cmd in [
+            "git-push origin main",
+            "/usr/lib/git-core/git-push origin main",
+            "git-push.exe origin main",
+            "command git-push origin main",
+            "exec -a git-push git origin main",
+            "exec -ca git-push git origin main",
+            "exec -l -a /x/git-push git origin main",
+            "exec -agit-push git origin main",
+            "exec -a git-status git origin main",
+        ] {
+            assert_blocks(&fx.run(cmd), &["cannot scan"]);
+        }
+        // A plain `exec`, and an `exec -a` naming anything but git, are not.
+        assert_allows(&fx.run("exec git push origin main"));
+        assert_allows(&fx.run("exec -a worker sleep 1"));
+    }
+
+    #[test]
+    fn a_source_spelled_as_an_object_id_that_a_ref_also_names_blocks() {
+        let fx = Fx::new("hexref");
+        let clean = git_out(&fx.work, &["rev-parse", "HEAD"]);
+        fx.git(&["checkout", "-q", "-b", "leak"]);
+        fx.commit("leak.txt", &format!("{}\n", aws_key()), "leak");
+        fx.git(&["checkout", "-q", "main"]);
+        // git push reads the source as the ref; rev-parse as the object.
+        for (made, cmd) in [
+            (
+                format!("refs/heads/{clean}"),
+                format!("git push origin {clean}:refs/heads/x"),
+            ),
+            (
+                format!("refs/tags/{clean}"),
+                format!("git push origin +{clean}:refs/heads/x"),
+            ),
+            (
+                format!("refs/remotes/{clean}/HEAD"),
+                format!("git push origin {clean}:refs/heads/x"),
+            ),
+            (
+                format!("refs/heads/{}", clean.to_uppercase()),
+                format!("git push origin {}:refs/heads/x", clean.to_uppercase()),
+            ),
+        ] {
+            fx.git(&["update-ref", &made, "leak"]);
+            assert_blocks(&fx.run(&cmd), &["named like an object id"]);
+            fx.git(&["update-ref", "-d", &made]);
+        }
+        // With no such ref, the object id is what git pushes.
+        assert_allows(&fx.run(&format!("git push origin {clean}:refs/heads/x")));
+    }
+
+    #[test]
+    fn remote_helpers_are_unscannable_pushes_but_git_remote_is_not() {
+        let fx = Fx::new("remotehelper");
+        for cmd in [
+            "git remote-https origin https://example.invalid/r.git",
+            "git remote-http origin http://example.invalid/r.git",
+            "git remote-ext origin 'ext::sh -c x'",
+            "git remote-fd 0",
+            "git remote-ftps origin ftps://example.invalid/r.git",
+            "git-remote-https origin https://example.invalid/r.git",
+            "/usr/lib/git-core/git-remote-http origin http://example.invalid/r.git",
+        ] {
+            assert_blocks(&fx.run(cmd), &["cannot scan"]);
+        }
+        for cmd in ["git remote", "git remote -v", "git remote add up /tmp/x"] {
+            assert_allows(&fx.run(cmd));
+        }
+    }
+
+    #[test]
+    fn commit_messages_in_an_unscannable_encoding_block() {
+        for (tag, header) in [
+            ("encutf7", "encoding UTF-7"),
+            ("encebcdic", "encoding IBM037"),
+        ] {
+            let fx = Fx::new(tag);
+            raw_commit(&fx, header, "clean");
+            assert_blocks(&fx.run("git push origin main"), &["encoding"]);
+        }
+        // Recorded by git itself from `i18n.commitEncoding`.
+        let fx = Fx::new("encgit");
+        fx.git(&[
+            "-c",
+            "i18n.commitEncoding=UTF-7",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "clean",
+        ]);
+        assert_blocks(&fx.run("git push origin main"), &["encoding"]);
+        // Encodings the scanner reads as-is.
+        let fx = Fx::new("encok");
+        for header in [
+            "encoding UTF-8",
+            "encoding utf8",
+            "encoding US-ASCII",
+            "encoding ascii",
+            "encoding ISO-8859-1",
+            "encoding iso-8859-15",
+            "encoding latin1",
+        ] {
+            raw_commit(&fx, header, "clean");
+        }
+        assert_allows(&fx.run("git push origin main"));
     }
 }
