@@ -4125,7 +4125,8 @@ mod tests {
                 "/repo",
                 vec![refused("/repo")],
             ),
-            // A `.` operand is not the `.` builtin.
+            // An expansion-named editor refuses whatever precedes it
+            // (review 10); this row does not test the `.` operand.
             (
                 "git add . && GIT_EDITOR=\"$EDITOR\" git commit",
                 "/repo",
@@ -4491,6 +4492,94 @@ mod tests {
         // belongs to a subshell and must not re-point the parent's push.
         let invocation = only("echo $(cd /x) && git push", "/repo");
         assert_eq!(invocation.work_dir, "/repo");
+    }
+
+    /// A process substitution's body runs in a subshell started from the
+    /// directory in effect where it is written, and its own `cd` dies with it
+    /// (cameronsjo/cadence-hooks#1233). Rows are `(command, the directory of
+    /// every push, in order)`; quoted `<(` is literal and pushes nothing.
+    #[test]
+    fn a_process_substitution_push_runs_in_the_parents_directory() {
+        for (command, want) in [
+            ("diff <(git push origin main) x", &["/repo"][..]),
+            ("cat >(git push origin main)", &["/repo"]),
+            ("tee >(git push origin main) >/dev/null", &["/repo"]),
+            ("cd /other && cat <(git push origin main)", &["/other"]),
+            ("cat <(cd /other) && git push origin main", &["/repo"]),
+            ("cat <(cd /other; true) && git push origin main", &["/repo"]),
+            (
+                "cat <(cd /other; true) >(cd /x); git push origin main",
+                &["/repo"],
+            ),
+            ("echo \"<(git push origin main)\"", &[]),
+            ("echo '>(git push origin main)'", &[]),
+        ] {
+            let dirs: Vec<String> = push_invocations(command, "/repo")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, want, "{command}");
+        }
+    }
+
+    /// A substitution the splitter cuts at a separator starts its subshell in
+    /// the segment that opens it, so a `cd` there is not that segment's
+    /// command: the walk never moves, and the push after it, still inside the
+    /// substitution, ran somewhere else. Such a push is directory-unverified
+    /// rather than placed in the parent's cwd, and the flag ends at the `)`
+    /// (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_cd_opening_a_cut_substitution_unverifies_the_push_inside_it() {
+        for command in [
+            "echo $(cd /other && git push origin main )",
+            "echo $(cd /other; git push origin main )",
+            "diff <(cd /other && git push origin main ) x",
+            "diff <(cd /other\ngit push origin main\n) x",
+            "cat >(cd /other || exit; git push origin main )",
+            "echo $(a $(cd /other; git push origin main ) )",
+            "echo $(pushd /other; git push origin main )",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}: no push");
+            for push in &pushes {
+                assert!(
+                    push.directory_unverified || push.work_dir == "/other",
+                    "{command:?}: a push placed in {} unflagged",
+                    push.work_dir
+                );
+            }
+        }
+        // Closed again: the parent's later push is placed as before.
+        for command in [
+            "echo $(cd /other; true) ; git push origin main",
+            "cat <(cd /other\ntrue\n) ; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+    }
+
+    /// A 200 KB flood of unclosed openers leaves 100 000 cut substitutions in
+    /// one segment. Reading each one's text to its end was quadratic — past
+    /// 20 s in release, and a hook past its deadline fails open.
+    #[test]
+    fn a_cut_substitution_opener_flood_walks_in_linear_time() {
+        for opener in ["<(", ">(", "$(", "<(\"", "echo <(cd a "] {
+            let command = format!(
+                "{} ; git push origin main",
+                opener.repeat(200 * 1024 / opener.len())
+            );
+            let started = std::time::Instant::now();
+            let pushes = push_invocations(&command, "/repo");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{opener:?}: {:?}",
+                started.elapsed()
+            );
+            assert!(!pushes.is_empty(), "{opener:?}");
+        }
     }
 
     #[test]

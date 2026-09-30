@@ -2505,4 +2505,45 @@ mod tests {
         assert!(message.contains("may modify history"), "{message}");
         assert!(!message.contains("cannot see inside"), "{message}");
     }
+
+    /// A process substitution runs its body (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_dangerous_git_command_inside_a_process_substitution_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("diff <(git push --force origin main) x", Block),
+            ("cat >(git reset --hard)", Block),
+            ("cat <(cat <(git reset --hard))", Block),
+            ("echo \"<(git reset --hard)\"", Allow),
+            ("echo '<(git reset --hard)'", Allow),
+            ("diff <(git show HEAD:a) <(git show HEAD~1:a)", Allow),
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
+
+    /// A 200 KB flood of process-substitution openers still reaches the
+    /// dangerous tail, promptly. Generous for a debug build.
+    #[test]
+    fn a_process_substitution_flood_before_a_reset_still_blocks_promptly() {
+        for opener in ["<(", "cat <(x) ", "<(a; "] {
+            let command = format!(
+                "{}\ngit reset --hard",
+                opener.repeat(200 * 1024 / opener.len())
+            );
+            let started = std::time::Instant::now();
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{opener:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(4),
+                "{opener:?}: {:?}",
+                started.elapsed()
+            );
+        }
+    }
 }

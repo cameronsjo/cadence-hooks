@@ -893,11 +893,21 @@ fn check_destructive_in_vault_at(
     // so a redirect hidden inside a `sh -c`/`bash -c` wrapper or a `$(…)`/
     // backtick substitution is also seen — the sibling secret-writes guard
     // uses the same wrapper-unwrapping splitter for the same reason.
+    //
+    // Each distinct target is judged once: a 200 KB flood of `>(` reads as
+    // 100 000 redirects to the same word in every segment the body walk
+    // lists, and resolving each again put the guard past its deadline, which
+    // fails open (cameronsjo/cadence-hooks#1233). The verdict for a target
+    // does not depend on which segment named it.
+    let mut judged = std::collections::HashSet::new();
     for segment in command_segments(command) {
         for target in clobber_redirect_targets(&segment)
             .into_iter()
             .flat_map(|target| with_brace_expansion(&target))
         {
+            if !judged.insert(target.clone()) {
+                continue;
+            }
             if let Some(resolved) = resolve_in_vault(&target, &cwd, &vault, &vault_prefix)
                 && meta.exists(&resolved)
             {
@@ -2049,6 +2059,42 @@ mod tests {
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
             );
+        }
+    }
+
+    /// A process substitution runs its body in the parent's directory
+    /// (cameronsjo/cadence-hooks#1233); quoted, it is literal text.
+    #[test]
+    fn a_delete_inside_a_process_substitution_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("cat <(rm note.md)", Block),
+            ("tee >(rm note.md) </dev/null", Block),
+            ("diff <(cat <(rm note.md)) x", Block),
+            ("echo \"<(rm note.md)\"", Allow),
+            ("echo '>(rm note.md)'", Allow),
+        ] {
+            assert_eq!(outcome_in_vault(command), outcome, "{command}");
+        }
+    }
+
+    /// A 200 KB flood of process-substitution openers, whose bodies are now
+    /// walked as commands, is judged inside the deadline, and a delete after
+    /// it still blocks (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_process_substitution_flood_is_judged_promptly() {
+        let limit =
+            std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
+        for opener in ["<(", ">(", ">(a "] {
+            let flood = opener.repeat(200 * 1024 / opener.len());
+            let started = std::time::Instant::now();
+            assert_eq!(
+                outcome_in_vault(&format!("{flood}\nrm note.md")),
+                cadence_hooks_core::Outcome::Block,
+                "{opener:?}"
+            );
+            let took = started.elapsed();
+            assert!(took < limit, "{opener:?}: {took:?}");
         }
     }
 

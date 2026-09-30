@@ -6503,14 +6503,25 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
 /// `echo $(cd /u`. The splitter cut that substitution at a separator inside
 /// it, so this text is a command its subshell runs before the segments that
 /// follow, up to the `)` that closes it (cameronsjo/cadence-hooks#1233).
+///
+/// Each tail ends where the next one's `(` begins, so its command word is
+/// its own and the tails together are no longer than the segment: a flood of
+/// 100 000 unclosed `<(` would otherwise copy the rest of the segment once per
+/// opener.
 pub(crate) fn cut_inner_tails(raw: &str) -> Vec<String> {
     let mut scratch = Vec::new();
     let peeled = peel_segment(raw, &mut scratch);
     let command = peeled.command.unwrap_or("");
-    segment_shape(command)
-        .inner_tails
-        .into_iter()
-        .map(|at| command[at..].to_string())
+    let starts = segment_shape_reading(command, true).inner_tails;
+    let ends = starts
+        .iter()
+        .skip(1)
+        .map(|&next| next - 1)
+        .chain(std::iter::once(command.len()));
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&at, end)| command[at..end].to_string())
         .collect()
 }
 
@@ -6613,7 +6624,8 @@ struct SegmentShape {
     /// in the substitution's subshell.
     inner_open: usize,
     /// Where the text inside each of those opens begins, as a byte offset
-    /// into the segment, outermost first.
+    /// into the segment, outermost first. Recorded only by
+    /// [`segment_shape_reading`] with tails on; empty otherwise.
     inner_tails: Vec<usize>,
 }
 
@@ -6624,6 +6636,14 @@ struct SegmentShape {
 /// opens an inner group that its `)` closes; only a `)` left unpaired
 /// closes a subshell.
 fn segment_shape(segment: &str) -> SegmentShape {
+    segment_shape_reading(segment, false)
+}
+
+/// [`segment_shape`], recording [`SegmentShape::inner_tails`] when
+/// `with_tails` is set — off for every per-segment walk, which needs only the
+/// counts and would otherwise allocate once per segment.
+fn segment_shape_reading(segment: &str, with_tails: bool) -> SegmentShape {
+    let mut tails = with_tails.then(Vec::new);
     let mut shape = SegmentShape::default();
     let mut rest = segment.trim_start();
     while let Some(after) = rest.strip_prefix('}') {
@@ -6645,7 +6665,7 @@ fn segment_shape(segment: &str) -> SegmentShape {
         }
     }
     let base = segment.len() - rest.len();
-    let mut inner = Vec::new();
+    let mut inner = 0usize;
     let mut previous: Option<char> = None;
     let mut chars = rest.char_indices();
     while let Some((at, c)) = chars.next() {
@@ -6658,17 +6678,25 @@ fn segment_shape(segment: &str) -> SegmentShape {
             '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
             '\'' => skip_quoted(&mut chars, '\'', false),
             '"' => skip_quoted(&mut chars, '"', true),
-            '(' => inner.push(base + at + 1),
-            ')' if !inner.is_empty() => {
-                inner.pop();
+            '(' => {
+                inner += 1;
+                if let Some(tails) = tails.as_mut() {
+                    tails.push(base + at + 1);
+                }
+            }
+            ')' if inner > 0 => {
+                inner -= 1;
+                if let Some(tails) = tails.as_mut() {
+                    tails.pop();
+                }
             }
             ')' => shape.paren_closes += 1,
             _ => {}
         }
         previous = Some(c);
     }
-    shape.inner_open = inner.len();
-    shape.inner_tails = inner;
+    shape.inner_open = inner;
+    shape.inner_tails = tails.unwrap_or_default();
     shape
 }
 
@@ -19582,6 +19610,149 @@ mod tests {
         );
     }
 
+    // --- process substitution (cameronsjo/cadence-hooks#1233)
+
+    /// An unquoted `<(…)`/`>(…)` runs its body, so the body is a segment of
+    /// its own. Every row was run through bash 5.2 with a harmless body:
+    /// each prints `/dev/fd/63` (or glues it into the word) and runs the
+    /// body. Rows are `(command, a segment it must surface)`.
+    #[test]
+    fn command_segments_surfaces_process_substitution_bodies() {
+        for (command, want) in [
+            ("true <(mv d .env)", "mv d .env"),
+            (": <(tee .env < d)", "tee .env < d"),
+            ("cat <(dd if=d of=.env)", "dd if=d of=.env"),
+            ("tee >(cat > .env)", "cat > .env"),
+            ("echo hi > >(cat > .env)", "cat > .env"),
+            ("cat <( cat <(cp d .env) )", "cp d .env"),
+            ("cat <(cat <(cat <(cp d .env)))", "cp d .env"),
+            // Glued into a word, after `$` or a digit, inside an unquoted
+            // `${…}` default, as an assignment value, and in `[[ … ]]`.
+            ("cat a<(cp d .env)", "cp d .env"),
+            ("cat <(cp d .env)b", "cp d .env"),
+            ("echo $<(cp d .env)", "cp d .env"),
+            ("echo 2>(cp d .env)", "cp d .env"),
+            ("echo ${v:-<(cp d .env)}", "cp d .env"),
+            ("x=<(cp d .env)", "cp d .env"),
+            ("[[ -e <(cp d .env) ]]", "cp d .env"),
+            ("for f in <(cp d .env); do cat $f; done", "cp d .env"),
+            // Inside a substitution that bash re-parses.
+            ("echo \"$(cat <(cp d .env))\"", "cp d .env"),
+            ("echo `cat <(cp d .env)`", "cp d .env"),
+            ("bash -c 'cat <(cp d .env)'", "cp d .env"),
+            ("bash -c \"cat <(cp d .env)\"", "cp d .env"),
+            // A quoted `)` does not end the body. The splitter cuts at a `;`
+            // inside it, as it cuts a `$(…)`, and the tail keeps the `)`.
+            ("cat <(echo ')' x; cp d .env)", "cp d .env)"),
+            ("cat <(echo \")\" x) .env", "echo \")\" x"),
+            // Unterminated (bash rejects it): the rest is kept, not dropped.
+            ("cat <(cp d .env", "cp d .env"),
+            ("cat <(cat <(cp d .env", "cp d .env"),
+            // A wrapper's argument is a path, and the body still runs.
+            ("watch <(cp d .env)", "cp d .env"),
+            ("diff <(git push origin main) x", "git push origin main"),
+        ] {
+            let out = command_segments(command);
+            assert!(
+                out.iter().any(|s| s == want),
+                "{command:?} surfaced no {want:?}: {out:?}"
+            );
+        }
+    }
+
+    /// Where `<(` is literal text, its body runs nowhere and is not a
+    /// segment. Rows are `(command, text no segment may equal)`.
+    #[test]
+    fn command_segments_leaves_literal_process_substitution_text() {
+        for (command, never) in [
+            ("echo \"<(cp d .env)\"", "cp d .env"),
+            ("echo '<(cp d .env)'", "cp d .env"),
+            ("echo $'<(cp d .env)'", "cp d .env"),
+            ("echo \"${v:-<(cp d .env)}\"", "cp d .env"),
+            ("echo \"a >(cp d .env) b\"", "cp d .env"),
+            ("echo hi # <(cp d .env)", "cp d .env"),
+            ("cat <<E\n<(cp d .env)\nE", "cp d .env"),
+            ("cat <<'E'\n$(cat <(cp d .env))\nE", "cp d .env"),
+        ] {
+            let out = command_segments(command);
+            assert!(
+                !out.iter().any(|s| s == never),
+                "{command:?} surfaced {never:?}: {out:?}"
+            );
+        }
+    }
+
+    /// The unquoted heredoc's `$(…)` does run, and a process substitution
+    /// inside it with it.
+    #[test]
+    fn command_segments_surfaces_process_substitution_in_a_heredoc_substitution() {
+        let out = command_segments("cat <<E\n$(cat <(cp d .env))\nE");
+        assert!(out.iter().any(|s| s == "cp d .env"), "{out:?}");
+    }
+
+    /// A process substitution's body is a child script of its segment, for a
+    /// walker that recurses with a fresh scope (the push walk,
+    /// `enforce-worktree`), and quoted text gives none.
+    #[test]
+    fn child_scripts_surfaces_process_substitution_bodies() {
+        for (segment, want) in [
+            (
+                "diff <(git push origin main) x",
+                &["git push origin main"][..],
+            ),
+            ("tee >(git commit -m x)", &["git commit -m x"]),
+            ("diff <(a) >(b)", &["a", "b"]),
+            ("echo \"<(git push origin main)\"", &[]),
+            ("echo '>(git push origin main)'", &[]),
+        ] {
+            let argv = tokenize(segment);
+            assert_eq!(child_scripts(&argv, segment), want, "{segment:?}");
+        }
+    }
+
+    /// `watch <(cmd)`'s script is the `/dev/fd/N` path, and `cmd` is a body of
+    /// the segment already, so nesting does not double the work per level —
+    /// the process-substitution twin of
+    /// `a_substitution_inside_a_wrapper_is_expanded_once`.
+    #[test]
+    fn a_process_substitution_inside_a_wrapper_is_expanded_once() {
+        for wrapper in ["watch", "env -S", "eval", "bash -c"] {
+            for fill in [" x", "x; "] {
+                let open = format!("{wrapper} <(").repeat(4);
+                let body = fill.repeat((200 * 1024 - open.len()) / fill.len());
+                let command = format!("{open}{body}{}", ")".repeat(4));
+                let segments = command_segments(&command);
+                let bytes: usize = segments.iter().map(String::len).sum();
+                assert!(
+                    bytes <= 8 * command.len(),
+                    "{wrapper:?} {fill:?}: {bytes} bytes from {}",
+                    command.len()
+                );
+            }
+        }
+    }
+
+    /// 200 KB floods of process-substitution openers return quickly and keep
+    /// the trailing payload. The bound is generous for a debug build; the
+    /// release timing is checked by the guard-level flood tests.
+    #[test]
+    fn command_segments_process_substitution_floods_stay_linear() {
+        for opener in ["<(", ">(", "<(a ", "<(a; ", "cat <(x) ", "<(\"", "a<(#"] {
+            let input = format!("{} ; cat .env", opener.repeat(200 * 1024 / opener.len()));
+            let started = std::time::Instant::now();
+            let segs = command_segments(&input);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "{opener:?}: command_segments took {took:?}"
+            );
+            assert!(
+                opener.contains(['#', '"']) || segs.iter().any(|s| s.contains("cat .env")),
+                "{opener:?}: the trailing payload was dropped"
+            );
+        }
+    }
+
     #[test]
     fn command_segments_escaped_backtick_not_expanded() {
         let out = command_segments(r#"tool --note "use \`cat .env\` here""#);
@@ -20375,6 +20546,24 @@ mod tests {
         }
     }
 
+    /// The command each cut-open substitution starts with, disjoint so a flood
+    /// of openers costs the segment's length once (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn cut_inner_tails_reads_each_open_substitution_s_own_text() {
+        for (segment, want) in [
+            ("echo $(cd /u", &["cd /u"][..]),
+            ("diff <(cd /u", &["cd /u"]),
+            ("echo $(a $(cd /u", &["a $", "cd /u"]),
+            ("echo $(cd /u $(b) x", &["cd /u $(b) x"]),
+            ("echo $(pwd) x", &[]),
+            ("echo \"$(cd /u\"", &[]),
+            ("echo '<(cd /u'", &[]),
+            ("<(<(<(", &["<", "<", ""]),
+        ] {
+            assert_eq!(cut_inner_tails(segment), want, "{segment:?}");
+        }
+    }
+
     #[test]
     fn segment_shape_skips_quotes_and_pairs_inner_parens() {
         let shape = |opens: &[bool], brace_closes, paren_closes| SegmentShape {
@@ -20412,7 +20601,6 @@ mod tests {
                 "echo $(true",
                 SegmentShape {
                     inner_open: 1,
-                    inner_tails: vec![7],
                     ..shape(&[], 0, 0)
                 },
             ),

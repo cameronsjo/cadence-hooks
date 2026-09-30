@@ -190,6 +190,17 @@ CORPUS="$WORK/corpus.tsv"
     # invariant is that a consumer never sees LESS text, which has to hold
     # whether or not the input happens to be runnable.
     printf '652-nested-unclosed-quote\tcat <<EOF\001$(echo "$(echo x" ; cat .env)\001EOF\n'
+    # cadence-hooks#1233: an unquoted process substitution runs its body, so a
+    # writer or a dangerous git verb there is a command of its own. Quoted, it
+    # is literal text (the last row), and must not move.
+    printf '1233-procsub-mv\ttrue <(mv d .env)\n'
+    printf '1233-procsub-tee\t: <(tee .env < d)\n'
+    printf '1233-procsub-glued\tcat a<(cp d .env)\n'
+    printf '1233-procsub-output\tcat >(git reset --hard)\n'
+    printf '1233-procsub-nested\tcat <(cat <(cat .env))\n'
+    printf '1233-procsub-in-dquoted-subst\techo "$(cat <(cp d .env))"\n'
+    printf '1233-procsub-unterminated\tcat <(cp d .env\n'
+    printf '1233-ctl-dquoted\techo "<(cp d .env)"\n'
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling
@@ -242,6 +253,9 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-git-commit\tgit commit -m "$(printf '"'"'%%s'"'"' x)"\n'
     printf 'allow-nested-plain\techo $(echo "$(date)")\n'
     printf 'allow-nested-quoted-paren\techo $(echo "$(echo '"'"'")'"'"')")\n'
+    printf 'allow-procsub-diff\tdiff <(sort a) <(sort b)\n'
+    printf 'allow-procsub-while\twhile read l; do echo "$l"; done < <(git ls-files)\n'
+    printf 'allow-procsub-dquoted\techo "<(git reset --hard)"\n'
 } > "$STAY_ALLOWED"
 
 # --- consumers ---------------------------------------------------------------
