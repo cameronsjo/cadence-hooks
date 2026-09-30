@@ -15,6 +15,7 @@
 
 use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::gitstate::GitState;
+use cadence_hooks_core::shell::parse_work_dir;
 use cadence_hooks_core::worktree::would_block_here;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
@@ -36,16 +37,23 @@ impl Check for WarnBranchBase {
             return CheckResult::allow();
         }
 
+        // Judge the repo the command actually runs in, not the raw payload
+        // cwd: `cd <nested> && git checkout -b …` from a meta-repo session
+        // branches the nested repo (cameronsjo/cadence-hooks#225). `dir` is
+        // `None` when the command's directory cannot be resolved to a repo —
+        // this guard only nudges, so it stays quiet then (ADR-0001).
+        let Some(dir) = effective_repo_dir(command, input.cwd.as_deref()) else {
+            return CheckResult::allow();
+        };
+
         // Branching in place in a primary checkout under worktree discipline
         // is the pattern `enforce-worktree` exists to prevent — checked
         // first, ahead of the base-branch logic below, since it applies
-        // regardless of which base is named. Only when the cwd resolves to
+        // regardless of which base is named. Only when the dir resolves to
         // a repo `would_block_here` can judge; no cwd falls through to the
         // existing behavior (fail open, ADR-0001).
         // TODO(#164): GitState will absorb this suppression gate.
-        if let Some(cwd) = input.cwd.as_deref()
-            && would_block_here(Path::new(cwd))
-        {
+        if input.cwd.is_some() && would_block_here(Path::new(&dir)) {
             return CheckResult::nudge(worktree_first_message());
         }
 
@@ -62,7 +70,7 @@ impl Check for WarnBranchBase {
         }
 
         // No explicit base — check current branch in the hook's working directory
-        let current = match current_branch(input.cwd.as_deref()) {
+        let current = match current_branch(Some(&dir)) {
             Some(b) => b,
             None => return CheckResult::allow(),
         };
@@ -149,6 +157,30 @@ const MAIN_BRANCH_REFS: &[&str] = &[
 
 fn is_main_branch(name: &str) -> bool {
     MAIN_BRANCH_REFS.contains(&name)
+}
+
+/// The directory whose repo `command` operates in: the payload `cwd` after any
+/// leading `cd` chain ([`parse_work_dir`]), resolved to the innermost repo
+/// root through [`cadence_hooks_core::target_repo`].
+///
+/// - No `cd` in effect: the cwd itself (long-standing behavior; `.` with no cwd).
+/// - A `cd` that resolves into a repo: that repo's root — the nested repo of a
+///   meta-repo session, a linked worktree, or another checkout.
+/// - A `cd` into somewhere that is no repo, does not exist, or cannot be
+///   read: `None`, so the caller stays quiet rather than judging the wrong repo
+///   (or, worse, the hook process's own directory).
+fn effective_repo_dir(command: &str, cwd: Option<&str>) -> Option<String> {
+    use cadence_hooks_core::target_repo::{TargetKind, resolve_effective_repo};
+    let Some(cwd) = cwd else {
+        return Some(".".to_string());
+    };
+    let work = parse_work_dir(command, cwd);
+    if work == cwd {
+        return Some(cwd.to_string());
+    }
+    resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir)
+        .resolved()
+        .map(|r| r.state.repo_root.to_string_lossy().into_owned())
 }
 
 /// The current branch of the repo enclosing `cwd`, or `None` for a detached
@@ -471,6 +503,96 @@ mod tests {
 
     fn with_clean_worktree_env<T>(f: impl FnOnce() -> T) -> T {
         with_worktree_env(None, None, f)
+    }
+
+    /// Meta-repo `meta/` (a primary on main) gitignoring `wt/`, a linked
+    /// worktree of the separate repo `src` on `feat/x`.
+    fn meta_with_nested_worktree(scratch: &Scratch) -> (PathBuf, PathBuf) {
+        let meta = scratch.path().join("meta");
+        let src = scratch.path().join("src");
+        for d in [&meta, &src] {
+            std::fs::create_dir(d).unwrap();
+            init_repo(d);
+        }
+        std::fs::write(meta.join(".gitignore"), "wt/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        let wt = meta.join("wt");
+        git_in(
+            &src,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
+        );
+        (meta, wt)
+    }
+
+    #[test]
+    fn cd_into_a_nested_repo_is_judged_against_that_repo() {
+        with_clean_worktree_env(|| {
+            let scratch = scratch("meta-cd");
+            let (meta, wt) = meta_with_nested_worktree(&scratch);
+            let m = meta.to_str().unwrap();
+            let w = wt.to_str().unwrap();
+            // (label, command, cwd, expected: None = allow, Some(needle) = nudge
+            // whose message contains it, and `forbid` must be absent)
+            type Case<'a> = (&'a str, String, &'a str, Option<&'a str>, &'a str);
+            let cases: Vec<Case> = vec![
+                (
+                    "meta cwd, cd into the linked nested repo: its branch is the base",
+                    format!("cd {w} && git checkout -b feat/y"),
+                    m,
+                    Some("feat/x"),
+                    "enforce-worktree",
+                ),
+                (
+                    "meta cwd, no cd: the meta primary is judged (unchanged)",
+                    "git checkout -b feat/y".to_string(),
+                    m,
+                    Some("enforce-worktree"),
+                    "",
+                ),
+                (
+                    "nested cwd, cd out to the meta primary: worktree-first",
+                    format!("cd {m} && git checkout -b feat/y"),
+                    w,
+                    Some("enforce-worktree"),
+                    "",
+                ),
+                (
+                    "explicit main base stays quiet after the cd",
+                    format!("cd {w} && git checkout -b feat/y main"),
+                    m,
+                    None,
+                    "",
+                ),
+                (
+                    "cd into a directory that does not exist: cannot judge, quiet",
+                    format!("cd {m}/no-such-dir && git checkout -b feat/y"),
+                    m,
+                    None,
+                    "",
+                ),
+            ];
+            for (label, command, cwd, want, forbid) in cases {
+                let result = WarnBranchBase.run(&make_bash_with_cwd(&command, cwd));
+                match want {
+                    None => assert_eq!(
+                        result.outcome,
+                        cadence_hooks_core::Outcome::Allow,
+                        "{label}"
+                    ),
+                    Some(needle) => {
+                        assert_eq!(
+                            result.outcome,
+                            cadence_hooks_core::Outcome::Nudge,
+                            "{label}"
+                        );
+                        let msg = result.message.unwrap();
+                        assert!(msg.contains(needle), "{label}: {msg}");
+                        assert!(forbid.is_empty() || !msg.contains(forbid), "{label}: {msg}");
+                    }
+                }
+            }
+        });
     }
 
     #[test]
