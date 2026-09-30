@@ -216,6 +216,9 @@ impl Check for PersistPlanApproval {
         let _ = std::panic::catch_unwind(|| {
             crate::heartbeat::beat_if_due(input.session_id(), input.cwd.as_deref())
         });
+        // Opt-in tool-activity stamp for `nudge-afk-gap` (#480): no I/O unless
+        // CADENCE_AFK_GAP is set, and throttled when it is.
+        let _ = std::panic::catch_unwind(|| crate::afk_gap::note_tool_activity(input.session_id()));
         result
     }
 }

@@ -15,12 +15,15 @@
 //! holding the Unix seconds of the last prompt. Written `0600` in a `0700`
 //! directory on first creation.
 //!
-//! **Last activity** is the later of that stamp and the mtime of the session's
-//! machine-wide registry mirror, which tool calls refresh through
-//! `persist-plan-approval`'s throttled heartbeat. Without the mirror a long
-//! autonomous run (prompt, five hours of tool calls, reply) would read as five
-//! idle hours. A session outside a git repo has no mirror and falls back to the
-//! prompt stamp alone.
+//! **Last activity** is the later of that stamp and a second per-session
+//! stamp, `<sid>.afk-activity`, which [`note_tool_activity`] refreshes from
+//! `persist-plan-approval`'s every-PostToolUse process, throttled to one write
+//! per [`ACTIVITY_REFRESH_SECS`]. Without it a long autonomous run (prompt,
+//! five hours of tool calls, reply) would read as five idle hours. It is a
+//! dedicated stamp rather than the registry mirror's mtime because
+//! `session start` re-registers the mirror on `--resume`, which would make
+//! every resumed session look freshly active and silence the marker in its
+//! headline case. Nothing but tool activity writes it.
 //!
 //! **Gated on state:** the first prompt a session is seen with records a stamp
 //! and says nothing — there is no prior activity to measure from. A missing,
@@ -28,10 +31,8 @@
 //! (ADR-0001).
 
 use crate::identity;
-use crate::registry;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
 
 /// Enables the hook when truthy.
 pub const ENABLE_VAR: &str = "CADENCE_AFK_GAP";
@@ -42,6 +43,11 @@ pub const DEFAULT_GAP_MINUTES: u64 = 240;
 
 /// The stamp file's suffix under the per-session state dir.
 const STAMP_SUFFIX: &str = "afk-gap";
+/// The tool-activity stamp's suffix under the per-session state dir.
+const ACTIVITY_SUFFIX: &str = "afk-activity";
+/// The tool-activity stamp is rewritten at most this often. Coarse on purpose:
+/// it only has to beat a threshold measured in hours.
+pub const ACTIVITY_REFRESH_SECS: u64 = 300;
 
 /// Pure: whether the enable flag is set.
 pub fn enabled_from(value: Option<&str>) -> bool {
@@ -72,7 +78,7 @@ fn gap_phrase(secs: u64) -> String {
 /// Pure: the one line to inject, or `None` below the threshold.
 ///
 /// `last_prompt` gates the whole thing: without a prior prompt this session
-/// there is nothing to measure from. `last_tool` (the registry mirror's mtime)
+/// there is nothing to measure from. `last_tool` (the tool-activity stamp)
 /// only ever moves last activity later, never earlier. A last activity in the
 /// future (clock skew, a restored stamp) is silent.
 pub fn gap_line(
@@ -104,13 +110,9 @@ fn read_stamp(path: &Path) -> Option<u64> {
     raw.trim().parse::<u64>().ok()
 }
 
-/// A file's mtime in Unix seconds; `None` when absent or unreadable.
-fn mtime_secs(path: &Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    modified
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
+/// The tool-activity stamp path for `session_id` under `state_dir`.
+fn activity_path(state_dir: &Path, session_id: &str) -> std::path::PathBuf {
+    state_dir.join(format!("{session_id}.{ACTIVITY_SUFFIX}"))
 }
 
 /// Create `dir` (and parents) owner-only on Unix. Existing directories keep
@@ -170,21 +172,51 @@ pub(crate) fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()>
     Ok(())
 }
 
-/// Testable core: read the previous stamp and the mirror mtime, record `now`,
-/// and return the line to inject, if any. The stamp write is best-effort and
-/// happens whether or not a line is returned.
+/// Testable core: read the previous prompt stamp and the tool-activity stamp,
+/// record `now` as the prompt stamp, and return the line to inject, if any.
+/// The write is best-effort and happens whether or not a line is returned.
 pub fn observe_prompt(
     state_dir: &Path,
-    mirror: Option<&Path>,
     session_id: &str,
     now: u64,
     threshold_secs: u64,
 ) -> Option<String> {
     let stamp = stamp_path(state_dir, session_id);
     let last_prompt = read_stamp(&stamp);
-    let last_tool = mirror.and_then(mtime_secs);
+    let last_tool = read_stamp(&activity_path(state_dir, session_id));
     let _ = write_private(&stamp, now.to_string().as_bytes());
     gap_line(last_prompt, last_tool, now, threshold_secs)
+}
+
+/// Testable core of [`note_tool_activity`]: refresh the tool-activity stamp
+/// when it is absent, unreadable, future-dated, or at least
+/// [`ACTIVITY_REFRESH_SECS`] old. Returns whether it wrote.
+pub fn record_tool_activity(state_dir: &Path, session_id: &str, now: u64) -> bool {
+    let path = activity_path(state_dir, session_id);
+    let due = match read_stamp(&path) {
+        Some(last) => now
+            .checked_sub(last)
+            .is_none_or(|age| age >= ACTIVITY_REFRESH_SECS),
+        None => true,
+    };
+    due && write_private(&path, now.to_string().as_bytes()).is_ok()
+}
+
+/// Mark tool activity for the gap hook. Called from `persist-plan-approval`,
+/// which already runs on every PostToolUse. Opt-in like the hook itself: with
+/// `CADENCE_AFK_GAP` unset this is one env read and no I/O. Never errors.
+pub fn note_tool_activity(session_id: Option<&str>) {
+    if !enabled_from(std::env::var(ENABLE_VAR).ok().as_deref()) {
+        return;
+    }
+    let Some(sid) = session_id.filter(|s| identity::is_safe_session_id(s)) else {
+        return;
+    };
+    record_tool_activity(
+        &cadence_hooks_metrics::common::state_dir(),
+        sid,
+        identity::now_epoch(),
+    );
 }
 
 /// Opt-in AFK gap marker on UserPromptSubmit.
@@ -207,10 +239,8 @@ impl Check for NudgeAfkGap {
             return CheckResult::allow();
         };
         let threshold = threshold_secs_from(std::env::var(MINUTES_VAR).ok().as_deref());
-        let mirror = registry::global_sessions_dir().join(identity::filename(sid));
         match observe_prompt(
             &cadence_hooks_metrics::common::state_dir(),
-            Some(&mirror),
             sid,
             identity::now_epoch(),
             threshold,
@@ -328,16 +358,16 @@ mod tests {
         let state = tmp.path().join("state");
         let t = 4 * H;
         // First prompt: silent, stamp written.
-        assert!(observe_prompt(&state, None, "sid-1", 10 * H, t).is_none());
+        assert!(observe_prompt(&state, "sid-1", 10 * H, t).is_none());
         assert_eq!(read_stamp(&stamp_path(&state, "sid-1")), Some(10 * H));
         // Next prompt one hour later: silent, stamp moves.
-        assert!(observe_prompt(&state, None, "sid-1", 11 * H, t).is_none());
+        assert!(observe_prompt(&state, "sid-1", 11 * H, t).is_none());
         // Six hours later: the marker, and the stamp moves again.
-        let line = observe_prompt(&state, None, "sid-1", 17 * H, t).unwrap();
+        let line = observe_prompt(&state, "sid-1", 17 * H, t).unwrap();
         assert!(line.starts_with("6 hours later…"), "{line}");
         assert_eq!(read_stamp(&stamp_path(&state, "sid-1")), Some(17 * H));
         // Another session's stamp is its own.
-        assert!(observe_prompt(&state, None, "sid-2", 40 * H, t).is_none());
+        assert!(observe_prompt(&state, "sid-2", 40 * H, t).is_none());
     }
 
     #[test]
@@ -345,24 +375,90 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().to_path_buf();
         std::fs::write(stamp_path(&state, "sid"), "not a number").unwrap();
-        assert!(observe_prompt(&state, None, "sid", 99 * H, 4 * H).is_none());
+        assert!(observe_prompt(&state, "sid", 99 * H, 4 * H).is_none());
         assert_eq!(read_stamp(&stamp_path(&state, "sid")), Some(99 * H));
     }
 
+    /// The long-autonomous-run guard: prompt, hours of tool calls, reply.
     #[test]
-    fn observe_prompt_reads_the_mirror_mtime() {
+    fn tool_activity_after_an_old_prompt_is_not_idle() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
-        let mirror = tmp.path().join("mirror.json");
-        std::fs::write(&mirror, "{}").unwrap();
-        let now = identity::now_epoch();
-        write_private(
-            &stamp_path(&state, "sid"),
-            (now - 6 * H).to_string().as_bytes(),
-        )
-        .unwrap();
-        // The mirror was just written, so the session was active moments ago.
-        assert!(observe_prompt(&state, Some(&mirror), "sid", now, 4 * H).is_none());
+        assert!(observe_prompt(&state, "sid", 10 * H, 4 * H).is_none());
+        // Tool calls for six hours, the last a minute before the reply.
+        for t in (10 * H..16 * H).step_by(60) {
+            record_tool_activity(&state, "sid", t);
+        }
+        assert!(observe_prompt(&state, "sid", 16 * H, 4 * H).is_none());
+        // Then a real six-hour idle stretch still fires.
+        let line = observe_prompt(&state, "sid", 22 * H, 4 * H).unwrap();
+        assert!(line.starts_with("6 hours later…"), "{line}");
+    }
+
+    #[test]
+    fn record_tool_activity_is_throttled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().to_path_buf();
+        let r = ACTIVITY_REFRESH_SECS;
+        // (now, wrote)
+        for (now, want) in [
+            (1000, true),          // absent
+            (1000 + r - 1, false), // too soon
+            (1000 + r, true),      // due
+            (500, true),           // stamp is in the future: rewrite
+            (501, false),
+        ] {
+            assert_eq!(record_tool_activity(&state, "sid", now), want, "{now}");
+        }
+    }
+
+    /// `session start` on `--resume` re-registers the registry mirror with a
+    /// fresh mtime. That must not read as activity (Gate 2 I1).
+    #[test]
+    fn resume_after_hours_still_marks_the_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metrics = tmp.path().join("metrics");
+        let sessions = tmp.path().join("repo").join(".claude").join("sessions");
+        let mirror = tmp.path().join("live-sessions");
+        let sid = "afk-resume-sid";
+        crate::registry::test_metrics_env::with_env_vars(
+            &[
+                (ENABLE_VAR, Some("1")),
+                (MINUTES_VAR, None),
+                ("CADENCE_METRICS_DIR", Some(metrics.to_str().unwrap())),
+            ],
+            || {
+                let state = cadence_hooks_metrics::common::state_dir();
+                let now = identity::now_epoch();
+                write_private(
+                    &stamp_path(&state, sid),
+                    (now - 6 * H).to_string().as_bytes(),
+                )
+                .unwrap();
+                let mut start = cadence_hooks_core::test_builders::make_user_prompt_submit(
+                    sid,
+                    "",
+                    tmp.path().to_str().unwrap(),
+                    "/tmp/t.jsonl",
+                );
+                start.prompt = None;
+                start.source = Some("resume".into());
+                crate::start::run_start(&start, &sessions, Some(&mirror), None, 1800, None);
+                assert!(
+                    mirror.join(identity::filename(sid)).exists(),
+                    "fixture: run_start should have re-registered the mirror"
+                );
+                let prompt = cadence_hooks_core::test_builders::make_user_prompt_submit(
+                    sid,
+                    "back",
+                    "/tmp",
+                    "/tmp/t.jsonl",
+                );
+                let msg = NudgeAfkGap.run(&prompt).message;
+                let msg = msg.expect("resumed session should get the gap line");
+                assert!(msg.starts_with("6 hours later…"), "{msg}");
+            },
+        );
     }
 
     #[test]
@@ -371,7 +467,7 @@ mod tests {
         // A regular file where the directory should be: every write fails.
         let blocker = tmp.path().join("state");
         std::fs::write(&blocker, "").unwrap();
-        assert!(observe_prompt(&blocker, None, "sid", 10 * H, 4 * H).is_none());
+        assert!(observe_prompt(&blocker, "sid", 10 * H, 4 * H).is_none());
     }
 
     #[cfg(unix)]
@@ -380,7 +476,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("fresh").join("state");
-        observe_prompt(&state, None, "sid", 10 * H, 4 * H);
+        observe_prompt(&state, "sid", 10 * H, 4 * H);
         let file_mode = std::fs::metadata(stamp_path(&state, "sid"))
             .unwrap()
             .permissions()
@@ -400,7 +496,7 @@ mod tests {
         let target = tmp.path().join("victim");
         std::fs::write(&target, "keep").unwrap();
         std::os::unix::fs::symlink(&target, stamp_path(&state, "sid")).unwrap();
-        observe_prompt(&state, None, "sid", 10 * H, 4 * H);
+        observe_prompt(&state, "sid", 10 * H, 4 * H);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     }
 

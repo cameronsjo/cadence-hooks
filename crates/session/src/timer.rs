@@ -141,27 +141,41 @@ pub fn apply(
                 None => TimerOutcome::ok(format!("timer '{label}' started")),
             }
         }
-        TimerAction::Lap | TimerAction::Stop => {
-            let Some(start) = running else {
-                return TimerOutcome::err(format!(
-                    "timer '{label}' is not running — start it with `cadence-hooks session timer start {label}`"
-                ));
+        TimerAction::Stop => {
+            // Claim the timer by renaming it away first: of two concurrent
+            // stops exactly one rename succeeds, so exactly one logs a row.
+            let claim = path.with_file_name(format!(".{label}.stop.{}", std::process::id()));
+            if std::fs::rename(&path, &claim).is_err() {
+                return not_running(label);
+            }
+            let claimed = read_start(&claim);
+            let _ = std::fs::remove_file(&claim);
+            let Some(start) = claimed else {
+                return not_running(label);
             };
             let elapsed = now.saturating_sub(start);
-            if action == TimerAction::Lap {
-                return TimerOutcome::ok(format!(
-                    "timer '{label}': {} (running)",
-                    format_elapsed(elapsed)
-                ));
-            }
-            let _ = std::fs::remove_file(&path);
             TimerOutcome {
                 ok: true,
                 line: format!("timer '{label}': {} (stopped)", format_elapsed(elapsed)),
                 stopped_ms: Some(elapsed),
             }
         }
+        TimerAction::Lap => {
+            let Some(start) = running else {
+                return not_running(label);
+            };
+            TimerOutcome::ok(format!(
+                "timer '{label}': {} (running)",
+                format_elapsed(now.saturating_sub(start))
+            ))
+        }
     }
+}
+
+fn not_running(label: &str) -> TimerOutcome {
+    TimerOutcome::err(format!(
+        "timer '{label}' is not running — start it with `cadence-hooks session timer start {label}`"
+    ))
 }
 
 /// Append one stopped-timer row to `<metrics_dir>/timers.jsonl`. Best-effort.
@@ -185,6 +199,18 @@ fn log_stop(metrics_dir: &Path, session_id: Option<&str>, label: &str, elapsed_m
 /// `session timer` entry point. Returns the process exit code.
 pub fn run_timer(action: TimerAction, label: Option<String>, session_id: Option<String>) -> u8 {
     let label = label.unwrap_or_else(|| DEFAULT_LABEL.to_string());
+    // An explicit id that fails validation is a caller error, not a cue to
+    // fall back to the shared scope and quietly run someone else's timer.
+    if let Some(bad) = session_id
+        .as_deref()
+        .filter(|s| !crate::identity::is_safe_session_id(s))
+    {
+        eprintln!(
+            "invalid --session-id {:?}: use letters, digits, '-', or '_'",
+            crate::identity::sanitize_field(bad, 80)
+        );
+        return 1;
+    }
     let sid = crate::cli::resolve_session_id(session_id);
     let scope = sid.as_deref().unwrap_or(SHARED_SCOPE);
     let outcome = apply(
@@ -296,6 +322,30 @@ mod tests {
                 out.line
             );
         }
+    }
+
+    #[test]
+    fn concurrent_stops_log_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        apply(tmp.path(), "s", TimerAction::Start, "t", 0);
+        let dir = tmp.path().to_path_buf();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || apply(&dir, "s", TimerAction::Stop, "t", 1_000))
+            })
+            .collect();
+        let stopped = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|o| o.stopped_ms.is_some())
+            .count();
+        assert_eq!(stopped, 1);
+        // No claim file left behind.
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join("timers").join("s"))
+            .unwrap()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
