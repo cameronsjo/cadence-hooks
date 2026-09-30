@@ -65,8 +65,8 @@
 //! command, an `include.path`/`includeIf` mention, `--git-dir`, `--work-tree`,
 //! `--config-env`, `-c include*`, or a directory it cannot resolve); the probe
 //! itself fails or times out; or `help.autocorrect` is set to run a guess
-//! (anything but `0`/`false`/`never`/`show`/`prompt`) and the subcommand is
-//! neither an alias nor a `git-<sub>` on `PATH` or in git's exec-path.
+//! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
+//! neither an alias nor a command `git --list-cmds` knows.
 //! Builtins skip all of it.
 //!
 //! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
@@ -496,24 +496,35 @@ fn alias_config(dir: &str) -> Result<AliasConfig, Stop> {
     Ok(out)
 }
 
-/// Is there a `git-<name>` executable on `PATH` or in git's exec-path (where
-/// most builtins also sit as links)? git runs one before it would
-/// autocorrect, so such a subcommand is not a guess. The exec-path is asked
-/// once per process; if git cannot answer, only `PATH` counts (stricter).
+/// Is `name` a command git knows: a builtin, or a `git-<name>` in git's
+/// exec-path or on `PATH`? git runs one before it would autocorrect, so such a
+/// subcommand is not a guess. Asked once per process through
+/// `git --list-cmds=builtins,main,others`, which also covers Git for Windows
+/// (dashed builtins are not installed there, and executables carry `.exe`).
+/// If git cannot answer, only a `git-<name>` file on `PATH` counts (stricter).
 fn external_subcommand_exists(dir: &str, name: &str) -> bool {
-    static EXEC_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static KNOWN: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
     if name.is_empty() || name.contains(['/', '\\']) {
         return false;
     }
-    let file = format!("git-{name}");
-    let exec_path =
-        EXEC_PATH.get_or_init(|| match git(dir, &["--exec-path"], 4096, Budget::Probe) {
-            Git::Ok(path) if !path.trim().is_empty() => Some(path.trim().into()),
+    let known = KNOWN.get_or_init(|| {
+        match git(
+            dir,
+            &["--list-cmds=builtins,main,others"],
+            256 * 1024,
+            Budget::Probe,
+        ) {
+            Git::Ok(list) if !list.trim().is_empty() => {
+                Some(list.lines().map(|l| l.trim().to_string()).collect())
+            }
             _ => None,
-        });
-    if exec_path.as_ref().is_some_and(|d| d.join(&file).is_file()) {
-        return true;
+        }
+    });
+    if let Some(known) = known {
+        return known.contains(name);
     }
+    let file = format!("git-{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(&file).is_file()))
 }
@@ -648,6 +659,7 @@ fn command_probe_blind(command: &str) -> Option<&'static str> {
     const ENV: &[&str] = &[
         "GIT_CONFIG",
         "GIT_DIR=",
+        "GIT_COMMON_DIR=",
         "GIT_WORK_TREE=",
         "HOME=",
         "XDG_CONFIG_HOME=",
@@ -659,6 +671,11 @@ fn command_probe_blind(command: &str) -> Option<&'static str> {
         || contains_ignoring_ascii_case(command, "includeif")
     {
         return Some("the command names a config include");
+    }
+    // Set by `-c` or an earlier `git config` in the same command, autocorrect
+    // is invisible to the on-disk probe but turns `git psuh` into a push.
+    if contains_ignoring_ascii_case(command, "help.autocorrect") {
+        return Some("the command sets `help.autocorrect`");
     }
     None
 }
@@ -2514,6 +2531,8 @@ mod tests {
         }
     }
 
+    // Unix only: Windows forbids control characters in file names.
+    #[cfg(unix)]
     #[test]
     fn control_character_paths_are_scanned() {
         let fx = Fx::new("ctlpath");
@@ -2554,6 +2573,9 @@ mod tests {
             "XDG_CONFIG_HOME=/tmp/x git zz",
             "GIT_DIR=/tmp/x/.git git zz",
             "GIT_WORK_TREE=/tmp/x git zz",
+            "GIT_COMMON_DIR=/tmp/x git zz",
+            "git -c help.autocorrect=immediate psuh origin main",
+            "git config help.autocorrect 1 && git psuh origin main",
             "git --git-dir=/tmp/x/.git zz",
             "git --work-tree /tmp/x zz",
             "git --config-env=alias.zz=V zz",
@@ -2571,6 +2593,7 @@ mod tests {
             "HOME=/tmp/x git status",
             "GIT_DIR=.git git log -1",
             "git -c include.path=/tmp/x status",
+            "git -c help.autocorrect=1 status",
             "cd \"$D\" && git status",
         ] {
             assert_allows(&fx.run(cmd));
