@@ -413,7 +413,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "warn-agent-dispatch",
-        description: "Warn on an Agent/Task dispatch with no model, a model on a fork, or an execution brief with no isolated HOME",
+        description: "Warn on an Agent/Task dispatch with no model, a model on a fork, an execution brief with no isolated HOME, or a teammate whose definition lacks SendMessage",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
