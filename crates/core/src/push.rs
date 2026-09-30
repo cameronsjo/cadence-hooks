@@ -3581,6 +3581,7 @@ mod tests {
     /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
     /// own exec argument is a push. Each row: the command, then per push found
     /// `(work_dir, repository_unresolved, unresolved, repository)`.
+    #[cfg(unix)]
     #[test]
     fn pushes_nested_in_a_git_exec_argument_are_seen() {
         type Want = (&'static str, bool, bool, Option<&'static str>);
@@ -3742,10 +3743,12 @@ mod tests {
     /// tree with a `.git`, under one scratch root: the git-exec walk finds a
     /// rebase's working-tree top on the file system, so the rows need a real
     /// one. Paths in and out are written relative to the root.
+    #[cfg(unix)]
     struct GitExecTree {
         scratch: Scratch,
     }
 
+    #[cfg(unix)]
     impl GitExecTree {
         fn new(name: &str) -> Self {
             let scratch = Scratch::new(&scratch_root(), name);
@@ -3788,6 +3791,7 @@ mod tests {
     /// trailing flags, B3 a rebase/bisect/difftool command run at the top of
     /// the working tree, B6 difftool, transports and a rebase's editor. Each
     /// measured under git 2.43 with a canary.
+    #[cfg(unix)]
     #[test]
     fn git_exec_pushes_the_review_found_are_seen() {
         type Want = (&'static str, bool, bool, Option<&'static str>);
