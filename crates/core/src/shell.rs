@@ -20434,6 +20434,12 @@ mod tests {
                 "cat <<E\nx $(cat <(cat <(echo $(git $(echo reset) --hard && true))))\nE",
                 "git reset --hard",
             ),
+            // Nesting past the scanner's cap behind the cut `$(…)` still
+            // leaves its own substitution read.
+            (
+                "cat <(cat <(cat <(echo $(git $(echo reset) --hard $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x ))))))))))))))))))); true))))",
+                "git reset --hard",
+            ),
             // Past the free levels, the `$(…)`s are read through every `<(`.
             (
                 "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
@@ -20444,8 +20450,13 @@ mod tests {
                 "cp d .env",
             ),
         ] {
+            // A word after the command (the capped tail) may follow it.
             let out = command_segments(command);
-            assert!(out.iter().any(|s| s == want), "{command:?}: {out:?}");
+            assert!(
+                out.iter()
+                    .any(|s| s == want || s.starts_with(&format!("{want} "))),
+                "{command:?}: {out:?}"
+            );
         }
     }
 
