@@ -534,7 +534,7 @@ fn apply_nudge_config(
         let cwd = target.cwd.as_deref()?;
         let root = cadence_hooks_core::paths::find_git_root(cwd)?;
         // A relative path is relative to the payload cwd, not the repo root.
-        let absolute = if file.starts_with('/') {
+        let absolute = if file.starts_with('/') || std::path::Path::new(&file).is_absolute() {
             file
         } else {
             format!("{cwd}/{file}")

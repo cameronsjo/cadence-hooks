@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`rules validate-frontmatter` also nudges on `skills:`/`mcpServers:` in an agent that describes teammate use (cameronsjo/cadence-hooks#615).** A definition that spawns a team teammate has both fields ignored, and the file shows no dispatch mode, so the signal is the description naming a "teammate" or "agent team" (the same keying as `lint-agent-tools.py`'s `teammate-ignored-field`). It applies to plugin agents and to `.claude/agents/` definitions, which are now classified so the teammate check can reach them; the plugin-only `hooks`/`mcpServers`/`permissionMode` nudge is unchanged and `.claude/agents/` still honours those. An agent that is a teammate without saying so is not caught.
 - **`doctor` reports direction-aware drift for the deployed rule trees (cameronsjo/cadence-hooks#688).** `<config>/rules/cadence` and `<config>/rules/workbench` are compared file by file against the pinned `cadence` and `cadence-rules` plugin copies, and each differing file is classified from content alone: upstream-ahead (resync is safe), deployed-ahead (a local edit; re-add it upstream before resyncing) or diverged. Machine-local files with no upstream twin and upstream files never deployed are exempt, the check only reads, and it stays silent when the rules dir or the plugin cache is absent. `cadence-rules.md` stays with the existing single-file check.
 
+### Fixed
+
+- **`nudges` path globs match on Windows.** A drive path (`C:\repo\docs\a.md`) did not start with `/`, so it was read as already repo-relative and never matched a glob such as `docs/**`; an absolute file path is now judged against the repo root on every platform. Windows CI also runs the suite again: tests that build POSIX shell strings from native temp paths, or rely on Unix-only temp roots and symlinks, are scoped to Unix.
+
 ## [0.117.0] - 2026-09-30
 
 ### Added
