@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cadence record-scrub` judges the file it actually reads.** It opens the draft once, non-blocking, checks the opened handle is a regular file, and reads through the 16 MiB cap, so a path swapped for a FIFO or a larger file between a check and the read can neither stall it nor have other bytes hashed (cameronsjo/cadence-hooks#755 review follow-up).
+
 ## [0.120.0] - 2026-09-30
 
 ### Added
