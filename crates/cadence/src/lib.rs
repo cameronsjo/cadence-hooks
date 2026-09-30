@@ -7,6 +7,8 @@
 pub mod audit_runner_pool;
 /// Require `MARKER(#issue):` format for TODO, FIXME, HACK, and other code markers.
 pub mod block_orphaned_todos;
+/// Nudge before internal harness vocabulary leaks into an external post.
+pub mod credential_scan;
 /// The `forgectl env` line the secret guards append to an env-file block.
 mod forgectl_hint;
 /// Block dangerous git operations (force-push main, reset --hard, etc.).
@@ -31,7 +33,6 @@ pub mod prevent_secret_leaks;
 pub mod prevent_secret_writes;
 /// Record that `/polish` ran on this branch (writes a branch-scoped marker). CLI action.
 pub mod record_polish;
-/// Nudge before internal harness vocabulary leaks into an external post.
 pub mod redact_external_content;
 /// Shared secret file patterns for both secret guards.
 pub mod secret_patterns;
