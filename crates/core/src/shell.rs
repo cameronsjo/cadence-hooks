@@ -2328,7 +2328,7 @@ pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<Str
 
 /// Whether `text` may hold a backslash inside quotes — the only place the
 /// two spellings of [`executable_token_pair`] differ. A cheap superset test.
-fn may_quote_a_backslash(text: &str) -> bool {
+pub fn may_quote_a_backslash(text: &str) -> bool {
     text.contains('\\') && text.contains(['\'', '"'])
 }
 
@@ -9886,7 +9886,7 @@ fn child_scripts_reading(
 /// spelling. Anything else (`argv` from another reading, an empty `segment`,
 /// no quoted backslash) keeps `argv` as given — the reading before this fix.
 fn script_tokens_of(argv: &[String], segment: &str) -> Option<Vec<String>> {
-    if segment.is_empty() || !argv.iter().any(|word| word.contains('\\')) {
+    if segment.is_empty() || !may_quote_a_backslash(segment) {
         return None;
     }
     let pair = executable_token_pair(segment);
@@ -13059,9 +13059,19 @@ fn untag(scripts: Vec<(String, Readings)>) -> Vec<String> {
 }
 
 fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<(String, Readings)> {
+    let readings = current_readings();
+    if !may_quote_a_backslash(segment) {
+        return wrapped_scripts_reading(
+            &executable_tokens(segment),
+            git_exec_too,
+            Backslashes::AsTyped,
+        )
+        .into_iter()
+        .map(|found| (found, readings))
+        .collect();
+    }
     let pair = executable_token_pair(segment);
     let (typed, script) = (&pair.0, &pair.1);
-    let readings = current_readings();
     // The spellings differ only where `'…'` made a backslash literal; with
     // none, the second reading is the first.
     if script == typed || readings != Readings::Both {

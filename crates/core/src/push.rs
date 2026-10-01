@@ -991,7 +991,7 @@ fn collect_push_invocations(
         // cap; the as-typed reading's that differ are walked beside them, so
         // one exec value is never counted twice (#1231 review I2).
         let readings = crate::shell::current_readings();
-        let pair = (readings != Readings::Typed && tokens.iter().any(|word| word.contains('\\')))
+        let pair = (readings != Readings::Typed && crate::shell::may_quote_a_backslash(segment))
             .then(|| crate::shell::executable_token_pair(segment));
         let (exec, alternates) = if pair.as_ref().is_none_or(|pair| pair.1 == pair.0) {
             (git_exec(&tokens), Vec::new())
