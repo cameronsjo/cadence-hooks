@@ -5159,10 +5159,8 @@ pub fn ships_in_cd_wrappers(command: &str, dir: &str) -> Vec<ShipSegment> {
 fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Vec<ShipSegment>) {
     const MAX_DEPTH: usize = 4;
     for segment in split_segments(command) {
-        let tokens = executable_script_tokens(strip_group_wrappers(&segment));
-        let Some(script) = shell_c_argument_tokens(&tokens) else {
-            continue;
-        };
+        let stripped = strip_group_wrappers(&segment);
+        let tokens = executable_tokens(stripped);
         if !matches!(
             command_word(
                 peel_command_runners(strip_compound_heads(&tokens))
@@ -5174,11 +5172,26 @@ fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Ve
         ) {
             continue;
         }
-        if parse_work_dir(&script, dir) != dir || (depth >= MAX_DEPTH && script.contains("cd")) {
-            out.extend(polish_ship_segments_for_origin(&script, None));
-        }
-        if depth < MAX_DEPTH {
-            collect_cd_wrapper_ships(&script, dir, depth + 1, out);
+        // The script bash builds, and the one this read before
+        // (cameronsjo/cadence-hooks#1231, see [`segment_scripts`]).
+        let mut scripts: Vec<String> =
+            shell_c_argument_tokens(&executable_script_tokens(stripped), Backslashes::Escaped)
+                .into_iter()
+                .collect();
+        merge_scripts(
+            &mut scripts,
+            shell_c_argument_tokens(&tokens, Backslashes::AsTyped)
+                .into_iter()
+                .collect(),
+        );
+        for script in scripts {
+            if parse_work_dir(&script, dir) != dir || (depth >= MAX_DEPTH && script.contains("cd"))
+            {
+                out.extend(polish_ship_segments_for_origin(&script, None));
+            }
+            if depth < MAX_DEPTH {
+                collect_cd_wrapper_ships(&script, dir, depth + 1, out);
+            }
         }
     }
 }
@@ -8952,8 +8965,8 @@ fn emit_reading(
         return;
     }
     if depth < MAX_WRAPPER_DEPTH {
-        let known = wrapped_scripts(&executable_script_tokens(original));
-        for script in wrapped_scripts(&executable_script_tokens(&reading)) {
+        let known = segment_scripts(original);
+        for script in segment_scripts(&reading) {
             if known.contains(&script) {
                 continue;
             }
@@ -9127,9 +9140,7 @@ fn emit_segment(
     let mut whole = Vec::new();
     let scripts = if depth < MAX_WRAPPER_DEPTH {
         if dedupe {
-            let mut scripts = wrapped_scripts(&executable_script_tokens(
-                &mark_expanded_substitutions(&segment),
-            ));
+            let mut scripts = segment_scripts(&mark_expanded_substitutions(&segment));
             scripts.retain(|script| {
                 let only = is_only_an_expanded_substitution(script);
                 if only {
@@ -9139,7 +9150,7 @@ fn emit_segment(
             });
             scripts
         } else {
-            wrapped_scripts(&executable_script_tokens(&segment))
+            segment_scripts(&segment)
         }
     } else {
         Vec::new()
@@ -9186,7 +9197,7 @@ fn emit_segment(
 /// expansion; out of allowance, a script is listed whole.
 fn scripts_past_the_bound(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for script in wrapped_scripts(&executable_script_tokens(segment)) {
+    for script in segment_scripts(segment) {
         if ExpansionWork::charge(script.len()) {
             out.extend(split_segments(&script).into_iter().map(unmark));
         } else {
@@ -9297,7 +9308,7 @@ fn list_unwrapped(work: &mut FlattenWork, fragment: String, out: &mut Vec<String
                 if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
                     continue;
                 }
-                next.extend(wrapped_scripts(&executable_script_tokens(&segment)));
+                next.extend(segment_scripts(&segment));
                 out.push(segment);
             }
         }
@@ -9330,7 +9341,7 @@ fn list_level(
             continue;
         }
         let scripts = if unwrap {
-            wrapped_scripts(&executable_script_tokens(&segment))
+            segment_scripts(&segment)
         } else {
             Vec::new()
         };
@@ -9550,14 +9561,22 @@ pub fn child_scripts_but_git_exec(argv: &[String], segment: &str) -> Vec<String>
 }
 
 fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> Vec<String> {
-    let script_argv = script_tokens_of(argv, segment);
-    let argv = script_argv.as_deref().unwrap_or(argv);
-    let mut out = wrapped_scripts_reading(argv, git_exec_too);
+    // Both readings, as [`segment_scripts`] gives them: the words bash
+    // builds first, then the caller's `argv` as before
+    // (cameronsjo/cadence-hooks#1231).
+    let mut out = match script_tokens_of(argv, segment) {
+        Some(script_argv) => {
+            let mut out = wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped);
+            merge_scripts(
+                &mut out,
+                wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
+            );
+            out
+        }
+        None => wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
+    };
     if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
-        let marked = wrapped_scripts_reading(
-            &executable_script_tokens(&mark_expanded_substitutions(segment)),
-            git_exec_too,
-        );
+        let marked = scripts_both_ways(&mark_expanded_substitutions(segment), git_exec_too);
         let aligned = marked.len() == out.len()
             && marked
                 .iter()
@@ -11673,7 +11692,7 @@ fn parameter_word_end(
 /// (#528 review E).
 #[cfg(test)]
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&executable_script_tokens(segment))
+    shell_c_argument_tokens(&executable_script_tokens(segment), Backslashes::Escaped)
 }
 
 /// Verbs that run the command following their OWN options. `sudo` and `xargs`
@@ -12451,12 +12470,12 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
 /// `runuser`, and a here-string fed to a shell — see [`wrapper_utility_script`]
 /// and [`shell_here_string`]. `tmux` can start several scripts in one
 /// invocation, so it is answered by [`wrapped_scripts`], the list form.
-fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
+fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<String> {
     let tokens = peel_command_runners(strip_compound_heads(tokens));
     let verb = command_word(tokens.first()?);
     match verb.as_ref() {
         "sh" | "bash" | "zsh" | "dash" => {}
-        "eval" => return eval_script(&tokens[1..]),
+        "eval" => return eval_script(&tokens[1..], view),
         "trap" => return trap_action(&tokens[1..]),
         other => return wrapper_utility_script(other, &tokens[1..]),
     }
@@ -12594,14 +12613,17 @@ const MAX_EVAL_UNWRAP: usize = 16;
 /// a walker that tracks state across segments must still refuse on `eval`
 /// (`push::directory_verb` does), because an `eval`'d `cd` moves the PARENT
 /// shell while a child script is walked in its own scope.
-fn eval_script(operands: &[String]) -> Option<String> {
+fn eval_script(operands: &[String], view: Backslashes) -> Option<String> {
     let mut script = join_eval_operands(operands)?;
     for _ in 0..MAX_EVAL_UNWRAP {
         let segments = split_segments(&script);
         let [only] = segments.as_slice() else {
             break;
         };
-        let tokens = tokenize_script_words(only);
+        let tokens: Vec<String> = tokenize_marked_in(only, view)
+            .into_iter()
+            .map(|token| token.text)
+            .collect();
         let argv = peel_command_runners(strip_compound_heads(&tokens));
         if argv
             .first()
@@ -12683,27 +12705,79 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
+///
+/// `tokens` are [`tokenize`]'s; a caller holding the segment wants
+/// [`segment_scripts`], which also reads the script each wrapper is handed
+/// with its quoted backslashes kept (cameronsjo/cadence-hooks#1231).
 pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
-    wrapped_scripts_reading(tokens, true)
+    wrapped_scripts_reading(tokens, true, Backslashes::AsTyped)
+}
+
+/// [`wrapped_scripts`] of one segment, read from the words bash builds
+/// ([`executable_script_tokens`]) and, when the segment carries a backslash,
+/// also from [`tokenize`]'s words as before.
+///
+/// **The first reading is the right one; the second is kept so no script
+/// this hunt surfaced before is lost** (cameronsjo/cadence-hooks#1231).
+/// Unescaping [`tokenize`]'s text strips a backslash `'…'` made literal, so
+/// a third `bash -c` level read `bash -c git` and the push reached no guard;
+/// the script spelling is what each nested shell parses. The old reading
+/// over-reads instead (`eval 'echo \$(cat .env)'` surfaces a `cat .env` bash
+/// never runs), which costs a false block at worst; dropping it is a
+/// separate decision.
+pub fn segment_scripts(segment: &str) -> Vec<String> {
+    scripts_both_ways(segment, true)
+}
+
+fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<String> {
+    let mut out = wrapped_scripts_reading(
+        &executable_script_tokens(segment),
+        git_exec_too,
+        Backslashes::Escaped,
+    );
+    if segment.contains('\\') {
+        merge_scripts(
+            &mut out,
+            wrapped_scripts_reading(
+                &executable_tokens(segment),
+                git_exec_too,
+                Backslashes::AsTyped,
+            ),
+        );
+    }
+    out
+}
+
+/// Append each of `more` not already in `out`.
+fn merge_scripts(out: &mut Vec<String>, more: Vec<String>) {
+    for script in more {
+        if !out.contains(&script) {
+            out.push(script);
+        }
+    }
 }
 
 /// [`wrapped_scripts`], leaving out the scripts a git subcommand runs through
 /// its own exec argument ([`git_exec`]) when `git_exec_too` is false — for a
 /// walker that recurses those itself, with the directory and doubt git gives
 /// them.
-fn wrapped_scripts_reading(tokens: &[String], git_exec_too: bool) -> Vec<String> {
+fn wrapped_scripts_reading(
+    tokens: &[String],
+    git_exec_too: bool,
+    view: Backslashes,
+) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
         Some(first) if command_word(first) == "find" => find_exec_scripts(&argv[1..]),
         Some(first) if command_word(first).starts_with("git") => {
-            let mut out: Vec<String> = shell_c_argument_tokens(tokens).into_iter().collect();
+            let mut out: Vec<String> = shell_c_argument_tokens(tokens, view).into_iter().collect();
             if git_exec_too && let Some(exec) = git_exec(tokens) {
                 out.extend(exec.scripts);
             }
             out
         }
-        _ => shell_c_argument_tokens(tokens).into_iter().collect(),
+        _ => shell_c_argument_tokens(tokens, view).into_iter().collect(),
     }
 }
 
@@ -13123,9 +13197,10 @@ fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
 /// `diff.external`, `core.askPass`, `core.gitProxy`, a diff driver's
 /// `textconv`, a merge driver, a filter's `clean`/`smudge`/`process`,
 /// `uploadpack.packObjectsHook`, a remote's `uploadpack`/`receivepack`/`vcs`,
-/// an `include.path`/`includeIf.<cond>.path` (a file of more config), and a
-/// `protocol.allow`/`protocol.<name>.allow` that is not `never` (`ext::`
-/// runs its URL as a command). Names compare lowercased, as git's do.
+/// and a `protocol.allow`/`protocol.<name>.allow` that is not `never`
+/// (`ext::` runs its URL as a command). Names compare lowercased, as git's
+/// do. A config file the command names (`include.path`, `GIT_CONFIG_GLOBAL`)
+/// is not read, like every other config file.
 ///
 /// Not counted: an empty value (git reads it as unset), a pager of `cat` or
 /// a boolean (`pager.log=false`), a boolean `core.fsmonitor` (the builtin
@@ -13144,7 +13219,6 @@ fn is_exec_valued_config(key: &str, value: Option<&str>) -> bool {
     };
     let exec = match (section, name) {
         ("protocol", "allow") => return value.is_none_or(|value| value != "never"),
-        ("include" | "includeif", "path") => return true,
         ("core", "hookspath") => return value.is_none_or(|value| value != "/dev/null"),
         ("core", "pager") | ("pager", _) => {
             return value

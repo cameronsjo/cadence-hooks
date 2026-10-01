@@ -978,15 +978,27 @@ fn collect_push_invocations(
             // this walk cannot place, so fail-closed callers refuse it.
             out.push(unresolvable_push(&segment_dir, segment_directory));
         }
-        // The exec values are scripts, so they are read from the tokenizer's
-        // script spelling: a backslash `'…'` made literal survives the one
-        // unescape a value gets (cameronsjo/cadence-hooks#1231).
-        let exec_tokens = if tokens.iter().any(|word| word.contains('\\')) {
-            Cow::Owned(crate::shell::executable_script_tokens(segment))
-        } else {
-            Cow::Borrowed(tokens.as_slice())
+        // The exec values are scripts, read as bash builds them (a backslash
+        // `'…'` made literal survives the one unescape a value gets) and as
+        // before (cameronsjo/cadence-hooks#1231, see `segment_scripts`).
+        let exec = match git_exec(&tokens) {
+            Some(mut exec) if tokens.iter().any(|word| word.contains('\\')) => {
+                if let Some(built) = git_exec(&crate::shell::executable_script_tokens(segment)) {
+                    let mut scripts = built.scripts;
+                    for script in std::mem::take(&mut exec.scripts) {
+                        if !scripts.contains(&script) {
+                            scripts.push(script);
+                        }
+                    }
+                    exec.scripts = scripts;
+                    exec.opaque |= built.opaque;
+                    exec.elsewhere |= built.elsewhere;
+                }
+                Some(exec)
+            }
+            exec => exec,
         };
-        if let Some(exec) = git_exec(&exec_tokens) {
+        if let Some(exec) = exec {
             collect_git_exec_pushes(
                 argv,
                 &exec,
