@@ -6500,11 +6500,15 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
 
 /// Whether `script` may hold a `case` construct whose `pattern)` arms a
 /// subshell walk would read as closers: the whole word `case` anywhere in
-/// the script outside comments and heredoc prose, and outside quotes when
-/// the quoting is plain enough to read confidently. A quoted
-/// `"just in case"`, a `# in case` comment or a commit message's heredoc
-/// body is not one, which a plain substring test counted
+/// the script outside comments, and outside quotes when the quoting is
+/// plain enough to read confidently. A quoted `"just in case"` or a
+/// `# in case` comment is not one, which a plain substring test counted
 /// (cameronsjo/cadence-hooks#1233 review).
+///
+/// Heredoc prose counts: the heredoc reader takes the shift in
+/// `(( y=1<<E ))` for an opener, and stripping its "body" hid the only real
+/// `case` (#1266 round-6 review C1). A commit message saying "in case" in a
+/// heredoc turns scoping off, which is the conservative side.
 ///
 /// No command-position test: bash takes `case` as a keyword after `f()`,
 /// `function f`, `coproc`, `time -p` and more, and each position the test
@@ -6520,7 +6524,7 @@ pub(crate) fn mentions_case_keyword(script: &str) -> bool {
     if !script.contains("case") {
         return false;
     }
-    let text = strip_comments(&strip_heredoc_bodies(script));
+    let text = strip_comments(script);
     let chars: Vec<char> = text.chars().collect();
     if !has_case_word(&chars, false) {
         return false;
@@ -20619,7 +20623,24 @@ mod tests {
             ("echo showcase lowercase", false),
             ("echo in_case", false),
             ("echo showcase case_x", false),
-            ("git commit -F- <<'E'\njust in case\nE\ngit push", false),
+            ("git commit -F- <<'E'\njust in case\nE\ngit push", true),
+            // An arithmetic shift is no heredoc (#1266 round-6 review C1).
+            (
+                "(( y=1<<E ))\ncase x in x) true\nE\n;; y) true;; esac",
+                true,
+            ),
+            (
+                "for ((i=1<<E; i<0; i++)); do :; done\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
+            (
+                "if (( 1<<E )); then :; fi\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
+            (
+                "while (( 0<<E )); do :; done\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
             ("echo case", true),
             ("grep case x", true),
             ("grep \\case x", true),

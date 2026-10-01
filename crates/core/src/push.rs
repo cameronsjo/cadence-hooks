@@ -4638,6 +4638,26 @@ mod tests {
             pushes.iter().all(|push| push.directory_unverified),
             "{pushes:?}"
         );
+        // An arithmetic `<<` is a shift, not a heredoc: the `case` after it
+        // is real, so its `y)` arm restores no scope (#1266 round-6 C1).
+        for opener in [
+            "(( y=1<<E ))",
+            "for ((i=1<<E; i<0; i++)); do :; done",
+            "if (( 1<<E )); then :; fi",
+            "while (( 0<<E )); do :; done",
+        ] {
+            let command = format!(
+                "(cd /other; {opener}\ncase x in x) true\nE\n;; y) true;; esac; git push origin main)"
+            );
+            let pushes = push_invocations(&command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}");
+            assert!(
+                pushes
+                    .iter()
+                    .all(|push| push.work_dir != "/repo" || push.directory_unverified),
+                "{command:?}: {pushes:?}"
+            );
+        }
     }
 
     #[test]
