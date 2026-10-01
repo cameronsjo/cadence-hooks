@@ -117,6 +117,12 @@
 //! reachable from what is pushed, including tags the remote already has. A
 //! submodule-recursing push in a repository whose index is too large to list
 //! (over ~300k entries) is refused as too large to check for submodules.
+//! A git command that sets, on its own command line, a value git runs as a
+//! command (`-c core.sshCommand=…`, `-c core.pager=…`, `-c credential.helper=…`,
+//! a `GIT_SSH_COMMAND=`/`GIT_PAGER=` prefix, …) reads as a push core cannot
+//! resolve and is refused whatever its subcommand, `GIT_SSH_COMMAND='ssh -i
+//! key' git push` included; the value is not parsed. An empty value and a
+//! pager of `cat` are not counted (cameronsjo/cadence-hooks#1231).
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than

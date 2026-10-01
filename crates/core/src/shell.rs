@@ -12516,8 +12516,8 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
             // The script is the word the shell hands the wrapper, escapes
             // removed: `bash -c cat\ .env` runs `cat .env`. Read raw, the
             // escaped blank kept it one word and no guard saw an operand.
-            // As with `eval_script`, over-unescaping a single-quoted script
-            // can only add a block.
+            // Read from [`executable_script_tokens`], a backslash `'…'` made
+            // literal survives this one unescape (cameronsjo/cadence-hooks#1231).
             return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
@@ -12592,9 +12592,11 @@ const MAX_EVAL_UNWRAP: usize = 16;
 /// place, so its tokens are NOT what bash hands `eval`. `eval "echo \$(cat
 /// .env)"` and `eval echo \$\(cat .env\)` both run the substitution, and read
 /// raw the `\$(` hid it from every scanner. [`unescape_word`] per operand
-/// closes that. It also unescapes a backslash inside SINGLE quotes, where bash
-/// keeps it literal — so `eval 'echo \$(cat .env)'` is over-inspected, which
-/// can only add a block.
+/// closes that. Read from [`executable_script_tokens`] (`view` is
+/// [`Backslashes::Escaped`]) a backslash inside SINGLE quotes stays literal,
+/// as bash keeps it; read from [`tokenize`]'s words it is unescaped too, so
+/// `eval 'echo \$(cat .env)'` is over-inspected — [`segment_scripts`] keeps
+/// both readings (cameronsjo/cadence-hooks#1231).
 ///
 /// A leading `--` is skipped: bash and zsh treat it as the end of `eval`'s
 /// options. dash runs it as a command named `--`, which fails, so surfacing the
@@ -12803,7 +12805,9 @@ pub struct GitExec {
     /// (`"$@"`, `$1`) that was substituted, which a `shift`, `set --`,
     /// quoting or a function's own arguments can make wrong: a walker judging
     /// a push reads the invocation as one it cannot resolve
-    /// (cameronsjo/cadence-hooks#1226 review 4).
+    /// (cameronsjo/cadence-hooks#1226 review 4). Also set when the
+    /// invocation sets a value git runs as a command ([`sets_an_exec_value`],
+    /// cameronsjo/cadence-hooks#1231).
     pub opaque: bool,
 }
 
@@ -12980,9 +12984,12 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 ///
 /// Surfacing only ever adds a script to inspect: a misread option (a rebase
 /// `--onto -x`) costs a false block on a command git refuses, never a miss.
-/// Config set in a file (`core.editor`, `core.pager`, `core.sshCommand`, a
-/// hooks path) and an exported editor are outside the command text and not
-/// read here (cameronsjo/cadence-hooks#1231).
+/// A setting on the command line that makes git run a command of its own
+/// (`-c core.sshCommand=…`, `-c core.pager=…`, `GIT_SSH_COMMAND=… git`, see
+/// [`sets_an_exec_value`]) makes the invocation [`GitExec::opaque`], whatever
+/// the subcommand; its value is not read. Config set in a file and an
+/// exported variable are outside the command text and not read here
+/// (cameronsjo/cadence-hooks#1231).
 pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     if !may_carry_git_exec(tokens) {
         return None;
@@ -20238,6 +20245,100 @@ mod tests {
             shell_c_argument("bash -c git\\ push\\ --force\\ origin\\ main"),
             Some("git push --force origin main".to_string())
         );
+    }
+
+    #[test]
+    fn command_segments_unescape_each_nested_wrapper_once() {
+        // cameronsjo/cadence-hooks#1231: a backslash inside `'…'` is literal,
+        // so each nested shell parses it. Unescaping the as-typed word
+        // stripped it one level early, and the third `bash -c` read
+        // `bash -c git`. Every row runs `git push origin main` under bash.
+        let push = "git push origin main".to_string();
+        for cmd in [
+            r#"bash -c 'bash -c "bash -c \"git push origin main\""'"#,
+            r#"bash -c 'bash -c "bash -c \"bash -c \\\"git push origin main\\\"\""'"#,
+            r#"bash -c 'bash -c '\''bash -c '\''\'\'''\''git push origin main'\''\'\'''\'''\'''"#,
+            r#"sh -c "sh -c 'sh -c \"git push origin main\"'""#,
+            r#"git rebase -x 'git rebase -x "git rebase -x \"git push origin main\" HEAD" HEAD' HEAD"#,
+            r#"eval 'eval "eval \"git push origin main\""'"#,
+            r#"bash -c 'trap "bash -c \"git push origin main\"" EXIT'"#,
+        ] {
+            assert!(command_segments(cmd).contains(&push), "{cmd:?}");
+        }
+        // The reading before stays beside the exact one, so nothing it
+        // surfaced is lost: bash runs no `cat .env` here, but it is still
+        // listed (a false block at worst).
+        assert!(
+            command_segments(r"eval 'echo \$(cat .env)'").contains(&"cat .env".to_string()),
+            "the as-typed reading is kept"
+        );
+    }
+
+    #[test]
+    fn tokenize_script_words_unescape_once_to_the_word_bash_builds() {
+        // cameronsjo/cadence-hooks#1231: one `unescape_word` of each script
+        // word is the word bash builds (checked with `printf '%s\n'`).
+        for (cmd, built) in [
+            (r"'a\b'", r"a\b"),
+            (r"'a\\b'", r"a\\b"),
+            (r#""a\b""#, r"a\b"),
+            (r#""a\\b""#, r"a\b"),
+            (r#""a\$b""#, "a$b"),
+            (r#""a\`b""#, "a`b"),
+            (r#""a\"b""#, r#"a"b"#),
+            ("\"a\\\nb\"", "ab"),
+            (r"a\ b", "a b"),
+            (r"a\\b", r"a\b"),
+            (r"$'a\\b'", r"a\b"),
+            (r"$'a\x5cb'", r"a\b"),
+            (r#"'x\"y'"#, r#"x\"y"#),
+        ] {
+            let words = tokenize_script_words(cmd);
+            assert_eq!(words.len(), 1, "{cmd:?}: {words:?}");
+            assert_eq!(unescape_word(&words[0]), built, "{cmd:?}");
+            // The as-typed tokens are unchanged by the mode.
+            assert_eq!(tokenize(cmd).len(), 1, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn exec_valued_git_config_keys_are_recognised() {
+        // cameronsjo/cadence-hooks#1231: a value git runs as a command.
+        for (key, value, runs) in [
+            ("core.sshCommand", Some("ssh -i k"), true),
+            ("core.pager", Some("less"), true),
+            ("core.pager", Some("cat"), false),
+            ("core.pager", Some(""), false),
+            ("pager.log", Some("false"), false),
+            ("pager.log", Some("x"), true),
+            ("core.fsmonitor", Some("true"), false),
+            ("core.fsmonitor", Some("./watch"), true),
+            ("core.hooksPath", Some("/dev/null"), false),
+            ("core.hooksPath", Some("hooks"), true),
+            ("diff.external", Some("x"), true),
+            ("diff.tool.textconv", Some("x"), true),
+            ("merge.ours.driver", Some("x"), true),
+            ("filter.lfs.smudge", Some("x"), true),
+            ("credential.helper", Some("!f"), true),
+            ("credential.https://h.helper", Some(""), false),
+            ("gpg.program", Some("x"), true),
+            ("gpg.ssh.defaultKeyCommand", Some("x"), true),
+            ("sendemail.toCmd", Some("x"), true),
+            ("mergetool.t.cmd", Some("x"), true),
+            ("core.askPass", Some("x"), true),
+            ("remote.origin.uploadpack", Some("x"), true),
+            ("protocol.ext.allow", Some("always"), true),
+            ("protocol.ext.allow", Some("never"), false),
+            ("protocol.allow", None, true),
+            ("core.sshcommand", None, true),
+            ("core.editor", Some("vim"), false),
+            ("user.name", Some("x"), false),
+            ("color.ui", Some("always"), false),
+            ("remote.origin.url", Some("x"), false),
+            ("sshcommand", Some("x"), false),
+        ] {
+            assert_eq!(is_exec_valued_config(key, value), runs, "{key}={value:?}");
+        }
     }
 
     #[test]

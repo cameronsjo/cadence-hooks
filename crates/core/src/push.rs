@@ -1233,6 +1233,9 @@ const MAX_GIT_EXEC_SCRIPTS: usize = 16;
 /// one: a command whose name is an expansion (`-x "$CMD"`), more scripts than
 /// [`MAX_GIT_EXEC_SCRIPTS`], or nesting past [`MAX_WRAPPER_DEPTH`] — so a
 /// `git rebase -x "git rebase -x …"` flood stops at the bound and refuses.
+/// So is an invocation that sets a value git runs as a command
+/// (`-c core.sshCommand=…`, `GIT_SSH_COMMAND=… git fetch`;
+/// [`crate::shell::GitExec::opaque`]).
 /// A script that runs `sh -c "$CMD"` or `eval "$CMD"` is read like the same
 /// command at the top level, which does not refuse it
 /// (cameronsjo/cadence-hooks#1231).
@@ -4374,6 +4377,101 @@ mod tests {
             );
             assert!(found.len() <= 16, "{}", found.len());
         }
+    }
+
+    #[test]
+    fn nested_escaped_wrappers_reach_the_push_walk() {
+        // cameronsjo/cadence-hooks#1231: three levels of `bash -c` with
+        // escaped inner quotes are read to the push; four reach the wrapper
+        // depth and are refused as a push the walk cannot resolve.
+        // Each runs `git push origin main` under bash.
+        for (command, resolved) in [
+            (
+                r#"bash -c 'bash -c "bash -c \"git push origin main\""'"#,
+                true,
+            ),
+            (
+                r#"bash -c 'bash -c '\''bash -c '\''\'\'''\''git push origin main'\''\'\'''\'''\'''"#,
+                true,
+            ),
+            (
+                r#"git rebase -x 'git rebase -x "git rebase -x \"git push origin main\" HEAD" HEAD' HEAD"#,
+                true,
+            ),
+            (
+                r#"bash -c 'bash -c "bash -c \"bash -c \\\"git push origin main\\\"\""'"#,
+                false,
+            ),
+        ] {
+            let found = push_locations(command, "/repo");
+            // The push itself reaches the walk (a rebase's lost top level
+            // may still leave it unverified, which is not this row's point).
+            let read = found
+                .iter()
+                .any(|push| push.refspecs.iter().any(|r| r.raw == "main"));
+            assert_eq!(read, resolved, "{command:?}: {found:?}");
+            if !resolved {
+                assert!(
+                    found.iter().any(|push| push.unresolved),
+                    "{command:?}: {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exec_valued_git_settings_read_as_an_unresolved_push() {
+        // cameronsjo/cadence-hooks#1231 (operator ruling): a value git runs
+        // as a command is not parsed; the invocation is a push the walk
+        // cannot resolve, so fail-closed guards refuse it.
+        for (command, unresolved) in [
+            ("git -c core.sshCommand=x fetch", true),
+            ("git -c core.sshCommand='git push origin main' fetch", true),
+            ("git -ccore.pager=x log", true),
+            ("git -c core.pager=x log", true),
+            ("git --config-env=core.sshCommand=V fetch", true),
+            ("git --config-env core.pager=V log", true),
+            ("git -c credential.helper='!f() { x; }; f' fetch", true),
+            ("git -c protocol.ext.allow=always fetch ext::x", true),
+            ("git -c core.hooksPath=h commit -m x", true),
+            ("git -c diff.external=x diff", true),
+            ("GIT_SSH_COMMAND=x git fetch", true),
+            ("env GIT_SSH_COMMAND=x git fetch", true),
+            ("GIT_SSH=x git fetch", true),
+            ("GIT_PAGER=less git log", true),
+            ("PAGER=less git log", true),
+            ("GIT_EXTERNAL_DIFF=x git diff", true),
+            ("GIT_ASKPASS=x git fetch", true),
+            ("bash -c 'GIT_SSH_COMMAND=x git fetch'", true),
+            ("GIT_SSH_COMMAND=x git-fetch", true),
+            // Inert: nothing of the command's choosing runs.
+            ("GIT_PAGER=cat git log", false),
+            ("git -c core.pager=cat log", false),
+            ("git -c pager.log=false log", false),
+            ("git -c credential.helper= fetch", false),
+            ("git -c core.hooksPath=/dev/null commit -m x", false),
+            ("git -c protocol.ext.allow=never fetch", false),
+            ("git -c user.name=x commit -m y", false),
+            ("GIT_EDITOR=true git commit", false),
+            ("git status", false),
+            ("FOO=1 git log", false),
+        ] {
+            let found = push_locations(command, "/repo");
+            assert_eq!(
+                found.iter().any(|push| push.unresolved),
+                unresolved,
+                "{command:?}: {found:?}"
+            );
+        }
+        // A push beside the setting is still read, and refused.
+        let found = push_locations("git -c core.sshCommand=x push origin main", "/repo");
+        assert!(found.iter().any(|push| push.unresolved), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|push| push.refspecs.iter().any(|r| r.raw == "main")),
+            "{found:?}"
+        );
     }
 
     #[test]
