@@ -12945,12 +12945,16 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // start one (`status`, `log`) is not read, and neither is anything once
     // no subcommand can be found — except that, not knowing it, every
     // editor is read.
+    // A setting that makes git run a command of its own (`core.sshCommand`,
+    // `core.pager`, `GIT_SSH_COMMAND`, …) is not read: the invocation is one
+    // whose push cannot be resolved (cameronsjo/cadence-hooks#1231).
+    let runs_a_setting = sets_an_exec_value(prefix, globals);
     let editor_only = |editors: Vec<String>| {
-        (!editors.is_empty()).then_some(GitExec {
+        (!editors.is_empty() || runs_a_setting).then_some(GitExec {
             scripts: editors,
             elsewhere: false,
             at_toplevel: true,
-            opaque: false,
+            opaque: runs_a_setting,
         })
     };
     let Some((subcommand, args)) = rest.and_then(<[String]>::split_first) else {
@@ -12966,19 +12970,19 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     } else {
         Vec::new()
     };
-    let mut opaque = false;
+    let mut opaque = runs_a_setting;
     let (scripts, elsewhere, at_toplevel) = match subcommand.as_str() {
         "rebase" => (exec_option_scripts(args, &REBASE_OPTIONS), false, true),
         "bisect" => {
             let (scripts, elsewhere, positional) = bisect_run_scripts(args);
-            opaque = positional;
+            opaque |= positional;
             (scripts, elsewhere, true)
         }
         // The helper the `submodule` script calls takes the same `foreach`.
         "submodule" | "submodule--helper" => {
             let (scripts, positional) =
                 submodule_foreach_script(args, subcommand == "submodule--helper");
-            opaque = positional;
+            opaque |= positional;
             (scripts, true, false)
         }
         "filter-branch" => (filter_branch_scripts(args), true, false),
@@ -13042,7 +13046,127 @@ fn may_carry_git_exec(tokens: &[String]) -> bool {
                 .strip_prefix("--")
                 .is_some_and(|name| name.starts_with(['u', 'r', 'e']))
             || (token.starts_with('-') && !token.starts_with("--") && token.contains('u'))
+            // A `-c`/`--config-env` global or an assignment may set a value
+            // git runs ([`sets_an_exec_value`]).
+            || token.starts_with("-c")
+            || token.starts_with("--config-env")
+            || token.contains('=')
     })
+}
+
+/// Environment names whose value git (or the ssh it starts) runs as a
+/// command: the transport's ssh, a pager, an external diff, a credential
+/// prompt, a `git://` proxy. The editors are read as scripts instead
+/// ([`GIT_EDITOR_ENV`]).
+const GIT_EXEC_ENV: &[&str] = &[
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PAGER",
+    "PAGER",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND",
+];
+
+/// Whether a git invocation sets, in front of it (`GIT_SSH_COMMAND=… git`)
+/// or as a `-c`/`--config-env` global, a value git runs as a command — read
+/// as an invocation whose push cannot be resolved, never parsed
+/// (cameronsjo/cadence-hooks#1231). See [`is_exec_valued_config`].
+///
+/// An empty value and a pager of exactly `cat` run nothing of the
+/// command's choosing, and are not counted. An editor is read as a script by
+/// [`editor_scripts`], so it is not counted here either.
+fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
+    let inert_pager = |value: &str| value.is_empty() || value == "cat";
+    let env = prefix.iter().any(|word| {
+        let word = unescape_word(word);
+        word.split_once('=').is_some_and(|(name, value)| {
+            GIT_EXEC_ENV.contains(&name)
+                && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
+                && !value.is_empty()
+        })
+    });
+    if env {
+        return true;
+    }
+    let mut i = 0;
+    while let Some(raw) = globals.get(i) {
+        i += 1;
+        let word = unescape_word(raw);
+        let (setting, from_env) = if word == "-c" || word == "--config-env" {
+            let Some(value) = globals.get(i) else { break };
+            i += 1;
+            (unescape_word(value).into_owned(), word == "--config-env")
+        } else if let Some(glued) = word.strip_prefix("--config-env=") {
+            (glued.to_string(), true)
+        } else if let Some(glued) = word.strip_prefix("-c").filter(|glued| !glued.is_empty()) {
+            (glued.to_string(), false)
+        } else {
+            continue;
+        };
+        // `-c key` with no `=` sets a boolean true.
+        let (key, value) = setting.split_once('=').unwrap_or((&setting, "true"));
+        if is_exec_valued_config(key, if from_env { None } else { Some(value) }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether config `key` set to `value` (`None`: read from a variable, so not
+/// known) makes git run a command (cameronsjo/cadence-hooks#1231): any key
+/// whose name ends in `command`, `program`, `helper` or `cmd`
+/// (`core.sshCommand`, `gpg.program`, `credential.helper`,
+/// `sendemail.toCmd`, `mergetool.<tool>.cmd`), `core.pager` and the
+/// `pager.<cmd>` section, `core.fsmonitor`, `core.hooksPath`,
+/// `diff.external`, `core.askPass`, `core.gitProxy`, a diff driver's
+/// `textconv`, a merge driver, a filter's `clean`/`smudge`/`process`,
+/// `uploadpack.packObjectsHook`, a remote's `uploadpack`/`receivepack`/`vcs`,
+/// an `include.path`/`includeIf.<cond>.path` (a file of more config), and a
+/// `protocol.allow`/`protocol.<name>.allow` that is not `never` (`ext::`
+/// runs its URL as a command). Names compare lowercased, as git's do.
+///
+/// Not counted: an empty value (git reads it as unset), a pager of `cat` or
+/// a boolean (`pager.log=false`), a boolean `core.fsmonitor` (the builtin
+/// daemon), and `core.hooksPath=/dev/null` (no hooks).
+fn is_exec_valued_config(key: &str, value: Option<&str>) -> bool {
+    let key = key.to_ascii_lowercase();
+    let (section, name) = match (key.split_once('.'), key.rsplit_once('.')) {
+        (Some((section, _)), Some((_, name))) => (section, name),
+        _ => return false,
+    };
+    let is_bool = |value: &str| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
+        )
+    };
+    let exec = match (section, name) {
+        ("protocol", "allow") => return value.is_none_or(|value| value != "never"),
+        ("include" | "includeif", "path") => return true,
+        ("core", "hookspath") => return value.is_none_or(|value| value != "/dev/null"),
+        ("core", "pager") | ("pager", _) => {
+            return value
+                .is_none_or(|value| !(value.is_empty() || value == "cat" || is_bool(value)));
+        }
+        ("core", "fsmonitor") => {
+            return value.is_none_or(|value| !(value.is_empty() || is_bool(value)));
+        }
+        ("core", "askpass" | "gitproxy")
+        | ("diff", "external" | "textconv")
+        | ("merge", "driver")
+        | ("filter", "clean" | "smudge" | "process")
+        | ("uploadpack", "packobjectshook")
+        | ("remote", "uploadpack" | "receivepack" | "vcs") => true,
+        _ => {
+            name.ends_with("command")
+                || name.ends_with("program")
+                || name.ends_with("helper")
+                || name.ends_with("cmd")
+        }
+    };
+    exec && value.is_none_or(|value| !value.is_empty())
 }
 
 /// Whether a git subcommand can start an editor: `commit`, `merge`, `tag`,
