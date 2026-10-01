@@ -20514,13 +20514,10 @@ mod tests {
     fn a_cut_open_process_substitution_keeps_its_own_words() {
         let deep = format!("{}{}", "$(x ".repeat(20), ")".repeat(20));
         for (command, want) in [
-            (
-                "cat <(cp d .env $(echo x; true)".to_string(),
-                "cp d .env $(",
-            ),
+            ("cat <(cp d .env $(echo x; true)".to_string(), "cp d .env"),
             (
                 "cat <(cp d .env \"$(echo x; true)\"".to_string(),
-                "cp d .env \"$(",
+                "cp d .env",
             ),
             (format!("cat <(cp d {deep} .env; true)"), ".env"),
         ] {
