@@ -153,6 +153,12 @@ fn unwrap_command_prefixes(tokens: &[String]) -> &[String] {
             argv = &argv[1..];
             continue;
         }
+        // `direnv exec DIR CMD…` runs CMD (#1265). `direnv` itself is on the
+        // metadata allowlist, so peeling past it only adds judgments.
+        if word == "direnv" && argv.get(1).is_some_and(|sub| sub == "exec") && argv.len() > 3 {
+            argv = &argv[3..];
+            continue;
+        }
         return argv;
     }
 }
@@ -706,6 +712,23 @@ fn segment_env_reads_at(
             found.push(read);
         }
     }
+    // The verb behind an unpeeled keyword is judged on its own too
+    // (#1265): `then git show :.env` read `then` as the command, so git's
+    // `<rev>:<path>` reading never ran. The union only adds reads; the
+    // keyword view's findings all stand, so no exemption is gained.
+    if lead > peel {
+        let behind = segment_direct_reads(
+            &tokens[lead - peel..],
+            &globs[lead - peel..],
+            &fixed[lead - peel..],
+            context,
+        );
+        for read in behind {
+            if !found.contains(&read) {
+                found.push(read);
+            }
+        }
+    }
     // A group closer glued to the last word — `{ (cat .env)}` — tokenizes as
     // `.env)}`, a name no secret pattern matches, while bash reads `.env`
     // (cameronsjo/cadence-hooks#1103). Judge the wrapper-stripped view too; the
@@ -1171,6 +1194,62 @@ fn segment_direct_reads(
     fixed: &[bool],
     context: ScanContext,
 ) -> Vec<(String, String)> {
+    let mut found = segment_operand_reads(tokens, globs, fixed, context);
+    if let Some((cmd_word, argv)) = resolve_command(tokens) {
+        for value in file_list_values(&cmd_word, argv) {
+            if let Some(file) = dangerous_secret_operand(value, Filename::Known) {
+                let read = (cmd_word.to_string(), file.to_string());
+                if !found.contains(&read) {
+                    found.push(read);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// GNU long options whose value is a file of FILE NAMES the command opens,
+/// whatever the command (#1265). A name that does not exist is reported with
+/// the name, so each one prints the list file: `wc --files0-from=.env`,
+/// `tar --files-from=.env`, and `diff --from-file=.env` (which compares, and
+/// so prints, the file itself). Judged before any exemption — `wc` and `du`
+/// are metadata-safe, but not with these.
+const FILE_LIST_LONG_OPTIONS: &[&str] = &["files0-from", "files-from", "from-file", "to-file"];
+
+/// The values of [`FILE_LIST_LONG_OPTIONS`] in `argv`, attached
+/// (`--files0-from=F`) or separate (`--files0-from F`), including a GNU
+/// abbreviation of six or more characters, plus `find -files0-from F`.
+fn file_list_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for (i, t) in argv.iter().enumerate().skip(1) {
+        if cmd == "find" && t == "-files0-from" {
+            out.extend(argv.get(i + 1).map(String::as_str));
+            continue;
+        }
+        let Some(long) = t.strip_prefix("--") else {
+            continue;
+        };
+        let (name, value) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        let known = FILE_LIST_LONG_OPTIONS
+            .iter()
+            .any(|option| *option == name || (name.len() >= 6 && option.starts_with(name)));
+        if known {
+            out.extend(value.or_else(|| argv.get(i + 1).map(String::as_str)));
+        }
+    }
+    out
+}
+
+/// [`segment_direct_reads`] without the [`file_list_values`] reads.
+fn segment_operand_reads(
+    tokens: &[String],
+    globs: &[bool],
+    fixed: &[bool],
+    context: ScanContext,
+) -> Vec<(String, String)> {
     let plain_jq_pipeline = context.plain_jq_pipeline;
     let Some((cmd_word, argv)) = resolve_command(tokens) else {
         return Vec::new();
@@ -1228,7 +1307,9 @@ fn segment_direct_reads(
                 .map(|value| (cmd_word.to_string(), value.to_string()))
                 .collect();
         }
-    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
+    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref())
+        && !direnv_runs_more(&cmd_word, argv)
+    {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -5114,6 +5195,24 @@ const ENVRC_TRANSPARENT_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 /// writes it and `exec` runs one.
 const DIRENV_INERT_SUBCOMMANDS: &[&str] = &["allow", "deny", "reload", "status", "version"];
 
+/// `direnv` subcommands that keep its metadata-only exemption: the inert set
+/// plus their aliases and a bare `direnv`. Any other verb loses it (#1265):
+/// `direnv dotenv bash .env` prints the file as `export` lines, and `exec`
+/// runs a command ([`unwrap_command_prefixes`] peels that one).
+const DIRENV_EXEMPT_SUBCOMMANDS: &[&str] = &[
+    "allow", "permit", "grant", "deny", "block", "revoke", "reload", "status", "version", "prune",
+    "hook", "help",
+];
+
+/// Does a metadata-safe `cmd` lose its exemption because it is a `direnv`
+/// whose subcommand is outside [`DIRENV_EXEMPT_SUBCOMMANDS`]?
+fn direnv_runs_more(cmd: &str, argv: &[String]) -> bool {
+    cmd == "direnv"
+        && argv
+            .get(1)
+            .is_some_and(|sub| !DIRENV_EXEMPT_SUBCOMMANDS.contains(&sub.as_str()))
+}
+
 /// A single-dash cluster (not `--long`) carrying the short option `flag`.
 fn short_cluster_has(arg: &str, flag: char) -> bool {
     short_cluster_has_before_value(arg, flag, &[])
@@ -5574,15 +5673,20 @@ fn literal_output(word: &str, argv: &[String]) -> Option<String> {
 }
 
 /// Does this shell invocation read its script from stdin — no `-c`, no script
-/// file operand (or an explicit `-s`)?
+/// file operand (or an explicit `-s`), or a script operand that IS stdin
+/// (`bash /dev/stdin`, `bash -`; cameronsjo/cadence-hooks#1265)?
 fn shell_reads_stdin(argv: &[String]) -> bool {
+    let stdin_script = |t: Option<&String>| {
+        t.is_none_or(|t| matches!(t.as_str(), "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"))
+    };
     let mut i = 1;
     while let Some(t) = argv.get(i) {
-        if t == "--" {
-            return argv.get(i + 1).is_none();
+        // A lone `-` ends options as `--` does.
+        if t == "--" || t == "-" {
+            return stdin_script(argv.get(i + 1));
         }
-        if !(t.starts_with('-') || t.starts_with('+')) || t.len() < 2 {
-            return false;
+        if !(t.starts_with('-') || t.starts_with('+')) {
+            return stdin_script(Some(t));
         }
         if SHELL_VALUED_OPTIONS.contains(&t.as_str()) {
             i += 2;
@@ -5599,6 +5703,32 @@ fn shell_reads_stdin(argv: &[String]) -> bool {
         i += 1;
     }
     true
+}
+
+/// Words that run the command after them with the pipe still on its stdin,
+/// peeled to find a shell consumer ([`stdin_shell_consumer`]). A detector
+/// peel: reaching a shell only adds judgments.
+const STDIN_SHELL_RUNNERS: &[&str] = &[
+    "exec", "nice", "nohup", "busybox", "toybox", "setsid", "stdbuf", "timeout", "sudo", "doas",
+    "env", "command", "builtin", "time", "unbuffer", "chrt", "ionice", "taskset",
+];
+
+/// The shell a pipeline stage runs with its script read from stdin, if any:
+/// `bash`, `sh -s`, `bash /dev/stdin`, and the same behind runner words
+/// (`exec bash`, `nice -n 5 bash`, `busybox sh`, `sudo -u root bash`). Past a
+/// runner word every token up to the shell is taken as the runner's own; a
+/// stage that does not open on a runner or a shell is no consumer.
+fn stdin_shell_consumer(tokens: &[String]) -> Option<String> {
+    for (i, t) in tokens.iter().enumerate() {
+        let word = command_word(t);
+        if SHELL_HEADS.contains(&word.as_ref()) {
+            return shell_reads_stdin(&tokens[i..]).then(|| word.into_owned());
+        }
+        if i == 0 && !STDIN_SHELL_RUNNERS.contains(&word.as_ref()) && !is_assignment_word(t) {
+            return None;
+        }
+    }
+    None
 }
 
 /// The `echo`/`printf` literals a pipeline hands a shell on stdin
@@ -5618,14 +5748,12 @@ pub fn piped_shell_scripts(command: &str) -> Vec<String> {
     for (segment, op) in split_segments_with_ops(command) {
         let tokens = tokenize(&segment);
         let mut text = None;
-        if let Some((word, argv)) = resolve_command(&tokens) {
-            match word.as_ref() {
-                "echo" | "printf" => text = literal_output(&word, argv),
-                w if SHELL_HEADS.contains(&w) && piped_in && shell_reads_stdin(argv) => {
-                    scripts.extend(previous_text.take());
-                }
-                _ => {}
-            }
+        if piped_in && stdin_shell_consumer(&tokens).is_some() {
+            scripts.extend(previous_text.take());
+        } else if let Some((word, argv)) = resolve_command(&tokens)
+            && matches!(word.as_ref(), "echo" | "printf")
+        {
+            text = literal_output(&word, argv);
         }
         previous_text = text;
         piped_in = op == Some("|");
@@ -5724,6 +5852,71 @@ fn shell_fed_heredoc_bodies(command: &str) -> Vec<String> {
     bodies
 }
 
+/// A secret file read through shell state the per-segment scan does not model
+/// (cameronsjo/cadence-hooks#1265), as `(how it is read, the name)`. Each arm
+/// fails closed: it does not work out what the state holds, it blocks when the
+/// construct appears and the command names a secret file anywhere.
+///
+/// - `$_` is the previous command's last argument, so `ls .env; cat "$_"`
+///   reads the file an allowed `ls` named. `${_}`, `${!v}` with `v=_`, a
+///   nameref (`declare -n r=_`), and an `eval` that builds the expansion
+///   from an escaped or single-quoted `$` (`eval "cat \$$x"`) reach the same
+///   value. `eval "$(direnv export bash)"` builds nothing and stays allowed.
+/// - Arithmetic recursively evaluates a variable's value, and an array
+///   subscript in that value runs its command substitution:
+///   `i='x[$(cat .env)]'; echo "${a[i]}"`. A command with an arithmetic
+///   context and a substitution opener is judged on every name it carries,
+///   quoted text included, since the value is quoted when assigned.
+/// - `BASH_ENV` and `ENV` name a file a starting shell sources.
+fn deferred_secret_reads(command: &str) -> Option<(&'static str, String)> {
+    static INDIRECT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\$\{?_(?:[^A-Za-z0-9_]|$)|\$\{!|\b(?:declare|typeset|local)\b[^;&|\n]*\s-[A-Za-z]*n|\beval\b[^;&|\n]*(?:\\\$|')",
+        )
+        .expect("indirection regex compiles")
+    });
+    static ARITHMETIC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\$\{[A-Za-z_][A-Za-z0-9_]*[\[:]|\(\(|\$\[|\blet\b|-(?:eq|ne|lt|le|gt|ge)\b|\b(?:declare|typeset|local|export|readonly)\b[^;&|\n]*\s-[A-Za-z]*i|[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]\+?=",
+        )
+        .expect("arithmetic regex compiles")
+    });
+    static OPENER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$\(|`|\\x24|\\044|\\u0024|\\x60|\\140").expect("opener regex compiles")
+    });
+    for segment in command_segments(command) {
+        for token in tokenize(&segment) {
+            if let Some((name, value)) = token.split_once('=')
+                && matches!(name, "BASH_ENV" | "ENV")
+                && let Some(file) = dangerous_secret_operand(value, Filename::Known)
+            {
+                return Some((
+                    "a starting shell sources it (`BASH_ENV`/`ENV`)",
+                    file.to_string(),
+                ));
+            }
+        }
+    }
+    if INDIRECT.is_match(command)
+        && let Some(name) = normalized_secret_name(command)
+    {
+        return Some((
+            "a later expansion can resolve to it (`$_`, `${!…}`, a nameref, or `eval`)",
+            name,
+        ));
+    }
+    if OPENER.is_match(command)
+        && ARITHMETIC.is_match(command)
+        && let Some(name) = normalized_secret_name(command)
+    {
+        return Some((
+            "arithmetic can run a command substitution held in a variable",
+            name,
+        ));
+    }
+    None
+}
+
 /// Findings of [`command_level_reads`].
 #[derive(Default)]
 struct CommandLevel {
@@ -5799,12 +5992,6 @@ fn command_level_reads(
                         out.reads.push((reader, name.clone(), *carve));
                     }
                 }
-                w if SHELL_HEADS.contains(&w) && piped_in && shell_reads_stdin(argv) => {
-                    match previous_text.take() {
-                        Some(script) => judged.push(script),
-                        None => out.opaque = true,
-                    }
-                }
                 "eval" => {
                     out.opaque |= argv[1..].iter().any(|a| eval_operand_is_opaque(a));
                 }
@@ -5821,6 +6008,19 @@ fn command_level_reads(
             .any(|script| script_is_opaque(script))
         {
             out.opaque = true;
+        }
+        // A shell reading its script from the pipe (#1265): the producer's
+        // literal text is judged as that script, and whatever the producer
+        // is, a secret named anywhere in the command may be in what it sends
+        // (`x='cat .env'; echo "$x" | bash`, `echo 'cat .env' | tee f | bash`).
+        if piped_in && let Some(shell) = stdin_shell_consumer(&tokens) {
+            match previous_text.take() {
+                Some(script) => judged.push(script),
+                None => out.opaque = true,
+            }
+            if let Some(name) = normalized_secret_name(command) {
+                out.reads.push((shell, name, false));
+            }
         }
         let words = executable_tokens(&segment);
         children.extend(child_scripts(skip_transparent_prefixes(&words), &segment));
@@ -6047,6 +6247,22 @@ fn bash_leaks_secrets_within(
                 )));
             }
         }
+        // #1265: reads through shell state no segment shows.
+        if let Some((how, token)) = deferred_secret_reads(command) {
+            return Some(CheckResult::block(with_forgectl_hint(
+                format!(
+                    "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
+                     Found: `{token}` named in a command where {how}\n\
+                     Fix: secrets are available to programs via direnv (`direnv allow`) — \
+                     run the program directly instead of reading its secret file, and keep \
+                     the file's name out of commands that use these constructs."
+                ),
+                HintKind::Read,
+                None,
+                &token,
+                detect,
+            )));
+        }
         // #1081/#1082: pipelines and heredocs a per-segment scan cannot see.
         let mut level = CommandLevel::default();
         command_level_reads(command, context, &mut budget, 0, &mut level);
@@ -6077,7 +6293,7 @@ fn bash_leaks_secrets_within(
         // Residual: the same pair split across two tool calls is not seen.
         let prints_content = segments.iter().any(|segment| {
             let tokens = tokenize(segment);
-            resolve_command(&tokens)
+            resolve_command(strip_leading_keywords(&tokens))
                 .is_some_and(|(word, argv)| word == "git" && git_prints_content(&argv[1..]))
         });
         if prints_content
