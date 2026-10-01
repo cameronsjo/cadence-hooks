@@ -970,8 +970,7 @@ fn collect_push_invocations(
                 .any(|child| {
                     crate::shell::command_segments(child).iter().any(|inner| {
                         !crate::shell::git_push_segments(inner).is_empty()
-                            || (inner.contains("git")
-                                && git_exec(&crate::shell::executable_tokens(inner)).is_some())
+                            || sets_git_config_past_the_bound(inner)
                     })
                 })
         {
@@ -1353,13 +1352,9 @@ fn collect_git_exec_pushes(
 /// list its children (cameronsjo/cadence-hooks#1231 review I1).
 fn mentions_an_exec_setting(segment: &str) -> bool {
     const MARKS: &[&str] = &[
-        "git_ssh",
+        "git_",
         "pager",
-        "git_external_diff",
         "askpass",
-        "git_proxy_command",
-        "git_config",
-        "git_allow_protocol",
         "config-env",
         "sshcommand",
         "fsmonitor",
@@ -1380,9 +1375,50 @@ fn mentions_an_exec_setting(segment: &str) -> bool {
         "uploadpack",
         "receivepack",
         "vcs",
+        "-c $",
+        "-c`",
     ];
-    let lower = segment.to_ascii_lowercase();
+    let lower = unquoted_lowercase(segment);
     lower.contains("git") && MARKS.iter().any(|mark| lower.contains(mark))
+}
+
+/// `text` lowercased with its quotes and backslashes dropped, so a cheap
+/// substring test is not defeated by `ssh"C"ommand` or `gi""t`
+/// (cameronsjo/cadence-hooks#1231 review).
+fn unquoted_lowercase(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether a segment past the wrapper depth runs git with a setting that
+/// may make it run a command: a `GIT_*` assignment in front of it, a `-c`
+/// or `--config-env` word, or anything [`crate::shell::git_exec`] reads
+/// (cameronsjo/cadence-hooks#1231 review I1).
+fn sets_git_config_past_the_bound(inner: &str) -> bool {
+    if !unquoted_lowercase(inner).contains("git") {
+        return false;
+    }
+    let tokens = crate::shell::executable_tokens(inner);
+    if git_exec(&tokens).is_some() {
+        return true;
+    }
+    let argv = peel_command_runners(crate::shell::strip_compound_heads(&tokens));
+    if argv
+        .first()
+        .is_none_or(|first| !command_word(first).starts_with("git"))
+    {
+        return false;
+    }
+    let prefix = &tokens[..tokens.len() - argv.len()];
+    prefix.iter().any(|word| {
+        let word = crate::shell::unescape_word(word);
+        word.starts_with("GIT_") && word.contains('=')
+    }) || argv[1..].iter().any(|word| {
+        let word = crate::shell::unescape_word(word);
+        word.starts_with("-c") || word.starts_with("--config-env")
+    })
 }
 
 /// `segment` without a leading function-definition head — `f()`, `f ( )`,

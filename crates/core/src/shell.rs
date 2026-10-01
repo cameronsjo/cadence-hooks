@@ -599,11 +599,17 @@ fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
         typed_raw.push((text, flags.to_vec()));
         true
     });
+    // The second walk is charged to its allowance; past it the command is
+    // marked unread and the script spelling is the as-typed one.
     let mut script_raw: Vec<(String, Vec<bool>)> = Vec::new();
-    walk_words(command, Backslashes::Escaped, &mut |text, flags, _, _| {
-        script_raw.push((text, flags.to_vec()));
-        true
-    });
+    if may_quote_a_backslash(command) && second_reading_affordable(command.len()) {
+        walk_words(command, Backslashes::Escaped, &mut |text, flags, _, _| {
+            script_raw.push((text, flags.to_vec()));
+            true
+        });
+    } else {
+        script_raw.clone_from(&typed_raw);
+    }
     let aligned = script_raw.len() == typed_raw.len();
     let mut typed = Vec::with_capacity(typed_raw.len());
     let mut script = Vec::with_capacity(typed_raw.len());
@@ -2285,8 +2291,8 @@ pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
 /// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
 /// nothing removed here is a word the shell executes.
 pub fn executable_tokens(segment: &str) -> Vec<String> {
-    // With no backslash the two spellings are one: tokenize as before.
-    if !segment.contains('\\') {
+    // With no quoted backslash the two spellings are one: tokenize as before.
+    if !may_quote_a_backslash(segment) {
         return executable_tokens_from(tokenize(strip_group_wrappers(segment)), None).0;
     }
     executable_token_pair(segment).0.clone()
@@ -2305,7 +2311,11 @@ pub fn executable_script_tokens(segment: &str) -> Vec<String> {
 /// cached). The compound-head strips drop leading words and peel a leading
 /// `(`/`{` off the head; the script spelling drops and peels the same.
 pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
-    if !segment.contains('\\') {
+    // The spellings differ only at a backslash quoting made literal, so with
+    // no backslash or no quote they are one; past the second reading's
+    // allowance the command is marked unread and read once
+    // (cameronsjo/cadence-hooks#1231 review C2).
+    if !may_quote_a_backslash(segment) {
         let typed = executable_tokens(segment);
         return std::rc::Rc::new((typed.clone(), typed));
     }
@@ -2314,6 +2324,38 @@ pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<Str
     let script_aligned = script.len() == typed.len();
     let (typed, script) = executable_tokens_from(typed, script_aligned.then_some(script));
     std::rc::Rc::new((typed.clone(), script.unwrap_or(typed)))
+}
+
+/// Whether `text` may hold a backslash inside quotes — the only place the
+/// two spellings of [`executable_token_pair`] differ. A cheap superset test.
+fn may_quote_a_backslash(text: &str) -> bool {
+    text.contains('\\') && text.contains(['\'', '"'])
+}
+
+/// Bytes the second reading of wrapper scripts may walk per thread before the
+/// command is marked unread ([`command_unread`]) and read once.
+const SECOND_READING_ALLOWANCE: usize = 1 << 20;
+
+thread_local! {
+    static SECOND_READING_LEFT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(SECOND_READING_ALLOWANCE) };
+}
+
+/// Charge `bytes` of second-reading work, or mark the command unread and
+/// answer `false` once the allowance is spent: past it a fail-closed guard
+/// refuses rather than grind (cameronsjo/cadence-hooks#1231 review C2).
+fn second_reading_affordable(bytes: usize) -> bool {
+    SECOND_READING_LEFT.with(|left| match left.get().checked_sub(bytes) {
+        Some(rest) => {
+            left.set(rest);
+            true
+        }
+        None => {
+            left.set(0);
+            mark_command_unread();
+            false
+        }
+    })
 }
 
 fn executable_tokens_from(
@@ -2631,7 +2673,13 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// cannot reuse that function, which stops at any `-`-leading token and so
 /// refuses exactly the `env -u FOO cmd` shape it must see through.
 pub fn is_assignment_word(token: &str) -> bool {
-    match token.split_once('=') {
+    // `NAME+=value` appends, and is an assignment prefix like `NAME=value`
+    // (cameronsjo/cadence-hooks#1231 review: `GIT_SSH_COMMAND+=x git fetch`
+    // hid the git behind it).
+    match token
+        .split_once('=')
+        .map(|(name, value)| (name.strip_suffix('+').unwrap_or(name), value))
+    {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
                 .next()
@@ -9792,6 +9840,12 @@ fn child_scripts_reading(
                 .map(|found| (found, readings))
                 .collect()
         }
+        Some(script_argv) if !second_reading_affordable(segment.len()) => {
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped)
+                .into_iter()
+                .map(|found| (found, readings))
+                .collect()
+        }
         Some(script_argv) => merge_readings(
             wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped),
             wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
@@ -13021,8 +13075,12 @@ fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<(String, Readings
             .map(|found| (found, readings))
             .collect();
     }
+    let found = wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped);
+    if !second_reading_affordable(segment.len()) {
+        return found.into_iter().map(|found| (found, readings)).collect();
+    }
     merge_readings(
-        wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped),
+        found,
         wrapped_scripts_reading(typed, git_exec_too, Backslashes::AsTyped),
     )
 }
