@@ -1496,41 +1496,89 @@ impl Check for GuardBodyBudget {
             &budgets_from(&moved.session.to_string_lossy()),
         );
         if effective.outcome == session.outcome {
-            return effective;
+            return agreed(effective, &session);
         }
-        CheckResult::nudge(config_disagreement(&moved, &effective, &session))
+        config_disagreement(&moved, effective, session)
     }
+}
+
+/// Both repos' configs reach the same verdict: the `cd` repo's result stands,
+/// and anything the session repo's config said differently rides along, so
+/// neither repo's finding is dropped (cameronsjo/cadence-hooks#225).
+fn agreed(effective: CheckResult, session: &CheckResult) -> CheckResult {
+    let Some(extra) = session
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty() && Some(*m) != effective.message.as_deref())
+    else {
+        return effective;
+    };
+    let mut result = effective;
+    let mut message = result.message.take().unwrap_or_default();
+    if !message.is_empty() {
+        message.push('\n');
+    }
+    message.push_str(&format!("[session repo config] {extra}"));
+    result.message = Some(message);
+    result
 }
 
 /// The nudge for a post whose two candidate repos' configs judge it
 /// differently: one line naming each repo and its verdict, then whatever each
-/// non-allow verdict had to say. Never a block — which repo's budget governs a
-/// `cd`'d post is the model's call (cameronsjo/cadence-hooks#225).
+/// non-allow verdict had to say, a block's message reworded as a would-block.
+/// Never a block — which repo's budget governs a `cd`'d post is the model's
+/// call (cameronsjo/cadence-hooks#225). A block downgraded this way writes a
+/// ledger row, so the downgrade is visible; a provenance either side already
+/// carried is kept.
 fn config_disagreement(
     moved: &cadence_hooks_core::target_repo::MovedRepo,
-    effective: &CheckResult,
-    session: &CheckResult,
-) -> String {
+    effective: CheckResult,
+    session: CheckResult,
+) -> CheckResult {
     use cadence_hooks_core::display::sanitize_field;
+    use cadence_hooks_core::{BypassKind, BypassProvenance, Outcome};
     let word = |r: &CheckResult| match r.outcome {
-        cadence_hooks_core::Outcome::Block => "block",
-        cadence_hooks_core::Outcome::Nudge => "nudge",
+        Outcome::Block => "block",
+        Outcome::Nudge => "nudge",
         _ => "allow",
     };
+    let (cd_says, session_says) = (word(&effective), word(&session));
     let line = format!(
-        "guard-body-budget: the two repos' budgets disagree. This command cds into {} (its config says {}); the session repo {} says {}. Not blocking — judge which repo's budget applies to this post.",
+        "guard-body-budget: the two repos' budgets disagree. This command cds into {} (its config says {cd_says}); the session repo {} says {session_says}. Not blocking — judge which repo's budget applies to this post.",
         moved.effective.display(),
-        word(effective),
         moved.session.display(),
-        word(session),
     );
     let mut out = sanitize_field(&line, 1200);
-    for (label, r) in [("cd repo", effective), ("session repo", session)] {
+    for (label, r) in [("cd repo", &effective), ("session repo", &session)] {
         if let Some(msg) = r.message.as_deref().filter(|m| !m.is_empty()) {
-            out.push_str(&format!("\n[{label} config] {msg}"));
+            out.push_str(&format!("\n[{label} config] {}", as_would_block(msg)));
         }
     }
-    out
+    let carried = effective.bypass.or(session.bypass);
+    let downgraded = cd_says == "block" || session_says == "block";
+    let bypass = if downgraded {
+        // The ledger row names no path (the provenance privacy contract):
+        // which side said what, and any switch that was also in play.
+        let mut reason =
+            format!("cd repo config says {cd_says}; session repo config says {session_says}");
+        if let Some(p) = &carried {
+            reason.push_str(&format!("; also {}", p.mechanism));
+        }
+        Some(BypassProvenance {
+            kind: BypassKind::ConfigDisagreement,
+            mechanism: "guard-body-budget config disagreement".to_string(),
+            reason: Some(reason),
+            expires_at: None,
+            armed_by_session: None,
+        })
+    } else {
+        carried
+    };
+    let nudge = CheckResult::nudge(out);
+    match bypass {
+        Some(p) => nudge.with_bypass(p),
+        None => nudge,
+    }
 }
 
 /// Measure every posting segment against `budgets` and fold the verdicts: the
@@ -3277,8 +3325,38 @@ mod tests {
                         first.contains("says block") && first.contains("says allow"),
                         "{label}: {first}"
                     );
+                    assert!(
+                        !msg.contains(VERDICT_BLOCKED),
+                        "{label}: a nudge must not say blocked: {msg}"
+                    );
+                    assert_eq!(
+                        result.bypass.as_ref().map(|p| p.kind),
+                        Some(cadence_hooks_core::BypassKind::ConfigDisagreement),
+                        "{label}: the downgraded block writes a ledger row"
+                    );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn agreeing_configs_keep_the_session_repos_message() {
+        scrubbed_env(|| {
+            let (_s, meta) = meta_with_nested_configs(
+                "agree-msgs",
+                Some(r#"{"mode": "nudge", "pr": [5, 10]}"#),
+                Some(r#"{"mode": "nudge", "pr": [10, 20]}"#),
+            );
+            let body = "word ".repeat(50);
+            let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
+                &format!("cd nested && gh pr create --title x --body \"{body}\""),
+                meta.to_str().unwrap(),
+            );
+            let result = GuardBodyBudget.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap_or_default();
+            assert!(msg.contains("[session repo config]"), "{msg}");
+            assert!(!msg.contains("budgets disagree"), "{msg}");
         });
     }
 }
