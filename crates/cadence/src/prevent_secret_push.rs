@@ -1854,6 +1854,10 @@ impl Check for PreventSecretPushGuard {
         "prevent-secret-push"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         self.run_with_escape(input, std::env::var(ESCAPE_ENV).ok().as_deref())
     }

@@ -241,14 +241,28 @@ fn run_push_with(input: &HookInput, command: &str, make_gh: &GhFactory<'_>) -> O
     // (two git spawns per push) runs only for pushes whose refspecs are all
     // implicit, and an implicit refspec is never a delete, so it could only
     // spend budget on pushes this hook skips anyway.
+    // One delete is counted once: core may read the same push twice, once
+    // per reading of a script whose spellings differ
+    // (cameronsjo/cadence-hooks#1231 review I2).
+    let mut seen = std::collections::HashSet::new();
     let deletes: Vec<_> = push_locations(command, cwd)
         .into_iter()
         .filter_map(|push| {
+            if push.unresolved {
+                return None;
+            }
             let branches: Vec<String> = push
                 .refspecs
                 .iter()
                 .filter(|r| r.is_delete)
                 .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
+                .filter(|branch| {
+                    seen.insert((
+                        push.work_dir.clone(),
+                        push.repository.clone(),
+                        branch.clone(),
+                    ))
+                })
                 .collect();
             (!branches.is_empty() && !push.unresolved).then_some((push, branches))
         })

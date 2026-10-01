@@ -1747,7 +1747,22 @@ pub trait Check {
     fn skip_at_effort(&self) -> &[&str] {
         &[]
     }
+
+    /// Whether this check refuses a Bash command part of which no reading
+    /// could take in ([`shell::command_unread`]): a word bash brace-expands
+    /// left whole when the expansion budget is spent. `false` (default) for
+    /// advisory checks; the fail-closed guards answer `true`
+    /// (cameronsjo/cadence-hooks#1279).
+    fn refuses_unread_commands(&self) -> bool {
+        false
+    }
 }
+
+/// The block a fail-closed guard gives a command it could not read in full
+/// ([`Check::refuses_unread_commands`]).
+pub const UNREAD_COMMAND_BLOCK: &str = "command too large to read in full — a brace expansion \
+     (or a wrapper's second reading) ran past what the guard reads, so what it runs cannot be \
+     verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions";
 
 /// Pure: should `run_check` short-circuit for the given effort level?
 ///
@@ -1998,7 +2013,21 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
         return None;
     }
-    Some(check.run(input))
+    shell::reset_command_unread();
+    let result = check.run(input);
+    // A fail-closed guard never allows a command it could not read in full:
+    // padding a command until the brace budget was spent left a later
+    // `{git,reset,--hard}` whole, and it ran past every guard
+    // (cameronsjo/cadence-hooks#1279). A bypass the guard honoured stands.
+    if check.refuses_unread_commands()
+        && input.command().is_some()
+        && matches!(result.outcome, Outcome::Allow | Outcome::Nudge)
+        && result.bypass.is_none()
+        && shell::command_unread()
+    {
+        return Some(CheckResult::block(UNREAD_COMMAND_BLOCK));
+    }
+    Some(result)
 }
 
 /// The emit-and-exit half of [`run_check`]: render the outcome to stdout/stderr

@@ -1194,6 +1194,44 @@ enum BraceExpansion {
 /// (`NAME=…`) is left alone, since bash does not expand an assignment
 /// statement and in command position that is what it is.
 fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) -> BraceExpansion {
+    let expansion = brace_expand_word_unmarked(text, structural, budget);
+    if expansion == BraceExpansion::Overflow {
+        mark_command_unread();
+    }
+    expansion
+}
+
+thread_local! {
+    static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that a reading of the command on this thread left part of it
+/// unread: a word bash brace-expands was left whole (a per-word bound, or
+/// the call's or thread's [`BraceBudget`] spent), or the second reading of
+/// a wrapper's script ran past its allowance ([`SecondReadingWork`]).
+fn mark_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(true));
+}
+
+/// Whether a reading on this thread left part of a command unread since the
+/// last [`reset_command_unread`] (cameronsjo/cadence-hooks#1279). A guard
+/// that refuses what it cannot read refuses then: a word left whole hides
+/// what bash builds from it, and padding a command until the budget is spent
+/// left `{git,reset,--hard}` whole, so it ran past every guard.
+pub fn command_unread() -> bool {
+    COMMAND_UNREAD.with(std::cell::Cell::get)
+}
+
+/// Clear [`command_unread`] before a check reads a command.
+pub fn reset_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(false));
+}
+
+fn brace_expand_word_unmarked(
+    text: &str,
+    structural: &[bool],
+    budget: &mut BraceBudget,
+) -> BraceExpansion {
     let Some(word) = expanding_brace_word(text, structural) else {
         return BraceExpansion::Unchanged;
     };
