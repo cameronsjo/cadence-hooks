@@ -5885,9 +5885,21 @@ fn deferred_secret_reads(command: &str) -> Option<(&'static str, String)> {
         Regex::new(r"\$\(|`|\\x24|\\044|\\u0024|\\x60|\\140").expect("opener regex compiles")
     });
     for segment in command_segments(command) {
-        for token in tokenize(&segment) {
+        let tokens = tokenize(&segment);
+        // `ENV` matters only to an interactive POSIX shell, so it counts where
+        // the shell itself assigns it (a prefix, or `export`/`declare`/`env`);
+        // `make ENV=.env` hands make a variable no shell sources. `BASH_ENV`
+        // counts anywhere: a make recipe under `SHELL=bash` sources it.
+        let declares = tokens.first().is_some_and(|head| {
+            matches!(
+                command_word(head).as_ref(),
+                "export" | "declare" | "typeset" | "local" | "readonly" | "env"
+            )
+        });
+        let prefix = tokens.iter().take_while(|t| is_assignment_word(t)).count();
+        for (i, token) in tokens.iter().enumerate() {
             if let Some((name, value)) = token.split_once('=')
-                && matches!(name, "BASH_ENV" | "ENV")
+                && (name == "BASH_ENV" || (name == "ENV" && (declares || i < prefix)))
                 && let Some(file) = dangerous_secret_operand(value, Filename::Known)
             {
                 return Some((
@@ -5964,6 +5976,7 @@ fn command_level_reads(
     let mut upstream: Option<(bool, String)> = None;
     let mut previous_text: Option<String> = None;
     let mut piped_in = false;
+    let secret_name = std::cell::OnceCell::new();
     for (segment, op) in split_segments_with_ops(command) {
         if !piped_in {
             upstream = None;
@@ -6018,8 +6031,8 @@ fn command_level_reads(
                 Some(script) => judged.push(script),
                 None => out.opaque = true,
             }
-            if let Some(name) = normalized_secret_name(command) {
-                out.reads.push((shell, name, false));
+            if let Some(name) = secret_name.get_or_init(|| normalized_secret_name(command)) {
+                out.reads.push((shell, name.clone(), false));
             }
         }
         let words = executable_tokens(&segment);
@@ -13318,5 +13331,273 @@ mod api_endpoint_tests {
             fixed("$p \"$@\" \"${a[@]}\" x* \"a\"$b '$x' <x `x` \"$(x)\""),
             [false; 9]
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_read_tests {
+    //! cameronsjo/cadence-hooks#1265: reads through `$_`, arithmetic,
+    //! `BASH_ENV`, a piped shell, `direnv`, a keyword, and file-list options.
+    //! Every blocked row printed a canary `.env` under real bash 5.2, or is
+    //! the same shape behind a construct the guard does not model.
+    use super::*;
+    use cadence_hooks_core::Outcome;
+
+    fn outcome(command: &str) -> Outcome {
+        SecretLeaksGuard::default()
+            .run(&cadence_hooks_core::test_builders::make_bash(command))
+            .outcome
+    }
+
+    fn assert_rows(rows: &[&str], want: Outcome, why: &str) {
+        for command in rows {
+            assert_eq!(outcome(command), want, "{command}: {why}");
+        }
+    }
+
+    #[test]
+    fn last_argument_and_indirection_reads_block() {
+        assert_rows(
+            &[
+                "ls .env; cat \"$_\"",
+                "stat .env; cat \"$_\"",
+                "ls .env && cat \"$_\"",
+                "ls .env || cat \"$_\"",
+                "ls .env | cat \"$_\"",
+                "ls .env\ncat \"$_\"",
+                "ls .env; x=$_; cat \"$x\"",
+                "ls .env; mapfile -t a < \"$_\"; echo \"${a[@]}\"",
+                "ls .env; exec 3<$_; cat <&3",
+                "trap 'cat \"$_\"' DEBUG; ls .env",
+                "ls .env; cat ${_}",
+                "ls .env; v=_; cat \"${!v}\"",
+                "ls .env; declare -n r=_; cat \"$r\"",
+                "ls .env; declare -g -n r=_; cat \"$r\"",
+                "ls .env; local -n r=_; cat \"$r\"",
+                "ls .env; x=_; eval \"cat \\$$x\"",
+                "ls .env; eval 'cat \"$_\"'",
+            ],
+            Outcome::Block,
+            "a later expansion reads the secret an allowed command named",
+        );
+        assert_rows(
+            &[
+                "mkdir -p foo && cd \"$_\"",
+                "ls .env.example; cat \"$_\"",
+                "eval \"$(direnv export bash)\"",
+                "direnv allow .envrc && eval \"$(direnv export bash)\"",
+                "echo $_x .env",
+            ],
+            Outcome::Allow,
+            "no secret name, a safe template, or no deferred expansion",
+        );
+    }
+
+    #[test]
+    fn arithmetic_subscript_substitutions_block() {
+        assert_rows(
+            &[
+                "i='x[$(cat .env >&2)]'; echo \"${a[i]}\"",
+                "i='x[$(cat .env >&2)]'; echo $((i))",
+                "i='x[`cat .env >&2`]'; let i",
+                "i=$'x[\\x24(cat .env >&2)]'; echo \"${a[i]}\"",
+                "i='x[$(cat .env >&2)]'; [[ i -eq 0 ]]",
+                "i='x[$(cat .env >&2)]'; declare -i n=i",
+                "p='$(cat .env >&2)'; i=\"x[$p]\"; echo ${s:i}",
+            ],
+            Outcome::Block,
+            "arithmetic runs the substitution held in the variable",
+        );
+        assert_rows(
+            &[
+                "for i in 1 2; do echo $((i+1)); done",
+                "i=$(wc -l < x); echo $((i))",
+                "a[0]=1; echo ${a[0]}",
+                "[ -f .env ] && echo yes",
+            ],
+            Outcome::Allow,
+            "no substitution opener beside a secret name",
+        );
+    }
+
+    #[test]
+    fn startup_file_variables_block() {
+        assert_rows(
+            &[
+                "BASH_ENV=.env bash -c 'true'",
+                "ENV=.env sh -i </dev/null",
+                "env BASH_ENV=.env bash -c true",
+                "export BASH_ENV=.env; bash -c true",
+                "declare -x BASH_ENV=\".env\"; bash -c true",
+                "BASH_ENV=~/.ssh/id_rsa bash -c true",
+                "make BASH_ENV=.env",
+                "export ENV=.env; sh -i",
+                "bash --rcfile .env -i </dev/null",
+                "bash --init-file .env -i </dev/null",
+            ],
+            Outcome::Block,
+            "a starting shell sources the named file",
+        );
+        assert_rows(
+            &[
+                "BASH_ENV=~/.bashrc bash -c true",
+                "ENV=$HOME/.shrc sh -i",
+                "make ENV=.env",
+            ],
+            Outcome::Allow,
+            "the startup file is no secret",
+        );
+    }
+
+    #[test]
+    fn scripts_piped_into_a_shell_block() {
+        assert_rows(
+            &[
+                "echo 'cat .env' | bash",
+                "printf 'cat .env' | sh",
+                "echo 'cat .env' | tee /dev/null | bash",
+                "echo 'cat .env' | bash -",
+                "echo 'cat .env' | bash /dev/stdin",
+                "echo 'cat .env' | sh /dev/fd/0",
+                "x='cat .env'; echo \"$x\" | bash",
+                "echo 'cat .env' | busybox sh",
+                "echo 'cat .env' | exec bash",
+                "echo 'cat .env' | nice -n 5 bash",
+                "echo 'cat .env' | sudo -u root bash",
+                "cat .env.sh .env | bash",
+            ],
+            Outcome::Block,
+            "the shell runs text that names a secret file",
+        );
+        assert_rows(
+            &[
+                "echo 'make' | bash",
+                "echo hi | bash -c 'cat'",
+                "ls .env | grep bash",
+                "echo 'cat .env' | bash script.sh",
+            ],
+            Outcome::Allow,
+            "no shell reads a secret-naming script from the pipe",
+        );
+    }
+
+    #[test]
+    fn shell_reads_stdin_covers_dash_and_stdin_devices() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (line, want) in [
+            ("bash", true),
+            ("bash -s", true),
+            ("bash -x", true),
+            ("bash -", true),
+            ("bash --", true),
+            ("bash /dev/stdin", true),
+            ("bash -- /proc/self/fd/0", true),
+            ("bash - script.sh", false),
+            ("bash script.sh", false),
+            ("bash -c true", false),
+        ] {
+            assert_eq!(shell_reads_stdin(&argv(line)), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn direnv_runs_and_dotenv_block() {
+        assert_rows(
+            &[
+                "direnv exec . cat .env",
+                "direnv exec /tmp cat prod.env",
+                "time direnv exec . cat .env",
+                "direnv dotenv bash .env",
+                "direnv exec . bash -c 'cat .env'",
+            ],
+            Outcome::Block,
+            "direnv runs or prints the secret file",
+        );
+        assert_rows(
+            &[
+                "direnv allow",
+                "direnv allow .envrc",
+                "direnv status",
+                "direnv exec . ls .env",
+                "direnv exec . make test",
+                "direnv export json",
+            ],
+            Outcome::Allow,
+            "an inert verb, or a metadata command run through exec",
+        );
+    }
+
+    #[test]
+    fn reads_behind_a_reserved_word_block() {
+        assert_rows(
+            &[
+                "if true; then git show :.env; fi",
+                "if true; then git cat-file -p :.env; fi",
+                "while true; do git show HEAD:.env; done",
+                "if false; then :; else git show :.env; fi",
+                "if ! git show :.env; then :; fi",
+                "then git show :.env",
+            ],
+            Outcome::Block,
+            "the verb behind the keyword reads a committed secret",
+        );
+        assert_rows(
+            &[
+                "if true; then git status; fi",
+                "then git show HEAD:README.md",
+                "for f in a; do git log --oneline; done",
+            ],
+            Outcome::Allow,
+            "the verb behind the keyword reads no secret",
+        );
+    }
+
+    #[test]
+    fn file_list_option_values_block() {
+        assert_rows(
+            &[
+                "sort --files0-from=.env",
+                "sort --files0-f=.env",
+                "wc --files0-from=.env",
+                "wc --files0-from .env",
+                "du --files0-from=.env",
+                "du --files0-from .env",
+                "find -files0-from .env",
+                "tar --files-from=.env -cf x",
+                "diff --from-file=.env x",
+                "diff --to-file=.env x",
+            ],
+            Outcome::Block,
+            "the command opens the list file and prints its lines",
+        );
+        assert_rows(
+            &[
+                "sort --files0-from=list.txt",
+                "wc -l .env",
+                "node --env-file=.env app.js",
+                "forgectl env keys --file=.env",
+            ],
+            Outcome::Allow,
+            "no file-list option names a secret, or the #771 consumed class",
+        );
+    }
+
+    #[test]
+    fn file_list_values_reads_both_spellings() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            file_list_values("sort", &argv("sort --files0-from=a --files-from b")),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            file_list_values("diff", &argv("diff --to-fil=a")),
+            vec!["a"]
+        );
+        assert!(file_list_values("x", &argv("x --file=a --from=b")).is_empty());
+        assert_eq!(
+            file_list_values("find", &argv("find -files0-from a")),
+            vec!["a"]
+        );
+        assert!(file_list_values("grep", &argv("grep -files0-from a")).is_empty());
     }
 }
