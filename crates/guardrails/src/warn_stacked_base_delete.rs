@@ -537,6 +537,36 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_read_two_ways_is_counted_once() {
+        // cameronsjo/cadence-hooks#1231 round 2 review I2: core reads a
+        // script whose spellings differ both ways, so five `-x` deletes came
+        // back as ten, past the eight this hook checks, and no dependent PR
+        // was looked up. Each delete counts once, so all five are checked.
+        use cadence_hooks_core::git_fixtures::{git_in, init_repo};
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        for values in [1, 5, 8] {
+            let command = format!(
+                "git rebase {}HEAD~1",
+                (0..values)
+                    .map(|n| format!("-x 'echo a\\b; git push origin --delete f{n}' "))
+                    .collect::<String>()
+            );
+            let (msg, calls) = push_calls(repo.path(), &command);
+            assert!(
+                calls > 0,
+                "{values}: checked, not counted past the cap: {msg:?}"
+            );
+            let msg = msg.expect("dependents nudge");
+            assert!(!msg.contains("than the"), "{values}: {msg}");
+        }
+    }
+
+    #[test]
     fn clone_floods_allow_before_the_deadline() {
         // A 200 KB flood of clones and bare pushes took ~3.1 s in release:
         // every bare push spent two git config probes in its own directory,

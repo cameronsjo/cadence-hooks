@@ -4561,6 +4561,23 @@ mod tests {
             ("GIT_ALLOW_PROTOCOL=https git ls-remote x", false),
             ("git -c interactive.diffFilter=x add -p", true),
             ("git -c \"$K=x\" fetch", true),
+            ("GIT_SSH_COMMAND+=x git fetch", true),
+            // Past the wrapper depth, spelled with quotes the text test
+            // must see through (round 2 review I1).
+            (
+                "echo $(echo $(echo $(echo $(git -c core.ssh\"C\"ommand=x fetch))))",
+                true,
+            ),
+            (
+                "echo $(echo $(echo $(echo $(gi\"\"t -c core.sshCommand=x fetch))))",
+                true,
+            ),
+            (
+                "echo $(echo $(echo $(echo $(git -c \"$K=x\" fetch))))",
+                true,
+            ),
+            ("echo $(echo $(echo $(echo $(GIT_DIR=/x git fetch))))", true),
+            ("echo $(echo $(echo $(echo $(git status))))", false),
             (
                 r#"bash -c 'bash -c "bash -c \"bash -c \\\"GIT_SSH_COMMAND=x git fetch\\\"\""'"#,
                 true,
