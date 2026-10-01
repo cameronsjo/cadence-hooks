@@ -1195,35 +1195,64 @@ fn segment_direct_reads(
     context: ScanContext,
 ) -> Vec<(String, String)> {
     let mut found = segment_operand_reads(tokens, globs, fixed, context);
-    if let Some((cmd_word, argv)) = resolve_command(tokens) {
-        for value in file_list_values(&cmd_word, argv) {
-            if let Some(file) = dangerous_secret_operand(value, Filename::Known) {
-                let read = (cmd_word.to_string(), file.to_string());
-                if !found.contains(&read) {
-                    found.push(read);
-                }
-            }
+    let Some((cmd_word, argv)) = resolve_command(tokens) else {
+        return found;
+    };
+    let mut push = |file: &str| {
+        let read = (cmd_word.to_string(), file.to_string());
+        if !found.contains(&read) {
+            found.push(read);
+        }
+    };
+    // `direnv dotenv [SHELL]` prints `./.env` as `export` lines (#1265).
+    if cmd_word == "direnv" && argv.get(1).is_some_and(|sub| sub == "dotenv") && argv.len() <= 3 {
+        push(".env");
+    }
+    // The #771 rulings keep their exemptions: `forgectl env keys --file=.env`
+    // (byte-exact head) and a consumed `--env-file=` / `--kubeconfig=` path.
+    if cmd_word == "forgectl" && tokens.first().is_some_and(|h| h == "forgectl") {
+        return found;
+    }
+    for (value, position) in file_list_values(&cmd_word, argv) {
+        if let Some(file) = dangerous_secret_operand(value, position) {
+            push(file);
         }
     }
     found
 }
 
-/// GNU long options whose value is a file of FILE NAMES the command opens,
-/// whatever the command (#1265). A name that does not exist is reported with
-/// the name, so each one prints the list file: `wc --files0-from=.env`,
-/// `tar --files-from=.env`, and `diff --from-file=.env` (which compares, and
-/// so prints, the file itself). Judged before any exemption — `wc` and `du`
-/// are metadata-safe, but not with these.
-const FILE_LIST_LONG_OPTIONS: &[&str] = &["files0-from", "files-from", "from-file", "to-file"];
+/// Long options whose value is a file of FILE NAMES (or a file compared
+/// whole) the command opens, whatever the command (#1265). A name that does
+/// not exist is reported with the name, so each one prints the list file:
+/// `wc --files0-from=.env`, `tar --files-from=.env`, `xargs --arg-file=.env`,
+/// `git add --pathspec-from-file=.env`, `diff --from-file=.env`. Any prefix of
+/// three or more characters counts, as GNU `getopt_long` accepts an
+/// unambiguous one. Judged before any exemption — `wc`, `du` and `git` are
+/// metadata-safe, but not with these.
+const FILE_LIST_LONG_OPTIONS: &[&str] = &[
+    "files0-from",
+    "files-from",
+    "from-file",
+    "arg-file",
+    "pathspec-from-file",
+    "to-file",
+];
 
-/// The values of [`FILE_LIST_LONG_OPTIONS`] in `argv`, attached
-/// (`--files0-from=F`) or separate (`--files0-from F`), including a GNU
-/// abbreviation of six or more characters, plus `find -files0-from F`.
-fn file_list_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<&'a str> {
+/// Option values in `argv` judged as files read, with the position each is
+/// judged at (a separate value only behind a hyphenated or `fil…` name):
+///
+/// - every attached `--opt=VALUE`, for every command, as an unqualified word
+///   (only an unambiguous secret spelling counts) — except an option that
+///   excludes what it names (`--exclude=`, `--ignore=`, `--hide=`, a `!`
+///   glob) and the consumed `--env-file=`/`--kubeconfig=` class (#771);
+/// - a [`FILE_LIST_LONG_OPTIONS`] value, attached or separate, as a known
+///   filename;
+/// - `find -files0-from F`.
+fn file_list_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<(&'a str, Filename)> {
     let mut out = Vec::new();
     for (i, t) in argv.iter().enumerate().skip(1) {
         if cmd == "find" && t == "-files0-from" {
-            out.extend(argv.get(i + 1).map(String::as_str));
+            out.extend(argv.get(i + 1).map(|v| (v.as_str(), Filename::Known)));
             continue;
         }
         let Some(long) = t.strip_prefix("--") else {
@@ -1233,11 +1262,37 @@ fn file_list_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<&'a str> {
             Some((name, value)) => (name, Some(value)),
             None => (long, None),
         };
-        let known = FILE_LIST_LONG_OPTIONS
-            .iter()
-            .any(|option| *option == name || (name.len() >= 6 && option.starts_with(name)));
-        if known {
-            out.extend(value.or_else(|| argv.get(i + 1).map(String::as_str)));
+        let file_list = name.len() >= 3
+            && FILE_LIST_LONG_OPTIONS
+                .iter()
+                .any(|option| option.starts_with(name));
+        match value {
+            Some(value) if file_list => out.push((value, Filename::Known)),
+            Some(value) => {
+                // An excluded name, or an output target (prevent-secret-writes'
+                // shape), is not read.
+                let excludes = ["exclude", "ignore", "hide", "save", "output"]
+                    .iter()
+                    .any(|word| name.contains(word));
+                let consumed = matches!(name, "env-file" | "kubeconfig");
+                // curl rejects `--opt=VALUE` outright; a glob value is a
+                // pattern (`--regexp='secret*'`), judged by the pattern scan.
+                if !excludes
+                    && !consumed
+                    && cmd != "curl"
+                    && !value.starts_with('!')
+                    && !value.is_empty()
+                    && !value.contains(['*', '?', '['])
+                {
+                    out.push((value, Filename::Unqualified));
+                }
+            }
+            // The separate spelling only where the name is not a whole option
+            // of its own elsewhere (`git filter-repo --path P`, `jq --arg`).
+            None if file_list && (name.contains('-') || name.starts_with("fil")) => {
+                out.extend(argv.get(i + 1).map(|v| (v.as_str(), Filename::Known)));
+            }
+            None => {}
         }
     }
     out
@@ -5719,6 +5774,7 @@ const STDIN_SHELL_RUNNERS: &[&str] = &[
 /// runner word every token up to the shell is taken as the runner's own; a
 /// stage that does not open on a runner or a shell is no consumer.
 fn stdin_shell_consumer(tokens: &[String]) -> Option<String> {
+    let tokens = without_redirections(tokens);
     for (i, t) in tokens.iter().enumerate() {
         let word = command_word(t);
         if SHELL_HEADS.contains(&word.as_ref()) {
@@ -5729,6 +5785,28 @@ fn stdin_shell_consumer(tokens: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// `tokens` without their redirections (`2>&1`, `>out`, `> out`, `<in`,
+/// `&>log`, `{fd}>&-`), which say nothing about the command or its script
+/// operand (#1265: `| bash 2>&1` read `2>&1` as the script file).
+fn without_redirections(tokens: &[String]) -> Vec<String> {
+    static REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:&>>?|>>?&?|<>|<&|>\||<)(.*)$")
+            .expect("redirection regex compiles")
+    });
+    let mut out = Vec::new();
+    let mut skip_target = false;
+    for t in tokens {
+        if std::mem::take(&mut skip_target) {
+            continue;
+        }
+        match REDIRECT.captures(t) {
+            Some(c) => skip_target = c.get(1).is_some_and(|rest| rest.as_str().is_empty()),
+            None => out.push(t.clone()),
+        }
+    }
+    out
 }
 
 /// The `echo`/`printf` literals a pipeline hands a shell on stdin
@@ -5854,79 +5932,184 @@ fn shell_fed_heredoc_bodies(command: &str) -> Vec<String> {
 
 /// A secret file read through shell state the per-segment scan does not model
 /// (cameronsjo/cadence-hooks#1265), as `(how it is read, the name)`. Each arm
-/// fails closed: it does not work out what the state holds, it blocks when the
-/// construct appears and the command names a secret file anywhere.
+/// fails closed: it does not work out what the state holds or which spelling
+/// reaches it, it blocks when the construct appears and the command names a
+/// secret file anywhere ([`normalized_secret_name`]).
 ///
-/// - `$_` is the previous command's last argument, so `ls .env; cat "$_"`
-///   reads the file an allowed `ls` named. `${_}`, `${!v}` with `v=_`, a
-///   nameref (`declare -n r=_`), and an `eval` that builds the expansion
-///   from an escaped or single-quoted `$` (`eval "cat \$$x"`) reach the same
-///   value. `eval "$(direnv export bash)"` builds nothing and stays allowed.
+/// - Deferred state: `$_` (the previous command's last argument, so
+///   `ls .env; cat "$_"` reads what an allowed `ls` named), `${!…}`, a
+///   nameref, an `eval` building a `$` from escaped or single-quoted text,
+///   `BASH_COMMAND`, a `trap`, and every startup hook a shell sources or runs
+///   (`BASH_ENV`, `ENV=`, `PROMPT_COMMAND`, `--rcfile`, `--init-file`).
+///   `eval "$(direnv export bash)"` builds nothing and stays allowed.
 /// - Arithmetic recursively evaluates a variable's value, and an array
-///   subscript in that value runs its command substitution:
-///   `i='x[$(cat .env)]'; echo "${a[i]}"`. A command with an arithmetic
-///   context and a substitution opener is judged on every name it carries,
-///   quoted text included, since the value is quoted when assigned.
-/// - `BASH_ENV` and `ENV` name a file a starting shell sources.
-fn deferred_secret_reads(command: &str) -> Option<(&'static str, String)> {
-    static INDIRECT: LazyLock<Regex> = LazyLock::new(|| {
+///   subscript in that value runs its command substitution
+///   (`i='x[$(cat .env)]'; echo "${a[i]}"`). The opener can be escaped,
+///   ANSI-C encoded, or built by `printf -v`, so any `$` beside an arithmetic
+///   context counts.
+/// - A shell or evaluator anywhere after a pipe ([`pipe_feeds_evaluator`]),
+///   beside a `<(…)`, or heading a segment of a command that also writes a
+///   file (`echo 'cat .env' > s.sh; bash s.sh`) runs text the guard did not
+///   read.
+/// - git reads `<rev>:<path>` wherever its segment sits (a case arm, a group,
+///   a function body, `coproc`): a `git` word anywhere plus a word whose
+///   object path is a secret ([`git_object_read_anywhere`]).
+fn deferred_secret_reads(command: &str, segments: &[String]) -> Option<(&'static str, String)> {
+    static STATE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"\$\{?_(?:[^A-Za-z0-9_]|$)|\$\{!|\b(?:declare|typeset|local)\b[^;&|\n]*\s-[A-Za-z]*n|\beval\b[^;&|\n]*(?:\\\$|')",
+            r"\$\{?_(?:[^A-Za-z0-9_]|$)|\$\{!|\b(?:declare|typeset|local)\b[^;&|\n]*\s-[A-Za-z]*n|\beval\b[^;&|\n]*(?:\\\$|')|BASH_ENV|BASH_COMMAND|PROMPT_COMMAND|\bENV\+?=|\btrap\b|--rcfile|--init-file",
         )
-        .expect("indirection regex compiles")
+        .expect("deferred-state regex compiles")
     });
     static ARITHMETIC: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"\$\{[A-Za-z_][A-Za-z0-9_]*[\[:]|\(\(|\$\[|\blet\b|-(?:eq|ne|lt|le|gt|ge)\b|\b(?:declare|typeset|local|export|readonly)\b[^;&|\n]*\s-[A-Za-z]*i|[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]\+?=",
+            r"\(\(|\$\[|\blet\b|-(?:eq|ne|lt|le|gt|ge)\b|\b(?:declare|typeset|local|export|readonly)\b[^;&|\n]*\s-[A-Za-z]*i|[A-Za-z0-9_@*}\]]\[[^\]]*[A-Za-z_]|\$\{[@*A-Za-z_][A-Za-z0-9_]*:[^-=?+]",
         )
         .expect("arithmetic regex compiles")
     });
-    static OPENER: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\(|`|\\x24|\\044|\\u0024|\\x60|\\140").expect("opener regex compiles")
-    });
-    for segment in command_segments(command) {
-        let tokens = tokenize(&segment);
-        // `ENV` matters only to an interactive POSIX shell, so it counts where
-        // the shell itself assigns it (a prefix, or `export`/`declare`/`env`);
-        // `make ENV=.env` hands make a variable no shell sources. `BASH_ENV`
-        // counts anywhere: a make recipe under `SHELL=bash` sources it.
-        let declares = tokens.first().is_some_and(|head| {
-            matches!(
-                command_word(head).as_ref(),
-                "export" | "declare" | "typeset" | "local" | "readonly" | "env"
-            )
-        });
-        let prefix = tokens.iter().take_while(|t| is_assignment_word(t)).count();
-        for (i, token) in tokens.iter().enumerate() {
-            if let Some((name, value)) = token.split_once('=')
-                && (name == "BASH_ENV" || (name == "ENV" && (declares || i < prefix)))
-                && let Some(file) = dangerous_secret_operand(value, Filename::Known)
+    let reason = if STATE.is_match(command) {
+        Some("a later expansion, trap, or startup hook can resolve to it")
+    } else if ARITHMETIC.is_match(command) && command.contains(['$', '`']) {
+        Some("arithmetic can run a command substitution held in a variable")
+    } else if pipe_feeds_evaluator(command)
+        || ((command.contains("<(") || command.contains('>') || command.contains("tee"))
+            && segments.iter().any(|segment| {
+                segment_head(&tokenize(segment)).is_some_and(|h| is_evaluator_word(&h))
+            }))
+        || (command.contains("<(") && words_of(command).any(|w| is_evaluator_word(&w)))
+    {
+        Some("a shell or evaluator runs text the guard cannot read")
+    } else {
+        None
+    };
+    if let Some(reason) = reason
+        && let Some(name) = normalized_secret_name(command).or_else(|| {
+            // A name the segmenter builds from assignments (`x=.e; ls ${x}nv`).
+            segments.iter().find_map(|segment| {
+                tokenize(segment).into_iter().find_map(|t| {
+                    (!t.contains(['*', '?', '[']))
+                        .then(|| dangerous_secret_operand(&t, Filename::Unqualified))
+                        .flatten()
+                        .map(str::to_string)
+                })
+            })
+        })
+    {
+        return Some((reason, name));
+    }
+    git_object_read_anywhere(command)
+        .map(|name| ("`git` reads it as a `<rev>:<path>` object", name))
+}
+
+/// `word` without the group, subshell and list punctuation glued to it.
+fn trim_group_punctuation(word: &str) -> &str {
+    word.trim_matches(|c| matches!(c, '{' | '}' | '(' | ')' | ';' | '&'))
+}
+
+/// Every word of every segment of `command`, quotes removed.
+fn words_of(command: &str) -> impl Iterator<Item = String> {
+    split_segments_with_ops(command)
+        .into_iter()
+        .flat_map(|(segment, _)| tokenize(&segment))
+}
+
+/// The word a segment runs, past reserved words, group openers, `!`,
+/// assignment prefixes and redirections.
+fn segment_head(tokens: &[String]) -> Option<String> {
+    let tokens = without_redirections(strip_leading_keywords(tokens));
+    tokens
+        .into_iter()
+        .map(|t| trim_group_punctuation(&t).to_string())
+        .find(|t| {
+            !t.is_empty()
+                && t != "!"
+                && !is_assignment_word(t)
+                && !matches!(
+                    t.as_str(),
+                    "then" | "do" | "else" | "if" | "while" | "until"
+                )
+        })
+}
+
+/// Is `word` (group and subshell punctuation trimmed) a shell, or a builtin
+/// or utility that runs text as commands: `bash`, `$BASH`, `${SHELL:-sh}`,
+/// `source`, `.`, `eval`, `script`? The builtins count only as a
+/// [`segment_head`] (`jq '.'` passes `.` as a filter); a shell's name counts
+/// anywhere in a stage, since a runner may sit in front of it.
+fn is_shell_word(word: &str) -> bool {
+    let w = word.split(['<', '>']).next().unwrap_or(word);
+    let w = trim_group_punctuation(w);
+    ["$BASH", "${BASH", "$SHELL", "${SHELL"]
+        .iter()
+        .any(|p| w.starts_with(p))
+        || matches!(command_word(w).as_ref(), w if SHELL_HEADS.contains(&w) || w == "fish")
+}
+
+/// [`is_shell_word`], or a head that evaluates text (see there).
+fn is_evaluator_word(word: &str) -> bool {
+    // A redirection glued on (`bash>&2`) is not part of the name.
+    let w = word.split(['<', '>']).next().unwrap_or(word);
+    let w = trim_group_punctuation(w);
+    if ["$BASH", "${BASH", "$SHELL", "${SHELL"]
+        .iter()
+        .any(|p| w.starts_with(p))
+    {
+        return true;
+    }
+    let word = command_word(w);
+    SHELL_HEADS.contains(&word.as_ref())
+        || matches!(word.as_ref(), "fish" | "source" | "." | "eval" | "script")
+}
+
+/// Does any segment after the command's first pipe carry an evaluator word
+/// anywhere ([`is_evaluator_word`])? Wherever it sits in that stage — behind
+/// a runner, a redirect, a brace group, an `if`, a `while read` loop — it may
+/// be running the text the pipe carries.
+fn pipe_feeds_evaluator(command: &str) -> bool {
+    let mut piped = false;
+    for (segment, op) in split_segments_with_ops(command) {
+        if piped {
+            let tokens = tokenize(&segment);
+            // A word the stage runs as its command from a variable
+            // (`| while read l; do $l; done`) evaluates the piped text too.
+            if tokens.iter().any(|t| is_shell_word(t))
+                || segment_head(&tokens)
+                    .is_some_and(|head| head.starts_with('$') || is_evaluator_word(&head))
             {
-                return Some((
-                    "a starting shell sources it (`BASH_ENV`/`ENV`)",
-                    file.to_string(),
-                ));
+                return true;
             }
         }
+        piped |= matches!(op, Some(o) if o.starts_with('|') && o != "||");
     }
-    if INDIRECT.is_match(command)
-        && let Some(name) = normalized_secret_name(command)
-    {
-        return Some((
-            "a later expansion can resolve to it (`$_`, `${!…}`, a nameref, or `eval`)",
-            name,
-        ));
+    false
+}
+
+/// A secret `<rev>:<path>` object path in a command that runs `git`
+/// anywhere, whatever construct its segment sits in.
+fn git_object_read_anywhere(command: &str) -> Option<String> {
+    if !command.contains("git") || !command.contains(':') {
+        return None;
     }
-    if OPENER.is_match(command)
-        && ARITHMETIC.is_match(command)
-        && let Some(name) = normalized_secret_name(command)
-    {
-        return Some((
-            "arithmetic can run a command substitution held in a variable",
-            name,
-        ));
+    let words: Vec<String> = words_of(command).collect();
+    let runs_git = words
+        .iter()
+        .any(|w| command_word(trim_group_punctuation(w)) == "git");
+    if !runs_git {
+        return None;
     }
-    None
+    words
+        .iter()
+        .map(|w| trim_group_punctuation(w))
+        .find_map(|w| {
+            w.contains(':')
+                .then(|| {
+                    git_object_paths(w)
+                        .skip(1)
+                        .find_map(|path| dangerous_secret_operand(path, Filename::Unqualified))
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
 }
 
 /// Findings of [`command_level_reads`].
@@ -6261,7 +6444,7 @@ fn bash_leaks_secrets_within(
             }
         }
         // #1265: reads through shell state no segment shows.
-        if let Some((how, token)) = deferred_secret_reads(command) {
+        if let Some((how, token)) = deferred_secret_reads(command, &segments) {
             return Some(CheckResult::block(with_forgectl_hint(
                 format!(
                     "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
@@ -10438,7 +10621,7 @@ mod tests {
             &[
                 "dd if=/dev/zero of=out.bin bs=1 count=1",
                 "dd if=.env.example",
-                "make ENV=.env",
+                "make CONF=.env",
                 "node --env-file=.env app.js",
                 "export F=.env",
             ],
@@ -10898,7 +11081,7 @@ mod tests {
                 "cat x.txt 2>&1",
                 "head -n1 x.txt>out.txt",
                 "echo hi>.env",
-                "make ENV=.env",
+                "make CONF=.env",
                 "cat --number x.txt",
                 "git log -1 --format=%H",
                 "curl -sSf -o/dev/null https://x",
@@ -13404,6 +13587,10 @@ mod deferred_read_tests {
                 "i='x[$(cat .env >&2)]'; [[ i -eq 0 ]]",
                 "i='x[$(cat .env >&2)]'; declare -i n=i",
                 "p='$(cat .env >&2)'; i=\"x[$p]\"; echo ${s:i}",
+                "i='x[$(cat .env >&2)]'; echo \"${@:i}\"",
+                "i=x[\\$\\(cat\\ .env\\ \\>\\&2\\)]; let i",
+                "i=$'x[\\U00000024(cat .env >&2)]'; let i",
+                "printf -v i 'x[%s(cat .env >&2)]' '$'; let i",
             ],
             Outcome::Block,
             "arithmetic runs the substitution held in the variable",
@@ -13432,6 +13619,12 @@ mod deferred_read_tests {
                 "BASH_ENV=~/.ssh/id_rsa bash -c true",
                 "make BASH_ENV=.env",
                 "export ENV=.env; sh -i",
+                // Any mention beside a secret name fails closed (#1265 Gate 2).
+                "make ENV=.env",
+                "BASH_ENV+=.env bash -c true",
+                "printf -v BASH_ENV .env; export BASH_ENV; bash -c true",
+                "PROMPT_COMMAND='cat .env' bash -i",
+                "trap 'cat ${BASH_COMMAND#ls }' DEBUG; ls .env",
                 "bash --rcfile .env -i </dev/null",
                 "bash --init-file .env -i </dev/null",
             ],
@@ -13439,11 +13632,7 @@ mod deferred_read_tests {
             "a starting shell sources the named file",
         );
         assert_rows(
-            &[
-                "BASH_ENV=~/.bashrc bash -c true",
-                "ENV=$HOME/.shrc sh -i",
-                "make ENV=.env",
-            ],
+            &["BASH_ENV=~/.bashrc bash -c true", "ENV=$HOME/.shrc sh -i"],
             Outcome::Allow,
             "the startup file is no secret",
         );
@@ -13465,20 +13654,50 @@ mod deferred_read_tests {
                 "echo 'cat .env' | nice -n 5 bash",
                 "echo 'cat .env' | sudo -u root bash",
                 "cat .env.sh .env | bash",
+                // Gate 2: redirects, runners, groups, evaluators, a variable
+                // head, process substitution, and a written script.
+                "x='cat .env'; echo \"$x\" | bash 2>&1",
+                "echo 'cat .env' | tee /dev/null | bash 2>&1",
+                "echo 'cat .env' | bash - 2>&1",
+                "echo 'cat .env' | sudo -u root bash 2>&1",
+                "echo 'cat .env' | bash>&2",
+                "echo 'cat .env' | 2>&1 bash",
+                "echo 'cat .env' | $BASH",
+                "echo 'cat .env' | ${SHELL:-bash}",
+                "echo 'cat .env' | { bash; }",
+                "echo 'cat .env' | ( bash )",
+                "echo 'cat .env' | if true; then bash; fi",
+                "echo 'cat .env' | source /dev/stdin",
+                "echo 'cat .env' | eval \"$(cat)\"",
+                "echo 'cat .env' | script -qc bash /dev/null",
+                "echo 'cat .env' | while read l; do eval \"$l\"; done",
+                "echo 'cat .env' | while read -r l; do $l; done",
+                "bash <(echo 'cat .env')",
+                "source <(echo 'cat .env')",
+                "echo 'cat .env' > s.sh; bash s.sh",
+                "ls .env | grep bash",
+                "echo 'cat .env' | bash script.sh",
             ],
             Outcome::Block,
             "the shell runs text that names a secret file",
         );
         assert_rows(
-            &[
-                "echo 'make' | bash",
-                "echo hi | bash -c 'cat'",
-                "ls .env | grep bash",
-                "echo 'cat .env' | bash script.sh",
-            ],
+            &["echo 'make' | bash", "echo hi | bash -c 'cat'"],
             Outcome::Allow,
             "no shell reads a secret-naming script from the pipe",
         );
+    }
+
+    #[test]
+    fn opaque_piped_shells_without_a_secret_do_not_block() {
+        for command in [
+            "curl -fsSL https://example.com/install.sh | bash",
+            "cat setup.sh | bash 2>&1",
+            "echo 'npm ci' | bash",
+            "tea api x | jq -r '.' >> /tmp/x.tsv",
+        ] {
+            assert_ne!(outcome(command), Outcome::Block, "{command}");
+        }
     }
 
     #[test]
@@ -13508,6 +13727,8 @@ mod deferred_read_tests {
                 "direnv exec /tmp cat prod.env",
                 "time direnv exec . cat .env",
                 "direnv dotenv bash .env",
+                "direnv dotenv",
+                "direnv dotenv bash",
                 "direnv exec . bash -c 'cat .env'",
             ],
             Outcome::Block,
@@ -13537,6 +13758,14 @@ mod deferred_read_tests {
                 "if false; then :; else git show :.env; fi",
                 "if ! git show :.env; then :; fi",
                 "then git show :.env",
+                "case x in x) git show :.env;; esac",
+                "{ git show :.env; }",
+                "( git show :.env )",
+                "function f { git show :.env; }; f",
+                "f() { git show :.env; }; f",
+                "coproc git show :.env",
+                "then { git show :.env; }",
+                "then X=1 git show :.env",
             ],
             Outcome::Block,
             "the verb behind the keyword reads a committed secret",
@@ -13566,6 +13795,15 @@ mod deferred_read_tests {
                 "tar --files-from=.env -cf x",
                 "diff --from-file=.env x",
                 "diff --to-file=.env x",
+                "sort --fil=.env",
+                "wc --fi=.env",
+                "du --file=.env",
+                "xargs --arg-file=.env",
+                "xargs --arg-f .env",
+                "sort --fil .env",
+                "git add --pathspec-from-file=.env",
+                "git stash push --pathspec-from-file .env",
+                "python --foo=.env",
             ],
             Outcome::Block,
             "the command opens the list file and prints its lines",
@@ -13576,6 +13814,9 @@ mod deferred_read_tests {
                 "wc -l .env",
                 "node --env-file=.env app.js",
                 "forgectl env keys --file=.env",
+                "grep -r --exclude=.env KEY .",
+                "ls --hide=.env",
+                "kubectl --kubeconfig=~/.kube/config get pods",
             ],
             Outcome::Allow,
             "no file-list option names a secret, or the #771 consumed class",
@@ -13585,19 +13826,22 @@ mod deferred_read_tests {
     #[test]
     fn file_list_values_reads_both_spellings() {
         let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let values = |cmd: &str, line: &str| -> Vec<String> {
+            file_list_values(cmd, &argv(line))
+                .into_iter()
+                .map(|(v, _)| v.to_string())
+                .collect()
+        };
         assert_eq!(
-            file_list_values("sort", &argv("sort --files0-from=a --files-from b")),
+            values("sort", "sort --files0-from=a --files-from b"),
             vec!["a", "b"]
         );
+        assert_eq!(values("diff", "diff --to-fil=a"), vec!["a"]);
         assert_eq!(
-            file_list_values("diff", &argv("diff --to-fil=a")),
+            values("x", "x --file=a --exclude=b --env-file=c"),
             vec!["a"]
         );
-        assert!(file_list_values("x", &argv("x --file=a --from=b")).is_empty());
-        assert_eq!(
-            file_list_values("find", &argv("find -files0-from a")),
-            vec!["a"]
-        );
-        assert!(file_list_values("grep", &argv("grep -files0-from a")).is_empty());
+        assert_eq!(values("find", "find -files0-from a"), vec!["a"]);
+        assert!(values("grep", "grep -files0-from a").is_empty());
     }
 }
