@@ -2228,7 +2228,7 @@ pub(crate) fn yaml_unquote(s: &str) -> String {
 /// not, is then [`yaml_quote`]d.
 fn render_frontmatter(f: &FrontmatterFields) -> String {
     let mut lines = vec!["---".to_string()];
-    lines.extend(hook_frontmatter_lines(f));
+    lines.extend(hook_frontmatter_lines(f, false));
     lines.push("---".to_string());
     lines.join("\n")
 }
@@ -2243,11 +2243,12 @@ fn render_frontmatter(f: &FrontmatterFields) -> String {
 /// (cameronsjo/cadence-hooks#870), but all three stay in [`HOOK_OWNED_KEYS`],
 /// so a plan-authored line claiming one is still dropped rather than passed
 /// through as forged attribution or a spoofed legacy idempotency anchor.
-fn hook_frontmatter_lines(f: &FrontmatterFields) -> Vec<String> {
-    let mut lines = vec![
-        format!("status: {}", yaml_quote("in-flight")),
-        format!("updated: {}", yaml_quote(f.updated)),
-    ];
+fn hook_frontmatter_lines(f: &FrontmatterFields, plan_says_blocked: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !plan_says_blocked {
+        lines.push(format!("status: {}", yaml_quote("in-flight")));
+    }
+    lines.push(format!("updated: {}", yaml_quote(f.updated)));
     if let Some(b) = f.branch {
         lines.push(format!(
             "branch: {}",
@@ -2308,10 +2309,14 @@ const HOOK_OWNED_KEYS: [&str; 8] = [
 /// `status: in-flight` would feed SessionStart. So [`render_document`] drops
 /// a plan line declaring one of these, exactly as it drops a
 /// [`HOOK_OWNED_KEYS`] line, and the hook's value is the only one written.
-/// With no resolvable branch (detached HEAD, no repo) NO `branch:` is written
-/// — the plan's is still dropped. Every other plan key (`next`, `pr`, `card`,
-/// `blocked`, free-form ones) is kept verbatim. Later lifecycle moves are
-/// edits to the persisted file, which this hook never re-renders.
+/// Two exceptions keep the plan's line (#1277 gate-2 m-2): a plan that says
+/// `status: blocked` stays blocked (the hook then writes no `status:`), since
+/// demoting a deliberately blocked plan to in-flight would hide the block;
+/// and with no resolvable branch (detached HEAD, no repo) the plan's own
+/// `branch:` is kept, the hook having no observed value to put there. Every
+/// other plan key (`next`, `pr`, `card`, `blocked`, free-form ones) is kept
+/// verbatim. Later lifecycle moves are edits to the persisted file, which
+/// this hook never re-renders.
 const APPROVAL_OWNED_KEYS: [&str; 3] = ["status", "updated", "branch"];
 
 /// The bare `key` of a `key:` line at column 0, or `None` for anything else
@@ -2356,18 +2361,23 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
         return format!("{}\n\n{body}\n", render_frontmatter(f));
     };
     let plan_block = &body[start..end];
+    let blocked_status = |line: &str| {
+        plan_line_key(line) == Some("status")
+            && line
+                .split_once(':')
+                .is_some_and(|(_, v)| v.trim().trim_matches(|c| c == '"' || c == '\'') == "blocked")
+    };
+    let plan_says_blocked = plan_block.lines().any(blocked_status);
+    let keep = |line: &str| match plan_line_key(line) {
+        Some(k) if HOOK_OWNED_KEYS.contains(&k) => false,
+        Some("status") => blocked_status(line),
+        Some("branch") => f.branch.is_none(),
+        Some(k) => !APPROVAL_OWNED_KEYS.contains(&k),
+        None => true,
+    };
     let mut lines = vec!["---".to_string()];
-    lines.extend(hook_frontmatter_lines(f));
-    lines.extend(
-        plan_block
-            .lines()
-            .filter(|line| {
-                !plan_line_key(line).is_some_and(|k| {
-                    HOOK_OWNED_KEYS.contains(&k) || APPROVAL_OWNED_KEYS.contains(&k)
-                })
-            })
-            .map(str::to_string),
-    );
+    lines.extend(hook_frontmatter_lines(f, plan_says_blocked));
+    lines.extend(plan_block.lines().filter(|l| keep(l)).map(str::to_string));
     lines.push("---".to_string());
     let rest = body[body_start..].trim_start_matches(['\r', '\n']);
     format!("{}\n\n{rest}\n", lines.join("\n"))
@@ -3534,18 +3544,21 @@ mod tests {
         );
         // Hook-owned lines first — `status`/`updated` are the hook's at
         // approval even though the plan declared `status: done` (#1256 M-1);
-        // the fixture resolves no branch, so the plan's `branch:` is dropped
-        // and none is written — then the plan's other lines verbatim.
+        // the fixture resolves no branch, so the plan's own `branch:` is kept
+        // (gate-2 m-2) — then the plan's other lines verbatim.
         assert!(doc.starts_with(
             "---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\nsession_id: \"own-sid\"\n"
         ));
         assert_eq!(doc.matches("\nstatus:").count(), 1, "{doc}");
         assert!(!doc.contains("status: done"), "{doc}");
-        assert!(!doc.contains("branch:"), "{doc}");
+        assert_eq!(doc.matches("\nbranch:").count(), 1, "{doc}");
         let (frontmatter, rest) = doc
             .split_once("---\n\n")
             .expect("closing fence + blank line");
-        assert!(frontmatter.ends_with("\nmachine: \"digest\"\nnext: \"ship it\"\n"));
+        assert!(
+            frontmatter.ends_with("\nmachine: \"digest\"\nnext: \"ship it\"\nbranch: feat/x\n"),
+            "{frontmatter}"
+        );
         assert_eq!(rest, "# Title\n\nbody text\n");
     }
 
@@ -3629,7 +3642,7 @@ mod tests {
     fn render_document_approval_owned_keys_table() {
         // (hook branch, plan block, must contain, must not contain)
         type Case<'a> = (Option<&'a str>, &'a str, &'a [&'a str], &'a [&'a str]);
-        let cases: [Case; 5] = [
+        let cases: [Case; 8] = [
             (
                 Some("feat/real"),
                 "status: done\nbranch: feat/never\nupdated: 1999-01-01\nnext: \"go\"",
@@ -3641,11 +3654,32 @@ mod tests {
                 ],
                 &["done", "feat/never", "1999"],
             ),
+            // Detached HEAD: the plan's own branch is kept, once (gate-2 m-2).
             (
                 None,
-                "branch: feat/never\npr: 12",
-                &["\npr: 12\n"],
-                &["branch:"],
+                "branch: feat/intended\npr: 12",
+                &["\nbranch: feat/intended\n", "\npr: 12\n"],
+                &[],
+            ),
+            // A plan that says blocked stays blocked; the hook adds no status.
+            (
+                Some("main"),
+                "status: blocked\nblocked: \"waiting on #1\"",
+                &["\nstatus: blocked\n", "\nblocked: \"waiting on #1\"\n"],
+                &["in-flight"],
+            ),
+            (
+                Some("main"),
+                "status: \"blocked\"",
+                &["\nstatus: \"blocked\"\n"],
+                &["in-flight"],
+            ),
+            // Anything else blocked-ish is still overridden.
+            (
+                Some("main"),
+                "status: blocked-ish\nstatus: done",
+                &["\nstatus: \"in-flight\"\n"],
+                &["blocked-ish", "done"],
             ),
             (
                 Some("main"),

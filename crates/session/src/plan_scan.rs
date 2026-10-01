@@ -152,13 +152,15 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
 /// YAML frontmatter block. One shared filter so the discipline can't drift
 /// between detectors.
 ///
-/// Comments: outside a fence, a line that opens `<!--` with no later `-->`
-/// starts a comment; every following line up to and INCLUDING the one
-/// carrying `-->` is skipped. A line that is wholly a comment (starts `<!--`)
-/// is skipped. Text before an opening `<!--` stays visible; text after a
-/// closing `-->` on the same line is dropped with it — skipping errs toward an
-/// unsettled verdict, the gate's conservative side. Frontmatter: a first line
-/// of exactly `---` with a later `---`/`...` line; an unclosed fence is prose.
+/// Comments follow CommonMark's HTML block (type 2): outside a fence, only a
+/// line whose `<!--` STARTS it (after at most 3 spaces of indent) opens one.
+/// That line, and — when it carries no `-->` after the opener — every
+/// following line up to and including the first carrying `-->`, is skipped;
+/// an unterminated opener runs to EOF, as it renders. A mid-line `<!--`
+/// (prose, inline code) renders as literal text and toggles nothing (#1277
+/// gate-2 I-1: treating it as an opener hid a visible `Panel:`/`Driver:`
+/// line). Text after a closing `-->` on the same line is dropped with it.
+/// Frontmatter: see [`leading_frontmatter_line_count`].
 pub(crate) fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
     visible_lines_after(body, leading_frontmatter_line_count(body))
 }
@@ -187,27 +189,57 @@ fn visible_lines_after(body: &str, skip: usize) -> impl Iterator<Item = &str> {
         if in_fence {
             return false;
         }
-        if let Some(open) = line.rfind("<!--") {
-            if !line[open..].contains("-->") {
-                in_comment = true;
-            }
-            if trimmed.starts_with("<!--") {
-                return false;
-            }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent <= 3
+            && let Some(after) = line.trim_start_matches(' ').strip_prefix("<!--")
+        {
+            in_comment = !after.contains("-->");
+            return false;
         }
         !line.starts_with('>')
     })
 }
 
 /// Lines (fences included) of a leading YAML frontmatter block, or 0.
+///
+/// A first line of exactly `---`, a later `---`/`...` close, and a body that
+/// reads as frontmatter: its first line a column-0 `key:` line, then only
+/// `key:` lines, indented continuation lines, `- ` items, or `#` comments —
+/// no blank line. Anything else (a line-1 `---` thematic break followed by a
+/// blank line and prose, #1277 gate-2 m-1) is not frontmatter, and its lines
+/// stay visible.
 fn leading_frontmatter_line_count(body: &str) -> usize {
     let mut lines = body.lines();
     if lines.next().map(str::trim_end) != Some("---") {
         return 0;
     }
-    lines
+    let Some(close) = lines
+        .clone()
         .position(|l| matches!(l.trim_end(), "---" | "..."))
-        .map_or(0, |close| close + 2)
+    else {
+        return 0;
+    };
+    let is_key = |l: &str| {
+        l.split_once(':').is_some_and(|(k, _)| {
+            !k.is_empty()
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    };
+    let mut block = lines.take(close);
+    let first_is_key = block.next().is_some_and(is_key);
+    let rest_ok = block.all(|l| {
+        !l.trim().is_empty()
+            && (is_key(l)
+                || l.starts_with([' ', '\t'])
+                || l.starts_with("- ")
+                || l.starts_with('#'))
+    });
+    if first_is_key && rest_ok {
+        close + 2
+    } else {
+        0
+    }
 }
 
 /// True when the plan body carries an `## Alternatives declined` heading at
@@ -1854,10 +1886,23 @@ mod tests {
                 false,
             ),
             ("# T\n\n<!-- Panel: none — one-line comment -->\n", false),
+            // A mid-line / inline-code `<!--` renders as text: no opener.
             (
-                "# T\n\nnote <!--\nPanel: none — opened mid-line\n-->\n",
-                false,
+                "# T\n\nnote <!--\nPanel: none — after a mid-line opener\n",
+                true,
             ),
+            (
+                "# Skip comments\n\nGoal: teach the scanner to skip `<!--` blocks.\n\n\
+                 Panel: none — docs-only change, no seat warranted\n",
+                true,
+            ),
+            (
+                "# T\n\nUse <!-- markers sparingly\n\nPanel: none — real reason\n",
+                true,
+            ),
+            // Line-start opener, indented up to 3 spaces; 4 is code.
+            ("# T\n\n   <!-- TODO\nPanel: none — hidden\n", false),
+            ("# T\n\n    <!-- code\nPanel: none — visible\n", true),
             // The line after a closed comment is visible again.
             ("# T\n\n<!--\nx\n-->\nPanel: none — real reason\n", true),
             // A `<!--` inside a fence is code, not a comment opener.
@@ -1867,6 +1912,19 @@ mod tests {
             (
                 "---\nstatus: x\n...\nPanel: none — after a `...` close\n",
                 true,
+            ),
+            // A line-1 `---` thematic break is not frontmatter (gate-2 m-1).
+            (
+                "---\n\n# T\n\nPanel: none — real reason\n\n---\n\n## Tasks\n",
+                true,
+            ),
+            (
+                "---\n# T\nPanel: none — first line is not a key\n---\n",
+                true,
+            ),
+            (
+                "---\nstatus: x\n  nested: y\n- item\nPanel: none — in fm\n---\n",
+                false,
             ),
             // An unclosed leading `---` is prose, not frontmatter.
             ("---\nPanel: none — no closing fence\n", true),
@@ -1881,6 +1939,15 @@ mod tests {
         for (body, want) in cases {
             assert_eq!(panel_line_settled(body), *want, "{body:?}");
         }
+        // gate-2 I-1: a mid-line `<!--` must not hide the Orchestrator block,
+        // so the Driver line wins over the legacy frontmatter fallback.
+        assert_eq!(
+            recommended_tier(
+                "---\nrecommended_model: haiku\n---\n\n# T\n\nGoal: skip `<!--` blocks.\n\n\
+                 ## Orchestrator\n\n**Driver:** opus\n\n## Tasks\n"
+            ),
+            Some(Tier::Opus)
+        );
         // The legacy reader still sees its frontmatter field.
         assert_eq!(
             legacy_recommended_model("---\nrecommended_model: sonnet\n---\n\n# T\n"),

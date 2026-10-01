@@ -150,10 +150,15 @@ pub fn run_lint_plan_shape(input: &HookInput) -> CheckResult {
         // `<config_dir>/plans` (a user-configured plans directory, another
         // CLAUDE_CONFIG_DIR) or unreadable inside it — means the one blocking
         // plan guard judged nothing. Record it in `failopen.jsonl`.
-        if let Some(path) = input.plan_file_path() {
-            let root = cadence_hooks_core::paths::claude_config_dir().join("plans");
-            log_unjudged(plan_store_miss(Path::new(path), &root));
-        }
+        // No plan text and no `planFilePath` at all is the same miss
+        // (#1277 gate-2 m-3).
+        log_unjudged(match input.plan_file_path() {
+            Some(path) => {
+                let root = cadence_hooks_core::paths::claude_config_dir().join("plans");
+                plan_store_miss(Path::new(path), &root)
+            }
+            None => "no-plan-text",
+        });
         return CheckResult::allow();
     };
     judge_plan_shape(&plan)
@@ -685,6 +690,21 @@ mod tests {
             !ledger.contains("custom-plans"),
             "no payload text: {ledger}"
         );
+
+        // Empty plan and no planFilePath: still a row (gate-2 m-3).
+        let bare = TempDir::new().unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "  "},
+        }))
+        .unwrap();
+        let r = crate::registry::test_metrics_env::with_metrics_dir(bare.path(), || {
+            run_lint_plan_shape(&input)
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        let ledger = fs::read_to_string(bare.path().join("failopen.jsonl")).unwrap();
+        assert!(ledger.contains("no-plan-text"), "{ledger}");
 
         // An inline plan is judged: no row.
         let judged = TempDir::new().unwrap();
