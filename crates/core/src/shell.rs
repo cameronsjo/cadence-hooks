@@ -9011,6 +9011,11 @@ fn emit_segment(
                     // shallower are skipped there rather than read twice.
                     {
                         let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
+                        let body = if kind == BodyKind::OpenProcSub {
+                            without_read_open_tail(&body, depth + 1)
+                        } else {
+                            std::borrow::Cow::Borrowed(body.as_str())
+                        };
                         expand_segments(&body, &mut scope, depth + 1, out, dedupe);
                     }
                 }
@@ -10744,6 +10749,28 @@ fn substitution_bodies_kinded(segment: &str) -> Vec<(String, BodyKind)> {
     let mut kinds = Vec::new();
     let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds), true);
     bodies.into_iter().zip(kinds).collect()
+}
+
+/// `body` cut where an unterminated substitution opens, when that
+/// substitution's whole reading was already read at `depth` or shallower by
+/// the pass through every `<(` ([`FlattenWork::through_read_by`]). Such a
+/// substitution runs to the end of the text, so everything after its opener
+/// is that reading, read already; reading it again inside the unclosed
+/// `<(`'s own body made one more full copy of a flood. An unterminated
+/// substitution is never evaluated into the surrounding command's words, so
+/// cutting it changes no reading of them. A bounded substitution is kept.
+fn without_read_open_tail(body: &str, depth: usize) -> std::borrow::Cow<'_, str> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut ranges = BodyRanges::default();
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut ranges), None, true);
+    let Some(&(start, end)) = ranges.hidden.last() else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    let tail: String = chars[start..end].iter().collect();
+    if end != chars.len() || !FlattenWork::through_read_by(&tail, depth) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    std::borrow::Cow::Owned(chars[..start].iter().collect())
 }
 
 /// The `$(…)` and backtick bodies of `text` with every `<(…)`/`>(…)` in it
