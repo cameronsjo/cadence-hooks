@@ -6014,7 +6014,7 @@ fn words_of(command: &str) -> impl Iterator<Item = String> {
 }
 
 /// The word a segment runs, past reserved words, group openers, `!`,
-/// assignment prefixes and redirections.
+/// assignment prefixes, redirections and runner words (`builtin eval`).
 fn segment_head(tokens: &[String]) -> Option<String> {
     let tokens = without_redirections(strip_leading_keywords(tokens));
     tokens
@@ -6024,6 +6024,7 @@ fn segment_head(tokens: &[String]) -> Option<String> {
             !t.is_empty()
                 && t != "!"
                 && !is_assignment_word(t)
+                && !STDIN_SHELL_RUNNERS.contains(&t.as_str())
                 && !matches!(
                     t.as_str(),
                     "then" | "do" | "else" | "if" | "while" | "until"
@@ -13672,6 +13673,7 @@ mod deferred_read_tests {
                 "echo 'cat .env' | script -qc bash /dev/null",
                 "echo 'cat .env' | while read l; do eval \"$l\"; done",
                 "echo 'cat .env' | while read -r l; do $l; done",
+                "echo 'cat .env' | builtin eval \"$(cat)\"",
                 "bash <(echo 'cat .env')",
                 "source <(echo 'cat .env')",
                 "echo 'cat .env' > s.sh; bash s.sh",
