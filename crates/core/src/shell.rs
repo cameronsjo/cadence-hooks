@@ -499,11 +499,97 @@ enum Backslashes {
 ///
 /// Token boundaries, brace expansion and the compound-head strips are those
 /// of [`tokenize`]: only the text of a quoted backslash differs.
+#[cfg(test)]
 fn tokenize_script_words(command: &str) -> Vec<String> {
-    tokenize_marked_in(command, Backslashes::Escaped)
-        .into_iter()
-        .map(|token| token.text)
-        .collect()
+    tokenize_pair(command).1.clone()
+}
+
+/// [`tokenize`] and [`tokenize_script_words`] of one command, from one walk
+/// per spelling and ONE charge to the thread's brace budget, cached for the
+/// thread (cameronsjo/cadence-hooks#1231 review C1/C2).
+///
+/// **The second spelling must cost the budget nothing.** Re-tokenizing a
+/// segment for it spent the whole per-call cap again on an overflowing word,
+/// so a few padding words (`: {1..4096}{1..4} a\b; {git,reset,--hard}`)
+/// exhausted the thread budget sooner and a later brace-spelled command was
+/// left whole, unread. The escaped word is expanded only where the as-typed
+/// word expanded under the budget, with a call-local allowance of its own:
+/// the two differ only in quoted backslashes, which are never brace syntax,
+/// so the work is the same and is already bounded by the charge.
+///
+/// The cache keeps the last few commands, so the wrapper hunt reading a
+/// segment both ways, and a guard tokenizing it again, walk it once.
+fn tokenize_pair(command: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
+    const KEEP: usize = 8;
+    thread_local! {
+        static PAIRS: std::cell::RefCell<Vec<(String, std::rc::Rc<(Vec<String>, Vec<String>)>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(hit) = PAIRS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let at = cache.iter().position(|(key, _)| key == command)?;
+        let entry = cache.remove(at);
+        let hit = entry.1.clone();
+        cache.push(entry);
+        Some(hit)
+    }) {
+        return hit;
+    }
+    let pair = std::rc::Rc::new(tokenize_pair_uncached(command));
+    PAIRS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= KEEP {
+            cache.remove(0);
+        }
+        cache.push((command.to_string(), pair.clone()));
+    });
+    pair
+}
+
+fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
+    let mut typed_raw: Vec<(String, Vec<bool>)> = Vec::new();
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
+        typed_raw.push((text, flags.to_vec()));
+        true
+    });
+    let mut script_raw: Vec<(String, Vec<bool>)> = Vec::new();
+    walk_words(command, Backslashes::Escaped, &mut |text, flags, _, _| {
+        script_raw.push((text, flags.to_vec()));
+        true
+    });
+    let aligned = script_raw.len() == typed_raw.len();
+    let mut typed = Vec::with_capacity(typed_raw.len());
+    let mut script = Vec::with_capacity(typed_raw.len());
+    with_brace_budget(|budget| {
+        for (at, (text, flags)) in typed_raw.into_iter().enumerate() {
+            let escaped = aligned.then(|| &script_raw[at]);
+            match brace_expand_word(&text, &flags, budget) {
+                BraceExpansion::Expanded(words) => {
+                    let mine = match escaped {
+                        Some((escaped, escaped_flags)) if *escaped != text => {
+                            let mut local = BraceBudget {
+                                bytes: MAX_BRACE_CALL_BYTES,
+                                words: MAX_BRACE_CALL_WORDS,
+                            };
+                            match brace_expand_word(escaped, escaped_flags, &mut local) {
+                                BraceExpansion::Expanded(mine) if mine.len() == words.len() => mine,
+                                _ => words.clone(),
+                            }
+                        }
+                        _ => words.clone(),
+                    };
+                    typed.extend(words);
+                    script.extend(mine);
+                }
+                BraceExpansion::Unchanged | BraceExpansion::Overflow => {
+                    script
+                        .push(escaped.map_or_else(|| text.clone(), |(escaped, _)| escaped.clone()));
+                    typed.push(text);
+                }
+            }
+        }
+    });
+    (typed, script)
 }
 
 fn tokenize_marked_in(command: &str, backslashes: Backslashes) -> Vec<MarkedToken> {
@@ -2114,7 +2200,7 @@ pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
 /// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
 /// nothing removed here is a word the shell executes.
 pub fn executable_tokens(segment: &str) -> Vec<String> {
-    executable_tokens_from(tokenize(strip_group_wrappers(segment)))
+    executable_token_pair(segment).0.clone()
 }
 
 /// [`executable_tokens`] in [`tokenize_script_words`]' spelling: the same
@@ -2122,10 +2208,39 @@ pub fn executable_tokens(segment: &str) -> Vec<String> {
 /// [`unescape_word`] a script extractor applies yields the word bash builds.
 /// Every wrapper hunt reads these (cameronsjo/cadence-hooks#1231).
 pub fn executable_script_tokens(segment: &str) -> Vec<String> {
-    executable_tokens_from(tokenize_script_words(strip_group_wrappers(segment)))
+    executable_token_pair(segment).1.clone()
 }
 
-fn executable_tokens_from(mut tokens: Vec<String>) -> Vec<String> {
+/// [`executable_tokens`] and [`executable_script_tokens`] of one segment,
+/// aligned word for word, from one [`tokenize_pair`] (one brace-budget charge,
+/// cached). The compound-head strips drop leading words and peel a leading
+/// `(`/`{` off the head; the script spelling drops and peels the same.
+pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<(Vec<String>, Vec<String>)>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = LAST.with(|last| {
+        last.borrow()
+            .as_ref()
+            .filter(|(key, _)| key == segment)
+            .map(|(_, pair)| pair.clone())
+    }) {
+        return hit;
+    }
+    let pair = tokenize_pair(strip_group_wrappers(segment));
+    let (typed, script) = (pair.0.clone(), pair.1.clone());
+    let script_aligned = script.len() == typed.len();
+    let (typed, script) = executable_tokens_from(typed, script_aligned.then_some(script));
+    let pair = std::rc::Rc::new((typed.clone(), script.unwrap_or(typed)));
+    LAST.with(|last| *last.borrow_mut() = Some((segment.to_string(), pair.clone())));
+    pair
+}
+
+fn executable_tokens_from(
+    mut tokens: Vec<String>,
+    mut script: Option<Vec<String>>,
+) -> (Vec<String>, Option<Vec<String>>) {
     loop {
         let window = strip_compound_heads(&tokens);
         // A group opener that survived because a keyword sat in front of it at
@@ -2137,18 +2252,27 @@ fn executable_tokens_from(mut tokens: Vec<String>) -> Vec<String> {
             .filter(|rest| !rest.is_empty())
             .map(str::to_string)
         {
+            let dropped = tokens.len() - window.len();
             let mut next = Vec::with_capacity(window.len());
             next.push(head);
             next.extend_from_slice(&window[1..]);
             tokens = next;
+            script = script.and_then(|mut words| {
+                let mut words = words.split_off(dropped);
+                let first = words.first_mut()?;
+                first.starts_with(['(', '{']).then(|| first.remove(0))?;
+                Some(words)
+            });
             continue;
         }
         // Every pass either drops a token or a character, so a pass that does
         // neither is the fixpoint.
         if window.len() == tokens.len() {
-            return tokens;
+            return (tokens, script);
         }
+        let dropped = tokens.len() - window.len();
         tokens = window.to_vec();
+        script = script.map(|mut words| words.split_off(dropped));
     }
 }
 
@@ -9597,25 +9721,19 @@ fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> 
 /// transparent prefixes stripped) in [`executable_script_tokens`]' spelling,
 /// so a wrapper's script is unescaped once (cameronsjo/cadence-hooks#1231).
 ///
-/// The two spellings differ only in the backslashes of quoted text, so a tail
-/// of the script tokens that matches `argv` with every backslash ignored is
-/// the same words. Anything else (`argv` from another reading, an empty
-/// `segment`) keeps `argv` as given — the reading before this fix.
+/// Both spellings come from one [`executable_token_pair`], so a tail of the
+/// as-typed words equal to `argv` names the same words in the script
+/// spelling. Anything else (`argv` from another reading, an empty `segment`,
+/// no quoted backslash) keeps `argv` as given — the reading before this fix.
 fn script_tokens_of(argv: &[String], segment: &str) -> Option<Vec<String>> {
     if segment.is_empty() || !argv.iter().any(|word| word.contains('\\')) {
         return None;
     }
-    let tokens = executable_script_tokens(segment);
-    let tail = tokens.get(tokens.len().checked_sub(argv.len())?..)?;
-    let same = |a: &str, b: &str| {
-        a.chars()
-            .filter(|&c| c != '\\')
-            .eq(b.chars().filter(|&c| c != '\\'))
-    };
-    tail.iter()
-        .zip(argv)
-        .all(|(script, word)| same(script, word))
-        .then(|| tail.to_vec())
+    let pair = executable_token_pair(segment);
+    let (typed, script) = (&pair.0, &pair.1);
+    let from = typed.len().checked_sub(argv.len())?;
+    let tail = script.get(from..)?;
+    (typed[from..] == *argv && tail != argv).then(|| tail.to_vec())
 }
 
 /// Push `text` onto `out` when it carries anything but whitespace.
@@ -12622,11 +12740,12 @@ fn eval_script(operands: &[String], view: Backslashes) -> Option<String> {
         let [only] = segments.as_slice() else {
             break;
         };
-        let tokens: Vec<String> = tokenize_marked_in(only, view)
-            .into_iter()
-            .map(|token| token.text)
-            .collect();
-        let argv = peel_command_runners(strip_compound_heads(&tokens));
+        let pair = tokenize_pair(only);
+        let tokens = match view {
+            Backslashes::AsTyped => &pair.0,
+            Backslashes::Escaped => &pair.1,
+        };
+        let argv = peel_command_runners(strip_compound_heads(tokens));
         if argv
             .first()
             .is_none_or(|first| command_word(first) != "eval")
@@ -12732,19 +12851,15 @@ pub fn segment_scripts(segment: &str) -> Vec<String> {
 }
 
 fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<String> {
-    let mut out = wrapped_scripts_reading(
-        &executable_script_tokens(segment),
-        git_exec_too,
-        Backslashes::Escaped,
-    );
-    if segment.contains('\\') {
+    let pair = executable_token_pair(segment);
+    let (typed, script) = (&pair.0, &pair.1);
+    let mut out = wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped);
+    // The spellings differ only where `'…'` made a backslash literal; with
+    // none, the second reading is the first.
+    if script != typed {
         merge_scripts(
             &mut out,
-            wrapped_scripts_reading(
-                &executable_tokens(segment),
-                git_exec_too,
-                Backslashes::AsTyped,
-            ),
+            wrapped_scripts_reading(typed, git_exec_too, Backslashes::AsTyped),
         );
     }
     out
@@ -13155,7 +13270,10 @@ const GIT_EXEC_ENV: &[&str] = &[
 /// as an invocation whose push cannot be resolved, never parsed
 /// (cameronsjo/cadence-hooks#1231). See [`is_exec_valued_config`].
 ///
-/// An empty value and a pager of exactly `cat` run nothing of the
+/// The environment spellings of `-c` (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+/// `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`), a `GIT_ALLOW_PROTOCOL`
+/// naming `ext`, and a `-c` key that is an expansion count whatever their
+/// value. An empty value and a pager of exactly `cat` run nothing of the
 /// command's choosing, and are not counted. An editor is read as a script by
 /// [`editor_scripts`], so it is not counted here either.
 fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
@@ -13163,9 +13281,20 @@ fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
     let env = prefix.iter().any(|word| {
         let word = unescape_word(word);
         word.split_once('=').is_some_and(|(name, value)| {
-            GIT_EXEC_ENV.contains(&name)
-                && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
-                && !value.is_empty()
+            // `NAME+=value` appends, so the value is not the whole setting.
+            let name = name.strip_suffix('+').unwrap_or(name);
+            // The `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` triple and
+            // `GIT_CONFIG_PARAMETERS` are `-c` spelled as the environment: any
+            // key at all, so any value counts.
+            name == "GIT_CONFIG_COUNT"
+                || name == "GIT_CONFIG_PARAMETERS"
+                || name.starts_with("GIT_CONFIG_KEY_")
+                || name.starts_with("GIT_CONFIG_VALUE_")
+                // `ext` among the allowed protocols runs a URL as a command.
+                || (name == "GIT_ALLOW_PROTOCOL" && value.to_ascii_lowercase().contains("ext"))
+                || (GIT_EXEC_ENV.contains(&name)
+                    && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
+                    && !value.is_empty())
         })
     });
     if env {
@@ -13188,7 +13317,10 @@ fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
         };
         // `-c key` with no `=` sets a boolean true.
         let (key, value) = setting.split_once('=').unwrap_or((&setting, "true"));
-        if is_exec_valued_config(key, if from_env { None } else { Some(value) }) {
+        // A key that is an expansion (`-c "$K=x"`) may be any key.
+        if key.contains(['$', '`'])
+            || is_exec_valued_config(key, if from_env { None } else { Some(value) })
+        {
             return true;
         }
     }
@@ -13204,7 +13336,7 @@ fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
 /// `diff.external`, `core.askPass`, `core.gitProxy`, a diff driver's
 /// `textconv`, a merge driver, a filter's `clean`/`smudge`/`process`,
 /// `uploadpack.packObjectsHook`, a remote's `uploadpack`/`receivepack`/`vcs`,
-/// and a `protocol.allow`/`protocol.<name>.allow` that is not `never`
+/// `interactive.diffFilter`, and a `protocol.allow`/`protocol.<name>.allow` that is not `never`
 /// (`ext::` runs its URL as a command). Names compare lowercased, as git's
 /// do. A config file the command names (`include.path`, `GIT_CONFIG_GLOBAL`)
 /// is not read, like every other config file.
@@ -13235,6 +13367,7 @@ fn is_exec_valued_config(key: &str, value: Option<&str>) -> bool {
             return value.is_none_or(|value| !(value.is_empty() || is_bool(value)));
         }
         ("core", "askpass" | "gitproxy")
+        | ("interactive", "difffilter")
         | ("diff", "external" | "textconv")
         | ("merge", "driver")
         | ("filter", "clean" | "smudge" | "process")

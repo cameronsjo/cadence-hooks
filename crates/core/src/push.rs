@@ -962,15 +962,19 @@ fn collect_push_invocations(
                     out,
                 );
             }
-        } else if segment.contains("push")
+        } else if (segment.contains("push") || segment.contains("git"))
             && child_scripts_but_git_exec(argv, segment)
                 .iter()
                 .any(|child| {
-                    crate::shell::command_segments(child)
-                        .iter()
-                        .any(|inner| !crate::shell::git_push_segments(inner).is_empty())
+                    crate::shell::command_segments(child).iter().any(|inner| {
+                        !crate::shell::git_push_segments(inner).is_empty()
+                            || crate::shell::runs_a_git_exec(inner)
+                    })
                 })
         {
+            // So is a git command past the bound that runs a command of its
+            // own or sets one (`GIT_SSH_COMMAND=… git fetch`), which the walk
+            // would otherwise refuse (cameronsjo/cadence-hooks#1231 review I1).
             // Past the depth bound the children are not walked, but a push
             // in one still runs: `cat <(echo $(echo $(echo $(git push origin
             // main))))` nests it one level past what this walk follows
@@ -981,27 +985,34 @@ fn collect_push_invocations(
         // The exec values are scripts, read as bash builds them (a backslash
         // `'…'` made literal survives the one unescape a value gets) and as
         // before (cameronsjo/cadence-hooks#1231, see `segment_scripts`).
-        let exec = match git_exec(&tokens) {
-            Some(mut exec) if tokens.iter().any(|word| word.contains('\\')) => {
-                if let Some(built) = git_exec(&crate::shell::executable_script_tokens(segment)) {
-                    let mut scripts = built.scripts;
-                    for script in std::mem::take(&mut exec.scripts) {
-                        if !scripts.contains(&script) {
-                            scripts.push(script);
-                        }
-                    }
-                    exec.scripts = scripts;
-                    exec.opaque |= built.opaque;
-                    exec.elsewhere |= built.elsewhere;
+        // The script spelling's scripts are the ones counted against the
+        // cap; the as-typed reading's that differ are walked beside them, so
+        // one exec value is never counted twice (#1231 review I2).
+        let pair = crate::shell::executable_token_pair(segment);
+        let (exec, alternates) = if pair.1 != pair.0 {
+            match (git_exec(&pair.1), git_exec(&tokens)) {
+                (Some(mut built), typed) => {
+                    let alternates = typed.map_or_else(Vec::new, |typed| {
+                        built.opaque |= typed.opaque;
+                        built.elsewhere |= typed.elsewhere;
+                        typed
+                            .scripts
+                            .into_iter()
+                            .filter(|script| !built.scripts.contains(script))
+                            .collect()
+                    });
+                    (Some(built), alternates)
                 }
-                Some(exec)
+                (None, typed) => (typed, Vec::new()),
             }
-            exec => exec,
+        } else {
+            (git_exec(&tokens), Vec::new())
         };
         if let Some(exec) = exec {
             collect_git_exec_pushes(
                 argv,
                 &exec,
+                &alternates,
                 &segment_dir,
                 depth,
                 Doubt {
@@ -1243,6 +1254,7 @@ const MAX_GIT_EXEC_SCRIPTS: usize = 16;
 fn collect_git_exec_pushes(
     argv: &[String],
     exec: &GitExec,
+    alternates: &[String],
     segment_dir: &str,
     depth: usize,
     inherited: Doubt,
@@ -1305,6 +1317,7 @@ fn collect_git_exec_pushes(
         || exec
             .scripts
             .iter()
+            .chain(alternates)
             .any(|script| unreadable(script) || runs_an_outer_alias(script))
     {
         out.push(unresolvable_push(&work_dir, doubt.directory));
@@ -1312,7 +1325,7 @@ fn collect_git_exec_pushes(
     if depth >= MAX_WRAPPER_DEPTH || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS {
         return;
     }
-    for script in &exec.scripts {
+    for script in exec.scripts.iter().chain(alternates) {
         collect_push_invocations(script, &work_dir, depth + 1, doubt, walk, writes, out);
     }
 }
