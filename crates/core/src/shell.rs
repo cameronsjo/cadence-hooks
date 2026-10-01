@@ -8969,16 +8969,11 @@ fn emit_segment(
                     // holds was already read by the pass below at a
                     // shallower level; a nested unclosed `<(` there repeats
                     // that pass on most of the same text, once per level.
-                    //
-                    // At the bound the pass would only list what the body's
-                    // own reading lists at the same level, so it is skipped
-                    // there.
-                    let through = depth + 1 < MAX_WRAPPER_DEPTH
-                        && match kind {
-                            BodyKind::Plain => false,
-                            BodyKind::ProcSub => true,
-                            BodyKind::OpenProcSub => !OpenProcSubRead::active(),
-                        };
+                    let through = match kind {
+                        BodyKind::Plain => false,
+                        BodyKind::ProcSub => true,
+                        BodyKind::OpenProcSub => !OpenProcSubRead::active(),
+                    };
                     // Past the free levels a nested `<(` spends one, so the
                     // `$(…)`s inside are also read where they sat before
                     // bodies were surfaced: one pass through every `<(` to
