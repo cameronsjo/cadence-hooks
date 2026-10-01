@@ -468,6 +468,45 @@ impl LeadRun {
 /// never disagree about where a token ends (cadence-hooks#237 security review,
 /// F25).
 pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
+    tokenize_marked_in(command, Backslashes::AsTyped)
+}
+
+/// What [`walk_words`] writes for a backslash that quoting made literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backslashes {
+    /// As typed: `'a\b'` is the text `a\b`. What every consumer of
+    /// [`tokenize`] reads.
+    AsTyped,
+    /// Escaped, so that ONE [`unescape_word`] of the text is the word bash
+    /// builds: `'a\b'` is `a\\b`, while an unquoted escape (`a\ b`) and a
+    /// `"…"` escape bash removes (`"\$x"`) stay a single backslash, and a
+    /// `"…"` line continuation is dropped. See [`tokenize_script_words`].
+    Escaped,
+}
+
+/// [`tokenize`], in the spelling a script extractor unescapes exactly once.
+///
+/// **The tokenizer is the only place that knows which backslashes quoting
+/// made literal**, so it is where quote removal is decided, once
+/// (cameronsjo/cadence-hooks#1231). Every script extractor
+/// ([`shell_c_argument_tokens`], [`eval_script`], [`trap_action`], a git exec
+/// value, …) applies [`unescape_word`] to the word it hands back as a script,
+/// which is right for an unquoted escape (`bash -c cat\ .env`) and wrong for
+/// a backslash inside `'…'`: on [`tokenize`]'s text `bash -c 'bash -c "bash
+/// -c \"git push origin main\""'` lost the escapes one level early, the
+/// third level read `bash -c git`, and the push reached no guard. Read from
+/// these words, each level's script is the word bash hands the shell.
+///
+/// Token boundaries, brace expansion and the compound-head strips are those
+/// of [`tokenize`]: only the text of a quoted backslash differs.
+fn tokenize_script_words(command: &str) -> Vec<String> {
+    tokenize_marked_in(command, Backslashes::Escaped)
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+fn tokenize_marked_in(command: &str, backslashes: Backslashes) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
     // One expansion budget for the whole call, drawn from the thread's
     // budget, so neither a command of many small exploding words nor a guard
@@ -477,6 +516,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     with_brace_budget(|budget| {
         walk_words(
             command,
+            backslashes,
             &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
                 push_expanded_token(
                     &mut tokens,
@@ -497,7 +537,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
 /// with its per-byte structural flags (see [`walk_words`]).
 fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
     let mut words = Vec::new();
-    walk_words(command, &mut |text, flags, _, _| {
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
         words.push((text, flags.to_vec()));
         true
     });
@@ -510,7 +550,7 @@ fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
 /// deep (50 KB) take seconds, past the hook deadline (PR #1118 review).
 fn first_raw_word(command: &str) -> Option<(String, Vec<bool>)> {
     let mut first = None;
-    walk_words(command, &mut |text, flags, _, _| {
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
         first = Some((text, flags.to_vec()));
         false
     });
@@ -525,7 +565,8 @@ type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) -> bool + 'a;
 /// The single tokenizer walk behind [`tokenize_marked`] and [`raw_words`]:
 /// calls `emit(text, structural, unquoted_prefix_len, expanding_prefix_len)`
 /// once per finished word, quotes removed.
-fn walk_words(command: &str, emit: &mut WordSink<'_>) {
+fn walk_words(command: &str, backslashes: Backslashes, emit: &mut WordSink<'_>) {
+    let escaped_mode = backslashes == Backslashes::Escaped;
     let mut current = String::new();
     let mut in_token = false;
     // `None` until this token's first quoting construct; then the byte length
@@ -594,6 +635,9 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     quote = None;
                     lead.close(current.len());
                 } else {
+                    if escaped_mode && c == '\\' {
+                        current.push('\\');
+                    }
                     current.push(c);
                 }
             }
@@ -605,7 +649,12 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 // one harmless `echo` (cadence-hooks#1089 review).
                 if c == '\\' {
                     if let Some(escaped) = chars.next() {
+                        let from = current.len();
                         decode_ansi_c_escape(escaped, &mut chars, &mut current, &mut ansi_c_nul);
+                        if escaped_mode && current[from..].contains('\\') {
+                            let decoded = current.split_off(from).replace('\\', "\\\\");
+                            current.push_str(&decoded);
+                        }
                     }
                     continue;
                 }
@@ -621,7 +670,26 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 // Inside `"…"`, `\` escapes `"` and `\` — so an escaped quote
                 // is content and must not end the string.
                 if c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
-                    current.push(chars.next().expect("peeked"));
+                    let escaped = chars.next().expect("peeked");
+                    if escaped_mode && escaped == '\\' {
+                        current.push('\\');
+                    }
+                    current.push(escaped);
+                    continue;
+                }
+                // bash also removes the backslash before `$`, a backtick and
+                // a newline (a line continuation, dropped whole). As typed,
+                // the backslash stays for the callers that unescape; escaped,
+                // it is the one escape they remove, and any other backslash
+                // in `"…"` is literal.
+                if escaped_mode && c == '\\' {
+                    match chars.peek() {
+                        Some('\n') => {
+                            chars.next();
+                        }
+                        Some('$' | '`') => current.push(c),
+                        _ => current.push_str("\\\\"),
+                    }
                     continue;
                 }
                 if c == '"' {
@@ -2046,7 +2114,18 @@ pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
 /// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
 /// nothing removed here is a word the shell executes.
 pub fn executable_tokens(segment: &str) -> Vec<String> {
-    let mut tokens = tokenize(strip_group_wrappers(segment));
+    executable_tokens_from(tokenize(strip_group_wrappers(segment)))
+}
+
+/// [`executable_tokens`] in [`tokenize_script_words`]' spelling: the same
+/// tokens, with each backslash quoting made literal escaped, so the single
+/// [`unescape_word`] a script extractor applies yields the word bash builds.
+/// Every wrapper hunt reads these (cameronsjo/cadence-hooks#1231).
+pub fn executable_script_tokens(segment: &str) -> Vec<String> {
+    executable_tokens_from(tokenize_script_words(strip_group_wrappers(segment)))
+}
+
+fn executable_tokens_from(mut tokens: Vec<String>) -> Vec<String> {
     loop {
         let window = strip_compound_heads(&tokens);
         // A group opener that survived because a keyword sat in front of it at
@@ -5080,7 +5159,7 @@ pub fn ships_in_cd_wrappers(command: &str, dir: &str) -> Vec<ShipSegment> {
 fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Vec<ShipSegment>) {
     const MAX_DEPTH: usize = 4;
     for segment in split_segments(command) {
-        let tokens = executable_tokens(strip_group_wrappers(&segment));
+        let tokens = executable_script_tokens(strip_group_wrappers(&segment));
         let Some(script) = shell_c_argument_tokens(&tokens) else {
             continue;
         };
@@ -8873,8 +8952,8 @@ fn emit_reading(
         return;
     }
     if depth < MAX_WRAPPER_DEPTH {
-        let known = wrapped_scripts(&executable_tokens(original));
-        for script in wrapped_scripts(&executable_tokens(&reading)) {
+        let known = wrapped_scripts(&executable_script_tokens(original));
+        for script in wrapped_scripts(&executable_script_tokens(&reading)) {
             if known.contains(&script) {
                 continue;
             }
@@ -9048,8 +9127,9 @@ fn emit_segment(
     let mut whole = Vec::new();
     let scripts = if depth < MAX_WRAPPER_DEPTH {
         if dedupe {
-            let mut scripts =
-                wrapped_scripts(&executable_tokens(&mark_expanded_substitutions(&segment)));
+            let mut scripts = wrapped_scripts(&executable_script_tokens(
+                &mark_expanded_substitutions(&segment),
+            ));
             scripts.retain(|script| {
                 let only = is_only_an_expanded_substitution(script);
                 if only {
@@ -9059,7 +9139,7 @@ fn emit_segment(
             });
             scripts
         } else {
-            wrapped_scripts(&executable_tokens(&segment))
+            wrapped_scripts(&executable_script_tokens(&segment))
         }
     } else {
         Vec::new()
@@ -9106,7 +9186,7 @@ fn emit_segment(
 /// expansion; out of allowance, a script is listed whole.
 fn scripts_past_the_bound(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for script in wrapped_scripts(&executable_tokens(segment)) {
+    for script in wrapped_scripts(&executable_script_tokens(segment)) {
         if ExpansionWork::charge(script.len()) {
             out.extend(split_segments(&script).into_iter().map(unmark));
         } else {
@@ -9217,7 +9297,7 @@ fn list_unwrapped(work: &mut FlattenWork, fragment: String, out: &mut Vec<String
                 if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
                     continue;
                 }
-                next.extend(wrapped_scripts(&executable_tokens(&segment)));
+                next.extend(wrapped_scripts(&executable_script_tokens(&segment)));
                 out.push(segment);
             }
         }
@@ -9250,7 +9330,7 @@ fn list_level(
             continue;
         }
         let scripts = if unwrap {
-            wrapped_scripts(&executable_tokens(&segment))
+            wrapped_scripts(&executable_script_tokens(&segment))
         } else {
             Vec::new()
         };
@@ -9470,10 +9550,12 @@ pub fn child_scripts_but_git_exec(argv: &[String], segment: &str) -> Vec<String>
 }
 
 fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> Vec<String> {
+    let script_argv = script_tokens_of(argv, segment);
+    let argv = script_argv.as_deref().unwrap_or(argv);
     let mut out = wrapped_scripts_reading(argv, git_exec_too);
     if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
         let marked = wrapped_scripts_reading(
-            &executable_tokens(&mark_expanded_substitutions(segment)),
+            &executable_script_tokens(&mark_expanded_substitutions(segment)),
             git_exec_too,
         );
         let aligned = marked.len() == out.len()
@@ -9490,6 +9572,31 @@ fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> 
     }
     out.extend(substitution_bodies(segment));
     out
+}
+
+/// The caller's `argv` (a tail of [`executable_tokens`] of `segment`, its
+/// transparent prefixes stripped) in [`executable_script_tokens`]' spelling,
+/// so a wrapper's script is unescaped once (cameronsjo/cadence-hooks#1231).
+///
+/// The two spellings differ only in the backslashes of quoted text, so a tail
+/// of the script tokens that matches `argv` with every backslash ignored is
+/// the same words. Anything else (`argv` from another reading, an empty
+/// `segment`) keeps `argv` as given — the reading before this fix.
+fn script_tokens_of(argv: &[String], segment: &str) -> Option<Vec<String>> {
+    if segment.is_empty() || !argv.iter().any(|word| word.contains('\\')) {
+        return None;
+    }
+    let tokens = executable_script_tokens(segment);
+    let tail = tokens.get(tokens.len().checked_sub(argv.len())?..)?;
+    let same = |a: &str, b: &str| {
+        a.chars()
+            .filter(|&c| c != '\\')
+            .eq(b.chars().filter(|&c| c != '\\'))
+    };
+    tail.iter()
+        .zip(argv)
+        .all(|(script, word)| same(script, word))
+        .then(|| tail.to_vec())
 }
 
 /// Push `text` onto `out` when it carries anything but whitespace.
@@ -11566,7 +11673,7 @@ fn parameter_word_end(
 /// (#528 review E).
 #[cfg(test)]
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&executable_tokens(segment))
+    shell_c_argument_tokens(&executable_script_tokens(segment))
 }
 
 /// Verbs that run the command following their OWN options. `sudo` and `xargs`
@@ -12494,7 +12601,7 @@ fn eval_script(operands: &[String]) -> Option<String> {
         let [only] = segments.as_slice() else {
             break;
         };
-        let tokens = tokenize(only);
+        let tokens = tokenize_script_words(only);
         let argv = peel_command_runners(strip_compound_heads(&tokens));
         if argv
             .first()
@@ -13588,7 +13695,7 @@ fn filter_branch_scripts(args: &[String]) -> Vec<String> {
 pub fn runs_a_git_exec(command: &str) -> bool {
     command_segments(command)
         .iter()
-        .any(|segment| git_exec(&executable_tokens(segment)).is_some())
+        .any(|segment| git_exec(&executable_script_tokens(segment)).is_some())
 }
 
 /// Whether `script` runs a command whose name is an expansion — `$CMD`,

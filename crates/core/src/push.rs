@@ -978,7 +978,15 @@ fn collect_push_invocations(
             // this walk cannot place, so fail-closed callers refuse it.
             out.push(unresolvable_push(&segment_dir, segment_directory));
         }
-        if let Some(exec) = git_exec(&tokens) {
+        // The exec values are scripts, so they are read from the tokenizer's
+        // script spelling: a backslash `'…'` made literal survives the one
+        // unescape a value gets (cameronsjo/cadence-hooks#1231).
+        let exec_tokens = if tokens.iter().any(|word| word.contains('\\')) {
+            Cow::Owned(crate::shell::executable_script_tokens(segment))
+        } else {
+            Cow::Borrowed(tokens.as_slice())
+        };
+        if let Some(exec) = git_exec(&exec_tokens) {
             collect_git_exec_pushes(
                 argv,
                 &exec,
