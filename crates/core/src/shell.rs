@@ -8983,6 +8983,7 @@ fn emit_segment(
                     // `$(…)`s inside are also read where they sat before
                     // bodies were surfaced: one pass through every `<(` to
                     // them, each read at this segment's next level.
+                    let mut read_tail: Option<usize> = None;
                     if through
                         && FlattenWork::first_through_read(&body, depth)
                         && ExpansionWork::charge(body.len())
@@ -8992,31 +8993,47 @@ fn emit_segment(
                             if dedupe && inner.starts_with(EXPANDED_MARK) {
                                 continue;
                             }
-                            if !FlattenWork::first_through_read(&inner, depth + 1) {
-                                continue;
+                            if FlattenWork::first_through_read(&inner, depth + 1) {
+                                if !FlattenWork::charge_through(inner.len()) {
+                                    // Past the allowance the body is still
+                                    // listed as written, not evaluated; a
+                                    // guard that arms the expansion
+                                    // allowance refuses.
+                                    ExpansionWork::exhaust();
+                                    break;
+                                }
+                                let mut scope = assignments.child();
+                                expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
                             }
-                            if !FlattenWork::charge_through(inner.len()) {
-                                // Past the allowance the body is still listed
-                                // as written, not evaluated; a guard that
-                                // arms the expansion allowance refuses.
-                                ExpansionWork::exhaust();
-                                break;
+                            // Read now, or already at this level or above.
+                            if kind == BodyKind::OpenProcSub
+                                && inner.len() > read_tail.unwrap_or(0)
+                                && open_tail_of(&body, &inner)
+                            {
+                                read_tail = Some(inner.len());
                             }
-                            let mut scope = assignments.child();
-                            expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
                         }
                     }
                     // The body itself is read after that pass, so the
                     // `$(…)`s inside it that the pass already read one level
                     // shallower are skipped there rather than read twice.
+                    //
+                    // A `$(` the pass read that nothing in the body can close
+                    // (no `)` follows it) runs to the body's end, so that
+                    // whole tail is the reading the pass just read: the body
+                    // is read without it rather than as one more copy of a
+                    // flood. Text after a `)` is never cut — a substitution
+                    // the scanner only gave up on (its depth cap) may close
+                    // there, and what follows is then the body's own words.
+                    // An unclosed substitution is never evaluated into the
+                    // words around it, so the cut changes no reading of them.
                     {
                         let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
-                        let body = if kind == BodyKind::OpenProcSub {
-                            without_read_open_tail(&body, depth + 1)
-                        } else {
-                            std::borrow::Cow::Borrowed(body.as_str())
+                        let body = match read_tail {
+                            Some(len) => &body[..body.len() - len - 2],
+                            None => body.as_str(),
                         };
-                        expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+                        expand_segments(body, &mut scope, depth + 1, out, dedupe);
                     }
                 }
             }
@@ -10751,26 +10768,14 @@ fn substitution_bodies_kinded(segment: &str) -> Vec<(String, BodyKind)> {
     bodies.into_iter().zip(kinds).collect()
 }
 
-/// `body` cut where an unterminated substitution opens, when that
-/// substitution's whole reading was already read at `depth` or shallower by
-/// the pass through every `<(` ([`FlattenWork::through_read_by`]). Such a
-/// substitution runs to the end of the text, so everything after its opener
-/// is that reading, read already; reading it again inside the unclosed
-/// `<(`'s own body made one more full copy of a flood. An unterminated
-/// substitution is never evaluated into the surrounding command's words, so
-/// cutting it changes no reading of them. A bounded substitution is kept.
-fn without_read_open_tail(body: &str, depth: usize) -> std::borrow::Cow<'_, str> {
-    let chars: Vec<char> = body.chars().collect();
-    let mut ranges = BodyRanges::default();
-    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut ranges), None, true);
-    let Some(&(start, end)) = ranges.hidden.last() else {
-        return std::borrow::Cow::Borrowed(body);
-    };
-    let tail: String = chars[start..end].iter().collect();
-    if end != chars.len() || !FlattenWork::through_read_by(&tail, depth) {
-        return std::borrow::Cow::Borrowed(body);
-    }
-    std::borrow::Cow::Owned(chars[..start].iter().collect())
+/// Whether `inner` is the reading of a `$(` in `body` that nothing after it
+/// can close: `body` ends `$(` + `inner`, and `inner` holds no `)`.
+fn open_tail_of(body: &str, inner: &str) -> bool {
+    !inner.is_empty()
+        && !inner.contains(')')
+        && body.len() >= inner.len() + 2
+        && body.ends_with(inner)
+        && body[..body.len() - inner.len()].ends_with("$(")
 }
 
 /// The `$(…)` and backtick bodies of `text` with every `<(…)`/`>(…)` in it
@@ -20500,6 +20505,35 @@ mod tests {
                 "{command:?}: {out:?}"
             );
         }
+    }
+
+    /// A cut-open `<(`'s own words are still read when a `$(` inside it
+    /// that the pass through every `<(` read is left off its body (#1266
+    /// round-5 review). Rows are `(command, segment wanted)`.
+    #[test]
+    fn a_cut_open_process_substitution_keeps_its_own_words() {
+        let deep = format!("{}{}", "$(x ".repeat(20), ")".repeat(20));
+        for (command, want) in [
+            (
+                "cat <(cp d .env $(echo x; true)".to_string(),
+                "cp d .env $(",
+            ),
+            (
+                "cat <(cp d .env \"$(echo x; true)\"".to_string(),
+                "cp d .env \"$(",
+            ),
+            (format!("cat <(cp d {deep} .env; true)"), ".env"),
+        ] {
+            let out = command_segments(&command);
+            assert!(
+                out.iter()
+                    .any(|s| s.starts_with("cp d") && s.contains(want)),
+                "{command:?}: {out:?}"
+            );
+        }
+        assert!(open_tail_of("echo $(cat x", "cat x"));
+        assert!(!open_tail_of("echo $(cat x) y", "cat x) y"));
+        assert!(!open_tail_of("echo `cat x", "cat x"));
     }
 
     /// Out of allowance, every fragment is still listed, and each unwraps
