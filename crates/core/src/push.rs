@@ -964,13 +964,14 @@ fn collect_push_invocations(
                     );
                 });
             }
-        } else if (segment.contains("push") || segment.contains("git"))
+        } else if (segment.contains("push") || mentions_an_exec_setting(segment))
             && child_scripts_but_git_exec(argv, segment)
                 .iter()
                 .any(|child| {
                     crate::shell::command_segments(child).iter().any(|inner| {
                         !crate::shell::git_push_segments(inner).is_empty()
-                            || crate::shell::runs_a_git_exec(inner)
+                            || (inner.contains("git")
+                                && git_exec(&crate::shell::executable_tokens(inner)).is_some())
                     })
                 })
         {
@@ -991,12 +992,13 @@ fn collect_push_invocations(
         // cap; the as-typed reading's that differ are walked beside them, so
         // one exec value is never counted twice (#1231 review I2).
         let readings = crate::shell::current_readings();
-        let pair = crate::shell::executable_token_pair(segment);
-        let (exec, alternates) = if pair.1 == pair.0 || readings == Readings::Typed {
+        let pair = (readings != Readings::Typed && tokens.iter().any(|word| word.contains('\\')))
+            .then(|| crate::shell::executable_token_pair(segment));
+        let (exec, alternates) = if pair.as_ref().is_none_or(|pair| pair.1 == pair.0) {
             (git_exec(&tokens), Vec::new())
-        } else if readings == Readings::Script {
+        } else if let Some(pair) = pair.as_ref().filter(|_| readings == Readings::Script) {
             (git_exec(&pair.1), Vec::new())
-        } else {
+        } else if let Some(pair) = pair.as_ref() {
             match (git_exec(&pair.1), git_exec(&tokens)) {
                 (Some(mut built), typed) => {
                     let alternates = typed.map_or_else(Vec::new, |typed| {
@@ -1008,6 +1010,8 @@ fn collect_push_invocations(
                 }
                 (None, typed) => (typed, Vec::new()),
             }
+        } else {
+            (git_exec(&tokens), Vec::new())
         };
         if let Some(exec) = exec {
             collect_git_exec_pushes(
@@ -1341,6 +1345,44 @@ fn collect_git_exec_pushes(
             collect_push_invocations(&script, &work_dir, depth + 1, doubt, walk, writes, out);
         });
     }
+}
+
+/// A cheap superset test for a segment past the wrapper depth that may set a
+/// value git runs ([`crate::shell::git_exec`]'s settings): one of the names
+/// such a setting is spelled with appears in it. Only such a segment pays to
+/// list its children (cameronsjo/cadence-hooks#1231 review I1).
+fn mentions_an_exec_setting(segment: &str) -> bool {
+    const MARKS: &[&str] = &[
+        "git_ssh",
+        "pager",
+        "git_external_diff",
+        "askpass",
+        "git_proxy_command",
+        "git_config",
+        "git_allow_protocol",
+        "config-env",
+        "sshcommand",
+        "fsmonitor",
+        "hookspath",
+        "external",
+        "gitproxy",
+        "textconv",
+        "driver",
+        "smudge",
+        "clean",
+        "process",
+        "helper",
+        "program",
+        "command",
+        "cmd",
+        "protocol",
+        "difffilter",
+        "uploadpack",
+        "receivepack",
+        "vcs",
+    ];
+    let lower = segment.to_ascii_lowercase();
+    lower.contains("git") && MARKS.iter().any(|mark| lower.contains(mark))
 }
 
 /// `segment` without a leading function-definition head — `f()`, `f ( )`,
