@@ -3628,7 +3628,8 @@ mod tests {
     #[test]
     fn render_document_approval_owned_keys_table() {
         // (hook branch, plan block, must contain, must not contain)
-        let cases: [(Option<&str>, &str, &[&str], &[&str]); 5] = [
+        type Case<'a> = (Option<&'a str>, &'a str, &'a [&'a str], &'a [&'a str]);
+        let cases: [Case; 5] = [
             (
                 Some("feat/real"),
                 "status: done\nbranch: feat/never\nupdated: 1999-01-01\nnext: \"go\"",
