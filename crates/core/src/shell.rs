@@ -468,6 +468,184 @@ impl LeadRun {
 /// never disagree about where a token ends (cadence-hooks#237 security review,
 /// F25).
 pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
+    tokenize_marked_in(command, Backslashes::AsTyped)
+}
+
+/// What [`walk_words`] writes for a backslash that quoting made literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backslashes {
+    /// As typed: `'a\b'` is the text `a\b`. What every consumer of
+    /// [`tokenize`] reads.
+    AsTyped,
+    /// Escaped, so that ONE [`unescape_word`] of the text is the word bash
+    /// builds: `'a\b'` is `a\\b`, while an unquoted escape (`a\ b`) and a
+    /// `"…"` escape bash removes (`"\$x"`) stay a single backslash, and a
+    /// `"…"` line continuation is dropped. See [`tokenize_script_words`].
+    Escaped,
+}
+
+/// [`tokenize`], in the spelling a script extractor unescapes exactly once.
+///
+/// **The tokenizer is the only place that knows which backslashes quoting
+/// made literal**, so it is where quote removal is decided, once
+/// (cameronsjo/cadence-hooks#1231). Every script extractor
+/// ([`shell_c_argument_tokens`], [`eval_script`], [`trap_action`], a git exec
+/// value, …) applies [`unescape_word`] to the word it hands back as a script,
+/// which is right for an unquoted escape (`bash -c cat\ .env`) and wrong for
+/// a backslash inside `'…'`: on [`tokenize`]'s text `bash -c 'bash -c "bash
+/// -c \"git push origin main\""'` lost the escapes one level early, the
+/// third level read `bash -c git`, and the push reached no guard. Read from
+/// these words, each level's script is the word bash hands the shell.
+///
+/// Token boundaries, brace expansion and the compound-head strips are those
+/// of [`tokenize`]: only the text of a quoted backslash differs.
+#[cfg(test)]
+fn tokenize_script_words(command: &str) -> Vec<String> {
+    tokenize_pair(command).1.clone()
+}
+
+/// [`tokenize`] and [`tokenize_script_words`] of one command, from one walk
+/// per spelling and ONE charge to the thread's brace budget, cached for the
+/// thread (cameronsjo/cadence-hooks#1231 review C1/C2).
+///
+/// **The second spelling must cost the budget nothing.** Re-tokenizing a
+/// segment for it spent the whole per-call cap again on an overflowing word,
+/// so a few padding words (`: {1..4096}{1..4} a\b; {git,reset,--hard}`)
+/// exhausted the thread budget sooner and a later brace-spelled command was
+/// left whole, unread. The escaped word is expanded only where the as-typed
+/// word expanded under the budget, with a call-local allowance of its own:
+/// the two differ only in quoted backslashes, which are never brace syntax,
+/// so the work is the same and is already bounded by the charge.
+///
+/// The cache keeps the last few commands, so the wrapper hunt reading a
+/// segment both ways walks it once. A re-read past the one the walk paid for
+/// is charged what the walk cost, as a fresh [`tokenize`] would be, and walks
+/// again when the budget cannot cover it.
+fn tokenize_pair(command: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
+    const KEEP: usize = 8;
+    type Pair = std::rc::Rc<(Vec<String>, Vec<String>)>;
+    /// One cached walk: what it charged, and whether the one free re-read
+    /// it paid for (the other spelling's) is still unspent.
+    struct Entry {
+        key: String,
+        pair: Pair,
+        cost: BraceBudget,
+        free: bool,
+    }
+    thread_local! {
+        static PAIRS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    // A re-read is charged what the walk cost, as a fresh tokenize would be:
+    // the budget bounds every reading's downstream work, and a free hit per
+    // repeat let a flood of one expanding segment run unbounded. The one
+    // re-read a walk includes is the other spelling of the same reading.
+    let hit = PAIRS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let at = cache.iter().position(|entry| entry.key == command)?;
+        let mut entry = cache.remove(at);
+        let affordable = std::mem::take(&mut entry.free) || charge_thread_brace_budget(entry.cost);
+        let pair = entry.pair.clone();
+        cache.push(entry);
+        affordable.then_some(pair)
+    });
+    if let Some(pair) = hit {
+        return pair;
+    }
+    let before = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+    let pair = std::rc::Rc::new(tokenize_pair_uncached(command));
+    let after = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+    let cost = BraceBudget {
+        bytes: before.bytes - after.bytes,
+        words: before.words - after.words,
+    };
+    PAIRS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|entry| entry.key != command);
+        if cache.len() >= KEEP {
+            cache.remove(0);
+        }
+        cache.push(Entry {
+            key: command.to_string(),
+            pair: pair.clone(),
+            cost,
+            free: true,
+        });
+    });
+    pair
+}
+
+/// Deduct `cost` from the thread's brace budget and answer `true`, or leave
+/// it untouched and answer `false` when it cannot cover the cost — the caller
+/// then walks again, and the walk spends what is left as a fresh one would.
+fn charge_thread_brace_budget(cost: BraceBudget) -> bool {
+    THREAD_BRACE_BUDGET.with(|cell| {
+        let budget = cell.get();
+        match (
+            budget.words.checked_sub(cost.words),
+            budget.bytes.checked_sub(cost.bytes),
+        ) {
+            (Some(words), Some(bytes)) => {
+                cell.set(BraceBudget { bytes, words });
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
+fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
+    let mut typed_raw: Vec<(String, Vec<bool>)> = Vec::new();
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
+        typed_raw.push((text, flags.to_vec()));
+        true
+    });
+    // The second walk is charged to its allowance; past it the command is
+    // marked unread and the script spelling is the as-typed one.
+    let mut script_raw: Vec<(String, Vec<bool>)> = Vec::new();
+    if may_quote_a_backslash(command) && second_reading_affordable(command.len()) {
+        walk_words(command, Backslashes::Escaped, &mut |text, flags, _, _| {
+            script_raw.push((text, flags.to_vec()));
+            true
+        });
+    } else {
+        script_raw.clone_from(&typed_raw);
+    }
+    let aligned = script_raw.len() == typed_raw.len();
+    let mut typed = Vec::with_capacity(typed_raw.len());
+    let mut script = Vec::with_capacity(typed_raw.len());
+    with_brace_budget(|budget| {
+        for (at, (text, flags)) in typed_raw.into_iter().enumerate() {
+            let escaped = aligned.then(|| &script_raw[at]);
+            match brace_expand_word(&text, &flags, budget) {
+                BraceExpansion::Expanded(words) => {
+                    let mine = match escaped {
+                        Some((escaped, escaped_flags)) if *escaped != text => {
+                            let mut local = BraceBudget {
+                                bytes: MAX_BRACE_CALL_BYTES,
+                                words: MAX_BRACE_CALL_WORDS,
+                            };
+                            match brace_expand_word(escaped, escaped_flags, &mut local) {
+                                BraceExpansion::Expanded(mine) if mine.len() == words.len() => mine,
+                                _ => words.clone(),
+                            }
+                        }
+                        _ => words.clone(),
+                    };
+                    typed.extend(words);
+                    script.extend(mine);
+                }
+                BraceExpansion::Unchanged | BraceExpansion::Overflow => {
+                    script
+                        .push(escaped.map_or_else(|| text.clone(), |(escaped, _)| escaped.clone()));
+                    typed.push(text);
+                }
+            }
+        }
+    });
+    (typed, script)
+}
+
+fn tokenize_marked_in(command: &str, backslashes: Backslashes) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
     // One expansion budget for the whole call, drawn from the thread's
     // budget, so neither a command of many small exploding words nor a guard
@@ -477,6 +655,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     with_brace_budget(|budget| {
         walk_words(
             command,
+            backslashes,
             &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
                 push_expanded_token(
                     &mut tokens,
@@ -497,7 +676,7 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
 /// with its per-byte structural flags (see [`walk_words`]).
 fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
     let mut words = Vec::new();
-    walk_words(command, &mut |text, flags, _, _| {
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
         words.push((text, flags.to_vec()));
         true
     });
@@ -510,7 +689,7 @@ fn raw_words(command: &str) -> Vec<(String, Vec<bool>)> {
 /// deep (50 KB) take seconds, past the hook deadline (PR #1118 review).
 fn first_raw_word(command: &str) -> Option<(String, Vec<bool>)> {
     let mut first = None;
-    walk_words(command, &mut |text, flags, _, _| {
+    walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
         first = Some((text, flags.to_vec()));
         false
     });
@@ -525,7 +704,8 @@ type WordSink<'a> = dyn FnMut(String, &[bool], usize, usize) -> bool + 'a;
 /// The single tokenizer walk behind [`tokenize_marked`] and [`raw_words`]:
 /// calls `emit(text, structural, unquoted_prefix_len, expanding_prefix_len)`
 /// once per finished word, quotes removed.
-fn walk_words(command: &str, emit: &mut WordSink<'_>) {
+fn walk_words(command: &str, backslashes: Backslashes, emit: &mut WordSink<'_>) {
+    let escaped_mode = backslashes == Backslashes::Escaped;
     let mut current = String::new();
     let mut in_token = false;
     // `None` until this token's first quoting construct; then the byte length
@@ -594,6 +774,9 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                     quote = None;
                     lead.close(current.len());
                 } else {
+                    if escaped_mode && c == '\\' {
+                        current.push('\\');
+                    }
                     current.push(c);
                 }
             }
@@ -605,7 +788,12 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 // one harmless `echo` (cadence-hooks#1089 review).
                 if c == '\\' {
                     if let Some(escaped) = chars.next() {
+                        let from = current.len();
                         decode_ansi_c_escape(escaped, &mut chars, &mut current, &mut ansi_c_nul);
+                        if escaped_mode && current[from..].contains('\\') {
+                            let decoded = current.split_off(from).replace('\\', "\\\\");
+                            current.push_str(&decoded);
+                        }
                     }
                     continue;
                 }
@@ -621,7 +809,26 @@ fn walk_words(command: &str, emit: &mut WordSink<'_>) {
                 // Inside `"…"`, `\` escapes `"` and `\` — so an escaped quote
                 // is content and must not end the string.
                 if c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
-                    current.push(chars.next().expect("peeked"));
+                    let escaped = chars.next().expect("peeked");
+                    if escaped_mode && escaped == '\\' {
+                        current.push('\\');
+                    }
+                    current.push(escaped);
+                    continue;
+                }
+                // bash also removes the backslash before `$`, a backtick and
+                // a newline (a line continuation, dropped whole). As typed,
+                // the backslash stays for the callers that unescape; escaped,
+                // it is the one escape they remove, and any other backslash
+                // in `"…"` is literal.
+                if escaped_mode && c == '\\' {
+                    match chars.peek() {
+                        Some('\n') => {
+                            chars.next();
+                        }
+                        Some('$' | '`') => current.push(c),
+                        _ => current.push_str("\\\\"),
+                    }
                     continue;
                 }
                 if c == '"' {
@@ -993,6 +1200,44 @@ enum BraceExpansion {
 /// (`NAME=…`) is left alone, since bash does not expand an assignment
 /// statement and in command position that is what it is.
 fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) -> BraceExpansion {
+    let expansion = brace_expand_word_unmarked(text, structural, budget);
+    if expansion == BraceExpansion::Overflow {
+        mark_command_unread();
+    }
+    expansion
+}
+
+thread_local! {
+    static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that a reading of the command on this thread left part of it
+/// unread: a word bash brace-expands was left whole (a per-word bound, or
+/// the call's or thread's [`BraceBudget`] spent), or the second reading of
+/// a wrapper's script ran past its allowance ([`SecondReadingWork`]).
+fn mark_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(true));
+}
+
+/// Whether a reading on this thread left part of a command unread since the
+/// last [`reset_command_unread`] (cameronsjo/cadence-hooks#1279). A guard
+/// that refuses what it cannot read refuses then: a word left whole hides
+/// what bash builds from it, and padding a command until the budget is spent
+/// left `{git,reset,--hard}` whole, so it ran past every guard.
+pub fn command_unread() -> bool {
+    COMMAND_UNREAD.with(std::cell::Cell::get)
+}
+
+/// Clear [`command_unread`] before a check reads a command.
+pub fn reset_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(false));
+}
+
+fn brace_expand_word_unmarked(
+    text: &str,
+    structural: &[bool],
+    budget: &mut BraceBudget,
+) -> BraceExpansion {
     let Some(word) = expanding_brace_word(text, structural) else {
         return BraceExpansion::Unchanged;
     };
@@ -2046,7 +2291,77 @@ pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
 /// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
 /// nothing removed here is a word the shell executes.
 pub fn executable_tokens(segment: &str) -> Vec<String> {
-    let mut tokens = tokenize(strip_group_wrappers(segment));
+    // With no quoted backslash the two spellings are one: tokenize as before.
+    if !may_quote_a_backslash(segment) {
+        return executable_tokens_from(tokenize(strip_group_wrappers(segment)), None).0;
+    }
+    executable_token_pair(segment).0.clone()
+}
+
+/// [`executable_tokens`] in [`tokenize_script_words`]' spelling: the same
+/// tokens, with each backslash quoting made literal escaped, so the single
+/// [`unescape_word`] a script extractor applies yields the word bash builds.
+/// Every wrapper hunt reads these (cameronsjo/cadence-hooks#1231).
+pub fn executable_script_tokens(segment: &str) -> Vec<String> {
+    executable_token_pair(segment).1.clone()
+}
+
+/// [`executable_tokens`] and [`executable_script_tokens`] of one segment,
+/// aligned word for word, from one [`tokenize_pair`] (one brace-budget charge,
+/// cached). The compound-head strips drop leading words and peel a leading
+/// `(`/`{` off the head; the script spelling drops and peels the same.
+pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
+    // The spellings differ only at a backslash quoting made literal, so with
+    // no backslash or no quote they are one; past the second reading's
+    // allowance the command is marked unread and read once
+    // (cameronsjo/cadence-hooks#1231 review C2).
+    if !may_quote_a_backslash(segment) {
+        let typed = executable_tokens(segment);
+        return std::rc::Rc::new((typed.clone(), typed));
+    }
+    let pair = tokenize_pair(strip_group_wrappers(segment));
+    let (typed, script) = (pair.0.clone(), pair.1.clone());
+    let script_aligned = script.len() == typed.len();
+    let (typed, script) = executable_tokens_from(typed, script_aligned.then_some(script));
+    std::rc::Rc::new((typed.clone(), script.unwrap_or(typed)))
+}
+
+/// Whether `text` may hold a backslash inside quotes — the only place the
+/// two spellings of [`executable_token_pair`] differ. A cheap superset test.
+pub fn may_quote_a_backslash(text: &str) -> bool {
+    text.contains('\\') && text.contains(['\'', '"'])
+}
+
+/// Bytes the second reading of wrapper scripts may walk per thread before the
+/// command is marked unread ([`command_unread`]) and read once.
+const SECOND_READING_ALLOWANCE: usize = 1 << 20;
+
+thread_local! {
+    static SECOND_READING_LEFT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(SECOND_READING_ALLOWANCE) };
+}
+
+/// Charge `bytes` of second-reading work, or mark the command unread and
+/// answer `false` once the allowance is spent: past it a fail-closed guard
+/// refuses rather than grind (cameronsjo/cadence-hooks#1231 review C2).
+fn second_reading_affordable(bytes: usize) -> bool {
+    SECOND_READING_LEFT.with(|left| match left.get().checked_sub(bytes) {
+        Some(rest) => {
+            left.set(rest);
+            true
+        }
+        None => {
+            left.set(0);
+            mark_command_unread();
+            false
+        }
+    })
+}
+
+fn executable_tokens_from(
+    mut tokens: Vec<String>,
+    mut script: Option<Vec<String>>,
+) -> (Vec<String>, Option<Vec<String>>) {
     loop {
         let window = strip_compound_heads(&tokens);
         // A group opener that survived because a keyword sat in front of it at
@@ -2058,18 +2373,27 @@ pub fn executable_tokens(segment: &str) -> Vec<String> {
             .filter(|rest| !rest.is_empty())
             .map(str::to_string)
         {
+            let dropped = tokens.len() - window.len();
             let mut next = Vec::with_capacity(window.len());
             next.push(head);
             next.extend_from_slice(&window[1..]);
             tokens = next;
+            script = script.and_then(|mut words| {
+                let mut words = words.split_off(dropped);
+                let first = words.first_mut()?;
+                first.starts_with(['(', '{']).then(|| first.remove(0))?;
+                Some(words)
+            });
             continue;
         }
         // Every pass either drops a token or a character, so a pass that does
         // neither is the fixpoint.
         if window.len() == tokens.len() {
-            return tokens;
+            return (tokens, script);
         }
+        let dropped = tokens.len() - window.len();
         tokens = window.to_vec();
+        script = script.map(|mut words| words.split_off(dropped));
     }
 }
 
@@ -2349,7 +2673,13 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// cannot reuse that function, which stops at any `-`-leading token and so
 /// refuses exactly the `env -u FOO cmd` shape it must see through.
 pub fn is_assignment_word(token: &str) -> bool {
-    match token.split_once('=') {
+    // `NAME+=value` appends, and is an assignment prefix like `NAME=value`
+    // (cameronsjo/cadence-hooks#1231 review: `GIT_SSH_COMMAND+=x git fetch`
+    // hid the git behind it).
+    match token
+        .split_once('=')
+        .map(|(name, value)| (name.strip_suffix('+').unwrap_or(name), value))
+    {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
                 .next()
@@ -5080,10 +5410,8 @@ pub fn ships_in_cd_wrappers(command: &str, dir: &str) -> Vec<ShipSegment> {
 fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Vec<ShipSegment>) {
     const MAX_DEPTH: usize = 4;
     for segment in split_segments(command) {
-        let tokens = executable_tokens(strip_group_wrappers(&segment));
-        let Some(script) = shell_c_argument_tokens(&tokens) else {
-            continue;
-        };
+        let stripped = strip_group_wrappers(&segment);
+        let tokens = executable_tokens(stripped);
         if !matches!(
             command_word(
                 peel_command_runners(strip_compound_heads(&tokens))
@@ -5095,11 +5423,26 @@ fn collect_cd_wrapper_ships(command: &str, dir: &str, depth: usize, out: &mut Ve
         ) {
             continue;
         }
-        if parse_work_dir(&script, dir) != dir || (depth >= MAX_DEPTH && script.contains("cd")) {
-            out.extend(polish_ship_segments_for_origin(&script, None));
-        }
-        if depth < MAX_DEPTH {
-            collect_cd_wrapper_ships(&script, dir, depth + 1, out);
+        // The script bash builds, and the one this read before
+        // (cameronsjo/cadence-hooks#1231, see [`segment_scripts`]).
+        let mut scripts: Vec<String> =
+            shell_c_argument_tokens(&executable_script_tokens(stripped), Backslashes::Escaped)
+                .into_iter()
+                .collect();
+        merge_scripts(
+            &mut scripts,
+            shell_c_argument_tokens(&tokens, Backslashes::AsTyped)
+                .into_iter()
+                .collect(),
+        );
+        for script in scripts {
+            if parse_work_dir(&script, dir) != dir || (depth >= MAX_DEPTH && script.contains("cd"))
+            {
+                out.extend(polish_ship_segments_for_origin(&script, None));
+            }
+            if depth < MAX_DEPTH {
+                collect_cd_wrapper_ships(&script, dir, depth + 1, out);
+            }
         }
     }
 }
@@ -8873,13 +9216,15 @@ fn emit_reading(
         return;
     }
     if depth < MAX_WRAPPER_DEPTH {
-        let known = wrapped_scripts(&executable_tokens(original));
-        for script in wrapped_scripts(&executable_tokens(&reading)) {
+        let known = segment_scripts(original);
+        for (script, readings) in segment_scripts_read(&reading) {
             if known.contains(&script) {
                 continue;
             }
             let mut scope = assignments.child();
-            expand_segments(&script, &mut scope, depth + 1, out, dedupe);
+            in_reading(readings, || {
+                expand_segments(&script, &mut scope, depth + 1, out, dedupe);
+            });
         }
     }
     out.push(unmark(reading));
@@ -9048,9 +9393,8 @@ fn emit_segment(
     let mut whole = Vec::new();
     let scripts = if depth < MAX_WRAPPER_DEPTH {
         if dedupe {
-            let mut scripts =
-                wrapped_scripts(&executable_tokens(&mark_expanded_substitutions(&segment)));
-            scripts.retain(|script| {
+            let mut scripts = segment_scripts_read(&mark_expanded_substitutions(&segment));
+            scripts.retain(|(script, _)| {
                 let only = is_only_an_expanded_substitution(script);
                 if only {
                     whole.push(unmark(script.trim().to_string()));
@@ -9059,7 +9403,7 @@ fn emit_segment(
             });
             scripts
         } else {
-            wrapped_scripts(&executable_tokens(&segment))
+            segment_scripts_read(&segment)
         }
     } else {
         Vec::new()
@@ -9090,12 +9434,14 @@ fn emit_segment(
     out.push(unmark(segment));
     out.extend(whole);
     out.extend(unread);
-    for inner in scripts {
+    for (inner, readings) in scripts {
         // A child shell inherits what is set so far, but its own
         // assignments die with the subshell — recurse on a snapshot so
         // they cannot reach the parent's later segments.
         let mut scope = assignments.child();
-        expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+        in_reading(readings, || {
+            expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+        });
     }
 }
 
@@ -9106,7 +9452,7 @@ fn emit_segment(
 /// expansion; out of allowance, a script is listed whole.
 fn scripts_past_the_bound(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for script in wrapped_scripts(&executable_tokens(segment)) {
+    for script in segment_scripts(segment) {
         if ExpansionWork::charge(script.len()) {
             out.extend(split_segments(&script).into_iter().map(unmark));
         } else {
@@ -9217,7 +9563,7 @@ fn list_unwrapped(work: &mut FlattenWork, fragment: String, out: &mut Vec<String
                 if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
                     continue;
                 }
-                next.extend(wrapped_scripts(&executable_tokens(&segment)));
+                next.extend(segment_scripts(&segment));
                 out.push(segment);
             }
         }
@@ -9250,7 +9596,7 @@ fn list_level(
             continue;
         }
         let scripts = if unwrap {
-            wrapped_scripts(&executable_tokens(&segment))
+            segment_scripts(&segment)
         } else {
             Vec::new()
         };
@@ -9459,37 +9805,95 @@ fn is_only_an_expanded_substitution(script: &str) -> bool {
 /// `segment` yields the same scripts as `argv`; otherwise every script is
 /// kept.
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
-    child_scripts_reading(argv, segment, true)
+    untag(child_scripts_reading(argv, segment, true))
 }
 
 /// [`child_scripts`] without the scripts a git subcommand runs through its own
 /// exec argument ([`git_exec`]), for a walker that recurses those itself with
 /// the directory git runs them in.
 pub fn child_scripts_but_git_exec(argv: &[String], segment: &str) -> Vec<String> {
+    untag(child_scripts_reading(argv, segment, false))
+}
+
+/// [`child_scripts_but_git_exec`], each script with the reading a walker
+/// recurses into it under ([`in_reading`]).
+pub fn child_scripts_but_git_exec_read(argv: &[String], segment: &str) -> Vec<(String, Readings)> {
     child_scripts_reading(argv, segment, false)
 }
 
-fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> Vec<String> {
-    let mut out = wrapped_scripts_reading(argv, git_exec_too);
+fn child_scripts_reading(
+    argv: &[String],
+    segment: &str,
+    git_exec_too: bool,
+) -> Vec<(String, Readings)> {
+    // Both readings, as [`segment_scripts`] gives them: the words bash
+    // builds first, then the caller's `argv` as before
+    // (cameronsjo/cadence-hooks#1231).
+    let readings = current_readings();
+    let script_argv = (readings != Readings::Typed)
+        .then(|| script_tokens_of(argv, segment))
+        .flatten();
+    let mut out = match script_argv {
+        Some(script_argv) if readings == Readings::Script => {
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped)
+                .into_iter()
+                .map(|found| (found, readings))
+                .collect()
+        }
+        Some(script_argv) if !second_reading_affordable(segment.len()) => {
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped)
+                .into_iter()
+                .map(|found| (found, readings))
+                .collect()
+        }
+        Some(script_argv) => merge_readings(
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped),
+            wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
+        ),
+        None => wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped)
+            .into_iter()
+            .map(|found| (found, readings))
+            .collect(),
+    };
     if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
-        let marked = wrapped_scripts_reading(
-            &executable_tokens(&mark_expanded_substitutions(segment)),
-            git_exec_too,
-        );
+        let marked = scripts_both_ways(&mark_expanded_substitutions(segment), git_exec_too);
         let aligned = marked.len() == out.len()
             && marked
                 .iter()
                 .zip(&out)
-                .all(|(tagged, script)| unmark(tagged.clone()) == *script);
+                .all(|((tagged, _), (script, _))| unmark(tagged.clone()) == *script);
         if aligned {
             let mut keep = marked
                 .iter()
-                .map(|tagged| !is_only_an_expanded_substitution(tagged));
+                .map(|(tagged, _)| !is_only_an_expanded_substitution(tagged));
             out.retain(|_| keep.next().unwrap_or(true));
         }
     }
-    out.extend(substitution_bodies(segment));
+    out.extend(
+        substitution_bodies(segment)
+            .into_iter()
+            .map(|body| (body, readings)),
+    );
     out
+}
+
+/// The caller's `argv` (a tail of [`executable_tokens`] of `segment`, its
+/// transparent prefixes stripped) in [`executable_script_tokens`]' spelling,
+/// so a wrapper's script is unescaped once (cameronsjo/cadence-hooks#1231).
+///
+/// Both spellings come from one [`executable_token_pair`], so a tail of the
+/// as-typed words equal to `argv` names the same words in the script
+/// spelling. Anything else (`argv` from another reading, an empty `segment`,
+/// no quoted backslash) keeps `argv` as given — the reading before this fix.
+fn script_tokens_of(argv: &[String], segment: &str) -> Option<Vec<String>> {
+    if segment.is_empty() || !may_quote_a_backslash(segment) {
+        return None;
+    }
+    let pair = executable_token_pair(segment);
+    let (typed, script) = (&pair.0, &pair.1);
+    let from = typed.len().checked_sub(argv.len())?;
+    let tail = script.get(from..)?;
+    (typed[from..] == *argv && tail != argv).then(|| tail.to_vec())
 }
 
 /// Push `text` onto `out` when it carries anything but whitespace.
@@ -11566,7 +11970,7 @@ fn parameter_word_end(
 /// (#528 review E).
 #[cfg(test)]
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&executable_tokens(segment))
+    shell_c_argument_tokens(&executable_script_tokens(segment), Backslashes::Escaped)
 }
 
 /// Verbs that run the command following their OWN options. `sudo` and `xargs`
@@ -12344,12 +12748,12 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
 /// `runuser`, and a here-string fed to a shell — see [`wrapper_utility_script`]
 /// and [`shell_here_string`]. `tmux` can start several scripts in one
 /// invocation, so it is answered by [`wrapped_scripts`], the list form.
-fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
+fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<String> {
     let tokens = peel_command_runners(strip_compound_heads(tokens));
     let verb = command_word(tokens.first()?);
     match verb.as_ref() {
         "sh" | "bash" | "zsh" | "dash" => {}
-        "eval" => return eval_script(&tokens[1..]),
+        "eval" => return eval_script(&tokens[1..], view),
         "trap" => return trap_action(&tokens[1..]),
         other => return wrapper_utility_script(other, &tokens[1..]),
     }
@@ -12390,8 +12794,8 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
             // The script is the word the shell hands the wrapper, escapes
             // removed: `bash -c cat\ .env` runs `cat .env`. Read raw, the
             // escaped blank kept it one word and no guard saw an operand.
-            // As with `eval_script`, over-unescaping a single-quoted script
-            // can only add a block.
+            // Read from [`executable_script_tokens`], a backslash `'…'` made
+            // literal survives this one unescape (cameronsjo/cadence-hooks#1231).
             return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
@@ -12466,9 +12870,11 @@ const MAX_EVAL_UNWRAP: usize = 16;
 /// place, so its tokens are NOT what bash hands `eval`. `eval "echo \$(cat
 /// .env)"` and `eval echo \$\(cat .env\)` both run the substitution, and read
 /// raw the `\$(` hid it from every scanner. [`unescape_word`] per operand
-/// closes that. It also unescapes a backslash inside SINGLE quotes, where bash
-/// keeps it literal — so `eval 'echo \$(cat .env)'` is over-inspected, which
-/// can only add a block.
+/// closes that. Read from [`executable_script_tokens`] (`view` is
+/// [`Backslashes::Escaped`]) a backslash inside SINGLE quotes stays literal,
+/// as bash keeps it; read from [`tokenize`]'s words it is unescaped too, so
+/// `eval 'echo \$(cat .env)'` is over-inspected — [`segment_scripts`] keeps
+/// both readings (cameronsjo/cadence-hooks#1231).
 ///
 /// A leading `--` is skipped: bash and zsh treat it as the end of `eval`'s
 /// options. dash runs it as a command named `--`, which fails, so surfacing the
@@ -12487,15 +12893,19 @@ const MAX_EVAL_UNWRAP: usize = 16;
 /// a walker that tracks state across segments must still refuse on `eval`
 /// (`push::directory_verb` does), because an `eval`'d `cd` moves the PARENT
 /// shell while a child script is walked in its own scope.
-fn eval_script(operands: &[String]) -> Option<String> {
+fn eval_script(operands: &[String], view: Backslashes) -> Option<String> {
     let mut script = join_eval_operands(operands)?;
     for _ in 0..MAX_EVAL_UNWRAP {
         let segments = split_segments(&script);
         let [only] = segments.as_slice() else {
             break;
         };
-        let tokens = tokenize(only);
-        let argv = peel_command_runners(strip_compound_heads(&tokens));
+        let pair = tokenize_pair(only);
+        let tokens = match view {
+            Backslashes::AsTyped => &pair.0,
+            Backslashes::Escaped => &pair.1,
+        };
+        let argv = peel_command_runners(strip_compound_heads(tokens));
         if argv
             .first()
             .is_none_or(|first| command_word(first) != "eval")
@@ -12576,27 +12986,175 @@ pub fn installs_trap_action(tokens: &[String]) -> bool {
 /// the single [`shell_c_argument_tokens`] answer, or — for `tmux`, whose one
 /// invocation can chain several commands that each start a shell — one entry
 /// per script ([`tmux_scripts`]).
+///
+/// `tokens` are [`tokenize`]'s; a caller holding the segment wants
+/// [`segment_scripts`], which also reads the script each wrapper is handed
+/// with its quoted backslashes kept (cameronsjo/cadence-hooks#1231).
 pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
-    wrapped_scripts_reading(tokens, true)
+    wrapped_scripts_reading(tokens, true, Backslashes::AsTyped)
+}
+
+/// [`wrapped_scripts`] of one segment, read from the words bash builds
+/// ([`executable_script_tokens`]) and, when the segment carries a backslash,
+/// also from [`tokenize`]'s words as before.
+///
+/// **The first reading is the right one; the second is kept so no script
+/// this hunt surfaced before is lost** (cameronsjo/cadence-hooks#1231).
+/// Unescaping [`tokenize`]'s text strips a backslash `'…'` made literal, so
+/// a third `bash -c` level read `bash -c git` and the push reached no guard;
+/// the script spelling is what each nested shell parses. The old reading
+/// over-reads instead (`eval 'echo \$(cat .env)'` surfaces a `cat .env` bash
+/// never runs), which costs a false block at worst; dropping it is a
+/// separate decision.
+pub fn segment_scripts(segment: &str) -> Vec<String> {
+    untag(scripts_both_ways(segment, true))
+}
+
+/// [`segment_scripts`], each script with the reading a walker recurses into
+/// it under ([`in_reading`]).
+pub fn segment_scripts_read(segment: &str) -> Vec<(String, Readings)> {
+    scripts_both_ways(segment, true)
+}
+
+/// Which readings of a wrapper's script the hunt takes
+/// (cameronsjo/cadence-hooks#1231 review C2).
+///
+/// A script found by only one reading is walked in that reading alone, so
+/// the as-typed chain is the one the hunt read before this change and the
+/// script chain is the one bash runs; crossing them at every level doubled
+/// the scripts per level. A script both readings found keeps the reading in
+/// force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readings {
+    /// Both readings (the top level).
+    Both,
+    /// Only [`tokenize`]'s words, as before.
+    Typed,
+    /// Only the words bash builds ([`executable_script_tokens`]).
+    Script,
+}
+
+thread_local! {
+    static READINGS: std::cell::Cell<Readings> = const { std::cell::Cell::new(Readings::Both) };
+}
+
+/// Run `walk` with `readings` in force for every wrapper hunt inside it.
+pub fn in_reading<R>(readings: Readings, walk: impl FnOnce() -> R) -> R {
+    struct Restore(Readings);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READINGS.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(READINGS.with(|cell| cell.replace(readings)));
+    walk()
+}
+
+pub(crate) fn current_readings() -> Readings {
+    READINGS.with(std::cell::Cell::get)
+}
+
+fn untag(scripts: Vec<(String, Readings)>) -> Vec<String> {
+    scripts.into_iter().map(|(script, _)| script).collect()
+}
+
+fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<(String, Readings)> {
+    let readings = current_readings();
+    if !may_quote_a_backslash(segment) {
+        return wrapped_scripts_reading(
+            &executable_tokens(segment),
+            git_exec_too,
+            Backslashes::AsTyped,
+        )
+        .into_iter()
+        .map(|found| (found, readings))
+        .collect();
+    }
+    let pair = executable_token_pair(segment);
+    let (typed, script) = (&pair.0, &pair.1);
+    // The spellings differ only where `'…'` made a backslash literal; with
+    // none, the second reading is the first.
+    if script == typed || readings != Readings::Both {
+        let (words, view) = if readings == Readings::Typed {
+            (typed, Backslashes::AsTyped)
+        } else {
+            (script, Backslashes::Escaped)
+        };
+        return wrapped_scripts_reading(words, git_exec_too, view)
+            .into_iter()
+            .map(|found| (found, readings))
+            .collect();
+    }
+    let found = wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped);
+    if !second_reading_affordable(segment.len()) {
+        return found.into_iter().map(|found| (found, readings)).collect();
+    }
+    merge_readings(
+        found,
+        wrapped_scripts_reading(typed, git_exec_too, Backslashes::AsTyped),
+    )
+}
+
+/// The script reading's scripts, then the as-typed reading's that differ,
+/// tagged with the reading each is walked in: one found by both keeps
+/// [`Readings::Both`]. Hashed, since a flood of exec options carries
+/// thousands of scripts.
+pub(crate) fn merge_readings(script: Vec<String>, typed: Vec<String>) -> Vec<(String, Readings)> {
+    let typed_set: std::collections::HashSet<&String> = typed.iter().collect();
+    let script_set: std::collections::HashSet<&String> = script.iter().collect();
+    let mut out: Vec<(String, Readings)> = script
+        .iter()
+        .map(|found| {
+            let readings = if typed_set.contains(found) {
+                Readings::Both
+            } else {
+                Readings::Script
+            };
+            (found.clone(), readings)
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    out.extend(
+        typed
+            .iter()
+            .filter(|found| !script_set.contains(found) && seen.insert(*found))
+            .map(|found| (found.clone(), Readings::Typed)),
+    );
+    out
+}
+
+/// Append each of `more` not already in `out` — hashed, since a flood of
+/// exec options carries thousands of scripts.
+fn merge_scripts(out: &mut Vec<String>, more: Vec<String>) {
+    let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
+    for script in more {
+        if seen.insert(script.clone()) {
+            out.push(script);
+        }
+    }
 }
 
 /// [`wrapped_scripts`], leaving out the scripts a git subcommand runs through
 /// its own exec argument ([`git_exec`]) when `git_exec_too` is false — for a
 /// walker that recurses those itself, with the directory and doubt git gives
 /// them.
-fn wrapped_scripts_reading(tokens: &[String], git_exec_too: bool) -> Vec<String> {
+fn wrapped_scripts_reading(
+    tokens: &[String],
+    git_exec_too: bool,
+    view: Backslashes,
+) -> Vec<String> {
     let argv = peel_command_runners(strip_compound_heads(tokens));
     match argv.first() {
         Some(first) if command_word(first) == "tmux" => tmux_scripts(&argv[1..]),
         Some(first) if command_word(first) == "find" => find_exec_scripts(&argv[1..]),
         Some(first) if command_word(first).starts_with("git") => {
-            let mut out: Vec<String> = shell_c_argument_tokens(tokens).into_iter().collect();
+            let mut out: Vec<String> = shell_c_argument_tokens(tokens, view).into_iter().collect();
             if git_exec_too && let Some(exec) = git_exec(tokens) {
                 out.extend(exec.scripts);
             }
             out
         }
-        _ => shell_c_argument_tokens(tokens).into_iter().collect(),
+        _ => shell_c_argument_tokens(tokens, view).into_iter().collect(),
     }
 }
 
@@ -12622,7 +13180,9 @@ pub struct GitExec {
     /// (`"$@"`, `$1`) that was substituted, which a `shift`, `set --`,
     /// quoting or a function's own arguments can make wrong: a walker judging
     /// a push reads the invocation as one it cannot resolve
-    /// (cameronsjo/cadence-hooks#1226 review 4).
+    /// (cameronsjo/cadence-hooks#1226 review 4). Also set when the
+    /// invocation sets a value git runs as a command ([`sets_an_exec_value`],
+    /// cameronsjo/cadence-hooks#1231).
     pub opaque: bool,
 }
 
@@ -12799,9 +13359,12 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 ///
 /// Surfacing only ever adds a script to inspect: a misread option (a rebase
 /// `--onto -x`) costs a false block on a command git refuses, never a miss.
-/// Config set in a file (`core.editor`, `core.pager`, `core.sshCommand`, a
-/// hooks path) and an exported editor are outside the command text and not
-/// read here (cameronsjo/cadence-hooks#1231).
+/// A setting on the command line that makes git run a command of its own
+/// (`-c core.sshCommand=…`, `-c core.pager=…`, `GIT_SSH_COMMAND=… git`, see
+/// [`sets_an_exec_value`]) makes the invocation [`GitExec::opaque`], whatever
+/// the subcommand; its value is not read. Config set in a file and an
+/// exported variable are outside the command text and not read here
+/// (cameronsjo/cadence-hooks#1231).
 pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     if !may_carry_git_exec(tokens) {
         return None;
@@ -12838,12 +13401,16 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // start one (`status`, `log`) is not read, and neither is anything once
     // no subcommand can be found — except that, not knowing it, every
     // editor is read.
+    // A setting that makes git run a command of its own (`core.sshCommand`,
+    // `core.pager`, `GIT_SSH_COMMAND`, …) is not read: the invocation is one
+    // whose push cannot be resolved (cameronsjo/cadence-hooks#1231).
+    let runs_a_setting = sets_an_exec_value(prefix, globals);
     let editor_only = |editors: Vec<String>| {
-        (!editors.is_empty()).then_some(GitExec {
+        (!editors.is_empty() || runs_a_setting).then_some(GitExec {
             scripts: editors,
             elsewhere: false,
             at_toplevel: true,
-            opaque: false,
+            opaque: runs_a_setting,
         })
     };
     let Some((subcommand, args)) = rest.and_then(<[String]>::split_first) else {
@@ -12859,19 +13426,19 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     } else {
         Vec::new()
     };
-    let mut opaque = false;
+    let mut opaque = runs_a_setting;
     let (scripts, elsewhere, at_toplevel) = match subcommand.as_str() {
         "rebase" => (exec_option_scripts(args, &REBASE_OPTIONS), false, true),
         "bisect" => {
             let (scripts, elsewhere, positional) = bisect_run_scripts(args);
-            opaque = positional;
+            opaque |= positional;
             (scripts, elsewhere, true)
         }
         // The helper the `submodule` script calls takes the same `foreach`.
         "submodule" | "submodule--helper" => {
             let (scripts, positional) =
                 submodule_foreach_script(args, subcommand == "submodule--helper");
-            opaque = positional;
+            opaque |= positional;
             (scripts, true, false)
         }
         "filter-branch" => (filter_branch_scripts(args), true, false),
@@ -12935,7 +13502,145 @@ fn may_carry_git_exec(tokens: &[String]) -> bool {
                 .strip_prefix("--")
                 .is_some_and(|name| name.starts_with(['u', 'r', 'e']))
             || (token.starts_with('-') && !token.starts_with("--") && token.contains('u'))
+            // A `-c`/`--config-env` global or an assignment may set a value
+            // git runs ([`sets_an_exec_value`]).
+            || token.starts_with("-c")
+            || token.starts_with("--config-env")
+            || token.contains('=')
     })
+}
+
+/// Environment names whose value git (or the ssh it starts) runs as a
+/// command: the transport's ssh, a pager, an external diff, a credential
+/// prompt, a `git://` proxy. The editors are read as scripts instead
+/// ([`GIT_EDITOR_ENV`]).
+const GIT_EXEC_ENV: &[&str] = &[
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PAGER",
+    "PAGER",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND",
+];
+
+/// Whether a git invocation sets, in front of it (`GIT_SSH_COMMAND=… git`)
+/// or as a `-c`/`--config-env` global, a value git runs as a command — read
+/// as an invocation whose push cannot be resolved, never parsed
+/// (cameronsjo/cadence-hooks#1231). See [`is_exec_valued_config`].
+///
+/// The environment spellings of `-c` (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+/// `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`), a `GIT_ALLOW_PROTOCOL`
+/// naming `ext`, and a `-c` key that is an expansion count whatever their
+/// value. An empty value and a pager of exactly `cat` run nothing of the
+/// command's choosing, and are not counted. An editor is read as a script by
+/// [`editor_scripts`], so it is not counted here either.
+fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
+    let inert_pager = |value: &str| value.is_empty() || value == "cat";
+    let env = prefix.iter().any(|word| {
+        let word = unescape_word(word);
+        word.split_once('=').is_some_and(|(name, value)| {
+            // `NAME+=value` appends, so the value is not the whole setting.
+            let name = name.strip_suffix('+').unwrap_or(name);
+            // The `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` triple and
+            // `GIT_CONFIG_PARAMETERS` are `-c` spelled as the environment: any
+            // key at all, so any value counts.
+            name == "GIT_CONFIG_COUNT"
+                || name == "GIT_CONFIG_PARAMETERS"
+                || name.starts_with("GIT_CONFIG_KEY_")
+                || name.starts_with("GIT_CONFIG_VALUE_")
+                // `ext` among the allowed protocols runs a URL as a command.
+                || (name == "GIT_ALLOW_PROTOCOL" && value.to_ascii_lowercase().contains("ext"))
+                || (GIT_EXEC_ENV.contains(&name)
+                    && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
+                    && !value.is_empty())
+        })
+    });
+    if env {
+        return true;
+    }
+    let mut i = 0;
+    while let Some(raw) = globals.get(i) {
+        i += 1;
+        let word = unescape_word(raw);
+        let (setting, from_env) = if word == "-c" || word == "--config-env" {
+            let Some(value) = globals.get(i) else { break };
+            i += 1;
+            (unescape_word(value).into_owned(), word == "--config-env")
+        } else if let Some(glued) = word.strip_prefix("--config-env=") {
+            (glued.to_string(), true)
+        } else if let Some(glued) = word.strip_prefix("-c").filter(|glued| !glued.is_empty()) {
+            (glued.to_string(), false)
+        } else {
+            continue;
+        };
+        // `-c key` with no `=` sets a boolean true.
+        let (key, value) = setting.split_once('=').unwrap_or((&setting, "true"));
+        // A key that is an expansion (`-c "$K=x"`) may be any key.
+        if key.contains(['$', '`'])
+            || is_exec_valued_config(key, if from_env { None } else { Some(value) })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether config `key` set to `value` (`None`: read from a variable, so not
+/// known) makes git run a command (cameronsjo/cadence-hooks#1231): any key
+/// whose name ends in `command`, `program`, `helper` or `cmd`
+/// (`core.sshCommand`, `gpg.program`, `credential.helper`,
+/// `sendemail.toCmd`, `mergetool.<tool>.cmd`), `core.pager` and the
+/// `pager.<cmd>` section, `core.fsmonitor`, `core.hooksPath`,
+/// `diff.external`, `core.askPass`, `core.gitProxy`, a diff driver's
+/// `textconv`, a merge driver, a filter's `clean`/`smudge`/`process`,
+/// `uploadpack.packObjectsHook`, a remote's `uploadpack`/`receivepack`/`vcs`,
+/// `interactive.diffFilter`, and a `protocol.allow`/`protocol.<name>.allow` that is not `never`
+/// (`ext::` runs its URL as a command). Names compare lowercased, as git's
+/// do. A config file the command names (`include.path`, `GIT_CONFIG_GLOBAL`)
+/// is not read, like every other config file.
+///
+/// Not counted: an empty value (git reads it as unset), a pager of `cat` or
+/// a boolean (`pager.log=false`), a boolean `core.fsmonitor` (the builtin
+/// daemon), and `core.hooksPath=/dev/null` (no hooks).
+fn is_exec_valued_config(key: &str, value: Option<&str>) -> bool {
+    let key = key.to_ascii_lowercase();
+    let (section, name) = match (key.split_once('.'), key.rsplit_once('.')) {
+        (Some((section, _)), Some((_, name))) => (section, name),
+        _ => return false,
+    };
+    let is_bool = |value: &str| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
+        )
+    };
+    let exec = match (section, name) {
+        ("protocol", "allow") => return value.is_none_or(|value| value != "never"),
+        ("core", "hookspath") => return value.is_none_or(|value| value != "/dev/null"),
+        ("core", "pager") | ("pager", _) => {
+            return value
+                .is_none_or(|value| !(value.is_empty() || value == "cat" || is_bool(value)));
+        }
+        ("core", "fsmonitor") => {
+            return value.is_none_or(|value| !(value.is_empty() || is_bool(value)));
+        }
+        ("core", "askpass" | "gitproxy")
+        | ("interactive", "difffilter")
+        | ("diff", "external" | "textconv")
+        | ("merge", "driver")
+        | ("filter", "clean" | "smudge" | "process")
+        | ("uploadpack", "packobjectshook")
+        | ("remote", "uploadpack" | "receivepack" | "vcs") => true,
+        _ => {
+            name.ends_with("command")
+                || name.ends_with("program")
+                || name.ends_with("helper")
+                || name.ends_with("cmd")
+        }
+    };
+    exec && value.is_none_or(|value| !value.is_empty())
 }
 
 /// Whether a git subcommand can start an editor: `commit`, `merge`, `tag`,
@@ -13588,7 +14293,7 @@ fn filter_branch_scripts(args: &[String]) -> Vec<String> {
 pub fn runs_a_git_exec(command: &str) -> bool {
     command_segments(command)
         .iter()
-        .any(|segment| git_exec(&executable_tokens(segment)).is_some())
+        .any(|segment| git_exec(&executable_script_tokens(segment)).is_some())
 }
 
 /// Whether `script` runs a command whose name is an expansion — `$CMD`,
@@ -19933,6 +20638,161 @@ mod tests {
             shell_c_argument("bash -c git\\ push\\ --force\\ origin\\ main"),
             Some("git push --force origin main".to_string())
         );
+    }
+
+    #[test]
+    fn command_segments_unescape_each_nested_wrapper_once() {
+        // cameronsjo/cadence-hooks#1231: a backslash inside `'…'` is literal,
+        // so each nested shell parses it. Unescaping the as-typed word
+        // stripped it one level early, and the third `bash -c` read
+        // `bash -c git`. Every row runs `git push origin main` under bash.
+        let push = "git push origin main".to_string();
+        for cmd in [
+            r#"bash -c 'bash -c "bash -c \"git push origin main\""'"#,
+            r#"bash -c 'bash -c "bash -c \"bash -c \\\"git push origin main\\\"\""'"#,
+            r#"bash -c 'bash -c '\''bash -c '\''\'\'''\''git push origin main'\''\'\'''\'''\'''"#,
+            r#"sh -c "sh -c 'sh -c \"git push origin main\"'""#,
+            r#"git rebase -x 'git rebase -x "git rebase -x \"git push origin main\" HEAD" HEAD' HEAD"#,
+            r#"eval 'eval "eval \"git push origin main\""'"#,
+            r#"bash -c 'trap "bash -c \"git push origin main\"" EXIT'"#,
+        ] {
+            assert!(command_segments(cmd).contains(&push), "{cmd:?}");
+        }
+        // The reading before stays beside the exact one, so nothing it
+        // surfaced is lost: bash runs no `cat .env` here, but it is still
+        // listed (a false block at worst).
+        assert!(
+            command_segments(r"eval 'echo \$(cat .env)'").contains(&"cat .env".to_string()),
+            "the as-typed reading is kept"
+        );
+    }
+
+    #[test]
+    fn the_script_spelling_costs_the_brace_budget_nothing() {
+        // cameronsjo/cadence-hooks#1231 review C1: reading a segment's
+        // script spelling re-spent the per-call cap on an overflowing word,
+        // so padding with a backslash drained the thread budget sooner and a
+        // later brace-spelled command was left whole. Each row runs `git
+        // reset --hard` under bash, and each was read before the change.
+        for cmd in [
+            r"x=$(: {1..4096}{1..4} a\b; {git,reset,--hard})",
+            r"cat <(: {1..4096}{1..4} a\b; {git,reset,--hard})",
+            r"x=$(: {1..4096}{1..4} 'a\b'; {git,reset,--hard})",
+            r": {1..4096}{1..4} a\b; : {1..4096}{1..4} a\b; {git,reset,--hard}",
+        ] {
+            // As a guard reads it: every segment, then its words.
+            let cmd = cmd.to_string();
+            let words = std::thread::spawn(move || {
+                command_segments(&cmd)
+                    .iter()
+                    .map(|segment| executable_tokens(segment))
+                    .collect::<Vec<_>>()
+            })
+            .join()
+            .expect("no panic");
+            assert!(
+                words
+                    .iter()
+                    .any(|w| w.as_slice() == ["git", "reset", "--hard"]),
+                "{words:?}"
+            );
+        }
+        let spent = |read: fn(&str)| {
+            std::thread::spawn(move || {
+                read(r"bash -c 'a\b' {1..4096}{1..4} {a,b}'\c'");
+                let left = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+                (
+                    MAX_BRACE_THREAD_WORDS - left.words,
+                    MAX_BRACE_THREAD_BYTES - left.bytes,
+                )
+            })
+            .join()
+            .expect("no panic")
+        };
+        // A guard reading a segment, then the wrapper hunt reading it both
+        // ways, spends no more than the two `tokenize` calls the same reads
+        // cost before: the second spelling is free.
+        let typed = spent(|w| {
+            tokenize(w);
+            tokenize(w);
+        });
+        let both = spent(|w| {
+            executable_tokens(w);
+            executable_script_tokens(w);
+            segment_scripts(w);
+        });
+        assert!(
+            both.0 <= typed.0 && both.1 <= typed.1,
+            "{both:?} > {typed:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_script_words_unescape_once_to_the_word_bash_builds() {
+        // cameronsjo/cadence-hooks#1231: one `unescape_word` of each script
+        // word is the word bash builds (checked with `printf '%s\n'`).
+        for (cmd, built) in [
+            (r"'a\b'", r"a\b"),
+            (r"'a\\b'", r"a\\b"),
+            (r#""a\b""#, r"a\b"),
+            (r#""a\\b""#, r"a\b"),
+            (r#""a\$b""#, "a$b"),
+            (r#""a\`b""#, "a`b"),
+            (r#""a\"b""#, r#"a"b"#),
+            ("\"a\\\nb\"", "ab"),
+            (r"a\ b", "a b"),
+            (r"a\\b", r"a\b"),
+            (r"$'a\\b'", r"a\b"),
+            (r"$'a\x5cb'", r"a\b"),
+            (r#"'x\"y'"#, r#"x\"y"#),
+        ] {
+            let words = tokenize_script_words(cmd);
+            assert_eq!(words.len(), 1, "{cmd:?}: {words:?}");
+            assert_eq!(unescape_word(&words[0]), built, "{cmd:?}");
+            // The as-typed tokens are unchanged by the mode.
+            assert_eq!(tokenize(cmd).len(), 1, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn exec_valued_git_config_keys_are_recognised() {
+        // cameronsjo/cadence-hooks#1231: a value git runs as a command.
+        for (key, value, runs) in [
+            ("core.sshCommand", Some("ssh -i k"), true),
+            ("core.pager", Some("less"), true),
+            ("core.pager", Some("cat"), false),
+            ("core.pager", Some(""), false),
+            ("pager.log", Some("false"), false),
+            ("pager.log", Some("x"), true),
+            ("core.fsmonitor", Some("true"), false),
+            ("core.fsmonitor", Some("./watch"), true),
+            ("core.hooksPath", Some("/dev/null"), false),
+            ("core.hooksPath", Some("hooks"), true),
+            ("diff.external", Some("x"), true),
+            ("diff.tool.textconv", Some("x"), true),
+            ("merge.ours.driver", Some("x"), true),
+            ("filter.lfs.smudge", Some("x"), true),
+            ("credential.helper", Some("!f"), true),
+            ("credential.https://h.helper", Some(""), false),
+            ("gpg.program", Some("x"), true),
+            ("gpg.ssh.defaultKeyCommand", Some("x"), true),
+            ("sendemail.toCmd", Some("x"), true),
+            ("mergetool.t.cmd", Some("x"), true),
+            ("core.askPass", Some("x"), true),
+            ("remote.origin.uploadpack", Some("x"), true),
+            ("protocol.ext.allow", Some("always"), true),
+            ("protocol.ext.allow", Some("never"), false),
+            ("protocol.allow", None, true),
+            ("core.sshcommand", None, true),
+            ("interactive.diffFilter", Some("x"), true),
+            ("core.editor", Some("vim"), false),
+            ("user.name", Some("x"), false),
+            ("color.ui", Some("always"), false),
+            ("remote.origin.url", Some("x"), false),
+            ("sshcommand", Some("x"), false),
+        ] {
+            assert_eq!(is_exec_valued_config(key, value), runs, "{key}={value:?}");
+        }
     }
 
     #[test]

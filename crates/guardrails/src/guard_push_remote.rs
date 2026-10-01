@@ -716,6 +716,10 @@ impl Check for PushRemoteGuard {
         "guard-push-remote"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         // One push walk per command, shared by the gate, the directory check
         // and the nudge: each is a full walk of every child script.

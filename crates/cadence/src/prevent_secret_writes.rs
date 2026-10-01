@@ -676,6 +676,10 @@ impl Check for SecretWritesGuard {
         "prevent-secret-writes"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let tool = input.normalized_tool_name().unwrap_or("");
 

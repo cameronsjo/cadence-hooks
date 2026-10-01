@@ -1440,6 +1440,10 @@ impl Check for RunbookScrubGuard {
         "guard-runbook-scrub"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let dir = std::env::var(DIR_ENV).ok();
         let escape = std::env::var(ESCAPE_ENV).ok();

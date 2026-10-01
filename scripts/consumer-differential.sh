@@ -213,6 +213,14 @@ CORPUS="$WORK/corpus.tsv"
     printf '1267-dollar-8\techo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(cp d .env))))))))\n'
     printf '1267-backtick-inner\techo $(echo $(echo $(echo `cat .env`)))\n'
     printf '1267-procsub-5\tcat <(cat <(cat <(cat <(cat <(cp d .env)))))\n'
+    # cadence-hooks#1231: three shells deep with escaped inner quotes. The
+    # wrapper hunt unescaped a backslash `'…'` made literal one level early,
+    # so the third level read `bash -c cp` and the command reached no guard.
+    printf '%s\t%s\n' '1231-three-dq-write' 'bash -c '"'"'bash -c "bash -c \"cp d .env\""'"'"''
+    printf '%s\t%s\n' '1231-three-dq-reset' 'bash -c "bash -c \"bash -c \\\"git reset --hard\\\"\""'
+    printf '%s\t%s\n' '1231-three-sq-write' 'bash -c '"'"'bash -c '"'"'\'"'"''"'"'bash -c '"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'cp d .env'"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"''
+    printf '%s\t%s\n' '1231-eval-three-sq-leak' 'eval '"'"'bash -c '"'"'\'"'"''"'"'bash -c '"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'bash -c '"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'\'"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'cat .env'"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'\'"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"''
+    printf '%s\t%s\n' '1231-rebase-three-reset' 'git rebase -x '"'"'bash -c '"'"'\'"'"''"'"'bash -c '"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"'git reset --hard'"'"'\'"'"''"'"'\'"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"'\'"'"''"'"''"'"' HEAD'
     # #1266 review: a wrapper script past the bound is unwrapped too.
     printf '1266-wrap-bash\tcat <(echo $(echo $(echo $(bash -c '"'"'git reset --hard'"'"'))))\n'
     printf '1266-wrap-sh\techo $(cat <(echo $(echo $(sh -c '"'"'cp d .env'"'"'))))\n'
@@ -296,6 +304,8 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-procsub-dquoted\techo "<(git reset --hard)"\n'
     printf 'allow-case-comment\tD=$(cd /tmp && pwd); git push origin main # just in case\n'
     printf 'allow-deep-plain\techo $(echo $(echo $(echo $(git status))))\n'
+    printf '%s\t%s\n' 'allow-1231-three-dq-echo' 'bash -c '"'"'bash -c "bash -c \"echo hi\""'"'"''
+    printf '%s\t%s\n' 'allow-1231-sq-backslash' 'bash -c '"'"'printf "%s\n" a\ b'"'"''
     printf 'allow-case-operand\tD=$(cd /tmp && pwd); grep case x; git push origin main\n'
     printf 'allow-case-escaped-operand\tD=$(cd /tmp && pwd); grep \\case x; git push origin main\n'
 } > "$STAY_ALLOWED"
