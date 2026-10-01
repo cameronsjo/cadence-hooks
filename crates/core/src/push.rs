@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, apply_cd_target,
+    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, Readings, TRANSPARENT, apply_cd_target,
     child_scripts_but_git_exec, command_word, executable_tokens_marked, git_command_line_aliases,
     git_exec, git_output_detailed, installs_trap_action, is_assignment_word, peel_command_runners,
     resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories,
@@ -951,16 +951,18 @@ fn collect_push_invocations(
                     || runs_in_found_directories(argv),
                 directory: segment_directory,
             };
-            for child in child_scripts_but_git_exec(argv, segment) {
-                collect_push_invocations(
-                    &child,
-                    &segment_dir,
-                    depth + 1,
-                    child_doubt,
-                    walk,
-                    writes,
-                    out,
-                );
+            for (child, readings) in crate::shell::child_scripts_but_git_exec_read(argv, segment) {
+                crate::shell::in_reading(readings, || {
+                    collect_push_invocations(
+                        &child,
+                        &segment_dir,
+                        depth + 1,
+                        child_doubt,
+                        walk,
+                        writes,
+                        out,
+                    );
+                });
             }
         } else if (segment.contains("push") || segment.contains("git"))
             && child_scripts_but_git_exec(argv, segment)
@@ -988,25 +990,24 @@ fn collect_push_invocations(
         // The script spelling's scripts are the ones counted against the
         // cap; the as-typed reading's that differ are walked beside them, so
         // one exec value is never counted twice (#1231 review I2).
+        let readings = crate::shell::current_readings();
         let pair = crate::shell::executable_token_pair(segment);
-        let (exec, alternates) = if pair.1 != pair.0 {
+        let (exec, alternates) = if pair.1 == pair.0 || readings == Readings::Typed {
+            (git_exec(&tokens), Vec::new())
+        } else if readings == Readings::Script {
+            (git_exec(&pair.1), Vec::new())
+        } else {
             match (git_exec(&pair.1), git_exec(&tokens)) {
                 (Some(mut built), typed) => {
                     let alternates = typed.map_or_else(Vec::new, |typed| {
                         built.opaque |= typed.opaque;
                         built.elsewhere |= typed.elsewhere;
-                        typed
-                            .scripts
-                            .into_iter()
-                            .filter(|script| !built.scripts.contains(script))
-                            .collect()
+                        typed.scripts
                     });
                     (Some(built), alternates)
                 }
                 (None, typed) => (typed, Vec::new()),
             }
-        } else {
-            (git_exec(&tokens), Vec::new())
         };
         if let Some(exec) = exec {
             collect_git_exec_pushes(
@@ -1325,8 +1326,20 @@ fn collect_git_exec_pushes(
     if depth >= MAX_WRAPPER_DEPTH || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS {
         return;
     }
-    for script in exec.scripts.iter().chain(alternates) {
-        collect_push_invocations(script, &work_dir, depth + 1, doubt, walk, writes, out);
+    // Each script in the reading that found it: the script reading's alone
+    // when the as-typed one did not find it too, the as-typed one's extras
+    // alone (cameronsjo/cadence-hooks#1231 review C2).
+    for (script, readings) in
+        crate::shell::merge_readings(exec.scripts.clone(), alternates.to_vec())
+    {
+        let readings = match readings {
+            Readings::Both => crate::shell::current_readings(),
+            _ if alternates.is_empty() => crate::shell::current_readings(),
+            other => other,
+        };
+        crate::shell::in_reading(readings, || {
+            collect_push_invocations(&script, &work_dir, depth + 1, doubt, walk, writes, out);
+        });
     }
 }
 

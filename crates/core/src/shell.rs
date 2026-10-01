@@ -518,32 +518,79 @@ fn tokenize_script_words(command: &str) -> Vec<String> {
 /// so the work is the same and is already bounded by the charge.
 ///
 /// The cache keeps the last few commands, so the wrapper hunt reading a
-/// segment both ways, and a guard tokenizing it again, walk it once.
+/// segment both ways walks it once. A re-read past the one the walk paid for
+/// is charged what the walk cost, as a fresh [`tokenize`] would be, and walks
+/// again when the budget cannot cover it.
 fn tokenize_pair(command: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
     const KEEP: usize = 8;
+    type Pair = std::rc::Rc<(Vec<String>, Vec<String>)>;
+    /// One cached walk: what it charged, and whether the one free re-read
+    /// it paid for (the other spelling's) is still unspent.
+    struct Entry {
+        key: String,
+        pair: Pair,
+        cost: BraceBudget,
+        free: bool,
+    }
     thread_local! {
-        static PAIRS: std::cell::RefCell<Vec<(String, std::rc::Rc<(Vec<String>, Vec<String>)>)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static PAIRS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    if let Some(hit) = PAIRS.with(|cache| {
+    // A re-read is charged what the walk cost, as a fresh tokenize would be:
+    // the budget bounds every reading's downstream work, and a free hit per
+    // repeat let a flood of one expanding segment run unbounded. The one
+    // re-read a walk includes is the other spelling of the same reading.
+    let hit = PAIRS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let at = cache.iter().position(|(key, _)| key == command)?;
-        let entry = cache.remove(at);
-        let hit = entry.1.clone();
+        let at = cache.iter().position(|entry| entry.key == command)?;
+        let mut entry = cache.remove(at);
+        let affordable = std::mem::take(&mut entry.free) || charge_thread_brace_budget(entry.cost);
+        let pair = entry.pair.clone();
         cache.push(entry);
-        Some(hit)
-    }) {
-        return hit;
+        affordable.then_some(pair)
+    });
+    if let Some(pair) = hit {
+        return pair;
     }
+    let before = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
     let pair = std::rc::Rc::new(tokenize_pair_uncached(command));
+    let after = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+    let cost = BraceBudget {
+        bytes: before.bytes - after.bytes,
+        words: before.words - after.words,
+    };
     PAIRS.with(|cache| {
         let mut cache = cache.borrow_mut();
+        cache.retain(|entry| entry.key != command);
         if cache.len() >= KEEP {
             cache.remove(0);
         }
-        cache.push((command.to_string(), pair.clone()));
+        cache.push(Entry {
+            key: command.to_string(),
+            pair: pair.clone(),
+            cost,
+            free: true,
+        });
     });
     pair
+}
+
+/// Deduct `cost` from the thread's brace budget and answer `true`, or leave
+/// it untouched and answer `false` when it cannot cover the cost — the caller
+/// then walks again, and the walk spends what is left as a fresh one would.
+fn charge_thread_brace_budget(cost: BraceBudget) -> bool {
+    THREAD_BRACE_BUDGET.with(|cell| {
+        let budget = cell.get();
+        match (
+            budget.words.checked_sub(cost.words),
+            budget.bytes.checked_sub(cost.bytes),
+        ) {
+            (Some(words), Some(bytes)) => {
+                cell.set(BraceBudget { bytes, words });
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
@@ -2200,6 +2247,10 @@ pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
 /// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
 /// nothing removed here is a word the shell executes.
 pub fn executable_tokens(segment: &str) -> Vec<String> {
+    // With no backslash the two spellings are one: tokenize as before.
+    if !segment.contains('\\') {
+        return executable_tokens_from(tokenize(strip_group_wrappers(segment)), None).0;
+    }
     executable_token_pair(segment).0.clone()
 }
 
@@ -2216,25 +2267,15 @@ pub fn executable_script_tokens(segment: &str) -> Vec<String> {
 /// cached). The compound-head strips drop leading words and peel a leading
 /// `(`/`{` off the head; the script spelling drops and peels the same.
 pub fn executable_token_pair(segment: &str) -> std::rc::Rc<(Vec<String>, Vec<String>)> {
-    thread_local! {
-        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<(Vec<String>, Vec<String>)>)>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    if let Some(hit) = LAST.with(|last| {
-        last.borrow()
-            .as_ref()
-            .filter(|(key, _)| key == segment)
-            .map(|(_, pair)| pair.clone())
-    }) {
-        return hit;
+    if !segment.contains('\\') {
+        let typed = executable_tokens(segment);
+        return std::rc::Rc::new((typed.clone(), typed));
     }
     let pair = tokenize_pair(strip_group_wrappers(segment));
     let (typed, script) = (pair.0.clone(), pair.1.clone());
     let script_aligned = script.len() == typed.len();
     let (typed, script) = executable_tokens_from(typed, script_aligned.then_some(script));
-    let pair = std::rc::Rc::new((typed.clone(), script.unwrap_or(typed)));
-    LAST.with(|last| *last.borrow_mut() = Some((segment.to_string(), pair.clone())));
-    pair
+    std::rc::Rc::new((typed.clone(), script.unwrap_or(typed)))
 }
 
 fn executable_tokens_from(
@@ -9090,12 +9131,14 @@ fn emit_reading(
     }
     if depth < MAX_WRAPPER_DEPTH {
         let known = segment_scripts(original);
-        for script in segment_scripts(&reading) {
+        for (script, readings) in segment_scripts_read(&reading) {
             if known.contains(&script) {
                 continue;
             }
             let mut scope = assignments.child();
-            expand_segments(&script, &mut scope, depth + 1, out, dedupe);
+            in_reading(readings, || {
+                expand_segments(&script, &mut scope, depth + 1, out, dedupe);
+            });
         }
     }
     out.push(unmark(reading));
@@ -9264,8 +9307,8 @@ fn emit_segment(
     let mut whole = Vec::new();
     let scripts = if depth < MAX_WRAPPER_DEPTH {
         if dedupe {
-            let mut scripts = segment_scripts(&mark_expanded_substitutions(&segment));
-            scripts.retain(|script| {
+            let mut scripts = segment_scripts_read(&mark_expanded_substitutions(&segment));
+            scripts.retain(|(script, _)| {
                 let only = is_only_an_expanded_substitution(script);
                 if only {
                     whole.push(unmark(script.trim().to_string()));
@@ -9274,7 +9317,7 @@ fn emit_segment(
             });
             scripts
         } else {
-            segment_scripts(&segment)
+            segment_scripts_read(&segment)
         }
     } else {
         Vec::new()
@@ -9305,12 +9348,14 @@ fn emit_segment(
     out.push(unmark(segment));
     out.extend(whole);
     out.extend(unread);
-    for inner in scripts {
+    for (inner, readings) in scripts {
         // A child shell inherits what is set so far, but its own
         // assignments die with the subshell — recurse on a snapshot so
         // they cannot reach the parent's later segments.
         let mut scope = assignments.child();
-        expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+        in_reading(readings, || {
+            expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+        });
     }
 }
 
@@ -9674,30 +9719,49 @@ fn is_only_an_expanded_substitution(script: &str) -> bool {
 /// `segment` yields the same scripts as `argv`; otherwise every script is
 /// kept.
 pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
-    child_scripts_reading(argv, segment, true)
+    untag(child_scripts_reading(argv, segment, true))
 }
 
 /// [`child_scripts`] without the scripts a git subcommand runs through its own
 /// exec argument ([`git_exec`]), for a walker that recurses those itself with
 /// the directory git runs them in.
 pub fn child_scripts_but_git_exec(argv: &[String], segment: &str) -> Vec<String> {
+    untag(child_scripts_reading(argv, segment, false))
+}
+
+/// [`child_scripts_but_git_exec`], each script with the reading a walker
+/// recurses into it under ([`in_reading`]).
+pub fn child_scripts_but_git_exec_read(argv: &[String], segment: &str) -> Vec<(String, Readings)> {
     child_scripts_reading(argv, segment, false)
 }
 
-fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> Vec<String> {
+fn child_scripts_reading(
+    argv: &[String],
+    segment: &str,
+    git_exec_too: bool,
+) -> Vec<(String, Readings)> {
     // Both readings, as [`segment_scripts`] gives them: the words bash
     // builds first, then the caller's `argv` as before
     // (cameronsjo/cadence-hooks#1231).
-    let mut out = match script_tokens_of(argv, segment) {
-        Some(script_argv) => {
-            let mut out = wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped);
-            merge_scripts(
-                &mut out,
-                wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
-            );
-            out
+    let readings = current_readings();
+    let script_argv = (readings != Readings::Typed)
+        .then(|| script_tokens_of(argv, segment))
+        .flatten();
+    let mut out = match script_argv {
+        Some(script_argv) if readings == Readings::Script => {
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped)
+                .into_iter()
+                .map(|found| (found, readings))
+                .collect()
         }
-        None => wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
+        Some(script_argv) => merge_readings(
+            wrapped_scripts_reading(&script_argv, git_exec_too, Backslashes::Escaped),
+            wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped),
+        ),
+        None => wrapped_scripts_reading(argv, git_exec_too, Backslashes::AsTyped)
+            .into_iter()
+            .map(|found| (found, readings))
+            .collect(),
     };
     if !out.is_empty() && !segment.contains(EXPANDED_MARK) {
         let marked = scripts_both_ways(&mark_expanded_substitutions(segment), git_exec_too);
@@ -9705,15 +9769,19 @@ fn child_scripts_reading(argv: &[String], segment: &str, git_exec_too: bool) -> 
             && marked
                 .iter()
                 .zip(&out)
-                .all(|(tagged, script)| unmark(tagged.clone()) == *script);
+                .all(|((tagged, _), (script, _))| unmark(tagged.clone()) == *script);
         if aligned {
             let mut keep = marked
                 .iter()
-                .map(|tagged| !is_only_an_expanded_substitution(tagged));
+                .map(|(tagged, _)| !is_only_an_expanded_substitution(tagged));
             out.retain(|_| keep.next().unwrap_or(true));
         }
     }
-    out.extend(substitution_bodies(segment));
+    out.extend(
+        substitution_bodies(segment)
+            .into_iter()
+            .map(|body| (body, readings)),
+    );
     out
 }
 
@@ -12847,28 +12915,114 @@ pub fn wrapped_scripts(tokens: &[String]) -> Vec<String> {
 /// never runs), which costs a false block at worst; dropping it is a
 /// separate decision.
 pub fn segment_scripts(segment: &str) -> Vec<String> {
+    untag(scripts_both_ways(segment, true))
+}
+
+/// [`segment_scripts`], each script with the reading a walker recurses into
+/// it under ([`in_reading`]).
+pub fn segment_scripts_read(segment: &str) -> Vec<(String, Readings)> {
     scripts_both_ways(segment, true)
 }
 
-fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<String> {
+/// Which readings of a wrapper's script the hunt takes
+/// (cameronsjo/cadence-hooks#1231 review C2).
+///
+/// A script found by only one reading is walked in that reading alone, so
+/// the as-typed chain is the one the hunt read before this change and the
+/// script chain is the one bash runs; crossing them at every level doubled
+/// the scripts per level. A script both readings found keeps the reading in
+/// force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readings {
+    /// Both readings (the top level).
+    Both,
+    /// Only [`tokenize`]'s words, as before.
+    Typed,
+    /// Only the words bash builds ([`executable_script_tokens`]).
+    Script,
+}
+
+thread_local! {
+    static READINGS: std::cell::Cell<Readings> = const { std::cell::Cell::new(Readings::Both) };
+}
+
+/// Run `walk` with `readings` in force for every wrapper hunt inside it.
+pub fn in_reading<R>(readings: Readings, walk: impl FnOnce() -> R) -> R {
+    struct Restore(Readings);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READINGS.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(READINGS.with(|cell| cell.replace(readings)));
+    walk()
+}
+
+pub(crate) fn current_readings() -> Readings {
+    READINGS.with(std::cell::Cell::get)
+}
+
+fn untag(scripts: Vec<(String, Readings)>) -> Vec<String> {
+    scripts.into_iter().map(|(script, _)| script).collect()
+}
+
+fn scripts_both_ways(segment: &str, git_exec_too: bool) -> Vec<(String, Readings)> {
     let pair = executable_token_pair(segment);
     let (typed, script) = (&pair.0, &pair.1);
-    let mut out = wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped);
+    let readings = current_readings();
     // The spellings differ only where `'…'` made a backslash literal; with
     // none, the second reading is the first.
-    if script != typed {
-        merge_scripts(
-            &mut out,
-            wrapped_scripts_reading(typed, git_exec_too, Backslashes::AsTyped),
-        );
+    if script == typed || readings != Readings::Both {
+        let (words, view) = if readings == Readings::Typed {
+            (typed, Backslashes::AsTyped)
+        } else {
+            (script, Backslashes::Escaped)
+        };
+        return wrapped_scripts_reading(words, git_exec_too, view)
+            .into_iter()
+            .map(|found| (found, readings))
+            .collect();
     }
+    merge_readings(
+        wrapped_scripts_reading(script, git_exec_too, Backslashes::Escaped),
+        wrapped_scripts_reading(typed, git_exec_too, Backslashes::AsTyped),
+    )
+}
+
+/// The script reading's scripts, then the as-typed reading's that differ,
+/// tagged with the reading each is walked in: one found by both keeps
+/// [`Readings::Both`]. Hashed, since a flood of exec options carries
+/// thousands of scripts.
+pub(crate) fn merge_readings(script: Vec<String>, typed: Vec<String>) -> Vec<(String, Readings)> {
+    let typed_set: std::collections::HashSet<&String> = typed.iter().collect();
+    let script_set: std::collections::HashSet<&String> = script.iter().collect();
+    let mut out: Vec<(String, Readings)> = script
+        .iter()
+        .map(|found| {
+            let readings = if typed_set.contains(found) {
+                Readings::Both
+            } else {
+                Readings::Script
+            };
+            (found.clone(), readings)
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    out.extend(
+        typed
+            .iter()
+            .filter(|found| !script_set.contains(found) && seen.insert(*found))
+            .map(|found| (found.clone(), Readings::Typed)),
+    );
     out
 }
 
-/// Append each of `more` not already in `out`.
+/// Append each of `more` not already in `out` — hashed, since a flood of
+/// exec options carries thousands of scripts.
 fn merge_scripts(out: &mut Vec<String>, more: Vec<String>) {
+    let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
     for script in more {
-        if !out.contains(&script) {
+        if seen.insert(script.clone()) {
             out.push(script);
         }
     }
