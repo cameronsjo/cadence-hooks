@@ -1105,7 +1105,13 @@ fn linked_worktree_of(cwd: &Path, root_repo: &Path) -> Option<PathBuf> {
 }
 
 /// Is every remote of `repo` owned (cadence-hooks#1014)? A repo with no
-/// remotes is local-only and owned by definition. Otherwise every fetch and
+/// remotes is local-only and owned by definition — **a deliberate design
+/// decision, not the vacuous truth of `all()` over empty output going
+/// unnoticed** (operator ruling, 2026-10-01, on cameronsjo/cadence-hooks#1256
+/// M-5): a remote-less checkout has no upstream a committed plan could leak
+/// into, so it gets in-repo writes and honours the repo's
+/// `CADENCE_PLANS_DIR` even with `CADENCE_ALLOWED_OWNERS` unset. Do not
+/// "fix" it with a `!listing.is_empty() &&` guard. Otherwise every fetch and
 /// push URL must pass the `guard-push-remote` allowlist check. An unparseable
 /// URL, an empty allowlist, or a failed or timed-out `git remote -v` all read
 /// as not owned. Unprovable counts as not owned, so the plan goes to the
@@ -1737,20 +1743,14 @@ pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
 /// file over the cap is not a plan this hook wrote, and must not become an
 /// unbounded read.
 /// `None` on any open/read failure or an oversized file.
+///
+/// Opened through [`cadence_hooks_core::paths::open_regular_nofollow`]
+/// (cameronsjo/cadence-hooks#1256): the candidate path is predictable (date +
+/// heading slug), so a repo that plants a FIFO there must not stall the hook
+/// to its deadline, and a planted symlink must not be followed. Either reads
+/// as "not this plan" and the collision ladder moves on.
 fn read_capped_at_idempotency_limit(path: &Path) -> Option<String> {
-    use std::io::Read as _;
-
-    let file = fs::File::open(path).ok()?;
-    let mut content = String::new();
-    if file
-        .take(IDEMPOTENCY_MAX_FILE_BYTES + 1)
-        .read_to_string(&mut content)
-        .is_err()
-        || content.len() as u64 > IDEMPOTENCY_MAX_FILE_BYTES
-    {
-        return None;
-    }
-    Some(content)
+    cadence_hooks_core::paths::read_capped_nofollow(path, IDEMPOTENCY_MAX_FILE_BYTES)
 }
 
 /// Does the document at `path` carry the plan body `body_hash` identifies?
@@ -2228,15 +2228,14 @@ pub(crate) fn yaml_unquote(s: &str) -> String {
 /// not, is then [`yaml_quote`]d.
 fn render_frontmatter(f: &FrontmatterFields) -> String {
     let mut lines = vec!["---".to_string()];
-    lines.extend(hook_frontmatter_lines(f, &[]));
+    lines.extend(hook_frontmatter_lines(f));
     lines.push("---".to_string());
     lines.join("\n")
 }
 
-/// The hook-owned frontmatter lines (no fences). `plan_keys` names the keys
-/// the plan's OWN leading block already carries — [`render_document`] passes
-/// them so a living plan's recorded `status`/`updated`/`branch` wins over the
-/// hook's birth defaults (cadence-hooks#738). The identity keys
+/// The hook-owned frontmatter lines (no fences). `status`/`updated`/`branch`
+/// are always the hook's at approval time (cameronsjo/cadence-hooks#1256 M-1):
+/// see [`APPROVAL_OWNED_KEYS`]. The identity keys
 /// (`session_id`, `model`, `harness`, `machine`, `approved_session_id`) are
 /// always emitted: they are this persist's provenance, not plan state.
 /// `session` and `approved_in` are no longer emitted — the session id carries
@@ -2244,18 +2243,12 @@ fn render_frontmatter(f: &FrontmatterFields) -> String {
 /// (cameronsjo/cadence-hooks#870), but all three stay in [`HOOK_OWNED_KEYS`],
 /// so a plan-authored line claiming one is still dropped rather than passed
 /// through as forged attribution or a spoofed legacy idempotency anchor.
-fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<String> {
-    let owned = |key: &str| plan_keys.contains(&key);
-    let mut lines = Vec::new();
-    if !owned("status") {
-        lines.push(format!("status: {}", yaml_quote("in-flight")));
-    }
-    if !owned("updated") {
-        lines.push(format!("updated: {}", yaml_quote(f.updated)));
-    }
-    if !owned("branch")
-        && let Some(b) = f.branch
-    {
+fn hook_frontmatter_lines(f: &FrontmatterFields) -> Vec<String> {
+    let mut lines = vec![
+        format!("status: {}", yaml_quote("in-flight")),
+        format!("updated: {}", yaml_quote(f.updated)),
+    ];
+    if let Some(b) = f.branch {
         lines.push(format!(
             "branch: {}",
             yaml_quote(&identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
@@ -2306,11 +2299,26 @@ const HOOK_OWNED_KEYS: [&str; 8] = [
     "approved_session_id",
 ];
 
+/// The lifecycle keys this hook owns AT APPROVAL TIME
+/// (cameronsjo/cadence-hooks#1256 M-1, conservative direction): a just-approved
+/// plan is `in-flight`, dated today, on the branch the session is on — facts
+/// the hook observes, not claims the plan makes. A plan-authored `status:
+/// done` or a `branch:` that never matches would otherwise persist a plan
+/// `nudge-plan-tick` / `warn-plan-ready-flip` can never bind to, and a planted
+/// `status: in-flight` would feed SessionStart. So [`render_document`] drops
+/// a plan line declaring one of these, exactly as it drops a
+/// [`HOOK_OWNED_KEYS`] line, and the hook's value is the only one written.
+/// With no resolvable branch (detached HEAD, no repo) NO `branch:` is written
+/// — the plan's is still dropped. Every other plan key (`next`, `pr`, `card`,
+/// `blocked`, free-form ones) is kept verbatim. Later lifecycle moves are
+/// edits to the persisted file, which this hook never re-renders.
+const APPROVAL_OWNED_KEYS: [&str; 3] = ["status", "updated", "branch"];
+
 /// The bare `key` of a `key:` line at column 0, or `None` for anything else
 /// (an indented/nested key, a comment, a continuation line, prose). Byte-level,
 /// deliberately: a plan's frontmatter block is untrusted content, and this is
-/// the ONLY interpretation [`render_document`] makes of it — which hook
-/// defaults to suppress, and which plan lines to drop as hook-owned.
+/// the ONLY interpretation [`render_document`] makes of it — which plan lines
+/// to drop as hook-owned.
 fn plan_line_key(line: &str) -> Option<&str> {
     let (key, _) = line.split_once(':')?;
     (!key.is_empty()
@@ -2320,21 +2328,15 @@ fn plan_line_key(line: &str) -> Option<&str> {
     .then_some(key)
 }
 
-/// The top-level keys a plan's own frontmatter block declares — see
-/// [`plan_line_key`] for what counts.
-fn plan_frontmatter_keys(block: &str) -> Vec<&str> {
-    block.lines().filter_map(plan_line_key).collect()
-}
-
 /// The full document written to disk, trailing-newline terminated.
 ///
 /// A body with no leading frontmatter gets the hook's block, a blank line,
 /// then the body. A body that already OPENS with its own `---` block (a plan
 /// authored from the template carries `status:`/`next:`/`branch:` from birth)
-/// gets ONE merged block (cadence-hooks#738): the hook-owned lines FIRST —
-/// with `status`/`updated`/`branch` suppressed when the plan's block already
-/// declares them — then the plan's own lines copied byte-for-byte, minus any
-/// line declaring a [`HOOK_OWNED_KEYS`] key; the body resumes after the
+/// gets ONE merged block (cadence-hooks#738): the hook-owned lines FIRST,
+/// then the plan's own lines copied byte-for-byte, minus any line declaring a
+/// [`HOOK_OWNED_KEYS`] or [`APPROVAL_OWNED_KEYS`] key (the hook's
+/// `status`/`updated`/`branch` win at approval, #1256); the body resumes after the
 /// plan's closing fence. Stacking a second block on top left SessionStart/
 /// outro reading the hook's `status: "in-flight"` / `branch:` forever,
 /// however far the plan had moved on.
@@ -2354,13 +2356,16 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
         return format!("{}\n\n{body}\n", render_frontmatter(f));
     };
     let plan_block = &body[start..end];
-    let plan_keys = plan_frontmatter_keys(plan_block);
     let mut lines = vec!["---".to_string()];
-    lines.extend(hook_frontmatter_lines(f, &plan_keys));
+    lines.extend(hook_frontmatter_lines(f));
     lines.extend(
         plan_block
             .lines()
-            .filter(|line| !plan_line_key(line).is_some_and(|k| HOOK_OWNED_KEYS.contains(&k)))
+            .filter(|line| {
+                !plan_line_key(line).is_some_and(|k| {
+                    HOOK_OWNED_KEYS.contains(&k) || APPROVAL_OWNED_KEYS.contains(&k)
+                })
+            })
             .map(str::to_string),
     );
     lines.push("---".to_string());
@@ -3145,6 +3150,36 @@ mod tests {
         );
     }
 
+    /// cameronsjo/cadence-hooks#1256 M-3: a planted FIFO or symlink at the
+    /// predictable candidate path is "not this plan" — no stall, no follow.
+    #[cfg(unix)]
+    #[test]
+    fn file_matches_body_refuses_fifo_and_symlink_without_stalling() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real.md");
+        fs::write(&real, doc_with_hash("hash-a")).unwrap();
+        let fifo = tmp.path().join("2026-09-30-fifo.md");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let link = tmp.path().join("2026-09-30-link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let started = std::time::Instant::now();
+        for (path, want) in [(&real, true), (&fifo, false), (&link, false)] {
+            assert_eq!(
+                file_matches_body(path, "hash-a"),
+                want,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn claim_target_backfilled_frontmatter_doc_is_idempotent_skip() {
         // The regression that IS cadence-hooks#399: before the recompute, a
@@ -3497,22 +3532,20 @@ mod tests {
             1,
             "exactly one closing fence (one block), got:\n{doc}"
         );
-        // Hook-owned lines first (`updated` was absent from the plan's block,
-        // so the hook supplies it; `status`/`branch` are the plan's), then the
-        // plan's own lines verbatim, then the one closing fence.
-        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nsession_id: \"own-sid\"\n"));
-        assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
+        // Hook-owned lines first — `status`/`updated` are the hook's at
+        // approval even though the plan declared `status: done` (#1256 M-1);
+        // the fixture resolves no branch, so the plan's `branch:` is dropped
+        // and none is written — then the plan's other lines verbatim.
+        assert!(doc.starts_with(
+            "---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\nsession_id: \"own-sid\"\n"
+        ));
         assert_eq!(doc.matches("\nstatus:").count(), 1, "{doc}");
-        assert!(!doc.contains("status: \"in-flight\""));
-        assert_eq!(doc.matches("\nbranch:").count(), 1);
+        assert!(!doc.contains("status: done"), "{doc}");
+        assert!(!doc.contains("branch:"), "{doc}");
         let (frontmatter, rest) = doc
             .split_once("---\n\n")
             .expect("closing fence + blank line");
-        assert!(
-            frontmatter.ends_with(
-                "\nmachine: \"digest\"\nstatus: done\nnext: \"ship it\"\nbranch: feat/x\n"
-            )
-        );
+        assert!(frontmatter.ends_with("\nmachine: \"digest\"\nnext: \"ship it\"\n"));
         assert_eq!(rest, "# Title\n\nbody text\n");
     }
 
@@ -3554,10 +3587,9 @@ mod tests {
         );
         assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         assert!(doc.contains("\nmachine: \"real-digest\"\n"));
-        // The plan's non-owned key survives, after the hook's lines.
-        let (frontmatter, _) = doc.split_once("---\n\n").unwrap();
-        assert!(frontmatter.ends_with("\nstatus: done\n"));
-        assert!(!doc.contains("status: \"in-flight\""));
+        // The plan's `status: done` is an approval-owned key (#1256): dropped.
+        assert!(!doc.contains("status: done"), "{doc}");
+        assert_eq!(doc.matches("\nstatus: \"in-flight\"\n").count(), 1, "{doc}");
         assert_eq!(doc.matches("\n---\n").count(), 1);
     }
 
@@ -3585,9 +3617,75 @@ mod tests {
         );
         assert!(doc.contains("session_id: \"own-sid\""), "{doc}");
         assert!(
-            doc.contains("status: \"planned\""),
-            "plan state wins: {doc}"
+            doc.contains("status: \"in-flight\"") && !doc.contains("planned"),
+            "the hook's status wins at approval (#1256): {doc}"
         );
+    }
+
+    /// cameronsjo/cadence-hooks#1256 M-1: at approval the hook's
+    /// `status`/`updated`/`branch` are authoritative whatever the plan's own
+    /// block claims; the plan's other keys survive verbatim.
+    #[test]
+    fn render_document_approval_owned_keys_table() {
+        // (hook branch, plan block, must contain, must not contain)
+        let cases: [(Option<&str>, &str, &[&str], &[&str]); 5] = [
+            (
+                Some("feat/real"),
+                "status: done\nbranch: feat/never\nupdated: 1999-01-01\nnext: \"go\"",
+                &[
+                    "\nstatus: \"in-flight\"\n",
+                    "\nbranch: \"feat/real\"\n",
+                    "\nupdated: \"2026-07-25\"\n",
+                    "\nnext: \"go\"\n",
+                ],
+                &["done", "feat/never", "1999"],
+            ),
+            (
+                None,
+                "branch: feat/never\npr: 12",
+                &["\npr: 12\n"],
+                &["branch:"],
+            ),
+            (
+                Some("main"),
+                "status: in-flight\nnext: \"planted\"",
+                &["\nstatus: \"in-flight\"\n", "\nnext: \"planted\"\n"],
+                &["\nstatus: in-flight\n"],
+            ),
+            (
+                Some("main"),
+                "  status: nested\ncard: x",
+                &[
+                    "\n  status: nested\n",
+                    "\ncard: x\n",
+                    "\nstatus: \"in-flight\"\n",
+                ],
+                &[],
+            ),
+            (
+                Some("main"),
+                "Status: done\nstatus-note: keep",
+                &["\nStatus: done\n", "\nstatus-note: keep\n"],
+                &[],
+            ),
+        ];
+        for (branch, block, want, deny) in cases {
+            let mut fields = base_fields("digest");
+            fields.branch = branch;
+            let doc = render_document(&fields, &format!("---\n{block}\n---\n\n# T\n"));
+            for w in want {
+                assert!(doc.contains(w), "missing {w:?} for {block:?}:\n{doc}");
+            }
+            for d in deny {
+                assert!(!doc.contains(d), "kept {d:?} for {block:?}:\n{doc}");
+            }
+            for key in APPROVAL_OWNED_KEYS {
+                assert!(
+                    doc.matches(&format!("\n{key}:")).count() <= 1,
+                    "{key} twice:\n{doc}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4921,9 +5019,10 @@ mod tests {
 
     #[test]
     fn end_to_end_approval_merges_a_template_plan_s_frontmatter_into_one_block() {
-        // cadence-hooks#738 end to end: the written file carries ONE block
-        // whose `status:` is the plan's, and the SessionStart scanner's
-        // reader (`leading_frontmatter_block`) sees the plan's keys.
+        // cadence-hooks#738 end to end: the written file carries ONE block,
+        // and the SessionStart scanner's reader (`leading_frontmatter_block`)
+        // sees the plan's own keys — `status`/`updated`/`branch` excepted,
+        // which are the hook's at approval (#1256 M-1).
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -4933,7 +5032,7 @@ mod tests {
 
         let input = exit_plan_mode_post_tool_use(
             "merge-sid",
-            "---\nstatus: in-flight\nnext: \"Phase 2\"\nbranch: main\n---\n\n# Merge Me\n\n- [x] done",
+            "---\nstatus: done\nnext: \"Phase 2\"\nbranch: feat/forged\nupdated: 1999-01-01\n---\n\n# Merge Me\n\n- [x] done",
             &cwd,
             &transcript_path.to_string_lossy(),
             Some(false),
@@ -4956,12 +5055,13 @@ mod tests {
             "one block:\n{written}"
         );
         let block = leading_frontmatter_block(&written).expect("leading block");
-        assert!(block.starts_with("updated: \"2026-07-20\"\nsession_id: \""));
+        assert!(block.starts_with("status: \"in-flight\"\nupdated: \"2026-07-20\"\n"));
+        assert!(!block.contains("forged") && !block.contains("1999") && !block.contains("done"));
         assert!(
             !block.contains("body_sha256"),
             "the retired body hash is never written (#870): {block}"
         );
-        assert!(block.ends_with("\nstatus: in-flight\nnext: \"Phase 2\"\nbranch: main\n"));
+        assert!(block.ends_with("\nnext: \"Phase 2\"\n"), "{block}");
         assert!(block.contains("approved_session_id: \"merge-sid\""));
         assert_eq!(block.matches("status:").count(), 1);
         assert_eq!(block.matches("branch:").count(), 1);
