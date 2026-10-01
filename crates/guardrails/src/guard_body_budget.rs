@@ -3188,7 +3188,15 @@ mod tests {
             let post = format!("gh pr create --title x --body \"{body}\"");
             // (label, meta config, nested config, command prefix, expected,
             // disagreement line expected)
-            let cases: Vec<(&str, Option<&str>, Option<&str>, &str, Outcome, bool)> = vec![
+            type Case<'a> = (
+                &'a str,
+                Option<&'a str>,
+                Option<&'a str>,
+                &'a str,
+                Outcome,
+                bool,
+            );
+            let cases: Vec<Case> = vec![
                 (
                     "agree: both block",
                     Some(STRICT),

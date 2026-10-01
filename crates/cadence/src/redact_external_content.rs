@@ -3332,7 +3332,15 @@ mod tests {
         let cred_post = format!("gh pr create --title t --body \"ACME-INC {}\"", fake_ghp());
         // (label, meta config, nested config, command, expected, disagreement
         // line expected)
-        let cases: Vec<(&str, Option<&str>, Option<&str>, String, Outcome, bool)> = vec![
+        type Case<'a> = (
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            String,
+            Outcome,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
             (
                 "agree: both flag it",
                 Some(ACME),
