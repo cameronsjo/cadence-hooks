@@ -251,6 +251,40 @@ pub fn command_repo_dir(command: &str, cwd: &str) -> Option<String> {
         .then(|| target_root.to_string_lossy().into_owned())
 }
 
+/// The two repos whose per-repo config a Bash `command` could fall under, when
+/// they differ: `effective` is the repo [`command_repo_dir`] says the command
+/// runs in (an unconditional leading `cd` into a repo nested inside the
+/// session's tree), and `session` is the repo enclosing `cwd`. Both are
+/// canonical roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedRepo {
+    /// The repo the command's leading `cd` moves into.
+    pub effective: PathBuf,
+    /// The repo enclosing the session's cwd.
+    pub session: PathBuf,
+}
+
+/// [`MovedRepo`] when `command`'s leading `cd` lands in a repo other than the
+/// session's own; `None` when there is no such move, when the `cd` stays in
+/// the session repo, or when [`command_repo_dir`] cannot name the repo (a
+/// conditional `cd`, a target outside the session's tree). Reads files only —
+/// it never spawns `git` in either repo.
+///
+/// For a guard that reads per-repo config: the effective repo's config is
+/// the primary reading, and where the two configs would judge differently
+/// the guard should say so rather than pick one silently
+/// (cameronsjo/cadence-hooks#225).
+pub fn moved_repo(command: &str, cwd: &str) -> Option<MovedRepo> {
+    let dir = command_repo_dir(command, cwd)?;
+    let root_of = |d: &str| {
+        let state = GitState::resolve(Path::new(d))?;
+        std::fs::canonicalize(state.repo_root).ok()
+    };
+    let effective = root_of(&dir)?;
+    let session = root_of(cwd)?;
+    (effective != session).then_some(MovedRepo { effective, session })
+}
+
 /// True when every `cd` segment of `command` is part of an unconditional
 /// leading chain: the segments up to and including the last `cd` are all bare
 /// `cd` commands, each followed by `&&` or `;`. A `cd` behind a guard
@@ -756,6 +790,45 @@ mod tests {
         ));
         for (label, command, cwd, want) in cases {
             assert_eq!(command_repo_dir(&command, cwd), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn moved_repo_names_both_roots_only_when_the_cd_changes_repo() {
+        let (_s, meta, plugin) = meta_layout("moved");
+        std::fs::create_dir_all(meta.join("plain-dir")).unwrap();
+        let m = meta.to_str().unwrap();
+        let want = MovedRepo {
+            effective: canon(&plugin),
+            session: canon(&meta),
+        };
+        // (label, command, expected)
+        let cases: Vec<(&str, &str, Option<MovedRepo>)> = vec![
+            (
+                "cd into the nested repo",
+                "cd plugin && gh pr create",
+                Some(want.clone()),
+            ),
+            (
+                "cd into a subdir of the nested repo",
+                "cd plugin/src && gh pr create",
+                Some(want),
+            ),
+            ("no cd", "gh pr create", None),
+            (
+                "cd within the session repo",
+                "cd plain-dir && gh pr create",
+                None,
+            ),
+            (
+                "a conditional cd",
+                "false && cd plugin && gh pr create",
+                None,
+            ),
+            ("a missing dir", "cd nope && gh pr create", None),
+        ];
+        for (label, command, want) in cases {
+            assert_eq!(moved_repo(command, m), want, "{label}");
         }
     }
 }

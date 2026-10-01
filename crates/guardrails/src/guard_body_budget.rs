@@ -1467,54 +1467,125 @@ impl Check for GuardBodyBudget {
         }
 
         let base_dir = resolve_base_dir(input);
-        let budgets = resolve_budgets(&EnvView::from_env(), load_config(&base_dir));
+        let budgets_from =
+            |config_dir: &str| resolve_budgets(&EnvView::from_env(), load_config(config_dir));
 
-        // Every segment is measured. The worst verdict decides the outcome, and
-        // every segment that had something to say says it — a command posting
-        // two bodies gets both lines.
-        let all_segments = command_segments(command);
-        let mut worst = 0u8;
-        let mut messages: Vec<String> = Vec::new();
-        let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
-        for (surface, segment) in &posts {
-            let outcome = evaluate_segment(*surface, &all_segments, segment, &base_dir, &budgets);
-            let sev = severity(&outcome.verdict);
-            worst = worst.max(sev);
-            match outcome.verdict {
-                Verdict::Allow => {}
-                Verdict::Nudge(msg) | Verdict::Block(msg) => messages.push(msg),
-                Verdict::NudgeWithBypass(msg, _) => messages.push(msg),
-            }
-            if let Some(p) = outcome.bypass {
-                bypasses.push((sev, p));
-            }
+        // A leading `cd` into a repo nested in the session's tree runs the
+        // post from that repo, so its config is the primary reading
+        // (cameronsjo/cadence-hooks#225). The session repo's config is read
+        // too: where the two agree the verdict stands, and where they differ
+        // the guard does not pick one silently — it nudges with both, so the
+        // model judges. Body files still resolve against the session cwd.
+        let Some(moved) = input
+            .cwd
+            .as_deref()
+            .and_then(|cwd| cadence_hooks_core::target_repo::moved_repo(command, cwd))
+        else {
+            return judge_command(&posts, command, &base_dir, &budgets_from(&base_dir));
+        };
+        let effective = judge_command(
+            &posts,
+            command,
+            &base_dir,
+            &budgets_from(&moved.effective.to_string_lossy()),
+        );
+        let session = judge_command(
+            &posts,
+            command,
+            &base_dir,
+            &budgets_from(&moved.session.to_string_lossy()),
+        );
+        if effective.outcome == session.outcome {
+            return effective;
         }
-        let bypass = fold_bypasses(bypasses);
+        CheckResult::nudge(config_disagreement(&moved, &effective, &session))
+    }
+}
 
-        let message = messages.join("\n");
-        match worst {
-            0 => match bypass {
-                Some(p) => CheckResult::allow_bypassed(p),
-                None => CheckResult::allow(),
-            },
-            3 => match budgets.mode {
-                // A real block lets nothing through, so nothing was bypassed —
-                // a ledger row here would record a bypass that did not happen.
-                Mode::Block => CheckResult::block(message),
-                Mode::Nudge => {
-                    let nudge = CheckResult::nudge(as_would_block(&message));
-                    match bypass {
-                        Some(p) => nudge.with_bypass(p),
-                        None => nudge,
-                    }
-                }
-            },
-            _ => {
-                let nudge = CheckResult::nudge(message);
+/// The nudge for a post whose two candidate repos' configs judge it
+/// differently: one line naming each repo and its verdict, then whatever each
+/// non-allow verdict had to say. Never a block — which repo's budget governs a
+/// `cd`'d post is the model's call (cameronsjo/cadence-hooks#225).
+fn config_disagreement(
+    moved: &cadence_hooks_core::target_repo::MovedRepo,
+    effective: &CheckResult,
+    session: &CheckResult,
+) -> String {
+    use cadence_hooks_core::display::sanitize_field;
+    let word = |r: &CheckResult| match r.outcome {
+        cadence_hooks_core::Outcome::Block => "block",
+        cadence_hooks_core::Outcome::Nudge => "nudge",
+        _ => "allow",
+    };
+    let line = format!(
+        "guard-body-budget: the two repos' budgets disagree. This command cds into {} (its config says {}); the session repo {} says {}. Not blocking — judge which repo's budget applies to this post.",
+        moved.effective.display(),
+        word(effective),
+        moved.session.display(),
+        word(session),
+    );
+    let mut out = sanitize_field(&line, 1200);
+    for (label, r) in [("cd repo", effective), ("session repo", session)] {
+        if let Some(msg) = r.message.as_deref().filter(|m| !m.is_empty()) {
+            out.push_str(&format!("\n[{label} config] {msg}"));
+        }
+    }
+    out
+}
+
+/// Measure every posting segment against `budgets` and fold the verdicts: the
+/// worst decides the outcome, and every segment with something to say says it.
+fn judge_command(
+    posts: &[(Surface, String)],
+    command: &str,
+    base_dir: &str,
+    budgets: &Budgets,
+) -> CheckResult {
+    // Every segment is measured. The worst verdict decides the outcome, and
+    // every segment that had something to say says it — a command posting
+    // two bodies gets both lines.
+    let all_segments = command_segments(command);
+    let mut worst = 0u8;
+    let mut messages: Vec<String> = Vec::new();
+    let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
+    for (surface, segment) in posts {
+        let outcome = evaluate_segment(*surface, &all_segments, segment, base_dir, budgets);
+        let sev = severity(&outcome.verdict);
+        worst = worst.max(sev);
+        match outcome.verdict {
+            Verdict::Allow => {}
+            Verdict::Nudge(msg) | Verdict::Block(msg) => messages.push(msg),
+            Verdict::NudgeWithBypass(msg, _) => messages.push(msg),
+        }
+        if let Some(p) = outcome.bypass {
+            bypasses.push((sev, p));
+        }
+    }
+    let bypass = fold_bypasses(bypasses);
+
+    let message = messages.join("\n");
+    match worst {
+        0 => match bypass {
+            Some(p) => CheckResult::allow_bypassed(p),
+            None => CheckResult::allow(),
+        },
+        3 => match budgets.mode {
+            // A real block lets nothing through, so nothing was bypassed —
+            // a ledger row here would record a bypass that did not happen.
+            Mode::Block => CheckResult::block(message),
+            Mode::Nudge => {
+                let nudge = CheckResult::nudge(as_would_block(&message));
                 match bypass {
                     Some(p) => nudge.with_bypass(p),
                     None => nudge,
                 }
+            }
+        },
+        _ => {
+            let nudge = CheckResult::nudge(message);
+            match bypass {
+                Some(p) => nudge.with_bypass(p),
+                None => nudge,
             }
         }
     }
@@ -3066,6 +3137,139 @@ mod tests {
                 let msg = result.message.unwrap_or_default();
                 assert!(msg.contains("500 words"), "{cmd}: {msg}");
                 assert!(!msg.contains("same command"), "{cmd}: {msg}");
+            }
+        });
+    }
+
+    // --- #225: a `cd`'d post reads both repos' configs ---
+
+    /// Meta-repo `meta/` gitignoring `nested/`, an independent repo; each gets
+    /// `config` (a `body_budget` section) when given.
+    fn meta_with_nested_configs(
+        tag: &str,
+        meta_cfg: Option<&str>,
+        nested_cfg: Option<&str>,
+    ) -> (
+        cadence_hooks_core::git_fixtures::Scratch,
+        std::path::PathBuf,
+    ) {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/body-budget-meta-scratch"),
+            tag,
+        );
+        let meta = s.path().join("meta");
+        let nested = meta.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&meta);
+        std::fs::write(meta.join(".gitignore"), "nested/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        init_repo(&nested);
+        for (root, cfg) in [(&meta, meta_cfg), (&nested, nested_cfg)] {
+            if let Some(cfg) = cfg {
+                std::fs::create_dir_all(root.join(".claude")).unwrap();
+                std::fs::write(
+                    root.join(".claude/cadence.json"),
+                    format!("{{\"body_budget\": {cfg}}}"),
+                )
+                .unwrap();
+            }
+        }
+        (s, meta)
+    }
+
+    #[test]
+    fn a_cd_into_a_nested_repo_judges_by_both_configs() {
+        scrubbed_env(|| {
+            const STRICT: &str = r#"{"mode": "block", "pr": [10, 20]}"#;
+            let body = "word ".repeat(50);
+            let post = format!("gh pr create --title x --body \"{body}\"");
+            // (label, meta config, nested config, command prefix, expected,
+            // disagreement line expected)
+            let cases: Vec<(&str, Option<&str>, Option<&str>, &str, Outcome, bool)> = vec![
+                (
+                    "agree: both block",
+                    Some(STRICT),
+                    Some(STRICT),
+                    "cd nested && ",
+                    Outcome::Block,
+                    false,
+                ),
+                (
+                    "agree: both allow",
+                    None,
+                    None,
+                    "cd nested && ",
+                    Outcome::Allow,
+                    false,
+                ),
+                (
+                    "disagree: the cd repo blocks, the session allows",
+                    None,
+                    Some(STRICT),
+                    "cd nested && ",
+                    Outcome::Nudge,
+                    true,
+                ),
+                (
+                    "disagree: the session blocks, the cd repo allows",
+                    Some(STRICT),
+                    None,
+                    "cd nested && ",
+                    Outcome::Nudge,
+                    true,
+                ),
+                (
+                    "no cd: the session config alone (unchanged)",
+                    Some(STRICT),
+                    None,
+                    "",
+                    Outcome::Block,
+                    false,
+                ),
+                (
+                    "no cd: the nested config is not read (unchanged)",
+                    None,
+                    Some(STRICT),
+                    "",
+                    Outcome::Allow,
+                    false,
+                ),
+                (
+                    "a conditional cd: the session config alone (unchanged)",
+                    Some(STRICT),
+                    None,
+                    "false && cd nested && ",
+                    Outcome::Block,
+                    false,
+                ),
+            ];
+            for (i, (label, meta_cfg, nested_cfg, prefix, want, disagrees)) in
+                cases.into_iter().enumerate()
+            {
+                let (_s, meta) =
+                    meta_with_nested_configs(&format!("cfg-{i}"), meta_cfg, nested_cfg);
+                let input = cadence_hooks_core::test_builders::make_bash_with_cwd(
+                    &format!("{prefix}{post}"),
+                    meta.to_str().unwrap(),
+                );
+                let result = GuardBodyBudget.run(&input);
+                assert_eq!(result.outcome, want, "{label}");
+                let msg = result.message.unwrap_or_default();
+                assert_eq!(
+                    msg.contains("budgets disagree"),
+                    disagrees,
+                    "{label}: {msg}"
+                );
+                if disagrees {
+                    let first = msg.lines().next().unwrap();
+                    assert!(
+                        first.contains("says block") && first.contains("says allow"),
+                        "{label}: {first}"
+                    );
+                }
             }
         });
     }
