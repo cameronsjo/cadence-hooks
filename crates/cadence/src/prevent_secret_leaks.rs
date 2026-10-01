@@ -1238,13 +1238,48 @@ const FILE_LIST_LONG_OPTIONS: &[&str] = &[
     "to-file",
 ];
 
+/// Attached options whose value is a pattern or an output target, never a
+/// file the command reads (#1265 Gate 2): matched by exact name only.
+const PATTERN_OR_TARGET_OPTIONS: &[&str] = &[
+    "exclude",
+    "include",
+    "ignore",
+    "hide",
+    "glob",
+    "iglob",
+    "output",
+    "save-cookies",
+];
+
+/// Does `--env-file=` keep the #771 consumed-path exemption? Only for a
+/// program that loads it and runs a script file: `node --env-file=.env
+/// app.js`. Inline code (`node --env-file=.env -e 'console.log(…)'`) prints
+/// whatever it likes, and a container run (`docker run --env-file=.env img
+/// env`) runs a command of the caller's choosing, so both are judged as the
+/// separate spelling already is (#1265 Gate 2).
+fn env_file_is_consumed(cmd: &str, argv: &[String]) -> bool {
+    let inline = |t: &String| {
+        matches!(t.as_str(), "--eval" | "--print" | "-i" | "--interactive")
+            || (t.starts_with('-') && !t.starts_with("--") && t.contains(['e', 'p']))
+            || t.starts_with("--eval=")
+            || t.starts_with("--print=")
+    };
+    let runs = |t: &String| matches!(t.as_str(), "run" | "exec" | "create" | "start");
+    match cmd {
+        "docker" | "podman" | "nerdctl" => !argv.iter().skip(1).any(runs),
+        "node" | "bun" | "deno" | "tsx" => !argv.iter().skip(1).any(inline),
+        _ => true,
+    }
+}
+
 /// Option values in `argv` judged as files read, with the position each is
 /// judged at (a separate value only behind a hyphenated or `fil…` name):
 ///
 /// - every attached `--opt=VALUE`, for every command, as an unqualified word
-///   (only an unambiguous secret spelling counts) — except an option that
-///   excludes what it names (`--exclude=`, `--ignore=`, `--hide=`, a `!`
-///   glob) and the consumed `--env-file=`/`--kubeconfig=` class (#771);
+///   (only an unambiguous secret spelling counts) — except a
+///   [`PATTERN_OR_TARGET_OPTIONS`] name, a `!` glob, a glob value, curl
+///   (which rejects the spelling), and the consumed `--kubeconfig=` and
+///   [`env_file_is_consumed`] `--env-file=` class (#771);
 /// - a [`FILE_LIST_LONG_OPTIONS`] value, attached or separate, as a known
 ///   filename;
 /// - `find -files0-from F`.
@@ -1269,12 +1304,18 @@ fn file_list_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<(&'a str, Filename
         match value {
             Some(value) if file_list => out.push((value, Filename::Known)),
             Some(value) => {
-                // An excluded name, or an output target (prevent-secret-writes'
-                // shape), is not read.
-                let excludes = ["exclude", "ignore", "hide", "save", "output"]
-                    .iter()
-                    .any(|word| name.contains(word));
-                let consumed = matches!(name, "env-file" | "kubeconfig");
+                // A pattern-valued option, or an output target
+                // (prevent-secret-writes' shape), reads no file named by its
+                // value — but never a name that says it opens one
+                // (`rg --ignore-file=.env` echoes lines that fail to parse).
+                let opens_file = [
+                    "-file", "-files", "-from", "-path", "-dir", "-config", "-rc",
+                ]
+                .iter()
+                .any(|suffix| name.ends_with(suffix));
+                let excludes = !opens_file && PATTERN_OR_TARGET_OPTIONS.contains(&name);
+                let consumed =
+                    name == "kubeconfig" || (name == "env-file" && env_file_is_consumed(cmd, argv));
                 // curl rejects `--opt=VALUE` outright; a glob value is a
                 // pattern (`--regexp='secret*'`), judged by the pattern scan.
                 if !excludes
@@ -13806,6 +13847,16 @@ mod deferred_read_tests {
                 "git add --pathspec-from-file=.env",
                 "git stash push --pathspec-from-file .env",
                 "python --foo=.env",
+                // Round 2: a name that opens a file is never exempt.
+                "rg --ignore-file=.env x .",
+                "rg --ignore-file=.env --files",
+                "fd --ignore-file=.env x",
+                "grep --exclude-from=.env x",
+                "rg --exclude-from=.env x",
+                // `--env-file=` where the program runs caller-chosen code.
+                "node --env-file=.env -e 'console.log(process.env.SECRET)'",
+                "node --env-file=.env -p process.env",
+                "docker run --env-file=.env alpine env",
             ],
             Outcome::Block,
             "the command opens the list file and prints its lines",
@@ -13819,6 +13870,8 @@ mod deferred_read_tests {
                 "grep -r --exclude=.env KEY .",
                 "ls --hide=.env",
                 "kubectl --kubeconfig=~/.kube/config get pods",
+                "docker compose --env-file=.env up -d",
+                "uv run --env-file=.env python app.py",
             ],
             Outcome::Allow,
             "no file-list option names a secret, or the #771 consumed class",
