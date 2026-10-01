@@ -20408,6 +20408,60 @@ mod tests {
     }
 
     #[test]
+    fn the_script_spelling_costs_the_brace_budget_nothing() {
+        // cameronsjo/cadence-hooks#1231 review C1: reading a segment's
+        // script spelling re-spent the per-call cap on an overflowing word,
+        // so padding with a backslash drained the thread budget sooner and a
+        // later brace-spelled command was left whole. Each row runs `git
+        // reset --hard` under bash, and each was read before the change.
+        for cmd in [
+            r"x=$(: {1..4096}{1..4} a\b; {git,reset,--hard})",
+            r"cat <(: {1..4096}{1..4} a\b; {git,reset,--hard})",
+            r"x=$(: {1..4096}{1..4} 'a\b'; {git,reset,--hard})",
+            r": {1..4096}{1..4} a\b; : {1..4096}{1..4} a\b; {git,reset,--hard}",
+        ] {
+            // As a guard reads it: every segment, then its words.
+            let cmd = cmd.to_string();
+            let words = std::thread::spawn(move || {
+                command_segments(&cmd)
+                    .iter()
+                    .map(|segment| executable_tokens(segment))
+                    .collect::<Vec<_>>()
+            })
+            .join()
+            .expect("no panic");
+            assert!(
+                words
+                    .iter()
+                    .any(|w| w.as_slice() == ["git", "reset", "--hard"]),
+                "{words:?}"
+            );
+        }
+        // One walk, one charge: both spellings spend what `tokenize` does.
+        let spent = |read: fn(&str)| {
+            std::thread::spawn(move || {
+                read(r"bash -c 'a\b' {1..4096}{1..4} {a,b}'\c'");
+                let left = THREAD_BRACE_BUDGET.with(std::cell::Cell::get);
+                (
+                    MAX_BRACE_THREAD_WORDS - left.words,
+                    MAX_BRACE_THREAD_BYTES - left.bytes,
+                )
+            })
+            .join()
+            .expect("no panic")
+        };
+        let typed = spent(|w| {
+            tokenize(w);
+        });
+        let both = spent(|w| {
+            executable_tokens(w);
+            executable_script_tokens(w);
+            segment_scripts(w);
+        });
+        assert_eq!(typed, both);
+    }
+
+    #[test]
     fn tokenize_script_words_unescape_once_to_the_word_bash_builds() {
         // cameronsjo/cadence-hooks#1231: one `unescape_word` of each script
         // word is the word bash builds (checked with `printf '%s\n'`).
@@ -20464,6 +20518,7 @@ mod tests {
             ("protocol.ext.allow", Some("never"), false),
             ("protocol.allow", None, true),
             ("core.sshcommand", None, true),
+            ("interactive.diffFilter", Some("x"), true),
             ("core.editor", Some("vim"), false),
             ("user.name", Some("x"), false),
             ("color.ui", Some("always"), false),

@@ -4456,6 +4456,24 @@ mod tests {
             ("GIT_EXTERNAL_DIFF=x git diff", true),
             ("GIT_ASKPASS=x git fetch", true),
             ("bash -c 'GIT_SSH_COMMAND=x git fetch'", true),
+            // Review I1: `-c` spelled as the environment, an `ext`
+            // protocol, an expanded key, an append, and past the depth.
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=x git fetch",
+                true,
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\" git fetch",
+                true,
+            ),
+            ("GIT_ALLOW_PROTOCOL=ext git ls-remote ext::x", true),
+            ("GIT_ALLOW_PROTOCOL=https git ls-remote x", false),
+            ("git -c interactive.diffFilter=x add -p", true),
+            ("git -c \"$K=x\" fetch", true),
+            (
+                r#"bash -c 'bash -c "bash -c \"bash -c \\\"GIT_SSH_COMMAND=x git fetch\\\"\""'"#,
+                true,
+            ),
             ("GIT_SSH_COMMAND=x git-fetch", true),
             // Inert: nothing of the command's choosing runs.
             ("GIT_PAGER=cat git log", false),
@@ -4485,6 +4503,25 @@ mod tests {
                 .any(|push| push.refspecs.iter().any(|r| r.raw == "main")),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn an_exec_value_read_both_ways_counts_once_against_the_cap() {
+        // cameronsjo/cadence-hooks#1231 review I2: nine `-x` values whose
+        // spellings differ were counted twice (18 > 16) and the walk stopped
+        // at the cap; each is counted once, and every delete is read.
+        let command = format!(
+            "git rebase {}HEAD~1",
+            (0..9)
+                .map(|n| format!("-x 'echo a\\b; git push origin --delete feat{n}' "))
+                .collect::<String>()
+        );
+        let found = push_locations(&command, "/repo");
+        let deletes = found
+            .iter()
+            .filter(|push| push.refspecs.iter().any(|r| r.is_delete))
+            .count();
+        assert!(deletes >= 9, "{found:?}");
     }
 
     #[test]
@@ -5052,12 +5089,15 @@ mod tests {
 
     #[test]
     fn a_git_config_env_prefix_marks_the_invocation_unresolved() {
+        // The `-c`-as-environment form also reads as setting an exec value
+        // (cameronsjo/cadence-hooks#1231), a second refusal beside the push.
+        let found = push_invocations(
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push",
+            "/repo",
+        );
         assert!(
-            only(
-                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push",
-                "/repo"
-            )
-            .unresolved
+            !found.is_empty() && found.iter().all(|push| push.unresolved),
+            "{found:?}"
         );
         assert!(only("GIT_CONFIG_GLOBAL=/x git push origin main", "/repo").unresolved);
         assert!(only("GIT_CONFIG_SYSTEM=/x git push origin main", "/repo").unresolved);
@@ -6170,12 +6210,13 @@ mod tests {
         // git honours this one standalone — no GIT_CONFIG_COUNT needed:
         // `GIT_CONFIG_PARAMETERS="'push.default=matching'" git config --get
         // push.default` prints `matching`.
+        let found = push_invocations(
+            "GIT_CONFIG_PARAMETERS='push.default=matching' git push origin",
+            "/repo",
+        );
         assert!(
-            only(
-                "GIT_CONFIG_PARAMETERS='push.default=matching' git push origin",
-                "/repo"
-            )
-            .unresolved
+            !found.is_empty() && found.iter().all(|push| push.unresolved),
+            "{found:?}"
         );
     }
 
