@@ -8969,15 +8969,16 @@ fn emit_segment(
                     // holds was already read by the pass below at a
                     // shallower level; a nested unclosed `<(` there repeats
                     // that pass on most of the same text, once per level.
-                    let through = match kind {
-                        BodyKind::Plain => false,
-                        BodyKind::ProcSub => true,
-                        BodyKind::OpenProcSub => !OpenProcSubRead::active(),
-                    };
-                    {
-                        let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
-                        expand_segments(&body, &mut scope, depth + 1, out, dedupe);
-                    }
+                    //
+                    // At the bound the pass would only list what the body's
+                    // own reading lists at the same level, so it is skipped
+                    // there.
+                    let through = depth + 1 < MAX_WRAPPER_DEPTH
+                        && match kind {
+                            BodyKind::Plain => false,
+                            BodyKind::ProcSub => true,
+                            BodyKind::OpenProcSub => !OpenProcSubRead::active(),
+                        };
                     // Past the free levels a nested `<(` spends one, so the
                     // `$(…)`s inside are also read where they sat before
                     // bodies were surfaced: one pass through every `<(` to
@@ -9004,6 +9005,13 @@ fn emit_segment(
                             let mut scope = assignments.child();
                             expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
                         }
+                    }
+                    // The body itself is read after that pass, so the
+                    // `$(…)`s inside it that the pass already read one level
+                    // shallower are skipped there rather than read twice.
+                    {
+                        let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
+                        expand_segments(&body, &mut scope, depth + 1, out, dedupe);
                     }
                 }
             }
