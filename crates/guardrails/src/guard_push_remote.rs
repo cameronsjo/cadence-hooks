@@ -2417,6 +2417,17 @@ mod tests {
         });
     }
 
+    /// Wall-clock bound for judging a 200 KB push flood, timed around the
+    /// judged call only. 2 s everywhere but Windows, where the debug-build
+    /// runner measured 2.05-2.16 s (cadence-hooks#1228): 4 s is ~2x that
+    /// headroom while still far below a genuine regression (a per-push
+    /// subprocess flood runs to the hook deadline). Release-mode performance
+    /// is guarded separately; this only bounds the unoptimized test build.
+    #[cfg(windows)]
+    const FLOOD_JUDGED_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+    #[cfg(not(windows))]
+    const FLOOD_JUDGED_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
     #[test]
     fn a_long_push_flood_is_judged_before_the_deadline() {
         // cadence-hooks#1131: one `git remote` probe per push spent the whole
@@ -2426,13 +2437,11 @@ mod tests {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
             let command = "git -C d push origin main; ".repeat(7000);
+            let input = make_bash_with_cwd(&command, &cwd);
             let started = std::time::Instant::now();
-            let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "took {:?}",
-                started.elapsed()
-            );
+            let result = PushRemoteGuard.run(&input);
+            let elapsed = started.elapsed();
+            assert!(elapsed < FLOOD_JUDGED_BOUND, "took {elapsed:?}");
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
@@ -2449,13 +2458,11 @@ mod tests {
             let cwd = repo.path().to_string_lossy();
             let unit = "for i in 1; do git push origin main; git config user.name x; done;";
             let flood = unit.repeat(200_000 / unit.len());
+            let input = make_bash_with_cwd(&flood, &cwd);
             let started = std::time::Instant::now();
-            let result = PushRemoteGuard.run(&make_bash_with_cwd(&flood, &cwd));
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "took {:?}",
-                started.elapsed()
-            );
+            let result = PushRemoteGuard.run(&input);
+            let elapsed = started.elapsed();
+            assert!(elapsed < FLOOD_JUDGED_BOUND, "took {elapsed:?}");
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
             let distinct: String = (0..6)
                 .map(|i| format!("for i in 1; do git push r{i} main; done;"))
