@@ -611,7 +611,9 @@ mod tests {
             "the block says only Panel: blocks: {msg}"
         );
         assert!(
-            msg.contains("Also missing, advisory only (a nudge, never a block): an Alternatives"),
+            msg.contains(
+                "Also missing, advisory only (a nudge, never a block): a ## Loop section, an Alternatives"
+            ),
             "the other stanzas are named as advice: {msg}"
         );
         assert!(
@@ -654,6 +656,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("plan-shape gate: plan lacks "));
+        assert!(msg.contains("a ## Loop section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -668,6 +671,48 @@ mod tests {
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
             "the stanza nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_missing_only_loop_nudges_and_never_blocks() {
+        let r = judge_plan_shape(&plan_scan::template_shaped_plan_without_loop());
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a missing Loop section never blocks"
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("plan-shape gate: plan lacks a ## Loop section — advisory, from "),
+            "the nudge names only the Loop stanza and marks it advisory: {msg}"
+        );
+        assert!(
+            !msg.contains("the one stanza that blocks"),
+            "the block wording is for an unsettled Panel: line: {msg}"
+        );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the Loop nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_loop_is_advisory_when_the_panel_line_blocks() {
+        // Panel: and Loop both missing: the block is for `Panel:` alone, and
+        // the Loop stanza rides along in the advisory tail.
+        let plan = plan_scan::template_shaped_plan_without_loop()
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let r = judge_plan_shape(&plan);
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("Also missing, advisory only (a nudge, never a block): a ## Loop section"),
+            "Loop is named as advice, not as the blocking stanza: {msg}"
+        );
+        assert!(
+            msg.contains("this plan lacks a settled Panel: line — the one stanza that blocks"),
+            "{msg}"
         );
     }
 
