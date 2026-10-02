@@ -12,8 +12,9 @@
 //!
 //! | payload | verdict |
 //! |---|---|
-//! | top-level, harness-template plan (no `Panel:` line) | exit 2, stderr names the three stanzas + the in-band escape |
+//! | top-level, harness-template plan (no `Panel:` line) | exit 2, stderr names the missing stanzas + the in-band escape |
 //! | top-level, template-shaped plan | exit 0, reminders-only nudge (subagents stopped, operator asked) |
+//! | top-level, template-shaped plan minus its `## Loop` section | exit 0, nudge naming that section and no other |
 //! | top-level, `Panel: none — reason`, no checkbox tasks | exit 0, one nudge sentence + the reminders |
 //! | subagent-originated (`agent_id` present), harness-template plan | exit 0, silent |
 //! | empty `tool_input`, no plan path | exit 0, silent (fail-open, ADR-0001) |
@@ -167,9 +168,12 @@ fn plan_missing_only_the_loop_section_nudges_naming_it_and_allows() {
         "a missing Loop section must never block"
     );
     let ctx = additional_context(&String::from_utf8_lossy(&out.stdout));
+    // The dash straight after the name is what makes it "only": a second
+    // missing stanza would put a comma there, and this fixture would no longer
+    // be what its name says.
     assert!(
-        ctx.contains("a ## Loop section"),
-        "the nudge names the missing Loop section: {ctx}"
+        ctx.contains("plan lacks a ## Loop section — advisory"),
+        "the nudge names the missing Loop section and no other: {ctx}"
     );
     assert!(
         !ctx.contains("the one stanza that blocks"),
