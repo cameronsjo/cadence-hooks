@@ -15,11 +15,12 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
-    brace_expansion_overflows, carries_substitution, child_scripts, command_segments, command_word,
-    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, heredoc_introducers,
-    is_assignment_word, skip_git_global_options, skip_transparent_prefixes, split_segments,
-    split_segments_with_ops, strip_group_wrappers, strip_heredoc_bodies, su_command_value,
-    tokenize, tokenize_marked, unescape_word,
+    MarkedToken, brace_expansion_overflows, carries_substitution, child_scripts, command_segments,
+    command_word, dollar_opens_quote_after, executable_tokens, executable_tokens_marked,
+    heredoc_introducers, is_assignment_word, is_bash_blank, skip_git_global_options,
+    skip_transparent_prefixes, split_segments, split_segments_with_ops, strip_group_wrappers,
+    strip_heredoc_bodies, strip_leading_keywords, su_command_value, tokenize, tokenize_marked,
+    unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -306,6 +307,14 @@ struct ScanContext {
     /// `export GIT_EDITOR=…`, `GIT_CONFIG_PARAMETERS=…`), which can make any
     /// later `git` run an arbitrary command — so no `git` keeps its exemption.
     git_env_rebound: bool,
+    /// The `gh api`/`tea api` endpoint exemption may apply: the whole
+    /// command is in [`api_command_in_grammar`], and its words split as bash
+    /// splits them ([`tokenizer_word_boundaries_match_bash`]) (#1237). Nor may it mention
+    /// `$_` or `${_`: bash sets `$_` to the last argument of the previous
+    /// command, so `gh api .env; cat "$_"` reads the exempted endpoint as a
+    /// file. Which segment a `$_` binds to is not modeled — any mention drops
+    /// the exemption.
+    api_endpoint_trusted: bool,
 }
 
 /// Most levels of command-string-in-an-option re-scanning.
@@ -606,6 +615,18 @@ fn untracked_content_by_tokens(command: &str, lower: &str) -> bool {
         || (has(&|t| t == "--untracked") && has(&|t| t == "--no-exclude-standard"))
 }
 
+/// A segment's words, each word's unquoted-glob mark, and whether the shell
+/// hands it over as exactly that one word ([`word_is_fixed`]).
+fn marked_words(segment: &str) -> (Vec<String>, Vec<bool>, Vec<bool>) {
+    let marked = tokenize_marked(segment);
+    let fixed = marked.iter().map(word_is_fixed).collect();
+    let (tokens, globs) = marked
+        .into_iter()
+        .map(|t| (t.text, t.unquoted_glob))
+        .unzip();
+    (tokens, globs, fixed)
+}
+
 /// [`segment_env_reads`] at a nesting depth: the segment's own operands, plus
 /// every command string it hands to something that runs it
 /// ([`nested_command_strings`]), scanned as commands in their own right.
@@ -635,20 +656,56 @@ fn segment_env_reads_at(
         (segment, Vec::new())
     };
     let segment = segment.as_ref();
-    let (tokens, globs): (Vec<String>, Vec<bool>) = tokenize_marked(segment)
-        .into_iter()
-        .map(|t| (t.text, t.unquoted_glob))
-        .unzip();
+    let (tokens, globs, fixed) = marked_words(segment);
     let Some(first) = tokens.first() else {
         return Vec::new();
     };
     if first.starts_with('#') {
         return Vec::new();
     }
+    // A loop or conditional body's reserved word is not its command (#1237),
+    // but peeling it would hand the segment its real verb's exemptions (a
+    // `do stat .env` would reach the metadata allowlist). So verdicts read
+    // the segment exactly as before; the peel renames the command a block
+    // message names, and moves the verdict only inside a command that is
+    // wholly in the api grammar, whose loop body is one `gh`/`tea api` call.
+    let lead = unquoted_leading_keywords(segment, &tokens);
+    let shown = (lead > 0).then(|| {
+        (
+            command_word(&tokens[0]).into_owned(),
+            resolve_command(&tokens[lead..]).map(|(word, _)| word.into_owned()),
+        )
+    });
+    let peel = if context.api_endpoint_trusted {
+        lead
+    } else {
+        0
+    };
+    // The files an api call reads into its request are judged behind a
+    // keyword too (`! gh api x -F k=@.env`): this only adds blocks.
+    let keyword_api_reads: Vec<(String, String)> = if lead > peel {
+        resolve_command(&tokens[lead..])
+            .map(|(cmd, argv)| {
+                api_file_values(&cmd, argv)
+                    .into_iter()
+                    .filter_map(|(_, file)| dangerous_secret_operand(file, Filename::Known))
+                    .map(|value| (cmd.to_string(), value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let (tokens, globs, fixed) = (&tokens[peel..], &globs[peel..], &fixed[peel..]);
     let mut found = {
         let _live = LiveScope::set(substitutions_live(segment));
-        segment_direct_reads(&tokens, &globs, context)
+        segment_direct_reads(tokens, globs, fixed, context)
     };
+    for read in keyword_api_reads {
+        if !found.contains(&read) {
+            found.push(read);
+        }
+    }
     // A group closer glued to the last word — `{ (cat .env)}` — tokenizes as
     // `.env)}`, a name no secret pattern matches, while bash reads `.env`
     // (cameronsjo/cadence-hooks#1103). Judge the wrapper-stripped view too; the
@@ -657,11 +714,8 @@ fn segment_env_reads_at(
     let unwrapped = strip_group_wrappers(trimmed);
     if trimmed.starts_with(['(', '{']) && unwrapped != trimmed {
         let _live = LiveScope::set(substitutions_live(unwrapped));
-        let (u_tokens, u_globs): (Vec<String>, Vec<bool>) = tokenize_marked(unwrapped)
-            .into_iter()
-            .map(|t| (t.text, t.unquoted_glob))
-            .unzip();
-        for read in segment_direct_reads(&u_tokens, &u_globs, context) {
+        let (u_tokens, u_globs, u_fixed) = marked_words(unwrapped);
+        for read in segment_direct_reads(&u_tokens, &u_globs, &u_fixed, context) {
             if !found.contains(&read) {
                 found.push(read);
             }
@@ -669,7 +723,7 @@ fn segment_env_reads_at(
     }
     let reread = {
         let _live = LiveScope::set(substitutions_live(segment));
-        substituted_word_reads(segment, &tokens, &globs, context)
+        substituted_word_reads(segment, tokens, globs, context)
     };
     for read in reread {
         if !found.contains(&read) {
@@ -679,7 +733,7 @@ fn segment_env_reads_at(
     if depth < NESTED_SCAN_DEPTH {
         for script in process_bodies
             .into_iter()
-            .chain(nested_command_strings(&tokens))
+            .chain(nested_command_strings(tokens))
         {
             if !budget.spend(&script) {
                 break;
@@ -687,6 +741,7 @@ fn segment_env_reads_at(
             for inner in command_segments(&script) {
                 let inner_context = ScanContext {
                     plain_jq_pipeline: false,
+                    api_endpoint_trusted: false,
                     ..context
                 };
                 found.extend(segment_env_reads_at(
@@ -696,8 +751,25 @@ fn segment_env_reads_at(
                     depth + 1,
                 ));
                 if budget.exhausted {
-                    return found;
+                    return rename_keyword_head(found, shown);
                 }
+            }
+        }
+    }
+    rename_keyword_head(found, shown)
+}
+
+/// Name the command behind a leading reserved word in each read attributed
+/// to that word: `for f in 1; do cat .env; done` blocks as an operand of
+/// `cat`, not `do` (#1237). The message only — no verdict reads this.
+fn rename_keyword_head(
+    mut found: Vec<(String, String)>,
+    shown: Option<(String, Option<String>)>,
+) -> Vec<(String, String)> {
+    if let Some((keyword, Some(verb))) = shown {
+        for (cmd_word, _) in &mut found {
+            if *cmd_word == keyword {
+                cmd_word.clone_from(&verb);
             }
         }
     }
@@ -877,7 +949,8 @@ fn substituted_word_reads(
     if !any_reread {
         return Vec::new();
     }
-    segment_direct_reads(&reread, &reread_globs, context)
+    // No word of a re-read argv is `fixed`: it is not the argv bash runs.
+    segment_direct_reads(&reread, &reread_globs, &[], context)
 }
 
 /// `text` without quote characters or backslashes, for matching a
@@ -1095,6 +1168,7 @@ fn git_command_operands(operands: &[String]) -> Vec<String> {
 fn segment_direct_reads(
     tokens: &[String],
     globs: &[bool],
+    fixed: &[bool],
     context: ScanContext,
 ) -> Vec<(String, String)> {
     let plain_jq_pipeline = context.plain_jq_pipeline;
@@ -1235,6 +1309,14 @@ fn segment_direct_reads(
     for (at, value) in attached_file_values(&cmd_word, argv) {
         uploads.entry(at).or_default().push(value);
     }
+    // The endpoint of `gh api`/`tea api` is a URL path, never opened (#1237);
+    // the files the call does read ride in `uploads`.
+    let api_endpoint = (exact_head && context.api_endpoint_trusted)
+        .then(|| api_endpoint_index(&cmd_word, argv, fixed.get(argv_at..).unwrap_or(&[])))
+        .flatten();
+    for (at, file) in api_file_values(&cmd_word, argv) {
+        uploads.entry(at).or_default().push(file);
+    }
     // Operands a recognized verb consumes without printing (#771, #782).
     let consumed: HashSet<usize> = if exact_head {
         consumed_path_operands(&cmd_word, argv)
@@ -1245,7 +1327,7 @@ fn segment_direct_reads(
     };
     argv.iter()
         .enumerate()
-        .filter(|(i, _)| Some(*i) != jq_filter && !consumed.contains(i))
+        .filter(|(i, _)| Some(*i) != jq_filter && Some(*i) != api_endpoint && !consumed.contains(i))
         .filter_map(|(i, t)| {
             // An unquoted glob in the pattern slot is expanded by the shell
             // before the command runs (`grep .env* x` runs
@@ -1619,6 +1701,711 @@ fn kubeconfig_assignment(token: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
         && !parts.contains(&"..")
         && parts.contains(&".kube")
+}
+
+/// One option of an API client's `api` subcommand, as [`api_option`] reads a
+/// token: its canonical long name, whether it takes a value, and the value
+/// when the token carries it attached.
+struct ApiOption<'a> {
+    name: &'static str,
+    valued: bool,
+    attached: Option<&'a str>,
+}
+
+/// The option grammar of `gh api` (cobra/pflag) and `tea api` (urfave/cli),
+/// as `(short, long, takes a value)` rows, or `None` for any other command
+/// (cadence-hooks#1237). Read from each tool's own flag definitions
+/// (`cli/cli` `pkg/cmd/api/api.go`, `gitea/tea` `cmd/api.go` plus its
+/// `--login`/`--repo`/`--remote` flags).
+fn api_client_options(cmd: &str) -> Option<&'static [(char, &'static str, bool)]> {
+    const GH: &[(char, &str, bool)] = &[
+        ('X', "method", true),
+        ('F', "field", true),
+        ('f', "raw-field", true),
+        ('H', "header", true),
+        ('p', "preview", true),
+        ('t', "template", true),
+        ('q', "jq", true),
+        ('i', "include", false),
+        ('h', "help", false),
+        (' ', "hostname", true),
+        (' ', "input", true),
+        (' ', "cache", true),
+        (' ', "slurp", false),
+        (' ', "paginate", false),
+        (' ', "silent", false),
+        (' ', "verbose", false),
+        (' ', "allow-escape-sequences", false),
+    ];
+    const TEA: &[(char, &str, bool)] = &[
+        ('X', "method", true),
+        ('f', "field", true),
+        ('F', "Field", true),
+        ('H', "header", true),
+        ('d', "data", true),
+        ('o', "output", true),
+        ('l', "login", true),
+        ('r', "repo", true),
+        ('R', "remote", true),
+        ('i', "include", false),
+        ('h', "help", false),
+    ];
+    match cmd {
+        "gh" => Some(GH),
+        "tea" => Some(TEA),
+        _ => None,
+    }
+}
+
+/// Read one `gh api`/`tea api` option token, or `None` when it is not an
+/// option this model knows — which callers treat as "cannot say where the
+/// operands are".
+///
+/// - `--name` / `--name=VALUE` for both tools.
+/// - `gh` (pflag): a short cluster, `-iX GET` or `-iXGET` — booleans, then at
+///   most one valued letter that takes the rest of the cluster or the next
+///   token.
+/// - `tea` (urfave/cli, Go flag syntax): one name per token, spelled with one
+///   dash or two (`-X GET`, `-login x`, `-X=GET`) — no clusters.
+fn api_option<'a>(cmd: &str, token: &'a str) -> Option<ApiOption<'a>> {
+    let rows = api_client_options(cmd)?;
+    let by_name = |name: &str, attached: Option<&'a str>| {
+        rows.iter()
+            .find(|(short, long, _)| {
+                *long == name
+                    || (*short != ' ' && name.chars().count() == 1 && name.starts_with(*short))
+            })
+            .map(|&(_, long, valued)| ApiOption {
+                name: long,
+                valued,
+                attached,
+            })
+    };
+    let body = token.strip_prefix('-')?;
+    if let Some(long) = body.strip_prefix('-') {
+        let (name, attached) = long
+            .split_once('=')
+            .map_or((long, None), |(name, value)| (name, Some(value)));
+        return by_name(name, attached).filter(|_| !name.is_empty());
+    }
+    if cmd == "tea" {
+        let (name, attached) = body
+            .split_once('=')
+            .map_or((body, None), |(name, value)| (name, Some(value)));
+        return by_name(name, attached).filter(|_| !name.is_empty());
+    }
+    let mut last = None;
+    for (at, c) in body.char_indices() {
+        let option = by_name(&body[at..at + c.len_utf8()], None)?;
+        if option.valued {
+            let rest = &body[at + c.len_utf8()..];
+            return Some(ApiOption {
+                attached: (!rest.is_empty()).then_some(rest),
+                ..option
+            });
+        }
+        last = Some(option);
+    }
+    last
+}
+
+/// Is `argv` a `gh api` or `tea api` call? The subcommand must be the word
+/// right after the head: a global option in front of it (`tea --login x api`)
+/// is a grammar this model does not read, so that spelling keeps the full scan.
+fn is_api_call(cmd: &str, argv: &[String]) -> bool {
+    api_client_options(cmd).is_some() && argv.get(1).is_some_and(|sub| sub == "api")
+}
+
+/// The argv index of the ENDPOINT operand of `gh api`/`tea api`: an HTTP path
+/// the client sends as a URL and never opens, so a `/repos/…?page=$p` or a
+/// `repos/o/r/contents/.env` there is no secret file (cadence-hooks#1237,
+/// operator ruling: exempt only this first positional).
+///
+/// `None` — keep the full scan — unless every word from the subcommand through
+/// the endpoint is `fixed` (see [`word_is_fixed`]: no word the shell may split,
+/// glob, or brace-expand into a different argv, which would move the endpoint
+/// onto a word the client reads as a file, e.g. `-X {GET,--input} .env`), and
+/// every option before it is one [`api_option`] knows. An unknown option might
+/// take a value, and then the word this walk calls the endpoint is that value.
+fn api_endpoint_index(cmd: &str, argv: &[String], fixed: &[bool]) -> Option<usize> {
+    if !is_api_call(cmd, argv) {
+        return None;
+    }
+    let mut i = 2;
+    let endpoint = loop {
+        let token = argv.get(i)?;
+        if token == "--" {
+            argv.get(i + 1)?;
+            break i + 1;
+        }
+        if token.len() > 1 && token.starts_with('-') {
+            let option = api_option(cmd, token)?;
+            i += if option.valued && option.attached.is_none() {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        break i;
+    };
+    (1..=endpoint)
+        .all(|at| fixed.get(at).copied().unwrap_or(false))
+        .then_some(endpoint)
+}
+
+/// The local files a `gh api`/`tea api` call reads into its request, by argv
+/// index (cadence-hooks#1237): `gh --input FILE`, the `@FILE` of a typed field
+/// (`gh -F/--field key=@FILE`, `tea -F/--Field key=@FILE`), and `tea -d/--data
+/// @FILE`. `-` and `@-` are stdin. The raw-field `-f` reads no file and stays
+/// with the ordinary operand scan, like every other word the endpoint
+/// exemption does not name.
+///
+/// Every token is examined, wherever it sits: over-collecting can only add a
+/// judgment.
+fn api_file_values<'a>(cmd: &str, argv: &'a [String]) -> Vec<(usize, &'a str)> {
+    if !is_api_call(cmd, argv) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, token) in argv.iter().enumerate().skip(2) {
+        let Some(option) = api_option(cmd, token) else {
+            continue;
+        };
+        let (at, value) = match option.attached {
+            Some(value) => (i, value),
+            None if option.valued => match argv.get(i + 1) {
+                Some(next) => (i + 1, next.as_str()),
+                None => continue,
+            },
+            None => continue,
+        };
+        let file = match option.name {
+            "input" if cmd == "gh" => Some(value),
+            "field" if cmd == "gh" => field_file(value),
+            "Field" => field_file(value),
+            "data" => value.strip_prefix('@'),
+            _ => None,
+        };
+        if let Some(file) = file.filter(|file| !file.is_empty() && *file != "-") {
+            out.push((at, file));
+        }
+    }
+    out
+}
+
+/// The `FILE` of a typed `key=@FILE` field value (the text after the first
+/// `=`), or of a bare `@FILE`.
+fn field_file(value: &str) -> Option<&str> {
+    value
+        .split_once('=')
+        .map_or(value, |(_, rest)| rest)
+        .strip_prefix('@')
+}
+
+/// Can the shell hand `token` to the command as exactly the one word the
+/// tokenizer read? `false` for any word bash may split, glob, or
+/// brace-expand, or that carries a substitution or a redirection:
+///
+/// - an unquoted glob character ([`MarkedToken::unquoted_glob`]);
+/// - a backtick, `$(`, `<`, or `>`;
+/// - a `$` anywhere except inside a word that is ONE double-quoted run
+///   (`"…$p"`), where bash does not split it — and even there not beside an
+///   `@`, since `"$@"` and `"${a[@]}"` expand to several words;
+/// - a brace list (`{a,b}`, `{1..3}`) outside such a run. [`tokenize`]
+///   already expands an unquoted one into its words, so this is a second
+///   line, not the first.
+///
+/// Errs toward `false`: a single-quoted `'$x'` or `'{a,b}'` is literal to
+/// bash but reads as not fixed here, which only keeps a scan.
+fn word_is_fixed(token: &MarkedToken) -> bool {
+    let text = token.text.as_str();
+    if text.is_empty()
+        || token.unquoted_glob
+        || text.contains(['`', '<', '>'])
+        || text.contains("$(")
+    {
+        return false;
+    }
+    let one_double_quoted_run =
+        token.unquoted_prefix_len == 0 && token.expanding_prefix_len == text.len();
+    let expands =
+        text.contains('$') || (text.contains('{') && (text.contains(',') || text.contains("..")));
+    !expands || (one_double_quoted_run && !text.contains('@'))
+}
+
+/// How one word of an [`api_command_in_grammar`] command was quoted — one
+/// kind per word; a word that mixes kinds (`'a'b`) is refused by the lexer.
+#[derive(Clone, Copy, PartialEq)]
+enum ApiQuote {
+    Plain,
+    Single,
+    Double,
+}
+
+/// One lexed unit of an [`api_command_in_grammar`] command.
+enum ApiLex {
+    Word(String, ApiQuote),
+    /// `;`, `&&`, a newline, or `|`.
+    Op(&'static str),
+    /// One of the few allowed output redirections, already validated.
+    Redirect,
+}
+
+/// Characters an unquoted word of the api grammar may carry: no expansion,
+/// glob, brace, tilde, comment, or quoting character.
+fn api_plain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._/:@=+-,".contains(c)
+}
+
+/// Characters of a plain redirection target (`> out/x.tsv`, `>> ~/x`).
+fn api_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._/~-".contains(c)
+}
+
+/// Is `name` a shell identifier other than `_` (whose `$_` is the previous
+/// command's last argument — the endpoint itself)?
+fn api_var_name(name: &str) -> bool {
+    name != "_"
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Lex `command` for [`api_command_in_grammar`], or `None` at the first
+/// character outside the grammar. Strict by construction: every character
+/// is either recognized here or refused.
+fn api_lex(command: &str) -> Option<Vec<ApiLex>> {
+    let chars: Vec<char> = command.chars().collect();
+    let boundary = |at: usize| {
+        chars
+            .get(at)
+            .is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | ';' | '|' | '&'))
+    };
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut i = 0;
+    let flush = |word: &mut String, out: &mut Vec<ApiLex>| {
+        if !word.is_empty() {
+            out.push(ApiLex::Word(std::mem::take(word), ApiQuote::Plain));
+        }
+    };
+    while let Some(&c) = chars.get(i) {
+        match c {
+            ' ' | '\t' => {
+                flush(&mut word, &mut out);
+                i += 1;
+            }
+            '\n' | ';' | '|' | '&' => {
+                flush(&mut word, &mut out);
+                let next = chars.get(i + 1).copied();
+                let op = match (c, next) {
+                    ('\n', _) => "\n",
+                    (';', Some(';')) | ('|', Some('|' | '&')) => return None,
+                    (';', _) => ";",
+                    ('|', _) => "|",
+                    ('&', Some('&')) => {
+                        i += 1;
+                        "&&"
+                    }
+                    _ => return None,
+                };
+                out.push(ApiLex::Op(op));
+                i += 1;
+            }
+            '>' => {
+                // `2>/dev/null`, `2>&1`, `> PATH`, `>> PATH` — nothing else.
+                let fd2 = match word.as_str() {
+                    "" => false,
+                    "2" => true,
+                    _ => return None,
+                };
+                word.clear();
+                i += 1;
+                let append = chars.get(i) == Some(&'>');
+                if append {
+                    i += 1;
+                }
+                if fd2 && !append && chars.get(i) == Some(&'&') {
+                    if chars.get(i + 1) != Some(&'1') || !boundary(i + 2) {
+                        return None;
+                    }
+                    i += 2;
+                } else {
+                    while matches!(chars.get(i), Some(' ' | '\t')) {
+                        i += 1;
+                    }
+                    let start = i;
+                    while chars.get(i).copied().is_some_and(api_path_char) {
+                        i += 1;
+                    }
+                    let target: String = chars[start..i].iter().collect();
+                    let allowed = if fd2 {
+                        !append && target == "/dev/null"
+                    } else {
+                        !target.is_empty()
+                    };
+                    if !allowed || !boundary(i) {
+                        return None;
+                    }
+                }
+                out.push(ApiLex::Redirect);
+            }
+            '\'' | '"' => {
+                if !word.is_empty() {
+                    return None;
+                }
+                let close = chars[i + 1..].iter().position(|&d| d == c)? + i + 1;
+                let body: String = chars[i + 1..close].iter().collect();
+                if body.contains('\n') {
+                    return None;
+                }
+                if c == '"' {
+                    if body.contains(['\\', '`', '!']) {
+                        return None;
+                    }
+                    // Every `$` opens `$NAME` or `${NAME}` — nothing else.
+                    let mut rest = body.as_str();
+                    while let Some(at) = rest.find('$') {
+                        let after = &rest[at + 1..];
+                        let (name, tail) = if let Some(braced) = after.strip_prefix('{') {
+                            let end = braced.find('}')?;
+                            (&braced[..end], &braced[end + 1..])
+                        } else {
+                            let end = after
+                                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                .unwrap_or(after.len());
+                            (&after[..end], &after[end..])
+                        };
+                        if !api_var_name(name) {
+                            return None;
+                        }
+                        rest = tail;
+                    }
+                }
+                if !boundary(close + 1) {
+                    return None;
+                }
+                let quote = if c == '"' {
+                    ApiQuote::Double
+                } else {
+                    ApiQuote::Single
+                };
+                out.push(ApiLex::Word(body, quote));
+                i = close + 1;
+            }
+            c if api_plain_char(c) => {
+                word.push(c);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    flush(&mut word, &mut out);
+    Some(out)
+}
+
+/// A cursor over [`api_lex`]'s output for [`api_command_in_grammar`].
+struct ApiParse<'a> {
+    lex: &'a [ApiLex],
+    at: usize,
+}
+
+impl ApiParse<'_> {
+    fn plain(&self) -> Option<&str> {
+        match self.lex.get(self.at) {
+            Some(ApiLex::Word(text, ApiQuote::Plain)) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn eat_plain(&mut self, want: &str) -> bool {
+        let hit = self.plain() == Some(want);
+        self.at += usize::from(hit);
+        hit
+    }
+
+    /// The words of one simple command, up to the next operator, then its
+    /// trailing redirections (a word after a redirection is refused).
+    fn simple(&mut self) -> Option<Vec<(String, ApiQuote)>> {
+        let mut words = Vec::new();
+        while let Some(ApiLex::Word(text, quote)) = self.lex.get(self.at) {
+            words.push((text.clone(), *quote));
+            self.at += 1;
+        }
+        while let Some(ApiLex::Redirect) = self.lex.get(self.at) {
+            self.at += 1;
+        }
+        match self.lex.get(self.at) {
+            None | Some(ApiLex::Op(_)) => Some(words),
+            Some(_) => None,
+        }
+    }
+
+    fn eat_separators(&mut self, allowed: &[&str]) -> usize {
+        let mut n = 0;
+        while let Some(ApiLex::Op(op)) = self.lex.get(self.at) {
+            if !allowed.contains(op) {
+                break;
+            }
+            self.at += 1;
+            n += 1;
+        }
+        n
+    }
+
+    /// Consumers of a pipeline: `| C [REDIRS]` repeated.
+    fn consumers(&mut self) -> Option<()> {
+        while let Some(ApiLex::Op("|")) = self.lex.get(self.at) {
+            self.at += 1;
+            if !api_consumer(&self.simple()?) {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// `(gh|tea) api FLAGS ENDPOINT FLAGS [REDIRS] [| C [REDIRS]]…`
+    fn api_pipeline(&mut self) -> Option<()> {
+        if !api_call_words(&self.simple()?) {
+            return None;
+        }
+        self.consumers()
+    }
+
+    /// Shape A, or `for NAME in W…; do A; done [REDIRS] [| C [REDIRS]]…`.
+    fn statement(&mut self) -> Option<()> {
+        if !self.eat_plain("for") {
+            return self.api_pipeline();
+        }
+        if !self.plain().is_some_and(api_var_name) {
+            return None;
+        }
+        self.at += 1;
+        if !self.eat_plain("in") {
+            return None;
+        }
+        let mut items = 0;
+        while self.plain().is_some_and(|w| !matches!(w, "do" | "done")) {
+            self.at += 1;
+            items += 1;
+        }
+        if items == 0 || self.eat_separators(&[";", "\n"]) == 0 || !self.eat_plain("do") {
+            return None;
+        }
+        self.api_pipeline()?;
+        if self.eat_separators(&[";", "\n"]) == 0 || !self.eat_plain("done") {
+            return None;
+        }
+        while let Some(ApiLex::Redirect) = self.lex.get(self.at) {
+            self.at += 1;
+        }
+        self.consumers()
+    }
+}
+
+/// Is `words` a `gh api`/`tea api` call whose every word this grammar
+/// understands: known options ([`api_option`]) with plain or single-quoted
+/// values, and exactly one ENDPOINT — plain, single-quoted, or double-quoted
+/// with only `$NAME` expansions (checked by the lexer)?
+fn api_call_words(words: &[(String, ApiQuote)]) -> bool {
+    let plain = |i: usize, want: &str| {
+        words
+            .get(i)
+            .is_some_and(|(w, q)| *q == ApiQuote::Plain && w == want)
+    };
+    let cmd = if plain(0, "gh") {
+        "gh"
+    } else if plain(0, "tea") {
+        "tea"
+    } else {
+        return false;
+    };
+    if !plain(1, "api") {
+        return false;
+    }
+    let mut endpoint = false;
+    let mut options_done = false;
+    let mut i = 2;
+    while let Some((word, quote)) = words.get(i) {
+        let is_option = *quote == ApiQuote::Plain && word.len() > 1 && word.starts_with('-');
+        if is_option && !options_done {
+            if word == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            let Some(option) = api_option(cmd, word) else {
+                return false;
+            };
+            if option.valued && option.attached.is_none() {
+                if !words
+                    .get(i + 1)
+                    .is_some_and(|(_, q)| matches!(q, ApiQuote::Plain | ApiQuote::Single))
+                {
+                    return false;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if endpoint {
+            return false;
+        }
+        endpoint = true;
+        i += 1;
+    }
+    endpoint
+}
+
+/// Is `words` one of the few pipeline consumers the grammar admits: `jq`
+/// with plain output flags and one single-quoted filter that loads nothing,
+/// bare `cat`, `sort` with `-r -n -u -f -k N[,M] -t 'C'`, `uniq` with
+/// `-c -d -u -i` and no operand, `head`/`tail` [`-n N`], and `wc -l` — each
+/// a flag set that opens no file?
+fn api_consumer(words: &[(String, ApiQuote)]) -> bool {
+    const JQ_FLAGS: &[&str] = &[
+        "-r",
+        "-c",
+        "-s",
+        "-e",
+        "-n",
+        "-S",
+        "-j",
+        "--raw-output",
+        "--compact-output",
+        "--slurp",
+    ];
+    let Some(((head, ApiQuote::Plain), args)) = words.split_first() else {
+        return false;
+    };
+    match head.as_str() {
+        "jq" => {
+            let mut filters = args.iter().filter(|(_, q)| *q == ApiQuote::Single);
+            let filter_ok = filters.next().is_some_and(|(f, _)| {
+                !["import", "include", "input_filename", "$__prog_args"]
+                    .iter()
+                    .any(|bad| f.contains(bad))
+            }) && filters.next().is_none();
+            filter_ok
+                && args.iter().all(|(w, q)| {
+                    *q == ApiQuote::Single
+                        || (*q == ApiQuote::Plain && JQ_FLAGS.contains(&w.as_str()))
+                })
+        }
+        "cat" => args.is_empty(),
+        // Flags that read no file: not `-m`/`--files0-from`/`-T`/`-o`, and
+        // `uniq` takes no operand (its second one is an output file).
+        "sort" => {
+            let mut i = 0;
+            while let Some((word, quote)) = args.get(i) {
+                let value = args.get(i + 1);
+                i += match (word.as_str(), quote) {
+                    ("-r" | "-n" | "-u" | "-f", ApiQuote::Plain) => 1,
+                    ("-k", ApiQuote::Plain)
+                        if value.is_some_and(|(v, q)| {
+                            *q == ApiQuote::Plain
+                                && v.split(',').count() <= 2
+                                && v.split(',')
+                                    .all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                        }) =>
+                    {
+                        2
+                    }
+                    ("-t", ApiQuote::Plain)
+                        if value.is_some_and(|(v, q)| {
+                            *q == ApiQuote::Single && v.chars().count() == 1
+                        }) =>
+                    {
+                        2
+                    }
+                    _ => return false,
+                };
+            }
+            true
+        }
+        "uniq" => args
+            .iter()
+            .all(|(w, q)| *q == ApiQuote::Plain && matches!(w.as_str(), "-c" | "-d" | "-u" | "-i")),
+        "head" | "tail" => match args {
+            [] => true,
+            [(n_flag, ApiQuote::Plain), (n, ApiQuote::Plain)] => {
+                n_flag == "-n" && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+            }
+            _ => false,
+        },
+        "wc" => matches!(args, [(l, ApiQuote::Plain)] if l == "-l"),
+        _ => false,
+    }
+}
+
+/// Is the WHOLE command a sequence — joined only by `;`, `&&`, or newlines —
+/// of statements each of one of two shapes (cadence-hooks#1237, operator
+/// ruling after three review rounds)?
+///
+/// - A: `(gh|tea) api FLAGS ENDPOINT FLAGS [REDIRS] [| C [REDIRS]]…`
+/// - B: `for NAME in W…; do A; done [REDIRS] [| C [REDIRS]]…`
+///
+/// The `gh api`/`tea api` endpoint exemption applies only then. An
+/// ALLOWLIST, because the denylists before it each met a new way for a later
+/// command to read the endpoint back — `$_`, `${!v}` with `v=_`, a `declare
+/// -n` nameref, history, a `trap` spelled past a word match, a shell fed a
+/// heredoc. Here no command outside the grammar runs at all, and none inside
+/// it can expand `$_` or run a program the grammar did not name:
+///
+/// - REDIRS are `2>/dev/null`, `2>&1`, `> PATH`, `>> PATH` (PATH plain); no
+///   input redirection, heredoc, here-string, `&`, or `|&`;
+/// - W and unquoted words are a plain charset; a double-quoted ENDPOINT
+///   expands only `$NAME`/`${NAME}`, never `$_`, `${!…}`, an operator, a
+///   backtick, or `$(`;
+/// - C is `jq` (output flags, one single-quoted filter that loads no module
+///   or file name), bare `cat`, `sort`/`uniq`, `head`/`tail` [`-n N`], or
+///   `wc -l`.
+fn api_command_in_grammar(command: &str) -> bool {
+    let Some(lex) = api_lex(command) else {
+        return false;
+    };
+    let mut parse = ApiParse { lex: &lex, at: 0 };
+    parse.eat_separators(&["\n"]);
+    loop {
+        if parse.statement().is_none() {
+            return false;
+        }
+        let separated = parse.eat_separators(&[";", "&&", "\n"]);
+        if parse.at == lex.len() {
+            return true;
+        }
+        if separated == 0 {
+            return false;
+        }
+    }
+}
+
+/// How many of `tokens`' leading shell reserved words (`do`, `then`, `if`, …)
+/// stand UNQUOTED at the start of `segment`, so bash reads them as keywords
+/// rather than a command. `for p in 1 2; do tea api …; done` segments as
+/// `do tea api …`, and without this the block named `do` as the command
+/// (cadence-hooks#1237).
+///
+/// [`strip_leading_keywords`] is a detector-side helper that reads quote-
+/// removed tokens, where `'do'` (a command named `do`) and `do` are the same
+/// text. Peeling here also moves a segment onto its real verb's exemptions, so
+/// each word is confirmed against the raw text: it must open the remaining
+/// segment verbatim and be followed by a blank.
+fn unquoted_leading_keywords(segment: &str, tokens: &[String]) -> usize {
+    let candidates = tokens.len() - strip_leading_keywords(tokens).len();
+    let mut rest = segment.trim_start_matches(is_bash_blank);
+    let mut peeled = 0;
+    for word in &tokens[..candidates] {
+        match rest.strip_prefix(word.as_str()) {
+            Some(after) if after.starts_with(is_bash_blank) => {
+                rest = after.trim_start_matches(is_bash_blank);
+                peeled += 1;
+            }
+            _ => break,
+        }
+    }
+    peeled
 }
 
 /// Operands a recognized verb consumes as configuration without printing,
@@ -4971,6 +5758,12 @@ fn command_level_reads(
     if depth > NESTED_SCAN_DEPTH || budget.out_of_time() {
         return;
     }
+    // Heredoc bodies and nested scripts are never an api command in the
+    // grammar the endpoint exemption requires (#1237).
+    let context = ScanContext {
+        api_endpoint_trusted: false,
+        ..context
+    };
     let mut judged: Vec<String> = shell_fed_heredoc_bodies(command);
     let mut children: Vec<String> = Vec::new();
     // Upstream of the current pipeline: a secret name a `find` selects or an
@@ -5210,6 +6003,11 @@ fn bash_leaks_secrets_within(
             git_env_rebound: tokenize(command)
                 .iter()
                 .any(|t| is_assignment_word(t) && t.starts_with("GIT_")),
+            api_endpoint_trusted: command.contains("api")
+                && !command.contains("$_")
+                && !command.contains("${_")
+                && tokenizer_word_boundaries_match_bash(command)
+                && api_command_in_grammar(command),
         };
         let segments = command_segments(command);
         let mut budget = RescanBudget::new(deadline);
@@ -11953,6 +12751,356 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "nothing secret is named",
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_endpoint_tests {
+    //! cadence-hooks#1237: the endpoint of `gh api`/`tea api` is a URL path,
+    //! and a loop body's `do` is not a command.
+    use super::*;
+    use cadence_hooks_core::Outcome;
+
+    fn verdict(command: &str) -> CheckResult {
+        SecretLeaksGuard::default().run(&cadence_hooks_core::test_builders::make_bash(command))
+    }
+
+    #[test]
+    fn api_endpoint_operand_is_not_a_secret_file() {
+        for command in [
+            // The reported commands, verbatim shapes.
+            "tea api --login sjo \"/repos/search?limit=50&page=$p\" 2>/dev/null | jq -r '.' >> /tmp/x.tsv",
+            "for p in 2 3 4; do tea api --login sjo \"/repos/search?limit=50&page=$p\" 2>/dev/null | jq -r '.' >> /tmp/x.tsv; done",
+            "tea api -l sjo -X GET '/repos/{owner}/{repo}/issues?state=open'",
+            "tea api -login=sjo /repos/search?limit=1",
+            // A repository path that names a file in the REMOTE repo.
+            "gh api repos/o/r/contents/.env",
+            "gh api /repos/o/r/contents/.env.production --jq .content",
+            "gh api .env",
+            "gh api -X GET .env",
+            "gh api --method=GET -H 'Accept: x' .env",
+            "gh api --hostname ghe.example.com .env",
+            "gh api -iX GET .env",
+            "gh api -iXGET .env",
+            "gh api --paginate --slurp .env",
+            "gh api -- .env",
+            "gh api \"repos/o/r/contents/.env?ref=$SHA\"",
+            // The whole command is in the grammar: statements of api
+            // pipelines and `for` loops around one, joined by `;`/`&&`/newline.
+            "gh api .env | jq '.'",
+            "gh api .env 2>/dev/null | jq -r '.x' >> /tmp/x.tsv",
+            "gh api .env | sort -u | head -n 5 | wc -l",
+            "for p in 1 2; do gh api .env | jq -c '.'; done | sort",
+            "for p in 1; do gh api .env; done > /tmp/out",
+            "for p in a b\ndo\n  gh api \"/r/${p}\" | cat\ndone",
+            "gh api .env; gh api .env",
+            "gh api /x && tea api .env",
+            "tea api --login sjo '/repos/search?limit=50&page=1' 2>&1 | jq -r '.' > /tmp/x.tsv; for p in 2 3 4; do tea api --login sjo \"/repos/search?limit=50&page=$p\" 2>/dev/null | jq -r '.' >> /tmp/x.tsv; done",
+            "tea api --login sjo '/repos/search?limit=50&page=1' 2>&1 | jq -r '.[] | [.full_name, .description] | @tsv' > /tmp/x.tsv; for p in 2 3 4; do tea api --login sjo \"/repos/search?limit=50&page=$p\" 2>/dev/null | jq -r '.[] | [.full_name, .description] | @tsv' >> /tmp/x.tsv; done",
+        ] {
+            assert_eq!(verdict(command).outcome, Outcome::Allow, "{command}");
+        }
+    }
+
+    #[test]
+    fn api_request_files_and_uncertain_endpoints_still_block() {
+        for command in [
+            // Files the client reads into the request (the ruling's test first).
+            "gh api x -F b=@.env",
+            "gh api repos/o/r -F b=@.env",
+            "gh api x -Fb=@.env",
+            "gh api x -iF b=@.env",
+            "gh api x --field b=@.env",
+            "gh api x --field=b=@prod.env",
+            "gh api -F b=@.env x",
+            "gh api x --input .env",
+            "gh api x --input=.env",
+            "gh api x --input prod.env",
+            "gh api --input .env x",
+            "gh api --input - x <.env",
+            "gh api --input - <.env x",
+            "tea api x -F k=@.env",
+            "tea api x --Field=k=@.env",
+            "tea api x -d @.env",
+            "tea api x --data=@.env.local",
+            // Every other word keeps the ordinary scan, the raw field included.
+            "gh api x .env",
+            "gh api x -f .env",
+            "tea api -o .env x",
+            // An option this model does not know may take the next word.
+            "gh api --unknown v .env",
+            "tea api -iX GET .env",
+            // Only the exact `gh api` / `tea api` spelling.
+            "command gh api .env",
+            "env gh api .env",
+            "sudo gh api .env",
+            "/usr/bin/gh api .env",
+            "./gh api .env",
+            "gh -R o/r api .env",
+            "tea --login x api .env",
+            "gh repo .env",
+            // A word the shell may split or expand moves the endpoint.
+            "gh api -X {GET,--input} .env",
+            "gh api $X .env",
+            "gh api \"$@\" .env",
+            "gh api .en*",
+            "gh api <.env",
+            "gh api \"$(cat .env)\"",
+            "gh api `cat .env`",
+            // The client may be something else in this command.
+            "gh() { cat \"$2\"; }; gh api .env",
+            "gh () { cat \"$2\"; }; gh api .env",
+            "function gh { cat \"$2\"; }; gh api .env",
+            "alias gh=cat; gh api .env",
+            "export PATH=/tmp/e:$PATH; gh api .env",
+            "BASH_CMDS[gh]=/bin/cat; gh api .env",
+            "hash -p /bin/cat gh; gh api .env",
+            "source ./x.sh; gh api .env",
+            ". ./x.sh; gh api .env",
+            "eval x; gh api .env",
+            "bash -c 'gh api .env'",
+            // Round 3: `trap` past a word match, and a heredoc-fed shell.
+            "v=_; t''rap 'cat \"${!v}\"' EXIT; gh api .env",
+            "v=_; \\trap 'cat \"${!v}\"' EXIT; gh api .env",
+            "v=_; builtin trap 'cat \"${!v}\"' EXIT; gh api .env",
+            "v=_; T=trap; $T 'cat \"${!v}\"' EXIT; gh api .env",
+            "bash <<'EOF'\nv=_; gh api .env; cat \"${!v}\"\nEOF",
+            "cat <<'EOF' | bash\nv=_\ngh api .env\ncat \"${!v}\"\nEOF",
+            "bash <<< 'gh api .env; cat \"$_\"'",
+            // Anything outside the grammar keeps the full scan.
+            "tea api .env; cat \"${!v}\"",
+            "v=_; gh api .env | cat \"${!v}\"",
+            "if true; then gh api .env; fi",
+            "x=1; gh api .env | jq '.'",
+            "gh api .env | jq .",
+            "gh api .env | jq -r --rawfile a x '.'",
+            "gh api .env | jq 'import \"x\" as x; .'",
+            "gh api .env | cat -",
+            // Consumer flags that open a file.
+            "gh api .env | sort --files0-from=.env",
+            "gh api .env | sort --files0-from .env",
+            "gh api .env | sort -m .env",
+            "gh api .env | sort -T .env",
+            "gh api .env | sort -o .env",
+            "gh api .env | sort .env",
+            "gh api .env | sort -rn .env",
+            "gh api .env | uniq -c .env",
+            "gh api .env | uniq .env out",
+            "gh api .env | head .env",
+            "gh api .env | tail -n 5 .env",
+            "gh api .env | wc -l .env",
+            "gh api .env | jq '.' .env",
+            "gh api .env | tee /tmp/x",
+            "gh api .env > \"$HOME/x\"",
+            "gh api .env 1>&2",
+            "gh api .env < /dev/null",
+            "gh api .env &",
+            "gh api .env |& cat",
+            "gh api .env || true",
+            "for p in \"$X\"; do gh api .env; done",
+            "for _ in 1; do gh api .env; done",
+            "for p in 1; do gh api .env; cat x; done",
+            "gh api .env # note",
+            // The exemption is one word of one segment.
+            "gh api /x; cat .env",
+            "gh api .env | cat .env",
+            // `$_` is the previous command's last argument: the endpoint.
+            "gh api .env; cat \"$_\"",
+            "tea api --login s .env; grep . \"$_\"",
+            "for p in 1; do gh api .env; done; cat \"$_\"",
+            "gh api .env; while read l; do echo $l; done < \"$_\"",
+            "gh api .env && cat \"$_\"",
+            "gh api .env || cat \"$_\"",
+            "gh api .env | cat \"$_\"",
+            "gh api .env\ncat \"$_\"",
+            "gh api .env; x=$_; cat \"$x\"",
+            "gh api .env; cat \"${_}\"",
+            "gh api .env; mapfile -t a < \"$_\"; echo \"${a[@]}\"",
+            "gh api .env; exec 3<$_; cat <&3",
+            "trap 'cat \"$_\"' DEBUG; gh api .env; true",
+            // Indirect `$_`: any command after the call could read it.
+            "v=_; gh api .env; cat \"${!v}\"",
+            "v=_; tea api .env; cat \"${!v}\"",
+            "v=_; gh api .env && cat \"${!v}\"",
+            "for v in _; do gh api .env; cat \"${!v}\"; done",
+            "v=_; gh api .env; grep . \"${!v}\"",
+            "v=_; gh api .env; mapfile -t a < \"${!v}\"; echo \"${a[@]}\"",
+            "declare -n r=_; gh api .env; cat \"$r\"",
+            "typeset -n r=_; gh api .env; cat \"$r\"",
+            "local -n r=_; gh api .env; cat \"$r\"",
+            "readonly -n r=_; gh api .env; cat \"$r\"",
+            "declare -n r=_; gh api .env; while read l; do echo \"$l\"; done < \"$r\"",
+            "v=_; for p in 1; do gh api .env; done > /tmp/o; cat \"${!v}\"",
+            // A loop re-runs what precedes or guards the call.
+            "v=_; for p in 1 2; do cat \"${!v}\"; gh api .env; done",
+            "v=_; for a in 1 2; do for p in 1; do gh api .env; done; cat \"${!v}\"; done",
+            "v=_; while cat \"${!v}\"; do gh api .env; done",
+            "v=_; until cat \"${!v}\"; do gh api .env; done",
+            "v=_; select p in 1; do gh api .env; done",
+            "v=_; if true; then while cat \"${!v}\"; do gh api .env; done; fi",
+            "v=_; for ((i=0;i<2;i++)); do gh api .env; done",
+            "v=_; gh api .env & cat \"${!v}\"",
+            "trap 'cat \"${!v}\"' EXIT; v=_; gh api .env",
+            // History re-reads the endpoint in a later command.
+            "set -o history\ngh api .env\nfc -ln -1 | awk '{print $NF}' | xargs cat",
+            "set -o history\ngh api .env\ncat $(history 2 | head -1 | awk '{print $NF}')",
+            "set -H -o history\ngh api .env\ncat !$",
+            "for p in 1; do gh api \"/r?p=$p\" --input .env; done",
+        ] {
+            assert_eq!(verdict(command).outcome, Outcome::Block, "{command}");
+        }
+    }
+
+    #[test]
+    fn loop_body_reads_name_the_real_command() {
+        for (command, verb) in [
+            ("for f in 1; do cat .env; done", "cat"),
+            ("while true; do head .env; done", "head"),
+            ("if true; then tail .env; fi", "tail"),
+            ("if true; then :; else cat .env; fi", "cat"),
+            ("! cat .env", "cat"),
+            // Quoted, `do` is a command name bash looks up.
+            ("'do' cat .env", "do"),
+            ("\"do\" cat .env", "do"),
+        ] {
+            let result = verdict(command);
+            assert_eq!(result.outcome, Outcome::Block, "{command}");
+            let shown = result.message.unwrap_or_default();
+            assert!(
+                shown.contains(&format!("as an operand of `{verb}`")),
+                "{command}: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peeled_keyword_changes_only_the_message() {
+        // Round 4: the peel must not reach a verb's exemption. Each leaks a
+        // canary in real bash, and each blocked before the peel existed.
+        for command in [
+            "if true; then direnv exec . cat .env; fi",
+            "for x in 1; do direnv exec . cat .env; done",
+            "! direnv exec . cat .env",
+            "if true; then command direnv exec . cat .env; fi",
+            "if true; then echo .env; fi; cat \"$_\"",
+            "for x in 1; do stat .env; done; cat \"$_\"",
+            // Round 5: an api call's request files behind a keyword.
+            "! gh api x -F k=@.env",
+            "if true; then gh api x --input=.env; fi",
+            "while true; do gh api x -F k=@.env; done",
+            "! tea api x -F k=@.env",
+            "if true; then tea api x --data=@.env; fi",
+            "for p in 1; do gh api x --field k=@prod.env; done",
+            "for f in 1; do ls .env; done",
+            "if true; then stat .env; fi",
+        ] {
+            assert_eq!(verdict(command).outcome, Outcome::Block, "{command}");
+        }
+        let message = verdict("for x in 1; do cat .env; done")
+            .message
+            .unwrap_or_default();
+        assert!(message.contains("as an operand of `cat`"), "{message}");
+    }
+
+    #[test]
+    fn api_endpoint_index_finds_only_the_first_positional() {
+        let words = |s: &str| -> Vec<String> { tokenize(s) };
+        let all_fixed = |argv: &[String]| vec![true; argv.len()];
+        for (command, want) in [
+            ("gh api /x", Some(2)),
+            ("gh api -X GET /x", Some(4)),
+            ("gh api -iXGET /x", Some(3)),
+            ("gh api --input f /x", Some(4)),
+            ("gh api -- -x", Some(3)),
+            ("tea api -login sjo /x", Some(4)),
+            ("tea api -X=GET /x", Some(3)),
+            ("gh api --nope /x", None),
+            ("tea api -iX GET /x", None),
+            ("gh api -X", None),
+            ("gh pr view /x", None),
+            ("curl api /x", None),
+        ] {
+            let argv = words(command);
+            let cmd = command_word(&argv[0]).into_owned();
+            assert_eq!(
+                api_endpoint_index(&cmd, &argv, &all_fixed(&argv)),
+                want,
+                "{command}"
+            );
+        }
+        let argv = words("gh api -X GET /x");
+        assert_eq!(
+            api_endpoint_index("gh", &argv, &[true, true, true, false, true]),
+            None,
+            "an option value the shell may expand moves the endpoint"
+        );
+    }
+
+    #[test]
+    fn the_api_grammar_admits_only_its_two_shapes() {
+        for (command, want) in [
+            ("gh api /x", true),
+            ("gh api -X GET '/x' --jq '.a' | jq -r '.'", true),
+            (
+                "tea api -l s \"/r?p=$p&q=${q}\" 2>/dev/null | jq '.' >> out.tsv",
+                true,
+            ),
+            ("for p in 1 2; do tea api \"/r?p=$p\"; done | sort", true),
+            ("gh api /a; gh api /b && gh api /c\n", true),
+            ("gh api /x 2>&1 > ~/out", true),
+            ("gh api \"$_\"", false),
+            ("gh api \"${_}\"", false),
+            ("gh api \"${p:-x}\"", false),
+            ("gh api \"$(x)\"", false),
+            ("gh api $p", false),
+            ("gh api /x?y", false),
+            ("gh api /x /y", false),
+            ("gh api /x 2>/tmp/e", false),
+            ("gh api /x >&2", false),
+            ("gh api /x > \"$f\"", false),
+            ("gh api /x <<'E'\nE", false),
+            ("gh api /x | jq .", false),
+            ("gh api /x | jq -f f '.'", false),
+            ("gh api /x | jq '.' '.'", false),
+            ("gh api /x | head -c 5", false),
+            (
+                "gh api /x | sort -r -n -k 2,3 -t ',' | uniq -c | tail -n 3",
+                true,
+            ),
+            ("gh api /x | sort -k 2,3,4", false),
+            ("gh api /x | sort -t ab", false),
+            ("gh api /x | sort --files0-from=f", false),
+            ("gh api /x | sort -rn", false),
+            ("gh api /x | uniq -c f", false),
+            ("gh api /x;; gh api /y", false),
+            ("gh api /x || gh api /y", false),
+            ("gh api /x & gh api /y", false),
+            ("gh api /x; ls", false),
+            ("ls; gh api /x", false),
+            ("for p in 1; do gh api /x; ls; done", false),
+            ("for p in $(ls); do gh api /x; done", false),
+            ("gh api 'a'b", false),
+            ("gh api /x --unknown", false),
+            ("gh api -H \"$h\" /x", false),
+            ("gh api /x # c", false),
+        ] {
+            assert_eq!(api_command_in_grammar(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_fixed_word_is_one_word_to_bash() {
+        let fixed = |s: &str| {
+            tokenize_marked(s)
+                .iter()
+                .map(word_is_fixed)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fixed("/x 'a b' \"/r?p=$p\" '{owner}'"), [true; 4]);
+        assert_eq!(
+            fixed("$p \"$@\" \"${a[@]}\" x* \"a\"$b '$x' <x `x` \"$(x)\""),
+            [false; 9]
         );
     }
 }
