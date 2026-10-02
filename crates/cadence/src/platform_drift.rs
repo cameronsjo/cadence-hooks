@@ -101,6 +101,26 @@ fn version_gap(current: &str, baseline: &str) -> bool {
     c_patch.abs_diff(b_patch) >= 5
 }
 
+/// Nudge text for the cadence-hooks half, split by direction: an installed
+/// binary older than the baseline needs a binary upgrade, while one at or above
+/// it means the plugin pin is the stale side (`brew upgrade` changes nothing).
+/// `None` when there is no gap or either version is malformed.
+fn hooks_drift_nudge(installed: &str, baseline: &str) -> Option<String> {
+    if !version_gap(installed, baseline) {
+        return None;
+    }
+    let ahead = parse_semver(installed)? > parse_semver(baseline)?;
+    Some(if ahead {
+        format!(
+            "the cadence plugin pin is behind the binary: installed cadence-hooks {installed}, plugin baseline expects {baseline} — run `claude plugin update cadence@workbench`, then `/reload-plugins`"
+        )
+    } else {
+        format!(
+            "cadence-hooks is behind: installed {installed}, plugin baseline expects {baseline} — upgrade with your install method (e.g. `brew upgrade cadence-hooks`)"
+        )
+    })
+}
+
 /// Nudge when the installed binary or platform has drifted past the baseline.
 pub struct PlatformDrift {
     pub baseline_path: Option<String>,
@@ -134,7 +154,7 @@ impl Check for PlatformDrift {
         let mut findings: Vec<(String, String)> = Vec::new();
         let installed_hooks_version = env!("CARGO_PKG_VERSION");
 
-        if version_gap(
+        if let Some(nudge) = hooks_drift_nudge(
             installed_hooks_version,
             &baseline.cadence_hooks.current_version,
         ) {
@@ -144,10 +164,7 @@ impl Check for PlatformDrift {
                     token_component(installed_hooks_version),
                     token_component(&baseline.cadence_hooks.current_version)
                 ),
-                format!(
-                    "cadence-hooks is behind: installed {installed_hooks_version}, plugin baseline expects {} — upgrade with your install method (e.g. `brew upgrade cadence-hooks`)",
-                    baseline.cadence_hooks.current_version
-                ),
+                nudge,
             ));
         }
 
@@ -264,6 +281,39 @@ mod tests {
     #[test]
     fn version_gap_fires_on_any_major_crossing() {
         assert!(version_gap("1.0.0", "0.66.0"));
+    }
+
+    #[test]
+    fn hooks_drift_nudge_table() {
+        let behind = "cadence-hooks is behind: installed 0.114.0, plugin baseline expects 0.116.0";
+        let pin = "the cadence plugin pin is behind the binary: installed cadence-hooks 0.116.0, plugin baseline expects 0.114.0";
+        // (installed, baseline, expected substring; None = silent)
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("0.114.0", "0.116.0", Some(behind)),
+            ("0.66.0", "0.66.5", Some("cadence-hooks is behind")),
+            ("0.116.0", "0.114.0", Some(pin)),
+            ("0.66.5", "0.66.0", Some("plugin pin is behind")),
+            ("0.116.0", "0.116.0", None),
+            ("0.66.4", "0.66.0", None),
+            ("bogus", "0.66.0", None),
+        ];
+        for (installed, baseline, want) in cases {
+            let got = hooks_drift_nudge(installed, baseline);
+            match want {
+                Some(w) => {
+                    let m = got.unwrap_or_else(|| panic!("{installed} vs {baseline}: silent"));
+                    assert!(m.contains(w), "{installed} vs {baseline}: {m}");
+                    if w.contains("pin") {
+                        assert!(m.contains("claude plugin update cadence@workbench"));
+                        assert!(m.contains("/reload-plugins"));
+                        assert!(!m.contains("brew upgrade"));
+                    } else {
+                        assert!(m.contains("brew upgrade cadence-hooks"));
+                    }
+                }
+                None => assert!(got.is_none(), "{installed} vs {baseline}: {got:?}"),
+            }
+        }
     }
 
     #[test]
