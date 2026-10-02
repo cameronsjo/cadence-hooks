@@ -155,6 +155,28 @@ fn template_shaped_plan_nudges_the_presentation_reminders_only() {
     );
 }
 
+/// The template-shaped plan with its `## Loop` section removed and nothing
+/// else changed. The missing section is named, and it never blocks
+/// (cadence-hooks#1281).
+#[test]
+fn plan_missing_only_the_loop_section_nudges_naming_it_and_allows() {
+    let out = run_fixture("epm-missing-loop-only.json");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a missing Loop section must never block"
+    );
+    let ctx = additional_context(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        ctx.contains("a ## Loop section"),
+        "the nudge names the missing Loop section: {ctx}"
+    );
+    assert!(
+        !ctx.contains("the one stanza that blocks"),
+        "a plan missing only the Loop section draws no block wording: {ctx}"
+    );
+}
+
 #[test]
 fn settled_panel_none_with_no_boxes_nudges_once_and_allows() {
     let out = run_fixture("epm-panel-none-no-boxes.json");

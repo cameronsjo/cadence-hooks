@@ -270,7 +270,7 @@ pub(crate) const TEMPLATE_POINTER: &str =
 #[cfg(test)]
 pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
     Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n\
-    ## Loop\n\nLoop: none — nothing recurs\n\n\
+    ## Loop\n\nLoop: none — nothing outlives the work\n\n\
     ## Alternatives declined\n\n- none\n\n\
     ## Global Constraints\n\n- keep it small\n\n\
     ## Orchestrator\n\n**Driver:** sonnet\n\n\
@@ -282,7 +282,8 @@ pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
 /// that still carries one.
 #[cfg(test)]
 pub(crate) fn template_shaped_plan_without_loop() -> String {
-    let plan = TEMPLATE_SHAPED_PLAN.replace("## Loop\n\nLoop: none — nothing recurs\n\n", "");
+    let plan =
+        TEMPLATE_SHAPED_PLAN.replace("## Loop\n\nLoop: none — nothing outlives the work\n\n", "");
     assert_ne!(
         plan, TEMPLATE_SHAPED_PLAN,
         "the fixture must carry a Loop section to strip"
@@ -291,9 +292,10 @@ pub(crate) fn template_shaped_plan_without_loop() -> String {
 }
 
 /// The ONE plan-shape detector both gates consume: the plan template's
-/// stanzas `body` lacks, in template order (`Panel:` line, `## Loop`,
-/// Alternatives declined, `## Global Constraints`, `## Orchestrator`,
-/// `## Tasks`, checkbox tasks). Only the `Panel:` line blocks at call time;
+/// stanzas `body` lacks, the `Panel:` line first and the rest in template
+/// order (`## Loop`, Alternatives declined, `## Global Constraints`,
+/// `## Orchestrator`, `## Tasks`, checkbox tasks). Only the `Panel:` line
+/// blocks at call time;
 /// the rest nudge, `## Loop` included (cadence-hooks#1019,
 /// cadence-hooks#1281). Empty for a template-shaped
 /// plan. Two scanners drifted once already (the #675 polish), which is why
@@ -1866,7 +1868,7 @@ mod tests {
         // tier (priority 3) but does NOT satisfy the template detector — the
         // nudge teaches the `## Orchestrator` + `Driver:` form (deliverable 7).
         let body = "---\nrecommended_model: sonnet\n---\n\n# T\n\n\
-                    Panel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — one-shot\n\n\
+                    Panel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
                     ## Alternatives declined\n\n- none\n\n\
                     ## Global Constraints\n\n- c\n\n## Tasks\n\n- [ ] task\n";
         assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
@@ -1875,7 +1877,7 @@ mod tests {
 
     #[test]
     fn missing_stanzas_deeper_heading_does_not_satisfy_section_detector() {
-        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — one-shot\n\n\
+        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
                     ## Alternatives declined\n\n\
                     - none\n\n### Global Constraints\n\n- c\n\n## Orchestrator\n\n\
                     **Driver:** sonnet\n\n## Tasks\n\n- [ ] task\n";
@@ -1895,8 +1897,10 @@ mod tests {
     /// `decoy` placed where the Loop section would sit, in a plan that has
     /// every other stanza: the heading must still read as missing.
     fn without_loop_but_with(decoy: &str) -> String {
-        let plan =
-            TEMPLATE_SHAPED_PLAN.replace("## Loop\n\nLoop: none — nothing recurs\n\n", decoy);
+        let plan = TEMPLATE_SHAPED_PLAN.replace(
+            "## Loop\n\nLoop: none — nothing outlives the work\n\n",
+            decoy,
+        );
         assert!(
             plan.contains(decoy),
             "the decoy must be in the plan under test"
@@ -1923,15 +1927,41 @@ mod tests {
             )),
             vec![LOOP_STANZA]
         );
+        // Markdown would render these two as the heading. The lint wants
+        // the exact line, so each still reads as missing.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with(" ## Loop\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("## loop\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        // The `Loop: none` line with no heading above it.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("Loop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+    }
+
+    #[test]
+    fn missing_stanzas_loop_heading_tolerates_trailing_whitespace() {
+        for heading in ["## Loop  ", "## Loop\t"] {
+            let plan = without_loop_but_with(&format!("{heading}\n\nLoop: none — x\n\n"));
+            assert!(
+                missing_stanzas(&plan).is_empty(),
+                "trailing whitespace after the heading must still count: {heading:?}"
+            );
+        }
     }
 
     #[test]
     fn missing_stanzas_accepts_the_loop_table_and_the_none_line() {
         let table = TEMPLATE_SHAPED_PLAN.replace(
-            "## Loop\n\nLoop: none — nothing recurs\n\n",
-            "## Loop\n\n| Step | Repeats until |\n|---|---|\n| review | no findings |\n\n",
+            "## Loop\n\nLoop: none — nothing outlives the work\n\n",
+            "## Loop\n\n| Thing created | Opened by (surfaces) | Closed by (surfaces) | Who closes |\n|---|---|---|---|\n| flag | `flag` (CLI) | `unflag` (CLI) | the user |\n\n",
         );
-        assert!(table.contains("| review | no findings |"));
+        assert!(table.contains("| flag | `flag` (CLI) | `unflag` (CLI) | the user |"));
         assert!(missing_stanzas(&table).is_empty(), "table form");
         // The fixture itself uses the `Loop: none — <reason>` form.
         assert!(TEMPLATE_SHAPED_PLAN.contains("Loop: none — "));
