@@ -206,6 +206,107 @@ pub fn resolve_effective_repo(cwd: &Path, target: &Path, kind: TargetKind) -> Re
     RepoResolver::new().resolve(cwd, target, kind)
 }
 
+/// The directory whose repo a Bash `command` operates in: `cwd` after the
+/// command's leading `cd` chain ([`crate::shell::parse_work_dir`]), resolved
+/// to the innermost repo root — so `cd <nested> && git …` from a meta-repo
+/// session is judged against the nested repo, not the meta-repo.
+///
+/// - No `cd` in effect: `cwd` itself, unchanged (the long-standing reading).
+/// - A `cd` into the session's own repo, or into a repo nested INSIDE its
+///   tree (the gitignored nested repo of a meta-repo, a worktree kept under
+///   the checkout): that repo's root.
+/// - Anything else is `None`:
+///   - a `cd` that does not run unconditionally — the chain must be the
+///     command's leading segments, each a bare `cd` joined by `&&` or `;`
+///     (`false && cd x`, `cd x || exit`, `git status; cd x` all fail this),
+///     since [`crate::shell::parse_work_dir`] assumes every `cd` runs;
+///   - a target outside the session repo's tree (an unrelated checkout, an
+///     enclosing repo, a sibling worktree), or a session cwd in no repo;
+///   - a target that is no repo, does not exist, or cannot be read
+///     ([`Resolution::NotARepo`] / [`Resolution::Ambiguous`]).
+///
+/// **Why so narrow.** Callers run `git` in the returned directory before the
+/// user approves the command, and a repo's own config can name programs git
+/// executes (`core.fsmonitor`, filter drivers). The session's own tree is the
+/// only one a hook may treat that way; a command's text must never be able to
+/// point a hook at an arbitrary repo on disk.
+///
+/// `None` means "cannot name the repo this command runs in". Only a guard that
+/// nudges may read it as quiet; a guard whose verdict relaxes on the repo must
+/// read it as "not exempt".
+pub fn command_repo_dir(command: &str, cwd: &str) -> Option<String> {
+    let work = crate::shell::parse_work_dir(command, cwd);
+    if work == cwd {
+        return Some(cwd.to_string());
+    }
+    if !leading_cd_chain_is_unconditional(command) {
+        return None;
+    }
+    let resolution = resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir);
+    let repo = resolution.resolved()?;
+    let session_root = std::fs::canonicalize(&repo.cwd_state.as_ref()?.repo_root).ok()?;
+    let target_root = std::fs::canonicalize(&repo.state.repo_root).ok()?;
+    target_root
+        .starts_with(&session_root)
+        .then(|| target_root.to_string_lossy().into_owned())
+}
+
+/// The two repos whose per-repo config a Bash `command` could fall under, when
+/// they differ: `effective` is the repo [`command_repo_dir`] says the command
+/// runs in (an unconditional leading `cd` into a repo nested inside the
+/// session's tree), and `session` is the repo enclosing `cwd`. Both are
+/// canonical roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedRepo {
+    /// The repo the command's leading `cd` moves into.
+    pub effective: PathBuf,
+    /// The repo enclosing the session's cwd.
+    pub session: PathBuf,
+}
+
+/// [`MovedRepo`] when `command`'s leading `cd` lands in a repo other than the
+/// session's own; `None` when there is no such move, when the `cd` stays in
+/// the session repo, or when [`command_repo_dir`] cannot name the repo (a
+/// conditional `cd`, a target outside the session's tree). Reads files only —
+/// it never spawns `git` in either repo.
+///
+/// For a guard that reads per-repo config: the effective repo's config is
+/// the primary reading, and where the two configs would judge differently
+/// the guard should say so rather than pick one silently
+/// (cameronsjo/cadence-hooks#225).
+pub fn moved_repo(command: &str, cwd: &str) -> Option<MovedRepo> {
+    let dir = command_repo_dir(command, cwd)?;
+    let root_of = |d: &str| {
+        let state = GitState::resolve(Path::new(d))?;
+        std::fs::canonicalize(state.repo_root).ok()
+    };
+    let effective = root_of(&dir)?;
+    let session = root_of(cwd)?;
+    (effective != session).then_some(MovedRepo { effective, session })
+}
+
+/// True when every `cd` segment of `command` is part of an unconditional
+/// leading chain: the segments up to and including the last `cd` are all bare
+/// `cd` commands, each followed by `&&` or `;`. A `cd` behind a guard
+/// (`false && cd x`), before `||`, in a pipeline, or after any other command
+/// fails — the caller cannot be sure the shell ends up there. So does a
+/// newline between `cd`s, which [`crate::shell::parse_work_dir`] does not
+/// follow: the directory it reports would not be where the shell ends up.
+fn leading_cd_chain_is_unconditional(command: &str) -> bool {
+    let segments = crate::shell::split_segments_with_ops(command);
+    let is_cd = |segment: &str| {
+        crate::shell::tokenize(segment)
+            .first()
+            .is_some_and(|word| word == "cd")
+    };
+    let Some(last_cd) = segments.iter().rposition(|(segment, _)| is_cd(segment)) else {
+        return false;
+    };
+    segments[..=last_cd]
+        .iter()
+        .all(|(segment, op)| is_cd(segment) && matches!(op, Some("&&" | ";")))
+}
+
 fn relate(target: &GitState, cwd: Option<&GitState>) -> RepoRelation {
     let Some(cwd) = cwd else {
         return RepoRelation::CwdNotARepo;
@@ -576,5 +677,158 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = resolve_effective_repo(&meta, Path::new(&deep), TargetKind::File);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn command_repo_dir_keys_off_the_repo_a_leading_cd_moves_into() {
+        let (s, meta, plugin) = meta_layout("command-dir");
+        std::fs::create_dir_all(meta.join("plain-dir")).unwrap();
+        // An unrelated repo outside the session's tree, and a symlink inside
+        // the meta repo that points at it.
+        let foreign = s.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        init_repo(&foreign);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&foreign, meta.join("link-out")).unwrap();
+        let m = meta.to_str().unwrap();
+        let f = foreign.to_str().unwrap();
+        let p = canon(&plugin).to_string_lossy().into_owned();
+        let meta_root = canon(&meta).to_string_lossy().into_owned();
+        // (label, command, cwd, expected)
+        let mut cases: Vec<(&str, String, &str, Option<String>)> = vec![
+            (
+                "no cd: the cwd, unchanged",
+                "git status".into(),
+                m,
+                Some(m.into()),
+            ),
+            (
+                "meta cwd, cd into the gitignored nested repo",
+                "cd plugin && git status".into(),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "meta cwd, cd into a subdir of the nested repo",
+                format!("cd {}/src && git status", plugin.display()),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "multi-cd chain ending in the nested repo",
+                "cd plain-dir && cd ../plugin && git status".into(),
+                m,
+                Some(p.clone()),
+            ),
+            (
+                "a newline-joined cd chain the parser does not follow: quiet",
+                "cd plain-dir\ncd ../plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a plain dir inside the meta repo: the meta repo",
+                "cd plain-dir; git status".into(),
+                m,
+                Some(meta_root.clone()),
+            ),
+            (
+                "nested cwd, cd out to the enclosing meta repo: outside the session tree",
+                format!("cd {m} && git status"),
+                &p,
+                None,
+            ),
+            (
+                "cd into an unrelated repo",
+                format!("cd {f} && git status"),
+                m,
+                None,
+            ),
+            (
+                "cd into an unrelated repo via ..",
+                "cd ../foreign && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd behind `false &&` may never run",
+                "false && cd plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd before `||`",
+                "cd plugin || exit; git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd after another command",
+                "git status; cd plugin && git status".into(),
+                m,
+                None,
+            ),
+            (
+                "a cd in a pipeline",
+                "cd plugin | cat; git status".into(),
+                m,
+                None,
+            ),
+            (
+                "cd into a missing dir: cannot say",
+                "cd no-such-dir && git status".into(),
+                m,
+                None,
+            ),
+        ];
+        #[cfg(unix)]
+        cases.push((
+            "a symlink inside the meta repo pointing out of it",
+            "cd link-out && git status".into(),
+            m,
+            None,
+        ));
+        for (label, command, cwd, want) in cases {
+            assert_eq!(command_repo_dir(&command, cwd), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn moved_repo_names_both_roots_only_when_the_cd_changes_repo() {
+        let (_s, meta, plugin) = meta_layout("moved");
+        std::fs::create_dir_all(meta.join("plain-dir")).unwrap();
+        let m = meta.to_str().unwrap();
+        let want = MovedRepo {
+            effective: canon(&plugin),
+            session: canon(&meta),
+        };
+        // (label, command, expected)
+        let cases: Vec<(&str, &str, Option<MovedRepo>)> = vec![
+            (
+                "cd into the nested repo",
+                "cd plugin && gh pr create",
+                Some(want.clone()),
+            ),
+            (
+                "cd into a subdir of the nested repo",
+                "cd plugin/src && gh pr create",
+                Some(want),
+            ),
+            ("no cd", "gh pr create", None),
+            (
+                "cd within the session repo",
+                "cd plain-dir && gh pr create",
+                None,
+            ),
+            (
+                "a conditional cd",
+                "false && cd plugin && gh pr create",
+                None,
+            ),
+            ("a missing dir", "cd nope && gh pr create", None),
+        ];
+        for (label, command, want) in cases {
+            assert_eq!(moved_repo(command, m), want, "{label}");
+        }
     }
 }

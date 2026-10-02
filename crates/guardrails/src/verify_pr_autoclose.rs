@@ -584,6 +584,26 @@ enum Flow {
     Neither,
 }
 
+/// The directory `gh` ran in: the payload cwd after an unconditional leading
+/// `cd` chain, resolved to the repo it lands in, so `cd <nested> && gh pr
+/// create` from a meta-repo session reads the nested repo's origin, not the
+/// meta-repo's (cameronsjo/cadence-hooks#225). No payload cwd falls back to
+/// this process's directory (long-standing). `None` — a conditional `cd`
+/// (`false && cd other`), a repo outside the session's tree, or a directory
+/// no repo can be named for — keeps the advisory quiet: the merge flow closes
+/// issues, so it must never act on a repo the command may not have touched.
+fn gh_work_dir(cmd: &str, cwd: Option<&str>) -> Option<String> {
+    match cwd {
+        Some(cwd) => cadence_hooks_core::target_repo::command_repo_dir(cmd, cwd),
+        None => Some(
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| ".".to_string()),
+        ),
+    }
+}
+
 /// Pick the flow from the command's `gh pr <sub>` segments
 /// ([`gh_pr_segments`]) rather than a substring (cadence-hooks#1076).
 ///
@@ -632,12 +652,10 @@ impl Check for VerifyPrAutoclose {
             return CheckResult::allow();
         }
 
-        // Resolve working directory
-        let cwd_fallback = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| ".".to_string());
-        let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+        let Some(cwd) = gh_work_dir(cmd, input.cwd.as_deref()) else {
+            return CheckResult::allow();
+        };
+        let cwd = cwd.as_str();
 
         // Get remote URL and parse it
         let Some(remote_url) = git_command(cwd, &["remote", "get-url", "origin"]) else {
@@ -1785,5 +1803,88 @@ mod tests {
             input.tool_response_stdout(),
             Some("https://github.com/owner/repo/pull/42")
         );
+    }
+
+    #[test]
+    fn gh_work_dir_reads_the_repo_a_leading_cd_moves_into() {
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        let s = Scratch::new(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/verify-pr-autoclose-scratch"),
+            "meta-cd",
+        );
+        let meta = s.path().join("meta");
+        let nested = meta.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&meta);
+        std::fs::write(meta.join(".gitignore"), "nested/\n").unwrap();
+        git_in(&meta, &["add", ".gitignore"]);
+        git_in(&meta, &["commit", "-q", "-m", "ignore"]);
+        init_repo(&nested);
+        let remote = |dir: &std::path::Path, slug: &str| {
+            let url = format!("https://github.com/o/{slug}.git");
+            git_in(dir, &["remote", "add", "origin", &url]);
+        };
+        let other = s.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        init_repo(&other);
+        remote(&meta, "meta");
+        remote(&nested, "nested");
+        remote(&other, "other");
+        let o = other.to_str().unwrap();
+        let m = meta.to_str().unwrap();
+        let n = nested.to_str().unwrap();
+        // (label, command, cwd, expected origin slug: None = quiet)
+        let cases: Vec<(&str, String, &str, Option<&str>)> = vec![
+            (
+                "meta cwd, cd into the gitignored nested repo",
+                "cd nested && gh pr create --fill".into(),
+                m,
+                Some("o/nested"),
+            ),
+            (
+                "meta cwd, no cd: the meta repo (unchanged)",
+                "gh pr create --fill".into(),
+                m,
+                Some("o/meta"),
+            ),
+            (
+                "nested cwd, cd out to the enclosing meta repo: outside the session tree",
+                format!("cd {m} && gh pr merge 3"),
+                n,
+                None,
+            ),
+            (
+                "a cd behind `false &&` never reaches the other repo",
+                format!("false && cd {o} && gh pr merge 5"),
+                m,
+                None,
+            ),
+            (
+                "an unrelated repo outside the session's tree",
+                format!("cd {o} && gh pr merge 5"),
+                m,
+                None,
+            ),
+            (
+                "a nested cd behind `false &&`",
+                "false && cd nested && gh pr merge 5".into(),
+                m,
+                None,
+            ),
+            (
+                "cd into a missing dir: quiet",
+                "cd nested/no-such && gh pr create --fill".into(),
+                m,
+                None,
+            ),
+        ];
+        for (label, command, cwd, want) in cases {
+            let slug = gh_work_dir(&command, Some(cwd)).map(|dir| {
+                let url = git_command(&dir, &["remote", "get-url", "origin"]).unwrap();
+                parse_remote(&url).unwrap().1
+            });
+            assert_eq!(slug.as_deref(), want, "{label}");
+        }
     }
 }
