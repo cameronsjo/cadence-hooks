@@ -2686,4 +2686,56 @@ mod tests {
             );
         }
     }
+
+    /// A write nested past the expansion depth still reaches the guard
+    /// (#1233 review C1, #1267).
+    #[test]
+    fn a_write_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(cp d .env))))",
+            "echo $(echo $(echo $(echo $(echo $(cp d .env)))))",
+            "echo $(echo $(echo $(echo `cp d .env`)))",
+            "cat <(cat <(cat <(cat <(cat <(cp d .env)))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(mv d .env))))))))",
+            "echo $(cat <(echo $(echo $(sh -c 'cp d .env'))))",
+            "diff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    /// A process substitution runs its body, so a writer there writes
+    /// (cameronsjo/cadence-hooks#1233). Quoted, it is literal text.
+    #[test]
+    fn a_write_inside_a_process_substitution_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("true <(mv d .env)", Block),
+            (": <(tee .env < d)", Block),
+            ("cat <(dd if=d of=.env)", Block),
+            ("cat <( cat <(cp d .env) )", Block),
+            ("cat a<(cp d .env)", Block),
+            ("echo $<(cp d .env)", Block),
+            ("echo 2>(cp d .env)", Block),
+            ("echo ${v:-<(cp d .env)}", Block),
+            ("x=<(cp d .env)", Block),
+            ("echo \"$(cat <(cp d .env))\"", Block),
+            ("cat <(cp d .env", Block),
+            ("watch <(cp d .env)", Block),
+            ("tee >(cat > .env)", Block),
+            ("echo \"<(cp d .env)\"", Allow),
+            ("echo '<(cp d .env)'", Allow),
+            ("echo \"${v:-<(cp d .env)}\"", Allow),
+            ("cat <(echo ok) <(sort a)", Allow),
+            ("while read l; do echo $l; done < <(git ls-files)", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
 }

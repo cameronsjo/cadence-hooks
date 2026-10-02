@@ -190,6 +190,55 @@ CORPUS="$WORK/corpus.tsv"
     # invariant is that a consumer never sees LESS text, which has to hold
     # whether or not the input happens to be runnable.
     printf '652-nested-unclosed-quote\tcat <<EOF\001$(echo "$(echo x" ; cat .env)\001EOF\n'
+    # cadence-hooks#1233: an unquoted process substitution runs its body, so a
+    # writer or a dangerous git verb there is a command of its own. Quoted, it
+    # is literal text (the last row), and must not move.
+    printf '1233-procsub-mv\ttrue <(mv d .env)\n'
+    printf '1233-procsub-tee\t: <(tee .env < d)\n'
+    printf '1233-procsub-glued\tcat a<(cp d .env)\n'
+    printf '1233-procsub-output\tcat >(git reset --hard)\n'
+    printf '1233-procsub-nested\tcat <(cat <(cat .env))\n'
+    printf '1233-procsub-in-dquoted-subst\techo "$(cat <(cp d .env))"\n'
+    printf '1233-procsub-unterminated\tcat <(cp d .env\n'
+    printf '1233-ctl-dquoted\techo "<(cp d .env)"\n'
+    # #1233 review C1 / #1267: a command nested past the expansion depth,
+    # with a `<(…)` spending one level or four plain `$(…)` levels.
+    printf '1233-deep-procsub-reset\tcat <(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-diff-reset\tdiff <(git diff) <(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-inner-procsub\techo $(echo $(cat <(echo $(git reset --hard))))\n'
+    printf '1233-deep-assign\tx=$(cat <(echo $(echo $(git reset --hard))))\n'
+    printf '1233-deep-write\tcat <(echo $(echo $(echo $(cp d .env))))\n'
+    printf '1233-deep-arith\t(( 1<(2+$(echo $(echo $(git reset --hard)))) ))\n'
+    printf '1267-dollar-4\techo $(echo $(echo $(echo $(git reset --hard))))\n'
+    printf '1267-dollar-8\techo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(cp d .env))))))))\n'
+    printf '1267-backtick-inner\techo $(echo $(echo $(echo `cat .env`)))\n'
+    printf '1267-procsub-5\tcat <(cat <(cat <(cat <(cat <(cp d .env)))))\n'
+    # #1266 review: a wrapper script past the bound is unwrapped too.
+    printf '1266-wrap-bash\tcat <(echo $(echo $(echo $(bash -c '"'"'git reset --hard'"'"'))))\n'
+    printf '1266-wrap-sh\techo $(cat <(echo $(echo $(sh -c '"'"'cp d .env'"'"'))))\n'
+    printf '1266-wrap-eval\tdiff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))\n'
+    printf '1266-wrap-nested\ttrue >(echo "$(echo $(sh -c '"'"'sh -c '"'"'"'"'"'"'"'"'git reset --hard'"'"'"'"'"'"'"'"''"'"'))")\n'
+    # #1266 review round 3: a `<(…)` spends no level, so the substitutions
+    # inside one are evaluated as on main.
+    printf '1266-procsub-eval-sub\tcat <(echo $(echo $(echo $(git $(echo reset) --hard))))\n'
+    printf '1266-procsub-eval-glue\tdiff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))\n'
+    printf '1266-procsub-nest4-eval-sub\tcat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))\n'
+    # #1266 review round 4 C1: a `<(` the splitter cut open at a separator
+    # inside it still reads its `$(…)`s at the level they had on main.
+    printf '1266-open-procsub-semi\tcat <(cat <(cat <(echo $(git $(echo reset) --hard; true))))\n'
+    printf '1266-open-procsub-and\tcat <(cat <(cat <(echo $(cp d .$(echo env) && true))))\n'
+    printf '1266-open-procsub-pipe\ttrue >(true >(true >(echo $(git `echo reset` --hard | true))))\n'
+    # #1266 review round 4 C2: `case` after `f()`/`coproc`/`time -p`, or
+    # behind a nested quote a flat reader misreads.
+    printf '1266-case-fn-header\t(cd /tmp; f() case x in x) true;; esac; f; git push origin main)\n'
+    printf '1266-case-coproc\techo "$(echo '"'"'a"b'"'"')"; (cd /tmp; coproc case x in x) true;; esac; git push origin main)\n'
+    # #1266 review round 3 C1: two eval floods spend the flatten allowance,
+    # and a padded command after them is still listed.
+    FLOOD_P='cat <(echo $(echo $(echo $(' FLOOD_Q='))))'
+    FLOOD_EVAL=$(printf 'eval %.0s' $(seq 1000))
+    FLOOD_PAD=$(printf 'A%.0s' $(seq 5000))
+    printf '1266-two-floods-write\t%s\n' "$FLOOD_P${FLOOD_EVAL}true$FLOOD_Q; $FLOOD_P${FLOOD_EVAL}:$FLOOD_Q; ${FLOOD_P}X=$FLOOD_PAD cp d .env$FLOOD_Q"
+    printf '1266-two-floods-reset\t%s\n' "$FLOOD_P${FLOOD_EVAL}true$FLOOD_Q; $FLOOD_P${FLOOD_EVAL}:$FLOOD_Q; ${FLOOD_P}git reset --hard $FLOOD_PAD$FLOOD_Q"
 } > "$CORPUS"
 
 # Assert the corpus is the shape its comments claim. `printf`'s escape handling
@@ -242,6 +291,13 @@ STAY_ALLOWED="$WORK/allowed.tsv"
     printf 'allow-git-commit\tgit commit -m "$(printf '"'"'%%s'"'"' x)"\n'
     printf 'allow-nested-plain\techo $(echo "$(date)")\n'
     printf 'allow-nested-quoted-paren\techo $(echo "$(echo '"'"'")'"'"')")\n'
+    printf 'allow-procsub-diff\tdiff <(sort a) <(sort b)\n'
+    printf 'allow-procsub-while\twhile read l; do echo "$l"; done < <(git ls-files)\n'
+    printf 'allow-procsub-dquoted\techo "<(git reset --hard)"\n'
+    printf 'allow-case-comment\tD=$(cd /tmp && pwd); git push origin main # just in case\n'
+    printf 'allow-deep-plain\techo $(echo $(echo $(echo $(git status))))\n'
+    printf 'allow-case-operand\tD=$(cd /tmp && pwd); grep case x; git push origin main\n'
+    printf 'allow-case-escaped-operand\tD=$(cd /tmp && pwd); grep \\case x; git push origin main\n'
 } > "$STAY_ALLOWED"
 
 # --- consumers ---------------------------------------------------------------
