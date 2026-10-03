@@ -14012,7 +14012,7 @@ fn home_may_be_rebound(command: &str) -> bool {
     });
     named > PATH_ASSIGNMENT.find_iter(command).count()
         || plain
-            .split(|c: char| matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '\n'))
+            .split([';', '&', '|', '(', ')', '`', '\n'])
             .any(|segment| {
                 let mut words = segment.split_whitespace();
                 words.next() == Some(".")
