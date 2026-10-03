@@ -69,8 +69,8 @@
 //! here means "not an alias", not "cannot publish": hooks, credential and
 //! other helpers, and fsmonitor commands a builtin runs are outside this
 //! guard's model, and `for-each-repo`, which runs a git command its arguments
-//! name, is probed like any other subcommand, as is `hook` when the command
-//! sets `core.hooksPath` (it then runs a hook the command picked). The running git vouches only for
+//! name, is probed like any other subcommand, as is `git hook` with any
+//! argument but `list` (`hook run` runs whatever hook the config names). The running git vouches only for
 //! a plain `git` in a command that does not name `PATH`; a `git` swapped
 //! without naming it (`hash -p`, a nameref built from an expansion, a sourced
 //! file) is outside the model. An exec-path script (`submodule`, `bisect`),
@@ -672,10 +672,6 @@ struct CommandEnv {
     script_blind: Option<&'static str>,
     /// The command names `GIT_EXEC_PATH` (quotes and backslashes removed).
     exec_path_moved: bool,
-    /// The command sets `core.hooksPath` (`-c`, `--config-env`,
-    /// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_KEY_<n>`, a `git config` write):
-    /// any `hooksPath` mention, case-insensitive like config keys.
-    hooks_path_set: bool,
     /// The command names the `PATH` variable other than to expand it
     /// ([`names_path_variable`]), so another `git` may run.
     path_moved: bool,
@@ -692,7 +688,6 @@ impl CommandEnv {
             script_blind: command_probe_blind(command, false),
             exec_path_moved: contains_ignoring_ascii_case(&plain, "GIT_EXEC_PATH"),
             path_moved: names_path_variable(&plain),
-            hooks_path_set: contains_ignoring_ascii_case(&plain, "hookspath"),
         }
     }
 }
@@ -933,11 +928,11 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         }
         let env = env.get_or_insert_with(|| CommandEnv::of(command));
         let ask_git = call.bare && !env.path_moved;
-        // `git hook run` under a `core.hooksPath` this command sets runs a
-        // hook the command picked: probed like an unknown subcommand, so a
-        // blind or failed probe fails closed as it did before.
-        let picked_hook = exact == "hook" && env.hooks_path_set;
-        if !picked_hook && is_builtin(exact, ask_git) {
+        // `git hook run` runs whatever hook the config names: probed like an
+        // unknown subcommand, so a blind or failed probe fails closed as it
+        // did before. Only bare `git hook` and `git hook list` run nothing.
+        let runs_hook = exact == "hook" && call.rest.get(1).is_some_and(|w| w.as_str() != "list");
+        if !runs_hook && is_builtin(exact, ask_git) {
             continue;
         }
         // An exec-path script is probed for a real alias like any other
@@ -3035,68 +3030,73 @@ mod tests {
 
     /// Gate 2 M3: the running git vouches only for the `git` it is: a call
     /// through a path, or under a command that mentions `PATH`, may run a
-    /// different git, so a builtin missing from [`BUILTINS`] (`hook`, added
-    /// in 2.36) is probed again and fails closed when blind.
+    /// different git, so a builtin missing from [`BUILTINS`] (`diagnose`, added
+    /// in 2.38) is probed again and fails closed when blind.
     #[test]
     fn the_running_git_vouches_only_for_a_plain_git_on_an_unchanged_path() {
         let fx = Fx::new("ask-git");
-        assert!(!BUILTINS.contains(&"hook"));
-        assert_allows(&fx.run("HOME=/tmp/x git hook run pre-push"));
+        assert!(!BUILTINS.contains(&"diagnose"));
+        assert_allows(&fx.run("HOME=/tmp/x git diagnose -o /tmp/x"));
         for command in [
-            "HOME=/tmp/x /usr/bin/git hook run pre-push",
-            "HOME=/tmp/x ./git hook run pre-push",
-            "PATH=/opt/old/bin:$PATH HOME=/tmp/x git hook run pre-push",
-            "export PATH=/opt/old/bin; HOME=/tmp/x git hook run pre-push",
-            "PATH+=:/opt; HOME=/tmp/x git hook run pre-push",
-            "declare -n r=PATH; r=/opt; HOME=/tmp/x git hook run pre-push",
+            "HOME=/tmp/x /usr/bin/git diagnose -o /tmp/x",
+            "HOME=/tmp/x ./git diagnose -o /tmp/x",
+            "PATH=/opt/old/bin:$PATH HOME=/tmp/x git diagnose -o /tmp/x",
+            "export PATH=/opt/old/bin; HOME=/tmp/x git diagnose -o /tmp/x",
+            "PATH+=:/opt; HOME=/tmp/x git diagnose -o /tmp/x",
+            "declare -n r=PATH; r=/opt; HOME=/tmp/x git diagnose -o /tmp/x",
         ] {
-            assert_blocks(&fx.run(command), &["hook", "cannot resolve"]);
+            assert_blocks(&fx.run(command), &["diagnose", "cannot resolve"]);
         }
         // A static builtin needs no vouching.
         assert_allows(&fx.run("PATH=/x HOME=/tmp/x /usr/bin/git credential fill"));
         // Round 2 m4: only the `PATH` variable itself counts, not an
         // expansion of it or a longer name.
         for command in [
-            "HOME=/tmp/x git hook run pre-push; echo $PATH ${PATH}",
-            "HOME=/tmp/x MANPATH=/x git hook run pre-push",
-            "HOME=/tmp/x git hook run pre-push --git-path x",
+            "HOME=/tmp/x git diagnose -o /tmp/x; echo $PATH ${PATH}",
+            "HOME=/tmp/x MANPATH=/x git diagnose -o /tmp/x",
+            "cd \"$W\" && git -c core.hooksPath=.h diagnose -o /tmp/x",
+            "HOME=/tmp/x git diagnose -o /tmp/x --git-path x",
         ] {
             assert_allows(&fx.run(command));
         }
     }
 
-    /// Gate 2 round 3: `git hook run` under a `core.hooksPath` the command
-    /// sets runs a hook the command picked, so a blind or unresolved probe
-    /// fails closed for it; without one, `hook` stays a builtin (#1284).
+    /// Gate 2 rounds 3-4: `git hook run` runs whatever hook the config
+    /// names, and a config can set `core.hooksPath` in more ways than a text
+    /// check can follow, so any `hook` call but bare `git hook` and
+    /// `git hook list` takes main's alias probe: blind fails closed, a
+    /// readable config with no `alias.hook` allows.
     #[test]
-    fn hook_under_a_command_set_hooks_path_is_probed() {
-        let fx = Fx::new("hookspath");
+    fn hook_run_takes_the_alias_probe() {
+        let fx = Fx::new("hookrun");
         for command in [
             "HOME=/tmp/x git -c core.hooksPath=.h hook run pre-push",
             "cd \"$W\" && git -c core.hooksPath=.h hook run pre-push",
-            "HOME=/tmp/x git -c core.HOOKSPATH=.h hook run pre-push",
-            "HOME=/tmp/x git --config-env=core.hooksPath=H hook run pre-push",
-            "GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='.h'\" git hook run pre-push",
-            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=.h \
-             git hook run pre-push",
-            "git config core.hooksPath .h; HOME=/tmp/x git hook run pre-push",
+            "K=core.hooks; HOME=/tmp/x git -c ${K}Path=.h hook run pre-push",
+            "GIT_CONFIG_GLOBAL=/tmp/x/g git hook run pre-push",
+            "HOME=/tmp/x git hook run pre-push",
+            "git -c include.path=/tmp/x/g hook run pre-push",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooks$'P'ath \
+             GIT_CONFIG_VALUE_0=.h git hook run pre-push",
+            "cd \"$W\" && git hook run pre-commit",
+            "HOME=/tmp/x git hook Run pre-push",
         ] {
             assert_blocks(&fx.run(command), &["hook", "cannot resolve"]);
         }
         for command in [
-            "HOME=/tmp/x git hook run pre-push",
             "HOME=/tmp/fakehome git hook",
-            "cd \"$W\" && git hook run pre-commit",
-            // A resolvable probe finds no `alias.hook`.
+            "HOME=/tmp/x git hook list pre-push",
+            "cd \"$W\" && git hook list pre-commit",
+            // A readable config with no `alias.hook`.
+            "git hook run pre-push",
             "git -c core.hooksPath=.h hook run pre-push",
-            // `core.hooksPath` set, but another builtin runs.
-            "HOME=/tmp/x git -c core.hooksPath=.h credential fill",
-            // ...and `hooksPath` is not the `PATH` variable (round 2 m4):
-            // `diagnose` (2.38) still takes the running git's word.
-            "cd \"$W\" && git -c core.hooksPath=.h diagnose -o /tmp/x",
         ] {
             assert_allows(&fx.run(command));
         }
+        // A readable config whose `alias.hook` pushes: git runs the builtin,
+        // but main's probe refuses it, and so does this.
+        fx.git(&["config", "alias.hook", "push"]);
+        assert_blocks(&fx.run("git hook run pre-push"), &["hook", "alias"]);
     }
 
     /// [`BUILTINS`] is sorted for its binary search, and every entry is a
