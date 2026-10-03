@@ -441,72 +441,204 @@ fn command_hints(calls: &[GitCall]) -> CommandHints {
     hints
 }
 
-/// Git builtins an alias cannot shadow (git runs the builtin), so a segment
-/// running one needs no alias probe. Not exhaustive: a missing name costs one
-/// config read, never a verdict.
+/// Commands compiled into EVERY git from 2.30.0 to the 2026-10 `master`:
+/// git looks a subcommand up in its builtin table before it tries an
+/// exec-path or `PATH` `git-<name>` and before any alias, so `alias.<name>`
+/// and a `git-<name>` executable can never replace one. The table is
+/// independent of env, config and directory, so a call running one needs no
+/// alias probe however blind that probe would be. Sorted (binary search);
+/// the intersection of `commands[]` in git.c at `v2.30.0` and `master`,
+/// minus `pack-redundant` and `whatchanged` (compiled out under
+/// `WITH_BREAKING_CHANGES`, so a git 3 alias can shadow them). Matched
+/// case-sensitively, as git does: `git STATUS` is not the builtin, and runs
+/// `alias.status`. A builtin added since 2.30 is confirmed with the running
+/// git instead ([`is_builtin`]).
 const BUILTINS: &[&str] = &[
     "add",
     "am",
+    "annotate",
     "apply",
     "archive",
-    "bisect",
     "blame",
     "branch",
+    "bugreport",
     "bundle",
     "cat-file",
+    "check-attr",
     "check-ignore",
+    "check-mailmap",
+    "check-ref-format",
     "checkout",
+    "checkout-index",
     "cherry",
     "cherry-pick",
     "clean",
     "clone",
+    "column",
     "commit",
+    "commit-graph",
+    "commit-tree",
     "config",
+    "count-objects",
+    "credential",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
     "describe",
     "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "difftool",
+    "fast-export",
+    "fast-import",
     "fetch",
+    "fetch-pack",
+    "fmt-merge-msg",
     "for-each-ref",
+    "for-each-repo",
     "format-patch",
     "fsck",
+    "fsck-objects",
     "gc",
+    "get-tar-commit-id",
     "grep",
+    "hash-object",
     "help",
+    "index-pack",
     "init",
+    "init-db",
+    "interpret-trailers",
     "log",
     "ls-files",
     "ls-remote",
     "ls-tree",
+    "mailinfo",
+    "mailsplit",
+    "maintenance",
     "merge",
     "merge-base",
+    "merge-file",
+    "merge-index",
+    "merge-ours",
+    "merge-recursive",
+    "merge-recursive-ours",
+    "merge-recursive-theirs",
+    "merge-subtree",
+    "merge-tree",
+    "mktag",
+    "mktree",
+    "multi-pack-index",
     "mv",
+    "name-rev",
     "notes",
+    "pack-objects",
+    "pack-refs",
+    "patch-id",
+    "pickaxe",
+    "prune",
+    "prune-packed",
     "pull",
     "push",
     "range-diff",
+    "read-tree",
     "rebase",
+    "receive-pack",
     "reflog",
     "remote",
+    "remote-ext",
+    "remote-fd",
+    "repack",
+    "replace",
+    "rerere",
     "reset",
     "restore",
     "rev-list",
     "rev-parse",
     "revert",
     "rm",
+    "send-pack",
     "shortlog",
     "show",
+    "show-branch",
+    "show-index",
     "show-ref",
     "sparse-checkout",
+    "stage",
     "stash",
     "status",
-    "submodule",
+    "stripspace",
+    "submodule--helper",
     "switch",
     "symbolic-ref",
     "tag",
+    "unpack-file",
+    "unpack-objects",
+    "update-index",
     "update-ref",
+    "update-server-info",
+    "upload-archive",
+    "upload-archive--writer",
+    "upload-pack",
     "var",
+    "verify-commit",
+    "verify-pack",
+    "verify-tag",
     "version",
     "worktree",
+    "write-tree",
 ];
+
+/// Commands every git since 2.30 ships as a builtin or an exec-path script
+/// (`git-bisect` became a builtin later; `git-submodule` is still a script).
+/// git runs an exec-path command before any alias and puts the exec-path ahead
+/// of `PATH`, so only a moved exec path ([`exec_path_moved`]) lets an alias or
+/// a `PATH` executable stand in for one.
+const EXEC_PATH_COMMANDS: &[&str] = &["bisect", "submodule"];
+
+/// Is `word` a builtin of git: one in [`BUILTINS`], or one the running git
+/// lists (`git --list-cmds=builtins`, a compiled-in table no env or config
+/// changes). The query runs once per process and a failure is not remembered,
+/// so until git answers only [`BUILTINS`] counts (stricter).
+fn is_builtin(word: &str) -> bool {
+    static RUNNING: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    if BUILTINS.binary_search(&word).is_ok() {
+        return true;
+    }
+    if word.is_empty() || word.contains(['/', '\\']) {
+        return false;
+    }
+    let running = RUNNING.get().or_else(|| {
+        let dir = std::env::temp_dir();
+        match git(
+            &dir.to_string_lossy(),
+            &["--list-cmds=builtins"],
+            64 * 1024,
+            Budget::Probe,
+        ) {
+            Git::Ok(list) if !list.trim().is_empty() => Some(
+                RUNNING.get_or_init(|| list.lines().map(|l| l.trim().to_string()).collect()),
+            ),
+            _ => None,
+        }
+    });
+    running.is_some_and(|running| running.contains(word))
+}
+
+/// Can this call move git's exec path: `GIT_EXEC_PATH` anywhere in the command
+/// (read with its quotes and backslashes removed), or a `--exec-path=` global?
+fn exec_path_moved(command: &str, call: &GitCall) -> bool {
+    let plain: String = command
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    contains_ignoring_ascii_case(&plain, "GIT_EXEC_PATH")
+        || call
+            .globals
+            .iter()
+            .any(|w| w.to_ascii_lowercase().starts_with("--exec-path"))
+}
 
 /// Read `git config -z --get-regexp <regex>` as `(key, value)` pairs. A key
 /// with no value reads as `true`, which is what git's boolean parser does.
@@ -641,11 +773,11 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
         };
         // git splits an alias with its own quoting, so `pu\sh` and `p"u"sh`
         // are `push` to it.
-        let plain: String = value
+        let unquoted: String = value
             .chars()
             .filter(|c| !matches!(c, '\\' | '"' | '\''))
-            .collect::<String>()
-            .to_ascii_lowercase();
+            .collect();
+        let plain = unquoted.to_ascii_lowercase();
         if plain.trim_start().starts_with('!')
             || plain.contains("push")
             || plain.contains("send-pack")
@@ -654,7 +786,8 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
         }
         // An alias may open with git's global options (`-c a.b=c x`,
         // `--paginate x`); its subcommand is the first word after them.
-        let words: Vec<String> = plain.split_whitespace().map(str::to_string).collect();
+        // Case kept: the next word is a builtin only as git spells it.
+        let words: Vec<String> = unquoted.split_whitespace().map(str::to_string).collect();
         let rest = skip_git_global_options(&words);
         match rest.first() {
             // Options only: git 2.43 refuses it as empty, but nothing here
@@ -666,8 +799,8 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
             Some(next) if next.starts_with('-') => {
                 return Some("is an alias opening with an option this guard cannot follow");
             }
-            Some(next) if BUILTINS.contains(&next.as_str()) => return None,
-            Some(next) => name = next.clone(),
+            Some(next) if is_builtin(next) => return None,
+            Some(next) => name = next.to_ascii_lowercase(),
         }
     }
     Some("is an alias chain too deep to follow")
@@ -684,6 +817,9 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         let Some(sub) = call.rest.first() else {
             continue;
         };
+        // git matches its builtins case-sensitively but alias names
+        // case-insensitively, so `git STATUS` runs `alias.status`.
+        let exact = sub.as_str();
         let sub = sub.to_ascii_lowercase();
         if call.renamed {
             return Some(format!(
@@ -704,7 +840,10 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
                 sane(&sub)
             ));
         }
-        if sub.starts_with('-') || BUILTINS.contains(&sub.as_str()) {
+        if sub.starts_with('-') || is_builtin(exact) {
+            continue;
+        }
+        if EXEC_PATH_COMMANDS.contains(&exact) && !exec_path_moved(command, call) {
             continue;
         }
         if hints.aliases.contains(&sub) {
