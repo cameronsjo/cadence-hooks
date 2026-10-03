@@ -1199,60 +1199,82 @@ enum BraceExpansion {
 /// `$(…)` and backtick spans are opaque; a word shaped as an assignment
 /// (`NAME=…`) is left alone, since bash does not expand an assignment
 /// statement and in command position that is what it is.
+///
+/// **Two overflows, two marks.** A word past its own bound
+/// ([`MAX_BRACE_GROUPS`], [`MAX_BRACE_WORDS`]) is left whole and recorded
+/// ([`brace_word_left_whole`]), and it spends nothing past the work it did:
+/// the words after it are still read. A word left whole because the call's or
+/// thread's budget is spent marks the command unread ([`command_unread`]),
+/// since every later expanding word is left whole too.
 fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) -> BraceExpansion {
-    let expansion = brace_expand_word_unmarked(text, structural, budget);
-    if expansion == BraceExpansion::Overflow {
-        mark_command_unread();
-    }
-    expansion
-}
-
-thread_local! {
-    static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Record that a reading of the command on this thread left part of it
-/// unread: a word bash brace-expands was left whole (a per-word bound, or
-/// the call's or thread's [`BraceBudget`] spent), or the second reading of
-/// a wrapper's script ran past its allowance ([`SecondReadingWork`]).
-fn mark_command_unread() {
-    COMMAND_UNREAD.with(|unread| unread.set(true));
-}
-
-/// Whether a reading on this thread left part of a command unread since the
-/// last [`reset_command_unread`] (cameronsjo/cadence-hooks#1279). A guard
-/// that refuses what it cannot read refuses then: a word left whole hides
-/// what bash builds from it, and padding a command until the budget is spent
-/// left `{git,reset,--hard}` whole, so it ran past every guard.
-pub fn command_unread() -> bool {
-    COMMAND_UNREAD.with(std::cell::Cell::get)
-}
-
-/// Clear [`command_unread`] before a check reads a command.
-pub fn reset_command_unread() {
-    COMMAND_UNREAD.with(|unread| unread.set(false));
-}
-
-fn brace_expand_word_unmarked(
-    text: &str,
-    structural: &[bool],
-    budget: &mut BraceBudget,
-) -> BraceExpansion {
     let Some(word) = expanding_brace_word(text, structural) else {
         return BraceExpansion::Unchanged;
     };
-    if count_brace_opens(&word) > MAX_BRACE_GROUPS || budget.is_spent() {
+    if count_brace_opens(&word) > MAX_BRACE_GROUPS {
+        mark_brace_word_left_whole();
+        return BraceExpansion::Overflow;
+    }
+    if budget.is_spent() {
+        mark_command_unread();
         return BraceExpansion::Overflow;
     }
     match expand_brace_chars(&word, budget) {
         Some(words) => {
             BraceExpansion::Expanded(words.into_iter().filter(|w| !w.is_empty()).collect())
         }
+        // A charge that did not fit spent the budget.
+        None if budget.is_spent() => {
+            mark_command_unread();
+            BraceExpansion::Overflow
+        }
         None => {
-            budget.spend();
+            mark_brace_word_left_whole();
             BraceExpansion::Overflow
         }
     }
+}
+
+thread_local! {
+    static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BRACE_WORD_LEFT_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that a reading of the command on this thread left part of it
+/// unread: the call's or thread's [`BraceBudget`] was spent, so a word bash
+/// brace-expands was left whole and every later one would be too, or the
+/// second reading of a wrapper's script ran past its allowance
+/// ([`SecondReadingWork`]).
+fn mark_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(true));
+}
+
+fn mark_brace_word_left_whole() {
+    BRACE_WORD_LEFT_WHOLE.with(|whole| whole.set(true));
+}
+
+/// Whether a reading on this thread left part of a command unread since the
+/// last [`reset_command_unread`] (cameronsjo/cadence-hooks#1279). A guard
+/// that refuses what it cannot read refuses then: padding a command until the
+/// budget was spent left `{git,reset,--hard}` whole, so it ran past every
+/// guard.
+pub fn command_unread() -> bool {
+    COMMAND_UNREAD.with(std::cell::Cell::get)
+}
+
+/// Whether a reading on this thread left one brace word whole for its own
+/// bound since the last [`reset_command_unread`], the budget intact. Whether
+/// that word can hide what runs is [`unexpanded_word_may_hide_a_command`]'s
+/// question: `touch file{1..5000}.txt` cannot, `bash -c '{rm,x,{1..5000}}'`
+/// can.
+pub fn brace_word_left_whole() -> bool {
+    BRACE_WORD_LEFT_WHOLE.with(std::cell::Cell::get)
+}
+
+/// Clear [`command_unread`] and [`brace_word_left_whole`] before a check
+/// reads a command.
+pub fn reset_command_unread() {
+    COMMAND_UNREAD.with(|unread| unread.set(false));
+    BRACE_WORD_LEFT_WHOLE.with(|whole| whole.set(false));
 }
 
 /// `text` as `(char, structural)` pairs when bash would brace-expand it — some
@@ -1601,6 +1623,282 @@ pub fn brace_expansion_overflows(command: &str) -> bool {
             .iter()
             .any(|(text, flags)| brace_expand_word(text, flags, budget) == BraceExpansion::Overflow)
     })
+}
+
+/// Commands whose arguments are data to every guard that refuses an unread
+/// command: what they print or skip is never run, read or written as a path
+/// by the command itself. A brace word left whole for its own bound in their
+/// argument list hides nothing ([`unexpanded_word_may_hide_a_command`]).
+pub const UNREAD_INERT_COMMANDS: &[&str] = &["echo", "printf", ":", "true", "false", "for"];
+
+/// [`UNREAD_INERT_COMMANDS`] plus the commands whose operands only name
+/// paths to create. Every refusing guard but the two that judge created
+/// paths (`prevent-secret-writes`: `touch .env`; `guard-runbook-scrub`: a
+/// write into the runbooks directory) passes this list.
+pub const UNREAD_INERT_OR_CREATING_COMMANDS: &[&str] = &[
+    "echo", "printf", ":", "true", "false", "for", "touch", "mkdir",
+];
+
+/// Commands that only read a pipe as data, so an inert command's output piped
+/// to them stays data.
+const UNREAD_DATA_SINKS: &[&str] = &[
+    "wc", "head", "tail", "sort", "uniq", "cut", "tr", "grep", "less", "more", "cat", "column",
+    "nl", "tac", "paste", "fold", "tee",
+];
+
+/// Commands a heredoc body only feeds as data or as a program in another
+/// language — never as a shell script ([`heredoc_bodies_a_shell_may_run`]).
+const HEREDOC_DATA_READERS: &[&str] = &[
+    "cat",
+    "tee",
+    "curl",
+    "wget",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "php",
+    "jq",
+    "yq",
+    "git",
+    "gh",
+    "wc",
+    "grep",
+    "rg",
+    "sort",
+    "uniq",
+    "head",
+    "tail",
+    "base64",
+    "sed",
+    "awk",
+    "psql",
+    "sqlite3",
+    "mysql",
+    "kubectl",
+    "cut",
+    "tr",
+    "diff",
+    "patch",
+    "less",
+    "more",
+    "column",
+    "envsubst",
+    "openssl",
+    "gpg",
+    "read",
+    "mapfile",
+    "readarray",
+    ":",
+    "true",
+];
+
+/// Reserved words that may open a segment ahead of its command word.
+const SEGMENT_LEADING_WORDS: &[&str] = &[
+    "{", "}", "(", ")", "((", "!", "do", "then", "else", "elif", "if", "while", "until", "time",
+];
+
+/// Can a brace word some reading left whole for its own bound
+/// ([`brace_word_left_whole`]) hide what `command` runs, reads or writes from
+/// a guard that judges the readings? (cameronsjo/cadence-hooks#1279, round 3.)
+///
+/// Bash runs `for i in {1..5000}`, `printf '%s\n' {a..z}{a..z}{a..z} | wc -l`
+/// and a heredoc body holding minified JSON harmlessly, and refusing them
+/// blocked routine commands; a lone word too big to expand in the argument
+/// list of a fixed, inert command cannot hide anything, because no guard
+/// judges what that list expands to. So `false` only when every place an
+/// expanding brace word may sit is such a list (`inert` names the commands)
+/// or a heredoc body no shell runs. Everything else answers `true`:
+///
+/// - a segment whose command is not in `inert`, or whose command word is not
+///   a fixed literal (`$x`, `{rm,x}`), or that runs a substitution;
+/// - an inert command whose output is piped to anything but a pure data sink
+///   (`echo {…} | bash`, `| xargs rm`), or a `printf -v`;
+/// - a heredoc body a shell may run ([`heredoc_bodies_a_shell_may_run`]);
+/// - in any of that text, quote-blind: a `{` (not opening `${`) with a `,` or
+///   `..` after it and a `}` after that, more than [`MAX_BRACE_GROUPS`] `{`,
+///   or a `$'…'` that may spell one. Quotes are ignored so a word inside
+///   `bash -c '…'` or `eval "…"` counts.
+pub fn unexpanded_word_may_hide_a_command(command: &str, inert: &[&str]) -> bool {
+    let segments = split_segments_with_ops(command);
+    let mut residual = String::new();
+    for body in heredoc_bodies_a_shell_may_run(command) {
+        residual.push_str(&body);
+        residual.push('\n');
+    }
+    for (at, (segment, op)) in segments.iter().enumerate() {
+        let words: Vec<String> = raw_words(segment)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        let mut rest = words.iter().skip_while(|word| {
+            SEGMENT_LEADING_WORDS.contains(&word.as_str()) || is_plain_assignment(word)
+        });
+        let Some(command_word) = rest.next() else {
+            residual.push_str(segment);
+            residual.push('\n');
+            continue;
+        };
+        if command_word.contains(['$', '`', '{', '}', '*', '?', '[', '\\', '\'', '"']) {
+            return true;
+        }
+        let piped_to_data = || {
+            segments[at..]
+                .iter()
+                .take_while(|(_, op)| *op == Some("|"))
+                .zip(&segments[at + 1..])
+                .all(|(_, (next, _))| {
+                    !runs_a_substitution(next)
+                        && raw_words(next)
+                            .first()
+                            .is_some_and(|(word, _)| UNREAD_DATA_SINKS.contains(&word.as_str()))
+                })
+        };
+        let inert_here = inert.contains(&command_word.as_str())
+            && !(command_word == "printf" && rest.any(|word| word.starts_with("-v")))
+            && !runs_a_substitution(segment)
+            && (*op != Some("|") || piped_to_data());
+        if !inert_here {
+            residual.push_str(segment);
+            residual.push('\n');
+        }
+    }
+    may_spell_a_brace_expansion(&residual)
+}
+
+/// Quote-blind: does `segment` hold a command or process substitution?
+fn runs_a_substitution(segment: &str) -> bool {
+    segment.contains('`') || ["$(", "<(", ">("].iter().any(|open| segment.contains(open))
+}
+
+/// `NAME=value` with no substitution in it — a prefix assignment that runs
+/// nothing.
+fn is_plain_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, value)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && !value.contains(['`', '{'])
+            && !value.contains("$(")
+    })
+}
+
+/// Quote-blind: could some word in `text`, at any quoting level, brace-expand?
+/// One linear pass — the residual can be the whole command.
+fn may_spell_a_brace_expansion(text: &str) -> bool {
+    if text.contains("$'") {
+        return true;
+    }
+    let mut opens = 0usize;
+    let (mut open, mut separated) = (false, false);
+    let mut previous = '\0';
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if previous != '$' => {
+                opens += 1;
+                open = true;
+            }
+            ',' if open => separated = true,
+            '.' if open && chars.peek() == Some(&'.') => separated = true,
+            '}' if separated => return true,
+            _ => {}
+        }
+        previous = c;
+    }
+    opens > MAX_BRACE_GROUPS
+}
+
+/// Bodies of the heredocs in `command` a shell may run as a script: the body
+/// of a line [`shell_fed_heredoc_bodies`] counts as shell-fed, and of every
+/// line any of whose commands is not in [`HEREDOC_DATA_READERS`] (`ssh host
+/// <<EOF`, `xargs <<EOF`). `cat > data.json <<'EOF'` and `python3 - <<'PY'`
+/// bodies are data.
+fn heredoc_bodies_a_shell_may_run(command: &str) -> Vec<String> {
+    heredoc_bodies_where(command, |line| {
+        shell_fed_line(line)
+            || split_segments(line).iter().any(|segment| {
+                let words = raw_words(segment);
+                let word = words
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .find(|word| {
+                        !SEGMENT_LEADING_WORDS.contains(word) && !is_plain_assignment(word)
+                    })
+                    .unwrap_or("");
+                !HEREDOC_DATA_READERS.contains(&command_word(word).as_ref())
+            })
+    })
+}
+
+/// Does `line` hand a heredoc (or its pipe) to a shell's stdin?
+fn shell_fed_line(line: &str) -> bool {
+    static SHELL_FED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?:^|[\s;&|(`{}])(?:(?:\S*/)?(?:bash|sh|zsh|dash|ksh|mksh|ash)(?:\s+[-+]\S+)*\s*(?:[0-9]*<<|[|;&)`}]|$)|(?:source|\.)\s+(?:/dev/stdin|/dev/fd/0|/proc/self/fd/0)\b)",
+        )
+        .expect("shell-fed heredoc regex compiles")
+    });
+    SHELL_FED.is_match(line)
+}
+
+/// Bodies of heredocs a SHELL reads on stdin (#1082): `bash <<EOF`, `sh -s
+/// <<'X'`, `source /dev/stdin <<EOF`, `cat <<EOF | bash`, also inside `$( … )`
+/// or backticks. Every heredoc on a shell-fed line is collected — an
+/// over-collection only adds text to judge. An unterminated body runs to the
+/// end of the command, as bash runs it.
+pub fn shell_fed_heredoc_bodies(command: &str) -> Vec<String> {
+    heredoc_bodies_where(command, shell_fed_line)
+}
+
+/// The bodies of every heredoc introduced on a logical line `keep` accepts.
+fn heredoc_bodies_where(command: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    if !command.contains("<<") {
+        return Vec::new();
+    }
+    let physical: Vec<&str> = command.split('\n').collect();
+    let mut bodies = Vec::new();
+    let mut i = 0;
+    while i < physical.len() {
+        // Join backslash-newline continuations the way the shell does.
+        let mut line = physical[i].to_string();
+        i += 1;
+        while i < physical.len() && (line.len() - line.trim_end_matches('\\').len()) % 2 == 1 {
+            line.pop();
+            line.push_str(physical[i]);
+            i += 1;
+        }
+        if !line.contains("<<") {
+            continue;
+        }
+        let intros = heredoc_introducers(&line);
+        if intros.is_empty() {
+            continue;
+        }
+        let kept = keep(&line);
+        for intro in intros {
+            let dash = line[intro.start..].starts_with("<<-");
+            let mut body: Vec<&str> = Vec::new();
+            while i < physical.len() {
+                let candidate = physical[i];
+                i += 1;
+                let end = if dash {
+                    candidate.trim_start_matches('\t') == intro.word
+                } else {
+                    candidate == intro.word
+                };
+                if end {
+                    break;
+                }
+                body.push(candidate);
+            }
+            if kept && !body.is_empty() {
+                bodies.push(body.join("\n"));
+            }
+        }
+    }
+    bodies
 }
 
 /// Decode the body of one `$'…'` run (the text between the quotes) onto

@@ -1756,13 +1756,56 @@ pub trait Check {
     fn refuses_unread_commands(&self) -> bool {
         false
     }
+
+    /// The commands whose argument lists this refusing check never judges,
+    /// so a brace word left whole there for its own bound cannot hide
+    /// anything from it ([`shell::unexpanded_word_may_hide_a_command`]). A
+    /// check that judges the paths `touch`/`mkdir` create narrows it to
+    /// [`shell::UNREAD_INERT_COMMANDS`].
+    fn unread_inert_commands(&self) -> &'static [&'static str] {
+        shell::UNREAD_INERT_OR_CREATING_COMMANDS
+    }
 }
 
 /// The block a fail-closed guard gives a command it could not read in full
 /// ([`Check::refuses_unread_commands`]).
+///
+/// **When a command counts as unread** ([`command_is_unread`]):
+///
+/// - **The brace budget is spent** — the call's or the thread's
+///   ([`shell::command_unread`]). Every expanding word after that point is left
+///   whole, so what follows may be unread whatever it is: padding a command
+///   until the budget ran out left `{git,reset,--hard}` whole
+///   (cameronsjo/cadence-hooks#1279). Also when a wrapper's second reading
+///   runs past its allowance (a ~400 KB `git commit -m '…\n…'` does).
+/// - **One word is past its own bound** (more than 4,096 words or 64 groups),
+///   the budget intact ([`shell::brace_word_left_whole`]), **and** it may sit
+///   where it hides what runs ([`shell::unexpanded_word_may_hide_a_command`]):
+///   in command position, under a command that is not a fixed literal, inside
+///   a wrapper's script (`bash -c`, `eval`, `xargs`, `find -exec`), in a
+///   heredoc a shell runs, or in an argument list a guard judges.
+///
+/// Deliberately **not** refused: such a word alone in the argument list of a
+/// fixed inert command ([`Check::unread_inert_commands`]: `echo`, `printf`,
+/// `:`, `for … in`, and `touch`/`mkdir` for checks that do not judge created
+/// paths) whose output is not piped past a data sink, and any word in a
+/// heredoc body no shell runs. Bash runs `for i in {1..5000}`, `touch
+/// file{1..5000}.txt` and minified JSON in `cat > x.json <<'EOF'` harmlessly,
+/// and no guard judges those words, so they hide nothing. Words after the
+/// lone word are still expanded and judged, so `: {1..5000}; {git,reset,--hard}`
+/// blocks on its merits.
 pub const UNREAD_COMMAND_BLOCK: &str = "command too large to read in full — a brace expansion \
      (or a wrapper's second reading) ran past what the guard reads, so what it runs cannot be \
-     verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions";
+     verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions \
+     (or a shorter quoted message with backslashes)";
+
+/// Whether `command`, just read by `check`, counts as unread
+/// ([`UNREAD_COMMAND_BLOCK`] says when).
+fn command_is_unread(check: &dyn Check, command: &str) -> bool {
+    shell::command_unread()
+        || (shell::brace_word_left_whole()
+            && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands()))
+}
 
 /// Pure: should `run_check` short-circuit for the given effort level?
 ///
@@ -2020,10 +2063,11 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     // `{git,reset,--hard}` whole, and it ran past every guard
     // (cameronsjo/cadence-hooks#1279). A bypass the guard honoured stands.
     if check.refuses_unread_commands()
-        && input.command().is_some()
         && matches!(result.outcome, Outcome::Allow | Outcome::Nudge)
         && result.bypass.is_none()
-        && shell::command_unread()
+        && input
+            .command()
+            .is_some_and(|command| command_is_unread(check, command))
     {
         return Some(CheckResult::block(UNREAD_COMMAND_BLOCK));
     }
