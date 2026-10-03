@@ -1156,6 +1156,20 @@ mod tests {
             let redirect = make_bash_input(&format!("echo x >> {path}"));
             assert_eq!(guard.run(&redirect).outcome, expected, "{path}");
         }
+        // #1293 review C1: a dotenv glob with its suffix spelled out is a
+        // write to that file.
+        for command in [
+            "echo x >> .e*.local",
+            "echo x > .e*.production",
+            "cp /tmp/a .e*.local",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
     }
 
     #[test]

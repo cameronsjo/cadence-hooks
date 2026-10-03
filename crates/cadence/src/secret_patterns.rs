@@ -6,6 +6,7 @@
 //! *value* embedded in written content, regardless of the filename.
 
 use regex::Regex;
+use std::cell::Cell;
 use std::sync::LazyLock;
 
 /// Safe template suffixes that are always allowed.
@@ -721,15 +722,47 @@ fn glob_may_name_secret(token: &str, position: Filename) -> bool {
             .is_some_and(|first| first.starts_with('.') && first.chars().count() <= 2);
     // An extglob group's literals are not read, so it carries every stem.
     let opaque = target.contains(&GlobElement::Group);
+    // Whether some family's stem is covered by the old unaligned count and
+    // the glob shares a name with it — the pre-#1285 verdict — and whether
+    // some family shares a name with a glob letter on its stem.
+    let mut unaligned = false;
+    let mut touched = false;
+    let mut skipped = Vec::new();
     if families_at(position).iter().any(|family| {
         if in_store || opaque || (dot_sweep && family.pattern.starts_with('.')) {
             return glob_intersects(target, &family.parsed);
         }
-        // `stem_covered` is a cheap necessary condition for the aligned walk,
-        // which alone decides (#1285).
-        stem_covered(&chunks, &family.stem) && stem_aligned(target, family)
+        // Cheap necessary conditions for the aligned walk (#1285): the stem
+        // quota, or one stem letter for the fixed-name quota.
+        let covered = stem_covered(&chunks, &family.stem);
+        let shares = shares_a_letter(&chunks, &family.touch);
+        if !covered && !(shares && fixed_covered(&chunks, &family.fixed_runs, family.need)) {
+            if shares {
+                skipped.push(family);
+            }
+            return false;
+        }
+        let walk = stem_aligned(target, family);
+        unaligned |= covered && walk != Walk::Disjoint;
+        touched |= walk == Walk::Touched;
+        walk == Walk::Aligned
     }) {
         return true;
+    }
+    // The old verdict still stands where the glob really names a deny-set
+    // file: a glob letter sits on some family's stem in a name they share
+    // (`app.?1?`, its `1` on `p12`; `xx.*e.pem*`, its `e` on `private`), or
+    // it matches a name spelled without its own words (`.zshenv*` reaches
+    // `.zshenv.local`). `*hooks*` does neither: its `ks` lands on no `jks`,
+    // and it reaches only a `hooks.jks` it spells itself.
+    if unaligned {
+        touched = touched
+            || skipped
+                .iter()
+                .any(|family| stem_aligned(target, family) == Walk::Touched);
+        if touched || names_a_neutral_secret(target, position) {
+            return true;
+        }
     }
     // Directory-qualified fragments: `~/.a?s/cred*`, `~/.kube/*`. The
     // single-component fragments are families in `deny_families`.
@@ -757,6 +790,17 @@ struct DenyFamily {
     /// does, or `None` when none does (then [`stem_aligned`] falls back to
     /// the unaligned [`stem_covered`] verdict, which only adds blocks).
     stem_mask: Option<Vec<bool>>,
+    /// The stem letters a glob must land on at least once for the fixed-name
+    /// quota: the stem, minus a leading `.` that every dotfile has.
+    touch: String,
+    /// The family's fixed literals ([`fixed_masks`]): the stem plus the
+    /// literals before its first wildcard, and the same plus those after its
+    /// last one. Empty when the stem is not found.
+    fixed: [Vec<bool>; 2],
+    /// The literal runs of the wider `fixed` mask.
+    fixed_runs: Vec<String>,
+    /// The stem quota: 2 for a stem of three characters or fewer, else 3.
+    need: usize,
 }
 
 /// [`deny_families`] for each position, built once: the fallback past the
@@ -802,8 +846,17 @@ fn deny_families(position: Filename) -> Vec<DenyFamily> {
         .map(|pattern| {
             let stem = distinctive_stem(&pattern);
             let parsed = parse_glob(&pattern);
+            let stem_mask = stem_mask(&parsed, &stem);
+            let fixed: [Vec<bool>; 2] = stem_mask
+                .as_deref()
+                .map(|mask| fixed_masks(&parsed, mask))
+                .unwrap_or_default();
             DenyFamily {
-                stem_mask: stem_mask(&parsed, &stem),
+                touch: stem.strip_prefix('.').unwrap_or(&stem).to_string(),
+                fixed_runs: fixed_runs(&parsed, &fixed[1]),
+                need: if stem.chars().count() <= 3 { 2 } else { 3 },
+                fixed,
+                stem_mask,
                 stem,
                 parsed,
                 pattern,
@@ -826,6 +879,67 @@ fn stem_mask(parsed: &[GlobElement], stem: &str) -> Option<Vec<bool>> {
     found.then_some(mask)
 }
 
+/// [`DenyFamily::fixed`] for `parsed`: the stem positions plus the literal
+/// run that opens the pattern, and that plus the literal run that closes it.
+/// A leading `.` counts only when the stem itself opens with it (`.env`):
+/// every dotfile has one, so for `.npmrc` it says nothing. For an exact name
+/// such as `.env.local` or `.npmrc` both masks are every counted literal.
+fn fixed_masks(parsed: &[GlobElement], stem: &[bool]) -> [Vec<bool>; 2] {
+    let literal = |e: &GlobElement| matches!(e, GlobElement::Literal(_));
+    let counted = |k: usize| k > 0 || stem[0] || parsed[0] != GlobElement::Literal('.');
+    let mut opening = stem.to_vec();
+    let head = parsed.iter().take_while(|e| literal(e)).count();
+    for (k, slot) in opening.iter_mut().enumerate().take(head) {
+        *slot = counted(k);
+    }
+    let mut both = opening.clone();
+    let tail = parsed.iter().rev().take_while(|e| literal(e)).count();
+    for (k, slot) in both.iter_mut().enumerate().skip(parsed.len() - tail) {
+        *slot |= counted(k);
+    }
+    [opening, both]
+}
+
+/// The literal runs a [`DenyFamily::fixed`] mask covers, for the cheap
+/// [`fixed_covered`] bound.
+fn fixed_runs(parsed: &[GlobElement], mask: &[bool]) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut run = String::new();
+    for (element, &on) in parsed.iter().zip(mask) {
+        match element {
+            GlobElement::Literal(c) if on => run.push(*c),
+            _ if !run.is_empty() => runs.push(std::mem::take(&mut run)),
+            _ => {}
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// A bound on the fixed-name quota: each literal run of the glob can line
+/// up with at most a common substring of each fixed run.
+fn fixed_covered(chunks: &[String], runs: &[String], need: usize) -> bool {
+    let mut covered = 0;
+    for chunk in chunks {
+        for run in runs {
+            covered += longest_common_substring(chunk, run, need);
+            if covered >= need {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does any literal run share a character with `stem`?
+fn shares_a_letter(chunks: &[String], stem: &str) -> bool {
+    chunks
+        .iter()
+        .any(|chunk| chunk.chars().any(|c| stem.contains(c)))
+}
+
 /// Is there one name that both the glob and `family` match, in which the
 /// glob's own LITERAL characters spell at least the [`stem_covered`] quota of
 /// the family's stem (#1285)?
@@ -837,18 +951,39 @@ fn stem_mask(parsed: &[GlobElement], stem: &str) -> Option<Vec<bool>> {
 /// spell `hooks.jks` and `cadencegcloud-credentials.json`. Here both must
 /// hold of the SAME name: the shared letters have to land on the stem. The
 /// split spellings the quota exists for still do — `.e*v`, `.[e]nv`,
-/// `.n?trc`, `*.k?y`, `*env` — and this only ever removes blocks
-/// [`stem_covered`] would add, never adds one.
-fn stem_aligned(target: &[GlobElement], family: &DenyFamily) -> bool {
+/// `.n?trc`, `*.k?y`, `*env`.
+///
+/// Once one glob letter is on the stem (a leading `.` aside), the family's
+/// fixed letters count too ([`DenyFamily::fixed`]): `.e*.local`,
+/// `.e??.production` and `.zshrc.l*` spell their secret as surely as `.env*`
+/// does (#1293 review C1, M3), while `.git*` (no stem letter of
+/// `.git-credentials`) and `.*rc` (`rc` with only the `.` every dotfile has)
+/// stay clean. A family's closing letters count only for a glob that closes
+/// with a literal too, so `*.j*` stays clean against `*.jks`.
+fn stem_aligned(target: &[GlobElement], family: &DenyFamily) -> Walk {
     let Some(mask) = &family.stem_mask else {
-        return glob_intersects(target, &family.parsed);
+        return glob_walk(target, &family.parsed, None);
     };
-    let need = if family.stem.chars().count() <= 3 {
-        2
-    } else {
-        3
+    let need = family.need;
+    // The closing literals count only for a glob that closes with a literal
+    // too: `*.j*` lines `.j` up with `*.jks` only by choosing to.
+    let closes = matches!(target.last(), Some(GlobElement::Literal(_)));
+    let cover = Cover {
+        stem: mask,
+        fixed: &family.fixed[usize::from(closes)],
+        need,
     };
-    glob_walk(target, &family.parsed, Some((mask, need)))
+    glob_walk(target, &family.parsed, Some(cover))
+}
+
+/// What [`glob_walk`] counts on the way to a common name: the `deny`
+/// elements under `stem` and under `fixed` that a LITERAL of the token
+/// consumes, against a quota of `need`.
+#[derive(Clone, Copy)]
+struct Cover<'a> {
+    stem: &'a [bool],
+    fixed: &'a [bool],
+    need: usize,
 }
 
 /// The part of a deny-set name that says "secret" rather than "file": every
@@ -906,7 +1041,13 @@ fn stem_covered(chunks: &[String], stem: &str) -> bool {
 /// stems are short, and a longer one is compared on its first 32 characters.
 fn longest_common_substring(a: &str, b: &str, cap: usize) -> usize {
     let mut row = [0usize; 33];
-    let b: Vec<char> = b.chars().take(32).collect();
+    let mut chars = ['\0'; 32];
+    let mut len = 0;
+    for (slot, c) in chars.iter_mut().zip(b.chars()) {
+        *slot = c;
+        len += 1;
+    }
+    let b = &chars[..len];
     let mut best = 0;
     for x in a.chars() {
         let mut diagonal = 0;
@@ -1173,14 +1314,121 @@ impl GlobElement {
 /// those the two patterns name, plus one stand-in for every other character,
 /// which is exact: an element that names no character treats them all alike.
 fn glob_intersects(token: &[GlobElement], deny: &[GlobElement]) -> bool {
-    glob_walk(token, deny, None)
+    glob_walk(token, deny, None) != Walk::Disjoint
 }
 
-/// [`glob_intersects`], optionally also counting the `deny` elements under
-/// `mask` that a LITERAL of `token` consumes, and accepting only a common
-/// name where that count reaches `need` ([`stem_aligned`]).
-fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<(&[bool], usize)>) -> bool {
-    let need = cover.map_or(0, |(_, need)| need);
+/// How many [`glob_walk`] states one thread may visit. A hook is one
+/// process, so this bounds the glob judgment of a whole command: a flood of
+/// distinct glob words that each pass the cheap filters cannot run the hook
+/// past its deadline, which fails open. Once spent, every walk reports a
+/// match, so the guard blocks (#1293 review M1). Ordinary commands visit a
+/// few thousand states.
+const GLOB_STEP_BUDGET: u64 = 4_000_000;
+
+thread_local! {
+    static GLOB_STEPS_LEFT: Cell<u64> = const { Cell::new(GLOB_STEP_BUDGET) };
+}
+
+/// Refill the budget, for tests that judge many globs on one thread.
+#[cfg(test)]
+fn reset_glob_budget() {
+    GLOB_STEPS_LEFT.with(|left| left.set(GLOB_STEP_BUDGET));
+}
+
+/// Spend one walk step; `false` once the budget is gone.
+fn spend_glob_step() -> bool {
+    GLOB_STEPS_LEFT.with(|left| match left.get() {
+        0 => false,
+        n => {
+            left.set(n - 1);
+            true
+        }
+    })
+}
+
+/// What [`glob_walk`] found: no common name, a common name short of the
+/// [`Cover`] quota (with or without a stem letter), or one that meets it
+/// (any common name, with no cover).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Walk {
+    Disjoint,
+    Shared,
+    /// A common name with at least one glob literal on the stem (a leading
+    /// `.` aside), short of the quota.
+    Touched,
+    Aligned,
+}
+
+/// Every deny-set family at `position` spelled out with each wildcard
+/// filled by nothing or by `x` (one `x` for a `?`): names a directory could
+/// hold without any help from the glob judged against them.
+static NEUTRAL_NAMES: LazyLock<[Vec<Vec<GlobElement>>; 2]> = LazyLock::new(|| {
+    [Filename::Known, Filename::Unqualified].map(|position| {
+        let mut names: Vec<String> = Vec::new();
+        for family in deny_families(position) {
+            let mut fills = vec![String::new()];
+            for c in family.pattern.chars() {
+                let options: &[&str] = match c {
+                    '*' => &["", "x"],
+                    '?' => &["x"],
+                    _ => &[],
+                };
+                fills = if options.is_empty() {
+                    fills.into_iter().map(|f| f + &c.to_string()).collect()
+                } else {
+                    fills
+                        .iter()
+                        .flat_map(|f| options.iter().map(move |o| format!("{f}{o}")))
+                        .collect()
+                };
+            }
+            names.extend(fills);
+        }
+        names.sort();
+        names.dedup();
+        names.iter().map(|name| parse_glob(name)).collect()
+    })
+});
+
+/// Can the glob match one of the [`NEUTRAL_NAMES`]?
+fn names_a_neutral_secret(target: &[GlobElement], position: Filename) -> bool {
+    NEUTRAL_NAMES[usize::from(position == Filename::Unqualified)]
+        .iter()
+        .any(|name| glob_intersects(target, name))
+}
+
+/// [`glob_intersects`], optionally also counting what [`Cover`] names and
+/// accepting only a common name where the count reaches its quota
+/// ([`stem_aligned`]): `need` stem positions, or with an anchor, one stem
+/// position and `need` anchor positions.
+fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<Cover>) -> Walk {
+    // Two leading literal runs that disagree share no name; this rejects
+    // most (glob, family) pairs before any allocation.
+    for (a, b) in token.iter().zip(deny) {
+        match (a, b) {
+            (GlobElement::Literal(x), GlobElement::Literal(y)) if x == y => {}
+            (GlobElement::Literal(_), GlobElement::Literal(_)) => return Walk::Disjoint,
+            _ => break,
+        }
+    }
+    // Likewise the closing runs, which every name must end with.
+    for (a, b) in token.iter().rev().zip(deny.iter().rev()) {
+        match (a, b) {
+            (GlobElement::Literal(x), GlobElement::Literal(y)) if x == y => {}
+            (GlobElement::Literal(_), GlobElement::Literal(_)) => return Walk::Disjoint,
+            _ => break,
+        }
+    }
+    let need = cover.map_or(0, |c| c.need);
+    // Progress is `(stem, fixed, touched)`: stem and fixed positions consumed
+    // by a token literal, each capped at `need`, and whether one of them was
+    // a stem position other than a leading `.` (`.*rc` reaches `.envrc` only
+    // through the `.` every dotfile has).
+    let width = need + 1;
+    let accepts = |stem: usize, fixed: usize, touched: usize| {
+        stem >= need
+            || (touched == 1 && fixed >= need && !cover.is_some_and(|c| c.fixed.is_empty()))
+    };
     let mut alphabet = vec!['.'];
     for element in token.iter().chain(deny) {
         element.explicit_chars(&mut alphabet);
@@ -1194,34 +1442,60 @@ fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<(&[bool]
         .collect();
     let (n, m) = (token.len(), deny.len());
     let index = |i: usize, j: usize, started: bool| (i * (m + 1) + j) * 2 + usize::from(started);
-    // The highest stem count each position was reached with, plus one (0 is
-    // unvisited). A higher count only ever accepts more, so a visit with no
-    // more than the best so far adds nothing.
-    let mut best = vec![0usize; (n + 1) * (m + 1) * 2];
-    let mut stack = vec![(0usize, 0usize, false, 0usize)];
-    while let Some((i, j, started, count)) = stack.pop() {
+    // The progress values each position was reached with, as a bit set. No
+    // transition depends on progress and a higher value in both parts only
+    // ever accepts more, so a visit dominated by an earlier one adds nothing.
+    let bit = |stem: usize, fixed: usize, touched: usize| (touched * width + stem) * width + fixed;
+    let mut seen = vec![0u32; (n + 1) * (m + 1) * 2];
+    let dominated = |bits: u32, stem: usize, fixed: usize, touched: usize| {
+        (touched..2)
+            .any(|t| (stem..width).any(|s| (fixed..width).any(|f| bits & (1 << bit(s, f, t)) != 0)))
+    };
+    let mut shared = Walk::Disjoint;
+    let mut stack = vec![(0usize, 0usize, false, 0usize, 0usize, 0usize)];
+    while let Some((i, j, started, stem, fixed, touched)) = stack.pop() {
+        if !spend_glob_step() {
+            return Walk::Aligned;
+        }
         let at = index(i, j, started);
-        if best[at] > count {
+        if dominated(seen[at], stem, fixed, touched) {
             continue;
         }
-        best[at] = count + 1;
-        if i == n && j == m && count >= need {
-            return true;
+        seen[at] |= 1 << bit(stem, fixed, touched);
+        if i == n && j == m {
+            if accepts(stem, fixed, touched) {
+                return Walk::Aligned;
+            }
+            shared = shared.max(if touched == 1 {
+                Walk::Touched
+            } else {
+                Walk::Shared
+            });
         }
         if i < n && token[i].repeats() {
-            stack.push((i + 1, j, started, count));
+            stack.push((i + 1, j, started, stem, fixed, touched));
         }
         if j < m && deny[j] == GlobElement::Star {
-            stack.push((i, j + 1, started, count));
+            stack.push((i, j + 1, started, stem, fixed, touched));
         }
         if i == n || j == m {
             continue;
         }
-        let shared = symbols.iter().any(|&c| {
-            token[i].accepts(c)
-                && deny[j].accepts(c)
-                && (started || c != Some('.') || (i == 0 && token[0].matches_leading_dot()))
-        });
+        let allowed = |c: Option<char>| {
+            started || c != Some('.') || (i == 0 && token[0].matches_leading_dot())
+        };
+        // Literals and wildcards are decided directly; only a set needs the
+        // alphabet.
+        let shared = match (&token[i], &deny[j]) {
+            (GlobElement::Literal(a), other) | (other, GlobElement::Literal(a)) => {
+                other.accepts(Some(*a)) && allowed(Some(*a))
+            }
+            (GlobElement::Set { .. }, _) | (_, GlobElement::Set { .. }) => symbols
+                .iter()
+                .any(|&c| token[i].accepts(c) && deny[j].accepts(c) && allowed(c)),
+            // Two wildcards share a character no pattern names.
+            _ => true,
+        };
         if shared {
             let next_i = if token[i].repeats() { i } else { i + 1 };
             let next_j = if deny[j] == GlobElement::Star {
@@ -1229,13 +1503,19 @@ fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<(&[bool]
             } else {
                 j + 1
             };
-            let spells_stem = cover.is_some_and(|(mask, _)| mask[j])
-                && matches!(token[i], GlobElement::Literal(_));
-            let count = (count + usize::from(spells_stem)).min(need);
-            stack.push((next_i, next_j, true, count));
+            let literal = matches!(token[i], GlobElement::Literal(_));
+            let (mut stem, mut fixed, mut touched) = (stem, fixed, touched);
+            if let Some(c) = cover.filter(|_| literal) {
+                stem = (stem + usize::from(c.stem[j])).min(need);
+                if let Some(&on) = c.fixed.get(j) {
+                    fixed = (fixed + usize::from(on)).min(need);
+                    touched |= usize::from(on && c.stem[j]);
+                }
+            }
+            stack.push((next_i, next_j, true, stem, fixed, touched));
         }
     }
-    false
+    shared
 }
 
 /// Substrings that mark a variable NAME as secret-shaped (`API_KEY`,
@@ -2715,6 +2995,168 @@ mod tests {
         for position in [Filename::Known, Filename::Unqualified] {
             for family in deny_families(position) {
                 assert!(family.stem_mask.is_some(), "{}", family.pattern);
+            }
+        }
+    }
+
+    /// Every deny-set name spelled without words: each family with each run
+    /// of wildcards filled by `""`, `x` or `xx`, kept only where the family
+    /// still matches it. A word fill is out of scope by construction: with
+    /// one, `*hooks*` names `hooks.jks` and `Cargo.*` names `cargo.key`.
+    fn brute_force_names(position: Filename) -> Vec<String> {
+        let mut names = Vec::new();
+        for family in deny_families(position) {
+            let mut fills = vec![String::new()];
+            let mut in_slot = false;
+            for c in family.pattern.chars() {
+                let wildcard = matches!(c, '*' | '?');
+                fills = match (wildcard, in_slot) {
+                    (true, true) => fills,
+                    (true, false) => fills
+                        .iter()
+                        .flat_map(|f| ["", "x", "xx"].map(|o| format!("{f}{o}")))
+                        .collect(),
+                    _ => fills.into_iter().map(|f| format!("{f}{c}")).collect(),
+                };
+                in_slot = wildcard;
+            }
+            names.extend(
+                fills
+                    .into_iter()
+                    .filter(|n| glob_intersects(&parse_glob(n), &family.parsed)),
+            );
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The family arm as it stood before #1285: any family whose stem the
+    /// unaligned count covers and which shares a name with the glob.
+    fn unaligned_family_verdict(token: &str, position: Filename) -> bool {
+        let target = parse_glob(token);
+        let chunks = literal_chunks(&target);
+        families_at(position).iter().any(|family| {
+            stem_covered(&chunks, &family.stem) && glob_intersects(&target, &family.parsed)
+        })
+    }
+
+    /// A deterministic stand-in for the #1293 review's fuzz: mutations of
+    /// real deny-set names with `?`, `*`, `[c]`, `[!x]` and `[a-z]`.
+    fn mutated_globs(names: &[String], count: usize) -> Vec<String> {
+        let mut state: u64 = 0x1293;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound
+        };
+        let mut out = Vec::new();
+        while out.len() < count {
+            let mut chars: Vec<String> =
+                names[next(names.len())].chars().map(String::from).collect();
+            for _ in 0..=next(4) {
+                if chars.is_empty() {
+                    break;
+                }
+                let i = next(chars.len());
+                match next(10) {
+                    0..=2 => chars[i] = "?".into(),
+                    3 | 4 => {
+                        let end = (i + 1 + next(6)).min(chars.len());
+                        chars.splice(i..end, ["*".to_string()]);
+                    }
+                    5 => chars[i] = format!("[{}]", chars[i]),
+                    6 => chars[i] = "[!q]".into(),
+                    7 if chars[i].chars().all(char::is_alphabetic) => chars[i] = "[a-z]".into(),
+                    8 => chars.insert(0, "*".into()),
+                    _ => chars.push("*".into()),
+                }
+            }
+            let glob = chars.concat().replace("**", "*");
+            if has_glob_syntax(&glob) {
+                out.push(glob);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_glob_the_old_rule_blocked_that_names_a_real_secret_still_blocks() {
+        // #1293 review C1: the invariant behind the #1285 narrowing. A glob
+        // the old unaligned rule blocked, and which matches a deny-set name a
+        // directory could hold without the glob's own words, still blocks.
+        // `*hooks*` is out of scope by construction: it reaches only a
+        // `hooks.jks` it spells itself.
+        let review = [
+            ".e*.local",
+            ".e*.production",
+            ".e*.staging",
+            ".e*.keys",
+            ".e*.secret",
+            ".e[n][v].local",
+            ".[e]n[v].local",
+            ".?n[v].loca?",
+            ".e??.production",
+            ".e*duction",
+            ".e*.l*",
+            ".e*.{local,production}",
+            ".[!q]n?.local",
+            ".e[n]?.loc*",
+            ".e*.l?c*7",
+            ".e*.?*l?c*a*7",
+            ".zshenv*",
+            ".zpro?ile*",
+            ".profi?e?*",
+            ".bash[_]profile.*",
+            "*[c]*nt*.json",
+            "*_k*.pem",
+            ".git-c*",
+            "pro*.e*",
+            "*s.?son",
+        ];
+        for position in [Filename::Known, Filename::Unqualified] {
+            let names = brute_force_names(position);
+            let parsed: Vec<_> = names.iter().map(|n| parse_glob(n)).collect();
+            let mut globs: Vec<String> = review.iter().map(|g| g.to_string()).collect();
+            // Seeds: the neutral names, and the #1293 review fixture's real
+            // secrets, whose words the mutations keep.
+            let mut seeds = names.clone();
+            seeds.extend(
+                [
+                    "app.keystore",
+                    "app.private.pem",
+                    "cert.p12",
+                    "cert.pfx",
+                    "server.key",
+                    "tls-key.pem",
+                    "tls_key.pem",
+                    "hooks.jks",
+                    "prod.env",
+                    "staging.env",
+                    "service-account-ci.json",
+                    "gcloud-credentials.json",
+                    ".env.local",
+                    ".zshrc.local",
+                    ".bash_profile.local",
+                    ".gitconfig.local",
+                    "id_ed25519",
+                ]
+                .map(String::from),
+            );
+            globs.extend(mutated_globs(&seeds, 4000));
+            for glob in globs {
+                reset_glob_budget();
+                for word in brace_expansions(&glob).unwrap_or_default() {
+                    let target = parse_glob(&word);
+                    let reaches = parsed.iter().any(|name| glob_intersects(&target, name));
+                    if reaches && unaligned_family_verdict(&word, position) {
+                        assert!(
+                            is_dangerous_secret_token_at(&glob, position),
+                            "{glob} ({position:?}) blocked before and names a deny-set file"
+                        );
+                    }
+                }
             }
         }
     }
