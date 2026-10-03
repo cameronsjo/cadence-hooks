@@ -1136,6 +1136,29 @@ mod tests {
     }
 
     #[test]
+    fn local_override_dotfile_writes_block_like_npmrc() {
+        // #1288: the shared deny-set covers writes as it does `.npmrc`; the
+        // tracked dotfile stays writable.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (path, expected) in [
+            ("/home/u/.zshrc.local", Block),
+            ("/home/u/.gitconfig.local", Block),
+            ("/home/u/.bash_profile.local", Block),
+            ("/home/u/.zshrc", Allow),
+            ("/home/u/.gitconfig", Allow),
+        ] {
+            let guard = SecretWritesGuard::default();
+            assert_eq!(
+                guard.run(&make_write_input(path)).outcome,
+                expected,
+                "{path}"
+            );
+            let redirect = make_bash_input(&format!("echo x >> {path}"));
+            assert_eq!(guard.run(&redirect).outcome, expected, "{path}");
+        }
+    }
+
+    #[test]
     fn write_suffix_env_blocked() {
         // #854: a Write to `prod.env` was allowed while `.env` blocked, so the
         // gap was on the tool path too, not only the Bash path.

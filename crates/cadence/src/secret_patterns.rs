@@ -43,6 +43,16 @@ pub const BLOCKED_FILENAMES: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".pgpass",
+    // Local-override shell and git config, kept out of a tracked dotfiles
+    // repo precisely because it holds tokens (#1288). The tracked files
+    // themselves (`.zshrc`, `.gitconfig`) stay readable.
+    ".zshrc.local",
+    ".zshenv.local",
+    ".zprofile.local",
+    ".bashrc.local",
+    ".bash_profile.local",
+    ".profile.local",
+    ".gitconfig.local",
 ];
 
 /// File extensions that must never be read or written (unambiguous secrets).
@@ -1183,18 +1193,18 @@ fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<(&[bool]
         .chain(std::iter::once(None))
         .collect();
     let (n, m) = (token.len(), deny.len());
-    let counts = need + 1;
-    let index = |i: usize, j: usize, started: bool, count: usize| {
-        ((i * (m + 1) + j) * 2 + usize::from(started)) * counts + count
-    };
-    let mut seen = vec![false; (n + 1) * (m + 1) * 2 * counts];
+    let index = |i: usize, j: usize, started: bool| (i * (m + 1) + j) * 2 + usize::from(started);
+    // The highest stem count each position was reached with, plus one (0 is
+    // unvisited). A higher count only ever accepts more, so a visit with no
+    // more than the best so far adds nothing.
+    let mut best = vec![0usize; (n + 1) * (m + 1) * 2];
     let mut stack = vec![(0usize, 0usize, false, 0usize)];
     while let Some((i, j, started, count)) = stack.pop() {
-        let at = index(i, j, started, count);
-        if seen[at] {
+        let at = index(i, j, started);
+        if best[at] > count {
             continue;
         }
-        seen[at] = true;
+        best[at] = count + 1;
         if i == n && j == m && count >= need {
             return true;
         }
@@ -2227,6 +2237,53 @@ mod tests {
     }
 
     #[test]
+    fn local_override_dotfiles_blocked() {
+        // #1288: local-override shell and git config holds tokens.
+        for name in [
+            ".zshrc.local",
+            ".zshenv.local",
+            ".zprofile.local",
+            ".bashrc.local",
+            ".bash_profile.local",
+            ".profile.local",
+            ".gitconfig.local",
+        ] {
+            assert!(is_blocked(name, &format!("/home/u/{name}")), "{name}");
+            assert!(is_dangerous_secret_token(&format!("~/{name}")), "{name}");
+            assert!(is_dangerous_secret_token(name), "{name}");
+        }
+        for (token, position) in [
+            (".*local", Filename::Unqualified),
+            (".zshrc.loc?l", Filename::Unqualified),
+            (".z*", Filename::Known),
+            (".b*", Filename::Known),
+        ] {
+            assert!(
+                is_dangerous_secret_token_at(token, position),
+                "{token} ({position:?})"
+            );
+        }
+        for name in [
+            ".zshrc",
+            ".bashrc",
+            ".gitconfig",
+            ".profile",
+            ".zshrc.local.example",
+            "zshrc.local",
+            ".vimrc.local",
+        ] {
+            assert!(!is_blocked(name, &format!("/home/u/{name}")), "{name}");
+            assert!(!is_dangerous_secret_token(&format!("~/{name}")), "{name}");
+        }
+        for token in [".zshrc*", ".git*", ".bash*", "~/.local/*", "*.local"] {
+            assert!(
+                !is_dangerous_secret_token_at(token, Filename::Known),
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
     fn normal_files_allowed() {
         assert!(!is_blocked("main.rs", "/project/src/main.rs"));
         assert!(!is_blocked("config.toml", "/project/config.toml"));
@@ -2621,6 +2678,11 @@ mod tests {
             ("service-account*.json", "service-account"),
             ("*.key", "key"),
             ("jks", "jks"),
+            // #1288: `.local` is what makes these secret; `.zshrc*` and
+            // `.git*` stay clean like `.git*` past `.git-credentials`.
+            (".zshrc.local", "local"),
+            (".bash_profile.local", "local"),
+            (".gitconfig.local", "local"),
         ] {
             assert_eq!(distinctive_stem(pattern), stem, "{pattern}");
         }
