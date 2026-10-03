@@ -13865,10 +13865,9 @@ fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
     let take = |value: &str, out: &mut ExecSettings| {
         // `credential.helper=!cmd` runs `cmd` under a shell.
         let value = value.strip_prefix('!').unwrap_or(value);
-        if is_literal_script(value) {
-            out.scripts.push(value.to_string());
-        } else {
-            out.opaque = true;
+        match literal_script(value) {
+            Some(script) => out.scripts.push(script),
+            None => out.opaque = true,
         }
     };
     for word in prefix {
@@ -13925,8 +13924,13 @@ fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
             out.opaque = true;
         } else if is_exec_valued_config(key, if from_env { None } else { Some(value) }) {
             let lower = key.to_ascii_lowercase();
-            if from_env || lower.starts_with("protocol.") || lower == "core.hookspath" {
+            if from_env || lower.starts_with("protocol.") {
                 out.opaque = true;
+            } else if lower == "core.hookspath" {
+                // Hooks on disk are outside every guard's reading, as the
+                // ones `git commit` runs anyway are; only a value that
+                // cannot be read refuses.
+                out.opaque |= literal_script(value).is_none();
             } else {
                 take(value, &mut out);
             }
@@ -13935,9 +13939,89 @@ fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
     out
 }
 
-/// Whether `value` is shell text a reading can take whole: no expansion,
+/// `value` as shell text a reading can take whole, or `None`: no expansion
 /// or substitution, and every quote closed. It is read as any other nested
 /// script, braces and all.
+///
+/// `$HOME` and `${HOME}` are the one expansion read, and only while the
+/// command being judged cannot have rebound `HOME` ([`note_command_home`]):
+/// they stand for a placeholder home, so `ssh -i $HOME/.ssh/k` is read as
+/// `ssh -i /home/placeholder/.ssh/k`. A `~` needs nothing: its expansion is
+/// never split into words.
+fn literal_script(value: &str) -> Option<String> {
+    let value = if value.contains("HOME") && HOME_FIXED.with(std::cell::Cell::get) {
+        static HOME_REF: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\$\{HOME\}|\$HOME\b").expect("HOME pattern compiles"));
+        HOME_REF.replace_all(value, HOME_PLACEHOLDER).into_owned()
+    } else {
+        value.to_string()
+    };
+    is_literal_script(&value).then_some(value)
+}
+
+/// The home [`literal_script`] reads `$HOME` as.
+const HOME_PLACEHOLDER: &str = "/home/placeholder";
+
+thread_local! {
+    /// Whether the command being judged cannot rebind `HOME`
+    /// ([`note_command_home`]). `false` until a command is noted.
+    static HOME_FIXED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Note the command a check is about to judge, so an exec-valued git setting
+/// may read `$HOME` in it ([`literal_script`]) only when nothing in the
+/// command can rebind `HOME` to more than one path: no `HOME` named other
+/// than as `$HOME`, `${HOME}` or an unquoted `HOME=<path>` assignment, read
+/// with quotes and backslashes dropped (`export HO""ME=x` counts), no `$'…'`
+/// that may spell it, and no `eval`, `source` or `.` that may run text that
+/// does. `HOME` exported by an earlier command is outside
+/// the command text, like every other exported variable
+/// (cameronsjo/cadence-hooks#1231).
+pub fn note_command_home(command: &str) {
+    HOME_FIXED.with(|fixed| fixed.set(!home_may_be_rebound(command)));
+}
+
+fn home_may_be_rebound(command: &str) -> bool {
+    if command.contains("$'") {
+        return true;
+    }
+    let plain: String = command
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let named = plain
+        .match_indices("HOME")
+        .filter(|&(at, _)| {
+            let before = plain[..at].chars().next_back();
+            let after = plain[at + 4..].chars().next();
+            if before.is_some_and(ident) || after.is_some_and(ident) {
+                return false;
+            }
+            // `$HOME` and `${HOME}` read it; anything else may set it.
+            !(plain[..at].ends_with('$') || (plain[..at].ends_with("${") && after == Some('}')))
+        })
+        .count();
+    // Except a plain assignment of one unquoted path-shaped word (`HOME=/x`,
+    // `export HOME=/tmp/h`): read as a path it cannot add a word or a
+    // command, so the placeholder stands for it. Every other mention (in
+    // quotes, `unset`, `read`, `for HOME in`) still counts.
+    static PATH_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:^|[\s;&|(])HOME=[A-Za-z0-9_./~+-]*(?:$|[\s;&|)])")
+            .expect("HOME assignment pattern compiles")
+    });
+    named > PATH_ASSIGNMENT.find_iter(command).count()
+        || plain
+            .split(|c: char| matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '\n'))
+            .any(|segment| {
+                let mut words = segment.split_whitespace();
+                words.next() == Some(".")
+                    || segment
+                        .split_whitespace()
+                        .any(|word| matches!(word, "eval" | "source"))
+            })
+}
+
 fn is_literal_script(value: &str) -> bool {
     if value.contains(['$', '`']) {
         return false;

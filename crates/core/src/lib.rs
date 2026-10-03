@@ -2057,6 +2057,7 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
         return None;
     }
     shell::reset_command_unread();
+    shell::note_command_home(input.command().unwrap_or(""));
     let result = check.run(input);
     // A fail-closed guard never allows a command it could not read in full:
     // padding a command until the brace budget was spent left a later

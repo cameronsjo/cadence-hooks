@@ -4580,6 +4580,76 @@ mod tests {
             ("git status", Nothing),
             ("FOO=1 git log", Nothing),
             ("echo $(echo $(echo $(echo $(git status))))", Nothing),
+            // `$HOME`/`${HOME}`/`~` in an otherwise literal value, while
+            // nothing in the command can rebind HOME past one path.
+            ("GIT_SSH_COMMAND=\"ssh -i $HOME/.ssh/k\" git fetch", Nothing),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME}/.ssh/k\" git fetch",
+                Nothing,
+            ),
+            ("git -c core.sshCommand=\"ssh -i ~/.ssh/k\" fetch", Nothing),
+            ("git -c core.sshCommand='ssh -i $HOME/k' pull", Nothing),
+            (
+                "HOME=/x GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "export HOME=/tmp/h; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "git add . && GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            // A literal hooks directory: hooks on disk are outside the
+            // reading, as the ones `git commit` runs anyway are.
+            ("git -c core.hooksPath=.githooks commit -m x", Nothing),
+            ("git -c core.hooksPath=~/.hooks commit -m x", Nothing),
+            ("git -c core.hooksPath=\"$HOME/hooks\" commit -m x", Nothing),
+            // HOME rebound, or any other expansion: refused as before.
+            (
+                "HOME='git push evil main' git -c core.pager='$HOME' log",
+                Unresolved,
+            ),
+            (
+                "HOME=\"a b\" GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "HOME=$(pwd) GIT_SSH_COMMAND='ssh -i $HOME/k' git fetch",
+                Unresolved,
+            ),
+            (
+                "unset HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "export HO\"\"ME=x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "read HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "source x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "eval x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                ". x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            ("GIT_SSH_COMMAND=\"ssh -i $HOMEX/k\" git fetch", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh -i $USER/k\" git fetch", Unresolved),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME:-/x}/k\" git fetch",
+                Unresolved,
+            ),
+            ("git -c core.hooksPath=\"$H\" commit -m x", Unresolved),
             // A literal value that pushes is judged as the push it is; git
             // runs it at the top of the working tree, which `/repo` (no
             // repository) cannot place.
@@ -4605,7 +4675,6 @@ mod tests {
             ("git --config-env=core.sshCommand=V fetch", Unresolved),
             ("git --config-env core.pager=V log", Unresolved),
             ("git -c protocol.ext.allow=always fetch ext::x", Unresolved),
-            ("git -c core.hooksPath=h commit -m x", Unresolved),
             (
                 "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=x git fetch",
                 Unresolved,
@@ -4641,6 +4710,8 @@ mod tests {
                 Unresolved,
             ),
         ] {
+            // As `decide_check` does before a check reads the command.
+            crate::shell::note_command_home(command);
             let found = push_locations(command, "/repo");
             let read = if found.iter().any(|push| push.unresolved) {
                 Unresolved
