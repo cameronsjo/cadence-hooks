@@ -14,6 +14,7 @@ pub mod bypass;
 pub mod capability;
 pub mod config;
 pub mod deadline;
+pub mod dir_variables;
 pub mod display;
 pub mod gh_bodies;
 pub mod gitstate;

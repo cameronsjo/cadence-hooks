@@ -6301,7 +6301,7 @@ impl<'a> CommandWordVariables<'a> {
 /// `$name`/`${name}` read — an assignment `name=…`, `read name`, `for name
 /// in`, `${name:=…}` — as the byte offset just after the name. Built in one
 /// pass, so a flood of distinct variables costs linear time.
-fn variable_mentions(command: &str) -> std::collections::HashMap<String, Vec<usize>> {
+pub(crate) fn variable_mentions(command: &str) -> std::collections::HashMap<String, Vec<usize>> {
     static IDENT: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("pattern should compile"));
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
@@ -6329,7 +6329,7 @@ fn variable_mentions(command: &str) -> std::collections::HashMap<String, Vec<usi
 /// assignment; `None` otherwise. A quoted value is read whole, and one with
 /// a blank or an expansion in it is not read: `c=' cd'; $c /u` splits to
 /// `cd /u`.
-fn literal_values_of(
+pub(crate) fn literal_values_of(
     command: &str,
     mentions: &std::collections::HashMap<String, Vec<usize>>,
     ends: &[usize],
