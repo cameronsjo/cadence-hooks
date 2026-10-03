@@ -118,27 +118,18 @@ pub(crate) struct InFlightPlan {
 /// consumer uses (the living-plan-guards plan's Task 3 shared-reader bullet;
 /// two independent scanners diverged on fence discipline in this feature's
 /// first cut, which is exactly the drift a single reader prevents). Lines
-/// inside fenced code blocks never count — a plan that *documents* checklist
-/// syntax in a fenced example carries no real boxes there. Fences open and
-/// close by [`visible_lines`]'s rule ([`fence_opener`], [`fence_closes`]:
-/// same character, closer at least as long, no info string), so the two
-/// readers agree on where a nested fence ends (cameronsjo/cadence-hooks#1283).
-/// Both tick spellings count as ticked (`[x]`/`[X]`).
+/// the plan-shape detectors skip never count: it reads through
+/// [`visible_lines`], so a box in fenced code, an HTML comment block or the
+/// leading frontmatter is an example, not a task, and the two readers agree
+/// on every hidden span (cameronsjo/cadence-hooks#1283). Hiding cuts both
+/// ways for the unticked count `plan_guards` reads: a hidden example box no
+/// longer raises it, and a box hidden by an unterminated fence or comment no
+/// longer counts either (an advisory nudge, never a block). Both tick
+/// spellings count as ticked (`[x]`/`[X]`).
 pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
-    let mut fence: Option<(u8, usize)> = None;
     let (mut unticked, mut ticked) = (0usize, 0usize);
-    for line in text.lines() {
+    for line in visible_lines(text) {
         let trimmed = line.trim_start();
-        if let Some((ch, len)) = fence {
-            if fence_closes(trimmed, ch, len) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some(opener) = fence_opener(trimmed) {
-            fence = Some(opener);
-            continue;
-        }
         if trimmed.starts_with("- [ ]") {
             unticked += 1;
         } else if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
@@ -158,16 +149,18 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
 ///
 /// Fences follow CommonMark: a line whose first non-space run is three or
 /// more backticks or tildes opens one, and only a line of the SAME character,
-/// at least as long as the opener, with nothing after it but whitespace
-/// closes it — so a four-backtick fence holding a three-backtick fence, or a
-/// backtick fence holding a tilde fence, stays one fence (see
-/// [`fence_opener`]). An unterminated fence runs to EOF, as it renders: the
+/// at least as long as the opener, with nothing after it but whitespace, and
+/// indented at most 3 columns past the opener (a tab is 4) closes it — so a
+/// four-backtick fence holding a three-backtick fence, a backtick fence
+/// holding a tilde fence, or a fence holding a 4-space-indented nested fence
+/// stays one fence (see [`fence_opener`]). An unterminated fence runs to EOF, as it renders: the
 /// error leans toward hiding, so a stray opener can only make a stanza read
 /// as missing, never let an example satisfy one.
 ///
 /// Comments follow CommonMark's HTML block (type 2): outside a fence, only a
 /// line whose `<!--` STARTS it (after at most 3 spaces of indent) opens one.
-/// That line, and — when it carries no `-->` after the opener — every
+/// That line, and — when it carries no `-->` after its `<!` (so `<!-->`
+/// and `<!--->` are complete, empty comments) — every
 /// following line up to and including the first carrying `-->`, is skipped;
 /// an unterminated opener runs to EOF, as it renders. A mid-line `<!--`
 /// (prose, inline code) renders as literal text and toggles nothing (#1277
@@ -185,8 +178,8 @@ fn visible_lines_with_frontmatter(body: &str) -> impl Iterator<Item = &str> {
 }
 
 fn visible_lines_after(body: &str, skip: usize) -> impl Iterator<Item = &str> {
-    // The open fence's character and run length, while inside one.
-    let mut fence: Option<(u8, usize)> = None;
+    // The open fence's character, run length and indent, while inside one.
+    let mut fence: Option<(u8, usize, usize)> = None;
     let mut in_comment = false;
     body.lines().skip(skip).filter(move |line| {
         if in_comment {
@@ -196,21 +189,25 @@ fn visible_lines_after(body: &str, skip: usize) -> impl Iterator<Item = &str> {
             return false;
         }
         let trimmed = line.trim_start();
-        if let Some((ch, len)) = fence {
-            if fence_closes(trimmed, ch, len) {
+        if let Some((ch, len, open_indent)) = fence {
+            // A closer indented 4+ columns past the opener is content.
+            if indent_columns(line) <= open_indent + 3 && fence_closes(trimmed, ch, len) {
                 fence = None;
             }
             return false;
         }
-        if let Some(opener) = fence_opener(trimmed) {
-            fence = Some(opener);
+        if let Some((ch, len)) = fence_opener(trimmed) {
+            fence = Some((ch, len, indent_columns(line)));
             return false;
         }
         let indent = line.len() - line.trim_start_matches(' ').len();
         if indent <= 3
-            && let Some(after) = line.trim_start_matches(' ').strip_prefix("<!--")
+            && let Some(comment) = line.trim_start_matches(' ').strip_prefix("<!")
+            && comment.starts_with("--")
         {
-            in_comment = !after.contains("-->");
+            // The opener's `--` may double as the closer's, so `<!-->` and
+            // `<!--->` are complete (empty) comments ending on this line.
+            in_comment = !comment.contains("-->");
             return false;
         }
         !line.starts_with('>')
@@ -231,6 +228,20 @@ fn fence_opener(trimmed: &str) -> Option<(u8, usize)> {
     (len >= 3).then_some((ch, len))
 }
 
+/// Columns of leading whitespace in `line`, a tab advancing to the next
+/// multiple of 4 (CommonMark's tab stop).
+fn indent_columns(line: &str) -> usize {
+    let mut cols = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => cols += 1,
+            b'\t' => cols += 4 - cols % 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
 /// True when `trimmed` closes a fence opened by `len` × `ch`: the same
 /// character, a run at least as long, and no info string after it.
 fn fence_closes(trimmed: &str, ch: u8, len: usize) -> bool {
@@ -247,6 +258,8 @@ fn fence_closes(trimmed: &str, ch: u8, len: usize) -> bool {
 /// blank line and prose, #1277 gate-2 m-1) is not frontmatter, and its lines
 /// stay visible.
 fn leading_frontmatter_line_count(body: &str) -> usize {
+    // A leading BOM is invisible and does not stop a renderer's frontmatter.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut lines = body.lines();
     if lines.next().map(str::trim_end) != Some("---") {
         return 0;
@@ -2135,7 +2148,33 @@ mod tests {
                 false,
             ),
             ("unterminated fence", format!("````\n{inner}```\n\n"), false),
+            (
+                "fence holding a 4-space-indented nested fence",
+                format!("```md\n1. Step\n\n    ```bash\n    make ci\n    ```\n\n{inner}```\n\n"),
+                false,
+            ),
+            (
+                "tilde fence holding a 4-space-indented nested fence",
+                format!("~~~md\n1. Step\n\n    ~~~sh\n    make ci\n    ~~~\n\n{inner}~~~\n\n"),
+                false,
+            ),
+            (
+                "tab-indented closer",
+                format!("```\n\t```\n{inner}```\n\n"),
+                false,
+            ),
             ("visible", format!("{inner}\n"), true),
+            ("after an empty comment", format!("<!-->\n{inner}\n"), true),
+            (
+                "after an empty comment, 3 dashes",
+                format!("<!--->\n{inner}\n"),
+                true,
+            ),
+            (
+                "after an indented fence's indented closer",
+                format!("    ```\n    x\n       ```\n{inner}\n"),
+                true,
+            ),
             (
                 "after a closed comment",
                 format!("<!--\nx\n-->\n{inner}\n"),
@@ -2231,6 +2270,38 @@ mod tests {
         );
     }
 
+    /// Gate-2 I-1 on #1289: a closer indented 4+ columns past its opener is
+    /// content. Closing there would expose the quoted `Panel:` example and
+    /// flip the real closer into an opener that hides `## Tasks`.
+    #[test]
+    fn indented_nested_closer_keeps_the_outer_fence_open() {
+        for (open, inner_open, inner_close) in
+            [("```md", "```bash", "```"), ("~~~md", "~~~sh", "~~~")]
+        {
+            let close = &open[..3];
+            let plan = format!(
+                "# T\n\nThe template, quoted:\n\n{open}\n1. Step one\n\n    {inner_open}\n    \
+                 make ci\n    {inner_close}\n\n{PANEL_LINE}{close}\n\n## Tasks\n\n- [ ] open task\n"
+            );
+            assert!(!panel_line_settled(&plan), "{plan:?}");
+            let missing = missing_stanzas(&plan);
+            assert!(missing.contains(&PANEL_STANZA), "{missing:?}");
+            assert!(!missing.contains(&TASKS_STANZA), "{missing:?}");
+            assert!(!missing.contains(&CHECKBOX_STANZA), "{missing:?}");
+            assert_eq!(checkbox_counts(&plan), (1, 0), "{plan:?}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_after_a_bom_is_hidden() {
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let plan = format!("\u{feff}---\nstatus: x\n{PANEL_LINE}---\n{without_panel}");
+        assert_eq!(missing_stanzas(&plan), vec![PANEL_STANZA], "{plan:?}");
+        let plain = format!("\u{feff}---\nstatus: x\n---\n{TEMPLATE_SHAPED_PLAN}");
+        assert!(missing_stanzas(&plain).is_empty(), "{plain:?}");
+    }
+
     #[test]
     fn checkbox_counts_match_nested_fences_table() {
         // (body, unticked, ticked)
@@ -2239,6 +2310,11 @@ mod tests {
             ("```\n~~~\n- [ ] a\n~~~\n```\n- [ ] b\n", 1, 0),
             ("````\n```\n````\n- [ ] a\n", 1, 0),
             ("```\n```md\n- [ ] a\n", 0, 0),
+            // Same visibility as `visible_lines`: comments and frontmatter.
+            ("<!--\n- [ ] example\n-->\n- [x] b\n", 0, 1),
+            ("<!-->\n- [ ] a\n", 1, 0),
+            ("---\nstatus: x\ntodo:\n- [ ] in yaml\n---\n- [ ] a\n", 1, 0),
+            ("```md\n    ```\n- [ ] example\n```\n- [ ] a\n", 1, 0),
         ];
         for (body, unticked, ticked) in cases {
             assert_eq!(checkbox_counts(body), (*unticked, *ticked), "{body:?}");
