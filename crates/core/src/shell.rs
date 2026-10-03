@@ -25218,4 +25218,134 @@ mod tests {
             strings.len()
         );
     }
+
+    /// cameronsjo/cadence-hooks#1297: bash takes `NAME[sub]=` and
+    /// `NAME[sub]+=` as assignment words, rejects them as prefix assignments
+    /// ("not a valid identifier") and runs the command after them anyway —
+    /// each `true` row measured under bash 5.2 with `echo ran` behind it.
+    #[test]
+    fn assignment_words_read_a_subscript_as_bash_does() {
+        for (word, want) in [
+            ("FOO=x", true),
+            ("FOO+=x", true),
+            ("_=x", true),
+            ("A[0]=x", true),
+            ("A[0]+=x", true),
+            ("A[]=x", true),
+            ("A[i=1]=x", true),
+            ("A[a[0]]=x", true),
+            ("A[\"]\"]=x", true),
+            ("A[']']=x", true),
+            ("A[\\]]=x", true),
+            ("A[$(echo 1)]=x", true),
+            ("_[0]=y", true),
+            ("A[0]==y", true),
+            // Not assignments: bash runs each as the command word.
+            ("A[]]=x", false),
+            ("A[0]x=y", false),
+            ("A[0]", false),
+            ("A[0", false),
+            ("A[\"0]=x", false),
+            ("1A=x", false),
+            ("1A[0]=x", false),
+            ("[0]=x", false),
+            ("=x", false),
+            ("A-B=x", false),
+            ("A+B=x", false),
+            ("A++=x", false),
+            ("--opt=x", false),
+            ("./a=b", false),
+            ("git", false),
+        ] {
+            assert_eq!(is_assignment_word(word), want, "{word:?}");
+        }
+        // The leading-word skip reaches the command behind each.
+        for (command, head) in [
+            ("A[0]=x git push origin main", "git"),
+            ("A[0]+=x git push origin main", "git"),
+            ("FOO+=x git push origin main", "git"),
+            ("A[0]=x B+=y C[1]+=z git push origin main", "git"),
+            ("A[0]=x make", "make"),
+            ("A[]]=x git push", "A[]]=x"),
+        ] {
+            let tokens = tokenize(command);
+            assert_eq!(
+                skip_transparent_prefixes(&tokens)
+                    .first()
+                    .map(String::as_str),
+                Some(head),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1290: `git p\ush` runs `git push`, and a
+    /// brace sequence spells the verb the tokenizer expands.
+    #[test]
+    fn git_push_segments_read_the_verb_bash_runs() {
+        for (command, pushes) in [
+            ("git push evil main", 1),
+            ("git p\\ush evil main", 1),
+            ("git pus{h..h} evil main", 1),
+            ("{git,pus{h..h},evil,main}", 1),
+            ("git pu''sh evil main", 1),
+            // Controls.
+            ("git PUSH evil main", 0),
+            ("git pull evil main", 0),
+            ("echo git push", 0),
+            ("git p\\\\ush evil main", 0),
+        ] {
+            assert_eq!(git_push_segments(command).len(), pushes, "{command:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1295: `git for-each-repo` runs `git ARG…` in
+    /// every repository its config key lists. Measured under git 2.43 with a
+    /// canary commit pushed to a local bare remote.
+    #[test]
+    fn for_each_repo_runs_its_operands_as_git_elsewhere() {
+        let git_exec_of = |command: &str| git_exec(&tokenize(command));
+        for (command, script) in [
+            (
+                "git -c r.x=\"$PWD\" for-each-repo --config=r.x push origin main",
+                "git push origin main",
+            ),
+            (
+                "git for-each-repo --config r.x push origin main",
+                "git push origin main",
+            ),
+            (
+                "git for-each-repo --conf r.x push origin main",
+                "git push origin main",
+            ),
+            (
+                "git for-each-repo --keep-going --config=r.x -- push origin main",
+                "git push origin main",
+            ),
+            ("git for-each-repo -- push", "git push"),
+            (
+                "git-for-each-repo --config=r.x push origin main",
+                "git push origin main",
+            ),
+            (
+                "git for-each-repo --config=maintenance.repo maintenance run",
+                "git maintenance run",
+            ),
+        ] {
+            assert_eq!(
+                git_exec_of(command).map(|exec| (exec.scripts, exec.elsewhere)),
+                Some((vec![script.to_string()], true)),
+                "{command:?}"
+            );
+        }
+        // Controls: nothing to run.
+        for command in [
+            "git for-each-repo --config=k",
+            "git for-each-repo --config k --",
+            "git config --get-all maintenance.repo",
+            "echo git for-each-repo --config=k push",
+        ] {
+            assert_eq!(git_exec_of(command), None, "{command:?}");
+        }
+    }
 }

@@ -2216,6 +2216,42 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1297 and #1295: a push behind a subscripted
+    /// assignment prefix publishes the same commits, so it is scanned; one
+    /// `git for-each-repo` runs lands in repositories its config key lists,
+    /// so it is refused. Each blocking row published a canary commit to a
+    /// local bare remote under bash 5.2 and git 2.43.
+    #[test]
+    fn pushes_behind_assignment_prefixes_and_for_each_repo_are_judged() {
+        let fx = Fx::new("prefix-foreach");
+        fx.commit("s.txt", &format!("{}\n", aws_key()), "s");
+        for command in [
+            "FOO+=x git push origin main",
+            "A[0]=x git push origin main",
+            "A[0]+=x git push origin main",
+            "A[k]=x B+=y git push origin main",
+            "git pus{h..h} origin main",
+            "git p\\ush origin main",
+        ] {
+            assert_blocks(&fx.run(command), &["s.txt"]);
+        }
+        for command in [
+            "git -c r.x=\"$PWD\" for-each-repo --config=r.x push origin main",
+            "git for-each-repo --config r.x push origin main",
+            "git for-each-repo --keep-going --config=r.x -- push origin main",
+        ] {
+            assert_blocks(&fx.run(command), &[]);
+        }
+        // Nothing pushes: nothing to scan.
+        for command in [
+            "FOO+=x make",
+            "A[0]=x make",
+            "git for-each-repo --config=maintenance.repo maintenance run",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+    }
+
     #[test]
     fn in_repo_fixture_paths_are_exempt_from_the_content_scan() {
         // A repo whose checkout path carries a `cadence-hooks` component, like

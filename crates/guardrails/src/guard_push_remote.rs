@@ -9,7 +9,8 @@ use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    may_spell_word, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    may_spell_word, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers,
+    strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -3339,6 +3340,66 @@ mod tests {
                 let command = command.replace("{other}", &other);
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1290, #1295 and #1297, judged from an owned
+    /// checkout that also has an unowned `evil` remote. Every blocking row
+    /// published a canary commit to a local bare remote under bash 5.2 and
+    /// git 2.43; each allowing row is an everyday command that must not.
+    #[test]
+    fn push_spellings_the_prefilter_vetoed_are_judged() {
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &["remote", "add", "evil", "https://github.com/evil/y.git"],
+        );
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, blocks) in [
+                // #1290: brace expansion, quote splices and escapes.
+                ("git pus{h..h} evil main", true),
+                ("{git,pus{h..h},evil,main}", true),
+                ("git pu''sh evil main", true),
+                ("git pu\"s\"h evil main", true),
+                ("git p\\ush evil main", true),
+                ("git $'\\x70ush' evil main", true),
+                // #1297: assignment prefixes.
+                ("FOO+=x git push evil main", true),
+                ("A[0]=x git push evil main", true),
+                ("A[0]+=x git push evil main", true),
+                // #1295: for-each-repo runs the push in repositories no
+                // walk can name, whichever remote it names.
+                (
+                    "git -c r.x=\"$PWD\" for-each-repo --config=r.x push evil main",
+                    true,
+                ),
+                ("git for-each-repo --config=r.x push origin main", true),
+                // Everyday commands still pass.
+                ("git push origin main", false),
+                ("git pus{h..h} origin main", false),
+                ("git pu''sh origin main", false),
+                ("A[0]=x git push origin main", false),
+                ("FOO+=x git push origin main", false),
+                ("FOO+=x make", false),
+                ("A[0]=x make", false),
+                (
+                    "git for-each-repo --config=maintenance.repo maintenance run",
+                    false,
+                ),
+                ("mkdir -p src/{a,b}/push", false),
+                ("echo \"{p,q}\" 'push'", false),
+                ("printf '%s\\n' {1..3} push", false),
+                ("git status", false),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
             }
         });
     }

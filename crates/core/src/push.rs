@@ -6799,4 +6799,52 @@ mod tests {
             assert_eq!(dirs, ["/r"], "{command}");
         }
     }
+
+    /// cameronsjo/cadence-hooks#1297 and #1295: a push behind a subscripted
+    /// or appending assignment prefix is found where it runs, and one `git
+    /// for-each-repo` runs is found as a push in a repository this walk
+    /// cannot name. Each push-bearing row published a canary commit to a
+    /// local bare remote under bash 5.2 and git 2.43.
+    #[test]
+    fn pushes_behind_assignment_prefixes_and_for_each_repo_are_found() {
+        let dir = "/nonexistent-pdg";
+        // `(repository, repository_unresolved)` per push found.
+        let found = |command: &str| -> Vec<(Option<String>, bool)> {
+            push_locations(command, dir)
+                .into_iter()
+                .map(|push| (push.repository, push.repository_unresolved))
+                .collect()
+        };
+        let origin = || (Some("origin".to_string()), false);
+        for (command, want) in [
+            ("FOO+=x git push origin main", vec![origin()]),
+            ("A[0]=x git push origin main", vec![origin()]),
+            ("A[0]+=x git push origin main", vec![origin()]),
+            ("A[k]=x B+=y git push origin main", vec![origin()]),
+            ("git p\\ush origin main", vec![origin()]),
+        ] {
+            assert_eq!(found(command), want, "{command:?}");
+        }
+        for command in [
+            "git -c r.x=\"$PWD\" for-each-repo --config=r.x push origin main",
+            "git for-each-repo --config r.x push origin main",
+            "git for-each-repo --keep-going --config=r.x -- push evil main",
+        ] {
+            let pushes = found(command);
+            assert!(
+                !pushes.is_empty() && pushes.iter().all(|(_, unresolved)| *unresolved),
+                "{command:?}: {pushes:?}"
+            );
+        }
+        // Controls: nothing pushes.
+        for command in [
+            "FOO+=x make",
+            "A[0]=x make",
+            "A[0]=x; echo push",
+            "git for-each-repo --config=maintenance.repo maintenance run",
+            "git for-each-repo --config=k fetch origin",
+        ] {
+            assert_eq!(found(command), Vec::new(), "{command:?}");
+        }
+    }
 }
