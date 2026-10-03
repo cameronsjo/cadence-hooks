@@ -13484,7 +13484,7 @@ pub struct GitExec {
     /// quoting or a function's own arguments can make wrong: a walker judging
     /// a push reads the invocation as one it cannot resolve
     /// (cameronsjo/cadence-hooks#1226 review 4). Also set when the
-    /// invocation sets a value git runs as a command ([`sets_an_exec_value`],
+    /// invocation sets a value git runs as a command that is not literal ([`exec_settings`],
     /// cameronsjo/cadence-hooks#1231).
     pub opaque: bool,
 }
@@ -13664,8 +13664,9 @@ const ARCHIVE_OPTIONS: ExecOptions = ExecOptions {
 /// `--onto -x`) costs a false block on a command git refuses, never a miss.
 /// A setting on the command line that makes git run a command of its own
 /// (`-c core.sshCommand=…`, `-c core.pager=…`, `GIT_SSH_COMMAND=… git`, see
-/// [`sets_an_exec_value`]) makes the invocation [`GitExec::opaque`], whatever
-/// the subcommand; its value is not read. Config set in a file and an
+/// [`exec_settings`]) is read as a script nested in the invocation when its
+/// value is fully literal, and otherwise makes the invocation
+/// [`GitExec::opaque`], whatever the subcommand. Config set in a file and an
 /// exported variable are outside the command text and not read here
 /// (cameronsjo/cadence-hooks#1231).
 pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
@@ -13705,10 +13706,14 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // no subcommand can be found — except that, not knowing it, every
     // editor is read.
     // A setting that makes git run a command of its own (`core.sshCommand`,
-    // `core.pager`, `GIT_SSH_COMMAND`, …) is not read: the invocation is one
-    // whose push cannot be resolved (cameronsjo/cadence-hooks#1231).
-    let runs_a_setting = sets_an_exec_value(prefix, globals);
-    let editor_only = |editors: Vec<String>| {
+    // `core.pager`, `GIT_SSH_COMMAND`, …) is read as a nested script when its
+    // value is literal; otherwise the invocation is one whose push cannot be
+    // resolved (cameronsjo/cadence-hooks#1231).
+    let settings = exec_settings(prefix, globals);
+    let runs_a_setting = settings.opaque;
+    let setting_scripts = settings.scripts;
+    let editor_only = |mut editors: Vec<String>| {
+        editors.extend(setting_scripts.iter().cloned());
         (!editors.is_empty() || runs_a_setting).then_some(GitExec {
             scripts: editors,
             elsewhere: false,
@@ -13770,6 +13775,7 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
     // it is the transports', that is a doubt, never a miss.
     let mut scripts = scripts;
     scripts.extend(editors);
+    scripts.extend(setting_scripts);
     Some(GitExec {
         scripts,
         elsewhere,
@@ -13806,7 +13812,7 @@ fn may_carry_git_exec(tokens: &[String]) -> bool {
                 .is_some_and(|name| name.starts_with(['u', 'r', 'e']))
             || (token.starts_with('-') && !token.starts_with("--") && token.contains('u'))
             // A `-c`/`--config-env` global or an assignment may set a value
-            // git runs ([`sets_an_exec_value`]).
+            // git runs ([`exec_settings`]).
             || token.starts_with("-c")
             || token.starts_with("--config-env")
             || token.contains('=')
@@ -13828,40 +13834,74 @@ const GIT_EXEC_ENV: &[&str] = &[
     "GIT_PROXY_COMMAND",
 ];
 
-/// Whether a git invocation sets, in front of it (`GIT_SSH_COMMAND=… git`)
-/// or as a `-c`/`--config-env` global, a value git runs as a command — read
-/// as an invocation whose push cannot be resolved, never parsed
-/// (cameronsjo/cadence-hooks#1231). See [`is_exec_valued_config`].
-///
-/// The environment spellings of `-c` (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
-/// `GIT_CONFIG_VALUE_<n>`, `GIT_CONFIG_PARAMETERS`), a `GIT_ALLOW_PROTOCOL`
-/// naming `ext`, and a `-c` key that is an expansion count whatever their
-/// value. An empty value and a pager of exactly `cat` run nothing of the
-/// command's choosing, and are not counted. An editor is read as a script by
+/// The values a git invocation sets, in front of it (`GIT_SSH_COMMAND=… git`)
+/// or as a `-c`/`--config-env` global, that git runs as a command (see
+/// [`is_exec_valued_config`]).
+#[derive(Debug, Default)]
+struct ExecSettings {
+    /// Each fully literal value, as the script git hands a shell: judged as
+    /// a command nested in the invocation, in its own repository, so `-c
+    /// core.pager="less -R"` or `GIT_SSH_COMMAND="ssh -i k"` runs nothing a
+    /// guard refuses while `-c core.sshCommand='git push evil main'` is a
+    /// push (cameronsjo/cadence-hooks#1231, round 3).
+    scripts: Vec<String>,
+    /// Some value cannot be read: an expansion, a substitution or unbalanced
+    /// quotes in it, a `--config-env` value (it lives in a variable), a key
+    /// that is an expansion (`-c "$K=x"`), `-c` spelled as the environment
+    /// (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`/`_VALUE_<n>`,
+    /// `GIT_CONFIG_PARAMETERS`), an `ext` protocol allowed (it runs a URL),
+    /// or a `core.hooksPath` (it names hooks, not a command). The invocation
+    /// is a push the walk cannot resolve.
+    opaque: bool,
+}
+
+/// [`ExecSettings`] of one git invocation (cameronsjo/cadence-hooks#1231).
+/// An empty value and a pager of exactly `cat` run nothing of the command's
+/// choosing, and are not counted. An editor is read as a script by
 /// [`editor_scripts`], so it is not counted here either.
-fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
+fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
+    let mut out = ExecSettings::default();
     let inert_pager = |value: &str| value.is_empty() || value == "cat";
-    let env = prefix.iter().any(|word| {
+    let take = |value: &str, out: &mut ExecSettings| {
+        // `credential.helper=!cmd` runs `cmd` under a shell.
+        let value = value.strip_prefix('!').unwrap_or(value);
+        if is_literal_script(value) {
+            out.scripts.push(value.to_string());
+        } else {
+            out.opaque = true;
+        }
+    };
+    for word in prefix {
         let word = unescape_word(word);
-        word.split_once('=').is_some_and(|(name, value)| {
-            // `NAME+=value` appends, so the value is not the whole setting.
-            let name = name.strip_suffix('+').unwrap_or(name);
-            // The `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` triple and
-            // `GIT_CONFIG_PARAMETERS` are `-c` spelled as the environment: any
-            // key at all, so any value counts.
-            name == "GIT_CONFIG_COUNT"
-                || name == "GIT_CONFIG_PARAMETERS"
-                || name.starts_with("GIT_CONFIG_KEY_")
-                || name.starts_with("GIT_CONFIG_VALUE_")
-                // `ext` among the allowed protocols runs a URL as a command.
-                || (name == "GIT_ALLOW_PROTOCOL" && value.to_ascii_lowercase().contains("ext"))
-                || (GIT_EXEC_ENV.contains(&name)
-                    && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
-                    && !value.is_empty())
-        })
-    });
-    if env {
-        return true;
+        let Some((name, value)) = word.split_once('=') else {
+            continue;
+        };
+        // `NAME+=value` appends, so the value is not the whole setting.
+        let (name, appends) = match name.strip_suffix('+') {
+            Some(name) => (name, true),
+            None => (name, false),
+        };
+        // The `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` triple and
+        // `GIT_CONFIG_PARAMETERS` are `-c` spelled as the environment: any
+        // key at all, so any value counts.
+        if name == "GIT_CONFIG_COUNT"
+            || name == "GIT_CONFIG_PARAMETERS"
+            || name.starts_with("GIT_CONFIG_KEY_")
+            || name.starts_with("GIT_CONFIG_VALUE_")
+            // `ext` among the allowed protocols runs a URL as a command.
+            || (name == "GIT_ALLOW_PROTOCOL" && value.to_ascii_lowercase().contains("ext"))
+        {
+            out.opaque = true;
+        } else if GIT_EXEC_ENV.contains(&name)
+            && !(matches!(name, "GIT_PAGER" | "PAGER") && inert_pager(value))
+            && !value.is_empty()
+        {
+            if appends {
+                out.opaque = true;
+            } else {
+                take(value, &mut out);
+            }
+        }
     }
     let mut i = 0;
     while let Some(raw) = globals.get(i) {
@@ -13881,13 +13921,41 @@ fn sets_an_exec_value(prefix: &[String], globals: &[String]) -> bool {
         // `-c key` with no `=` sets a boolean true.
         let (key, value) = setting.split_once('=').unwrap_or((&setting, "true"));
         // A key that is an expansion (`-c "$K=x"`) may be any key.
-        if key.contains(['$', '`'])
-            || is_exec_valued_config(key, if from_env { None } else { Some(value) })
-        {
-            return true;
+        if key.contains(['$', '`']) {
+            out.opaque = true;
+        } else if is_exec_valued_config(key, if from_env { None } else { Some(value) }) {
+            let lower = key.to_ascii_lowercase();
+            if from_env || lower.starts_with("protocol.") || lower == "core.hookspath" {
+                out.opaque = true;
+            } else {
+                take(value, &mut out);
+            }
         }
     }
-    false
+    out
+}
+
+/// Whether `value` is shell text a reading can take whole: no expansion,
+/// or substitution, and every quote closed. It is read as any other nested
+/// script, braces and all.
+fn is_literal_script(value: &str) -> bool {
+    if value.contains(['$', '`']) {
+        return false;
+    }
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for c in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ => {}
+        }
+    }
+    !(single || double || escaped)
 }
 
 /// Whether config `key` set to `value` (`None`: read from a variable, so not
