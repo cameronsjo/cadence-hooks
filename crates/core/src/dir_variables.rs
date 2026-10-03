@@ -38,8 +38,8 @@
 //! `wait -p`, `trap`, `alias`, `enable`, `fc`, `builtin`, `coproc`, `case`,
 //! `function`, `[[ … ]]` and `(( … ))`/`$(( … ))`/`$[ … ]` arithmetic, an
 //! array-element assignment, a `${…}` with any operator, `$'…'`/`$"…"`,
-//! backticks, a command word built from an expansion, and a heredoc the scan
-//! cannot pair with its terminator. Text inside single quotes and inside a
+//! backticks, a command word built from an expansion, a glob or a brace, and
+//! a heredoc the scan cannot pair with its terminator. Text inside single quotes and inside a
 //! quoted-delimiter heredoc body is data to this shell and is neither read for
 //! these nor rewritten.
 //!
@@ -179,8 +179,25 @@ fn splices_verbatim(value: &str) -> bool {
 /// or run text as code in this shell. Their presence in command position
 /// anywhere refuses the whole command.
 const ASSIGNING_BUILTINS: &[&str] = &[
-    "eval", "source", ".", "declare", "typeset", "local", "readonly", "read", "readarray",
-    "mapfile", "getopts", "let", "unset", "trap", "alias", "unalias", "enable", "fc", "builtin",
+    "eval",
+    "source",
+    ".",
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
+    "read",
+    "readarray",
+    "mapfile",
+    "getopts",
+    "let",
+    "unset",
+    "trap",
+    "alias",
+    "unalias",
+    "enable",
+    "fc",
+    "builtin",
 ];
 
 /// Reserved words that refuse the command: their bodies are grammar this scan
@@ -239,6 +256,8 @@ enum Simple {
     Wait,
     /// `command` / `time`: option words keep command position.
     Runner,
+    /// A `for` header: `for x do` opens the body with no `;`.
+    For,
 }
 
 #[derive(Default)]
@@ -311,6 +330,11 @@ impl<'a> Scan<'a> {
         }
     }
 
+    /// Step over `n` bytes, never past the end.
+    fn skip(&mut self, n: usize) {
+        self.i = (self.i + n).min(self.b.len());
+    }
+
     fn peek(&self, k: usize) -> Option<u8> {
         self.b.get(self.i + k).copied()
     }
@@ -326,7 +350,7 @@ impl<'a> Scan<'a> {
                         self.dquote = false;
                         self.i += 1;
                     }
-                    b'\\' => self.i += 2,
+                    b'\\' => self.skip(2),
                     b'`' => return None,
                     b'$' => self.dollar()?,
                     b'\n' if !self.heredocs.is_empty() => return None,
@@ -351,16 +375,14 @@ impl<'a> Scan<'a> {
                     }
                 }
                 b'\\' => {
-                    if self.peek(1) == Some(b'\n') {
-                        self.i += 2;
-                    } else {
+                    if self.peek(1) != Some(b'\n') {
                         self.start_word();
-                        self.i += 2;
                     }
+                    self.skip(2);
                 }
                 b'\'' => {
                     self.start_word();
-                    let close = self.src[self.i + 1..].find('\'')?;
+                    let close = self.src.get(self.i + 1..)?.find('\'')?;
                     self.i += close + 2;
                 }
                 b'"' => {
@@ -453,7 +475,7 @@ impl<'a> Scan<'a> {
         // A word glued to the operator that is only digits (`2>`) or `{fd}`
         // names the descriptor; it is not a word of the command.
         if let Some(start) = self.word_start {
-            let text = &self.src[start..self.i];
+            let text = self.src.get(start..self.i)?;
             if !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()) {
                 self.word_start = None;
             } else if text.starts_with('{') && text.ends_with('}') {
@@ -500,8 +522,8 @@ impl<'a> Scan<'a> {
         let plain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-');
         let (delimiter, expands) = match self.peek(0)? {
             quote @ (b'\'' | b'"') => {
-                let close = self.src[self.i + 1..].find(quote as char)?;
-                let word = &self.src[self.i + 1..self.i + 1 + close];
+                let close = self.src.get(self.i + 1..)?.find(quote as char)?;
+                let word = self.src.get(self.i + 1..self.i + 1 + close)?;
                 if word.is_empty() || !word.bytes().all(plain) {
                     return None;
                 }
@@ -516,7 +538,7 @@ impl<'a> Scan<'a> {
                 if start == self.i {
                     return None;
                 }
-                (self.src[start..self.i].to_string(), true)
+                (self.src.get(start..self.i)?.to_string(), true)
             }
         };
         if !matches!(
@@ -542,10 +564,12 @@ impl<'a> Scan<'a> {
                 if self.i >= self.b.len() {
                     return None;
                 }
-                let end = self.src[self.i..]
+                let end = self
+                    .src
+                    .get(self.i..)?
                     .find('\n')
                     .map_or(self.b.len(), |n| self.i + n);
-                let line = &self.src[self.i..end];
+                let line = self.src.get(self.i..end)?;
                 self.i = (end + 1).min(self.b.len());
                 let check = if doc.strip_tabs {
                     line.trim_start_matches('\t')
@@ -576,21 +600,21 @@ impl<'a> Scan<'a> {
                 self.i += 2;
             }
             Some(b'{') => {
-                let rest = &self.src[start + 2..];
+                let rest = self.src.get(start + 2..)?;
                 let len = ident_len(rest);
                 if len == 0 || rest.as_bytes().get(len) != Some(&b'}') {
                     return None;
                 }
                 self.i = start + 2 + len + 1;
-                self.consider_use(start, &rest[..len]);
+                self.consider_use(start, &rest[..len])?;
             }
             Some(b'[') => return None,
             Some(b'\'' | b'"') if !self.dquote => return None,
             Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
-                let rest = &self.src[start + 1..];
+                let rest = self.src.get(start + 1..)?;
                 let len = ident_len(rest);
                 self.i = start + 1 + len;
-                self.consider_use(start, &rest[..len]);
+                self.consider_use(start, &rest[..len])?;
             }
             Some(c) if c.is_ascii_digit() || b"@*#?$!-".contains(&c) => self.i += 2,
             _ => self.i += 1,
@@ -600,19 +624,22 @@ impl<'a> Scan<'a> {
 
     /// Record the read spanning `start..self.i` of `name` when it is a
     /// directory operand and `name` is bound here.
-    fn consider_use(&mut self, start: usize, name: &str) {
+    fn consider_use(&mut self, start: usize, name: &str) -> Option<()> {
         if !self.bound.contains(name) {
-            return;
+            return Some(());
         }
         let word_start = self.word_start.unwrap_or(start);
-        let prefix: String = self.src[word_start..start]
+        let prefix: String = self
+            .src
+            .get(word_start..start)?
             .chars()
             .filter(|&c| c != '"')
             .collect();
         let target = match prefix.as_str() {
             "" => self
                 .prev_word
-                .is_some_and(|(s, e)| TARGET_FLAGS.contains(&&self.src[s..e])),
+                .and_then(|(s, e)| self.src.get(s..e))
+                .is_some_and(|word| TARGET_FLAGS.contains(&word)),
             "-C" | "--git-dir=" | "--work-tree=" => true,
             _ => false,
         };
@@ -623,6 +650,7 @@ impl<'a> Scan<'a> {
                 name: name.to_string(),
             });
         }
+        Some(())
     }
 
     /// Open a group: `(`, `$(`, `<(`, `>(` or `{`.
@@ -691,7 +719,7 @@ impl<'a> Scan<'a> {
         let Some(start) = self.word_start.take() else {
             return Some(());
         };
-        let raw = &self.src[start..self.i];
+        let raw = self.src.get(start..self.i)?;
         let dynamic = std::mem::take(&mut self.word_dynamic);
         self.prev_word = Some((start, self.i));
         if std::mem::take(&mut self.redirect_target) {
@@ -715,6 +743,13 @@ impl<'a> Scan<'a> {
             return None;
         }
         let word = dequote(raw);
+        // A glob or a brace in a command word expands to a name this scan
+        // never saw: `rea?` runs `read` where a file of that name exists.
+        if !matches!(word.as_str(), "{" | "}" | "[")
+            && word.contains(['{', '}', '*', '?', '[', ']'])
+        {
+            return None;
+        }
         if ASSIGNING_BUILTINS.contains(&word.as_str()) || REFUSED_KEYWORDS.contains(&word.as_str())
         {
             return None;
@@ -729,6 +764,7 @@ impl<'a> Scan<'a> {
                 self.compound += 1;
                 self.stmt.pure = false;
                 self.cmd_pos = false;
+                self.simple = Simple::For;
             }
             "then" | "else" | "elif" | "do" | "!" => self.stmt.pure = false,
             "fi" | "done" => {
@@ -785,6 +821,10 @@ impl<'a> Scan<'a> {
                     None => self.stmt.pure = false,
                 }
             }
+            Simple::For if dequote(raw) == "do" => {
+                self.cmd_pos = true;
+                self.simple = Simple::None;
+            }
             Simple::Printf if dequote(raw).starts_with("-v") => return None,
             Simple::Wait if dequote(raw).starts_with('-') => return None,
             _ => self.stmt.pure = false,
@@ -803,10 +843,10 @@ impl<'a> Scan<'a> {
             && matches!(term, Term::Seq | Term::And | Term::Or);
         if dominates {
             for name in stmt.names {
-                if self.bound.insert(name.clone()) {
-                    if let Some(here) = self.bound_at.last_mut() {
-                        here.push(name);
-                    }
+                if self.bound.insert(name.clone())
+                    && let Some(here) = self.bound_at.last_mut()
+                {
+                    here.push(name);
                 }
             }
         }
@@ -854,7 +894,9 @@ fn assignment_name(raw: &str) -> Option<&str> {
 /// A word with its quotes and backslashes removed — over-eager inside double
 /// quotes, which only reads more words as a refused builtin.
 fn dequote(raw: &str) -> String {
-    raw.chars().filter(|c| !matches!(c, '\'' | '"' | '\\' | '\n')).collect()
+    raw.chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '\n'))
+        .collect()
 }
 
 /// Can an expanding heredoc body line assign a variable in this shell? Its
@@ -941,6 +983,8 @@ mod tests {
             // A relative literal resolves to itself; the guard reads it
             // against wherever the shell is then.
             ("M=sub; cd $M", "M=sub; cd sub"),
+            // A trailing backslash is a literal one to bash.
+            ("M=/a; git -C $M x \\", "M=/a; git -C /a x \\"),
             // Controls for refusals below: the same shapes with nothing that
             // can assign still resolve, so each refusal is the hazard's.
             (
@@ -991,7 +1035,10 @@ mod tests {
             ("git -C \"$M\" commit", "never assigned"),
             ("git -C \"$M\" commit; M=/a", "assigned after the read"),
             ("M=/a git -C \"$M\" commit", "prefix assignment"),
-            ("M=/a cd x; git -C \"$M\" commit", "prefix assignment, later read"),
+            (
+                "M=/a cd x; git -C \"$M\" commit",
+                "prefix assignment, later read",
+            ),
             ("M=/a | true; git -C \"$M\" commit", "pipeline element"),
             ("M=/a & git -C \"$M\" commit", "backgrounded"),
             ("(M=/a); git -C \"$M\" commit", "subshell assignment"),
@@ -1003,40 +1050,97 @@ mod tests {
             ("if x; then M=/a; fi; git -C \"$M\" commit", "if branch"),
             ("while x; do M=/a; done; git -C \"$M\" commit", "loop body"),
             ("M=/a; M=/b; git -C \"$M\" commit", "reassigned"),
-            ("M=/a; if x; then M=/p; fi; git -C \"$M\" commit", "conditional reassign"),
+            (
+                "M=/a; if x; then M=/p; fi; git -C \"$M\" commit",
+                "conditional reassign",
+            ),
             ("M=/a; M+=/b; git -C \"$M\" commit", "append"),
             ("M=/a; unset M; git -C \"$M\" commit", "unset"),
             ("M=/a; read M </f; git -C \"$M\" commit", "read"),
-            ("M=/a; for M in /p; do :; done; git -C \"$M\" commit", "for name"),
+            (
+                "M=/a; for M in /p; do :; done; git -C \"$M\" commit",
+                "for name",
+            ),
             ("M=/a; : ${M:=/p}; git -C \"$M\" commit", "default assign"),
             ("M=/a; git -C \"${M:-/p}\" commit", "operator read"),
-            ("M=/a; f() { M=/p; }; f; git -C \"$M\" commit", "function reassign"),
-            ("M=/a; n=M; read \"$n\" </f; git -C \"$M\" commit", "dynamic read"),
-            ("M=/a; read \"$n\" </f; git -C \"$M\" commit", "read, name unknown"),
+            (
+                "M=/a; f() { M=/p; }; f; git -C \"$M\" commit",
+                "function reassign",
+            ),
+            (
+                "M=/a; n=M; read \"$n\" </f; git -C \"$M\" commit",
+                "dynamic read",
+            ),
+            (
+                "M=/a; read \"$n\" </f; git -C \"$M\" commit",
+                "read, name unknown",
+            ),
             ("M=/a; r''ead \"$n\"; git -C \"$M\" commit", "quoted read"),
             ("M=/a; \\read \"$n\"; git -C \"$M\" commit", "escaped read"),
-            ("M=/a; command read \"$n\"; git -C \"$M\" commit", "command read"),
-            ("M=/a; command -p read \"$n\"; git -C \"$M\" commit", "command -p read"),
-            ("M=/a; 2>/dev/null read \"$n\"; git -C \"$M\" commit", "redirect first"),
-            ("M=/a; >f read \"$n\"; git -C \"$M\" commit", "redirect target first"),
-            ("M=/a; x=1 read \"$n\"; git -C \"$M\" commit", "prefix then read"),
+            (
+                "M=/a; command read \"$n\"; git -C \"$M\" commit",
+                "command read",
+            ),
+            (
+                "M=/a; command -p read \"$n\"; git -C \"$M\" commit",
+                "command -p read",
+            ),
+            (
+                "M=/a; 2>/dev/null read \"$n\"; git -C \"$M\" commit",
+                "redirect first",
+            ),
+            (
+                "M=/a; >f read \"$n\"; git -C \"$M\" commit",
+                "redirect target first",
+            ),
+            (
+                "M=/a; x=1 read \"$n\"; git -C \"$M\" commit",
+                "prefix then read",
+            ),
             ("M=/a; (read \"$n\"; git -C \"$M\" commit)", "read in group"),
-            ("M=/a; $c \"$n\"; git -C \"$M\" commit", "dynamic command word"),
-            ("M=/a; \"$c\" x; git -C \"$M\" commit", "quoted dynamic command"),
+            (
+                "M=/a; $c \"$n\"; git -C \"$M\" commit",
+                "dynamic command word",
+            ),
+            (
+                "M=/a; \"$c\" x; git -C \"$M\" commit",
+                "quoted dynamic command",
+            ),
             ("M=/a; eval \"$s\"; git -C \"$M\" commit", "eval"),
             ("M=/a; source ./env; git -C \"$M\" commit", "source"),
             ("M=/a; . ./env; git -C \"$M\" commit", "dot"),
             ("M=/a; declare -u M=/a; git -C \"$M\" commit", "declare"),
             ("M=/a; local M=/a; git -C \"$M\" commit", "local"),
-            ("M=/a; export \"$n=/p\"; git -C \"$M\" commit", "dynamic export"),
-            ("M=/a; printf -v \"$n\" /p; git -C \"$M\" commit", "printf -v"),
-            ("M=/a; printf -v\"$n\" /p; git -C \"$M\" commit", "printf -v glued"),
+            (
+                "M=/a; export \"$n=/p\"; git -C \"$M\" commit",
+                "dynamic export",
+            ),
+            (
+                "M=/a; printf -v \"$n\" /p; git -C \"$M\" commit",
+                "printf -v",
+            ),
+            (
+                "M=/a; printf -v\"$n\" /p; git -C \"$M\" commit",
+                "printf -v glued",
+            ),
             ("M=/a; wait -p \"$n\"; git -C \"$M\" commit", "wait -p"),
             ("M=/a; let \"$n=1\"; git -C \"$M\" commit", "let"),
-            ("M=/a; (( $n = 1 )); git -C \"$M\" commit", "arithmetic command"),
-            ("M=/a; x=$(( $n = 1 )); git -C \"$M\" commit", "arithmetic expansion"),
-            ("M=/a; x=$[ $n = 1 ]; git -C \"$M\" commit", "old arithmetic"),
-            ("M=/a; [[ $n -eq 1 ]]; git -C \"$M\" commit", "[[ arithmetic"),
+            (
+                "M=/a; (( $n = 1 )); git -C \"$M\" commit",
+                "arithmetic command",
+            ),
+            (
+                "M=/a; x=$(( $n = 1 )); git -C \"$M\" commit",
+                "arithmetic expansion",
+            ),
+            (
+                "M=/a; x=$[ $n = 1 ]; git -C \"$M\" commit",
+                "old arithmetic",
+            ),
+            (
+                "M=/a; [[ $n -eq 1 ]]; git -C \"$M\" commit",
+                "[[ arithmetic",
+            ),
             ("M=/a; a[$n=1]=x; git -C \"$M\" commit", "array subscript"),
             ("M=/a; x=${y^}; git -C \"$M\" commit", "case operator"),
             ("M=/a; x=${!y}; git -C \"$M\" commit", "indirection"),
@@ -1044,20 +1148,52 @@ mod tests {
             ("M=/a; trap 'x' DEBUG; git -C \"$M\" commit", "trap"),
             ("M=/a; alias g=x; git -C \"$M\" commit", "alias"),
             ("M=/a; case x in x) ;; esac; git -C \"$M\" commit", "case"),
-            ("M=/a; function f { :; }; git -C \"$M\" commit", "function keyword"),
-            ("M=/a; git -C \"$M\" commit -m \"`id`\"", "backtick in dquote"),
-            ("M=/a; cat <<EOF\n${M:=x}\nEOF\ngit -C \"$M\" commit", "assigning body"),
-            ("M=/a; cat <<EOF\nno end\ngit -C \"$M\" commit", "unterminated heredoc"),
-            ("M=/a; cat <<E'O'F\nx\nEOF\ngit -C \"$M\" commit", "split delimiter"),
+            (
+                "M=/a; function f { :; }; git -C \"$M\" commit",
+                "function keyword",
+            ),
+            (
+                "M=/a; git -C \"$M\" commit -m \"`id`\"",
+                "backtick in dquote",
+            ),
+            (
+                "M=/a; cat <<EOF\n${M:=x}\nEOF\ngit -C \"$M\" commit",
+                "assigning body",
+            ),
+            (
+                "M=/a; cat <<EOF\nno end\ngit -C \"$M\" commit",
+                "unterminated heredoc",
+            ),
+            (
+                "M=/a; cat <<E'O'F\nx\nEOF\ngit -C \"$M\" commit",
+                "split delimiter",
+            ),
             ("PWD=/a; cd x; git -C \"$PWD\" commit", "shell-managed name"),
             ("IFS=/; M=/a; git -C $M commit", "IFS changed"),
-            ("M=/a; git -C \"$M\" commit -m \"M=/p\"", "conflicting mention"),
+            (
+                "M=/a; git -C \"$M\" commit -m \"M=/p\"",
+                "conflicting mention",
+            ),
             ("M=/a; (git -C \"$M\" commit", "unbalanced group"),
             ("M=/a; echo \"$M", "unterminated quote"),
             ("M=/a; git -C '$M' commit", "single-quoted read"),
             ("M=/a; git -C \\$M commit", "escaped read"),
             ("M=/a; bash -c 'git -C \"$M\" commit'", "child script"),
             ("M=/a; git -C \"$MX\" commit", "different name"),
+            (
+                "M=/a; for x do read \"$n\"; done; git -C \"$M\" commit",
+                "for without in",
+            ),
+            (
+                "M=/a; rea? \"$n\"; git -C \"$M\" commit",
+                "globbed command word",
+            ),
+            ("M=/a; {read,x}; git -C \"$M\" commit", "brace command word"),
+            (
+                "M=/a; exec {fd}>f; git -C \"$M\" commit",
+                "named descriptor",
+            ),
+            ("M=/a; echo \"x\\", "backslash at the end of a quote"),
         ];
         for (command, why) in cases {
             assert_eq!(
@@ -1079,6 +1215,28 @@ mod tests {
             "M=/a; cd -- \"$M\"",
         ] {
             assert_eq!(resolved(command), command);
+        }
+    }
+
+    /// A panic here would fail every guard open, so arbitrary input must
+    /// only ever give an answer.
+    #[test]
+    fn arbitrary_input_never_panics() {
+        let alphabet: Vec<&str> = vec![
+            "M", "=", "/a", "$", "{", "}", "(", ")", "\"", "'", "\\", "`", ";", "&", "|", "<", ">",
+            "<<", "EOF", "\n", " ", "\t", "#", "-C", "cd", "git", "é", "日", "[", "*", "!", "do",
+            "for", "if", "fi", "export", "read",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            let mut command = String::from("M=/a; ");
+            for _ in 0..(state % 24) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                command.push_str(alphabet[(state % alphabet.len() as u64) as usize]);
+            }
+            let _ = resolve_literal_dir_variables(&command);
         }
     }
 
