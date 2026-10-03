@@ -2979,18 +2979,64 @@ pub fn is_assignment_word(token: &str) -> bool {
     // `NAME+=value` appends, and is an assignment prefix like `NAME=value`
     // (cameronsjo/cadence-hooks#1231 review: `GIT_SSH_COMMAND+=x git fetch`
     // hid the git behind it).
-    match token
-        .split_once('=')
-        .map(|(name, value)| (name.strip_suffix('+').unwrap_or(name), value))
-    {
-        Some((name, _)) if !name.is_empty() => {
-            name.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        _ => false,
+    let name_len = token
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    if name_len == 0 || token.as_bytes()[0].is_ascii_digit() {
+        return false;
     }
+    let rest = &token[name_len..];
+    // `NAME[sub]=value` and `NAME[sub]+=value` are assignment words too: bash
+    // rejects them as prefix assignments ("not a valid identifier") and still
+    // runs the command after them, so `A[0]=x git push` pushed while every
+    // push walk took `A[0]=x` for the command (cameronsjo/cadence-hooks#1297).
+    let rest = match rest.strip_prefix('[') {
+        Some(subscript) => match subscript_end(subscript) {
+            Some(end) => &subscript[end..],
+            None => return false,
+        },
+        None => rest,
+    };
+    rest.starts_with('=') || rest.starts_with("+=")
+}
+
+/// The byte offset just past the `]` closing a subscript whose `[` was
+/// already consumed, by bash's rule: brackets nest, and a quoted or
+/// backslash-escaped `]` does not close it (`A["]"]=x`, `A[\]]=x` and
+/// `A[a[0]]=x` are each one assignment word under bash 5.2). `None` when the
+/// subscript never closes — the word is then not an assignment, as before.
+fn subscript_end(subscript: &str) -> Option<usize> {
+    let bytes = subscript.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if quote == b'"' && bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// True when `command` is about to ship branch work: `gh pr ready`
@@ -12989,7 +13035,9 @@ pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
             // `push` stays case-sensitive: only the executable word folds
             // ([`command_word`]), because a subcommand is case-sensitive to git
             // and inventing `PUSH` would judge a command the shell never runs.
-            if subcommand != "push" {
+            // It is read unescaped: bash runs `git p\ush` as `git push`, and
+            // the push walk already read it so (cameronsjo/cadence-hooks#1290).
+            if unescape_word(subcommand) != "push" {
                 return None;
             }
             Some(rest.to_vec())
@@ -13745,6 +13793,9 @@ pub fn git_exec(tokens: &[String]) -> Option<GitExec> {
             (scripts, true, false)
         }
         "filter-branch" => (filter_branch_scripts(args), true, false),
+        // It runs `git ARG…` in every repository its config key lists, none
+        // of which this walk can read (cameronsjo/cadence-hooks#1295).
+        "for-each-repo" => (for_each_repo_script(args), true, false),
         "difftool" => (exec_option_scripts(args, &DIFFTOOL_OPTIONS), false, true),
         "fetch" | "ls-remote" | "pull" | "clone" | "push" | "archive" | "fetch-pack"
         | "send-pack" => (
@@ -13800,6 +13851,7 @@ fn may_carry_git_exec(tokens: &[String]) -> bool {
                     | "submodule--helper"
                     | "filter-branch"
                     | "difftool"
+                    | "for-each-repo"
             )
             || token
                 .strip_prefix("--")
@@ -14060,6 +14112,7 @@ const GIT_EXEC_SUBCOMMANDS: &[&str] = &[
     "submodule--helper",
     "filter-branch",
     "difftool",
+    "for-each-repo",
     "fetch",
     "ls-remote",
     "pull",
@@ -14555,6 +14608,35 @@ fn submodule_foreach_script(args: &[String], helper: bool) -> (Vec<String>, bool
             chain_script(&command, head_is_text)
         }
     }
+}
+
+/// The git command a `git for-each-repo [--config=KEY] [--keep-going] [--]
+/// ARG…` runs in each repository KEY lists: `git ARG…`, written as a script
+/// (cameronsjo/cadence-hooks#1295). git stops reading its own options at the
+/// first operand, and takes any unambiguous prefix of `--config` as that
+/// option, so `--conf KEY` consumes KEY as the key rather than running it.
+/// See [`git_exec`].
+fn for_each_repo_script(args: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while let Some(raw) = args.get(i) {
+        let word = unescape_word(raw);
+        if word == "--" {
+            i += 1;
+            break;
+        }
+        let Some(name) = word.strip_prefix("--") else {
+            break;
+        };
+        i += 1;
+        if !name.contains('=') && !name.is_empty() && "config".starts_with(name) {
+            i += 1;
+        }
+    }
+    args.get(i..)
+        .and_then(quoted_script)
+        .map(|command| format!("git {command}"))
+        .into_iter()
+        .collect()
 }
 
 /// Every command a `git filter-branch` `eval`s. See [`git_exec`].

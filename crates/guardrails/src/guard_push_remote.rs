@@ -9,7 +9,7 @@ use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    may_spell_word, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -37,10 +37,16 @@ static GIT_PUSH_VERB: LazyLock<Regex> =
 ///
 /// `alias` passes too (cadence-hooks#1161): a `git -c alias.p='!…' p` or a
 /// `--config-env=alias.p=VAR` can run a push whose text never spells `push`.
+///
+/// Both words are asked through [`may_spell_word`], not as raw substrings:
+/// bash builds `push` from text that never holds it — `pus{h..h}` and
+/// `{git,pus{h..h},evil,main}` (brace expansion), `pu''sh` (a quote splice),
+/// `p\ush`, `$'\x70ush'` — and the substring prefilter allowed every one
+/// before the tokenizer, which decodes them as git-safety and
+/// prevent-secret-push already do, could see the push
+/// (cameronsjo/cadence-hooks#1290).
 fn mentions_push(command: &str) -> bool {
-    let bytes = command.as_bytes();
-    bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"push"))
-        || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"alias"))
+    may_spell_word(command, "push") || may_spell_word(command, "alias")
 }
 
 /// Can the command push? [`mentions_push`], or a git invocation that runs a
