@@ -712,11 +712,12 @@ fn glob_may_name_secret(token: &str, position: Filename) -> bool {
     // An extglob group's literals are not read, so it carries every stem.
     let opaque = target.contains(&GlobElement::Group);
     if families_at(position).iter().any(|family| {
-        let gated = in_store
-            || opaque
-            || (dot_sweep && family.pattern.starts_with('.'))
-            || stem_covered(&chunks, &family.stem);
-        gated && glob_intersects(target, &family.parsed)
+        if in_store || opaque || (dot_sweep && family.pattern.starts_with('.')) {
+            return glob_intersects(target, &family.parsed);
+        }
+        // `stem_covered` is a cheap necessary condition for the aligned walk,
+        // which alone decides (#1285).
+        stem_covered(&chunks, &family.stem) && stem_aligned(target, family)
     }) {
         return true;
     }
@@ -742,6 +743,10 @@ struct DenyFamily {
     pattern: String,
     parsed: Vec<GlobElement>,
     stem: String,
+    /// Which elements of `parsed` spell `stem`: every run of literals that
+    /// does, or `None` when none does (then [`stem_aligned`] falls back to
+    /// the unaligned [`stem_covered`] verdict, which only adds blocks).
+    stem_mask: Option<Vec<bool>>,
 }
 
 /// [`deny_families`] for each position, built once: the fallback past the
@@ -784,12 +789,56 @@ fn deny_families(position: Filename) -> Vec<DenyFamily> {
     }
     patterns
         .into_iter()
-        .map(|pattern| DenyFamily {
-            stem: distinctive_stem(&pattern),
-            parsed: parse_glob(&pattern),
-            pattern,
+        .map(|pattern| {
+            let stem = distinctive_stem(&pattern);
+            let parsed = parse_glob(&pattern);
+            DenyFamily {
+                stem_mask: stem_mask(&parsed, &stem),
+                stem,
+                parsed,
+                pattern,
+            }
         })
         .collect()
+}
+
+/// Mark every run of literal elements in `parsed` that spells `stem`.
+fn stem_mask(parsed: &[GlobElement], stem: &str) -> Option<Vec<bool>> {
+    let stem: Vec<GlobElement> = stem.chars().map(GlobElement::Literal).collect();
+    let mut mask = vec![false; parsed.len()];
+    let mut found = false;
+    for (start, window) in parsed.windows(stem.len().max(1)).enumerate() {
+        if window == stem {
+            mask[start..start + stem.len()].fill(true);
+            found = true;
+        }
+    }
+    found.then_some(mask)
+}
+
+/// Is there one name that both the glob and `family` match, in which the
+/// glob's own LITERAL characters spell at least the [`stem_covered`] quota of
+/// the family's stem (#1285)?
+///
+/// [`stem_covered`] counts any substring a literal run shares with the stem,
+/// wherever it sits, and [`glob_intersects`] finds a common name separately —
+/// so `*hooks*` (whose `ks` is two letters of `jks`) and `*cadence*` (whose
+/// `den` is three of `credentials`) blocked, because their `*` alone can
+/// spell `hooks.jks` and `cadencegcloud-credentials.json`. Here both must
+/// hold of the SAME name: the shared letters have to land on the stem. The
+/// split spellings the quota exists for still do — `.e*v`, `.[e]nv`,
+/// `.n?trc`, `*.k?y`, `*env` — and this only ever removes blocks
+/// [`stem_covered`] would add, never adds one.
+fn stem_aligned(target: &[GlobElement], family: &DenyFamily) -> bool {
+    let Some(mask) = &family.stem_mask else {
+        return glob_intersects(target, &family.parsed);
+    };
+    let need = if family.stem.chars().count() <= 3 {
+        2
+    } else {
+        3
+    };
+    glob_walk(target, &family.parsed, Some((mask, need)))
 }
 
 /// The part of a deny-set name that says "secret" rather than "file": every
@@ -1114,6 +1163,14 @@ impl GlobElement {
 /// those the two patterns name, plus one stand-in for every other character,
 /// which is exact: an element that names no character treats them all alike.
 fn glob_intersects(token: &[GlobElement], deny: &[GlobElement]) -> bool {
+    glob_walk(token, deny, None)
+}
+
+/// [`glob_intersects`], optionally also counting the `deny` elements under
+/// `mask` that a LITERAL of `token` consumes, and accepting only a common
+/// name where that count reaches `need` ([`stem_aligned`]).
+fn glob_walk(token: &[GlobElement], deny: &[GlobElement], cover: Option<(&[bool], usize)>) -> bool {
+    let need = cover.map_or(0, |(_, need)| need);
     let mut alphabet = vec!['.'];
     for element in token.iter().chain(deny) {
         element.explicit_chars(&mut alphabet);
@@ -1126,23 +1183,26 @@ fn glob_intersects(token: &[GlobElement], deny: &[GlobElement]) -> bool {
         .chain(std::iter::once(None))
         .collect();
     let (n, m) = (token.len(), deny.len());
-    let index = |i: usize, j: usize, started: bool| (i * (m + 1) + j) * 2 + usize::from(started);
-    let mut seen = vec![false; (n + 1) * (m + 1) * 2];
-    let mut stack = vec![(0usize, 0usize, false)];
-    while let Some((i, j, started)) = stack.pop() {
-        let at = index(i, j, started);
+    let counts = need + 1;
+    let index = |i: usize, j: usize, started: bool, count: usize| {
+        ((i * (m + 1) + j) * 2 + usize::from(started)) * counts + count
+    };
+    let mut seen = vec![false; (n + 1) * (m + 1) * 2 * counts];
+    let mut stack = vec![(0usize, 0usize, false, 0usize)];
+    while let Some((i, j, started, count)) = stack.pop() {
+        let at = index(i, j, started, count);
         if seen[at] {
             continue;
         }
         seen[at] = true;
-        if i == n && j == m {
+        if i == n && j == m && count >= need {
             return true;
         }
         if i < n && token[i].repeats() {
-            stack.push((i + 1, j, started));
+            stack.push((i + 1, j, started, count));
         }
         if j < m && deny[j] == GlobElement::Star {
-            stack.push((i, j + 1, started));
+            stack.push((i, j + 1, started, count));
         }
         if i == n || j == m {
             continue;
@@ -1159,7 +1219,10 @@ fn glob_intersects(token: &[GlobElement], deny: &[GlobElement]) -> bool {
             } else {
                 j + 1
             };
-            stack.push((next_i, next_j, true));
+            let spells_stem = cover.is_some_and(|(mask, _)| mask[j])
+                && matches!(token[i], GlobElement::Literal(_));
+            let count = (count + usize::from(spells_stem)).min(need);
+            stack.push((next_i, next_j, true, count));
         }
     }
     false
@@ -2405,6 +2468,23 @@ mod tests {
             ("id_[!A-Z]sa", Unqualified),
             (".e[!N]v", Unqualified),
             (".[!e]nv", Unqualified),
+            // #1285: an aligned stem still blocks around any wildcard.
+            ("*.env*", Known),
+            ("*id_rsa*", Unqualified),
+            ("*credentials*", Known),
+            ("*-credentials*", Unqualified),
+            ("*hooks*.jks", Known),
+            ("*hooks*.key", Known),
+            ("*.jks", Known),
+            ("*.j?s", Known),
+            ("*.?ks", Known),
+            ("cadence*.env", Known),
+            ("*cadence*/.env*", Known),
+            ("*secrets*", Unqualified),
+            (".npm*", Unqualified),
+            (".n?mrc", Unqualified),
+            ("*.p?x", Known),
+            ("*.privat*", Unqualified),
         ] {
             assert!(
                 is_dangerous_secret_token_at(token, position),
@@ -2466,6 +2546,29 @@ mod tests {
             ("${home}/x.txt", Known),
             // URLs.
             ("https://h/p?x=1", Unqualified),
+            // #1285: letters shared with a stem only count where they can
+            // spell it. `hooks` shares `ks` with `jks` and `cadence` shares
+            // `den` with `credentials`, but no name puts them there.
+            ("*hooks*", Known),
+            ("*hooks*", Unqualified),
+            ("hooks*", Known),
+            ("*hooks", Known),
+            ("*hook*", Known),
+            ("*ooks*", Known),
+            ("*cadence-hooks*", Known),
+            ("*cadence-hooks*", Unqualified),
+            ("*cadence*", Known),
+            ("*cadence*", Unqualified),
+            ("*dence*", Known),
+            ("cadence*", Known),
+            ("*nce*", Known),
+            ("*cad*", Known),
+            ("*foo*", Known),
+            ("src/*hooks*/*.rs", Known),
+            // #1276: `?ref=$ref` reads as `?ref=*`, whose scattered `f`/`r`
+            // matched `pfx` and `private`.
+            ("repos/o/r/contents/format.c?ref=*", Known),
+            ("repos/o/r/contents/format.c?ref=$ref", Known),
         ] {
             assert!(
                 !is_dangerous_secret_token_at(token, position),
@@ -2545,6 +2648,13 @@ mod tests {
         assert!(!covered(&[".", "rc"], "npmrc"));
         assert!(!covered(&[".git"], "credentials"));
         assert!(!covered(&[".pem"], "key"));
+        // Every family spells its stem in its own pattern, so the aligned
+        // walk never falls back to the unaligned count (#1285).
+        for position in [Filename::Known, Filename::Unqualified] {
+            for family in deny_families(position) {
+                assert!(family.stem_mask.is_some(), "{}", family.pattern);
+            }
+        }
     }
 
     #[test]
