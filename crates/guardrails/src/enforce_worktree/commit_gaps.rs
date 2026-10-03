@@ -425,7 +425,13 @@ pub(super) fn brace_overflow_hides_commit(command: &str) -> bool {
             let segment = super::strip_group_punctuation(&raw).to_string();
             let words = command_tokens(&tokenize_marked(&segment));
             let argv = peel_command_prefixes(strip_compound_heads(&words));
+            // The word as written, too: once expanded, `{g,}it` reads as
+            // `git` and no longer shows the brace that put it there.
             argv.first().is_some_and(|w| w.contains('{'))
+                || segment
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.contains('{'))
         })
 }
 

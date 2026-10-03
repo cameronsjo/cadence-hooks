@@ -1727,12 +1727,29 @@ pub fn unexpanded_word_may_hide_a_command(command: &str, inert: &[&str]) -> bool
         residual.push_str(&body);
         residual.push('\n');
     }
-    for (at, (segment, op)) in segments.iter().enumerate() {
-        let words: Vec<String> = raw_words(segment)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        let mut rest = words.iter().skip_while(|word| {
+    let words: Vec<Vec<String>> = segments
+        .iter()
+        .map(|(segment, _)| {
+            raw_words(segment)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect()
+        })
+        .collect();
+    // Whether each segment's output reaches only pure data sinks: one pass
+    // from the end, so a long pipeline costs one read per segment.
+    let mut to_data = vec![true; segments.len()];
+    for at in (0..segments.len().saturating_sub(1)).rev() {
+        let next = &segments[at + 1].0;
+        to_data[at] = segments[at].1 != Some("|")
+            || (!runs_a_substitution(next)
+                && words[at + 1]
+                    .first()
+                    .is_some_and(|word| UNREAD_DATA_SINKS.contains(&word.as_str()))
+                && to_data[at + 1]);
+    }
+    for (at, (segment, _)) in segments.iter().enumerate() {
+        let mut rest = words[at].iter().skip_while(|word| {
             SEGMENT_LEADING_WORDS.contains(&word.as_str()) || is_plain_assignment(word)
         });
         let Some(command_word) = rest.next() else {
@@ -1743,22 +1760,10 @@ pub fn unexpanded_word_may_hide_a_command(command: &str, inert: &[&str]) -> bool
         if command_word.contains(['$', '`', '{', '}', '*', '?', '[', '\\', '\'', '"']) {
             return true;
         }
-        let piped_to_data = || {
-            segments[at..]
-                .iter()
-                .take_while(|(_, op)| *op == Some("|"))
-                .zip(&segments[at + 1..])
-                .all(|(_, (next, _))| {
-                    !runs_a_substitution(next)
-                        && raw_words(next)
-                            .first()
-                            .is_some_and(|(word, _)| UNREAD_DATA_SINKS.contains(&word.as_str()))
-                })
-        };
         let inert_here = inert.contains(&command_word.as_str())
             && !(command_word == "printf" && rest.any(|word| word.starts_with("-v")))
             && !runs_a_substitution(segment)
-            && (*op != Some("|") || piped_to_data());
+            && to_data[at];
         if !inert_here {
             residual.push_str(segment);
             residual.push('\n');
@@ -15386,6 +15391,121 @@ mod tests {
         assert!(!brace_expansion_overflows(&format!(
             "cat > x.json <<'EOF'\n{json}\nEOF"
         )));
+    }
+
+    #[test]
+    fn a_word_past_its_own_bound_spends_nothing_and_the_words_after_it_are_read() {
+        // cameronsjo/cadence-hooks#1279 round 3 (I2): a lone word past
+        // MAX_BRACE_WORDS or MAX_BRACE_GROUPS is recorded, not read as a
+        // spent budget, and the words after it still expand and are judged.
+        for (command, tail) in [
+            (": {1..5000}; {git,reset,--hard}", "reset"),
+            (": {1..100000} {cp,d,.env}", ".env"),
+            (
+                &format!(": {} {{rm,note.md}}", "{a,b}".repeat(65)),
+                "note.md",
+            ),
+        ] {
+            let command = command.to_string();
+            let (tokens, whole, unread) = std::thread::spawn(move || {
+                reset_command_unread();
+                let tokens = tokenize(&command);
+                (tokens, brace_word_left_whole(), command_unread())
+            })
+            .join()
+            .expect("no panic");
+            assert!(tokens.iter().any(|t| t == tail), "{tokens:?}");
+            assert!(whole && !unread, "{tokens:?}");
+        }
+        // A spent budget still marks the command unread.
+        let unread = std::thread::spawn(|| {
+            reset_command_unread();
+            let _ = tokenize(&"{1..4096} ".repeat(200));
+            command_unread()
+        })
+        .join()
+        .expect("no panic");
+        assert!(unread);
+    }
+
+    #[test]
+    fn a_lone_unexpanded_word_hides_a_command_only_outside_inert_argument_lists() {
+        // cameronsjo/cadence-hooks#1279 round 3 (I1, I2).
+        let json = format!(
+            "[{}]",
+            (0..40)
+                .map(|i| format!(r#"{{"id":{i},"tags":["a","b"],"m":{{"x":1,"y":2}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let inert = UNREAD_INERT_OR_CREATING_COMMANDS;
+        for (command, hides) in [
+            // Inert argument lists and heredoc bodies no shell runs.
+            ("for i in {1..5000}; do echo $i; done", false),
+            ("touch file{1..5000}.txt", false),
+            ("echo {1..100000} | wc -w", false),
+            (
+                r"printf '%s\n' {a..z}{a..z}{a..z} | sort | uniq -c | head",
+                false,
+            ),
+            ("echo {1..5000} | tee out.txt", false),
+            ("echo {1..5000} > nums.txt", false),
+            ("{ echo {1..5000}; }", false),
+            ("if true; then echo {1..5000}; fi", false),
+            ("X=1 time echo {1..5000}", false),
+            (&format!("cat <<'EOF' > data.json\n{json}\nEOF"), false),
+            (
+                &format!("curl -d @- https://e.x <<'EOF'\n{json}\nEOF"),
+                false,
+            ),
+            (&format!("python3 - <<'PY'\nd = {json}\nPY"), false),
+            (
+                "git commit -F - <<'EOF'\nfeat: support {1..5000} ranges\nEOF",
+                false,
+            ),
+            ("cat <<EOF\n{1..100000}\nEOF", false),
+            // Command position, a wrapper's script, a shell-fed body, a
+            // non-literal command word, output a shell or xargs runs.
+            (": {1..5000}; {git,reset,--hard}", true),
+            ("{rm,note.md,{1..5000}}", true),
+            ("git {reset,--hard,{1..5000}}", true),
+            ("rm {note.md,{1..5000}}", true),
+            ("bash -c 'echo {1..5000}'", true),
+            (
+                "echo {1..5000}; bash -c '{git,reset,--hard,{1..5000}}'",
+                true,
+            ),
+            ("echo {1..5000}; eval \"{rm,x,{1..5000}}\"", true),
+            (r": {1..5000}; eval $'\x7brm,x,\x7b1..5000\x7d\x7d'", true),
+            ("echo {1..5000}; x='{rm,x,{1..5000}}'; eval $x", true),
+            ("bash <<'EOF'\necho {1..5000}\nEOF", true),
+            ("cat <<'EOF' | bash\n{rm,note.md,{1..5000}}\nEOF", true),
+            ("ssh localhost <<'EOF'\n{rm,note.md,{1..5000}}\nEOF", true),
+            ("for x in {rm,note.md,{1..5000}}; do $x; done", true),
+            ("$CMD {1..5000}", true),
+            ("echo {rm,note.md,{1..5000}} | bash", true),
+            ("echo {note.md,{1..5000}} | xargs rm", true),
+            ("echo {rm,x,{1..5000}} | tee >(bash)", true),
+            ("echo $(bash -c '{rm,note.md,{1..5000}}')", true),
+            ("printf -v {GIT_DIR,{1..5000}} x", true),
+            (&format!("echo {}", "{a}".repeat(65)), false),
+            (&format!("cp {} d", "{a}".repeat(65)), true),
+        ] {
+            assert_eq!(
+                unexpanded_word_may_hide_a_command(command, inert),
+                hides,
+                "{command}"
+            );
+        }
+        // A guard that judges created paths: `touch .{a..z}{a..z}{a..z}`
+        // creates `.env`.
+        for command in ["touch .{a..z}{a..z}{a..z}", "mkdir -p {.ssh,{1..5000}}"] {
+            assert!(!unexpanded_word_may_hide_a_command(command, inert));
+            assert!(unexpanded_word_may_hide_a_command(
+                command,
+                UNREAD_INERT_COMMANDS
+            ));
+        }
     }
 
     fn structural_chars(text: &str) -> Vec<(char, bool)> {
