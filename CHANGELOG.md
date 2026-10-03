@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.122.0] - 2026-10-03
+
 ### Added
 
 - **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
