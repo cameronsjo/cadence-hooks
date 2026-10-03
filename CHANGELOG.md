@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
 
+### Fixed
+
+- **`prevent-secret-push` no longer treats a git builtin as a possible push alias.** git runs a builtin before any alias or `git-<name>` executable, so `git credential`, `credential-cache`, `credential-store`, `hook`, `maintenance` and `merge-tree` are now allowed when the command sets `HOME=` or a `GIT_CONFIG*`/`GIT_DIR`/`XDG_CONFIG_HOME` variable, or runs in a directory the guard cannot resolve. The static list now holds every builtin shared by git 2.30 through current `master`, and a newer builtin is confirmed once per run with `git --list-cmds=builtins`. The match is now case-sensitive, as git's is. Before, `git STATUS` and an alias whose value is `STATUS` were skipped as the builtin `status`, but git runs them through `alias.status`, which can push; they are now probed. `submodule` is not a builtin: it is still skipped as an exec-path script, unless the command sets `GIT_EXEC_PATH` or `--exec-path`. An unknown subcommand still fails closed (`HOME=/tmp/x git mycustomalias` blocks). (cameronsjo/cadence-hooks#1284)
+
 ## [0.121.0] - 2026-09-30
 
 ### Security

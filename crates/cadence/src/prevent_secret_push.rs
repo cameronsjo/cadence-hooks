@@ -61,7 +61,12 @@
 //! commit whose `encoding` header is not UTF-8, US-ASCII or ISO-8859-* (a
 //! token in it need not be ASCII bytes).
 //!
-//! **Aliases.** A `git <sub>` whose subcommand is not a builtin is looked up in
+//! **Aliases.** git runs a builtin before any alias or `git-<name>`, so a
+//! subcommand spelled exactly as one (`BUILTINS`, else `git --list-cmds=builtins`
+//! of the running git; case-sensitive, as git is: `git STATUS` runs
+//! `alias.status`) is never probed, whatever the env or directory. Nor is an
+//! exec-path script (`submodule`, `bisect`) while the command cannot move the
+//! exec path. Any other `git <sub>` is looked up in
 //! the repository's config (`alias.<sub>`, following alias-of-alias, past any
 //! global options an alias value opens with). It blocks as unresolved when:
 //! its value names `push` or `send-pack` or starts with `!`; an alias opens
@@ -77,7 +82,6 @@
 //! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
 //! neither an alias, a builtin or exec-path command `git --list-cmds` knows,
 //! nor an executable `git-<name>` in an absolute `PATH` directory.
-//! Builtins skip all of it.
 //!
 //! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
 //! (process-group kill, stdout cap, shared hook deadline, stdin written from
@@ -598,10 +602,10 @@ const EXEC_PATH_COMMANDS: &[&str] = &["bisect", "submodule"];
 
 /// Is `word` a builtin of git: one in [`BUILTINS`], or one the running git
 /// lists (`git --list-cmds=builtins`, a compiled-in table no env or config
-/// changes). The query runs once per process and a failure is not remembered,
-/// so until git answers only [`BUILTINS`] counts (stricter).
+/// changes). The query runs at most once per process, so a long command costs
+/// one spawn; if it fails only [`BUILTINS`] counts (stricter).
 fn is_builtin(word: &str) -> bool {
-    static RUNNING: std::sync::OnceLock<std::collections::HashSet<String>> =
+    static RUNNING: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     if BUILTINS.binary_search(&word).is_ok() {
         return true;
@@ -609,21 +613,23 @@ fn is_builtin(word: &str) -> bool {
     if word.is_empty() || word.contains(['/', '\\']) {
         return false;
     }
-    let running = RUNNING.get().or_else(|| {
-        let dir = std::env::temp_dir();
-        match git(
-            &dir.to_string_lossy(),
-            &["--list-cmds=builtins"],
-            64 * 1024,
-            Budget::Probe,
-        ) {
-            Git::Ok(list) if !list.trim().is_empty() => Some(
-                RUNNING.get_or_init(|| list.lines().map(|l| l.trim().to_string()).collect()),
-            ),
-            _ => None,
-        }
-    });
-    running.is_some_and(|running| running.contains(word))
+    RUNNING
+        .get_or_init(|| {
+            let dir = std::env::temp_dir();
+            match git(
+                &dir.to_string_lossy(),
+                &["--list-cmds=builtins"],
+                64 * 1024,
+                Budget::Probe,
+            ) {
+                Git::Ok(list) if !list.trim().is_empty() => {
+                    Some(list.lines().map(|l| l.trim().to_string()).collect())
+                }
+                _ => None,
+            }
+        })
+        .as_ref()
+        .is_some_and(|running| running.contains(word))
 }
 
 /// Can this call move git's exec path: `GIT_EXEC_PATH` anywhere in the command
@@ -2726,6 +2732,139 @@ mod tests {
             &fresh.run("git config alias.qq push; git qq origin main"),
             &["qq", "alias"],
         );
+    }
+
+    /// cadence-hooks#1284: git runs a builtin before any alias, so no env,
+    /// config or directory state can make one a push. Every row of the issue's
+    /// table, and the comment's `merge-tree` with an unresolved directory.
+    #[test]
+    fn a_git_builtin_is_never_a_possible_alias_whatever_the_env_or_dir() {
+        let fx = Fx::new("builtin-blind");
+        let plain = fx.work.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let cred = "GIT_TRACE=1 git -c credential.helper= credential fill";
+        let mut cases: Vec<(String, String)> = vec![
+            (cred.into(), plain.display().to_string()),
+            (cred.into(), "/nonexistent/cadence-1284".into()),
+            (
+                format!("cd /nonexistent && {cred}"),
+                plain.display().to_string(),
+            ),
+            (
+                format!("HOME=/tmp/fakehome {cred}"),
+                plain.display().to_string(),
+            ),
+            (
+                "git -C \"$W\" merge-tree --write-tree --name-only \
+                 refs/remotes/origin/main refs/remotes/origin/b"
+                    .into(),
+                fx.work.display().to_string(),
+            ),
+            (
+                "HOME=/tmp/x git credential fill".into(),
+                fx.work.display().to_string(),
+            ),
+        ];
+        for env in [
+            "GIT_CONFIG_GLOBAL=/tmp/x",
+            "GIT_DIR=/tmp/x",
+            "XDG_CONFIG_HOME=/tmp/x",
+            "GIT_CONFIG_NOSYSTEM=1",
+        ] {
+            cases.push((format!("{env} {cred}"), plain.display().to_string()));
+        }
+        for sub in [
+            "status",
+            "log",
+            "config --list",
+            "var",
+            "for-each-ref",
+            "rev-parse",
+            "worktree",
+            "credential",
+            "credential-cache",
+            "credential-store",
+            "hook",
+            "maintenance",
+            "merge-tree",
+        ] {
+            cases.push((
+                format!("HOME=/tmp/fakehome git {sub}"),
+                fx.work.display().to_string(),
+            ));
+        }
+        // An alias shadowing a builtin is ignored by git.
+        fx.git(&["config", "alias.credential", "push"]);
+        cases.push(("git credential fill".into(), fx.work.display().to_string()));
+        for (command, cwd) in &cases {
+            let input = make_bash_with_cwd(command, cwd);
+            let r = PreventSecretPushGuard.run_with(&input, None, |_| false);
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "{command} in {cwd}: {:?}",
+                r.message
+            );
+        }
+    }
+
+    /// The other side of #1284: only an exact builtin is skipped. git matches
+    /// builtins case-sensitively and aliases case-insensitively (`git STATUS`
+    /// runs `alias.status`), an exec-path script yields to an alias once the
+    /// exec path moves, and a genuine unknown still fails closed.
+    #[test]
+    fn only_an_exact_builtin_skips_the_alias_probe() {
+        let fx = Fx::new("builtin-exact");
+        fx.git(&["config", "alias.status", "push"]);
+        fx.git(&["config", "alias.credential", "push"]);
+        fx.git(&["config", "alias.submodule", "push"]);
+        fx.git(&["config", "alias.up", "STATUS"]);
+        for (command, needle) in [
+            ("git STATUS", "alias"),
+            ("git Credential fill", "alias"),
+            ("git up", "alias"),
+            ("git -c alias.q=Status q", "alias"),
+            ("git --exec-path=/nonexistent submodule", "alias"),
+            ("GIT_EXEC_PATH=/nonexistent git submodule", "alias"),
+            ("HOME=/tmp/x git mycustomalias", "cannot resolve"),
+            ("HOME=/tmp/x git Credential fill", "cannot resolve"),
+            ("git -C \"$W\" mycustomalias", "cannot resolve"),
+        ] {
+            assert_blocks(&fx.run(command), &[needle]);
+        }
+        // Raw push plumbing is a builtin too, and still refused.
+        assert_blocks(&fx.run("HOME=/tmp/x git send-pack r main"), &["send-pack"]);
+        // An exec-path script runs before any alias while the exec path stays.
+        for command in ["git submodule", "HOME=/tmp/x git submodule update"] {
+            assert_allows(&fx.run(command));
+        }
+    }
+
+    /// [`BUILTINS`] is sorted for its binary search, and every entry is a
+    /// builtin of the git running the tests (git 2.30 or later).
+    #[test]
+    fn builtins_list_is_sorted_and_names_real_git_builtins() {
+        assert!(
+            BUILTINS.windows(2).all(|w| w[0] < w[1]),
+            "BUILTINS unsorted"
+        );
+        let out = std::process::Command::new("git")
+            .arg("--list-cmds=builtins")
+            .output()
+            .expect("git runs");
+        let running: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for name in BUILTINS {
+            assert!(
+                running.iter().any(|r| r == name),
+                "{name} is not a git builtin"
+            );
+        }
+        for name in ["pack-redundant", "whatchanged", "submodule", "STATUS"] {
+            assert!(!BUILTINS.contains(&name), "{name} must not be listed");
+        }
     }
 
     #[test]
