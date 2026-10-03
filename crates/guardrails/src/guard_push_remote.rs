@@ -3369,6 +3369,7 @@ mod tests {
                 ("FOO+=x git push evil main", true),
                 ("A[0]=x git push evil main", true),
                 ("A[0]+=x git push evil main", true),
+                ("A[\"]\"]=x git push evil main", true),
                 // #1295: for-each-repo runs the push in repositories no
                 // walk can name, whichever remote it names.
                 (

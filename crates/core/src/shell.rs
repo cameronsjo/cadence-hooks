@@ -2991,52 +2991,18 @@ pub fn is_assignment_word(token: &str) -> bool {
     // rejects them as prefix assignments ("not a valid identifier") and still
     // runs the command after them, so `A[0]=x git push` pushed while every
     // push walk took `A[0]=x` for the command (cameronsjo/cadence-hooks#1297).
-    let rest = match rest.strip_prefix('[') {
-        Some(subscript) => match subscript_end(subscript) {
-            Some(end) => &subscript[end..],
-            None => return false,
-        },
-        None => rest,
-    };
-    rest.starts_with('=') || rest.starts_with("+=")
-}
-
-/// The byte offset just past the `]` closing a subscript whose `[` was
-/// already consumed, by bash's rule: brackets nest, and a quoted or
-/// backslash-escaped `]` does not close it (`A["]"]=x`, `A[\]]=x` and
-/// `A[a[0]]=x` are each one assignment word under bash 5.2). `None` when the
-/// subscript never closes — the word is then not an assignment, as before.
-fn subscript_end(subscript: &str) -> Option<usize> {
-    let bytes = subscript.as_bytes();
-    let mut depth = 1usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            quote @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    if quote == b'"' && bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
-                }
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+    //
+    // The subscript is not matched bracket by bracket. The tokenizer has
+    // already removed quotes, so `A["]"]=x` — one assignment to bash —
+    // arrives as `A[]]=x`, which bash would run as a command. Any `]=` or
+    // `]+=` after `NAME[` is read as closing it: a superset of bash's rule,
+    // whose only over-read (`A[]]=x`, `A[0]x]=y` typed bare) names a command
+    // no system has, so judging the words after it as the command can add a
+    // verdict on a command that never runs, never remove one.
+    match rest.strip_prefix('[') {
+        Some(subscript) => subscript.contains("]=") || subscript.contains("]+="),
+        None => rest.starts_with('=') || rest.starts_with("+="),
     }
-    None
 }
 
 /// True when `command` is about to ship branch work: `gh pr ready`
@@ -25237,15 +25203,18 @@ mod tests {
             ("A[\"]\"]=x", true),
             ("A[']']=x", true),
             ("A[\\]]=x", true),
+            // `A["]"]=x` after quote removal: read as the assignment it was.
+            ("A[]]=x", true),
             ("A[$(echo 1)]=x", true),
+            ("A[k y]=x", true),
             ("_[0]=y", true),
             ("A[0]==y", true),
             // Not assignments: bash runs each as the command word.
-            ("A[]]=x", false),
             ("A[0]x=y", false),
             ("A[0]", false),
             ("A[0", false),
-            ("A[\"0]=x", false),
+            ("A[0=x", false),
+            ("A]=x", false),
             ("1A=x", false),
             ("1A[0]=x", false),
             ("[0]=x", false),
@@ -25266,7 +25235,7 @@ mod tests {
             ("FOO+=x git push origin main", "git"),
             ("A[0]=x B+=y C[1]+=z git push origin main", "git"),
             ("A[0]=x make", "make"),
-            ("A[]]=x git push", "A[]]=x"),
+            ("A[0]x=y git push", "A[0]x=y"),
         ] {
             let tokens = tokenize(command);
             assert_eq!(

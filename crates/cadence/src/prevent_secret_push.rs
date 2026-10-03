@@ -2230,6 +2230,8 @@ mod tests {
             "A[0]=x git push origin main",
             "A[0]+=x git push origin main",
             "A[k]=x B+=y git push origin main",
+            "A[\"]\"]=x git push origin main",
+            "A[\"k y\"]=x git push origin main",
             "git pus{h..h} origin main",
             "git p\\ush origin main",
         ] {
