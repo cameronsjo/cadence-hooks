@@ -57,7 +57,7 @@
 //! hosts the ONE implementation of the plan template's mandatory-stanza
 //! checks ([`missing_stanzas`], built on [`panel_line_settled`],
 //! [`alternatives_stanza_present`], [`checkbox_present`], and the shared
-//! [`visible_lines`] fence/quote filter). Two gates consume it: the
+//! [`visible_lines`] filter for fences, quotes, comments and frontmatter). Two gates consume it: the
 //! persist-time format-gate sentence in [`crate::persist_plan`] (after
 //! approval) and the call-time `session lint-plan-shape` block in
 //! [`crate::plan_guards`] (at `PreToolUse:ExitPlanMode`). They share one
@@ -118,19 +118,25 @@ pub(crate) struct InFlightPlan {
 /// consumer uses (the living-plan-guards plan's Task 3 shared-reader bullet;
 /// two independent scanners diverged on fence discipline in this feature's
 /// first cut, which is exactly the drift a single reader prevents). Lines
-/// inside fenced code blocks (``` / ~~~ toggles) never count — a plan that
-/// *documents* checklist syntax in a fenced example carries no real boxes
-/// there. Both tick spellings count as ticked (`[x]`/`[X]`).
+/// inside fenced code blocks never count — a plan that *documents* checklist
+/// syntax in a fenced example carries no real boxes there. Fences open and
+/// close by [`visible_lines`]'s rule ([`fence_opener`], [`fence_closes`]:
+/// same character, closer at least as long, no info string), so the two
+/// readers agree on where a nested fence ends (cameronsjo/cadence-hooks#1283).
+/// Both tick spellings count as ticked (`[x]`/`[X]`).
 pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
-    let mut in_fence = false;
+    let mut fence: Option<(u8, usize)> = None;
     let (mut unticked, mut ticked) = (0usize, 0usize);
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        if let Some((ch, len)) = fence {
+            if fence_closes(trimmed, ch, len) {
+                fence = None;
+            }
             continue;
         }
-        if in_fence {
+        if let Some(opener) = fence_opener(trimmed) {
+            fence = Some(opener);
             continue;
         }
         if trimmed.starts_with("- [ ]") {
@@ -144,24 +150,138 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
 
 /// Every plan-shape detector in this module ([`alternatives_stanza_present`],
 /// [`panel_line_settled`]) and the `## Orchestrator` reader in
-/// [`crate::persist_plan`] skip the same two things before inspecting a
-/// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
-/// matching, which errs toward skipping ambiguous lines) and block quotes
-/// (`>`). One shared filter so the discipline can't drift between detectors.
+/// [`crate::persist_plan`] skip the same things before inspecting a line —
+/// so a line the operator never sees in a rendered view cannot settle a gate
+/// (cameronsjo/cadence-hooks#1283): fenced code, block quotes (`>`), HTML
+/// comment blocks, and the leading YAML frontmatter block. One shared filter
+/// so the discipline can't drift between detectors.
+///
+/// Fences follow CommonMark: a line whose first non-space run is three or
+/// more backticks or tildes opens one, and only a line of the SAME character,
+/// at least as long as the opener, with nothing after it but whitespace
+/// closes it — so a four-backtick fence holding a three-backtick fence, or a
+/// backtick fence holding a tilde fence, stays one fence (see
+/// [`fence_opener`]). An unterminated fence runs to EOF, as it renders: the
+/// error leans toward hiding, so a stray opener can only make a stanza read
+/// as missing, never let an example satisfy one.
+///
+/// Comments follow CommonMark's HTML block (type 2): outside a fence, only a
+/// line whose `<!--` STARTS it (after at most 3 spaces of indent) opens one.
+/// That line, and — when it carries no `-->` after the opener — every
+/// following line up to and including the first carrying `-->`, is skipped;
+/// an unterminated opener runs to EOF, as it renders. A mid-line `<!--`
+/// (prose, inline code) renders as literal text and toggles nothing (#1277
+/// gate-2 I-1: treating it as an opener hid a visible `Panel:`/`Driver:`
+/// line). Text after a closing `-->` on the same line is dropped with it.
+/// Frontmatter: see [`leading_frontmatter_line_count`].
 pub(crate) fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
-    let mut in_fence = false;
-    body.lines().filter(move |line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+    visible_lines_after(body, leading_frontmatter_line_count(body))
+}
+
+/// [`visible_lines`] WITHOUT the frontmatter skip, for the one reader whose
+/// subject lives there: the legacy `recommended_model:` frontmatter field.
+fn visible_lines_with_frontmatter(body: &str) -> impl Iterator<Item = &str> {
+    visible_lines_after(body, 0)
+}
+
+fn visible_lines_after(body: &str, skip: usize) -> impl Iterator<Item = &str> {
+    // The open fence's character and run length, while inside one.
+    let mut fence: Option<(u8, usize)> = None;
+    let mut in_comment = false;
+    body.lines().skip(skip).filter(move |line| {
+        if in_comment {
+            if line.contains("-->") {
+                in_comment = false;
+            }
             return false;
         }
-        !in_fence && !line.starts_with('>')
+        let trimmed = line.trim_start();
+        if let Some((ch, len)) = fence {
+            if fence_closes(trimmed, ch, len) {
+                fence = None;
+            }
+            return false;
+        }
+        if let Some(opener) = fence_opener(trimmed) {
+            fence = Some(opener);
+            return false;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent <= 3
+            && let Some(after) = line.trim_start_matches(' ').strip_prefix("<!--")
+        {
+            in_comment = !after.contains("-->");
+            return false;
+        }
+        !line.starts_with('>')
     })
 }
 
+/// The fence character and run length when `trimmed` (a line with its
+/// leading whitespace removed) opens a fenced code block: three or more
+/// backticks or tildes, an info string allowed after. Any indent opens one —
+/// wider than CommonMark's 3 spaces, so a fence nested in a list item is
+/// still skipped; the error leans toward hiding.
+fn fence_opener(trimmed: &str) -> Option<(u8, usize)> {
+    let ch = *trimmed.as_bytes().first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == ch).count();
+    (len >= 3).then_some((ch, len))
+}
+
+/// True when `trimmed` closes a fence opened by `len` × `ch`: the same
+/// character, a run at least as long, and no info string after it.
+fn fence_closes(trimmed: &str, ch: u8, len: usize) -> bool {
+    let run = trimmed.bytes().take_while(|&b| b == ch).count();
+    run >= len && trimmed[run..].trim().is_empty()
+}
+
+/// Lines (fences included) of a leading YAML frontmatter block, or 0.
+///
+/// A first line of exactly `---`, a later `---`/`...` close, and a body that
+/// reads as frontmatter: its first line a column-0 `key:` line, then only
+/// `key:` lines, indented continuation lines, `- ` items, or `#` comments —
+/// no blank line. Anything else (a line-1 `---` thematic break followed by a
+/// blank line and prose, #1277 gate-2 m-1) is not frontmatter, and its lines
+/// stay visible.
+fn leading_frontmatter_line_count(body: &str) -> usize {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return 0;
+    }
+    let Some(close) = lines
+        .clone()
+        .position(|l| matches!(l.trim_end(), "---" | "..."))
+    else {
+        return 0;
+    };
+    let is_key = |l: &str| {
+        l.split_once(':').is_some_and(|(k, _)| {
+            !k.is_empty()
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    };
+    let mut block = lines.take(close);
+    let first_is_key = block.next().is_some_and(is_key);
+    let rest_ok = block.all(|l| {
+        !l.trim().is_empty()
+            && (is_key(l)
+                || l.starts_with([' ', '\t'])
+                || l.starts_with("- ")
+                || l.starts_with('#'))
+    });
+    if first_is_key && rest_ok {
+        close + 2
+    } else {
+        0
+    }
+}
+
 /// True when the plan body carries an `## Alternatives declined` heading at
-/// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
+/// line start ([`visible_lines`]'s skip discipline). Case-exact:
 /// the template writes it one way.
 pub(crate) fn alternatives_stanza_present(body: &str) -> bool {
     visible_lines(body).any(|line| line.starts_with("## Alternatives declined"))
@@ -215,11 +335,11 @@ fn trivial_none_reason(reason: &str) -> bool {
 /// block quotes are skipped before the first-match rule applies
 /// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
 /// with no stanza at all must not mint a settled verdict (security review of
-/// this change; same class as the quoted-example hole above). The fence
-/// tracker is deliberately naive — it toggles without matching fence
-/// lengths — which errs toward skipping ambiguous lines: on a malformed
-/// document the failure mode is a spurious nudge (fail-loud), never a
-/// suppressed one. Detection only; the caller names this stanza (a static
+/// this change; same class as the quoted-example hole above). HTML
+/// comments, nested fences and leading frontmatter are skipped the same way
+/// (cameronsjo/cadence-hooks#1283), and an unterminated fence or comment
+/// hides to EOF: on a malformed document the failure mode is a spurious
+/// block (fail-loud), never a hidden line settling the gate. Detection only; the caller names this stanza (a static
 /// string, "a settled Panel: line") in the composed format-gate line, never
 /// any matched text.
 pub(crate) fn panel_line_settled(body: &str) -> bool {
@@ -969,7 +1089,7 @@ fn find_drivable_token(block: &[&str]) -> Option<Tier> {
 /// anchored, so a decoy can't reach it, and stripping would eat a
 /// legitimately backtick-wrapped value).
 fn legacy_recommended_model(body: &str) -> Option<Tier> {
-    visible_lines(body)
+    visible_lines_with_frontmatter(body)
         .take_while(|line| !line.starts_with("## "))
         .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
 }
@@ -1969,5 +2089,188 @@ mod tests {
             missing_stanzas(TEMPLATE_SHAPED_PLAN).is_empty(),
             "none form"
         );
+    }
+
+    // --- hidden positions: comment, nested fence, frontmatter (cadence-hooks#1283) ---
+
+    /// `inner` (a `Panel:` line or a `## Loop` section, newline-terminated)
+    /// in each position the plan-shape scan must treat as hidden, and the
+    /// one plain position it must count. `(label, plan text, visible)`.
+    fn positions(inner: &str) -> Vec<(&'static str, String, bool)> {
+        vec![
+            ("html comment block", format!("<!--\n{inner}-->\n\n"), false),
+            (
+                "one-line html comment",
+                format!("<!-- {inner}-->\n\n"),
+                false,
+            ),
+            (
+                "indented html comment",
+                format!("   <!--\n{inner}-->\n\n"),
+                false,
+            ),
+            (
+                "unterminated html comment",
+                format!("<!--\n{inner}\n"),
+                false,
+            ),
+            (
+                "4-backtick fence holding 3",
+                format!("````md\n```\n{inner}```\n````\n\n"),
+                false,
+            ),
+            (
+                "backtick fence holding tilde",
+                format!("```md\n~~~\n{inner}~~~\n```\n\n"),
+                false,
+            ),
+            (
+                "tilde fence holding backtick",
+                format!("~~~md\n```\n{inner}```\n~~~\n\n"),
+                false,
+            ),
+            (
+                "closer with an info string",
+                format!("```\n```md\n{inner}```\n\n"),
+                false,
+            ),
+            ("unterminated fence", format!("````\n{inner}```\n\n"), false),
+            ("visible", format!("{inner}\n"), true),
+            (
+                "after a closed comment",
+                format!("<!--\nx\n-->\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a closed nested fence",
+                format!("````\n```\n````\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a longer closer",
+                format!("```\nx\n`````\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a mid-line <!--",
+                format!("note <!-- x\n\n{inner}\n"),
+                true,
+            ),
+        ]
+    }
+
+    const PANEL_LINE: &str = "Panel: r ran — 1 finding, 1 folded in, 0 declined\n";
+    const LOOP_SECTION: &str = "## Loop\n\nLoop: none — nothing outlives the work\n";
+
+    #[test]
+    fn panel_line_in_each_hidden_position_reads_as_missing_table() {
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        assert!(without_panel.contains("## Loop"));
+        for (label, decoy, visible) in positions(PANEL_LINE) {
+            let plan = without_panel.replacen("## Loop", &format!("{decoy}## Loop"), 1);
+            assert!(plan.contains(&decoy), "{label}: decoy placed");
+            // An unterminated span hides the rest of the plan too, so a
+            // hidden case asserts this stanza is missing, not that it alone is.
+            let missing = missing_stanzas(&plan);
+            if visible {
+                assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
+            } else {
+                assert!(
+                    missing.contains(&PANEL_STANZA),
+                    "{label}: {missing:?} in {plan:?}"
+                );
+            }
+            assert_eq!(panel_line_settled(&plan), visible, "{label}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn loop_section_in_each_hidden_position_reads_as_missing_table() {
+        for (label, decoy, visible) in positions(LOOP_SECTION) {
+            let plan = without_loop_but_with(&decoy);
+            // An unterminated span hides the rest of the plan too, so a
+            // hidden case asserts this stanza is missing, not that it alone is.
+            let missing = missing_stanzas(&plan);
+            if visible {
+                assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
+            } else {
+                assert!(
+                    missing.contains(&LOOP_STANZA),
+                    "{label}: {missing:?} in {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stanzas_inside_leading_frontmatter_read_as_missing() {
+        // A YAML comment line is legal frontmatter, so a `## Loop` there is
+        // hidden with the block.
+        let loop_in_fm = format!(
+            "---\nstatus: in-flight\n## Loop\n---\n{}",
+            template_shaped_plan_without_loop()
+        );
+        assert_eq!(missing_stanzas(&loop_in_fm), vec![LOOP_STANZA]);
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let panel_in_fm = format!("---\n{PANEL_LINE}---\n{without_panel}");
+        assert_eq!(missing_stanzas(&panel_in_fm), vec![PANEL_STANZA]);
+        let panel_after_dots = format!("---\nstatus: x\n...\n{PANEL_LINE}{without_panel}");
+        assert!(
+            missing_stanzas(&panel_after_dots).is_empty(),
+            "after a `...` close"
+        );
+        // A line-1 `---` thematic break followed by prose is not frontmatter.
+        let hr = format!("---\n\n{TEMPLATE_SHAPED_PLAN}");
+        assert!(missing_stanzas(&hr).is_empty(), "thematic break: {hr:?}");
+        // The legacy reader still sees its own frontmatter field.
+        assert_eq!(
+            legacy_recommended_model("---\nrecommended_model: sonnet\n---\n\n# T\n"),
+            Some(Tier::Sonnet)
+        );
+    }
+
+    #[test]
+    fn checkbox_counts_match_nested_fences_table() {
+        // (body, unticked, ticked)
+        let cases: &[(&str, usize, usize)] = &[
+            ("````\n```\n- [ ] a\n```\n````\n- [x] b\n", 0, 1),
+            ("```\n~~~\n- [ ] a\n~~~\n```\n- [ ] b\n", 1, 0),
+            ("````\n```\n````\n- [ ] a\n", 1, 0),
+            ("```\n```md\n- [ ] a\n", 0, 0),
+        ];
+        for (body, unticked, ticked) in cases {
+            assert_eq!(checkbox_counts(body), (*unticked, *ticked), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn fence_opener_and_closer_table() {
+        // (line, opener)
+        let openers: &[(&str, Option<(u8, usize)>)] = &[
+            ("```", Some((b'`', 3))),
+            ("````md", Some((b'`', 4))),
+            ("~~~~~", Some((b'~', 5))),
+            ("``", None),
+            ("~~", None),
+            ("x```", None),
+        ];
+        for (line, want) in openers {
+            assert_eq!(fence_opener(line), *want, "{line:?}");
+        }
+        // (line, opener char, opener len, closes)
+        let closers: &[(&str, u8, usize, bool)] = &[
+            ("```", b'`', 3, true),
+            ("````", b'`', 3, true),
+            ("```  ", b'`', 3, true),
+            ("```", b'`', 4, false),
+            ("~~~", b'`', 3, false),
+            ("```md", b'`', 3, false),
+            ("``` x", b'`', 3, false),
+        ];
+        for (line, ch, len, want) in closers {
+            assert_eq!(fence_closes(line, *ch, *len), *want, "{line:?}");
+        }
     }
 }
