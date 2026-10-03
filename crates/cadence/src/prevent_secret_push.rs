@@ -2232,6 +2232,11 @@ mod tests {
             "A[k]=x B+=y git push origin main",
             "A[\"]\"]=x git push origin main",
             "A[\"k y\"]=x git push origin main",
+            // #1299 review C1: the command word reads as an assignment only
+            // once its quotes are gone, or bash closes its subscript early.
+            "\"d[0]=/git\" push origin main",
+            "'d[0]=/../../../../../../../../usr/bin/git' push origin main",
+            "d[0]x]=/../../../../../../../../usr/bin/git push origin main",
             "git pus{h..h} origin main",
             "git p\\ush origin main",
         ] {

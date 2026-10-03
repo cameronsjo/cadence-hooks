@@ -595,8 +595,12 @@ fn charge_thread_brace_budget(cost: BraceBudget) -> bool {
 
 fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
     let mut typed_raw: Vec<(String, Vec<bool>)> = Vec::new();
+    let mut lookalikes: Vec<bool> = Vec::new();
+    let mut position = CommandPosition::Leading;
     walk_words(command, Backslashes::AsTyped, &mut |text, flags, _, _| {
-        typed_raw.push((text, flags.to_vec()));
+        let (text, flags, settled) = settle_command_position(&mut position, text, flags.to_vec());
+        typed_raw.push((text, flags));
+        lookalikes.push(settled.is_some_and(|settled| settled.lookalike));
         true
     });
     // The second walk is charged to its allowance; past it the command is
@@ -611,10 +615,20 @@ fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
         script_raw.clone_from(&typed_raw);
     }
     let aligned = script_raw.len() == typed_raw.len();
+    // A subscript the typed word settled ([`settle_command_position`]) is
+    // settled in the script word too: they differ only in quoted backslashes.
+    if aligned {
+        for (typed, script) in typed_raw.iter().zip(script_raw.iter_mut()) {
+            if !is_assignment_word(&script.0) && is_subscripted_assignment_word(&typed.0) {
+                script.clone_from(typed);
+            }
+        }
+    }
     let mut typed = Vec::with_capacity(typed_raw.len());
     let mut script = Vec::with_capacity(typed_raw.len());
     with_brace_budget(|budget| {
         for (at, (text, flags)) in typed_raw.into_iter().enumerate() {
+            let (typed_from, script_from) = (typed.len(), script.len());
             let escaped = aligned.then(|| &script_raw[at]);
             match brace_expand_word(&text, &flags, budget) {
                 BraceExpansion::Expanded(words) => {
@@ -640,13 +654,145 @@ fn tokenize_pair_uncached(command: &str) -> (Vec<String>, Vec<String>) {
                     typed.push(text);
                 }
             }
+            if lookalikes[at] {
+                for word in [typed.get_mut(typed_from), script.get_mut(script_from)]
+                    .into_iter()
+                    .flatten()
+                {
+                    mark_command_word_lookalike(word);
+                }
+            }
         }
     });
     (typed, script)
 }
 
+/// Where a tokenizer walk stands among a command's leading words: bash
+/// reads assignment words only before the command word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandPosition {
+    Leading,
+    Past,
+}
+
+/// What [`settle_command_position`] did to one word.
+#[derive(Clone, Copy)]
+struct Settled {
+    /// The word is the command word, and bash does not read it as an
+    /// assignment however its text reads once quotes are gone.
+    lookalike: bool,
+}
+
+/// Bash decides an assignment word on the word as typed, before quote
+/// removal and expansion: an unquoted NAME, optionally an unquoted `[` and a
+/// subscript whose UNQUOTED brackets match, then an unquoted `=` or `+=`.
+/// `Some(None)` for a plain assignment, `Some(Some((open, close)))` for a
+/// subscripted one (the byte offsets of its `[` and closing `]`), `None`
+/// otherwise. `structural` is [`walk_words`]' per-byte flag: emitted
+/// unquoted and unescaped.
+#[allow(clippy::option_option)]
+fn typed_assignment(text: &str, structural: &[bool]) -> Option<Option<(usize, usize)>> {
+    let bytes = text.as_bytes();
+    let live = |i: usize| structural.get(i).copied().unwrap_or(false);
+    let name_len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    if name_len == 0 || bytes[0].is_ascii_digit() || !(0..name_len).all(live) {
+        return None;
+    }
+    let mut at = name_len;
+    let mut subscript = None;
+    if bytes.get(at) == Some(&b'[') && live(at) {
+        let mut depth = 1usize;
+        let mut i = at + 1;
+        loop {
+            let byte = *bytes.get(i)?;
+            if live(i) {
+                match byte {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        subscript = Some((at, i));
+        at = i + 1;
+    }
+    if bytes.get(at) == Some(&b'+') && live(at) {
+        at += 1;
+    }
+    (bytes.get(at) == Some(&b'=') && live(at)).then_some(subscript)
+}
+
+/// Settle one word, as typed, against bash's assignment rule while the walk
+/// is still among the command's leading words, so that every caller's
+/// [`is_assignment_word`] on the quote-removed text agrees with bash
+/// (cameronsjo/cadence-hooks#1299 review C1):
+///
+/// - a subscripted assignment whose quoted subscript no longer reads as one
+///   (`A["]"]=x` → `A[]]=x`) has the subscript replaced by `[0]` — bash
+///   assigns nothing from a prefix subscript, so no caller reads it;
+/// - the command word — the first word that is neither an assignment nor a
+///   reserved word — is reported, so the caller can mark it when its text
+///   reads as an assignment though bash runs it (`"d[0]=/git" push`,
+///   `d[0]x]=/usr/bin/git push`, `A[]]=x cd /tmp`); see
+///   [`mark_command_word_lookalike`].
+fn settle_command_position(
+    position: &mut CommandPosition,
+    text: String,
+    structural: Vec<bool>,
+) -> (String, Vec<bool>, Option<Settled>) {
+    if *position == CommandPosition::Past {
+        return (text, structural, None);
+    }
+    match typed_assignment(&text, &structural) {
+        Some(Some((open, close))) if !is_assignment_word(&text) => {
+            let mut settled = String::with_capacity(text.len());
+            settled.push_str(&text[..open]);
+            settled.push_str("[0]");
+            settled.push_str(&text[close + 1..]);
+            let mut flags = structural[..open].to_vec();
+            flags.extend([true, false, true]);
+            flags.extend_from_slice(structural.get(close + 1..).unwrap_or(&[]));
+            (settled, flags, Some(Settled { lookalike: false }))
+        }
+        Some(_) => (text, structural, Some(Settled { lookalike: false })),
+        None if structural.iter().all(|live| *live)
+            && (LEADING_KEYWORDS.contains(&text.as_str())
+                || matches!(text.as_str(), "{" | "(" | "time")) =>
+        {
+            (text, structural, Some(Settled { lookalike: false }))
+        }
+        None => {
+            *position = CommandPosition::Past;
+            (text, structural, Some(Settled { lookalike: true }))
+        }
+    }
+}
+
+/// Mark a command word whose quote-removed text reads as an assignment
+/// ([`is_assignment_word`]) though bash runs it, by spelling it as the
+/// relative path it is: `./d[0]=/git` runs the same program, its basename is
+/// still `git`, and no caller skips it as a prefix. Answers whether it
+/// marked the word.
+fn mark_command_word_lookalike(word: &mut String) -> bool {
+    let marked = is_assignment_word(word);
+    if marked {
+        word.insert_str(0, "./");
+    }
+    marked
+}
+
 fn tokenize_marked_in(command: &str, backslashes: Backslashes) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
+    let mut position = CommandPosition::Leading;
     // One expansion budget for the whole call, drawn from the thread's
     // budget, so neither a command of many small exploding words nor a guard
     // that re-tokenizes every segment can multiply the per-word bound into a
@@ -657,14 +803,45 @@ fn tokenize_marked_in(command: &str, backslashes: Backslashes) -> Vec<MarkedToke
             command,
             backslashes,
             &mut |text, flags, unquoted_prefix_len, expanding_prefix_len| {
+                let typed_len = text.len();
+                let (text, flags, settled) =
+                    settle_command_position(&mut position, text, flags.to_vec());
+                // A settled subscript keeps its quoting marks only where they
+                // still describe the text: wholly unquoted, or quoted from
+                // inside the subscript on.
+                let relen = |len: usize| {
+                    if len >= typed_len {
+                        text.len()
+                    } else {
+                        len.min(text.find('[').map_or(len, |open| open + 1))
+                    }
+                };
+                let (unquoted_prefix_len, expanding_prefix_len) = if text.len() == typed_len {
+                    (unquoted_prefix_len, expanding_prefix_len)
+                } else {
+                    (relen(unquoted_prefix_len), relen(expanding_prefix_len))
+                };
+                let from = tokens.len();
                 push_expanded_token(
                     &mut tokens,
                     text,
-                    flags,
+                    &flags,
                     unquoted_prefix_len,
                     expanding_prefix_len,
                     budget,
                 );
+                if settled.is_some_and(|settled| settled.lookalike)
+                    && let Some(token) = tokens.get_mut(from)
+                    && mark_command_word_lookalike(&mut token.text)
+                {
+                    // The `./` is unquoted, and opens the word.
+                    token.unquoted_prefix_len += 2;
+                    token.expanding_prefix_len = if token.expanding_prefix_len == 0 {
+                        2
+                    } else {
+                        token.expanding_prefix_len + 2
+                    };
+                }
                 true
             },
         );
@@ -2927,7 +3104,9 @@ pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
         && tokens.get(idx + 1).is_some();
     (names_transparent_prefix(tok) && runs_the_next_word)
         || ends_a_prefix_s_options
-        || is_assignment_word(tok)
+        || (is_assignment_word(tok)
+            && (!is_subscripted_assignment_word(tok)
+                || tokens[..idx].iter().all(|word| is_assignment_word(word))))
         || is_env_assignment_operand(tokens, idx)
 }
 
@@ -2991,18 +3170,70 @@ pub fn is_assignment_word(token: &str) -> bool {
     // rejects them as prefix assignments ("not a valid identifier") and still
     // runs the command after them, so `A[0]=x git push` pushed while every
     // push walk took `A[0]=x` for the command (cameronsjo/cadence-hooks#1297).
+    // The subscript closes where bash's does ([`subscript_end`]), and the
+    // `=` must follow it at once: `A[]]=x` and `A[0]x]=y` are commands.
     //
-    // The subscript is not matched bracket by bracket. The tokenizer has
-    // already removed quotes, so `A["]"]=x` — one assignment to bash —
-    // arrives as `A[]]=x`, which bash would run as a command. Any `]=` or
-    // `]+=` after `NAME[` is read as closing it: a superset of bash's rule,
-    // whose only over-read (`A[]]=x`, `A[0]x]=y` typed bare) names a command
-    // no system has, so judging the words after it as the command can add a
-    // verdict on a command that never runs, never remove one.
-    match rest.strip_prefix('[') {
-        Some(subscript) => subscript.contains("]=") || subscript.contains("]+="),
-        None => rest.starts_with('=') || rest.starts_with("+="),
+    // A tokenizer word has lost its quotes, which decide this for bash
+    // (`"d[0]=/git"` is a command, `A["]"]=x` an assignment); the tokenizer
+    // settles both in command position before any caller sees the text
+    // ([`settle_command_position`]).
+    let rest = match rest.strip_prefix('[') {
+        Some(subscript) => match subscript_end(subscript) {
+            Some(end) => &subscript[end..],
+            None => return false,
+        },
+        None => rest,
+    };
+    rest.starts_with('=') || rest.starts_with("+=")
+}
+
+/// Is `token` an assignment word with a subscript (`NAME[sub]=…`)? Bash takes
+/// one only before the command word, never as an argument a prefix runs
+/// (`nohup A[0]=x git` runs `A[0]=x`).
+fn is_subscripted_assignment_word(token: &str) -> bool {
+    is_assignment_word(token)
+        && token
+            .bytes()
+            .find(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            == Some(b'[')
+}
+
+/// The byte offset just past the `]` closing a subscript whose `[` was
+/// already consumed, by bash's rule: brackets nest, and a quoted or
+/// backslash-escaped `]` does not close it (`A["]"]=x`, `A[\]]=x` and
+/// `A[a[0]]=x` are each one assignment word under bash 5.2). `None` when the
+/// subscript never closes.
+fn subscript_end(subscript: &str) -> Option<usize> {
+    let bytes = subscript.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if quote == b'"' && bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    None
 }
 
 /// True when `command` is about to ship branch work: `gh pr ready`
@@ -25203,18 +25434,20 @@ mod tests {
             ("A[\"]\"]=x", true),
             ("A[']']=x", true),
             ("A[\\]]=x", true),
-            // `A["]"]=x` after quote removal: read as the assignment it was.
-            ("A[]]=x", true),
             ("A[$(echo 1)]=x", true),
+            // A quoted blank, after quote removal.
             ("A[k y]=x", true),
             ("_[0]=y", true),
             ("A[0]==y", true),
             // Not assignments: bash runs each as the command word.
+            ("A[]]=x", false),
+            ("A[0]x]=y", false),
             ("A[0]x=y", false),
             ("A[0]", false),
             ("A[0", false),
             ("A[0=x", false),
             ("A]=x", false),
+            ("A[\"0]=x", false),
             ("1A=x", false),
             ("1A[0]=x", false),
             ("[0]=x", false),
@@ -25236,6 +25469,19 @@ mod tests {
             ("A[0]=x B+=y C[1]+=z git push origin main", "git"),
             ("A[0]=x make", "make"),
             ("A[0]x=y git push", "A[0]x=y"),
+            ("A[]]=x git push", "./A[]]=x"),
+            // A subscript bash reads past its quotes is settled to `[0]`.
+            ("A[\"]\"]=x git push", "git"),
+            ("A['k y']=x git push", "git"),
+            // A quoted word is the command, whatever its text reads as.
+            ("\"d[0]=/git\" push evil main", "./d[0]=/git"),
+            ("'FOO=/usr/bin/git' push evil main", "./FOO=/usr/bin/git"),
+            (
+                "d[0]x]=/usr/bin/git push evil main",
+                "./d[0]x]=/usr/bin/git",
+            ),
+            // So is a word after a prefix that runs it.
+            ("nohup A[0]=/usr/bin/git push", "A[0]=/usr/bin/git"),
         ] {
             let tokens = tokenize(command);
             assert_eq!(
@@ -25246,6 +25492,26 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    /// cameronsjo/cadence-hooks#1299 review C1: only the command word is
+    /// settled. An argument that reads as an assignment is left as typed.
+    #[test]
+    fn only_the_command_word_is_settled() {
+        for (command, want) in [
+            (
+                "git commit -m \"A[0]=x\"",
+                vec!["git", "commit", "-m", "A[0]=x"],
+            ),
+            ("echo 'FOO=1' A[]]=x", vec!["echo", "FOO=1", "A[]]=x"]),
+            ("A=1 'B=2' x", vec!["A=1", "./B=2", "x"]),
+            ("then 'A=1' x", vec!["then", "./A=1", "x"]),
+            ("{A[0]=x,git} push", vec!["./A[0]=x", "git", "push"]),
+            ("FOO=1 git push", vec!["FOO=1", "git", "push"]),
+        ] {
+            assert_eq!(tokenize(command), want, "{command:?}");
+        }
+        assert_eq!(tokenize_script_words("'d[0]=/git' push")[0], "./d[0]=/git");
     }
 
     /// cameronsjo/cadence-hooks#1290: `git p\ush` runs `git push`, and a

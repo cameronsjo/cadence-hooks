@@ -9261,6 +9261,37 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1297 and the #1299 review's C1: a
+    /// subscripted assignment prefix is skipped as bash skips it, and a word
+    /// whose text only reads as one once quotes are gone, or whose subscript
+    /// bash closes before its `=`, is the command — the `cd` behind it never
+    /// runs, and a git behind it by path does. Measured under bash 5.2.
+    #[test]
+    fn subscripted_assignment_prefixes_are_read_as_bash_reads_them() {
+        for (cmd, want) in [
+            ("A[0]=x git commit -m x", vec!["/cwd"]),
+            ("A[0]+=x git commit -m x", vec!["/cwd"]),
+            ("A[0]=x cd /wt && git commit -m x", vec!["/wt"]),
+            ("A[\"]\"]=x cd /wt && git commit -m x", vec!["/wt"]),
+            ("d[0]x]=/usr/bin/git commit -m x", vec!["/cwd"]),
+            ("\"d[0]=/git\" commit -m x", vec!["/cwd"]),
+            ("'d[0]=/usr/bin/git' commit -m x", vec!["/cwd"]),
+        ] {
+            assert_eq!(sorted_targets(cmd, "/cwd"), want, "{cmd}");
+        }
+        for cmd in [
+            "A[]]=x cd /wt; git commit -m x",
+            "A[0]x]=y cd /wt; git commit -m x",
+            "\"A[0]=x\" cd /wt; git commit -m x",
+        ] {
+            assert!(
+                sorted_targets(cmd, "/cwd").contains(&"/cwd".to_string()),
+                "{cmd}: {:?}",
+                sorted_targets(cmd, "/cwd")
+            );
+        }
+    }
+
     #[test]
     fn cd_behind_an_assignment_to_a_variable_cd_reads_is_unresolved() {
         for cmd in [
