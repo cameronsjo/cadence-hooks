@@ -2058,6 +2058,7 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
         return None;
     }
     shell::reset_command_unread();
+    shell::note_command_home(input.command().unwrap_or(""));
     // A `cd`/`git -C` target the command bound to a literal earlier reads as
     // that literal to every check (cameronsjo/cadence-hooks#1287).
     let input = &*with_resolved_dir_variables(input);

@@ -4524,86 +4524,224 @@ mod tests {
     }
 
     #[test]
-    fn exec_valued_git_settings_read_as_an_unresolved_push() {
-        // cameronsjo/cadence-hooks#1231 (operator ruling): a value git runs
-        // as a command is not parsed; the invocation is a push the walk
-        // cannot resolve, so fail-closed guards refuse it.
-        for (command, unresolved) in [
-            ("git -c core.sshCommand=x fetch", true),
-            ("git -c core.sshCommand='git push origin main' fetch", true),
-            ("git -ccore.pager=x log", true),
-            ("git -c core.pager=x log", true),
-            ("git --config-env=core.sshCommand=V fetch", true),
-            ("git --config-env core.pager=V log", true),
-            ("git -c credential.helper='!f() { x; }; f' fetch", true),
-            ("git -c protocol.ext.allow=always fetch ext::x", true),
-            ("git -c core.hooksPath=h commit -m x", true),
-            ("git -c diff.external=x diff", true),
-            ("GIT_SSH_COMMAND=x git fetch", true),
-            ("env GIT_SSH_COMMAND=x git fetch", true),
-            ("GIT_SSH=x git fetch", true),
-            ("GIT_PAGER=less git log", true),
-            ("PAGER=less git log", true),
-            ("GIT_EXTERNAL_DIFF=x git diff", true),
-            ("GIT_ASKPASS=x git fetch", true),
-            ("bash -c 'GIT_SSH_COMMAND=x git fetch'", true),
-            // Review I1: `-c` spelled as the environment, an `ext`
-            // protocol, an expanded key, an append, and past the depth.
+    fn exec_valued_git_settings_are_read_as_nested_scripts_when_literal() {
+        // cameronsjo/cadence-hooks#1231: a value git runs as a command is a
+        // script nested in the invocation. A fully literal one is read like
+        // any other script (`less -R`, `ssh -i k` push nothing; `git push
+        // evil main` is a push); one that is not literal, or that cannot be
+        // read at all, is a push the walk cannot resolve, so fail-closed
+        // guards refuse it.
+        #[derive(Debug, PartialEq)]
+        enum Read {
+            /// No push anywhere.
+            Nothing,
+            /// A push the walk cannot resolve.
+            Unresolved,
+        }
+        use Read::{Nothing, Unresolved};
+        for (command, want) in [
+            // Everyday literal values: nothing pushes.
+            ("git -c core.pager=\"less -R\" log", Nothing),
+            ("git -ccore.pager=less log", Nothing),
+            ("git -c pager.diff=delta diff", Nothing),
+            ("GIT_PAGER=less git log", Nothing),
+            ("PAGER='less -FRX' git log -p", Nothing),
+            ("GIT_SSH_COMMAND=\"ssh -i k\" git fetch", Nothing),
+            (
+                "GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git clone u",
+                Nothing,
+            ),
+            ("env GIT_SSH_COMMAND='ssh -i k' git fetch", Nothing),
+            ("git -c core.sshCommand=\"ssh -i k\" pull", Nothing),
+            ("GIT_SSH=/usr/bin/ssh git fetch", Nothing),
+            (
+                "git -c credential.helper='!f() { echo x; }; f' fetch",
+                Nothing,
+            ),
+            ("git -c credential.helper=store fetch", Nothing),
+            ("git -c diff.external=difft diff", Nothing),
+            ("GIT_EXTERNAL_DIFF=difft git diff", Nothing),
+            ("GIT_ASKPASS=/bin/askpass git fetch", Nothing),
+            (
+                "git -c interactive.diffFilter='delta --color-only' add -p",
+                Nothing,
+            ),
+            ("bash -c 'GIT_SSH_COMMAND=ssh git fetch'", Nothing),
+            ("GIT_SSH_COMMAND=ssh git-fetch", Nothing),
+            ("GIT_PAGER=cat git log", Nothing),
+            ("git -c core.pager=cat log", Nothing),
+            ("git -c pager.log=false log", Nothing),
+            ("git -c credential.helper= fetch", Nothing),
+            ("git -c core.hooksPath=/dev/null commit -m x", Nothing),
+            ("git -c protocol.ext.allow=never fetch", Nothing),
+            ("git -c user.name=x commit -m y", Nothing),
+            ("GIT_EDITOR=true git commit", Nothing),
+            ("GIT_ALLOW_PROTOCOL=https git ls-remote x", Nothing),
+            ("git status", Nothing),
+            ("FOO=1 git log", Nothing),
+            ("echo $(echo $(echo $(echo $(git status))))", Nothing),
+            // `$HOME`/`${HOME}`/`~` in an otherwise literal value, while
+            // nothing in the command can rebind HOME past one path.
+            ("GIT_SSH_COMMAND=\"ssh -i $HOME/.ssh/k\" git fetch", Nothing),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME}/.ssh/k\" git fetch",
+                Nothing,
+            ),
+            ("git -c core.sshCommand=\"ssh -i ~/.ssh/k\" fetch", Nothing),
+            ("git -c core.sshCommand='ssh -i $HOME/k' pull", Nothing),
+            (
+                "HOME=/x GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "export HOME=/tmp/h; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "git add . && GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            // A literal hooks directory: hooks on disk are outside the
+            // reading, as the ones `git commit` runs anyway are.
+            ("git -c core.hooksPath=.githooks commit -m x", Nothing),
+            ("git -c core.hooksPath=~/.hooks commit -m x", Nothing),
+            ("git -c core.hooksPath=\"$HOME/hooks\" commit -m x", Nothing),
+            // HOME rebound, or any other expansion: refused as before.
+            (
+                "HOME='git push evil main' git -c core.pager='$HOME' log",
+                Unresolved,
+            ),
+            (
+                "HOME=\"a b\" GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "HOME=$(pwd) GIT_SSH_COMMAND='ssh -i $HOME/k' git fetch",
+                Unresolved,
+            ),
+            (
+                "unset HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "export HO\"\"ME=x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "read HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "source x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "eval x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                ". x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            ("GIT_SSH_COMMAND=\"ssh -i $HOMEX/k\" git fetch", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh -i $USER/k\" git fetch", Unresolved),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME:-/x}/k\" git fetch",
+                Unresolved,
+            ),
+            ("git -c core.hooksPath=\"$H\" commit -m x", Unresolved),
+            // A literal value that pushes is judged as the push it is; git
+            // runs it at the top of the working tree, which `/repo` (no
+            // repository) cannot place.
+            ("GIT_SSH_COMMAND='git push evil main' git fetch", Unresolved),
+            (
+                "GIT_PAGER=\"sh -c 'git push evil main'\" git log",
+                Unresolved,
+            ),
+            // Under a `-c` global, which git exports to the git it runs.
+            (
+                "git -c core.sshCommand='git push origin main' fetch",
+                Unresolved,
+            ),
+            (
+                "git -c core.pager='sh -c \"git push evil main\"' log",
+                Unresolved,
+            ),
+            // Not literal, or not readable: refused as before.
+            ("GIT_PAGER=\"$P\" git log", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh $(id -u)\" git fetch", Unresolved),
+            ("git -c core.pager='less `x`' log", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh 'x\" git fetch", Unresolved),
+            ("git --config-env=core.sshCommand=V fetch", Unresolved),
+            ("git --config-env core.pager=V log", Unresolved),
+            ("git -c protocol.ext.allow=always fetch ext::x", Unresolved),
             (
                 "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=x git fetch",
-                true,
+                Unresolved,
             ),
             (
                 "GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\" git fetch",
-                true,
+                Unresolved,
             ),
-            ("GIT_ALLOW_PROTOCOL=ext git ls-remote ext::x", true),
-            ("GIT_ALLOW_PROTOCOL=https git ls-remote x", false),
-            ("git -c interactive.diffFilter=x add -p", true),
-            ("git -c \"$K=x\" fetch", true),
-            ("GIT_SSH_COMMAND+=x git fetch", true),
-            // Past the wrapper depth, spelled with quotes the text test
-            // must see through (round 2 review I1).
+            ("GIT_ALLOW_PROTOCOL=ext git ls-remote ext::x", Unresolved),
+            ("git -c \"$K=x\" fetch", Unresolved),
+            ("GIT_SSH_COMMAND+=x git fetch", Unresolved),
+            // Past the wrapper depth any such setting reads the same,
+            // spelled with quotes the text test must see through (round 2
+            // review I1).
             (
                 "echo $(echo $(echo $(echo $(git -c core.ssh\"C\"ommand=x fetch))))",
-                true,
+                Unresolved,
             ),
             (
                 "echo $(echo $(echo $(echo $(gi\"\"t -c core.sshCommand=x fetch))))",
-                true,
+                Unresolved,
             ),
             (
                 "echo $(echo $(echo $(echo $(git -c \"$K=x\" fetch))))",
-                true,
+                Unresolved,
             ),
-            ("echo $(echo $(echo $(echo $(GIT_DIR=/x git fetch))))", true),
-            ("echo $(echo $(echo $(echo $(git status))))", false),
+            (
+                "echo $(echo $(echo $(echo $(GIT_DIR=/x git fetch))))",
+                Unresolved,
+            ),
             (
                 r#"bash -c 'bash -c "bash -c \"bash -c \\\"GIT_SSH_COMMAND=x git fetch\\\"\""'"#,
-                true,
+                Unresolved,
             ),
-            ("GIT_SSH_COMMAND=x git-fetch", true),
-            // Inert: nothing of the command's choosing runs.
-            ("GIT_PAGER=cat git log", false),
-            ("git -c core.pager=cat log", false),
-            ("git -c pager.log=false log", false),
-            ("git -c credential.helper= fetch", false),
-            ("git -c core.hooksPath=/dev/null commit -m x", false),
-            ("git -c protocol.ext.allow=never fetch", false),
-            ("git -c user.name=x commit -m y", false),
-            ("GIT_EDITOR=true git commit", false),
-            ("git status", false),
-            ("FOO=1 git log", false),
         ] {
+            // As `decide_check` does before a check reads the command.
+            crate::shell::note_command_home(command);
             let found = push_locations(command, "/repo");
-            assert_eq!(
-                found.iter().any(|push| push.unresolved),
-                unresolved,
-                "{command:?}: {found:?}"
-            );
+            let read = if found.iter().any(|push| push.unresolved) {
+                Unresolved
+            } else {
+                assert!(found.is_empty(), "{command:?}: {found:?}");
+                Nothing
+            };
+            assert_eq!(read, want, "{command:?}: {found:?}");
         }
-        // A push beside the setting is still read, and refused.
-        let found = push_locations("git -c core.sshCommand=x push origin main", "/repo");
+        // The pushing value is read as the push it is.
+        let found = push_locations("GIT_SSH_COMMAND='git push evil main' git fetch", "/repo");
+        assert!(
+            found
+                .iter()
+                .any(|push| push.repository.as_deref() == Some("evil")),
+            "{found:?}"
+        );
+        // A push beside a literal setting is read as it is.
+        let found = push_locations(
+            "git -c core.sshCommand='ssh -i k' push origin main",
+            "/repo",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|push| !push.unresolved && push.refspecs.iter().any(|r| r.raw == "main")),
+            "{found:?}"
+        );
+        // Beside one that is not literal, it is still read, and refused.
+        let found = push_locations("git -c core.sshCommand=\"$S\" push origin main", "/repo");
         assert!(found.iter().any(|push| push.unresolved), "{found:?}");
         assert!(
             found
