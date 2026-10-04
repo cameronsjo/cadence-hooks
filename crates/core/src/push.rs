@@ -1162,9 +1162,14 @@ fn collect_push_invocations(
             out.push(invocation);
         } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &segment_dir) {
             out.push(unresolvable_push(&segment_dir, segment_directory));
-        } else if let Some(mut invocation) =
-            reverse_fetch_invocation(argv, argv_quoted, prefix, &segment_dir, scope_unresolved)
-        {
+        } else if let Some(mut invocation) = reverse_fetch_invocation(
+            argv,
+            argv_quoted,
+            prefix,
+            &segment_dir,
+            scope_unresolved,
+            *segment_dir != *cwd,
+        ) {
             // The `GIT_DIR=` prefix is this function's own destination, so
             // only the scope's doubts carry over, not `prefix_redirect`.
             let doubt = scope_unresolved || scope_lost;
@@ -1208,12 +1213,13 @@ const FETCH_VALUE_SHORT: &str = "josX";
 /// judges it as it judges the push.
 ///
 /// **Only the publishing shape.** The destination must be named away from the
-/// command's own repository (`-C`, `--git-dir`, a `GIT_DIR=` prefix, or a
-/// `GIT_DIR` exported earlier in the scope), the source must be local (`.`,
-/// `$PWD`, a path, `file://`, or a bare word naming an existing directory there),
-/// and a fetch must name a refspec with a destination outside
-/// `refs/remotes/` — a pull merges into the checked-out branch, so every pull
-/// counts. An ordinary `git fetch`, `git pull`, `git fetch origin main:main` in
+/// command's own repository (`-C`, `--git-dir`, a `GIT_DIR=` prefix, a
+/// `GIT_DIR` exported earlier in the scope, or a `cd` earlier in it — `moved`),
+/// the source must be local (`.`, `$PWD`, a path, `file://`, or a bare word
+/// naming an existing directory there) and not the destination itself, and a
+/// fetch must write a ref outside `refs/remotes/` — a `src:dst` refspec, a
+/// `tag NAME`, or `--tags`; a pull merges into the checked-out branch, so
+/// every pull counts. An ordinary `git fetch`, `git pull`, `git fetch origin main:main` in
 /// the command's own repository, and `git -C other fetch origin` stay reads.
 fn reverse_fetch_invocation(
     argv: &[String],
@@ -1221,6 +1227,7 @@ fn reverse_fetch_invocation(
     prefix: &[String],
     effective_dir: &str,
     scope_git_dir: bool,
+    moved: bool,
 ) -> Option<PushInvocation> {
     let argv: Vec<String> = strip_unquoted_redirections(argv, argv_quoted)
         .into_iter()
@@ -1251,7 +1258,7 @@ fn reverse_fetch_invocation(
             globals.work_dir.clone()
         }
         Some(dir) => resolve_cd_target(&dir, &globals.work_dir),
-        None if globals.work_dir != effective_dir || globals.unreadable_dir => {
+        None if globals.work_dir != effective_dir || globals.unreadable_dir || moved => {
             globals.work_dir.clone()
         }
         None if scope_git_dir => {
@@ -1264,6 +1271,7 @@ fn reverse_fetch_invocation(
     let mut positionals: Vec<String> = Vec::new();
     let mut from_stdin = false;
     let mut dry_run = false;
+    let mut tags = false;
     let mut options_done = false;
     let mut idx = 0;
     while let Some(raw) = words.get(idx) {
@@ -1281,6 +1289,7 @@ fn reverse_fetch_invocation(
             match word.as_ref() {
                 "--stdin" => from_stdin = true,
                 "--dry-run" => dry_run = true,
+                "--tags" => tags = true,
                 // Every positional is a repository: nothing is written but
                 // remote-tracking refs and FETCH_HEAD.
                 "--multiple" | "--all" if !pull => return None,
@@ -1289,17 +1298,37 @@ fn reverse_fetch_invocation(
             }
             continue;
         }
-        if let Some(at) = word[1..].find(|c| FETCH_VALUE_SHORT.contains(c)) {
-            if at + 2 == word.len() {
-                idx += 1;
-            }
+        // A value-taking letter ends the cluster; last in the word, its
+        // value is the next word.
+        if !pull && word[1..].contains('t') {
+            tags = true;
+        }
+        if let Some(at) = word[1..].find(|c| FETCH_VALUE_SHORT.contains(c))
+            && at + 2 == word.len()
+        {
+            idx += 1;
         }
     }
     let (source, refspecs) = positionals.split_first()?;
     let (source_dir, source_known) = local_fetch_source(source, effective_dir, &globals.work_dir)?;
     unknown |= !source_known;
     let mut published: Vec<Refspec> = Vec::new();
-    for raw in refspecs {
+    let mut refspecs = refspecs.iter();
+    while let Some(raw) = refspecs.next() {
+        // `tag NAME` is `refs/tags/NAME:refs/tags/NAME`.
+        if raw == "tag"
+            && let Some(name) = refspecs.next()
+        {
+            let spec = format!("refs/tags/{name}");
+            published.push(Refspec {
+                raw: format!("tag {name}"),
+                source: Some(spec.clone()),
+                destination: Some(spec),
+                is_delete: false,
+                implicit: false,
+            });
+            continue;
+        }
         let body = raw.strip_prefix('+').unwrap_or(raw);
         if body.starts_with('^') {
             continue;
@@ -1326,7 +1355,7 @@ fn reverse_fetch_invocation(
     }
     if from_stdin {
         unknown = true;
-    } else if refspecs.is_empty() && pull {
+    } else if positionals.len() == 1 && (pull || tags) {
         published.push(Refspec {
             raw: "HEAD".to_string(),
             source: Some("HEAD".to_string()),
@@ -1335,7 +1364,7 @@ fn reverse_fetch_invocation(
             implicit: true,
         });
     }
-    if published.is_empty() && !from_stdin {
+    if published.is_empty() && !from_stdin && !tags {
         return None;
     }
     if !unknown && lexical_dir(&source_dir) == lexical_dir(&destination) {
@@ -1355,7 +1384,7 @@ fn reverse_fetch_invocation(
         work_dir: source_dir,
         refspecs: published,
         all_or_mirror: false,
-        tags: false,
+        tags,
         dry_run,
         mirror: false,
         follow_tags: None,
@@ -5427,6 +5456,22 @@ mod tests {
                 "git -C ../dst fetch --stdin \"$PWD\"".into(),
                 Some((&cwd, &dst, &["HEAD"], true)),
             ),
+            (
+                "git -C ../dst fetch \"$PWD\" tag v1".into(),
+                Some((&cwd, &dst, &["refs/tags/v1"], false)),
+            ),
+            (
+                "git -C ../dst fetch --tags \"$PWD\"".into(),
+                Some((&cwd, &dst, &["HEAD"], false)),
+            ),
+            (
+                "cd ../dst && git fetch ../work main:main".into(),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                "cd ../dst && git fetch \"$OLDPWD\" main:main".into(),
+                Some((&dst, &dst, &["main"], true)),
+            ),
             // Reads: the own repository, a remote, no destination, a
             // remote-tracking destination, the destination itself.
             ("git fetch".into(), None),
@@ -5445,6 +5490,11 @@ mod tests {
             ),
             ("git -C ../dst fetch \"$PWD\" ^main".into(), None),
             ("git -C ../dst fetch . main:main".into(), None),
+            ("cd ../dst && git fetch \"$PWD\" main:main".into(), None),
+            ("cd ../dst && git fetch origin main:main".into(), None),
+            ("cd ../dst && git pull".into(), None),
+            ("git -C ../dst fetch --tags origin".into(), None),
+            ("git fetch --tags".into(), None),
             (
                 "git -C ../dst fetch --multiple \"$PWD\" origin".into(),
                 None,

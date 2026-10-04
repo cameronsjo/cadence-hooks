@@ -825,6 +825,11 @@ fn moved_directories(
             }
         };
         moved_before = true;
+        if dirs.len() >= MAX_MOVED_DIRS {
+            // Nothing more is kept: the set is already given up as unknown.
+            unknown = true;
+            continue;
+        }
         let target = expand_known_variable(target, command, "OBSIDIAN_VAULT", Some(vault))
             .or_else(|| expand_known_variable(target, command, "HOME", home))
             .unwrap_or_else(|| target.clone());
@@ -1183,13 +1188,21 @@ fn relative_operand_moved_into_vault(
     home: Option<&str>,
     meta: &dyn FileMeta,
 ) -> bool {
+    let mut seen = std::collections::HashSet::new();
     let relative: Vec<&String> = deletions
         .operands
         .iter()
         .filter(|operand| !looks_absolute(operand) && !operand.starts_with('~'))
+        .filter(|operand| seen.insert(operand.as_str()))
         .collect();
     if relative.is_empty() {
         return false;
+    }
+    // Each operand is judged in every directory, and in one the text cannot
+    // name it costs a stat: past the cap the answer is yes, as it is past the
+    // canonicalize budget.
+    if relative.len() > MAX_JUDGED_OPERANDS {
+        return true;
     }
     let (dirs, unknown) = moved_directories(&deletions.moves, command, cwd, vault, home);
     for dir in &dirs {
