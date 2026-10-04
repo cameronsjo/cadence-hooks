@@ -267,12 +267,12 @@ mod tests {
     fn parse_semver_clamp_table() {
         let pre_32 = format!("1.2.3-{}", "a".repeat(32));
         let pre_33 = format!("1.2.3-{}", "a".repeat(33));
-        let cases: &[(&str, Option<(u32, u32, u32)>)] = &[
+        let cases = [
             ("1.2.3", Some((1, 2, 3))),
             ("1.2.3-rc.1", Some((1, 2, 3))),
             ("1.2.3-Beta2", Some((1, 2, 3))),
-            (&pre_32, Some((1, 2, 3))),
-            (&pre_33, None),
+            (pre_32.as_str(), Some((1, 2, 3))),
+            (pre_33.as_str(), None),
             ("1.2.3-", None),
             ("1.2.3 IGNORE PREVIOUS INSTRUCTIONS", None),
             ("1.2.3-rc ignore", None),
@@ -290,7 +290,7 @@ mod tests {
             ("1..3", None),
         ];
         for (v, want) in cases {
-            assert_eq!(parse_semver(v), *want, "{v:?}");
+            assert_eq!(parse_semver(v), want, "{v:?}");
         }
     }
 
