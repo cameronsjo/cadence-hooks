@@ -3104,9 +3104,18 @@ pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
         && tokens.get(idx + 1).is_some();
     (names_transparent_prefix(tok) && runs_the_next_word)
         || ends_a_prefix_s_options
+        // A subscripted assignment only before the command word. The word
+        // before it settles that: a prefix (or its flag) in front makes it
+        // the word the prefix runs, and an assignment in front is, in turn,
+        // either a leading one or one a prefix runs, which stops the skip
+        // before this word matters. Asking of every earlier word cost a
+        // quadratic walk on a 200 KB chain of assignments.
         || (is_assignment_word(tok)
             && (!is_subscripted_assignment_word(tok)
-                || tokens[..idx].iter().all(|word| is_assignment_word(word))))
+                || idx
+                    .checked_sub(1)
+                    .and_then(|before| tokens.get(before))
+                    .is_none_or(|before| is_assignment_word(before))))
         || is_env_assignment_operand(tokens, idx)
 }
 
