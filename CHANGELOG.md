@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`platform-drift` no longer tells you to upgrade a binary that is already ahead.** When the installed `cadence-hooks` is newer than the plugin baseline, the nudge now says the cadence plugin pin is behind and names `claude plugin update cadence@workbench` then `/reload-plugins`. An older binary keeps the `brew upgrade cadence-hooks` text, and the daily gate token (`hooks:<running>><expected>`) is unchanged. (cameronsjo/cadence-hooks#1223)
+
 ## [0.122.0] - 2026-10-03
 
 ### Added
