@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
 
+### Fixed
+
+- **A post to another repo no longer inherits the current checkout's redaction allowlist.** When `redact-external-content` resolves a `gh … -R owner/repo` target that is none of the current checkout's remotes, it drops that checkout's `redaction.allowlist`, `categories` ceilings and `originAudience` from `.claude/cadence.json` and names the destination in its nudge. `additionalPatterns` still apply. The `redact-scan` CLI takes a new `--repo OWNER/REPO` flag that does the same, and prints the same note beside its hits. The destination repo's own config is not looked up: no local checkout of it is assumed, so the scan falls back to the defaults. A post with no `-R`, a `git commit`, a `-R` naming any remote of this checkout, and targets the guard cannot resolve (such as a `gh api` path) keep the checkout's config as before. Shaped hits only nudge, so nothing new blocks. (cameronsjo/cadence-hooks#1245)
+
 ## [0.121.0] - 2026-09-30
 
 ### Security

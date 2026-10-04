@@ -237,6 +237,31 @@ pub(super) fn post_targets(command: &str, base_dir: &str) -> Vec<Option<Target>>
     out
 }
 
+/// The repo every remote of the checkout at `base_dir` points to, lowercase.
+/// Empty when `base_dir` is not a checkout or has no readable remote.
+pub(super) fn checkout_repos(base_dir: &str) -> Vec<Target> {
+    let Some(out) = git_command(base_dir, &["config", "--get-regexp", r"^remote\..*\.url$"]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(_, url)| host_and_repo_from_url(url))
+        .map(|(host, repo)| (host.to_ascii_lowercase(), repo.to_ascii_lowercase()))
+        .collect()
+}
+
+/// The first resolved target that is none of the checkout's own repos (`own`,
+/// from [`checkout_repos`]), as `owner/repo` — a post that leaves this repo
+/// (cameronsjo/cadence-hooks#1245). An unresolved target is not foreign: no
+/// `-R` means gh posts to this checkout.
+pub(super) fn foreign_target(targets: &[Option<Target>], own: &[Target]) -> Option<String> {
+    targets
+        .iter()
+        .flatten()
+        .find(|t| !own.contains(t))
+        .map(|(_, slug)| slug.clone())
+}
+
 /// The single `owner/repo` every posting segment resolves to on the default
 /// host, or `None` when there is no posting segment, any segment is
 /// unresolved, the segments disagree, or the host is not the default one. This
@@ -460,6 +485,64 @@ mod tests {
         for (targets, want) in table {
             assert_eq!(shared_destination(&targets).as_deref(), want, "{targets:?}");
         }
+    }
+
+    #[test]
+    fn foreign_target_table() {
+        let own = vec![
+            ("github.com".to_string(), "me/meta".to_string()),
+            ("github.com".to_string(), "up/meta".to_string()),
+        ];
+        let table: Vec<(Vec<Option<Target>>, Option<&str>)> = vec![
+            (vec![t("github.com", "me/meta")], None),
+            (vec![t("github.com", "up/meta")], None),
+            (vec![t("github.com", "me/tool")], Some("me/tool")),
+            // Same slug on another host is another repo.
+            (vec![t("ghe.example", "me/meta")], Some("me/meta")),
+            // Unresolved targets are not foreign.
+            (vec![None], None),
+            (vec![], None),
+            (
+                vec![None, t("github.com", "me/meta"), t("github.com", "x/y")],
+                Some("x/y"),
+            ),
+        ];
+        for (targets, want) in table {
+            assert_eq!(
+                foreign_target(&targets, &own).as_deref(),
+                want,
+                "{targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_repos_reads_every_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        assert!(checkout_repos(base).is_empty(), "not a checkout");
+        for args in [
+            &["init", "-q"][..],
+            &["remote", "add", "origin", "https://github.com/Me/Meta.git"],
+            &["remote", "add", "upstream", "git@github.com:up/meta.git"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        let mut repos = checkout_repos(base);
+        repos.sort();
+        assert_eq!(
+            repos,
+            vec![
+                ("github.com".to_string(), "me/meta".to_string()),
+                ("github.com".to_string(), "up/meta".to_string()),
+            ]
+        );
     }
 
     fn resolve(cmd: &str) -> Vec<Option<Target>> {

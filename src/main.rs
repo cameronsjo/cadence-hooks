@@ -313,6 +313,11 @@ enum CadenceCommands {
         /// (default: config originAudience, else public)
         #[arg(long, value_name = "TIER")]
         audience: Option<String>,
+        /// Destination repo (OWNER/REPO, as `gh -R` takes it). When it is none
+        /// of the current checkout's remotes, this checkout's allowlist,
+        /// category ceilings and originAudience are not applied
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
         /// Scaffold the redaction section of .claude/cadence.json and exit
         #[arg(long)]
         init: bool,
@@ -1692,6 +1697,7 @@ fn main() {
             CadenceCommands::RedactScan {
                 file,
                 audience,
+                repo,
                 init,
                 status,
                 validate_config,
@@ -1708,8 +1714,10 @@ fn main() {
                     );
                 }
                 process::exit(
-                    cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
-                        .into(),
+                    cadence_hooks_cadence::redact_external_content::run_scan_to(
+                        file, audience, repo, init,
+                    )
+                    .into(),
                 );
             }
             // Hook checks dispatched above, through `check_plan`.
