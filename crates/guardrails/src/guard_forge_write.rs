@@ -21,8 +21,8 @@ use cadence_hooks_core::config::{
     AllowEntry, env_allow_entries, env_extra_hosts, is_allowed_with_extra_hosts,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, host_and_repo_from_url,
-    skip_transparent_prefixes, strip_group_wrappers,
+    COMMAND_RUNNERS, command_segments, command_word, executable_tokens, host_and_repo_from_url,
+    names_transparent_prefix, peel_command_runners, strip_group_wrappers,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -168,12 +168,35 @@ fn parse_target(value: &str, host: Option<&str>) -> Option<Target> {
     })
 }
 
+/// The words from the command that runs, once the prefixes and command runners
+/// in front of it are peeled: `timeout 5 tea …`, `nice -n 5 glab …`,
+/// `stdbuf -o0 tea …`, `xargs tea …` and `sudo -u me glab …` all run the forge
+/// CLI. Only transparent prefixes were peeled before, so every runner hid the
+/// write from this guard (cameronsjo/cadence-hooks#1262).
+///
+/// **A runner the peel cannot parse does not hide the write.** When the peel
+/// stops on a runner or prefix (an option it does not model), the first
+/// `tea`/`glab` word behind it is taken as the command, so the write is still
+/// judged rather than skipped as a read.
+fn forge_argv(tokens: &[String]) -> &[String] {
+    let rest = peel_command_runners(tokens);
+    let stuck = rest.first().is_some_and(|w| {
+        COMMAND_RUNNERS.contains(&command_word(w).as_ref()) || names_transparent_prefix(w)
+    });
+    if !stuck {
+        return rest;
+    }
+    rest.iter()
+        .position(|w| matches!(command_word(w).as_ref(), "tea" | "glab"))
+        .map_or(rest, |at| &rest[at..])
+}
+
 /// The forge write in one segment, or `None` for anything else (reads
 /// included). Pure apart from reading `GITLAB_HOST` for `glab`.
 fn forge_write(segment: &str) -> Option<ForgeWrite> {
     let tokens = executable_tokens(strip_group_wrappers(segment));
-    let prefix_len = tokens.len() - skip_transparent_prefixes(&tokens).len();
-    let rest = skip_transparent_prefixes(&tokens);
+    let rest = forge_argv(&tokens);
+    let prefix_len = tokens.len() - rest.len();
     let head = rest.first()?;
     let forge = match command_word(head).as_ref() {
         "glab" => Forge::Glab,
@@ -440,6 +463,55 @@ mod tests {
             "ls -la tea",
         ] {
             assert_eq!(outcome(cmd), Outcome::Allow, "{cmd}");
+        }
+    }
+
+    /// Every command runner and prefix in front of a forge write, against an
+    /// unowned and an owned target (cameronsjo/cadence-hooks#1262): the runner
+    /// runs the CLI, so the target decides, never the wrapper.
+    #[test]
+    fn a_runner_in_front_of_a_write_is_peeled_before_the_target_is_judged() {
+        let wrappers = [
+            "timeout 5",
+            "timeout -s KILL 5",
+            "timeout --kill-after=2 5",
+            "nice",
+            "nice -n 5",
+            "nice -5",
+            "nohup",
+            "nohup --",
+            "stdbuf -o0",
+            "stdbuf -oL -eL",
+            "xargs",
+            "xargs -0",
+            "sudo",
+            "sudo -u me",
+            "setsid",
+            "env",
+            "env -i",
+            "command",
+            "exec",
+            "time",
+            "/usr/bin/timeout 5",
+            "timeout 5 nice -n 1",
+            // A runner option the peel does not model: the write is still found.
+            "timeout --frobnicate 5",
+            "nice --frobnicate",
+        ];
+        for wrapper in wrappers {
+            for (write, owned) in [
+                ("tea pr create --repo evil/r", false),
+                ("glab mr create -R evil/r --title x", false),
+                ("tea pr create --repo cameronsjo/r", true),
+                ("glab mr create -R cameronsjo/r --title x", true),
+            ] {
+                let cmd = format!("{wrapper} {write}");
+                let want = if owned { Outcome::Allow } else { Outcome::Block };
+                assert_eq!(outcome(&cmd), want, "{cmd}");
+            }
+            // A read behind the same runner stays a read.
+            let read = format!("{wrapper} glab mr list -R evil/r");
+            assert_eq!(outcome(&read), Outcome::Allow, "{read}");
         }
     }
 
