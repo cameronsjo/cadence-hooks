@@ -5132,7 +5132,8 @@ destinations = ["me/*", "them/exact"]
         let base = dir.path().to_str().unwrap();
         let t = |slug: &str| Some((dh.clone(), slug.to_string()));
         // (targets, config softens?, expected foreign destination)
-        let table: Vec<(Vec<Option<context::Target>>, bool, Option<&str>)> = vec![
+        type Row = (Vec<Option<context::Target>>, bool, Option<&'static str>);
+        let table: Vec<Row> = vec![
             (vec![t("me/tool")], true, Some("me/tool")),
             (vec![t("me/meta")], true, None),
             (vec![t("up/meta")], true, None),
