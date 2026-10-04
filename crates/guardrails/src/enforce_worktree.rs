@@ -9250,15 +9250,19 @@ mod tests {
                 "{cmd}"
             );
         }
-        // A quoted `time` or assignment in front is a command NAME too, but
-        // the plain gate reads the words unquoted and cannot tell, so these
-        // take the union path — the session cwd is still judged.
-        for cmd in [
-            r#""time" cd /wt; git commit -m x"#,
-            r#""FOO=1" cd /wt; git commit -m x"#,
-        ] {
-            assert_eq!(sorted_targets(cmd, "/cwd"), vec!["/cwd", "/wt"], "{cmd}");
-        }
+        // A quoted `time` in front is a command NAME too, but the plain gate
+        // reads the words unquoted and cannot tell, so it takes the union
+        // path — the session cwd is still judged.
+        assert_eq!(
+            sorted_targets(r#""time" cd /wt; git commit -m x"#, "/cwd"),
+            vec!["/cwd", "/wt"]
+        );
+        // A quoted assignment is settled by the tokenizer as the command word
+        // it is (cameronsjo/cadence-hooks#1299 review C1): only the cwd.
+        assert_eq!(
+            sorted_targets(r#""FOO=1" cd /wt; git commit -m x"#, "/cwd"),
+            vec!["/cwd"]
+        );
     }
 
     /// cameronsjo/cadence-hooks#1297 and the #1299 review's C1: a
@@ -9272,7 +9276,8 @@ mod tests {
             ("A[0]=x git commit -m x", vec!["/cwd"]),
             ("A[0]+=x git commit -m x", vec!["/cwd"]),
             ("A[0]=x cd /wt && git commit -m x", vec!["/wt"]),
-            ("A[\"]\"]=x cd /wt && git commit -m x", vec!["/wt"]),
+            // Quoting in front of the `cd` takes the union path: both judged.
+            ("A[\"]\"]=x cd /wt && git commit -m x", vec!["/cwd", "/wt"]),
             ("d[0]x]=/usr/bin/git commit -m x", vec!["/cwd"]),
             ("\"d[0]=/git\" commit -m x", vec!["/cwd"]),
             ("'d[0]=/usr/bin/git' commit -m x", vec!["/cwd"]),

@@ -25469,17 +25469,15 @@ mod tests {
             ("A[0]=x B+=y C[1]+=z git push origin main", "git"),
             ("A[0]=x make", "make"),
             ("A[0]x=y git push", "A[0]x=y"),
-            ("A[]]=x git push", "./A[]]=x"),
+            ("A[]]=x git push", "A[]]=x"),
             // A subscript bash reads past its quotes is settled to `[0]`.
             ("A[\"]\"]=x git push", "git"),
             ("A['k y']=x git push", "git"),
             // A quoted word is the command, whatever its text reads as.
             ("\"d[0]=/git\" push evil main", "./d[0]=/git"),
             ("'FOO=/usr/bin/git' push evil main", "./FOO=/usr/bin/git"),
-            (
-                "d[0]x]=/usr/bin/git push evil main",
-                "./d[0]x]=/usr/bin/git",
-            ),
+            // Its subscript closes before `x`: a command by path, as typed.
+            ("d[0]x]=/usr/bin/git push evil main", "d[0]x]=/usr/bin/git"),
             // So is a word after a prefix that runs it.
             ("nohup A[0]=/usr/bin/git push", "A[0]=/usr/bin/git"),
         ] {
