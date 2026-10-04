@@ -4844,12 +4844,26 @@ fn kill_process_group(child: &std::process::Child) {
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
 
+thread_local! {
+    static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many bounded git spawns this thread has attempted (including ones the
+/// shared deadline skipped). Lets a test pin "judged with N probes" without
+/// timing it: a wall-clock bound on a flood fails on a loaded runner with the
+/// guard behaving correctly (cadence-hooks#1228).
+pub fn git_spawn_count() -> usize {
+    GIT_SPAWNS.with(std::cell::Cell::get)
+}
+
 /// Run a prepared git command bounded by the process deadline
 /// ([`crate::deadline`]): armed hook paths share one budget across spawns
 /// (a pre-exhausted budget skips the spawn entirely), unarmed CLI paths cap
 /// each spawn individually, and a disabled deadline runs unbounded.
 pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     use crate::deadline::{self, BudgetState};
+
+    GIT_SPAWNS.with(|n| n.set(n.get() + 1));
 
     let timeout = match deadline::state() {
         BudgetState::Disabled => {

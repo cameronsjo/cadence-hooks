@@ -2426,12 +2426,24 @@ mod tests {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
             let command = "git -C d push origin main; ".repeat(7000);
+            // The #1131 regression is one `git remote` spawn per push (~7000
+            // here). Pin that by counting spawns: deterministic on any
+            // runner. A raw `elapsed() < 2s` bound failed on a loaded
+            // windows-latest runner at 2.16 s with the guard behaving
+            // correctly (cadence-hooks#1228).
+            let spawns_before = cadence_hooks_core::shell::git_spawn_count();
             let started = std::time::Instant::now();
             let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+            let elapsed = started.elapsed();
+            let spawns = cadence_hooks_core::shell::git_spawn_count() - spawns_before;
+            // One listing for the directory plus one URL resolve for `origin`.
+            assert!(spawns <= 4, "{spawns} git spawns for one directory");
+            // Catastrophic-only backstop for a CPU-bound regression (a
+            // per-segment parse). Deliberately far above the ~2 s a healthy
+            // run takes on a loaded runner: the tight bound is what flaked.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "took {:?}",
-                started.elapsed()
+                elapsed < std::time::Duration::from_secs(30),
+                "took {elapsed:?}"
             );
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
