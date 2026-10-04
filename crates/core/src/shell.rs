@@ -22570,6 +22570,44 @@ mod tests {
         assert!(!out.contains(&"cat .env".to_string()));
     }
 
+    /// Inside backticks bash removes the backslash before `$`, a backtick
+    /// and a backslash (and before `"` when the span is double-quoted) before
+    /// the body runs, so an escaped `\$(` there is a live substitution
+    /// (cameronsjo/cadence-hooks#1271). Rows are `(command, whether bash runs
+    /// `git reset --hard`)`, each checked in real bash with a canary; the
+    /// deep rows sit past the depth bound, where bodies are listed rather
+    /// than expanded.
+    #[test]
+    fn command_segments_read_a_backtick_body_with_its_backslashes_removed() {
+        let wrap = |inner: &str, levels: usize| {
+            format!("{}{inner}{}", "echo $(".repeat(levels), ")".repeat(levels))
+        };
+        let mut rows: Vec<(String, bool)> = vec![
+            (r"echo `echo \$(git reset --hard)`".into(), true),
+            (r#"echo "`echo \$(git reset --hard)`""#.into(), true),
+            (r#"echo `echo "\$(git reset --hard)"`"#.into(), true),
+            (r#"echo "`echo \"\$(git reset --hard)\"`""#.into(), true),
+            (r"echo `echo \\\\$(git reset --hard)`".into(), true),
+            (r"x=`echo \`git reset --hard\``".into(), true),
+            // bash leaves `\$` for the body's shell, which reads it literally.
+            (r"echo `echo \\\$(git reset --hard)`".into(), false),
+            (r"echo `echo '$(git reset --hard)'`".into(), false),
+            (r"echo \`echo \$(git reset --hard)\`".into(), false),
+        ];
+        for levels in [1, 3, 6, 12] {
+            rows.push((wrap(r"echo `echo \$(git reset --hard)`", levels), true));
+            rows.push((wrap(r"echo `echo \`git reset --hard\``", levels), true));
+        }
+        for (command, runs) in rows {
+            let out = command_segments(&command);
+            assert_eq!(
+                out.iter().any(|s| s.trim().starts_with("git reset --hard")),
+                runs,
+                "{command}: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn command_segments_nested_paren_substitution() {
         // Inner parens must not close the substitution early.

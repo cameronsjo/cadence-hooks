@@ -56,7 +56,14 @@ fn mentions_push(command: &str) -> bool {
 /// (cameronsjo/cadence-hooks#1226). Asked of the tokenized command, not of
 /// words in it, so an escaped or abbreviated spelling is not a way past.
 fn may_push(command: &str) -> bool {
-    mentions_push(command) || runs_a_git_exec(command)
+    mentions_push(command) || runs_a_git_exec(command) || may_reverse_fetch(command)
+}
+
+/// Can the command publish through a `git fetch`/`git pull` run in another
+/// repository from this one (cameronsjo/cadence-hooks#1294)? The push walk
+/// reports such a fetch as the push it is; this only lets the command reach it.
+fn may_reverse_fetch(command: &str) -> bool {
+    may_spell_word(command, "fetch") || may_spell_word(command, "pull")
 }
 
 /// Check if a URL's owner is in the allowed list.
@@ -684,7 +691,7 @@ fn push_locations_both_readings(
         // segment adds no verdict, and asking `runs_a_git_exec` of every
         // segment of a 200 KB flood cost the test deadline on the Windows
         // runner.
-        if !mentions_push(&raw) {
+        if !mentions_push(&raw) && !may_reverse_fetch(&raw) {
             continue;
         }
         for push in push_locations(strip_group_wrappers(&raw), &dir) {
@@ -2589,6 +2596,77 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A fetch run in another local repository from this one writes this
+    /// one's commits there, which is a push (cameronsjo/cadence-hooks#1294),
+    /// and is judged exactly as the push it equals: `git push <that path>`
+    /// falls back to the checkout's tracking remote, so from an unowned
+    /// checkout every publishing spelling blocks, and from an owned one each
+    /// gets the verdict its push gets. The everyday fetch and pull shapes stay
+    /// allowed from either.
+    #[cfg(unix)]
+    #[test]
+    fn a_reverse_fetch_into_another_repository_is_judged_as_a_push() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let unowned = checkout_with_origin("https://github.com/evil/y.git");
+        let other = checkout_with_origin("https://github.com/cameronsjo/z.git");
+        let other = other.path().to_string_lossy().to_string();
+        let publishing = [
+            (
+                format!("git -C {other} fetch \"$PWD\" main:main"),
+                format!("git push {other} main:main"),
+            ),
+            (
+                format!("git -C {other} fetch \"$PWD\" main:feature"),
+                format!("git push {other} main:feature"),
+            ),
+            (
+                format!("git -C {other} pull \"$PWD\" main"),
+                format!("git push {other} main"),
+            ),
+            (
+                format!("git --git-dir={other}/.git fetch . main:main"),
+                format!("git push {other}/.git main:main"),
+            ),
+            (
+                format!("GIT_DIR={other}/.git git fetch . main:main"),
+                format!("git push {other}/.git main:main"),
+            ),
+        ];
+        let everyday = [
+            "git fetch".to_string(),
+            "git pull".to_string(),
+            "git pull --rebase origin main".to_string(),
+            "git fetch origin main:main".to_string(),
+            "git fetch --all --prune".to_string(),
+            format!("git -C {other} fetch origin"),
+            format!("git -C {other} pull"),
+            format!("git -C {other} fetch \"$PWD\" main"),
+            format!("git -C {other} fetch \"$PWD\" main:refs/remotes/x/main"),
+        ];
+        with_env(&owners_only(), || {
+            let run = |command: &str, dir: &tempfile::TempDir| {
+                let cwd = dir.path().to_string_lossy().to_string();
+                PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd))
+            };
+            for (fetch, push) in &publishing {
+                let result = run(fetch, &unowned);
+                assert_eq!(result.outcome, Block, "{fetch}: {:?}", result.message);
+                assert_eq!(
+                    run(fetch, &owned).outcome,
+                    run(push, &owned).outcome,
+                    "{fetch} is judged as {push}"
+                );
+            }
+            for command in &everyday {
+                for dir in [&owned, &unowned] {
+                    let result = run(command, dir);
+                    assert_eq!(result.outcome, Allow, "{command}: {:?}", result.message);
+                }
+            }
+        });
     }
 
     /// cadence-hooks#1161 and the `find -exec` lane: every row runs from an

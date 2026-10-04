@@ -2056,6 +2056,50 @@ mod tests {
         assert!(!r.message.as_deref().unwrap().contains(&aws_key()));
     }
 
+    /// A fetch run in ANOTHER repository from this one publishes this one's
+    /// commits there, as a push would (cameronsjo/cadence-hooks#1294). Each
+    /// publishing spelling is judged like the push; the reads and the
+    /// non-publishing fetches stay allowed with the same secret outbound.
+    #[test]
+    fn a_reverse_fetch_into_another_repository_is_judged_as_a_push() {
+        let fx = Fx::new("revfetch");
+        fx.commit("src/cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        let remote = fx.remote.to_str().unwrap();
+        let work = fx.work.to_str().unwrap();
+        for command in [
+            format!("git -C {remote} fetch \"$PWD\" main:main"),
+            format!("git -C {remote} fetch {work} +main:refs/heads/main"),
+            format!("git -C {remote} fetch file://{work} main:main"),
+            format!("git --git-dir={remote} fetch . main:main"),
+            format!("GIT_DIR={remote} git fetch \"$PWD\" main:main"),
+            format!("export GIT_DIR={remote}; git fetch \"$PWD\" main:main"),
+            format!("git -C {remote} fetch --depth 1 \"$PWD\" main:topic"),
+            format!("echo $(git -C {remote} fetch \"$PWD\" main:main)"),
+        ] {
+            // A `GIT_DIR` exported earlier names no destination this walk
+            // reads, so that row is refused rather than scanned.
+            let needles: &[&str] = if command.starts_with("export") {
+                &["could not resolve"]
+            } else {
+                &["src/cfg.txt"]
+            };
+            assert_blocks(&fx.run(&command), needles);
+        }
+        for command in [
+            "git fetch".to_string(),
+            "git pull".to_string(),
+            "git fetch origin main:main".to_string(),
+            "git fetch . main:feature".to_string(),
+            format!("git -C {remote} fetch origin"),
+            format!("git -C {remote} fetch \"$PWD\" main"),
+            format!("git -C {remote} fetch \"$PWD\" main:refs/remotes/w/main"),
+            format!("git -C {remote} fetch --dry-run \"$PWD\" main:main"),
+            format!("git -C {remote} fetch . main:main"),
+        ] {
+            assert_allows(&fx.run(&command));
+        }
+    }
+
     #[test]
     fn github_token_blocks() {
         let fx = Fx::new("ghtoken");

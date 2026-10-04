@@ -1162,8 +1162,290 @@ fn collect_push_invocations(
             out.push(invocation);
         } else if hides_a_push_behind_a_prefix(argv, &tokens, &unquoted_prefix_lens, &segment_dir) {
             out.push(unresolvable_push(&segment_dir, segment_directory));
+        } else if let Some(mut invocation) =
+            reverse_fetch_invocation(argv, argv_quoted, prefix, &segment_dir, scope_unresolved)
+        {
+            // The `GIT_DIR=` prefix is this function's own destination, so
+            // only the scope's doubts carry over, not `prefix_redirect`.
+            let doubt = scope_unresolved || scope_lost;
+            invocation.unresolved |= doubt || segment_directory;
+            invocation.repository_unresolved |= doubt;
+            invocation.directory_unverified |= segment_directory;
+            out.push(invocation);
         }
     }
+}
+
+/// `git fetch`/`git pull` options whose value is the next word.
+const FETCH_VALUE_OPTIONS: &[&str] = &[
+    "--depth",
+    "--deepen",
+    "--shallow-since",
+    "--shallow-exclude",
+    "--refmap",
+    "--jobs",
+    "--upload-pack",
+    "--server-option",
+    "--negotiation-tip",
+    "--filter",
+    "--recurse-submodules-default",
+    "--submodule-prefix",
+    "--strategy",
+    "--strategy-option",
+];
+
+/// Short `git fetch`/`git pull` options whose value is the rest of the word
+/// or the next one.
+const FETCH_VALUE_SHORT: &str = "josX";
+
+/// A `git fetch`/`git pull` that writes into ANOTHER local repository from a
+/// local one, read as the push it is (cameronsjo/cadence-hooks#1294).
+///
+/// `git -C ../remote.git fetch "$PWD" main:main` updates the bare repository's
+/// `main` with this repository's commits — what `git push ../remote.git
+/// main:main` does — and no push guard saw it. It is reported as that push,
+/// run from the source repository to the destination one, so every push guard
+/// judges it as it judges the push.
+///
+/// **Only the publishing shape.** The destination must be named away from the
+/// command's own repository (`-C`, `--git-dir`, a `GIT_DIR=` prefix, or a
+/// `GIT_DIR` exported earlier in the scope), the source must be local (`.`,
+/// `$PWD`, a path, `file://`, or a bare word naming an existing directory there),
+/// and a fetch must name a refspec with a destination outside
+/// `refs/remotes/` — a pull merges into the checked-out branch, so every pull
+/// counts. An ordinary `git fetch`, `git pull`, `git fetch origin main:main` in
+/// the command's own repository, and `git -C other fetch origin` stay reads.
+fn reverse_fetch_invocation(
+    argv: &[String],
+    argv_quoted: &[usize],
+    prefix: &[String],
+    effective_dir: &str,
+    scope_git_dir: bool,
+) -> Option<PushInvocation> {
+    let argv: Vec<String> = strip_unquoted_redirections(argv, argv_quoted)
+        .into_iter()
+        .cloned()
+        .collect();
+    if command_word(argv.first()?) != "git" {
+        return None;
+    }
+    let globals = git_globals(&argv[1..], effective_dir, false);
+    let (subcommand, words) = globals.rest.split_first()?;
+    let pull = match unescape_word(subcommand).as_ref() {
+        "fetch" => false,
+        "pull" => true,
+        _ => return None,
+    };
+    let global_words = &argv[1..argv.len() - globals.rest.len()];
+    let git_dir = git_dir_value(global_words).or_else(|| {
+        prefix.iter().rev().find_map(|word| {
+            unescape_word(word)
+                .strip_prefix("GIT_DIR=")
+                .map(str::to_string)
+        })
+    });
+    let mut unknown = globals.unreadable_dir;
+    let destination = match git_dir {
+        Some(dir) if dir.contains(['$', '`']) || dir.is_empty() => {
+            unknown = true;
+            globals.work_dir.clone()
+        }
+        Some(dir) => resolve_cd_target(&dir, &globals.work_dir),
+        None if globals.work_dir != effective_dir || globals.unreadable_dir => {
+            globals.work_dir.clone()
+        }
+        None if scope_git_dir => {
+            unknown = true;
+            globals.work_dir.clone()
+        }
+        None => return None,
+    };
+
+    let mut positionals: Vec<String> = Vec::new();
+    let mut from_stdin = false;
+    let mut dry_run = false;
+    let mut options_done = false;
+    let mut idx = 0;
+    while let Some(raw) = words.get(idx) {
+        idx += 1;
+        let word = unescape_word(raw);
+        if options_done || !word.starts_with('-') || word == "-" {
+            positionals.push(word.into_owned());
+            continue;
+        }
+        if word == "--" {
+            options_done = true;
+            continue;
+        }
+        if word.starts_with("--") {
+            match word.as_ref() {
+                "--stdin" => from_stdin = true,
+                "--dry-run" => dry_run = true,
+                // Every positional is a repository: nothing is written but
+                // remote-tracking refs and FETCH_HEAD.
+                "--multiple" | "--all" if !pull => return None,
+                long if FETCH_VALUE_OPTIONS.contains(&long) => idx += 1,
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(at) = word[1..].find(|c| FETCH_VALUE_SHORT.contains(c)) {
+            if at + 2 == word.len() {
+                idx += 1;
+            }
+        }
+    }
+    let (source, refspecs) = positionals.split_first()?;
+    let (source_dir, source_known) = local_fetch_source(source, effective_dir, &globals.work_dir)?;
+    unknown |= !source_known;
+    let mut published: Vec<Refspec> = Vec::new();
+    for raw in refspecs {
+        let body = raw.strip_prefix('+').unwrap_or(raw);
+        if body.starts_with('^') {
+            continue;
+        }
+        let (src, dst) = match body.split_once(':') {
+            Some((src, dst)) => (src, Some(dst)),
+            None => (body, None),
+        };
+        let writes = match dst {
+            Some(dst) => !dst.is_empty() && !dst.starts_with("refs/remotes/"),
+            None => pull,
+        };
+        if !writes {
+            continue;
+        }
+        let src = if src.is_empty() { "HEAD" } else { src };
+        published.push(Refspec {
+            raw: raw.clone(),
+            source: Some(src.to_string()),
+            destination: dst.map(str::to_string),
+            is_delete: false,
+            implicit: false,
+        });
+    }
+    if from_stdin {
+        unknown = true;
+    } else if refspecs.is_empty() && pull {
+        published.push(Refspec {
+            raw: "HEAD".to_string(),
+            source: Some("HEAD".to_string()),
+            destination: None,
+            is_delete: false,
+            implicit: true,
+        });
+    }
+    if published.is_empty() && !from_stdin {
+        return None;
+    }
+    if !unknown && lexical_dir(&source_dir) == lexical_dir(&destination) {
+        // A repository fetching from itself publishes nothing new.
+        return None;
+    }
+    if published.is_empty() {
+        published.push(Refspec {
+            raw: "HEAD".to_string(),
+            source: Some("HEAD".to_string()),
+            destination: None,
+            is_delete: false,
+            implicit: true,
+        });
+    }
+    Some(PushInvocation {
+        work_dir: source_dir,
+        refspecs: published,
+        all_or_mirror: false,
+        tags: false,
+        dry_run,
+        mirror: false,
+        follow_tags: None,
+        recurse_submodules: None,
+        unresolved: unknown,
+        repository_unresolved: unknown,
+        directory_unverified: false,
+        config_destinations: Vec::new(),
+        destination_unreadable: false,
+        config_remotes: Vec::new(),
+        repository: Some(destination),
+        // Invisible to a reading of the text for `git push`, as an aliased
+        // push is: judged from these fields wherever it runs.
+        via_alias: true,
+    })
+}
+
+/// The value of the last `--git-dir` among git's global words.
+fn git_dir_value(globals: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut words = globals.iter();
+    while let Some(word) = words.next() {
+        let word = unescape_word(word);
+        if let Some(value) = word.strip_prefix("--git-dir=") {
+            found = Some(value.to_string());
+        } else if word == "--git-dir" {
+            found = words.next().map(|value| unescape_word(value).into_owned());
+        }
+    }
+    found
+}
+
+/// The directory a `git fetch`/`git pull` source names, when it is local, and
+/// whether the text says which one: `None` for a remote name or URL. `$PWD`
+/// is the shell's directory (`shell_dir`); every other relative path resolves
+/// against git's own (`git_dir`, after `-C`). A bare word is a remote name
+/// unless a directory of that name exists there — git's own order is the
+/// remote first, so this can only read a remote as a path, never the
+/// reverse. Any other expansion is a local path of unknown place.
+fn local_fetch_source(source: &str, shell_dir: &str, git_dir: &str) -> Option<(String, bool)> {
+    for pwd in ["$PWD", "${PWD}"] {
+        if let Some(rest) = source.strip_prefix(pwd)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            if rest.contains(['$', '`']) {
+                return Some((shell_dir.to_string(), false));
+            }
+            return Some((format!("{shell_dir}{rest}"), true));
+        }
+    }
+    if source.contains(['$', '`']) {
+        return Some((shell_dir.to_string(), false));
+    }
+    let path = if let Some(rest) = source.strip_prefix("file://") {
+        rest
+    } else if source.contains("://") || scp_like(source) {
+        return None;
+    } else {
+        source
+    };
+    let bare = !path.contains('/') && !matches!(path, "." | "..") && !path.starts_with('~');
+    let dir = resolve_cd_target(path, git_dir);
+    if bare && !std::path::Path::new(&dir).is_dir() {
+        return None;
+    }
+    Some((dir, true))
+}
+
+/// `host:path` — git's scp-like URL: a colon before any slash.
+fn scp_like(source: &str) -> bool {
+    match (source.find(':'), source.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// `path` with `.` and `..` components folded, for comparing two spellings.
+fn lexical_dir(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// A push this walk knows may run but cannot place or describe: every
@@ -5076,6 +5358,137 @@ mod tests {
         let closed = format!("{}git push origin main", "(cd a;".repeat(40));
         let pushes = push_invocations(&format!("{closed}{}", ")".repeat(40)), "/repo");
         assert!(pushes[0].work_dir.starts_with("/repo/a/a"), "{pushes:?}");
+    }
+
+    /// A fetch or pull run in another local repository from a local source
+    /// is the push from that source to it (cameronsjo/cadence-hooks#1294).
+    /// Rows are `(command, Some((work_dir, repository, refspec sources,
+    /// unresolved)))` for a publish, `None` for a read; `{sib}` is an existing
+    /// directory beside the destination, so its bare name is a path.
+    #[test]
+    fn a_reverse_fetch_into_another_repository_is_a_push() {
+        let root = tempfile::tempdir().expect("create root");
+        let root = root.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(format!("{root}/dst/sib")).expect("create sibling");
+        std::fs::create_dir_all(format!("{root}/work")).expect("create work");
+        let cwd = format!("{root}/work");
+        let dst = format!("{root}/dst");
+        type Want<'a> = Option<(&'a str, &'a str, &'a [&'a str], bool)>;
+        let rows: Vec<(String, Want)> = vec![
+            (
+                "git -C ../dst fetch \"$PWD\" main:main".into(),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                format!("git -C {dst} fetch {cwd} +main:refs/heads/x"),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                format!("git -C {dst} fetch file://{cwd} main:main"),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                "git --git-dir=../dst fetch . main:main".into(),
+                Some((".", &dst, &["main"], false)),
+            ),
+            (
+                "GIT_DIR=../dst git fetch . a:b c:refs/remotes/o/c".into(),
+                Some((".", &dst, &["a"], false)),
+            ),
+            (
+                "git -C ../dst fetch --depth 1 -j 4 \"$PWD\" main:main".into(),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                "git -C ../dst pull \"$PWD\" main".into(),
+                Some((&cwd, &dst, &["main"], false)),
+            ),
+            (
+                "git -C ../dst pull \"$PWD\"".into(),
+                Some((&cwd, &dst, &["HEAD"], false)),
+            ),
+            (
+                "git -C ../dst fetch sib main:main".into(),
+                Some(("sib", &dst, &["main"], false)),
+            ),
+            (
+                "git -C ../dst fetch \"$SRC\" main:main".into(),
+                Some((&cwd, &dst, &["main"], true)),
+            ),
+            (
+                "git -C \"$D\" fetch \"$PWD\" main:main".into(),
+                Some((&cwd, &cwd, &["main"], true)),
+            ),
+            (
+                "export GIT_DIR=../dst; git fetch \"$PWD\" main:main".into(),
+                Some((&cwd, &cwd, &["main"], true)),
+            ),
+            (
+                "git -C ../dst fetch --stdin \"$PWD\"".into(),
+                Some((&cwd, &dst, &["HEAD"], true)),
+            ),
+            // Reads: the own repository, a remote, no destination, a
+            // remote-tracking destination, the destination itself.
+            ("git fetch".into(), None),
+            ("git pull".into(), None),
+            ("git fetch origin main:main".into(), None),
+            ("git fetch . main:feature".into(), None),
+            ("git fetch ../dst main:main".into(), None),
+            ("git -C ../dst fetch origin".into(), None),
+            ("git -C ../dst fetch origin main:main".into(), None),
+            ("git -C ../dst pull".into(), None),
+            ("git -C ../dst pull --rebase upstream main".into(), None),
+            ("git -C ../dst fetch \"$PWD\" main".into(), None),
+            (
+                "git -C ../dst fetch \"$PWD\" main:refs/remotes/w/main".into(),
+                None,
+            ),
+            ("git -C ../dst fetch \"$PWD\" ^main".into(), None),
+            ("git -C ../dst fetch . main:main".into(), None),
+            (
+                "git -C ../dst fetch --multiple \"$PWD\" origin".into(),
+                None,
+            ),
+            (
+                "git -C ../dst fetch https://example.com/x.git main:main".into(),
+                None,
+            ),
+            ("git -C ../dst fetch host:x.git main:main".into(), None),
+        ];
+        for (command, want) in rows {
+            let found = push_locations(&command, &cwd);
+            match want {
+                None => assert!(found.is_empty(), "{command}: {found:?}"),
+                Some((work_dir, repository, sources, unresolved)) => {
+                    assert_eq!(found.len(), 1, "{command}: {found:?}");
+                    let push = &found[0];
+                    let at = |p: &str| lexical_dir(&resolve_cd_target(p, &cwd));
+                    let place = |p: &str| {
+                        if p == "sib" {
+                            at(&format!("{dst}/sib"))
+                        } else {
+                            at(p)
+                        }
+                    };
+                    if !unresolved {
+                        assert_eq!(lexical_dir(&push.work_dir), place(work_dir), "{command}");
+                        assert_eq!(
+                            push.repository.as_deref().map(lexical_dir),
+                            Some(at(repository)),
+                            "{command}"
+                        );
+                    }
+                    let got: Vec<&str> = push
+                        .refspecs
+                        .iter()
+                        .filter_map(|r| r.source.as_deref())
+                        .collect();
+                    assert_eq!(got, sources, "{command}");
+                    assert_eq!(push.repository_unresolved, unresolved, "{command}");
+                    assert!(push.via_alias, "{command}");
+                }
+            }
+        }
     }
 
     #[test]

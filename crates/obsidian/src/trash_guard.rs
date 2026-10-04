@@ -877,7 +877,7 @@ fn expand_known_variable(
         }
         rest
     };
-    let reads = command.matches(&plain).count();
+    let reads = command.matches(&plain).count() + command.matches(&braced).count();
     if command.matches(name).count() != reads {
         return None;
     }
@@ -1895,6 +1895,106 @@ mod tests {
             &FakeFs::default(),
         );
         assert_eq!(result.outcome, Allow);
+    }
+
+    /// A vault for the directory-change rows: its files, its directory
+    /// listings, and directories that canonicalize elsewhere.
+    struct MovedFs {
+        files: HashSet<String>,
+        listings: std::collections::HashMap<String, Vec<String>>,
+        links: std::collections::HashMap<String, String>,
+    }
+
+    impl FileMeta for MovedFs {
+        fn exists(&self, path: &str) -> bool {
+            self.files.contains(path) || self.listings.contains_key(path)
+        }
+        fn canonical_dir(&self, path: &str) -> Option<String> {
+            self.links.get(path).cloned()
+        }
+        fn entries(&self, path: &str) -> Option<Vec<String>> {
+            self.listings.get(path).cloned()
+        }
+    }
+
+    /// A deletion runs in the directory a `cd` moved it to, at the top level,
+    /// in a substitution's subshell, in a backtick span, or in a script a
+    /// wrapper runs (cameronsjo/cadence-hooks#1271). Every row runs from
+    /// `/work`, outside the vault `/vault`; every Block row but the climbs
+    /// was ALLOW before.
+    /// A `cd` whose target the text cannot name blocks only a deletion that
+    /// names something the vault holds.
+    #[test]
+    fn a_deletion_is_judged_where_a_cd_in_the_command_moves_it() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let fs = MovedFs {
+            files: ["/vault/Runbooks/x.md", "/vault/a.md"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            listings: [
+                ("/vault", vec!["Runbooks", "a.md", ".obsidian"]),
+                ("/vault/Runbooks", vec!["x.md"]),
+            ]
+            .into_iter()
+            .map(|(dir, names)| {
+                (
+                    dir.to_string(),
+                    names.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect(),
+            links: [("/work/vlink", "/vault")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let judge = |command: &str| {
+            check_destructive_in_vault_at(command, "/work", "/vault", Some("/home/me"), &fs).outcome
+        };
+        for (command, want) in [
+            // The report, verbatim, and its other spellings.
+            ("echo $(cd \"$OBSIDIAN_VAULT\"; rm Runbooks/x.md)", Block),
+            ("cd \"$OBSIDIAN_VAULT\"; rm Runbooks/x.md", Block),
+            ("cd \"${OBSIDIAN_VAULT}/Runbooks\" && rm x.md", Block),
+            ("echo $(cd /vault; rm Runbooks/x.md)", Block),
+            ("echo $(cd /vault && rm Runbooks/x.md)", Block),
+            ("(cd /vault; rm Runbooks/x.md)", Block),
+            ("echo `cd /vault; rm Runbooks/x.md`", Block),
+            ("bash -c 'cd /vault; rm Runbooks/x.md'", Block),
+            ("eval 'cd /vault; rm a.md'", Block),
+            ("cd ../vault && rm Runbooks/x.md", Block),
+            ("echo $(cd ..; cd vault; rm a.md)", Block),
+            ("builtin cd -P /vault && rm a.md", Block),
+            ("pushd /vault && rm a.md && popd", Block),
+            ("cd vlink && rm a.md", Block),
+            ("cd /vault/Runbooks && rm -f *.md", Block),
+            ("cd && rm -rf ../../vault", Block),
+            // A target the text cannot name: judged by what the vault holds.
+            ("cd \"$D\" && rm a.md", Block),
+            ("cd \"$D\" && rm -f *.md", Block),
+            ("cd \"$D\" && rm -rf ..", Block),
+            ("cd - && rm a.md", Block),
+            ("cd \"$D\" && rm -f *.o", Allow),
+            ("cd \"$D\" && rm -rf build dist", Allow),
+            ("cd - && rm -f out.log", Allow),
+            // A variable the command may set is not the guard's value.
+            (
+                "OBSIDIAN_VAULT=/tmp; cd \"$OBSIDIAN_VAULT\" && rm -f *.o",
+                Allow,
+            ),
+            // Everyday moves that never reach the vault.
+            ("cd /tmp && rm -rf build", Allow),
+            ("cd .. && rm -rf work/target", Allow),
+            ("cd ~/proj && rm -f a.md", Allow),
+            ("echo $(cd /tmp; rm a.md)", Allow),
+            ("(cd sub && rm -rf node_modules)", Allow),
+            ("pushd /srv && rm -f a.md && popd", Allow),
+            ("rm a.md", Allow),
+            ("cd /vault && ls", Allow),
+        ] {
+            assert_eq!(judge(command), want, "{command}");
+        }
     }
 
     /// Fake canonicalizer: maps a directory to its canonical form, or reports
