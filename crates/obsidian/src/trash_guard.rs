@@ -7,10 +7,10 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
-    executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
-    redirect_operator_span, redirect_targets, skip_git_global_options, strip_verbatim_prefix,
-    tokenize,
+    UNRESOLVABLE_DIR, carries_substitution, child_scripts, clobber_redirect_targets,
+    command_segments, command_word, executable_tokens, executable_tokens_marked, looks_absolute,
+    peel_command_runners, redirect_operator_span, redirect_targets, segment_work_dirs,
+    skip_git_global_options, strip_group_wrappers, strip_verbatim_prefix, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -667,7 +667,9 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Deletions) {
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
         let verb = command_word(first);
         if let Some(moved) = directory_move(&verb, argv) {
-            out.moves.push(moved);
+            // A move a re-scanned script makes is never a top-level segment.
+            let at = if depth == 0 { segment.as_str() } else { "" };
+            out.moves.push((at.to_string(), moved));
         }
         if head_deletes(argv) {
             let mut start = 1;
@@ -725,7 +727,8 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Deletions) {
 #[derive(Default)]
 struct Deletions {
     operands: Vec<String>,
-    moves: Vec<DirMove>,
+    /// Each change with the segment that makes it (empty inside a re-scan).
+    moves: Vec<(String, DirMove)>,
 }
 
 /// One directory change, as written. Where it lands is settled later
@@ -797,10 +800,11 @@ const MAX_MOVED_DIRS: usize = 32;
 /// `$OBSIDIAN_VAULT` and `$HOME` at the head of a target are read as the
 /// values the guard holds, unless the command names the variable anywhere
 /// other than in such a read (it may set it). Any other expansion is unknown.
-fn moved_directories(
-    moves: &[DirMove],
+fn moved_directories<'a>(
+    moves: impl IntoIterator<Item = &'a DirMove>,
     command: &str,
     cwd: &str,
+    bases: &[String],
     vault: &str,
     home: Option<&str>,
 ) -> (Vec<String>, bool) {
@@ -841,6 +845,7 @@ fn moved_directories(
             vec![cwd.to_string()]
         } else {
             std::iter::once(cwd.to_string())
+                .chain(bases.iter().cloned())
                 .chain(dirs.iter().cloned())
                 .collect()
         };
@@ -1174,12 +1179,56 @@ fn operands_touch_vault(
     false
 }
 
-/// Does a relative deletion operand land in the vault from a directory some
-/// `cd`/`pushd` in the command moves to ([`moved_directories`])? Lexically,
-/// and through the directory's canonical form so a `cd` into a symlink to
-/// the vault counts; in a directory the text cannot name, by what the vault
-/// holds ([`unknown_dir_operand_reaches_vault`]). Absolute and `~` operands
-/// do not depend on the directory and are judged by the caller.
+/// The distinct relative operands in `operands`: the ones whose target
+/// depends on the directory the deletion runs in.
+fn relative_operands(operands: &[String]) -> Vec<&String> {
+    let mut seen = std::collections::HashSet::new();
+    operands
+        .iter()
+        .filter(|operand| !looks_absolute(operand) && !operand.starts_with('~'))
+        .filter(|operand| seen.insert(operand.as_str()))
+        .collect()
+}
+
+/// Does any of `relative` land in the vault from `dir` — lexically, or
+/// through `dir`'s canonical form, so a `cd` into a symlink to the vault
+/// counts?
+fn reaches_vault_from(
+    relative: &[&String],
+    dir: &str,
+    vault: &str,
+    home: Option<&str>,
+    meta: &dyn FileMeta,
+) -> bool {
+    let canonical = meta
+        .canonical_dir(dir)
+        .map(|c| normalize_path(&c))
+        .filter(|c| c != dir);
+    std::iter::once(dir)
+        .chain(canonical.as_deref())
+        .any(|base| {
+            relative
+                .iter()
+                .any(|operand| operand_lexically_touches_vault(operand, base, vault, home))
+        })
+}
+
+/// Does a relative deletion operand land in the vault from a directory a
+/// `cd`/`pushd` in the command moves it to (cameronsjo/cadence-hooks#1271)?
+/// Absolute and `~` operands do not depend on the directory and are judged
+/// by the caller; a directory the text cannot name is judged by what the
+/// vault holds ([`unknown_dir_operand_reaches_vault`]).
+///
+/// - **Top-level segments are placed exactly.** [`segment_work_dirs`] says
+///   where each one runs — a `( … )` subshell's `cd` ends at its `)`, `cd -`
+///   and `popd` return where they went — and each deletion in a segment that
+///   runs away from `cwd` is judged there.
+/// - **A move inside a body is over-approximated.** A `cd` in a `$( … )`,
+///   backtick, `<( … )` or wrapper script moves only that body's subshell,
+///   and the splitter may cut the body across segments, so once any move sits
+///   in a body every relative deletion operand in the command is also judged
+///   in each directory any move in it can reach ([`moved_directories`]): it
+///   can add a block, never lift one. `$OBSIDIAN_VAULT` and `$HOME` read as the values the guard holds.
 fn relative_operand_moved_into_vault(
     deletions: &Deletions,
     command: &str,
@@ -1188,41 +1237,118 @@ fn relative_operand_moved_into_vault(
     home: Option<&str>,
     meta: &dyn FileMeta,
 ) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let relative: Vec<&String> = deletions
-        .operands
+    let located = segment_work_dirs(&with_known_dirs(command, vault, home), cwd);
+    let tops: std::collections::HashSet<&str> = located
         .iter()
-        .filter(|operand| !looks_absolute(operand) && !operand.starts_with('~'))
-        .filter(|operand| seen.insert(operand.as_str()))
+        .map(|segment| strip_group_wrappers(&segment.raw).trim())
         .collect();
+    let mut top_dirs: Vec<String> = Vec::new();
+    let mut judged = 0;
+    for segment in &located {
+        let dir: &str = &segment.dir;
+        if dir == cwd
+            || !DELETING_SPELLINGS
+                .iter()
+                .any(|verb| segment.raw.contains(verb))
+        {
+            continue;
+        }
+        judged += 1;
+        if judged > MAX_JUDGED_SEGMENTS {
+            return true;
+        }
+        let mut here = Deletions::default();
+        deletion_operands(&segment.raw, 0, &mut here);
+        let relative = relative_operands(&here.operands);
+        // Each operand may cost a stat: past the cap the answer is yes, as
+        // it is past the canonicalize budget.
+        if relative.len() > MAX_JUDGED_OPERANDS {
+            return true;
+        }
+        let reaches = if dir == UNRESOLVABLE_DIR {
+            relative
+                .iter()
+                .any(|operand| unknown_dir_operand_reaches_vault(operand, vault, meta))
+        } else {
+            if !top_dirs.iter().any(|known| known == dir) && top_dirs.len() < MAX_MOVED_DIRS {
+                top_dirs.push(dir.to_string());
+            }
+            reaches_vault_from(&relative, dir, vault, home, meta)
+        };
+        if reaches {
+            return true;
+        }
+    }
+
+    // The splitter can cut a body at a `;` inside it, so the moves after the
+    // cut read as top-level segments of their own (`echo $(cd ..; cd vault;
+    // rm x)`): once any move sits in a body, every move is read as one.
+    if deletions.moves.iter().all(|(segment, _)| {
+        tops.contains(strip_group_wrappers(&with_known_dirs(segment, vault, home)).trim())
+    }) {
+        return false;
+    }
+    let relative = relative_operands(&deletions.operands);
     if relative.is_empty() {
         return false;
     }
-    // Each operand is judged in every directory, and in one the text cannot
-    // name it costs a stat: past the cap the answer is yes, as it is past the
-    // canonicalize budget.
     if relative.len() > MAX_JUDGED_OPERANDS {
         return true;
     }
-    let (dirs, unknown) = moved_directories(&deletions.moves, command, cwd, vault, home);
-    for dir in &dirs {
-        let canonical = meta
-            .canonical_dir(dir)
-            .map(|c| normalize_path(&c))
-            .filter(|c| c != dir);
-        for base in std::iter::once(dir).chain(canonical.as_ref()) {
-            if relative
+    let moves = deletions.moves.iter().map(|(_, moved)| moved);
+    let (dirs, unknown) = moved_directories(moves, command, cwd, &top_dirs, vault, home);
+    dirs.iter()
+        .any(|dir| reaches_vault_from(&relative, dir, vault, home, meta))
+        || (unknown
+            && relative
                 .iter()
-                .any(|operand| operand_lexically_touches_vault(operand, base, vault, home))
-            {
-                return true;
-            }
+                .any(|operand| unknown_dir_operand_reaches_vault(operand, vault, meta)))
+}
+
+/// `command` with each read of `$OBSIDIAN_VAULT`/`$HOME` replaced by the
+/// value the guard holds, for placing the segments a `cd` to one moves
+/// ([`expand_known_variable`]'s rule for when that value is the one the
+/// shell reads). A value with any character the shell treats specially is
+/// left as written: the walk then reads that `cd` as going where it cannot
+/// say.
+fn with_known_dirs<'a>(
+    command: &'a str,
+    vault: &str,
+    home: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    let mut out = std::borrow::Cow::Borrowed(command);
+    for (name, value) in [("OBSIDIAN_VAULT", Some(vault)), ("HOME", home)] {
+        let Some(value) = value.filter(|v| {
+            !v.is_empty()
+                && v.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':')
+                })
+        }) else {
+            continue;
+        };
+        let plain = format!("${name}");
+        let braced = format!("${{{name}}}");
+        let reads = out.matches(&plain).count() + out.matches(&braced).count();
+        if reads == 0 || out.matches(name).count() != reads {
+            continue;
         }
+        let replaced = out.replace(&braced, value);
+        let mut text = String::with_capacity(replaced.len());
+        let mut rest = replaced.as_str();
+        while let Some(at) = rest.find(&plain) {
+            let after = &rest[at + plain.len()..];
+            text.push_str(&rest[..at]);
+            if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                text.push_str(&plain);
+            } else {
+                text.push_str(value);
+            }
+            rest = after;
+        }
+        text.push_str(rest);
+        out = std::borrow::Cow::Owned(text);
     }
-    unknown
-        && relative
-            .iter()
-            .any(|operand| unknown_dir_operand_reaches_vault(operand, vault, meta))
+    out
 }
 
 /// Check if a destructive command targets the Obsidian vault, or if a
@@ -2005,6 +2131,30 @@ mod tests {
             ("pushd /srv && rm -f a.md && popd", Allow),
             ("rm a.md", Allow),
             ("cd /vault && ls", Allow),
+            // A top-level move is placed exactly: a subshell's `cd` ends at
+            // its `)`, and `cd -`/`popd` return where they left. (Spelled
+            // through the variable: a literal vault path anywhere in a
+            // deleting command blocks on its own, as it always has.)
+            ("(cd \"$OBSIDIAN_VAULT\" && git pull); rm -rf build", Allow),
+            // The directory walk does not follow `cd -` (it may also fail
+            // and stay), so a deletion after one is judged in the vault too.
+            (
+                "cd \"$OBSIDIAN_VAULT\" && git add -A && cd - && rm -f tmp.txt",
+                Block,
+            ),
+            (
+                "pushd \"$OBSIDIAN_VAULT\" && git status && popd && rm -rf build",
+                Allow,
+            ),
+            ("(cd \"$OBSIDIAN_VAULT\" && git pull) && rm a.md", Allow),
+            ("(cd \"$OBSIDIAN_VAULT\" && rm a.md)", Block),
+            // A move inside a body reaches every deletion in the command:
+            // an over-approximation, so this one blocks though bash deletes
+            // `build` in /work.
+            (
+                "x=$(cd \"$OBSIDIAN_VAULT\" && git log -1); rm -rf build",
+                Block,
+            ),
         ] {
             assert_eq!(judge(command), want, "{command}");
         }

@@ -11958,6 +11958,16 @@ fn scan_substitution_bodies_in(
             let span = (i + 1, j.min(chars.len()));
             let escaped = chars[span.0..span.1].contains(&'\\');
             record(span, true, escaped.then_some(body.as_str()));
+            // The reading this scan gave before bash's rule was applied —
+            // every escape pair dropped whole — is kept beside it where the
+            // two differ: it read `\\$(` as a live `$(`, which bash leaves
+            // literal, and a reading may only ever be added (#1271).
+            let dropped = escaped
+                .then(|| without_escape_pairs(&chars[span.0..span.1]))
+                .filter(|dropped| *dropped != body && !dropped.trim().is_empty());
+            if dropped.is_some() {
+                record(span, false, None);
+            }
             let quoting_unterminated =
                 j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]);
             let confident = j < chars.len() && !quoting_unterminated;
@@ -11969,6 +11979,7 @@ fn scan_substitution_bodies_in(
                 }
                 bodies.push(body);
             }
+            bodies.extend(dropped);
             // The closing backtick was found (j < chars.len()), but the span's
             // own quoting never resolved — an unterminated `'…'`/`"…"`/`$'…'`
             // inside it. The outer segment splitter doesn't know backticks
@@ -12046,6 +12057,22 @@ fn backtick_body(chars: &[char], j: &mut usize, in_double: bool) -> String {
     }
     *j = (*j).min(chars.len());
     body
+}
+
+/// `text` with every backslash escape pair dropped whole: the backtick body
+/// this scan read before [`backtick_body`] applied bash's rule.
+fn without_escape_pairs(text: &[char]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        if text[at] == '\\' {
+            at += 2;
+            continue;
+        }
+        out.push(text[at]);
+        at += 1;
+    }
+    out
 }
 
 /// One assignment a segment makes, as [`segment_assignments`] reads it.

@@ -1395,7 +1395,8 @@ fn reverse_fetch_invocation(
         config_destinations: Vec::new(),
         destination_unreadable: false,
         config_remotes: Vec::new(),
-        repository: Some(destination),
+        // An unknown destination is refused, not looked up.
+        repository: (!unknown).then_some(destination),
         // Invisible to a reading of the text for `git push`, as an aliased
         // push is: judged from these fields wherever it runs.
         via_alias: true,
@@ -1425,6 +1426,17 @@ fn git_dir_value(globals: &[String]) -> Option<String> {
 /// remote first, so this can only read a remote as a path, never the
 /// reverse. Any other expansion is a local path of unknown place.
 fn local_fetch_source(source: &str, shell_dir: &str, git_dir: &str) -> Option<(String, bool)> {
+    // Past any real path length nothing is resolved or stat-ed: a `cd a; …`
+    // flood grows the directory with every move, and resolving each fetch
+    // against it was quadratic. A local source there is of unknown place.
+    let past_path_max = |dir: &str| dir.len() > crate::shell::MAX_DIR_LEN;
+    if past_path_max(shell_dir) || past_path_max(git_dir) {
+        let local = source.contains(['/', '$', '`'])
+            || matches!(source, "." | "..")
+            || source.starts_with('~');
+        let remote = source.contains("://") && !source.starts_with("file://") || scp_like(source);
+        return (local && !remote).then(|| (shell_dir.to_string(), false));
+    }
     for pwd in ["$PWD", "${PWD}"] {
         if let Some(rest) = source.strip_prefix(pwd)
             && (rest.is_empty() || rest.starts_with('/'))
