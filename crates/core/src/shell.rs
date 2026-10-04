@@ -4848,8 +4848,9 @@ thread_local! {
     static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many bounded git spawns this thread has attempted (including ones the
-/// shared deadline skipped). Lets a test pin "judged with N probes" without
+/// How many git spawns this thread has attempted through [`run_git_bounded`]
+/// (including ones the shared deadline skipped). Test support, public only
+/// because guard crates' tests call it. Lets a test pin "judged with N probes" without
 /// timing it: a wall-clock bound on a flood fails on a loaded runner with the
 /// guard behaving correctly (cadence-hooks#1228).
 pub fn git_spawn_count() -> usize {

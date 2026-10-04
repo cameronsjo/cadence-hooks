@@ -2436,11 +2436,10 @@ mod tests {
             let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
             let elapsed = started.elapsed();
             let spawns = cadence_hooks_core::shell::git_spawn_count() - spawns_before;
-            // One listing for the directory plus one URL resolve for `origin`.
+            // Measured 4 on a healthy run, independent of the push count.
             assert!(spawns <= 4, "{spawns} git spawns for one directory");
-            // Catastrophic-only backstop for a CPU-bound regression (a
-            // per-segment parse). Deliberately far above the ~2 s a healthy
-            // run takes on a loaded runner: the tight bound is what flaked.
+            // Hang guard only, not a performance assertion: far above a
+            // healthy run so runner load cannot trip it.
             assert!(
                 elapsed < std::time::Duration::from_secs(30),
                 "took {elapsed:?}"
