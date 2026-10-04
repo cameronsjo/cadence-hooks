@@ -114,8 +114,9 @@ pub struct PushInvocation {
     /// - a `--git-dir`/`--work-tree` flag, or a `GIT_DIR=`/`GIT_WORK_TREE=` env
     ///   assignment, pointing git at a repository this walk would have to model
     ///   git's setup rules to name correctly;
-    /// - a directory change this walk could not follow — a bare `cd`, `cd -`, a
-    ///   `$`-bearing target, `popd`, a bare `pushd`. Every later push in that
+    /// - a directory change this walk could not follow — a bare `cd`, a
+    ///   `$`-bearing target, a flagged `pushd` — or a `cd -`/`popd` back to a
+    ///   directory the command never recorded. Every later push in that
     ///   scope is marked, because the tracked directory is now a guess.
     ///
     /// **Which refs** — a bare push may publish more than the current branch:
@@ -142,9 +143,11 @@ pub struct PushInvocation {
     pub repository_unresolved: bool,
     /// A directory change before this push that the walk could not follow,
     /// with no which-repository cause in play: a `cd`/`pushd` whose target it
-    /// cannot read (`cd "$VAR"`, `cd -`, `cd $(other)`), `popd`, or a bare
-    /// `cd`. The push may run in another directory, but nothing shows it is
-    /// meant to reach another repository, so an ownership guard nudges on it
+    /// cannot read (`cd "$VAR"`, `cd $(other)`), or a bare `cd`; a `cd -` or
+    /// `popd` back to the session's own `$OLDPWD` or stack is a
+    /// which-repository doubt instead (cameronsjo/cadence-hooks#1300). The
+    /// push may run in another directory, but nothing shows it is meant to
+    /// reach another repository, so an ownership guard nudges on it
     /// rather than blocking. Implies [`PushInvocation::unresolved`]
     /// (cadence-hooks#1095 ruling).
     pub directory_unverified: bool,
@@ -761,19 +764,29 @@ fn collect_push_invocations(
     // The directory half, kept apart so a caller can tell `cd "$VAR"` from an
     // `eval` or a `GIT_DIR=` redirect.
     let mut scope_directory = inherited.directory;
+    // Where `cd -` and `popd` return (cameronsjo/cadence-hooks#1300): the
+    // directory before this scope's last move (`$OLDPWD`) and the `pushd`
+    // stack this scope built, each with the directory doubt it had. Both are
+    // unknown at the scope's start — they are the session's — and a return to
+    // an unknown one sets `scope_lost`, a which-repository doubt that fails
+    // closed, until a literal absolute `cd` says where the shell is again.
+    let mut dirs = DirHistory::default();
+    let mut scope_lost = false;
 
     // A `( … )` subshell's `cd` ends with it (cameronsjo/cadence-hooks#1172):
     // the directory state each open one started from, and the closes the
     // previous segment left to apply. Off for a script with a `case`, whose
     // `pattern)` arms read as closers this walk cannot tell from real ones.
     let mut scopes_subshells = !crate::shell::mentions_case_keyword(script);
-    let mut subshells: Vec<(String, bool)> = Vec::new();
+    let mut subshells: Vec<(String, bool, bool, DirHistory)> = Vec::new();
     let mut pending_closes = 0;
     for (segment, _next_op) in split_segments_with_ops(script) {
         for _ in 0..std::mem::take(&mut pending_closes) {
-            if let Some((dir, directory)) = subshells.pop() {
+            if let Some((dir, directory, lost, history)) = subshells.pop() {
                 effective_dir = dir;
                 scope_directory = directory;
+                scope_lost = lost;
+                dirs = history;
             }
         }
         if scopes_subshells {
@@ -786,7 +799,12 @@ fn collect_push_invocations(
                 scope_directory = true;
             } else {
                 for _ in 0..opens {
-                    subshells.push((effective_dir.clone(), scope_directory));
+                    subshells.push((
+                        effective_dir.clone(),
+                        scope_directory,
+                        scope_lost,
+                        dirs.clone(),
+                    ));
                 }
                 pending_closes = closes;
             }
@@ -898,7 +916,7 @@ fn collect_push_invocations(
         if unbalanced_closer {
             scope_unresolved = true;
         }
-        let segment_unresolved = scope_unresolved || prefix_redirect;
+        let segment_unresolved = scope_unresolved || scope_lost || prefix_redirect;
         // Known substitutions are read by name only when nothing in the
         // command can have redefined the name and the segment has no quoting
         // that could make the text a literal (cadence-hooks#1095 review).
@@ -1032,6 +1050,36 @@ fn collect_push_invocations(
 
         match directory_verb(&tokens, known_ok) {
             Some(DirectoryVerb::Knowable(verb_tokens)) => {
+                // A directory past any real path length is not recorded: it
+                // is a flood (`cd a; cd a; …`), and copying it per move was
+                // quadratic. A return to it fails closed instead.
+                let before = (effective_dir.len() <= MAX_RECORDED_DIR)
+                    .then(|| (effective_dir.clone(), scope_directory));
+                let back = match return_move(verb_tokens) {
+                    Some(ReturnMove::Back) => Some(dirs.oldpwd.take()),
+                    Some(ReturnMove::Pop) => Some(dirs.stack.pop()),
+                    Some(ReturnMove::Swap) => Some(dirs.stack.pop().inspect(|_| {
+                        dirs.push(before.clone());
+                    })),
+                    Some(ReturnMove::Unknown) => Some(None),
+                    None => None,
+                };
+                if let Some(back) = back {
+                    match back {
+                        Some((dir, directory)) => {
+                            effective_dir = dir;
+                            scope_directory = directory;
+                            dirs.oldpwd = before;
+                        }
+                        // The session's `$OLDPWD` or stack: unprovable.
+                        None => {
+                            scope_lost = true;
+                            dirs.oldpwd = None;
+                        }
+                    }
+                    continue;
+                }
+                let pushes = unescape_word(&verb_tokens[0]).as_ref() == "pushd";
                 match resolve_directory_verb(verb_tokens, known_ok) {
                     Some((target, absolute)) => {
                         // In place: a fresh join per `cd` copied the whole
@@ -1044,12 +1092,31 @@ fn collect_push_invocations(
                         // here. A which-repository doubt does not.
                         if absolute {
                             scope_directory = false;
+                            scope_lost = false;
                         }
+                        if pushes {
+                            dirs.push(before.clone());
+                        }
+                        dirs.oldpwd = before;
                     }
                     // The target could not be read. Keeping the pre-`cd`
                     // directory and saying nothing is the trap — see
                     // [`resolve_directory_verb`].
-                    None => scope_directory = true,
+                    None => {
+                        scope_directory = true;
+                        // An unflagged `pushd "$D"` still pushed the
+                        // directory it left; a flagged one may have rotated
+                        // or added anything, so the whole stack is unknown.
+                        if pushes && return_move(verb_tokens).is_none() {
+                            match verb_tokens.get(1).map(|word| unescape_word(word)) {
+                                Some(word) if !word.starts_with(['-', '+']) => {
+                                    dirs.push(before.clone());
+                                }
+                                _ => dirs.stack.clear(),
+                            }
+                        }
+                        dirs.oldpwd = before;
+                    }
                 }
                 continue;
             }
@@ -2153,6 +2220,100 @@ fn resolve_directory_verb(tokens: &[String], known_ok: bool) -> Option<(Option<&
                 crate::shell::looks_absolute(target),
             ))
         }
+        _ => None,
+    }
+}
+
+/// Where `cd -` and `popd` return, as far as one script scope has seen
+/// (cameronsjo/cadence-hooks#1300). Each entry is a directory and the
+/// directory doubt it carried when the shell left it.
+#[derive(Clone, Default)]
+struct DirHistory {
+    /// `$OLDPWD`: the directory before the scope's last move.
+    oldpwd: Option<(String, bool)>,
+    /// The `pushd` stack this scope built, top last. What lies below it is
+    /// the session's, so popping past it is unprovable.
+    stack: Vec<(String, bool)>,
+}
+
+/// Most `pushd` entries a scope remembers; older ones are forgotten, and a
+/// `popd` past what is remembered fails closed.
+const MAX_DIR_STACK: usize = 64;
+
+/// Longest directory [`DirHistory`] records (Linux's `PATH_MAX`).
+const MAX_RECORDED_DIR: usize = 4096;
+
+impl DirHistory {
+    /// Push `entry`, or — when it was too long to record — forget the whole
+    /// stack, so every later `popd` fails closed.
+    fn push(&mut self, entry: Option<(String, bool)>) {
+        let Some(entry) = entry else {
+            self.stack.clear();
+            return;
+        };
+        if self.stack.len() >= MAX_DIR_STACK {
+            self.stack.remove(0);
+        }
+        self.stack.push(entry);
+    }
+}
+
+/// A directory verb that returns somewhere this walk may have recorded.
+enum ReturnMove {
+    /// `cd -` (with any `-L`/`-P`/`--` before it): `$OLDPWD`.
+    Back,
+    /// A bare `popd`: the top of the stack.
+    Pop,
+    /// A bare `pushd`: swap the top of the stack with the current directory.
+    Swap,
+    /// `cd ~-…`, `popd` with an operand or flag, `pushd -`/`+N`/`-N`: a
+    /// return this walk does not model. The tokenizer has removed the quotes
+    /// that decide whether `~-` is `$OLDPWD` or a directory named `~-`.
+    Unknown,
+}
+
+/// The return a directory verb makes, or `None` for a move
+/// [`resolve_directory_verb`] reads. `tokens` begins at the verb.
+fn return_move(tokens: &[String]) -> Option<ReturnMove> {
+    let verb = unescape_word(tokens.first()?);
+    let rest = strip_redirections(&tokens[1..]);
+    let words: Vec<_> = rest.iter().map(|word| unescape_word(word)).collect();
+    match verb.as_ref() {
+        "cd" => {
+            let operands: Vec<_> = words
+                .iter()
+                .skip_while(|word| matches!(word.as_ref(), "-L" | "-P" | "-e" | "-@" | "--"))
+                .collect();
+            match operands.as_slice() {
+                [only] if only.as_ref() == "-" => Some(ReturnMove::Back),
+                [only] if only.starts_with("~-") => Some(ReturnMove::Unknown),
+                _ => None,
+            }
+        }
+        "popd" => Some(if words.is_empty() {
+            ReturnMove::Pop
+        } else {
+            ReturnMove::Unknown
+        }),
+        "pushd" => match words.as_slice() {
+            [] => Some(ReturnMove::Swap),
+            [only]
+                if only.as_ref() == "-"
+                    || only.starts_with('+')
+                    || only.starts_with("~-")
+                    || only.starts_with("~+") =>
+            {
+                Some(ReturnMove::Unknown)
+            }
+            [only]
+                if only.starts_with('-')
+                    && only.len() > 1
+                    && only[1..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                Some(ReturnMove::Unknown)
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3813,7 +3974,9 @@ mod tests {
             ),
             // An unreadable target is the directory half, not this one.
             ("cd \"$DIR\" && git push origin main", "/repo", false),
-            ("cd - && git push origin main", "/repo", false),
+            // The session's `$OLDPWD` is unprovable: which repository
+            // (cameronsjo/cadence-hooks#1300).
+            ("cd - && git push origin main", "/repo", true),
             ("GIT_DIR=/x/.git git push origin main", "/repo", true),
             (
                 "export GIT_DIR=/x/.git; git push origin main",
@@ -5360,7 +5523,6 @@ mod tests {
             "cd \"$HOME/other\" && git push origin main",
             "cd \"$(git rev-parse --show-toplevel)/sub\" && git push origin main",
             "cd \"$(git -C /other rev-parse --show-toplevel)\" && git push origin main",
-            "cd -; git push origin main",
             "cd; git push origin main",
         ] {
             let invocation = only(command, "/repo");
@@ -6983,6 +7145,73 @@ mod tests {
             "git for-each-repo --config=k fetch origin",
         ] {
             assert_eq!(found(command), Vec::new(), "{command:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1300: `cd -` returns to `$OLDPWD` and `popd`
+    /// to the top of the stack, which this walk models when the same command
+    /// recorded them. A return to the session's own `$OLDPWD` or stack is a
+    /// which-repository doubt, so fail-closed callers refuse it. Each row was
+    /// checked against bash 5.2 (`cd /tmp && cd - ; git push evil …` and the
+    /// `pushd`/`popd` pair published a canary from the starting repo).
+    #[test]
+    fn cd_dash_and_popd_return_where_the_command_left() {
+        // `(work_dir, repository_unresolved, directory_unverified)`.
+        let found = |command: &str| -> Vec<(String, bool, bool)> {
+            push_locations(command, "/r")
+                .into_iter()
+                .map(|push| {
+                    (
+                        push.work_dir,
+                        push.repository_unresolved,
+                        push.directory_unverified,
+                    )
+                })
+                .collect()
+        };
+        let at = |dir: &str| vec![(dir.to_string(), false, false)];
+        for (command, want) in [
+            ("cd /tmp && cd - ; git push origin main", at("/r")),
+            ("cd /tmp; cd -; git push origin main", at("/r")),
+            (
+                "cd /tmp && cd -- - >/dev/null && git push origin main",
+                at("/r"),
+            ),
+            ("A[0]=x cd /tmp && cd - ; git push origin main", at("/r")),
+            ("cd /a; cd /b; cd -; git push origin main", at("/a")),
+            ("cd /a; cd -; cd -; git push origin main", at("/a")),
+            ("cd -; cd /a && git push origin main", at("/a")),
+            ("pushd /a; popd; git push origin main", at("/r")),
+            (
+                "pushd /a >/dev/null; pushd /b; popd; git push origin main",
+                at("/a"),
+            ),
+            ("cd /t && pushd /a && pushd; git push origin main", at("/t")),
+            ("(cd /a && cd -); git push origin main", at("/r")),
+            ("cd /tmp; git push origin main; cd -", at("/tmp")),
+            // Back to a directory the walk could not read: still a nudge.
+            (
+                "cd \"$X\" && cd /a && cd - ; git push origin main",
+                vec![("/r".to_string(), false, true)],
+            ),
+        ] {
+            assert_eq!(found(command), want, "{command:?}");
+        }
+        // Unprovable returns fail closed.
+        for command in [
+            "cd - && git push origin main",
+            "cd /tmp && cd ~- ; git push origin main",
+            "popd; git push origin main",
+            "pushd /a; popd; popd; git push origin main",
+            "pushd; git push origin main",
+            "cd /a && popd +1; git push origin main",
+            "(cd /a; cd -; cd -) ; cd -; git push origin main",
+        ] {
+            let pushes = found(command);
+            assert!(
+                !pushes.is_empty() && pushes.iter().all(|(_, repository, _)| *repository),
+                "{command:?}: {pushes:?}"
+            );
         }
     }
 }

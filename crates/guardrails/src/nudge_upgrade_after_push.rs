@@ -20,6 +20,9 @@ use std::path::Path;
 
 const TARGET_REPO: &str = "cameronsjo/cadence-hooks";
 
+/// Most pushes one command is probed for. A real command pushes a handful.
+const MAX_PROBED_PUSHES: usize = 16;
+
 fn is_main(name: &str) -> bool {
     let name = name.strip_prefix("refs/heads/").unwrap_or(name);
     name == "main" || name == "master"
@@ -96,9 +99,20 @@ impl Check for NudgeUpgradeAfterPush {
             .unwrap_or_else(|| ".".to_string());
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
 
+        // Each probe spawns git, so an advisory nudge probes at most
+        // `MAX_PROBED_PUSHES` pushes, and each directory once: a flood of
+        // `git for-each-repo … push` segments spent the whole hook deadline
+        // here (cameronsjo/cadence-hooks#1299 review 2, I1).
+        let mut probed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         let pushed_main = push_invocations(command, cwd)
             .iter()
-            .any(|push| is_push_to_main(push) && is_cadence_hooks_checkout(&push.work_dir));
+            .take(MAX_PROBED_PUSHES)
+            .any(|push| {
+                is_push_to_main(push)
+                    && *probed
+                        .entry(push.work_dir.clone())
+                        .or_insert_with(|| is_cadence_hooks_checkout(&push.work_dir))
+            });
         if !pushed_main {
             return CheckResult::allow();
         }

