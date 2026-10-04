@@ -238,9 +238,7 @@ fn resolve_reader(tokens: &[String]) -> Option<(Cow<'_, str>, &[String], ReaderP
     loop {
         let (word, resolved) = resolve_command(argv)?;
         // `env`'s own assignments, dropped by the wrapper peel.
-        peel.rebound |= argv[..argv.len() - resolved.len()]
-            .iter()
-            .any(|t| is_assignment_word(t) && !assignment_is_inert(t));
+        peel.rebound |= prefix_rebinds(&argv[..argv.len() - resolved.len()]);
         let mut rest = resolved;
         while let Some(head) = rest.first() {
             let width = if is_assignment_word(head) {
@@ -305,6 +303,8 @@ fn assignment_is_inert(word: &str) -> bool {
         "VISUAL",
         "BROWSER",
         "GCONV_PATH",
+        // libmagic's default magic file: `file` prints what its rules match.
+        "MAGIC",
         "NODE_OPTIONS",
         "NODE_PATH",
         "JQ_LIBRARY_PATH",
@@ -314,6 +314,68 @@ fn assignment_is_inert(word: &str) -> bool {
     };
     let name = name.to_ascii_uppercase();
     !NAMES.contains(&name.as_str()) && !PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Do any of the assignments a wrapper peel dropped (`prefix`) rebind?
+fn prefix_rebinds(prefix: &[String]) -> bool {
+    prefix
+        .iter()
+        .any(|t| is_assignment_word(t) && !assignment_is_inert(t))
+}
+
+/// Does `file`'s argv load a magic file (`-m`/`--magic-file`) or read its
+/// names from a file (`-f`/`--files-from`, which prints each line it cannot
+/// open)? Either makes `file` print bytes it read, so it loses the
+/// metadata-only exemption. Short clusters are matched on any `m` or `f`
+/// letter and long options on any unique prefix, failing toward a block.
+fn file_reads_named_file(argv: &[String]) -> bool {
+    argv.iter().skip(1).any(|t| match t.strip_prefix("--") {
+        Some(long) => {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            name.len() >= 2 && ("magic-file".starts_with(name) || "files-from".starts_with(name))
+        }
+        None => t
+            .strip_prefix('-')
+            .is_some_and(|cluster| cluster.contains(['m', 'f'])),
+    })
+}
+
+/// The files `file`'s `-m`/`-f` options name, as `(argv index, path)`: an
+/// attached `--magic-file=X` or `-mX`, or the next word after an option or a
+/// cluster ending in `m` or `f`.
+fn file_named_values(argv: &[String]) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    for (i, t) in argv.iter().enumerate().skip(1) {
+        let next = argv.get(i + 1).map(|n| (i + 1, n.as_str()));
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some((i, value))),
+                None => (long, next),
+            };
+            if name.len() >= 2 && ("magic-file".starts_with(name) || "files-from".starts_with(name))
+            {
+                out.extend(value);
+            }
+        } else if let Some(cluster) = t.strip_prefix('-')
+            && let Some(at) = cluster.find(['m', 'f'])
+        {
+            let rest = &cluster[at + 1..];
+            out.extend(if rest.is_empty() {
+                next
+            } else {
+                Some((i, rest))
+            });
+        }
+    }
+    out
+}
+
+/// The metadata-only exemption for a resolved `word`: on the list, not a
+/// `file` that reads a named file, and not behind a rebinding assignment.
+fn metadata_exempt(word: &str, argv: &[String], rebound: bool) -> bool {
+    METADATA_SAFE_COMMANDS.contains(&word)
+        && !rebound
+        && !(word == "file" && file_reads_named_file(argv))
 }
 
 /// Spellings of standard input as a file operand.
@@ -1365,7 +1427,7 @@ fn segment_resolved_reads(
                 .map(|value| (cmd_word.to_string(), value.to_string()))
                 .collect();
         }
-    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) && !peel.rebound {
+    } else if metadata_exempt(&cmd_word, argv, peel.rebound) {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -1450,6 +1512,12 @@ fn segment_resolved_reads(
     }
     for (at, value) in attached_file_values(&cmd_word, argv) {
         uploads.entry(at).or_default().push(value);
+    }
+    // `file -m`/`-f` print bytes of the file they load (#1301 review I1).
+    if cmd_word == "file" {
+        for (at, value) in file_named_values(argv) {
+            uploads.entry(at).or_default().push(value);
+        }
     }
     // `gh api`'s endpoint is a URL path, and its `--input`/`-F key=@FILE`
     // values are files it sends (#1276).
@@ -3026,8 +3094,9 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
         .iter()
         .position(|t| EXEC_FLAGS.contains(&t.as_str()))
         .and_then(|i| tokens.get(i + 1..))?;
-    let (sub_word, _) = resolve_command(action)?;
-    if METADATA_SAFE_COMMANDS.contains(&sub_word.as_ref()) {
+    let (sub_word, sub_argv) = resolve_command(action)?;
+    let rebound = prefix_rebinds(&action[..action.len() - sub_argv.len()]);
+    if metadata_exempt(&sub_word, sub_argv, rebound) {
         return None;
     }
     let position = if PURE_FILE_READERS.contains(&sub_word.as_ref()) {
@@ -5088,10 +5157,12 @@ fn xargs_command(argv: &[String]) -> Option<&[String]> {
 fn xargs_reader(argv: &[String]) -> Option<String> {
     let sub = xargs_command(argv)?;
     let (word, sub_argv) = resolve_command(sub)?;
+    // `xargs env LD_PRELOAD=x ls` rebinds the `ls` it runs (#1296).
+    let rebound = prefix_rebinds(&sub[..sub.len() - sub_argv.len()]);
     let exempt = if word == "git" {
-        git_keeps_exemption(&sub_argv[1..])
+        !rebound && git_keeps_exemption(&sub_argv[1..])
     } else {
-        METADATA_SAFE_COMMANDS.contains(&word.as_ref())
+        metadata_exempt(&word, sub_argv, rebound)
     };
     (!exempt).then(|| word.into_owned())
 }
@@ -12710,6 +12781,7 @@ mod tests {
             ("XDG_CONFIG_HOME=/tmp", false),
             ("NODE_OPTIONS=--require=x", false),
             ("KUBECONFIG=x", false),
+            ("MAGIC=m", false),
             ("not-an-assignment", false),
         ] {
             assert_eq!(assignment_is_inert(word), inert, "{word}");
@@ -12731,5 +12803,65 @@ mod tests {
                 "{unit}"
             );
         }
+    }
+
+    #[test]
+    fn file_loading_a_named_file_loses_its_exemption() {
+        // #1301 review I1: a magic file's rules print what they match, and
+        // `-f` prints every line it cannot open as a name.
+        assert_bash(
+            &[
+                "MAGIC=m file .env",
+                "FOO=1 MAGIC=m file .env",
+                "file -m m .env",
+                "file -mm .env",
+                "file -bm m .env",
+                "file --magic-file m .env",
+                "file --magic-file=m .env",
+                "file --mag=m .env",
+                "file -f .env",
+                "file -f - < .env",
+                "file --files-from .env",
+                "file --files-from=prod.env",
+                "file -m prod.env x",
+                "file -fprod.env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "file prints bytes of a file it was told to load",
+        );
+        assert_bash(
+            &[
+                "file .env",
+                "file -b .env",
+                "file --mime-type .env",
+                "FOO=1 file .env",
+                "file -m /usr/share/misc/magic README.md",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "file reports a type",
+        );
+    }
+
+    #[test]
+    fn rebinding_env_behind_find_exec_and_xargs_is_judged() {
+        // #1301 review N1: the nested exemption sites consult the denylist.
+        assert_bash(
+            &[
+                "find . -name .env -exec env LD_PRELOAD=x ls {} +",
+                "echo .env | xargs env LD_PRELOAD=x ls",
+                "find . -name .env -exec file -f {} +",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a rebinding prefix voids the nested exemption",
+        );
+        assert_bash(
+            &[
+                "find . -name .env -exec env FOO=1 ls {} +",
+                "find . -name .env -exec ls -l {} +",
+                "echo .env | xargs env FOO=1 ls",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "an inert prefix keeps the nested exemption",
+        );
     }
 }
