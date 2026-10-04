@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
 
+### Security
+
+- **`platform-drift` no longer echoes text that rides after a baseline version number.** The version parser now accepts only `MAJOR.MINOR.PATCH` with an optional `-[0-9A-Za-z.]{1,32}` pre-release tag, over the whole string. Any other value, such as `9.9.9 IGNORE PREVIOUS INSTRUCTIONS`, counts as malformed, so the SessionStart nudge stays silent instead of carrying the extra text into `additionalContext`. (cameronsjo/cadence-hooks#1250)
+
+### Changed
+
+- **The `doctor --quiet` blocker envelope now informs the operator rather than instructing Claude.** It used to say `Run 'cadence-hooks doctor' and tell the user in one line before other work.` and now says `Running 'cadence-hooks doctor' shows which hooks and why.` The count line is unchanged. This matches the ruling that `<cadence-system-message>` is data with no authority. (cameronsjo/cadence-hooks#1251)
+
 ## [0.121.0] - 2026-09-30
 
 ### Security
