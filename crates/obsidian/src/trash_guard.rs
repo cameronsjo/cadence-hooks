@@ -336,6 +336,13 @@ pub trait FileMeta {
     fn canonical_dir(&self, _path: &str) -> Option<String> {
         None
     }
+
+    /// True iff `path` is an existing directory (symlinks followed). The
+    /// default, no directory, keeps every deletion judged where the shell
+    /// started: a `cd` into one that is not there fails and moves nothing.
+    fn is_dir(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// Production impl over `std::fs`. Uses `symlink_metadata(...).is_ok()` — a
@@ -344,6 +351,10 @@ pub struct RealFs;
 impl FileMeta for RealFs {
     fn exists(&self, path: &str) -> bool {
         std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
     }
 
     fn physical(&self, path: &str) -> Option<String> {
@@ -672,12 +683,12 @@ fn placed_deletions_all_outside_vault(
             return false;
         }
     }
-    let placed = moved_deletion_operands(command, cwd, vault, home);
+    let placed = moved_deletion_operands(command, cwd, vault, home, meta);
     if placed.lifted.is_empty() || placed.judged.len() > MAX_JUDGED_OPERANDS {
         return false;
     }
     let mut left = Vec::new();
-    deletion_operands(command, 0, &mut left);
+    deletion_operands(&with_known_dirs(command, vault, home), 0, &mut left);
     if RescanBudget::spent() {
         return false;
     }
@@ -909,15 +920,17 @@ fn operands_touch_vault(
     home: Option<&str>,
     meta: &dyn FileMeta,
 ) -> bool {
+    // `$OBSIDIAN_VAULT` and `$HOME` read as the values the guard holds, so
+    // `rm -rf "$OBSIDIAN_VAULT"` names the vault ([`with_known_dirs`]).
     let mut operands = Vec::new();
-    deletion_operands(command, 0, &mut operands);
+    deletion_operands(&with_known_dirs(command, vault, home), 0, &mut operands);
     // An operand the re-scan allowance left unread may name a vault path.
     if RescanBudget::spent() {
         return true;
     }
     // A relative operand a `cd` earlier in the command moved is judged where
     // it lands, and no longer in `cwd` (cameronsjo/cadence-hooks#1271).
-    let placed = moved_deletion_operands(command, cwd, vault, home);
+    let placed = moved_deletion_operands(command, cwd, vault, home, meta);
     remove_each(&mut operands, &placed.lifted);
     operands.extend(placed.judged);
     let mut calls = 0;
@@ -987,14 +1000,22 @@ const MAX_MOVED_BODY_BYTES: usize = 16 * 1024;
 ///   ([`with_known_dirs`]).
 ///
 /// A placed operand is judged only where it lands: [`Placed::lifted`]
-/// lists it as written, for the caller to stop judging in `cwd`. A move the
+/// lists it as written, for the caller to stop judging in `cwd` — only when
+/// the directory it lands in exists and the script has no `||`, since a
+/// failed `cd` leaves the deletion in `cwd`. A move the
 /// top level makes leaves a body's starting directory unknown, so what such
 /// a body places is judged there but not lifted from `cwd`.
 ///
 /// A deletion after a move the walk cannot place (`cd "$D"`, `cd -`,
 /// `popd`, a `cd` in an `if`), or inside a wrapper script (`bash -c 'cd …;
 /// rm …'`), is not listed: it keeps the verdict it had in `cwd`.
-fn moved_deletion_operands(command: &str, cwd: &str, vault: &str, home: Option<&str>) -> Placed {
+fn moved_deletion_operands(
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+    meta: &dyn FileMeta,
+) -> Placed {
     let mut out = Placed::default();
     if command.len() > MAX_JUDGED_COMMAND_LEN
         || !(command.contains("cd") || command.contains("pushd"))
@@ -1004,7 +1025,7 @@ fn moved_deletion_operands(command: &str, cwd: &str, vault: &str, home: Option<&
     let text = with_known_dirs(command, vault, home);
     let mut budget = MAX_MOVED_BODY_BYTES;
     let mut judged = 0;
-    place_deletions(&text, cwd, 0, &mut budget, &mut judged, &mut out);
+    place_deletions(&text, cwd, 0, &mut budget, &mut judged, meta, &mut out);
     out
 }
 
@@ -1036,9 +1057,12 @@ fn place_deletions(
     depth: usize,
     budget: &mut usize,
     judged: &mut usize,
+    meta: &dyn FileMeta,
     out: &mut Placed,
 ) {
-    let lifts = base != UNRESOLVABLE_DIR;
+    // A `||` may run the deletion only because a `cd` failed (`cd /x ||
+    // rm …`, `cd /x || true; rm …`): such a script lifts nothing.
+    let lifts = base != UNRESOLVABLE_DIR && !script.contains("||");
     let located = segment_work_dirs(script, base);
     let moved = located.iter().any(|segment| *segment.dir != *base);
     // The walk lists a segment once per directory it may run in, one after
@@ -1068,6 +1092,9 @@ fn place_deletions(
             return;
         }
         let dir = collapse_dots(&normalize_path(dir));
+        // A `cd` into a directory that is not there fails and leaves the
+        // shell where it was: lift only from a directory that exists.
+        let lifts = lifts && meta.is_dir(&dir);
         let mut operands = Vec::new();
         deletion_operands(raw, 0, &mut operands);
         for operand in operands {
@@ -1100,7 +1127,7 @@ fn place_deletions(
             return;
         };
         *budget = left;
-        place_deletions(&body, body_base, depth + 1, budget, judged, out);
+        place_deletions(&body, body_base, depth + 1, budget, judged, meta, out);
     }
 }
 
@@ -1488,6 +1515,9 @@ mod tests {
         fn exists(&self, path: &str) -> bool {
             self.0.contains(path)
         }
+        fn is_dir(&self, path: &str) -> bool {
+            self.0.contains(path)
+        }
     }
 
     /// cadence-hooks#839: with the shell standing in the vault, a deletion is
@@ -1611,7 +1641,7 @@ mod tests {
         ];
         for &(command, expected) in cases {
             let result =
-                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::default());
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::with(&["/tmp"]));
             assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
         }
         // The same allowed shapes from a vault SUBDIRECTORY.
@@ -1908,6 +1938,14 @@ mod tests {
                 "OBSIDIAN_VAULT=/tmp; cd \"$OBSIDIAN_VAULT\" && rm x.md",
                 Allow,
             ),
+            // An operand that reads `$OBSIDIAN_VAULT`/`$HOME` names the value
+            // the guard holds.
+            ("rm -rf \"$OBSIDIAN_VAULT\"", Block),
+            ("cd build && rm -rf \"$OBSIDIAN_VAULT\"", Block),
+            ("rm -f \"${OBSIDIAN_VAULT}/notes/a.md\"", Block),
+            ("rm -rf \"$HOME/vault\"", Block),
+            ("rm -rf \"$HOME/proj/build\"", Allow),
+            ("OBSIDIAN_VAULT=/tmp/v; rm -rf \"$OBSIDIAN_VAULT\"", Allow),
         ];
         for &(command, expected) in cases {
             let result = check_destructive_in_vault_at(
@@ -1932,6 +1970,15 @@ mod tests {
     fn a_placed_deletion_is_judged_only_where_it_lands() {
         use cadence_hooks_core::Outcome::{Allow, Block};
         let vault = "/home/me/vault";
+        // The directories that exist; `/nonexistent`, `/tmp/scratch` and
+        // `/home/me/nosuchdir` do not.
+        let dirs = FakeFs::with(&[
+            "/tmp",
+            "/var/tmp",
+            "/home/me",
+            "/home/me/proj",
+            "/home/me/build",
+        ]);
         let cases: &[(&str, &str, cadence_hooks_core::Outcome)] = &[
             // From $HOME.
             ("/home/me", "cd /tmp && rm -rf ./*", Allow),
@@ -1969,15 +2016,23 @@ mod tests {
             (vault, "cd /tmp && ln -s $HOME/vault l && rm -rf l/", Block),
             (vault, "echo $(cd /tmp; rm -f a)", Allow),
             (vault, "echo $(cd /tmp; ls); rm -f a", Block),
+            // A `cd` that fails leaves the deletion where the shell started:
+            // into a directory that is not there, or with a `||` that runs
+            // the deletion when it fails.
+            (vault, "cd /nonexistent; rm -f x.md", Block),
+            (vault, "cd /nonexistent && rm -f x.md", Block),
+            (vault, "cd /tmp/scratch; rm -rf notes", Block),
+            (vault, "cd /tmp || rm -f x.md", Block),
+            (vault, "cd /tmp || exit 1; rm -rf build", Block),
+            (vault, "echo $(cd /nonexistent; rm -f a)", Block),
+            ("/home/me", "cd nosuchdir; rm -rf vault", Block),
+            ("/home/me", "cd nosuchdir && rm -rf ./*", Block),
+            ("/home/me", "cd proj; rm -rf vault/notes", Allow),
+            ("/home/me", "cd /tmp || exit; rm -rf ./*", Block),
         ];
         for &(cwd, command, expected) in cases {
-            let result = check_destructive_in_vault_at(
-                command,
-                cwd,
-                vault,
-                Some("/home/me"),
-                &FakeFs::default(),
-            );
+            let result =
+                check_destructive_in_vault_at(command, cwd, vault, Some("/home/me"), &dirs);
             assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
         }
     }

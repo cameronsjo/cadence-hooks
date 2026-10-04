@@ -22,7 +22,7 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, command_segments, command_word, executable_tokens, host_and_repo_from_url,
-    names_transparent_prefix, peel_command_runners, strip_group_wrappers,
+    is_assignment_word, names_transparent_prefix, peel_command_runners, strip_group_wrappers,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -186,9 +186,28 @@ fn forge_argv(tokens: &[String]) -> &[String] {
     if !stuck {
         return rest;
     }
-    rest.iter()
-        .position(|w| matches!(command_word(w).as_ref(), "tea" | "glab"))
-        .map_or(rest, |at| &rest[at..])
+    // Only the words a runner can take before its command: options, other
+    // runners and prefixes, assignments, and a number or duration
+    // (`timeout --x 5`). The first other word is the command, so a `tea`
+    // later in its arguments (`echo tea pr create …`) is not one.
+    for (at, word) in rest.iter().enumerate() {
+        let verb = command_word(word);
+        if matches!(verb.as_ref(), "tea" | "glab") {
+            return &rest[at..];
+        }
+        let runner_word = word.starts_with('-')
+            || COMMAND_RUNNERS.contains(&verb.as_ref())
+            || names_transparent_prefix(word)
+            || is_assignment_word(word)
+            || (word.starts_with(|c: char| c.is_ascii_digit())
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd')));
+        if !runner_word {
+            break;
+        }
+    }
+    rest
 }
 
 /// The forge write in one segment, or `None` for anything else (reads
@@ -513,6 +532,10 @@ mod tests {
                 };
                 assert_eq!(outcome(&cmd), want, "{cmd}");
             }
+            // A `tea` among the arguments of the command a runner runs is
+            // not the command.
+            let echoed = format!("{wrapper} echo tea pr create --repo evil/r");
+            assert_eq!(outcome(&echoed), Outcome::Allow, "{echoed}");
             // A read behind the same runner stays a read.
             let read = format!("{wrapper} glab mr list -R evil/r");
             assert_eq!(outcome(&read), Outcome::Allow, "{read}");
