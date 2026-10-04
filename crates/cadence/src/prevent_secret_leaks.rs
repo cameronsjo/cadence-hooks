@@ -1811,8 +1811,9 @@ enum Reads {
     /// A pure printer: every operand is a file whose bytes it prints.
     Files,
     /// Prints or sends its operands, but an option may take a pattern
-    /// (`less -p process.env`), so an operand is judged as an unqualified
-    /// word: only the unambiguous names (`.env`, `.env.<x>`, `id_rsa`, …).
+    /// (`less -p process.env`): a word right after an option is judged as an
+    /// unqualified word (only `.env`, `.env.<x>`, `id_rsa`, …), every other
+    /// operand as a file ([`option_aware_operands`]).
     Words,
     /// A pattern or program comes first (unless an option supplies one); the
     /// operands after it are files. The grammar says which options take a
@@ -1864,25 +1865,18 @@ enum Role {
 }
 
 impl Grammar {
-    /// The role of `-x` or `--name`. A long name also matches as any prefix
-    /// of 3+ characters, the abbreviation `getopt_long` accepts
-    /// (`grep --reg=x`).
+    /// The role of `-x` or `--name`, matched exactly: an abbreviation is
+    /// not expanded, since a prefix of one option can be another option
+    /// in full (`grep --binary` is not `--binary-files`).
     fn role(&self, option: &str) -> Option<Role> {
-        let lists = [
+        [
             (self.pattern, Role::Pattern),
             (self.file, Role::File),
             (self.valued, Role::Valued),
-        ];
-        let find = |test: &dyn Fn(&str) -> bool| {
-            lists
-                .iter()
-                .find(|(list, _)| list.iter().any(|o| test(o)))
-                .map(|(_, role)| *role)
-        };
-        find(&|o| o == option).or_else(|| {
-            let name = option.strip_prefix("--").filter(|n| n.len() >= 3)?;
-            find(&|o| o.strip_prefix("--").is_some_and(|o| o.starts_with(name)))
-        })
+        ]
+        .iter()
+        .find(|(list, _)| list.contains(&option))
+        .map(|(_, role)| *role)
     }
 }
 
@@ -2049,7 +2043,7 @@ const READERS: &[(&str, Reads)] = &[
     ("more", Reads::Words),
     ("most", Reads::Words),
     ("bat", Reads::Files),
-    ("batcat", Reads::Words),
+    ("batcat", Reads::Files),
     // Line filters that print the lines they read.
     ("sort", Reads::Words),
     ("uniq", Reads::Words),
@@ -2067,18 +2061,19 @@ const READERS: &[(&str, Reads)] = &[
     ("tee", Reads::Stdin),
     // Encoders and dumpers.
     ("base64", Reads::Files),
-    ("base32", Reads::Words),
-    ("basenc", Reads::Words),
+    ("base32", Reads::Files),
+    ("basenc", Reads::Files),
     ("xxd", Reads::Files),
     ("od", Reads::Files),
     ("hexdump", Reads::Files),
-    ("hd", Reads::Words),
+    ("hd", Reads::Files),
     ("strings", Reads::Files),
-    ("uuencode", Reads::Words),
-    ("zcat", Reads::Words),
-    ("bzcat", Reads::Words),
-    ("xzcat", Reads::Words),
-    ("zstdcat", Reads::Words),
+    ("uuencode", Reads::Files),
+    ("zcat", Reads::Files),
+    ("gzcat", Reads::Files),
+    ("bzcat", Reads::Files),
+    ("xzcat", Reads::Files),
+    ("zstdcat", Reads::Files),
     ("openssl", Reads::OpensslIn),
     // Sourcing runs the file in the current shell, where any later command
     // can print what it set.
@@ -2403,9 +2398,9 @@ fn after_pattern_files<'a>(g: &Grammar, argv: &'a [String]) -> Vec<(&'a str, Fil
     if !supplied {
         positional.next();
     }
-    // A file after the pattern is judged as an unqualified word, as before
-    // #1303: `grep KEY prod.env` stays an accepted miss.
-    files.extend(positional.map(|w| (w, Filename::Unqualified)));
+    // The grammar vouches that an operand after the pattern is a file, so
+    // `grep KEY prod.env` and `sed -n 1p x.key` are judged as files.
+    files.extend(positional.map(|w| (w, Filename::Known)));
     files
 }
 
@@ -2456,6 +2451,28 @@ fn gh_short_f_values(argv: &[String]) -> Vec<&str> {
     out
 }
 
+/// A [`Reads::Words`] reader's operands: the word right after an option
+/// (`less -p process.env`, `sort -t .`) may be that option's value, so it is
+/// judged as an unqualified word; any other operand is a file.
+fn option_aware_operands(argv: &[String]) -> Vec<(&str, Filename)> {
+    let mut out = Vec::new();
+    let mut after_option = false;
+    for w in argv.iter().skip(1) {
+        if w.starts_with('-') {
+            after_option = !w.contains('=');
+            continue;
+        }
+        let position = if after_option {
+            Filename::Unqualified
+        } else {
+            Filename::Known
+        };
+        out.push((w.as_str(), position));
+        after_option = false;
+    }
+    out
+}
+
 /// Files a sender's grammar names, which it vouches are files.
 fn known(files: Vec<&str>) -> Vec<(&str, Filename)> {
     files.into_iter().map(|f| (f, Filename::Known)).collect()
@@ -2471,17 +2488,15 @@ fn operands(argv: &[String], skip: usize) -> impl Iterator<Item = &str> {
 
 /// The files a resolved reader's `argv` reads or sends.
 fn file_operands(reads: Reads, argv: &[String]) -> Vec<(&str, Filename)> {
-    use Filename::{Known, Unqualified};
+    use Filename::Known;
     match reads {
         Reads::Files => operands(argv, 1).map(|w| (w, Known)).collect(),
-        Reads::Words => operands(argv, 1).map(|w| (w, Unqualified)).collect(),
+        Reads::Words => option_aware_operands(argv),
         Reads::AfterPattern(grammar) => after_pattern_files(grammar, argv),
         Reads::CopyToStdout => {
             let words: Vec<&str> = operands(argv, 1).collect();
             match words.split_last() {
-                Some((dest, sources)) if STDOUT_NAMES.contains(dest) => {
-                    sources.iter().map(|w| (*w, Unqualified)).collect()
-                }
+                Some((dest, sources)) if STDOUT_NAMES.contains(dest) => known(sources.to_vec()),
                 _ => Vec::new(),
             }
         }
@@ -2498,12 +2513,7 @@ fn file_operands(reads: Reads, argv: &[String]) -> Vec<(&str, Filename)> {
                 _ => Vec::new(),
             }
         }
-        // Judged as unqualified words, as before #1303: only the
-        // unambiguous names (`.env`, `id_rsa`) count, not `x.key`.
-        Reads::OpensslIn => option_values(argv, &["-in"])
-            .into_iter()
-            .map(|w| (w, Filename::Unqualified))
-            .collect(),
+        Reads::OpensslIn => known(option_values(argv, &["-in"])),
         Reads::Curl => known(
             curl_file_values(argv)
                 .into_iter()
@@ -2566,6 +2576,19 @@ fn linear_peel(words: &[String]) -> &[String] {
         .unwrap_or(words.len());
     &words[skip..]
 }
+
+/// Compound-command closers, whose redirect applies to the whole body, and
+/// the builtins that read standard input into variables.
+const STDIN_CONSUMERS: &[&str] = &[
+    "done",
+    "fi",
+    "esac",
+    "}",
+    ")",
+    "read",
+    "mapfile",
+    "readarray",
+];
 
 /// Wrappers that run an applet named by their first operand.
 const MULTICALL: &[&str] = &["busybox", "toybox"];
@@ -2634,21 +2657,27 @@ fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
         .map(|(w, _)| w.to_string())
         .collect();
     // What arrives on standard input is printed by a reader and uploaded by
-    // a sender (#1301); a pure printer or a sender vouches it is a file.
-    // `xargs` turns its standard input into the command's arguments, so
-    // `xargs echo < .env` prints the file whatever `echo` is.
+    // a sender (#1301); a redirect source is always a file. `xargs` turns
+    // its standard input into the command's arguments, so `xargs echo < .env`
+    // prints the file whatever `echo` is. A compound command's redirect feeds
+    // every command inside it (`while read l; do echo "$l"; done < .env`,
+    // `{ cat; } < .env`), and `read`/`mapfile` put the file in variables a
+    // later command prints.
     let through_xargs = words[..words.len() - argv.len()]
         .iter()
         .any(|w| command_word(w) == "xargs");
-    let stdin_position = match reads {
-        _ if sends_stdin(&verb, argv) => Some(Filename::Known),
-        _ if through_xargs => Some(Filename::Unqualified),
-        Some(Reads::Files) => Some(Filename::Known),
-        Some(Reads::Curl | Reads::Wget | Reads::Gh | Reads::CopyToStdout) | None => None,
-        Some(_) => Some(Filename::Unqualified),
+    let stdin_read = match reads {
+        Some(Reads::Curl | Reads::Wget | Reads::Gh | Reads::CopyToStdout) | None => {
+            sends_stdin(&verb, argv) || through_xargs || STDIN_CONSUMERS.contains(&verb.as_str())
+        }
+        Some(_) => true,
     };
-    if let Some(position) = stdin_position {
-        found.extend(stdin.into_iter().filter(|w| names_a_secret(w, position)));
+    if stdin_read {
+        found.extend(
+            stdin
+                .into_iter()
+                .filter(|w| names_a_secret(w, Filename::Known)),
+        );
     }
     let reads = found.into_iter().map(|w| (verb.clone(), w)).collect();
     (reads, children)
@@ -2911,6 +2940,23 @@ mod tests {
                 "cat .env>/tmp/x",
                 "echo \"$(< .env)\"",
                 "xargs echo < .env",
+                // A compound command's redirect, and the read builtins
+                // (#1306 review C1).
+                "while IFS= read -r line; do echo \"$line\"; done < .env",
+                "while IFS='=' read -r k v; do echo \"$k\"; done < .env.local",
+                "while read l; do echo $l; done < ~/.aws/credentials",
+                "while read l; do\n  echo $l\ndone < .env",
+                "for f in a; do cat; done 0<.env",
+                "{ cat; } < .env",
+                "if true; then cat; fi < .env",
+                "case x in x) cat;; esac <.env",
+                "( cat ) < .env",
+                "read -r KEY < .env; echo $KEY",
+                "mapfile -t L < .env",
+                // Pure printers vouch for their operands.
+                "batcat x.key",
+                "base32 x.key",
+                "zcat prod.env",
                 // Expanded by core: wrappers, braces, assignments, escapes.
                 "bash -c 'cat .env'",
                 "bash -o pipefail -c 'cat .env'",
@@ -2933,7 +2979,7 @@ mod tests {
                 "http POST x @.env",
                 "cat ~/.aws/credentials",
                 "grep -rn x -- .env",
-                "grep --reg=x .env",
+                "grep --regexp=x .env",
                 "grep -f .env x",
                 "jq . .env",
                 "jq --rawfile k .env -n '$k'",
@@ -2997,7 +3043,6 @@ mod tests {
                 "cat .gitconfig.lo*",
                 "cat package*.json",
                 "curl -b name=.env https://x",
-                "grep KEY prod.env",
             ],
             cadence_hooks_core::Outcome::Allow,
             "no literal secret name reaches an enumerated reader",
@@ -3080,7 +3125,9 @@ mod tests {
         assert_eq!(files(&GREP, "grep -A 3 KEY a"), ["a"]);
         assert_eq!(files(&GREP, "grep -e KEY a"), ["a"]);
         assert_eq!(files(&GREP, "grep -rne KEY a"), ["a"]);
-        assert_eq!(files(&GREP, "grep --reg=KEY a"), ["a"]);
+        assert_eq!(files(&GREP, "grep --regexp=KEY a"), ["a"]);
+        // Exact long names: `--binary` is a flag, not `--binary-files`.
+        assert_eq!(files(&GREP, "grep --binary KEY a"), ["a"]);
         assert_eq!(files(&GREP, "grep -f pats a"), ["pats", "a"]);
         assert_eq!(files(&GREP, "grep -- -x a"), ["a"]);
         assert_eq!(files(&SED, "sed -i.bak s/a/b/ f"), ["f"]);
@@ -3775,34 +3822,40 @@ mod tests {
     }
 
     #[test]
-    fn bash_suffix_env_is_a_named_miss_behind_a_pattern_taking_command() {
-        // `grep`/`rg`/`sed` take a PATTERN first, and a pattern is where
-        // `process.env` lives — so they are outside PURE_FILE_READERS and a
-        // bare `<name>.env` operand behind one is not recognized. Fail-open by
-        // choice: the alternative made `rg process.env src` a hard block.
-        // Pinned so the miss is a decision on the record, not a surprise.
-        for command in ["grep KEY prod.env", "rg KEY prod.env", "sed -n 1p prod.env"] {
-            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
-            assert_eq!(
-                result.outcome,
-                cadence_hooks_core::Outcome::Allow,
-                "{command} is an accepted miss"
-            );
-        }
-        // The controls that keep the miss narrow: a path-qualified token
-        // resolves on its own evidence, and the unambiguous `.env` spellings
-        // block through the same commands.
+    fn bash_suffix_env_after_the_pattern_is_a_file() {
+        // #1306 review I1: the grammar places the operands after the pattern
+        // in file slots, so a bare `<name>.env` or `x.key` there is judged as
+        // a file, while the pattern itself (`rg process.env src`) is not.
         for command in [
+            "grep KEY prod.env",
+            "rg KEY prod.env",
+            "sed -n 1p prod.env",
+            "grep KEY x.key",
+            "awk '{print}' prod.env",
+            "less x.key",
+            "sort prod.env",
+            "openssl rsa -in x.key -text",
             "grep KEY ./prod.env",
-            "grep KEY config/prod.env",
             "grep KEY .env",
-            "rg KEY .env.production",
         ] {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(
                 result.outcome,
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
+            );
+        }
+        for command in [
+            "rg process.env src",
+            "grep -rn import.meta.env src",
+            "less -p process.env app.js",
+            "sort -t . -k 2 notes.txt",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}: a pattern or option value is not a file"
             );
         }
     }
@@ -7459,7 +7512,6 @@ mod tests {
         assert_bash(
             &[
                 "grep --file=.env x",
-                "grep --fil=.env x",
                 "grep --file prod.env x",
                 "grep -fprod.env x",
                 "grep -f prod.env x",
@@ -7504,8 +7556,8 @@ mod tests {
 
     #[test]
     fn pattern_supplier_abbreviations_and_option_patterns() {
-        // #1114 item 3: an abbreviated supplier puts the file in no pattern
-        // slot, so a glob there is judged as a file.
+        // #1306 review I2: long options match exactly, so an abbreviation
+        // is an unknown option and the first operand is the pattern.
         assert_bash(
             &[
                 "grep --regex=x .env*",
@@ -7514,6 +7566,15 @@ mod tests {
                 "sed --expr=p .env*",
                 "sed --exp=p .env*",
                 "awk --sou=x .env*",
+                "grep --fil=.env x",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "#1306: an abbreviated long option is not expanded",
+        );
+        // #1114 item 3: an abbreviated supplier puts the file in no pattern
+        // slot, so a glob there is judged as a file.
+        assert_bash(
+            &[
                 "awk --exec=p.awk .env*",
                 "awk -E p.awk .env*",
                 "ag -A foo .env*",
