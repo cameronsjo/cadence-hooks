@@ -1838,7 +1838,12 @@ enum Reads {
     Stdin,
 }
 
-/// The option grammar of a pattern-first reader.
+/// The option grammar of a pattern-first reader, taken from each tool's
+/// `--help` (ripgrep 14.1, GNU grep 3.11, GNU sed 4.9, jq 1.7; awk is the
+/// union of gawk and mawk, yq of mikefarah's and the jq wrapper's). Long
+/// names match exactly. An option the grammar does not list makes every
+/// operand after the pattern an unqualified word again, so a missing entry
+/// can never create a block ([`after_pattern_files`]).
 struct Grammar {
     /// Options whose value is the pattern or program, so no operand is.
     pattern: &'static [&'static str],
@@ -1847,9 +1852,14 @@ struct Grammar {
     file: &'static [&'static str],
     /// Other options that take a value.
     valued: &'static [&'static str],
+    /// Options that take no value.
+    flags: &'static [&'static str],
     /// Options that take two values, the second a file when `true`
     /// (`jq --rawfile NAME FILE`) and text when `false` (`jq --arg K V`).
     pairs: &'static [(&'static str, bool)],
+    /// Options after which every operand is an argument, not a file
+    /// (`jq --args`).
+    ends_files: &'static [&'static str],
     /// Leading subcommand words skipped before the pattern (`yq eval`).
     subcommands: &'static [&'static str],
     /// Short options that take only an attached value (sed's `-i[SUFFIX]`).
@@ -1862,6 +1872,7 @@ enum Role {
     Pattern,
     File,
     Valued,
+    Flag,
 }
 
 impl Grammar {
@@ -1873,6 +1884,8 @@ impl Grammar {
             (self.pattern, Role::Pattern),
             (self.file, Role::File),
             (self.valued, Role::Valued),
+            (self.flags, Role::Flag),
+            (self.ends_files, Role::Flag),
         ]
         .iter()
         .find(|(list, _)| list.contains(&option))
@@ -1884,26 +1897,101 @@ const GREP: Grammar = Grammar {
     pattern: &["-e", "--regexp"],
     file: &["-f", "--file"],
     valued: &[
+        "--after-context",
+        "--before-context",
+        "--binary-files",
+        "--context",
+        "--devices",
+        "--directories",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--group-separator",
+        "--include",
+        "--label",
+        "--max-count",
         "-A",
         "-B",
         "-C",
         "-D",
         "-d",
         "-m",
-        "--after-context",
-        "--before-context",
-        "--context",
-        "--max-count",
-        "--include",
-        "--exclude",
-        "--exclude-dir",
-        "--exclude-from",
-        "--label",
-        "--devices",
-        "--directories",
-        "--binary-files",
+    ],
+    // `-NUM` is `--context=NUM`.
+    flags: &[
+        "--basic-regexp",
+        "--binary",
+        "--byte-offset",
+        "--color",
+        "--colour",
+        "--count",
+        "--dereference-recursive",
+        "--extended-regexp",
+        "--files-with-matches",
+        "--files-without-match",
+        "--fixed-strings",
+        "--help",
+        "--ignore-case",
+        "--initial-tab",
+        "--invert-match",
+        "--line-buffered",
+        "--line-number",
+        "--line-regexp",
+        "--no-filename",
+        "--no-group-separator",
+        "--no-ignore-case",
+        "--no-messages",
+        "--null",
+        "--null-data",
+        "--only-matching",
+        "--perl-regexp",
+        "--quiet",
+        "--recursive",
+        "--silent",
+        "--text",
+        "--version",
+        "--with-filename",
+        "--word-regexp",
+        "-E",
+        "-F",
+        "-G",
+        "-H",
+        "-I",
+        "-L",
+        "-P",
+        "-R",
+        "-T",
+        "-U",
+        "-V",
+        "-Z",
+        "-a",
+        "-b",
+        "-c",
+        "-h",
+        "-i",
+        "-l",
+        "-n",
+        "-o",
+        "-q",
+        "-r",
+        "-s",
+        "-v",
+        "-w",
+        "-x",
+        "-z",
+        "-0",
+        "-1",
+        "-2",
+        "-3",
+        "-4",
+        "-5",
+        "-6",
+        "-7",
+        "-8",
+        "-9",
     ],
     pairs: &[],
+    ends_files: &[],
     subcommands: &[],
     attached: &[],
 };
@@ -1912,49 +2000,146 @@ const RG: Grammar = Grammar {
     pattern: &["-e", "--regexp"],
     file: &["-f", "--file"],
     valued: &[
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--colors",
+        "--context",
+        "--context-separator",
+        "--dfa-size-limit",
+        "--encoding",
+        "--engine",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--generate",
+        "--glob",
+        "--hostname-bin",
+        "--hyperlink-format",
+        "--iglob",
+        "--ignore-file",
+        "--max-columns",
+        "--max-count",
+        "--max-depth",
+        "--max-filesize",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "--regex-size-limit",
+        "--replace",
+        "--sort",
+        "--sortr",
+        "--threads",
+        "--type",
+        "--type-add",
+        "--type-clear",
+        "--type-not",
         "-A",
         "-B",
         "-C",
         "-E",
+        "-M",
+        "-T",
+        "-d",
         "-g",
         "-j",
-        "-M",
         "-m",
         "-r",
         "-t",
-        "-T",
-        "--after-context",
-        "--before-context",
-        "--context",
-        "--encoding",
-        "--glob",
-        "--iglob",
-        "--type",
-        "--type-not",
-        "--type-add",
-        "--replace",
-        "--max-count",
-        "--max-columns",
-        "--threads",
-        "--max-depth",
-        "--max-filesize",
-        "--pre",
-        "--pre-glob",
-        "--sort",
-        "--sortr",
-        "--ignore-file",
-        "--colors",
-        "--path-separator",
-        "--context-separator",
-        "--engine",
+    ],
+    flags: &[
+        "--auto-hybrid-regex",
+        "--binary",
+        "--block-buffered",
+        "--byte-offset",
+        "--case-sensitive",
+        "--column",
+        "--count",
+        "--count-matches",
+        "--crlf",
+        "--debug",
+        "--files",
+        "--files-with-matches",
+        "--files-without-match",
+        "--fixed-strings",
+        "--follow",
+        "--glob-case-insensitive",
+        "--heading",
+        "--help",
+        "--hidden",
+        "--ignore-case",
+        "--ignore-file-case-insensitive",
+        "--include-zero",
+        "--invert-match",
+        "--json",
+        "--line-buffered",
+        "--line-number",
+        "--line-regexp",
+        "--max-columns-preview",
+        "--mmap",
+        "--multiline",
+        "--multiline-dotall",
+        "--no-config",
+        "--no-filename",
+        "--null",
+        "--null-data",
+        "--one-file-system",
+        "--only-matching",
+        "--passthru",
+        "--pcre2",
+        "--pcre2-version",
+        "--pretty",
+        "--quiet",
+        "--search-zip",
+        "--smart-case",
+        "--sort-files",
+        "--stats",
+        "--stop-on-nonmatch",
+        "--text",
+        "--trace",
+        "--trim",
+        "--type-list",
+        "--unrestricted",
+        "--version",
+        "--vimgrep",
+        "--with-filename",
+        "--word-regexp",
+        "-.",
+        "-0",
+        "-F",
+        "-H",
+        "-I",
+        "-L",
+        "-N",
+        "-P",
+        "-S",
+        "-U",
+        "-V",
+        "-a",
+        "-b",
+        "-c",
+        "-h",
+        "-i",
+        "-l",
+        "-n",
+        "-o",
+        "-p",
+        "-q",
+        "-s",
+        "-u",
+        "-v",
+        "-w",
+        "-x",
+        "-z",
     ],
     pairs: &[],
+    ends_files: &[],
     subcommands: &[],
     attached: &[],
 };
 
-/// The silver searcher and ack: `-A`/`-B`/`-C` take an optional attached
-/// count, so the next word is the pattern.
+/// The silver searcher and ack (not installed where this was measured, so
+/// the lists are partial): `-A`/`-B`/`-C` take an optional attached count,
+/// so the next word is the pattern.
 const AG: Grammar = Grammar {
     pattern: &[],
     file: &[],
@@ -1972,7 +2157,12 @@ const AG: Grammar = Grammar {
         "--type-set",
         "--match",
     ],
+    flags: &[
+        "-i", "-s", "-S", "-w", "-v", "-l", "-L", "-c", "-o", "-Q", "-u", "-U", "-a", "-t", "-z",
+        "--hidden",
+    ],
     pairs: &[],
+    ends_files: &[],
     subcommands: &[],
     attached: &['A', 'B', 'C'],
 };
@@ -1981,34 +2171,139 @@ const SED: Grammar = Grammar {
     pattern: &["-e", "--expression"],
     file: &["-f", "--file"],
     valued: &["-l", "--line-length"],
+    // `--in-place[=SUFFIX]` takes only an attached value.
+    flags: &[
+        "--debug",
+        "--follow-symlinks",
+        "--help",
+        "--in-place",
+        "--null-data",
+        "--posix",
+        "--quiet",
+        "--regexp-extended",
+        "--sandbox",
+        "--separate",
+        "--silent",
+        "--unbuffered",
+        "--version",
+        "-E",
+        "-n",
+        "-r",
+        "-s",
+        "-u",
+        "-z",
+    ],
     pairs: &[],
+    ends_files: &[],
     subcommands: &[],
     attached: &['i'],
 };
 
 const AWK: Grammar = Grammar {
     pattern: &["-e", "--source"],
-    file: &["-f", "--file", "-E", "--exec"],
-    valued: &["-F", "-v", "--field-separator", "--assign"],
+    file: &["-f", "--file", "-E", "--exec", "-i", "--include"],
+    valued: &[
+        "-F",
+        "-v",
+        "-l",
+        "-W",
+        "--field-separator",
+        "--assign",
+        "--load",
+    ],
+    flags: &[
+        "-b",
+        "-c",
+        "-C",
+        "-D",
+        "-g",
+        "-h",
+        "-M",
+        "-n",
+        "-N",
+        "-O",
+        "-P",
+        "-r",
+        "-s",
+        "-S",
+        "-t",
+        "-V",
+        "-Y",
+        "--characters-as-bytes",
+        "--traditional",
+        "--copyright",
+        "--gen-pot",
+        "--help",
+        "--bignum",
+        "--non-decimal-data",
+        "--use-lc-numeric",
+        "--optimize",
+        "--posix",
+        "--re-interval",
+        "--no-optimize",
+        "--sandbox",
+        "--lint-old",
+        "--version",
+    ],
     pairs: &[],
+    ends_files: &[],
     subcommands: &[],
-    attached: &[],
+    // gawk's `-d[file]`, `-o[file]`, `-p[file]`, `-L[fatal]`.
+    attached: &['d', 'o', 'p', 'L'],
 };
 
 const JQ: Grammar = Grammar {
     pattern: &[],
     file: &["-f", "--from-file"],
     valued: &["-L", "--indent"],
+    flags: &[
+        "--ascii-output",
+        "--build-configuration",
+        "--color-output",
+        "--compact-output",
+        "--exit-status",
+        "--help",
+        "--join-output",
+        "--monochrome-output",
+        "--null-input",
+        "--raw-input",
+        "--raw-output",
+        "--raw-output0",
+        "--seq",
+        "--slurp",
+        "--sort-keys",
+        "--stream",
+        "--stream-errors",
+        "--tab",
+        "--unbuffered",
+        "--version",
+        "-C",
+        "-M",
+        "-R",
+        "-S",
+        "-V",
+        "-a",
+        "-c",
+        "-e",
+        "-h",
+        "-j",
+        "-n",
+        "-r",
+        "-s",
+    ],
     pairs: &[
         ("--arg", false),
         ("--argjson", false),
         ("--slurpfile", true),
         ("--rawfile", true),
     ],
+    ends_files: &["--args", "--jsonargs"],
     subcommands: &[],
     attached: &[],
 };
 
+/// mikefarah's yq and the jq-wrapper yq. `-s` is a flag in one and takes a
+/// value in the other, so it is left unlisted (an unknown option).
 const YQ: Grammar = Grammar {
     pattern: &[],
     file: &["--from-file"],
@@ -2016,11 +2311,63 @@ const YQ: Grammar = Grammar {
         "-I",
         "-o",
         "-p",
+        "-w",
+        "-L",
         "--indent",
         "--output-format",
         "--input-format",
+        "--expression",
+        "--split-exp",
+        "--front-matter",
+        "--width",
     ],
-    pairs: &[],
+    flags: &[
+        "-i",
+        "-P",
+        "-C",
+        "-M",
+        "-N",
+        "-e",
+        "-r",
+        "-n",
+        "-0",
+        "-v",
+        "-y",
+        "-Y",
+        "-c",
+        "-j",
+        "-a",
+        "-S",
+        "-R",
+        "-h",
+        "-V",
+        "--inplace",
+        "--in-place",
+        "--prettyPrint",
+        "--unwrapScalar",
+        "--null-input",
+        "--nul-output",
+        "--verbose",
+        "--exit-status",
+        "--no-doc",
+        "--colors",
+        "--no-colors",
+        "--yaml-output",
+        "--yaml-roundtrip",
+        "--raw-output",
+        "--compact-output",
+        "--tab",
+        "--sort-keys",
+        "--help",
+        "--version",
+    ],
+    pairs: &[
+        ("--arg", false),
+        ("--argjson", false),
+        ("--slurpfile", true),
+        ("--rawfile", true),
+    ],
+    ends_files: &["--args", "--jsonargs"],
     subcommands: &["e", "eval", "ea", "eval-all"],
     attached: &[],
 };
@@ -2336,7 +2683,11 @@ fn shell_c_script(argv: &[String]) -> Option<&str> {
 fn after_pattern_files<'a>(g: &Grammar, argv: &'a [String]) -> Vec<(&'a str, Filename)> {
     let mut files = Vec::new();
     let mut positional = Vec::new();
+    // Positional operands seen before an `ends_files` option.
+    let mut file_end: Option<usize> = None;
     let mut supplied = false;
+    // An option the grammar does not list may have taken the next word.
+    let mut unknown = false;
     let mut options_done = false;
     let mut i = 1;
     while let Some(t) = argv.get(i) {
@@ -2347,6 +2698,10 @@ fn after_pattern_files<'a>(g: &Grammar, argv: &'a [String]) -> Vec<(&'a str, Fil
         }
         if t == "--" {
             options_done = true;
+            continue;
+        }
+        if g.ends_files.contains(&t.as_str()) {
+            file_end.get_or_insert(positional.len());
             continue;
         }
         if let Some(&(_, second_is_file)) = g.pairs.iter().find(|(name, _)| name == t) {
@@ -2364,43 +2719,77 @@ fn after_pattern_files<'a>(g: &Grammar, argv: &'a [String]) -> Vec<(&'a str, Fil
         } else {
             // A short cluster ends at its first valued letter (`-rne PAT`),
             // or at one that takes only an attached value (sed's `-i.bak`).
-            let cluster = &t[1..];
-            let found = cluster.char_indices().find_map(|(at, c)| {
+            // Every letter before it must be a known flag.
+            let mut found = None;
+            for (at, c) in t[1..].char_indices() {
                 if g.attached.contains(&c) {
-                    return Some(None);
+                    found = Some(Role::Flag);
+                    break;
                 }
-                let role = g.role(&format!("-{c}"))?;
-                let rest = &cluster[at + c.len_utf8()..];
-                Some(Some((role, (!rest.is_empty()).then_some(rest))))
-            });
-            match found {
-                Some(Some((role, rest))) => (Some(role), rest),
-                _ => (None, None),
+                let rest = &t[1 + at + c.len_utf8()..];
+                match g.role(&format!("-{c}")) {
+                    Some(Role::Flag) => found = Some(Role::Flag),
+                    Some(role) => {
+                        found = Some(role);
+                        if !rest.is_empty() {
+                            supplied |= role != Role::Valued;
+                            if role == Role::File {
+                                // An attached value is judged as a word.
+                                files.push((rest, Filename::Unqualified));
+                            }
+                            found = Some(Role::Flag);
+                        }
+                        break;
+                    }
+                    None => {
+                        found = None;
+                        break;
+                    }
+                }
             }
+            (found, None)
         };
         let Some(role) = role else {
+            unknown = true;
             continue;
         };
+        if role == Role::Flag {
+            continue;
+        }
+        supplied |= role != Role::Valued;
         let value = match attached {
-            Some(value) => Some(value),
+            Some(value) => Some((value, Filename::Unqualified)),
             None => {
                 i += 1;
-                argv.get(i - 1).map(String::as_str)
+                argv.get(i - 1).map(|v| (v.as_str(), Filename::Known))
             }
         };
-        supplied |= role != Role::Valued;
         if role == Role::File {
-            files.extend(value.map(|v| (v, Filename::Known)));
+            files.extend(value);
         }
     }
-    let mut positional = positional.into_iter().peekable();
-    while positional.next_if(|w| g.subcommands.contains(w)).is_some() {}
+    let end = file_end.unwrap_or(positional.len());
+    let mut operands = positional.iter().enumerate().peekable();
+    while operands
+        .next_if(|(_, w)| g.subcommands.contains(w))
+        .is_some()
+    {}
     if !supplied {
-        positional.next();
+        operands.next();
     }
     // The grammar vouches that an operand after the pattern is a file, so
-    // `grep KEY prod.env` and `sed -n 1p x.key` are judged as files.
-    files.extend(positional.map(|w| (w, Filename::Known)));
+    // `grep KEY prod.env` and `sed -n 1p x.key` are judged as files, unless
+    // an unknown option may have shifted the pattern into this slot.
+    let position = if unknown {
+        Filename::Unqualified
+    } else {
+        Filename::Known
+    };
+    files.extend(
+        operands
+            .filter(|&(at, _)| at < end)
+            .map(|(_, w)| (*w, position)),
+    );
     files
 }
 
@@ -3134,6 +3523,9 @@ mod tests {
         assert_eq!(files(&SED, "sed -ie p f"), ["f"]);
         assert_eq!(files(&JQ, "jq --arg k v . f"), ["f"]);
         assert_eq!(files(&JQ, "jq --rawfile k r -n ."), ["r"]);
+        assert_eq!(files(&JQ, "jq . a --args b c"), ["a"]);
+        assert_eq!(files(&RG, "rg -d 2 KEY a"), ["a"]);
+        assert_eq!(files(&RG, "rg --type-clear ts KEY a"), ["a"]);
         assert_eq!(files(&YQ, "yq eval .a f"), ["f"]);
         assert_eq!(files(&AWK, "awk -F , {print} f"), ["f"]);
     }
@@ -3837,6 +4229,12 @@ mod tests {
             "openssl rsa -in x.key -text",
             "grep KEY ./prod.env",
             "grep KEY .env",
+            "rg -d 2 KEY prod.env",
+            "jq . prod.env --args a",
+            "grep --file=.env src",
+            "grep -n -A 3 KEY prod.env",
+            "grep -rn5 KEY prod.env",
+            "grep --bogus KEY .env",
         ] {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(
@@ -3850,6 +4248,23 @@ mod tests {
             "grep -rn import.meta.env src",
             "less -p process.env app.js",
             "sort -t . -k 2 notes.txt",
+            // #1306 delta review: valued options from each tool's --help.
+            "rg -d 2 process.env src",
+            "rg --type-clear ts process.env src",
+            "rg --dfa-size-limit 1G process.env src",
+            "rg --field-match-separator : process.env src",
+            "rg --regex-size-limit 1G process.env src",
+            "rg --hyperlink-format x process.env src",
+            "jq -n '$ARGS' --args a.env b",
+            "jq -n --jsonargs '$ARGS' prod.env",
+            // An option the grammar does not list leaves the slots
+            // unqualified: it can never create a block.
+            "rg --frobnicate 2 process.env src",
+            "grep -Q 3 KEY prod.env",
+            "sed --bogus x 1p x.key",
+            // An attached value is judged as a word.
+            "grep -fprod.env src",
+            "grep -fprod.env x",
         ] {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(
@@ -7513,7 +7928,6 @@ mod tests {
             &[
                 "grep --file=.env x",
                 "grep --file prod.env x",
-                "grep -fprod.env x",
                 "grep -f prod.env x",
                 "grep -ivf .env x",
                 "sed --file=.env x",
