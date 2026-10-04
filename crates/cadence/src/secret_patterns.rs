@@ -184,7 +184,7 @@ pub(crate) fn is_env_family_secret(component: &str) -> bool {
     is_env_family_secret_at(component, Filename::Known)
 }
 
-/// [`is_env_family_secret`], told whether the caller knows this names a file.
+/// `is_env_family_secret`, told whether the caller knows this names a file.
 pub(crate) fn is_env_family_secret_at(component: &str, position: Filename) -> bool {
     // `.envrc` is a direnv loader rather than a dotenv file. It is in the deny
     // set and NOT in the dotenv shape — exactly the kind of difference the
@@ -201,7 +201,7 @@ pub(crate) fn is_env_family_secret_at(component: &str, position: Filename) -> bo
 /// The single home for the three spellings, because two predicates need the
 /// same shape question and disagreed about it for months. `is_forgectl_env_file`
 /// (which decides what `forgectl env --file` accepts) knew all three;
-/// [`is_env_family_secret`] knew only the first two, so `prod.env` was readable
+/// `is_env_family_secret` knew only the first two, so `prod.env` was readable
 /// and writable while `.env` blocked, and the shipped guidance naming `*.env`
 /// as guarded was false for that shape (cadence-hooks#854).
 ///
@@ -385,7 +385,7 @@ pub(crate) fn envrc_carveout_allows(filename: &str, content: Option<&str>) -> bo
 /// `settings.environment`, `.environment`, and `my.envelope.txt` stay clean
 /// (closes the #86 substring false-block class for both secret guards).
 /// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
-/// trailing `)` (subshell close) before classifying via [`is_env_family_secret`].
+/// trailing `)` (subshell close) before classifying via [`is_env_family_secret_at`].
 pub fn is_dangerous_env_token(token: &str) -> bool {
     is_dangerous_env_token_at(token, Filename::Unqualified)
 }
