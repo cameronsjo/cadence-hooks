@@ -336,6 +336,13 @@ pub trait FileMeta {
     fn canonical_dir(&self, _path: &str) -> Option<String> {
         None
     }
+
+    /// The names in directory `path`, or `None` when it cannot be listed —
+    /// read as "may hold anything" by the one caller, a glob judged in a
+    /// directory the command moved to without saying where.
+    fn entries(&self, _path: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Production impl over `std::fs`. Uses `symlink_metadata(...).is_ok()` — a
@@ -381,7 +388,22 @@ impl FileMeta for RealFs {
             &resolved.to_string_lossy(),
         )))
     }
+
+    fn entries(&self, path: &str) -> Option<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path).ok()? {
+            // Past the cap the listing is unknown, which reads as a match.
+            if names.len() == MAX_LISTED_ENTRIES {
+                return None;
+            }
+            names.push(entry.ok()?.file_name().to_string_lossy().into_owned());
+        }
+        Some(names)
+    }
 }
+
+/// Most entries [`RealFs::entries`] reads from one directory.
+const MAX_LISTED_ENTRIES: usize = 4096;
 
 /// Canonicalize an existing path; a dangling symlink, which does not, resolves
 /// through its parent and keeps its own name.
@@ -635,7 +657,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// operand is judged only where a deleting verb receives it. Options and
 /// unquoted redirections are skipped; `find` contributes its start paths. A
 /// deletion whose operands arrive on stdin (`xargs rm`) names none here.
-fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
+fn deletion_operands(command: &str, depth: usize, out: &mut Deletions) {
     for segment in segments_of(command).iter() {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
@@ -644,18 +666,28 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
         };
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
         let verb = command_word(first);
+        if let Some(moved) = directory_move(&verb, argv) {
+            out.moves.push(moved);
+        }
         if head_deletes(argv) {
             let mut start = 1;
             if verb == "git" {
                 let rest = skip_git_global_options(&argv[1..]);
                 start = argv.len() - rest.len() + 1;
             }
-            collect_operands(argv, lens, start, false, verb == "truncate", out);
+            collect_operands(
+                argv,
+                lens,
+                start,
+                false,
+                verb == "truncate",
+                &mut out.operands,
+            );
         } else if verb == "find" {
             let is_delete = argv.iter().any(|t| t == "-delete");
             let has_exec = argv.iter().any(|t| EXEC_ACTIONS.contains(&t.as_str()));
             if is_delete || has_exec {
-                collect_operands(argv, lens, 1, true, false, out);
+                collect_operands(argv, lens, 1, true, false, &mut out.operands);
             }
             for (i, token) in argv.iter().enumerate() {
                 if !EXEC_ACTIONS.contains(&token.as_str()) {
@@ -685,6 +717,235 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// What [`deletion_operands`] reads out of a command: every deletion operand,
+/// and every directory change any segment makes — at the top level, inside a
+/// substitution body, or in a script a wrapper runs.
+#[derive(Default)]
+struct Deletions {
+    operands: Vec<String>,
+    moves: Vec<DirMove>,
+}
+
+/// One directory change, as written. Where it lands is settled later
+/// ([`moved_directories`]), against the directories the command could be in.
+#[derive(Debug, PartialEq, Eq)]
+enum DirMove {
+    /// `cd DIR`/`pushd DIR`, the target word as the shell hands it.
+    To(String),
+    /// `cd -` or `popd`: back to where an earlier change left from.
+    Back,
+    /// A change this text cannot follow: `cd "$D"` (a variable other than the
+    /// vault's or home's), an option it does not read, two operands.
+    Unknown,
+}
+
+/// The directory change `argv` makes, when its command is `cd`, `pushd` or
+/// `popd` (prefixes and runners already peeled, so `builtin cd` counts).
+fn directory_move(verb: &str, argv: &[String]) -> Option<DirMove> {
+    if !matches!(verb, "cd" | "pushd" | "popd") {
+        return None;
+    }
+    if verb == "popd" {
+        return Some(DirMove::Back);
+    }
+    let mut operands = Vec::new();
+    let mut options_done = false;
+    for word in &argv[1..] {
+        if !options_done && word == "--" {
+            options_done = true;
+            continue;
+        }
+        if !options_done && word.len() > 1 && word.starts_with('-') {
+            // `cd -L/-P/-e/-@` only pick how symlinks resolve. Any other
+            // option, and every `pushd` option, is not read here.
+            if verb == "cd" && word[1..].chars().all(|c| "LPe@".contains(c)) {
+                continue;
+            }
+            return Some(DirMove::Unknown);
+        }
+        options_done = true;
+        operands.push(word.as_str());
+    }
+    Some(match operands.as_slice() {
+        [] if verb == "cd" => DirMove::To("~".to_string()),
+        ["-"] => DirMove::Back,
+        [target] if !(verb == "pushd" && target.starts_with('+')) => {
+            DirMove::To((*target).to_string())
+        }
+        _ => DirMove::Unknown,
+    })
+}
+
+/// Most directories [`moved_directories`] keeps before it gives the rest up
+/// as unknown.
+const MAX_MOVED_DIRS: usize = 32;
+
+/// Where the command's directory changes may leave a deletion: every
+/// directory a `cd`/`pushd` in it can reach, resolved against `cwd` and each
+/// directory reached before it, and whether some change goes where the text
+/// cannot say (cameronsjo/cadence-hooks#1271).
+///
+/// **Order and scope are not followed, on purpose.** A `cd` inside
+/// `$(cd "$OBSIDIAN_VAULT"; rm x)` moves only its own subshell, and one after
+/// the deletion moves nothing it deletes; reading every change as reaching
+/// every deletion over-approximates both. A deletion is judged in each
+/// directory as well as in `cwd`, so the extra directories can only add a
+/// block, and only for an operand that lands in the vault from one of them.
+///
+/// `$OBSIDIAN_VAULT` and `$HOME` at the head of a target are read as the
+/// values the guard holds, unless the command names the variable anywhere
+/// other than in such a read (it may set it). Any other expansion is unknown.
+fn moved_directories(
+    moves: &[DirMove],
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+) -> (Vec<String>, bool) {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut unknown = false;
+    let mut moved_before = false;
+    for moved in moves {
+        let target = match moved {
+            DirMove::To(target) => target,
+            // A return to a directory an earlier change left from is a
+            // directory already in the set; the first change returns to the
+            // session's own, which the command does not name.
+            DirMove::Back => {
+                unknown |= !moved_before;
+                moved_before = true;
+                continue;
+            }
+            DirMove::Unknown => {
+                unknown = true;
+                moved_before = true;
+                continue;
+            }
+        };
+        moved_before = true;
+        let target = expand_known_variable(target, command, "OBSIDIAN_VAULT", Some(vault))
+            .or_else(|| expand_known_variable(target, command, "HOME", home))
+            .unwrap_or_else(|| target.clone());
+        if target.contains(GLOB_CHARS) || (target.contains('~') && !target.starts_with('~')) {
+            unknown = true;
+            continue;
+        }
+        let bases: Vec<String> = if looks_absolute(&target) || target.starts_with('~') {
+            vec![cwd.to_string()]
+        } else {
+            std::iter::once(cwd.to_string())
+                .chain(dirs.iter().cloned())
+                .collect()
+        };
+        for base in bases {
+            let Some(dir) = resolve_operand(&target, &base, home) else {
+                unknown = true;
+                continue;
+            };
+            if dir != cwd && !dirs.contains(&dir) {
+                if dirs.len() == MAX_MOVED_DIRS {
+                    unknown = true;
+                    break;
+                }
+                dirs.push(dir);
+            }
+        }
+    }
+    (dirs, unknown)
+}
+
+/// `word` with a leading `$NAME`/`${NAME}` read as `value`, when it starts
+/// with one, `value` is known, and every mention of `NAME` in `command` is
+/// such a read — no assignment, `read`, `for` or `export` can have changed it.
+fn expand_known_variable(
+    word: &str,
+    command: &str,
+    name: &str,
+    value: Option<&str>,
+) -> Option<String> {
+    let value = value?;
+    let plain = format!("${name}");
+    let braced = format!("${{{name}}}");
+    let rest = if let Some(rest) = word.strip_prefix(&braced) {
+        rest
+    } else {
+        let rest = word.strip_prefix(&plain)?;
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        rest
+    };
+    let reads = command.matches(&plain).count();
+    if command.matches(name).count() != reads {
+        return None;
+    }
+    if rest.contains(GLOB_CHARS) {
+        return None;
+    }
+    Some(format!("{value}{rest}"))
+}
+
+/// Does a relative deletion `operand`, run in a directory the command moved
+/// to without saying where, reach a vault entry? Judged as if that directory
+/// were the vault root: a literal name reaches one when the vault holds it
+/// (or it climbs to the vault or above), a glob when it matches an entry of
+/// the vault directory it names. Not a block on every such deletion: `cd
+/// "$BUILD" && rm -f *.o` is everyday, and only a vault that holds what the
+/// deletion names makes it one.
+fn unknown_dir_operand_reaches_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> bool {
+    let Some(at) = operand.find(GLOB_CHARS) else {
+        let path = collapse_dots(&format!("{vault}/{}", normalize_path(operand)));
+        return vault.starts_with(&format!("{path}/")) || path == vault || meta.exists(&path);
+    };
+    let (dir, pattern) = match operand[..at].rfind('/') {
+        Some(slash) => (&operand[..slash], &operand[slash + 1..]),
+        None => ("", operand),
+    };
+    let dir = collapse_dots(&format!("{vault}/{}", normalize_path(dir)));
+    if !touches_vault(&dir, vault) {
+        return false;
+    }
+    // A glob that climbs above the vault may match the vault itself.
+    if vault.starts_with(&format!("{dir}/")) {
+        return true;
+    }
+    if pattern.contains('/') {
+        return meta.exists(&dir);
+    }
+    match meta.entries(&dir) {
+        Some(names) => names.iter().any(|name| wildcard_matches(pattern, name)),
+        None => meta.exists(&dir),
+    }
+}
+
+/// A glob `pattern` against one directory entry: `*` any run, `?` any one
+/// character, and every other expansion character (`[`, `{`, `$`, a
+/// backtick, a backslash) read as `*` — a wider match, never a narrower one.
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let star = |c: char| (GLOB_CHARS.contains(&c) && c != '?') || matches!(c, ']' | '}' | '\\');
+    // Iterative glob match with one backtrack point: linear-ish, no recursion.
+    let (mut p, mut n) = (0, 0);
+    let mut back: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && star(pattern[p]) {
+            back = Some((p, n));
+            p += 1;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if let Some((bp, bn)) = back {
+            p = bp + 1;
+            n = bn + 1;
+            back = Some((bp, bn + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| star(c))
 }
 
 /// Push the operands of `argv[start..]`. `roots_only` (a `find`) stops at the
@@ -850,12 +1111,18 @@ fn operands_touch_vault(
     home: Option<&str>,
     meta: &dyn FileMeta,
 ) -> bool {
-    let mut operands = Vec::new();
-    deletion_operands(command, 0, &mut operands);
+    let mut deletions = Deletions::default();
+    deletion_operands(command, 0, &mut deletions);
     // An operand the re-scan allowance left unread may name a vault path.
     if RescanBudget::spent() {
         return true;
     }
+    if !deletions.moves.is_empty()
+        && relative_operand_moved_into_vault(&deletions, command, cwd, vault, home, meta)
+    {
+        return true;
+    }
+    let operands = deletions.operands;
     let mut calls = 0;
     let mut canonical_vault: Option<Option<String>> = None;
     for operand in operands {
@@ -900,6 +1167,49 @@ fn operands_touch_vault(
         }
     }
     false
+}
+
+/// Does a relative deletion operand land in the vault from a directory some
+/// `cd`/`pushd` in the command moves to ([`moved_directories`])? Lexically,
+/// and through the directory's canonical form so a `cd` into a symlink to
+/// the vault counts; in a directory the text cannot name, by what the vault
+/// holds ([`unknown_dir_operand_reaches_vault`]). Absolute and `~` operands
+/// do not depend on the directory and are judged by the caller.
+fn relative_operand_moved_into_vault(
+    deletions: &Deletions,
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+    meta: &dyn FileMeta,
+) -> bool {
+    let relative: Vec<&String> = deletions
+        .operands
+        .iter()
+        .filter(|operand| !looks_absolute(operand) && !operand.starts_with('~'))
+        .collect();
+    if relative.is_empty() {
+        return false;
+    }
+    let (dirs, unknown) = moved_directories(&deletions.moves, command, cwd, vault, home);
+    for dir in &dirs {
+        let canonical = meta
+            .canonical_dir(dir)
+            .map(|c| normalize_path(&c))
+            .filter(|c| c != dir);
+        for base in std::iter::once(dir).chain(canonical.as_ref()) {
+            if relative
+                .iter()
+                .any(|operand| operand_lexically_touches_vault(operand, base, vault, home))
+            {
+                return true;
+            }
+        }
+    }
+    unknown
+        && relative
+            .iter()
+            .any(|operand| unknown_dir_operand_reaches_vault(operand, vault, meta))
 }
 
 /// Check if a destructive command targets the Obsidian vault, or if a

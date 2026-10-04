@@ -10186,20 +10186,23 @@ fn flatten_text(
     let mut top = BodyRanges::default();
     scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top), None, true);
     pending.extend(
-        top.bodies
-            .into_iter()
-            .filter(|&(start, _)| !(dedupe && chars.get(start) == Some(&EXPANDED_MARK))),
+        PendingBody::all(top, 0, None).filter(|body| {
+            !(dedupe
+                && matches!(body, PendingBody::Span(start, _) if chars.get(*start) == Some(&EXPANDED_MARK)))
+        }),
     );
-    while let Some((start, end)) = pending.pop_front() {
-        if start >= end {
-            continue;
-        }
-        let len = end - start;
+    while let Some(next) = pending.pop_front() {
+        let (offset, body): (usize, &[char]) = match &next {
+            PendingBody::Span(start, end) if start < end => (*start, &chars[*start..*end]),
+            PendingBody::Span(..) => continue,
+            PendingBody::Text(text) if !text.is_empty() => (0, text),
+            PendingBody::Text(_) => continue,
+        };
+        let len = body.len();
         if len > work.left || !ExpansionWork::charge(len) {
             return false;
         }
         work.left -= len;
-        let body = &chars[start..end];
         let mut ranges = BodyRanges::default();
         scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges), None, true);
         let mut collapsed = String::with_capacity(len);
@@ -10214,14 +10217,42 @@ fn flatten_text(
             collapsed.extend(&body[at..]);
         }
         list_level(work, &collapsed, true, out, Some(texts));
-        pending.extend(
-            ranges
-                .bodies
-                .into_iter()
-                .map(|(from, to)| (start + from, start + to)),
-        );
+        let owned = matches!(next, PendingBody::Text(_)).then_some(body);
+        pending.extend(PendingBody::all(ranges, offset, owned));
     }
     true
+}
+
+/// A body [`flatten_text`] has still to read: a span of the text it was
+/// handed, or a text of its own — a `` `…` `` body bash reads with a
+/// backslash removed ([`backtick_body`]), or a body nested in one.
+enum PendingBody {
+    Span(usize, usize),
+    Text(Vec<char>),
+}
+
+impl PendingBody {
+    /// Every body `ranges` found in a scanned text: its rewritten text where
+    /// the scan recorded one, else a copy of the span when the scanned text
+    /// is itself an `owned` one, else the span moved `offset` chars into the
+    /// outer text. `rewritten` is a subsequence of `bodies` in scan order, so
+    /// one cursor pairs them.
+    fn all(
+        ranges: BodyRanges,
+        offset: usize,
+        owned: Option<&[char]>,
+    ) -> impl Iterator<Item = Self> + '_ {
+        let mut rewritten = ranges.rewritten.into_iter().peekable();
+        ranges.bodies.into_iter().map(move |span| {
+            if let Some((_, text)) = rewritten.next_if(|(at, _)| *at == span) {
+                return Self::Text(text.chars().collect());
+            }
+            match owned {
+                Some(text) => Self::Text(text[span.0.min(span.1)..span.1].to_vec()),
+                None => Self::Span(offset + span.0, offset + span.1),
+            }
+        })
+    }
 }
 
 /// The text of `ranges` of `chars`, overlaps merged, cut at every
@@ -11767,6 +11798,10 @@ struct BodyRanges {
     /// The spans a substitution occupies in the text that holds it, in text
     /// order and disjoint: what that text reads as without them.
     hidden: Vec<(usize, usize)>,
+    /// A `` `…` `` body whose text bash reads differently from the span as
+    /// written ([`backtick_body`]'s backslash removal), keyed by the span in
+    /// `bodies`: that body is read from this text, not from the span.
+    rewritten: Vec<((usize, usize), String)>,
 }
 
 /// [`scan_substitution_bodies`] over `chars`, also recording each body's
@@ -11780,11 +11815,14 @@ fn scan_substitution_bodies_in(
     mut kinds: Option<&mut Vec<BodyKind>>,
     procsub_opens: bool,
 ) -> Vec<String> {
-    let mut record = |body: (usize, usize), hidden: bool| {
+    let mut record = |body: (usize, usize), hidden: bool, rewritten: Option<&str>| {
         if let Some(ranges) = ranges.as_deref_mut() {
             ranges.bodies.push(body);
             if hidden {
                 ranges.hidden.push(body);
+            }
+            if let Some(text) = rewritten {
+                ranges.rewritten.push((body, text.to_string()));
             }
         }
     };
@@ -11836,7 +11874,7 @@ fn scan_substitution_bodies_in(
         let opens = c == '$' || (procsub_opens && quote.is_none() && matches!(c, '<' | '>'));
         if opens && chars.get(i + 1) == Some(&'(') {
             if let Ok((body, end)) = scan_substitution_body(chars, i + 2, true) {
-                record((i + 2, end - 1), true);
+                record((i + 2, end - 1), true, None);
                 if !body.trim().is_empty() {
                     if !body.contains('\\') {
                         starts.push(i + 2);
@@ -11884,14 +11922,14 @@ fn scan_substitution_bodies_in(
             if !matches!(blind, Ok((_, end)) if end == chars.len()) {
                 push_nonblank(&mut bodies, &chars[i + 2..]);
             }
-            record((i + 2, chars.len()), true);
+            record((i + 2, chars.len()), true, None);
             if let Ok((blind_body, blind_end)) = blind {
                 if !blind_body.trim().is_empty() {
                     bodies.push(blind_body);
                 }
                 push_nonblank(&mut bodies, &chars[blind_end..]);
-                record((i + 2, blind_end - 1), false);
-                record((blind_end, chars.len()), false);
+                record((i + 2, blind_end - 1), false, None);
+                record((blind_end, chars.len()), false, None);
             }
             // A widened reading is not a body bash bounds the same way, and
             // each is most of the text again: it spends a level like any
@@ -11916,22 +11954,16 @@ fn scan_substitution_bodies_in(
         // `` `…` `` backticks.
         if c == '`' {
             let mut j = i + 1;
-            let mut body = String::new();
-            while j < chars.len() && chars[j] != '`' {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                body.push(chars[j]);
-                j += 1;
-            }
-            record((i + 1, j.min(chars.len())), true);
+            let body = backtick_body(chars, &mut j, quote == Some(Quote::Double));
+            let span = (i + 1, j.min(chars.len()));
+            let escaped = chars[span.0..span.1].contains(&'\\');
+            record(span, true, escaped.then_some(body.as_str()));
             let quoting_unterminated =
                 j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]);
             let confident = j < chars.len() && !quoting_unterminated;
             if !body.trim().is_empty() {
-                // The span as written: the loop above drops an escape pair
-                // from `body`, so `body` cannot show one.
+                // The span as written: `backtick_body` removes the
+                // backslash of an escape pair, so `body` cannot show one.
                 if confident && !chars[i + 1..j].contains(&'\\') {
                     starts.push(i + 1);
                 }
@@ -11954,7 +11986,7 @@ fn scan_substitution_bodies_in(
             }
             if quoting_unterminated {
                 push_nonblank(&mut bodies, &chars[j + 1..]);
-                record((j + 1, chars.len()), false);
+                record((j + 1, chars.len()), false, None);
                 break;
             }
             i = j + 1;
@@ -11974,6 +12006,46 @@ fn scan_substitution_bodies_in(
         kinds.resize(bodies.len(), BodyKind::Plain);
     }
     bodies
+}
+
+/// The command text of the `` `…` `` span whose body starts at `*j`, read the
+/// way bash reads it, with `*j` left on the closing backtick (or the end).
+///
+/// Inside backticks a backslash keeps its literal meaning except before `$`,
+/// a backtick or another backslash, where it is removed before the body is
+/// run — and, when the span sits inside double quotes, before `"` too. So
+/// ``echo `echo \$(git reset --hard)` `` runs `git reset --hard`: the body
+/// bash runs is `echo $(git reset --hard)`. The escape pair used to be
+/// dropped whole, so the `$` vanished with its backslash, the substitution
+/// behind it read as `(git reset --hard)` and reached no guard
+/// (cameronsjo/cadence-hooks#1271). A backslash-newline is removed whole;
+/// every other `\x` stays as written, for the body's own shell to read.
+fn backtick_body(chars: &[char], j: &mut usize, in_double: bool) -> String {
+    let mut body = String::new();
+    while *j < chars.len() && chars[*j] != '`' {
+        if chars[*j] == '\\' {
+            match chars.get(*j + 1) {
+                Some(&next) if matches!(next, '$' | '`' | '\\') || (in_double && next == '"') => {
+                    body.push(next);
+                }
+                // A backslash-newline is a line continuation, joined before
+                // the body is read (so a heredoc in it ends at the joined
+                // terminator).
+                Some('\n') => {}
+                Some(&next) => {
+                    body.push('\\');
+                    body.push(next);
+                }
+                None => body.push('\\'),
+            }
+            *j += 2;
+            continue;
+        }
+        body.push(chars[*j]);
+        *j += 1;
+    }
+    *j = (*j).min(chars.len());
+    body
 }
 
 /// One assignment a segment makes, as [`segment_assignments`] reads it.

@@ -506,7 +506,11 @@ mod tests {
                 ("glab mr create -R cameronsjo/r --title x", true),
             ] {
                 let cmd = format!("{wrapper} {write}");
-                let want = if owned { Outcome::Allow } else { Outcome::Block };
+                let want = if owned {
+                    Outcome::Allow
+                } else {
+                    Outcome::Block
+                };
                 assert_eq!(outcome(&cmd), want, "{cmd}");
             }
             // A read behind the same runner stays a read.
