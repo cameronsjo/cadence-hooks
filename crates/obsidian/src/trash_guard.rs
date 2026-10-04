@@ -7,10 +7,10 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
-    executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
-    redirect_operator_span, redirect_targets, segment_work_dirs, skip_git_global_options,
-    strip_verbatim_prefix, substitution_bodies, tokenize, UNRESOLVABLE_DIR,
+    UNRESOLVABLE_DIR, carries_substitution, child_scripts, clobber_redirect_targets,
+    command_segments, command_word, executable_tokens, executable_tokens_marked, looks_absolute,
+    peel_command_runners, redirect_operator_span, redirect_targets, segment_work_dirs,
+    skip_git_global_options, strip_verbatim_prefix, substitution_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -958,17 +958,26 @@ fn place_deletions(
     out: &mut Vec<String>,
 ) {
     let located = segment_work_dirs(script, base);
-    let mut moved = false;
-    for segment in &located {
-        let dir: &str = &segment.dir;
-        if dir == base {
-            continue;
-        }
-        moved = true;
-        if dir == UNRESOLVABLE_DIR
-            || !DELETING_SPELLINGS
+    let moved = located.iter().any(|segment| *segment.dir != *base);
+    // The walk lists a segment once per directory it may run in, one after
+    // the other. Only a segment it places in exactly one directory, and not
+    // one it cannot place (after `cd -`, `cd "$D"`, a `cd` in an `if`), is
+    // read here.
+    let mut at = 0;
+    while at < located.len() {
+        let raw = &located[at].raw;
+        let end = at
+            + located[at..]
                 .iter()
-                .any(|verb| segment.raw.contains(verb))
+                .take_while(|segment| segment.raw == *raw)
+                .count();
+        let placed = &located[at..end];
+        at = end;
+        let dir: &str = &placed[0].dir;
+        if dir == base
+            || dir == UNRESOLVABLE_DIR
+            || placed.iter().any(|segment| *segment.dir != *dir)
+            || !DELETING_SPELLINGS.iter().any(|verb| raw.contains(verb))
         {
             continue;
         }
@@ -978,7 +987,7 @@ fn place_deletions(
         }
         let dir = collapse_dots(&normalize_path(dir));
         let mut operands = Vec::new();
-        deletion_operands(&segment.raw, 0, &mut operands);
+        deletion_operands(raw, 0, &mut operands);
         for operand in operands {
             if looks_absolute(&operand) || operand.starts_with('~') {
                 continue;
@@ -1735,6 +1744,89 @@ mod tests {
             &FakeFs::default(),
         );
         assert_eq!(result.outcome, Allow);
+    }
+
+    /// A relative deletion is judged where a plain `cd`/`pushd` earlier in
+    /// the same command puts it: at the top level, in a `( … )` subshell, and
+    /// in a `$( … )` or backtick body (cameronsjo/cadence-hooks#1271). Every
+    /// row runs from `/home/me/proj`, outside the vault
+    /// `/home/me/vault`; every Block row was Allow before. A deletion after a
+    /// move the directory walk cannot place keeps its old verdict, and a
+    /// `cd` in a subshell or substitution moves nothing after it.
+    #[test]
+    fn a_relative_deletion_is_judged_where_a_plain_cd_puts_it() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let vault = "/home/me/vault";
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // Top level.
+            ("cd \"$OBSIDIAN_VAULT\" && rm x.md", Block),
+            ("cd \"${OBSIDIAN_VAULT}/notes\" && rm a.md", Block),
+            ("cd $HOME/vault; rm -f notes/*.md", Block),
+            ("cd ../vault && rm -f *.md", Block),
+            ("cd .. && cd vault && rm x.md", Block),
+            ("pushd \"$OBSIDIAN_VAULT\" && rm x.md && popd", Block),
+            ("builtin cd \"$OBSIDIAN_VAULT\" && rm x.md", Block),
+            (
+                "cd \"$OBSIDIAN_VAULT\" && find . -name '*.md' -delete",
+                Block,
+            ),
+            ("cd $HOME && rm -rf vault", Block),
+            // A `( … )` subshell.
+            ("(cd ../vault && rm x.md)", Block),
+            ("(cd \"$OBSIDIAN_VAULT\"; rm -f notes/a.md)", Block),
+            // A `$( … )` or backtick body.
+            ("echo $(cd \"$OBSIDIAN_VAULT\"; rm x.md)", Block),
+            ("echo $(cd \"$OBSIDIAN_VAULT\" && rm x.md)", Block),
+            ("x=$(cd ../vault; rm x.md)", Block),
+            ("echo `cd \"$OBSIDIAN_VAULT\"; rm x.md`", Block),
+            ("echo $(echo $(cd \"$OBSIDIAN_VAULT\" && rm x.md))", Block),
+            // A move that never reaches the vault.
+            ("cd build && rm -rf out", Allow),
+            ("cd /tmp && rm -rf build", Allow),
+            ("cd .. && rm -rf proj/build", Allow),
+            ("cd $HOME && rm -rf proj/build", Allow),
+            ("echo $(cd sub; rm -f x)", Allow),
+            ("echo $(cd /tmp && rm x.md)", Allow),
+            (
+                "cd \"$OBSIDIAN_VAULT\" && git status && cd $HOME/proj && rm -rf build",
+                Allow,
+            ),
+            // A subshell's or substitution's `cd` ends with it.
+            (
+                "x=$(cd \"$OBSIDIAN_VAULT\" && git log -1); rm -rf build",
+                Allow,
+            ),
+            ("echo $(cd \"$OBSIDIAN_VAULT\"; ls); rm -f out.txt", Allow),
+            ("(cd ../vault && ls); rm -f out.txt", Allow),
+            (
+                "(cd \"$OBSIDIAN_VAULT\" && git pull) && rm -rf build",
+                Allow,
+            ),
+            // A move the walk cannot place keeps the old verdict.
+            ("cd \"$OBSIDIAN_VAULT\" && cd - && rm x.md", Allow),
+            (
+                "cd \"$OBSIDIAN_VAULT\" && git add -A && cd - && rm -f out.txt",
+                Allow,
+            ),
+            ("cd \"$D\" && rm x.md", Allow),
+            ("if true; then cd \"$OBSIDIAN_VAULT\"; fi; rm x.md", Allow),
+            ("bash -c 'cd \"$OBSIDIAN_VAULT\"; rm x.md'", Allow),
+            // A variable the command may set is not the guard's value.
+            (
+                "OBSIDIAN_VAULT=/tmp; cd \"$OBSIDIAN_VAULT\" && rm x.md",
+                Allow,
+            ),
+        ];
+        for &(command, expected) in cases {
+            let result = check_destructive_in_vault_at(
+                command,
+                "/home/me/proj",
+                vault,
+                Some("/home/me"),
+                &FakeFs::default(),
+            );
+            assert_eq!(result.outcome, expected, "{command}");
+        }
     }
 
     /// Fake canonicalizer: maps a directory to its canonical form, or reports
