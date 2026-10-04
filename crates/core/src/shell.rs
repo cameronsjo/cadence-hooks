@@ -11451,7 +11451,7 @@ fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
 /// everything after the span as inside that still-open quote and never turns
 /// it into its own segment — the backtick arm below surfaces that tail as an
 /// extra body so it still reaches the guards (cameronsjo/cadence-hooks#653).
-fn substitution_bodies(segment: &str) -> Vec<String> {
+pub fn substitution_bodies(segment: &str) -> Vec<String> {
     scan_substitution_bodies(segment, &mut Vec::new())
 }
 

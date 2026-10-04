@@ -9,8 +9,8 @@
 use cadence_hooks_core::shell::{
     carries_substitution, child_scripts, clobber_redirect_targets, command_segments, command_word,
     executable_tokens, executable_tokens_marked, looks_absolute, peel_command_runners,
-    redirect_operator_span, redirect_targets, skip_git_global_options, strip_verbatim_prefix,
-    tokenize,
+    redirect_operator_span, redirect_targets, segment_work_dirs, skip_git_global_options,
+    strip_verbatim_prefix, substitution_bodies, tokenize, UNRESOLVABLE_DIR,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -856,6 +856,9 @@ fn operands_touch_vault(
     if RescanBudget::spent() {
         return true;
     }
+    // A relative operand a `cd` earlier in the command moved, judged where
+    // it lands (cameronsjo/cadence-hooks#1271).
+    operands.extend(moved_deletion_operands(command, cwd, vault, home));
     let mut calls = 0;
     let mut canonical_vault: Option<Option<String>> = None;
     for operand in operands {
@@ -900,6 +903,153 @@ fn operands_touch_vault(
         }
     }
     false
+}
+
+/// Bytes of substitution bodies [`moved_deletion_operands`] reads again: a
+/// `cd` someone types sits in a short command, and a flood of nested `$(`
+/// would otherwise be walked once per level.
+const MAX_MOVED_BODY_BYTES: usize = 16 * 1024;
+
+/// Each relative deletion operand that a plain `cd`/`pushd` earlier in the
+/// same command moved, rewritten as the absolute path it lands on, so the
+/// caller judges it as if typed that way (cameronsjo/cadence-hooks#1271).
+///
+/// - **Top level and `( … )`**: [`segment_work_dirs`] places each segment, a
+///   subshell's `cd` ending at its `)`. A segment it places in a directory
+///   other than `cwd` contributes its deletions' relative operands there.
+/// - **`$( … )`, backtick and `<( … )` bodies**: each body is placed as a
+///   script of its own, so its `cd` moves only its own deletions. A body
+///   starts in `cwd` when no top-level segment moved, and in a directory
+///   the walk cannot place otherwise, so only an absolute (or
+///   `$OBSIDIAN_VAULT`/`$HOME`/`~`) `cd` in it is followed.
+/// - `$OBSIDIAN_VAULT` and `$HOME` read as the values the guard holds
+///   ([`with_known_dirs`]).
+///
+/// A deletion after a move the walk cannot place (`cd "$D"`, `cd -`,
+/// `popd`), or inside a wrapper script (`bash -c 'cd …; rm …'`), is not
+/// listed: it keeps the verdict it had in `cwd`. Nothing here lifts a block;
+/// every operand is judged in `cwd` as well.
+fn moved_deletion_operands(
+    command: &str,
+    cwd: &str,
+    vault: &str,
+    home: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if command.len() > MAX_JUDGED_COMMAND_LEN
+        || !(command.contains("cd") || command.contains("pushd"))
+    {
+        return out;
+    }
+    let text = with_known_dirs(command, vault, home);
+    let mut budget = MAX_MOVED_BODY_BYTES;
+    let mut judged = 0;
+    place_deletions(&text, cwd, 0, &mut budget, &mut judged, &mut out);
+    out
+}
+
+/// [`moved_deletion_operands`] for one script started in `base`.
+fn place_deletions(
+    script: &str,
+    base: &str,
+    depth: usize,
+    budget: &mut usize,
+    judged: &mut usize,
+    out: &mut Vec<String>,
+) {
+    let located = segment_work_dirs(script, base);
+    let mut moved = false;
+    for segment in &located {
+        let dir: &str = &segment.dir;
+        if dir == base {
+            continue;
+        }
+        moved = true;
+        if dir == UNRESOLVABLE_DIR
+            || !DELETING_SPELLINGS
+                .iter()
+                .any(|verb| segment.raw.contains(verb))
+        {
+            continue;
+        }
+        *judged += 1;
+        if *judged > MAX_JUDGED_SEGMENTS {
+            return;
+        }
+        let dir = collapse_dots(&normalize_path(dir));
+        let mut operands = Vec::new();
+        deletion_operands(&segment.raw, 0, &mut operands);
+        for operand in operands {
+            if looks_absolute(&operand) || operand.starts_with('~') {
+                continue;
+            }
+            let joined = format!("{dir}/{operand}");
+            if !out.contains(&joined) {
+                out.push(joined);
+            }
+        }
+    }
+    if depth >= MAX_NESTED_DEPTH {
+        return;
+    }
+    let body_base = if moved { UNRESOLVABLE_DIR } else { base };
+    for body in substitution_bodies(script) {
+        if !(body.contains("cd") || body.contains("pushd"))
+            || !DELETING_SPELLINGS.iter().any(|verb| body.contains(verb))
+        {
+            continue;
+        }
+        let Some(left) = budget.checked_sub(body.len()) else {
+            return;
+        };
+        *budget = left;
+        place_deletions(&body, body_base, depth + 1, budget, judged, out);
+    }
+}
+
+/// `command` with each read of `$OBSIDIAN_VAULT`/`$HOME` (`${…}` too)
+/// replaced by the value the guard holds, so the directory walk can place a
+/// `cd` to one. Left as written when the command names the variable other
+/// than by such a read (it may set it), or the value carries a character the
+/// shell treats specially: the walk then cannot place that `cd`.
+fn with_known_dirs<'a>(
+    command: &'a str,
+    vault: &str,
+    home: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    let mut out = std::borrow::Cow::Borrowed(command);
+    for (name, value) in [("OBSIDIAN_VAULT", Some(vault)), ("HOME", home)] {
+        let Some(value) = value.filter(|v| {
+            !v.is_empty()
+                && v.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':')
+                })
+        }) else {
+            continue;
+        };
+        let plain = format!("${name}");
+        let braced = format!("${{{name}}}");
+        let reads = out.matches(&plain).count() + out.matches(&braced).count();
+        if reads == 0 || out.matches(name).count() != reads {
+            continue;
+        }
+        let replaced = out.replace(&braced, value);
+        let mut text = String::with_capacity(replaced.len());
+        let mut rest = replaced.as_str();
+        while let Some(at) = rest.find(&plain) {
+            let after = &rest[at + plain.len()..];
+            text.push_str(&rest[..at]);
+            if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                text.push_str(&plain);
+            } else {
+                text.push_str(value);
+            }
+            rest = after;
+        }
+        text.push_str(rest);
+        out = std::borrow::Cow::Owned(text);
+    }
+    out
 }
 
 /// Check if a destructive command targets the Obsidian vault, or if a
