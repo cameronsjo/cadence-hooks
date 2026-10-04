@@ -207,6 +207,188 @@ fn resolve_command<'a>(tokens: &'a [String]) -> Option<(Cow<'a, str>, &'a [Strin
     Some((command_word(argv.first()?), argv))
 }
 
+/// What [`resolve_reader`] stepped over to reach the command word.
+#[derive(Default)]
+struct ReaderPeel<'a> {
+    /// A peeled assignment (bare or `env`'s) can change what the command
+    /// does or which program runs ([`assignment_is_inert`]).
+    rebound: bool,
+    /// A redirection sat before the command word.
+    redirected: bool,
+    /// The bare assignment and redirection words peeled, judged as the
+    /// unqualified words they were before #1296.
+    words: Vec<&'a str>,
+}
+
+/// [`resolve_command`], continued past leading `NAME=value` assignments and
+/// redirections: `FOO=1 cat prod.env` and `>out cat prod.env` run `cat`, so
+/// `cat` is the reader judged (cameronsjo/cadence-hooks#1296). Before this the
+/// assignment or operator was the head, no reader was recognized, and only the
+/// unambiguous `.env` spellings blocked.
+///
+/// A DETECTOR here, an EXEMPTION only conditionally (see [`COMMAND_WRAPPERS`]):
+/// the resolved word decides which operands are known filenames, which only
+/// adds blocks, and also whether a metadata-only exemption applies, which
+/// subtracts them. Callers grant an exemption only when `rebound` is false.
+///
+/// Terminates by strict shrink: each pass drops at least one token.
+fn resolve_reader(tokens: &[String]) -> Option<(Cow<'_, str>, &[String], ReaderPeel<'_>)> {
+    let mut peel = ReaderPeel::default();
+    let mut argv = tokens;
+    loop {
+        let (word, resolved) = resolve_command(argv)?;
+        // `env`'s own assignments, dropped by the wrapper peel.
+        peel.rebound |= argv[..argv.len() - resolved.len()]
+            .iter()
+            .any(|t| is_assignment_word(t) && !assignment_is_inert(t));
+        let mut rest = resolved;
+        while let Some(head) = rest.first() {
+            let width = if is_assignment_word(head) {
+                peel.rebound |= !assignment_is_inert(head);
+                1
+            } else {
+                match redirection_of(head) {
+                    Some(true) => 2,
+                    Some(false) => 1,
+                    None => break,
+                }
+            };
+            // Something must remain to be the command.
+            if rest.len() <= width {
+                break;
+            }
+            peel.redirected |= width == 2 || !is_assignment_word(head);
+            peel.words.extend(rest[..width].iter().map(String::as_str));
+            rest = &rest[width..];
+        }
+        if rest.len() == resolved.len() {
+            return Some((word, resolved, peel));
+        }
+        argv = rest;
+    }
+}
+
+/// Is a `NAME=value` prefix unable to change which program runs or what it
+/// reads? An assignment that can is "rebound": the command behind it is still
+/// judged as the reader, but it never earns a metadata-only exemption, so
+/// `LD_PRELOAD=x ls .env` keeps blocking while `FOO=1 ls .env` does not
+/// (cameronsjo/cadence-hooks#1296).
+///
+/// A denylist by necessity — `NODE_ENV=production npm run build` and
+/// `RUST_LOG=debug cargo test` are everyday spellings an allowlist would turn
+/// into false blocks. It only gates exemptions (metadata-safe heads, `find`,
+/// `git`, and the byte-exact-head pattern exemptions), so it names what can
+/// make one of those heads run code or read other files: the loader, the
+/// command search path and shell startup, the configuration homes, the
+/// helper programs git, gh, and direnv spawn, the config files grep, rg,
+/// awk, and kubectl read, and the language runtimes' startup options. Matched
+/// case-insensitively, failing toward rebound.
+fn assignment_is_inert(word: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "LD_", "DYLD_", "GIT_", "GH_", "BASH", "DIRENV_", "XDG_", "LESS", "GREP_", "RIPGREP_",
+        "AWK", "KUBE", "PYTHON", "PERL", "RUBY", "JAVA_", "_JAVA_", "SSH_", "SUDO_",
+    ];
+    const NAMES: &[&str] = &[
+        "PATH",
+        "IFS",
+        "ENV",
+        "CDPATH",
+        "SHELLOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "HOME",
+        "ZDOTDIR",
+        "SHELL",
+        "PAGER",
+        "MANPAGER",
+        "EDITOR",
+        "VISUAL",
+        "BROWSER",
+        "GCONV_PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "JQ_LIBRARY_PATH",
+    ];
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.to_ascii_uppercase();
+    !NAMES.contains(&name.as_str()) && !PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Spellings of standard input as a file operand.
+const STDIN_NAMES: &[&str] = &["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"];
+
+/// Programs that send their standard input somewhere else whatever their
+/// arguments: a socket, a remote shell, a mail transport, an HTTPie body.
+const STDIN_SENDERS: &[&str] = &[
+    "nc", "ncat", "netcat", "socat", "telnet", "ssh", "scp", "sftp", "mail", "mailx", "sendmail",
+    "mutt", "http", "https", "xh", "xhs",
+];
+
+/// Does `cmd` send what arrives on its standard input off the machine?
+/// A secret file redirected into it (`gh api r --input - < prod.env`) is then
+/// uploaded, so the redirection's source is judged as a known filename
+/// (cameronsjo/cadence-hooks#1296). A program that keeps its stdin local is
+/// judged by its own rule.
+fn sends_stdin(cmd: &str, argv: &[String]) -> bool {
+    let stdin = |v: &str| STDIN_NAMES.contains(&v);
+    // `--opt -`, `--opt=-`, `-o-`, and a `key=@-` field value.
+    let option_takes_stdin = |names: &[&str]| {
+        argv.iter().enumerate().any(|(i, t)| {
+            let next_is_stdin = argv.get(i + 1).is_some_and(|n| stdin(n));
+            names.iter().any(|name| {
+                (t == name && next_is_stdin)
+                    || t.strip_prefix(name)
+                        .and_then(|v| v.strip_prefix('=').or((name.len() == 2).then_some(v)))
+                        .is_some_and(|v| !v.is_empty() && stdin(v))
+            })
+        })
+    };
+    let field_from_stdin = |t: &str| {
+        t.split_once('=')
+            .and_then(|(_, v)| v.strip_prefix('@'))
+            .is_some_and(stdin)
+    };
+    match cmd {
+        _ if STDIN_SENDERS.contains(&cmd) => true,
+        "curl" => curl_file_values(argv)
+            .into_iter()
+            .any(|(_, option, used, value)| match used {
+                // `-T .` is curl's non-blocking stdin.
+                FileUse::Upload => {
+                    (option == "upload-file" && value == ".")
+                        || curl_value_paths(option, value).into_iter().any(stdin)
+                }
+                FileUse::Read => stdin(value),
+                _ => false,
+            }),
+        "wget" => wget_file_values(argv)
+            .0
+            .iter()
+            .any(|(_, _, used, value)| *used == FileUse::Read && stdin(value)),
+        "gh" => {
+            option_takes_stdin(&["--input", "--body-file", "--notes-file", "-F"])
+                || argv.iter().any(|t| field_from_stdin(t))
+                || (argv.get(1).is_some_and(|t| t == "gist")
+                    && argv.get(2).is_some_and(|t| t == "create"))
+        }
+        "kubectl" => {
+            option_takes_stdin(&["-f", "--filename", "--from-file", "--from-env-file"])
+                || argv.iter().any(|t| field_from_stdin(t))
+        }
+        "aws" | "gsutil" | "gcloud" | "rclone" | "az" => {
+            argv.iter().skip(1).any(|t| stdin(t)) || argv.iter().any(|t| t == "rcat")
+        }
+        "tee" => argv
+            .iter()
+            .skip(1)
+            .any(|t| t.starts_with("/dev/tcp/") || t.starts_with("/dev/udp/")),
+        "openssl" => argv.get(1).is_some_and(|t| t == "s_client"),
+        _ => false,
+    }
+}
+
 /// If a segment hands one or more dangerous `.env`-family files to a
 /// content-emitting command, return every `(command word, offending token)`
 /// pair — NOT just the first (#307: a single-token result let a second
@@ -1097,14 +1279,43 @@ fn segment_direct_reads(
     globs: &[bool],
     context: ScanContext,
 ) -> Vec<(String, String)> {
-    let plain_jq_pipeline = context.plain_jq_pipeline;
-    let Some((cmd_word, argv)) = resolve_command(tokens) else {
+    let Some((cmd_word, argv, peel)) = resolve_reader(tokens) else {
         return Vec::new();
     };
+    // The peeled assignment and redirection words keep the unqualified
+    // judgment they had as operands of an unrecognized head (#1296), so a
+    // `< .env ls` still blocks.
+    let peeled: Vec<(String, String)> = peel
+        .words
+        .iter()
+        .filter_map(|t| dangerous_secret_operand(t, Filename::Unqualified))
+        .map(|value| (cmd_word.to_string(), value.to_string()))
+        .collect();
+    let found = segment_resolved_reads(tokens, globs, &cmd_word, argv, &peel, context);
+    let mut all = peeled;
+    for read in found {
+        if !all.contains(&read) {
+            all.push(read);
+        }
+    }
+    all
+}
+
+/// [`segment_direct_reads`] once the command word is resolved.
+fn segment_resolved_reads(
+    tokens: &[String],
+    globs: &[bool],
+    cmd_word: &Cow<'_, str>,
+    argv: &[String],
+    peel: &ReaderPeel<'_>,
+    context: ScanContext,
+) -> Vec<(String, String)> {
+    let plain_jq_pipeline = context.plain_jq_pipeline;
+    let cmd_word = cmd_word.clone();
     // `find` is metadata-safe on its own (`find . -name .env`), but an
     // exec-family action runs a real command on each hit — judge that
     // command instead of exempting the whole `find` (#118).
-    if cmd_word == "find" {
+    if cmd_word == "find" && !peel.rebound {
         return find_exec_leak(argv).into_iter().collect();
     }
     // The exemption keys on the segment's FIRST token, byte for byte, BEFORE
@@ -1145,16 +1356,17 @@ fn segment_direct_reads(
         // A `GIT_*` assignment in front of this `git` (or anywhere in the
         // command) can make it run anything (#850 delta review I6).
         let git_env = context.git_env_rebound
+            || peel.rebound
             || tokens
                 .iter()
                 .any(|t| is_assignment_word(t) && t.starts_with("GIT_"));
         if !git_env && git_keeps_exemption(&argv[1..]) {
-            return secret_input_redirections(argv)
+            return secret_input_redirections(tokens)
                 .into_iter()
                 .map(|value| (cmd_word.to_string(), value.to_string()))
                 .collect();
         }
-    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
+    } else if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) && !peel.rebound {
         return Vec::new();
     }
     // A pure file reader vouches for its operands: `cat prod.env` names a
@@ -1186,9 +1398,14 @@ fn segment_direct_reads(
     // `*`, `?` and `[` are that language's syntax, so it is exempt from the
     // glob judgment alone — a literal secret name there still counts. Same
     // byte-exact head rule as the jq filter above.
-    let exact_head = tokens.first().is_some_and(|head| *head == cmd_word);
     // `argv` is a suffix of `tokens` (the prefix peel only advances).
     let argv_at = tokens.len() - argv.len();
+    // Inert assignments may precede the head (`NAME=v grep …`); a wrapper,
+    // redirection, or rebinding assignment may not (#1296).
+    let exact_head = !peel.rebound
+        && !peel.redirected
+        && tokens[..argv_at].iter().all(|t| is_assignment_word(t))
+        && argv.first().is_some_and(|head| *head == cmd_word);
     let pattern = exact_head
         .then(|| pattern_operand_index(&cmd_word, argv))
         .flatten();
@@ -1237,20 +1454,15 @@ fn segment_direct_reads(
     }
     // `gh api`'s endpoint is a URL path, and its `--input`/`-F key=@FILE`
     // values are files it sends (#1276).
-    // A `VAR=value` prefix (`GH_HOST=x gh api …`) leaves the assignment as
-    // the head; the files are still judged behind it, while the endpoint
-    // exemption keeps its byte-exact head rule.
+    // A `VAR=value` prefix (`GH_HOST=x gh api …`) is peeled by
+    // [`resolve_reader`]; a `GH_*` one is rebinding, so the endpoint exemption
+    // keeps its byte-exact head rule there.
     let mut gh_endpoint = None;
-    let assignments = argv.iter().take_while(|t| is_assignment_word(t)).count();
-    if cmd_word == "gh"
-        || argv
-            .get(assignments)
-            .is_some_and(|head| assignments > 0 && command_word(head) == "gh")
-    {
-        let (endpoint, files) = gh_api_operands(&argv[assignments..]);
-        gh_endpoint = endpoint.filter(|_| exact_head && assignments == 0);
+    if cmd_word == "gh" {
+        let (endpoint, files) = gh_api_operands(argv);
+        gh_endpoint = endpoint.filter(|_| exact_head);
         for (at, file) in files {
-            uploads.entry(assignments + at).or_default().push(file);
+            uploads.entry(at).or_default().push(file);
         }
     }
     // Operands a recognized verb consumes without printing (#771, #782).
@@ -1367,6 +1579,16 @@ fn segment_direct_reads(
                         .map(|value| (cmd_word.to_string(), value.to_string())),
                     _ => None,
                 }),
+        )
+        // A file redirected into a reader is printed, and into a program that
+        // sends its stdin out is uploaded (#1296), wherever the redirection
+        // sits in the segment.
+        .chain(
+            (position == Filename::Known || sends_stdin(&cmd_word, argv))
+                .then(|| secret_input_redirections(tokens))
+                .into_iter()
+                .flatten()
+                .map(|value| (cmd_word.to_string(), value.to_string())),
         )
         .collect()
 }
