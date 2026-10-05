@@ -221,6 +221,9 @@ struct HookRef {
     expected_plugin: String,
     /// Whether this hook has a matcher of "Bash"
     is_bash_matcher: bool,
+    /// The matcher string of the block this hook was declared in (`""` when
+    /// the block has none). Read by the multi-matcher pin table.
+    matcher: String,
     /// Whether this hook has an `if` filter
     has_if_filter: bool,
     /// The hook event type from hooks.json (e.g., "PreToolUse", "PostToolUse")
@@ -880,6 +883,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
                         plugin,
                         expected_plugin: expected_plugin.to_string(),
                         is_bash_matcher: is_bash,
+                        matcher: matcher_str.to_string(),
                         has_if_filter: has_if,
                         event_type: event.clone(),
                         matcher_index,
@@ -3170,6 +3174,216 @@ fn persist_plan_approval_stays_on_every_post_tool_use() {
              with matcher `*` and no `if:` — session liveness depends on it \
              (#902). {}\n\n{hint}",
             path.display()
+        );
+    }
+}
+
+/// Hooks wired under more than one `(event, matcher)` entry, with every entry
+/// each one needs.
+///
+/// A guard registered under several matchers is easy to half-unwire: drop one
+/// entry and every other assertion in this file still passes, because the
+/// command is still registered *somewhere* (#1246). `guard-runbook-scrub` is
+/// the motivating case — it scrubs file writes under the Write/Edit matcher and
+/// shell commands under the Bash matcher, and losing either half silently
+/// stops half of its coverage.
+///
+/// Each requirement is `(event, probe)`. `Some(tool)` means some entry for this
+/// command under `event` must have a matcher that fires on `tool` (as
+/// [`matcher_covers`] reads it); `None` means any entry under `event` will do,
+/// for events whose matcher is not a tool name.
+///
+/// [`every_multi_matcher_hook_is_pinned`] keeps the table complete: a command
+/// that gains a second entry must be added here with all of its entries.
+/// One required entry for a [`MULTI_MATCHER_HOOKS`] row: `(event, probe)`.
+type MatcherEntry = (&'static str, Option<&'static str>);
+
+const MULTI_MATCHER_HOOKS: &[(&str, &[MatcherEntry])] = &[
+    (
+        "guardrails guard-runbook-scrub",
+        &[
+            ("PreToolUse", Some("Write")),
+            ("PreToolUse", Some("Edit")),
+            ("PreToolUse", Some("MultiEdit")),
+            ("PreToolUse", Some("Bash")),
+        ],
+    ),
+    (
+        "cadence prevent-secret-leaks",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Read")),
+            ("PreToolUse", Some("Grep")),
+        ],
+    ),
+    (
+        "cadence prevent-secret-writes",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Write")),
+            ("PreToolUse", Some("Edit")),
+        ],
+    ),
+    (
+        "cadence redact-external-content",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Write")),
+            ("PreToolUse", Some("Edit")),
+        ],
+    ),
+    (
+        "cadence warn-overshare",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Write")),
+            ("PreToolUse", Some("Edit")),
+        ],
+    ),
+    (
+        "guardrails enforce-worktree",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Edit")),
+            ("PreToolUse", Some("Write")),
+        ],
+    ),
+    (
+        "session guard",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Edit")),
+            ("PreToolUse", Some("Write")),
+        ],
+    ),
+    (
+        "guardrails warn-agent-dispatch",
+        &[("PreToolUse", Some("Agent")), ("PreToolUse", Some("Task"))],
+    ),
+    (
+        "obsidian trash-guard",
+        &[
+            ("PreToolUse", Some("Bash")),
+            ("PreToolUse", Some("Edit")),
+            ("PreToolUse", Some("Write")),
+        ],
+    ),
+    (
+        "metrics log-ask-user-question",
+        &[
+            ("PreToolUse", Some("AskUserQuestion")),
+            ("PostToolUse", Some("AskUserQuestion")),
+        ],
+    ),
+    (
+        "metrics log-subagent",
+        &[("SubagentStart", None), ("SubagentStop", None)],
+    ),
+    (
+        "cadence model-posture",
+        &[("SessionStart", Some("startup")), ("PostModelSwitch", None)],
+    ),
+    (
+        "cadence audit-runner-pool",
+        &[
+            ("PostToolUse", Some("Write")),
+            ("PostToolUse", Some("Edit")),
+            ("PostToolUse", Some("MultiEdit")),
+        ],
+    ),
+];
+
+/// Does `matcher` fire on the literal name `probe`?
+///
+/// Reads only the forms the estate's manifests use: empty or `*` (everything)
+/// and `|`-separated literal alternatives, optionally `^…$`-anchored. A regex
+/// alternative such as `mcp__.*(write|edit)` never equals a plain tool name, so
+/// it neither matches nor breaks the literal alternatives beside it. Unlike
+/// [`matcher_matches_bash`] the comparison is exact: matchers are
+/// case-sensitive, and a pin should not pass on a spelling the platform would
+/// not fire on.
+fn matcher_covers(matcher: &str, probe: &str) -> bool {
+    if matcher.is_empty() || matcher == "*" {
+        return true;
+    }
+    matcher
+        .split('|')
+        .any(|alt| alt.trim().trim_start_matches('^').trim_end_matches('$') == probe)
+}
+
+#[test]
+fn matcher_covers_reads_literal_alternatives_only() {
+    assert!(matcher_covers("", "Bash"));
+    assert!(matcher_covers("*", "Write"));
+    assert!(matcher_covers("Bash", "Bash"));
+    assert!(matcher_covers("^Bash$|^Edit$", "Edit"));
+    assert!(matcher_covers(
+        "Write|Edit|MultiEdit|mcp__.*(write|edit|create).*",
+        "MultiEdit"
+    ));
+    assert!(!matcher_covers("Write|Edit", "Bash"));
+    assert!(!matcher_covers("bash", "Bash"));
+    assert!(!matcher_covers("mcp__.*(write|edit).*", "Edit"));
+}
+
+#[test]
+fn multi_matcher_hooks_keep_every_entry() {
+    for subject in audit_subjects() {
+        let label = subject.label;
+        let hint = &subject.hint;
+        let refs: Vec<&HookRef> = subject.refs.values().flatten().collect();
+        let mut missing = Vec::new();
+        for (command, required) in MULTI_MATCHER_HOOKS {
+            for (event, probe) in *required {
+                let wired = refs.iter().any(|r| {
+                    r.command == *command
+                        && r.event_type == *event
+                        && probe.is_none_or(|tool| matcher_covers(&r.matcher, tool))
+                });
+                if !wired {
+                    missing.push(format!(
+                        "  `{command}`: no {event} entry{}",
+                        probe.map_or(String::new(), |t| format!(" whose matcher fires on `{t}`"))
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "[{label}] a hook wired under several matchers lost one of its entries (#1246):\n{}\n\n\
+             Restore the entry in the plugin's hooks.json, or, if the narrowing is \
+             deliberate, update MULTI_MATCHER_HOOKS in the same change.\n\n{hint}",
+            missing.join("\n")
+        );
+    }
+}
+
+#[test]
+fn every_multi_matcher_hook_is_pinned() {
+    for subject in audit_subjects() {
+        let label = subject.label;
+        let hint = &subject.hint;
+        let mut entries: BTreeMap<&str, BTreeSet<(&str, &str)>> = BTreeMap::new();
+        for r in subject.refs.values().flatten() {
+            entries
+                .entry(r.command.as_str())
+                .or_default()
+                .insert((r.event_type.as_str(), r.matcher.as_str()));
+        }
+        let unpinned: Vec<String> = entries
+            .iter()
+            .filter(|(command, seen)| {
+                seen.len() > 1 && !MULTI_MATCHER_HOOKS.iter().any(|(c, _)| c == *command)
+            })
+            .map(|(command, seen)| format!("  `{command}`: {seen:?}"))
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            "[{label}] these hooks are wired under more than one (event, matcher) \
+             entry but MULTI_MATCHER_HOOKS does not pin them, so losing one entry \
+             would pass every assertion here (#1246):\n{}\n\n\
+             Add each with every entry it needs.\n\n{hint}",
+            unpinned.join("\n")
         );
     }
 }
