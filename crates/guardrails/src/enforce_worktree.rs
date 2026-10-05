@@ -11894,8 +11894,16 @@ mod tests {
                 assert!(scan.unresolved_cd.is_some(), "{name}");
             }
             // Debug builds get headroom; release is the hook's real budget.
-            let limit =
-                std::time::Duration::from_millis(if cfg!(debug_assertions) { 6000 } else { 500 });
+            // The Windows runner's debug build runs ~3x slower than Linux
+            // debug (`subst-heredoc-nest`: 6.14 s there, 2.03 s on Linux, no
+            // algorithmic change), so it gets twice the debug headroom.
+            let limit = std::time::Duration::from_millis(if cfg!(all(windows, debug_assertions)) {
+                12_000
+            } else if cfg!(debug_assertions) {
+                6000
+            } else {
+                500
+            });
             assert!(took < limit, "{name}: {took:?}");
             // Without a commit anywhere there is nothing to refuse.
             let quiet = scan_targets(&body, "/w", false);
