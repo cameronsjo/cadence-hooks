@@ -324,6 +324,9 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     // which also needs an INTENTIONAL_CROSS_PLUGIN_HOOKS row (two-PR shape,
     // cameronsjo/cadence-hooks#989).
     ("session plan-driver", "cameronsjo/cadence-hooks#989"),
+    // Opt-in UserPromptSubmit gap marker: binary first, its `cadence` plugin
+    // hooks.json entry rides the follow-up monorepo wiring PR (two-PR shape).
+    ("session nudge-afk-gap", "cameronsjo/cadence-hooks#480"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -2502,6 +2505,8 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
             "SessionStart"
         } else if window.contains(", pre") || window.contains("pre)") {
             "PreToolUse"
+        } else if window.contains(", prompt") || window.contains("prompt)") {
+            "UserPromptSubmit"
         } else {
             continue;
         };

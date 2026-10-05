@@ -941,6 +941,15 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "nudge-afk-gap",
+        description: "Mark a long idle gap (\"6 hours later…\") on the next prompt; opt-in via CADENCE_AFK_GAP=1, threshold CADENCE_AFK_GAP_MINUTES (default 240) (UserPromptSubmit)",
+        namespace: "session",
+        events: &[HookEvent::UserPromptSubmit],
+        // Remote: its tool-activity stamp is written by persist-plan-approval, which self-disables in the cloud; running without it would read a long autonomous turn as idle.
+        remote: RemotePolicy::SelfDisable,
+        suppressible: false,
+    },
+    HookEntry {
         name: "plan-driver",
         description: "Ask to confirm a /model switch (command or picker, attended TUI only: CLAUDE_CODE_ENTRYPOINT=cli and CLAUDE_CODE_SESSION_ATTENDED=1, never -p, stream-json, SDK or CLAUDE_CODE_REMOTE, where an ask refuses the switch) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
         namespace: "session",
@@ -1456,6 +1465,7 @@ mod tests {
         "backstop-record",
         "backstop-warn",
         "persist-plan-approval",
+        "nudge-afk-gap",
     ];
 
     #[test]

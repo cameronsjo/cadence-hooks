@@ -52,7 +52,7 @@ fn resolve_session_id_from(
 
 /// Resolve this session's id from the real environment. See
 /// [`resolve_session_id_from`] for the priority order and rationale.
-fn resolve_session_id(flag: Option<String>) -> Option<String> {
+pub(crate) fn resolve_session_id(flag: Option<String>) -> Option<String> {
     resolve_session_id_from(
         flag,
         std::env::var("CLAUDE_SESSION_ID").ok(),

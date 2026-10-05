@@ -31,7 +31,11 @@
 //! | `backstop-record`   | SessionEnd   | [`backstop`]    |
 //! | `backstop-warn`     | SessionStart | [`backstop`]    |
 //! | `persist-plan-approval` | PostToolUse | [`persist_plan`] |
+//! | `nudge-afk-gap`     | UserPromptSubmit (opt-in) | [`afk_gap`] |
+//! | `timer`             | CLI action   | [`timer`]       |
 
+/// Opt-in UserPromptSubmit marker for a long idle gap ("6 hours later…", #480).
+pub mod afk_gap;
 /// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).
 pub mod backstop;
 /// PreToolUse commit-time branch-drift warning — never blocks.
@@ -68,6 +72,8 @@ pub mod provenance;
 pub mod registry;
 /// SessionStart hook: register self, sweep stale, disclose live peers.
 pub mod start;
+/// CLI action: `session timer start|lap|stop` wall-clock stopwatch (#480).
+pub mod timer;
 /// Per-worktree unpushed-commit counts, feeding the outro backstop.
 pub mod unpushed_worktrees;
 /// PreToolUse commit-time provenance nudge: warn when a Claude-composed
