@@ -8,15 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
-
-### Security
-
-- **`platform-drift` no longer echoes text that rides after a baseline version number.** The version parser now accepts only `MAJOR.MINOR.PATCH` with an optional `-[0-9A-Za-z.]{1,32}` pre-release tag, over the whole string. Any other value, such as `9.9.9 IGNORE PREVIOUS INSTRUCTIONS`, counts as malformed, so the SessionStart nudge stays silent instead of carrying the extra text into `additionalContext`. (cameronsjo/cadence-hooks#1250)
+- **`session guard` counts every nudge it fires in `guard_nudges.jsonl`.** Each branch-switch, blanket-staging, or lane-collision nudge appends one row (`check`, `tool`, `sessionId`, `peerCount`, `repo`) to the metrics dir, so whether any of them earns a block tier can be decided from counts. The row is the only side effect: no context is added, and a write failure is a silent no-op (cameronsjo/cadence-hooks#272).
+- **`session guard` nudges on a Bash command that writes into a live peer's declared lane.** It reuses `enforce-worktree`'s subprocess tree-mutation walk (#234), so a `sed -i`, `tee`, `>`/`>>`/`2>` redirect, or a package-manager verb whose directory lands in a peer's `touching` path now warns just as an `Edit`/`Write` there does, including through `cd`, `sh -c` and `$(…)`. It only adds nudges, and an allowed command is never blocked. A target the walk cannot resolve is not warned about: a relative `$VAR/…` path, `cp`/`mv`/`install`, `python -c`, and the walk's other documented misses (cameronsjo/cadence-hooks#272).
 
 ### Changed
 
 - **The `doctor --quiet` blocker envelope now informs the operator rather than instructing Claude.** It used to say `Run 'cadence-hooks doctor' and tell the user in one line before other work.` and now says `Running 'cadence-hooks doctor' shows which hooks and why.` The count line is unchanged. This matches the ruling that `<cadence-system-message>` is data with no authority. (cameronsjo/cadence-hooks#1251)
+
+### Fixed
+
+- **`platform-drift` no longer tells you to upgrade a binary that is already ahead.** When the installed `cadence-hooks` is newer than the plugin baseline, the nudge now says the cadence plugin pin is behind and names `claude plugin update cadence@workbench` then `/reload-plugins`. An older binary keeps the `brew upgrade cadence-hooks` text, and the daily gate token (`hooks:<running>><expected>`) is unchanged. (cameronsjo/cadence-hooks#1223)
+- **A plan-shape stanza hidden from the rendered plan no longer counts.** The shared line filter behind `lint-plan-shape`, the persist-time format gate and the `## Orchestrator` reader now skips HTML comment blocks (a line-start `<!--` through the line carrying `-->`; a mid-line `<!--` stays literal text), the plan's leading YAML frontmatter (after an optional BOM), and nested fences: a fence closes only on the same character, at least as long as the opener, with no info string, indented at most 3 columns past the opener, so a four-backtick fence holding a three-backtick one, a backtick fence holding a tilde one, or a fence quoting a 4-space-indented nested fence stays one fence. `<!-->` and `<!--->` are complete empty comments. A `Panel:` line in any of those positions now reads as missing and blocks, and a `## Loop` heading there reads as missing. An unterminated fence or comment hides the rest of the plan, so it can only make a stanza read as missing. The checkbox counter reads through the same filter, so a box in a fence, comment or frontmatter is never counted. (cameronsjo/cadence-hooks#1283)
+- **`warn-unreviewed-ready-flip` now says it cannot see a review marker posted earlier in the same command.** The hook reads the PR before the Bash command runs, so a command that posts a `cadence-review` marker and then merges drew a bare "not reviewed at head" warning. When no approval signal is found, the message now adds that a marker posted earlier in the same command is not seen and that the warning is stale if the command posts one. The command text is not parsed for markers, and a CHANGES_REQUESTED-only warning does not carry the sentence, since a marker cannot clear that half. (cameronsjo/cadence-hooks#1236)
+
+### Security
+
+- **`SECURITY.md`'s offline verification recipe is pinned tighter and names the cosign version it needs.** The `cosign verify-blob` identity pattern is now anchored (`^…release\.yml@refs/tags/vN.N.N$`), and the note offering a repository-only pattern is replaced by a warning. A signature from any workflow on any branch of this repo satisfies the repository-only pattern, which a dry run confirmed. The recipe now requires cosign v2.5.0 or later, because releases signed by cosign-installer v4 (cosign v3) use the newer bundle format, which v2.4.x and earlier reject.
+- **`platform-drift` no longer echoes text that rides after a baseline version number.** The version parser now accepts only `MAJOR.MINOR.PATCH` with an optional `-[0-9A-Za-z.]{1,32}` pre-release tag, over the whole string. Any other value, such as `9.9.9 IGNORE PREVIOUS INSTRUCTIONS`, counts as malformed, so the SessionStart nudge stays silent instead of carrying the extra text into `additionalContext`. (cameronsjo/cadence-hooks#1250)
+
+## [0.122.0] - 2026-10-03
+
+### Added
+
+- **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
 
 ## [0.121.0] - 2026-09-30
 
