@@ -19236,6 +19236,10 @@ mod tests {
         // nesting level surfaced two near-whole bodies and the wrapper
         // recursion re-read both (1.4 s in enforce-worktree, 4x main). The
         // blind reading models `case` too now, and surfaces one.
+        //
+        // Pinned on the bytes surfaced, not wall time: a 5 s bound failed at
+        // 5.03 s on a loaded windows-latest runner. A healthy run surfaces
+        // about 4x the input; before the `case` model it surfaced 15x.
         for unit in ["$(case a in a) ", "\"$(case a in a) "] {
             let input = format!("echo {} ; cat .env", unit.repeat(200_000 / unit.len()));
             let chars: Vec<char> = input.chars().collect();
@@ -19244,7 +19248,17 @@ mod tests {
             let segs = command_segments(&input);
             let took = started.elapsed();
             assert!(segs.iter().any(|s| s.contains("cat .env")), "{unit}");
-            assert!(took < std::time::Duration::from_secs(5), "{unit}: {took:?}");
+            let bytes: usize = segs.iter().map(String::len).sum();
+            assert!(
+                bytes <= 8 * input.len(),
+                "{unit}: {bytes} bytes surfaced from {}",
+                input.len()
+            );
+            // Hang guard only, far above a healthy run.
+            assert!(
+                took < std::time::Duration::from_secs(60),
+                "{unit}: {took:?}"
+            );
         }
     }
 
