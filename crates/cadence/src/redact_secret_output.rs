@@ -576,10 +576,10 @@ pub enum Strength {
     /// value itself looks like metadata ([`metadata_value`]) — a URL, path,
     /// number, reference, plain word or lowercase k8s-style name.
     Meta,
-    /// A glued `…pass` word whose stem also names a counter or a timestamp
-    /// (`lastpass`, `hashpass`, `endpass`): masked as [`Strength::Strong`] is,
-    /// except a value that is only digits (`lastpass=1696500000`,
-    /// `HASHPASS: 12`), which counts something.
+    /// A whole name that is a glued `…pass` word whose stem also names a
+    /// counter or a timestamp (`lastpass`, `hashpass`, `endpass`): masked as
+    /// [`Strength::Strong`] is, except a value that is only digits
+    /// (`lastpass=1696500000`, `HASHPASS: 12`), which counts something.
     Counter,
 }
 
@@ -703,20 +703,23 @@ fn classify(segs: &[&str]) -> Option<Strength> {
         return Some(Strength::Strong);
     }
     let mut weak = false;
-    // A counter stem (`lastpass`) only lowers the name when no later segment
-    // is strong: `LASTPASS_PASSWORD` is still a password.
-    let mut counter = false;
     for (i, seg) in segs.iter().enumerate() {
         let prev = i.checked_sub(1).map(|p| segs[p]);
         match *seg {
             "token" => {
                 // `NextToken`, `next_page_token`, `IdempotencyToken`: the
                 // camelCase and separated spellings of the pagination and
-                // idempotency handles. Other glued exemptions (`keytoken`,
-                // `synctoken`) stay glued-only, so `KEY_TOKEN` is strong.
-                if prev.is_none_or(|p| {
-                    !TOKEN_COUNT_QUALIFIERS.contains(&p) && !HANDLE_TOKEN_QUALIFIERS.contains(&p)
-                }) {
+                // idempotency handles. A `page` token is a handle only as the
+                // next or previous page's: `PAGE_TOKEN`/`FB_PAGE_TOKEN` is a
+                // Facebook Page access token. Other glued exemptions
+                // (`keytoken`, `synctoken`) stay glued-only, so `KEY_TOKEN`
+                // is strong.
+                let handle = match prev {
+                    Some("page") => i >= 2 && matches!(segs[i - 2], "next" | "prev"),
+                    Some(p) => HANDLE_TOKEN_QUALIFIERS.contains(&p),
+                    None => false,
+                };
+                if !handle && prev.is_none_or(|p| !TOKEN_COUNT_QUALIFIERS.contains(&p)) {
                     return Some(Strength::Strong);
                 }
             }
@@ -733,14 +736,18 @@ fn classify(segs: &[&str]) -> Option<Strength> {
                 .strip_suffix("pass")
                 .is_some_and(|stem| COUNTER_PASS_PREFIXES.contains(&stem)) =>
             {
-                counter = true;
+                // Only the whole name is a counter (`lastpass`, `HASHPASS`).
+                // Beside any other segment it is the strong word it was
+                // (`LASTPASS_PASSWORD`, `LASTPASS_PIN`).
+                return Some(if segs.len() == 1 {
+                    Strength::Counter
+                } else {
+                    Strength::Strong
+                });
             }
             s if STRONG_WORDS.contains(&s) || glued_strong(s) => return Some(Strength::Strong),
             _ => {}
         }
-    }
-    if counter {
-        return Some(Strength::Counter);
     }
     weak.then_some(Strength::Weak)
 }
@@ -775,9 +782,10 @@ fn glued_strong(seg: &str) -> bool {
 }
 
 /// Segments before a separate `token` segment that make it a pagination or
-/// idempotency handle, not a credential (`NextToken`, `next_page_token`,
-/// `IdempotencyToken`).
-const HANDLE_TOKEN_QUALIFIERS: &[&str] = &["next", "page", "idempotency"];
+/// idempotency handle, not a credential (`NextToken`, `IdempotencyToken`).
+/// `page` counts only after `next`/`prev` (`next_page_token`), handled where
+/// this is read.
+const HANDLE_TOKEN_QUALIFIERS: &[&str] = &["next", "idempotency"];
 
 /// Stems of a glued `…pass` word that may count something: see
 /// [`Strength::Counter`].
@@ -2541,6 +2549,8 @@ mod tests {
             format!("{{\"nextToken\": \"{handle}\"}}\n"),
             format!("NextToken: {handle}\n"),
             format!("{{\"next_page_token\": \"{handle}\"}}\n"),
+            format!("{{\"nextPageToken\": \"{handle}\"}}\n"),
+            format!("{{\"prev_page_token\": \"{handle}\"}}\n"),
             format!("{{\"ClientToken\": \"{handle}\"}}\n"),
             format!("{{\"IdempotencyToken\": \"{handle}\"}}\n"),
             "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)\n"
@@ -2585,6 +2595,14 @@ mod tests {
             "LASTPASS_PASSWORD=48213907\n".to_string(),
             "HASHPASS_SECRET=12345678\n".to_string(),
             "ENDPASS_TOKEN=12345678\n".to_string(),
+            "LASTPASS_PIN=4821\n".to_string(),
+            // A page token is a credential unless it is the next or
+            // previous page's (Facebook Page access tokens).
+            format!("FB_PAGE_TOKEN={}\n", alnum(32)),
+            format!("FACEBOOK_PAGE_TOKEN={}\n", alnum(32)),
+            format!("PAGE_TOKEN={}\n", alnum(32)),
+            format!("page_token: {}\n", alnum(32)),
+            format!("pageToken: {}\n", alnum(32)),
         ];
         for input in &masks {
             assert_ne!(redact(input), None, "{input:?} was not masked");
