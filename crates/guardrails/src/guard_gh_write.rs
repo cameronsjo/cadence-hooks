@@ -2168,6 +2168,48 @@ fn api_repos_target(endpoint: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
+/// The organization a `gh api orgs/<org>[/…]` endpoint PATH addresses, so an
+/// organization-level write is judged against the owner allowlist like a
+/// `repos/<owner>/…` one (cameronsjo/cadence-hooks#1311).
+///
+/// Reads the path only, like [`api_repos_target`], and anchored to its start.
+/// Only a plain path is read: the org must be a literal GitHub login, and every
+/// later segment plain text with no `.`/`..` segment, percent-escape,
+/// placeholder or expansion. Any other shape returns `None` and keeps the
+/// unverifiable-write verdict it had.
+fn api_orgs_owner(endpoint: &str) -> Option<String> {
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let mut segments = path.split('/');
+    if segments.next() != Some("orgs") {
+        return None;
+    }
+    let org = segments.next()?;
+    let is_login = !org.is_empty()
+        && !org.starts_with('-')
+        && org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let rest: Vec<&str> = segments.collect();
+    // A later `repos/<owner>/…` names a repository too
+    // (`orgs/<org>/teams/<team>/repos/<owner>/<repo>`): one owned by
+    // another account is not this org's to grant, so it keeps the old verdict.
+    let names_another_owner = rest
+        .windows(2)
+        .any(|pair| pair[0] == "repos" && !pair[1].eq_ignore_ascii_case(org));
+    if names_another_owner {
+        return None;
+    }
+    let rest_is_plain = rest.iter().all(|segment| {
+        !segment.is_empty()
+            && *segment != "."
+            && *segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    });
+    (is_login && rest_is_plain).then(|| org.to_string())
+}
+
 /// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
 /// SEPARATE value token, which the positional scan must step over.
 ///
@@ -3858,6 +3900,27 @@ fn judge_write_segments(
             // pattern, so the segment fell through to the cwd remote and
             // was allowed from any owned checkout (#463 review).
             if api_repos_target(&endpoint).is_none() {
+                // An `orgs/<org>` endpoint names its owner: allowed when that
+                // org is an allowed owner on every host gh may reach
+                // (cameronsjo/cadence-hooks#1311). Repo-scoped entries do not
+                // cover an organization-level write.
+                let hosts = gh_host_env.candidates();
+                let org_owned = api_orgs_owner(&endpoint).is_some_and(|org| {
+                    !hosts.is_empty()
+                        && hosts.iter().all(|env_host| {
+                            config::is_allowed_with_extra_hosts(
+                                &gh_command_host(&segment, env_host),
+                                &org,
+                                "",
+                                allowed_owners,
+                                &[],
+                                extra_hosts,
+                            )
+                        })
+                });
+                if org_owned {
+                    continue;
+                }
                 return Some(api_unverifiable_block(
                     &segment,
                     false,
@@ -6883,6 +6946,84 @@ mod tests {
         );
         // Anchored: the path must START with the repos/ segment.
         assert_eq!(api_repos_target("user/repos/cameronsjo/allowed"), None);
+    }
+
+    #[test]
+    fn api_orgs_owner_reads_a_plain_org_path_only() {
+        for (endpoint, want) in [
+            ("orgs/cameronsjo", Some("cameronsjo")),
+            ("/orgs/cameronsjo/", Some("cameronsjo")),
+            ("orgs/cameronsjo/hooks/1", Some("cameronsjo")),
+            ("orgs/cameronsjo/actions/secrets/X_Y", Some("cameronsjo")),
+            ("orgs/cameronsjo?per_page=5", Some("cameronsjo")),
+            // Decoys in the query and fragment supply nothing.
+            ("orgs/evil-org/repos?ref=orgs/cameronsjo", Some("evil-org")),
+            ("user/repos#orgs/cameronsjo", None),
+            // Anchored, and only a plain path is read.
+            ("x/orgs/cameronsjo", None),
+            ("orgs/", None),
+            ("orgs/{owner}", None),
+            ("orgs/$ORG", None),
+            ("orgs/-x", None),
+            ("orgs/cameronsjo/../evil/repos", None),
+            ("orgs/cameronsjo/./x", None),
+            ("orgs/cameronsjo/%2e%2e/evil", None),
+            ("orgs/cameronsjo//x", None),
+            ("https://api.github.com/orgs/cameronsjo", None),
+            // A team grant on another owner's repository is not the org's.
+            ("orgs/cameronsjo/teams/core/repos/evil/x", None),
+            (
+                "orgs/cameronsjo/teams/core/repos/CameronSjo/x",
+                Some("cameronsjo"),
+            ),
+        ] {
+            assert_eq!(api_orgs_owner(endpoint).as_deref(), want, "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn an_org_write_to_an_allowed_owner_allows() {
+        // cameronsjo/cadence-hooks#1311: an `orgs/<org>` write names its owner,
+        // so it is judged against the owner allowlist instead of refused as
+        // unverifiable.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api -X PATCH orgs/cameronsjo -f name=\"Artificer Made\"",
+                "gh api --method PATCH /orgs/cameronsjo -f blog=https://example.com",
+                "gh api -X POST orgs/cameronsjo/hooks -f name=web",
+                "gh api -X PUT orgs/CameronSjo/actions/permissions -f enabled_repositories=all",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn an_org_write_to_an_unlisted_or_unreadable_owner_still_blocks() {
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api -X PATCH orgs/evil-org -f name=x",
+                "gh api -X POST orgs/evil-org/repos -f name=x",
+                "gh api -X POST \"orgs/evil-org/repos?ref=orgs/cameronsjo\" -f name=x",
+                "gh api -X PATCH orgs/$ORG -f name=x",
+                "gh api -X PATCH orgs/cameronsjo/../evil-org -f name=x",
+                "gh api -X PUT orgs/cameronsjo/teams/core/repos/evil/x -f permission=push",
+                "gh api -X PATCH orgs/cameronsjo --hostname evil.example -f name=x",
+                "GH_HOST=evil.example gh api -X PATCH orgs/cameronsjo -f name=x",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
     }
 
     #[test]

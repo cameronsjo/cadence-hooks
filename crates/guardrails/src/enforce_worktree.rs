@@ -1386,9 +1386,59 @@ fn outside_ranges(text: &str, ranges: &[Range<usize>]) -> String {
 /// `<<`: the shapes core's escape-blind heredoc reading gets wrong (#1084).
 /// An escaped quote inside a delimiter word (`<<"E\"F"`) changes the
 /// delimiter as much as one before the operator changes where it starts.
+///
+/// A backslash inside a single-quoted span is a literal character to bash, not
+/// an escape, so `sed 's|\\"x\\"|y|'` after a heredoc is not suspect
+/// (cameronsjo/cadence-hooks#1317). Only spans that open and close on one line
+/// are read that way; any quote left open at a line end falls back to the
+/// quote-blind substring reading.
 fn escapes_hide_a_heredoc(command: &str) -> bool {
-    command.contains("\\<")
-        || (command.contains("<<") && (command.contains("\\'") || command.contains("\\\"")))
+    let (escaped_lt, escaped_quote) = escapes_outside_single_quotes(command).unwrap_or_else(|| {
+        (
+            command.contains("\\<"),
+            command.contains("\\'") || command.contains("\\\""),
+        )
+    });
+    escaped_lt || (command.contains("<<") && escaped_quote)
+}
+
+/// Whether `text` holds an escaped `<`, and an escaped quote, anywhere outside
+/// a single-quoted span. `None` when a quote is still open at a line end (a
+/// multi-line string, or an apostrophe in a comment or heredoc body), where
+/// this line-local reading cannot be trusted.
+fn escapes_outside_single_quotes(text: &str) -> Option<(bool, bool)> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        AnsiC,
+    }
+    let (mut lt, mut quote) = (false, false);
+    let mut state = Quote::None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (&state, c) {
+            (Quote::Single, '\'') => state = Quote::None,
+            (Quote::Single, '\n') => return None,
+            (Quote::Single, _) => {}
+            (_, '\\') => match chars.next() {
+                Some('<') => lt = true,
+                Some('\'' | '"') => quote = true,
+                _ => {}
+            },
+            (Quote::None, '\'') => state = Quote::Single,
+            (Quote::None, '"') => state = Quote::Double,
+            (Quote::None, '$') if chars.peek() == Some(&'\'') => {
+                chars.next();
+                state = Quote::AnsiC;
+            }
+            (Quote::Double, '"') | (Quote::AnsiC, '\'') => state = Quote::None,
+            (Quote::Double | Quote::AnsiC, '\n') => return None,
+            _ => {}
+        }
+    }
+    (state == Quote::None).then_some((lt, quote))
 }
 
 /// [`heredoc_reading_suspect`] from the raw command alone. A command
@@ -10884,6 +10934,40 @@ mod tests {
             );
         }
         assert!(!escapes_hide_a_heredoc("echo \\\"x\\\" && git commit -m x"));
+    }
+
+    #[test]
+    fn a_backslash_in_single_quotes_after_a_heredoc_is_data() {
+        // cameronsjo/cadence-hooks#1317: inside single quotes a backslash is a
+        // literal character, so the `\"` in this sed script is not an escaped
+        // quote and the heredoc reading is not suspect. The quote-blind
+        // fallback used to read the script as `cd … && git commit`.
+        let issue = "cat > /tmp/h <<'EOF'\n{}\nEOF\nsed 's|cd \\\"$(mktemp -d)\\\" \\&\\& git commit|x|' /tmp/f > /tmp/g";
+        let perlish = "cat > /tmp/p.json <<'EOF'\n{\"a\": 1}\nEOF\nperl -0pi -e 's/cd \\\"\\$D\\\" && git commit/x/' notes.md";
+        for cmd in [issue, perlish] {
+            assert!(!escapes_hide_a_heredoc(cmd), "{cmd:?}");
+            assert!(!command_heredocs_suspect(cmd), "{cmd:?}");
+            let scan = scan_targets(cmd, "/w", false);
+            assert!(scan.unresolved_cd.is_none(), "{cmd:?}");
+            assert!(scan.commits.is_empty(), "{cmd:?}: {:?}", scan.commits);
+        }
+        // Outside single quotes the same escapes still count.
+        for cmd in [
+            "cat <<EOF\nx\nEOF\necho \\\"a\\\" ; git commit -m x",
+            "cat <<EOF\nx\nEOF\necho \"a \\\" b\"",
+            "cat <<EOF\nx\nEOF\necho $'a\\'b'",
+            "echo \\<<EOF",
+        ] {
+            assert!(escapes_hide_a_heredoc(cmd), "{cmd:?}");
+        }
+        // A quote left open at a line end keeps the substring reading.
+        assert!(escapes_hide_a_heredoc(
+            "cat <<EOF\nx\nEOF\necho 'it\\\"s\nfine'"
+        ));
+        assert!(escapes_hide_a_heredoc(
+            "cat <<EOF\nx\nEOF\n# don't\necho '\\\"'"
+        ));
+        assert!(!escapes_hide_a_heredoc("grep '\\<word\\>' f.txt"));
     }
 
     #[test]
