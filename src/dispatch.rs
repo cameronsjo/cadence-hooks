@@ -774,6 +774,34 @@ fn merge_group_output(
     let mut context = nudges.clone();
     context.extend(degraded.iter().map(String::as_str));
 
+    // An output rewrite (cameronsjo/cadence-hooks#776) from any member. On
+    // PostToolUse it survives a sibling Block: the tool already ran, so exit 2
+    // would discard stdout and hand the model the raw output. The block's
+    // reason rides `additionalContext` in the exit-0 envelope — never as
+    // `decision: "block"` beside the rewrite, a pairing that is undocumented.
+    // First one wins; each rewriter sees the original output.
+    let rewrite = results.iter().find_map(|r| r.updated_tool_output.as_ref());
+    if event == HookEvent::PostToolUse
+        && let Some(output) = rewrite
+        && results.iter().any(|r| r.outcome == Outcome::Block)
+    {
+        let mut parts: Vec<&str> = results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Block)
+            .filter_map(|r| r.message.as_deref())
+            .collect();
+        parts.extend(context.iter().copied());
+        let ctx = (!parts.is_empty()).then(|| join_within_budget(&parts));
+        return GroupOutput {
+            stdout: Some(cadence_hooks_core::updated_tool_output_json(
+                event,
+                output,
+                ctx.as_deref(),
+            )),
+            stderr: None,
+            code: 0,
+        };
+    }
     if results.iter().any(|r| r.outcome == Outcome::Block) {
         let blocks: Vec<String> = results
             .iter()
@@ -789,7 +817,7 @@ fn merge_group_output(
         };
     }
     let asks = messages(Outcome::Ask);
-    if asks.is_empty() && nudges.is_empty() {
+    if asks.is_empty() && nudges.is_empty() && rewrite.is_none() {
         return if degraded.is_empty() {
             GroupOutput::default()
         } else {
@@ -814,6 +842,9 @@ fn merge_group_output(
             "additionalContext".into(),
             join_within_budget(&context).into(),
         );
+    }
+    if let Some(output) = rewrite {
+        specific.insert("updatedToolOutput".into(), output.clone());
     }
     GroupOutput {
         stdout: Some(serde_json::json!({ "hookSpecificOutput": specific }).to_string()),
@@ -896,12 +927,20 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
     let mut messages = Vec::new();
     let mut block_metadata = None;
     let mut winning_bypass = None;
+    let mut updated_tool_output = None;
     let mut bypasses: Vec<BypassProvenance> = Vec::new();
     for result in &mut results {
         // Harvested from EVERY result, not just the winners: a bypass ridden by
         // a target whose Allow lost to a sibling Block is still a guardrail that
         // was stepped outside of, and the row recording it is the whole point of
         // `bypasses.jsonl`.
+        // An output rewrite is harvested from EVERY result too: on PostToolUse
+        // the tool already ran, so a sibling's Block must not discard the
+        // masking (the renderer carries it beside the block). First one wins;
+        // each rewriter sees the original output, so two cannot be chained.
+        if updated_tool_output.is_none() {
+            updated_tool_output = result.updated_tool_output.take();
+        }
         if let Some(bypass) = result.bypass.take() {
             if result.outcome == outcome && winning_bypass.is_none() {
                 winning_bypass = Some(bypass.clone());
@@ -928,6 +967,7 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
             // Unchanged from before: the winner carries a winner's bypass, so
             // every existing consumer of this field sees what it always did.
             bypass: winning_bypass,
+            updated_tool_output,
         },
         outcomes,
         bypasses,
@@ -1224,6 +1264,76 @@ mod tests {
     }
 
     #[test]
+    fn output_rewrite_rides_group_and_aggregate_and_matches_standalone() {
+        let out = serde_json::json!({
+            "stdout": "masked", "stderr": "", "interrupted": false, "isImage": false,
+        });
+        let rewrite = || CheckResult::rewrite_output(out.clone());
+        // Standalone and a one-member group render the same envelope.
+        let alone = cadence_hooks_core::render_result(&rewrite(), HookEvent::PostToolUse).0;
+        let group = merge_group_output(HookEvent::PostToolUse, &[rewrite()], &[]);
+        assert_eq!(group.code, 0);
+        assert_eq!(group.stdout, alone);
+        let v = parse_stdout(&group);
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        // Alongside a nudge, both ride one envelope.
+        let v = parse_stdout(&merge_group_output(
+            HookEvent::PostToolUse,
+            &[CheckResult::nudge("note"), rewrite()],
+            &[],
+        ));
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "note");
+        // A sibling Block on PostToolUse keeps the rewrite: exit 0, the block
+        // reason in additionalContext, no `decision` (exit 2 would hand the
+        // model the raw output).
+        let blocked = merge_group_output(
+            HookEvent::PostToolUse,
+            &[CheckResult::block("no"), rewrite()],
+            &[],
+        );
+        assert_eq!(blocked.code, 0);
+        let v = parse_stdout(&blocked);
+        assert!(
+            v.get("decision").is_none(),
+            "no undocumented decision beside a rewrite"
+        );
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "no");
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        // PreToolUse has no output to rewrite: a block stays exit 2.
+        let pre = merge_group_output(
+            HookEvent::PreToolUse,
+            &[CheckResult::block("no"), rewrite()],
+            &[],
+        );
+        assert_eq!(pre.code, 2);
+        // The per-target aggregate keeps the rewrite whichever outcome wins,
+        // and the standalone renderer carries it beside a Block with exit 0.
+        let kept = aggregate_results(vec![rewrite()]).expect("aggregate");
+        assert_eq!(kept.result.updated_tool_output, Some(out.clone()));
+        let beside_block =
+            aggregate_results(vec![rewrite(), CheckResult::block("b")]).expect("aggregate");
+        assert_eq!(beside_block.result.outcome, Outcome::Block);
+        assert_eq!(beside_block.result.updated_tool_output, Some(out.clone()));
+        let (stdout, stderr) =
+            cadence_hooks_core::render_result(&beside_block.result, HookEvent::PostToolUse);
+        let v: serde_json::Value = serde_json::from_str(&stdout.expect("stdout")).unwrap();
+        assert!(v.get("decision").is_none());
+        assert!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some_and(|c| c.starts_with('b'))
+        );
+        assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"], out);
+        assert_eq!(stderr, None);
+        // A plain allow still renders nothing.
+        let plain =
+            cadence_hooks_core::render_result(&CheckResult::allow(), HookEvent::PostToolUse);
+        assert_eq!(plain, (None, None));
+    }
+
+    #[test]
     fn group_ask_carries_nudges_alongside() {
         let results = [CheckResult::nudge("context"), CheckResult::ask("confirm?")];
         let v = parse_stdout(&merge_group_output(HookEvent::PreToolUse, &results, &[]));
@@ -1416,6 +1526,7 @@ mod tests {
                 message: Some("confirm?".to_string()),
                 block_metadata: None,
                 bypass: None,
+                updated_tool_output: None,
             };
 
             for _ in 0..3 {

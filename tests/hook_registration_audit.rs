@@ -311,6 +311,14 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // Binary half of the two-PR shape: the cadence plugin's hooks.json entries
+    // (PostToolUse Bash for the redactor, PreToolUse Bash for the Ask guard)
+    // ride the follow-up monorepo wiring PR (cameronsjo/cadence-hooks#776).
+    (
+        "cadence redact-secret-output",
+        "cameronsjo/cadence-hooks#776",
+    ),
+    ("cadence guard-secret-dump", "cameronsjo/cadence-hooks#776"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

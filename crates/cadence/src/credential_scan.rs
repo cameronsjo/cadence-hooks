@@ -50,6 +50,8 @@ const KINDS: &[&str] = &[
     "API key (sk- shape)",
     "Google API key",
     "Private key PEM header",
+    "GitLab token",
+    "npm token",
 ];
 
 static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -62,6 +64,8 @@ static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"|(?P<k5>sk-[A-Za-z0-9_-]{20,})",
         r"|(?P<k6>AIza[A-Za-z0-9_-]{35})",
         r"|(?P<k7>-----BEGIN[A-Z ]*PRIVATE ?KEY(?: ?BLOCK)?-----)",
+        r"|(?P<k8>glpat-[A-Za-z0-9_-]{20,})",
+        r"|(?P<k9>npm_[A-Za-z0-9]{36,})",
     ))
     .expect("credential regex is valid")
 });
@@ -84,8 +88,10 @@ fn looks_random(s: &str) -> bool {
 
 /// Known token prefixes, for the one plain-space join (see [`normalize`]).
 static PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|[sr]k_live_|sk-|AIza)")
-        .expect("prefix regex is valid")
+    Regex::new(
+        r"^(?:gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|[sr]k_live_|sk-|AIza|glpat-|npm_)",
+    )
+    .expect("prefix regex is valid")
 });
 
 /// Copy of `text` with shell-concatenation seams removed, so a split token
@@ -150,27 +156,173 @@ fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
+/// The block tier's per-match gates. [`direct_spans`] (the output redactor)
+/// deliberately relaxes the boundary half; see its doc.
+fn accepts(idx: usize, token: &str, orig: &str, offset: usize) -> bool {
+    // Left boundary, judged in the ORIGINAL text so a token fused onto a
+    // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
+    if let Some(prev) = orig[..offset].chars().next_back()
+        && (prev.is_ascii_alphanumeric() || prev == '_' || (idx == 5 && prev == '-'))
+    {
+        return false;
+    }
+    // sk- also needs a random-looking body: prose can resemble it.
+    random_enough(idx, token)
+}
+
+/// The randomness gate for the shapes a placeholder can take: `sk-` (prose),
+/// and GitLab/npm tokens, whose documented placeholders
+/// (`glpat-xxxxxxxxxxxxxxxxxxxx`, `npm_XXXX…`) fit the length rule.
+fn random_enough(idx: usize, token: &str) -> bool {
+    match idx {
+        5 => looks_random(&token[3..]),
+        8 => looks_random(&token["glpat-".len()..]),
+        9 => looks_random(&token["npm_".len()..]),
+        _ => true,
+    }
+}
+
+/// One credential token found by [`direct_spans`]: its kind and its byte
+/// range in the scanned text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub kind: &'static str,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Every credential token written **as-is** in `text`, as byte ranges, with no
+/// hit cap. For `redact-secret-output` (cameronsjo/cadence-hooks#776), which
+/// masks each token in place. Same [`TOKEN_RE`] grammar as [`scan`] (the
+/// block tiers: `redact-external-content`, `prevent-secret-push`), with three
+/// deliberate differences, all toward masking more, because a redactor's miss
+/// leaks a secret while its false positive only costs readability:
+///
+/// - **No left-boundary gate** except for the `sk-` shape, whose prefix prose
+///   can form (`task-…`, `risk-…`). A token glued to a JSON escape (`\n` +
+///   token), an ANSI colour code or a `%3D` is still a token here.
+/// - For `sk-`, a letter right after a backslash, or the end of a `%XX` escape,
+///   counts as a boundary.
+/// - **JWTs** (`eyJ…` three base64url segments) are masked. They stay out of
+///   [`TOKEN_RE`] because an example JWT in a doc or test fixture would start
+///   blocking pushes; masking one in output costs nothing.
+///
+/// The normalized (split-token) pass is skipped: output is not shell source,
+/// and a split form has no byte-exact span to mask.
+pub fn direct_spans(text: &str) -> Vec<TokenSpan> {
+    let mut out = Vec::new();
+    // `find_iter` + a prefix lookup instead of `captures_iter`: capture
+    // resolution per match is the dominant cost on a dense run of near-misses
+    // (`sk-aaaa… sk-aaaa…`), and the prefix alone names the alternative.
+    for m in TOKEN_RE.find_iter(text) {
+        let Some(idx) = kind_index(m.as_str()) else {
+            continue;
+        };
+        if (idx == 5 && !sk_boundary(text, m.start())) || !random_enough(idx, m.as_str()) {
+            continue;
+        }
+        out.push(TokenSpan {
+            kind: KINDS[idx],
+            start: m.start(),
+            end: m.end(),
+        });
+    }
+    for m in JWT_RE.find_iter(text) {
+        out.push(TokenSpan {
+            kind: JWT_KIND,
+            start: m.start(),
+            end: m.end(),
+        });
+    }
+    for m in CLOUD_TOKEN_RE.find_iter(text) {
+        let kind = if m.as_str().starts_with("ya29.") {
+            "Google access token"
+        } else {
+            "Heroku token"
+        };
+        out.push(TokenSpan {
+            kind,
+            start: m.start(),
+            end: m.end(),
+        });
+    }
+    out
+}
+
+/// Which [`TOKEN_RE`] alternative a match came from, by its prefix (the
+/// alternatives' prefixes are disjoint, so this agrees with the capture).
+fn kind_index(token: &str) -> Option<usize> {
+    let b = token.as_bytes();
+    Some(match b {
+        [b'g', b'h', b'p' | b'o' | b'u' | b's' | b'r', b'_', ..] => 0,
+        _ if token.starts_with("github_pat_") => 1,
+        _ if token.starts_with("AKIA") || token.starts_with("ASIA") => 2,
+        _ if token.starts_with("xox") => 3,
+        _ if token.starts_with("sk_live_") || token.starts_with("rk_live_") => 4,
+        _ if token.starts_with("sk-") => 5,
+        _ if token.starts_with("AIza") => 6,
+        _ if token.starts_with("-----BEGIN") => 7,
+        _ if token.starts_with("glpat-") => 8,
+        _ if token.starts_with("npm_") => 9,
+        _ => return None,
+    })
+}
+
+/// Kind name for a masked JWT (redactor-only, see [`direct_spans`]).
+pub const JWT_KIND: &str = "JWT";
+
+static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+        .expect("jwt regex is valid")
+});
+
+/// Bare cloud CLI tokens (redactor-only, like JWTs): Google OAuth access
+/// tokens (`ya29.…`, printed by `gcloud auth print-access-token`) and Heroku
+/// API tokens (`HRKU-…`).
+static CLOUD_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"ya29\.[A-Za-z0-9_\-][A-Za-z0-9_.\-]{19,}|HRKU-[A-Za-z0-9_\-]{20,}")
+        .expect("cloud token regex is valid")
+});
+
+/// The END line of a private-key block, of every kind the `k7` header matches.
+pub static PEM_END_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----END[A-Z ]*PRIVATE ?KEY(?: ?BLOCK)?-----").expect("pem end regex is valid")
+});
+
+/// Left boundary for the `sk-` shape in the redactor: the block-tier rule,
+/// except that an escape letter (`\n`) or a `%XX` escape ends a word.
+fn sk_boundary(text: &str, offset: usize) -> bool {
+    let before = &text[..offset];
+    let mut rev = before.chars().rev();
+    let Some(prev) = rev.next() else {
+        return true;
+    };
+    if !(prev.is_ascii_alphanumeric() || prev == '_' || prev == '-') {
+        return true;
+    }
+    let prev2 = rev.next();
+    if prev2 == Some('\\') {
+        return true;
+    }
+    let prev3 = rev.next();
+    prev3 == Some('%') && prev.is_ascii_hexdigit() && prev2.is_some_and(|c| c.is_ascii_hexdigit())
+}
+
+/// Kind name of the PEM private-key header, for callers that extend its span
+/// over the key body.
+pub const PEM_KIND: &str = KINDS[7];
+
 fn scan_one(scan: &str, orig: &str, map: Option<&[usize]>, out: &mut Vec<CredHit>) {
     for caps in TOKEN_RE.captures_iter(scan) {
         if out.len() >= MAX_HITS {
             return;
         }
-        let Some((idx, m)) =
-            (0..KINDS.len()).find_map(|i| caps.name(&format!("k{i}")).map(|m| (i, m)))
-        else {
+        let Some((idx, m)) = (0..KINDS.len()).find_map(|i| caps.get(i + 1).map(|m| (i, m))) else {
             continue;
         };
         let s = m.as_str();
         let offset = map.map_or(m.start(), |mp| mp[m.start()]);
-        // Left boundary, judged in the ORIGINAL text so a token fused onto a
-        // quote seam (`x""ghp_…`) is still seen but `task-…` never is.
-        if let Some(prev) = orig[..offset].chars().next_back()
-            && (prev.is_ascii_alphanumeric() || prev == '_' || (idx == 5 && prev == '-'))
-        {
-            continue;
-        }
-        // sk- also needs a random-looking body: prose can resemble it.
-        if idx == 5 && !looks_random(&s[3..]) {
+        if !accepts(idx, s, orig, offset) {
             continue;
         }
         let hit = CredHit {
@@ -244,6 +396,21 @@ mod tests {
     }
     fn kinds(text: &str) -> Vec<&'static str> {
         scan(text).iter().map(|h| h.kind).collect()
+    }
+
+    #[test]
+    fn gitlab_and_npm_need_a_random_body() {
+        let glpat = ["gl", "pat-"].concat();
+        let npm = ["np", "m_"].concat();
+        for placeholder in [
+            glpat.clone() + &"x".repeat(20),
+            npm.clone() + &"X".repeat(36),
+        ] {
+            assert!(kinds(&placeholder).is_empty(), "{placeholder}");
+            assert!(direct_spans(&placeholder).is_empty(), "{placeholder}");
+        }
+        assert_eq!(kinds(&(glpat + &alnum(20))), vec!["GitLab token"]);
+        assert_eq!(kinds(&(npm + &alnum(36))), vec!["npm token"]);
     }
 
     #[test]

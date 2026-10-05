@@ -1235,6 +1235,24 @@ fn segment_direct_reads(
     for (at, value) in attached_file_values(&cmd_word, argv) {
         uploads.entry(at).or_default().push(value);
     }
+    // `gh api`'s endpoint is a URL path, and its `--input`/`-F key=@FILE`
+    // values are files it sends (#1276).
+    // A `VAR=value` prefix (`GH_HOST=x gh api …`) leaves the assignment as
+    // the head; the files are still judged behind it, while the endpoint
+    // exemption keeps its byte-exact head rule.
+    let mut gh_endpoint = None;
+    let assignments = argv.iter().take_while(|t| is_assignment_word(t)).count();
+    if cmd_word == "gh"
+        || argv
+            .get(assignments)
+            .is_some_and(|head| assignments > 0 && command_word(head) == "gh")
+    {
+        let (endpoint, files) = gh_api_operands(&argv[assignments..]);
+        gh_endpoint = endpoint.filter(|_| exact_head && assignments == 0);
+        for (at, file) in files {
+            uploads.entry(assignments + at).or_default().push(file);
+        }
+    }
     // Operands a recognized verb consumes without printing (#771, #782).
     let consumed: HashSet<usize> = if exact_head {
         consumed_path_operands(&cmd_word, argv)
@@ -1253,6 +1271,9 @@ fn segment_direct_reads(
             let expands = globs.get(argv_at + i).copied().unwrap_or(true);
             if Some(i) == pattern && !expands {
                 return pattern_word_secret(t, position);
+            }
+            if Some(i) == gh_endpoint && !expands {
+                return gh_endpoint_secret(t, position);
             }
             if let Some(value) = kube_values
                 .get(&i)
@@ -1673,6 +1694,125 @@ fn consumed_path_operands(cmd: &str, argv: &[String]) -> Vec<usize> {
         }
         _ => Vec::new(),
     }
+}
+
+/// What a `gh api` argv (`argv[0]` is `gh`, `argv[1]` is exactly `api`)
+/// names: the index of its ENDPOINT positional, and each file it reads
+/// through `--input FILE` or a `-F`/`--field key=@FILE` value, as
+/// `(argv index, path)` (cameronsjo/cadence-hooks#1276).
+///
+/// The endpoint is a URL path sent to GitHub, never a local file, so only
+/// its glob judgment is skipped ([`gh_endpoint_secret`]); a literal secret
+/// name there (`repos/o/r/contents/.env`, with or without a `?ref=`) still
+/// blocks, since the call prints that file. The endpoint is reported only when the argv parses
+/// without doubt against gh's own `api` flag set: an unknown flag, a `--`,
+/// or a second positional leaves it `None`, and the word keeps the full
+/// operand scan.
+fn gh_api_operands(argv: &[String]) -> (Option<usize>, Vec<(usize, &str)>) {
+    const VALUED_LONG: &[&str] = &[
+        "cache",
+        "field",
+        "header",
+        "hostname",
+        "input",
+        "jq",
+        "method",
+        "preview",
+        "raw-field",
+        "template",
+    ];
+    const BOOLEAN_LONG: &[&str] = &["include", "paginate", "silent", "slurp", "verbose", "help"];
+    const VALUED_SHORT: &str = "FfHXqtp";
+    const BOOLEAN_SHORT: &str = "ih";
+    let mut files = Vec::new();
+    if argv.get(1).is_none_or(|sub| sub != "api") {
+        return (None, files);
+    }
+    fn file_value<'a>(at: usize, name: &str, value: &'a str) -> Option<(usize, &'a str)> {
+        match name {
+            "input" if value != "-" => Some((at, value)),
+            "field" => value
+                .split_once('=')
+                .and_then(|(_, v)| v.strip_prefix('@'))
+                .filter(|path| *path != "-")
+                .map(|path| (at, path)),
+            _ => None,
+        }
+    }
+    let mut endpoint = None;
+    let mut certain = true;
+    let mut i = 2;
+    while let Some(t) = argv.get(i) {
+        if t == "--" {
+            certain = false;
+            break;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if VALUED_LONG.contains(&name) {
+                let at = if attached.is_some() { i } else { i + 1 };
+                if let Some(value) = attached.or_else(|| argv.get(i + 1).map(String::as_str)) {
+                    files.extend(file_value(at, name, value));
+                }
+                i = at + 1;
+            } else {
+                certain &= BOOLEAN_LONG.contains(&name) && attached.is_none();
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(cluster) = t.strip_prefix('-').filter(|c| !c.is_empty()) {
+            let mut next = i + 1;
+            for (k, letter) in cluster.char_indices() {
+                if BOOLEAN_SHORT.contains(letter) {
+                    continue;
+                }
+                if !VALUED_SHORT.contains(letter) {
+                    certain = false;
+                    break;
+                }
+                // pflag drops one `=` right after a shorthand wherever it sits
+                // in the cluster: `-iF=x=@.env` sets `--field x=@.env`.
+                let rest = &cluster[k + letter.len_utf8()..];
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                let (at, value) = if rest.is_empty() {
+                    next = i + 2;
+                    (i + 1, argv.get(i + 1).map(String::as_str))
+                } else {
+                    (i, Some(rest))
+                };
+                let name = match letter {
+                    'F' => "field",
+                    _ => "other",
+                };
+                if let Some(value) = value {
+                    files.extend(file_value(at, name, value));
+                }
+                break;
+            }
+            i = next;
+            continue;
+        }
+        if endpoint.is_some() {
+            certain = false;
+        }
+        endpoint.get_or_insert(i);
+        i += 1;
+    }
+    (endpoint.filter(|_| certain), files)
+}
+
+/// [`pattern_word_secret`] for a `gh api` endpoint, whose path is also
+/// judged as a literal name with its `?query` removed: the endpoint
+/// `repos/o/r/contents/.env?ref=main` prints that `.env` (#1276).
+fn gh_endpoint_secret(word: &str, position: Filename) -> Option<&str> {
+    pattern_word_secret(word, position).or_else(|| {
+        let (path, _) = word.split_once('?')?;
+        is_dangerous_secret_name_at(path, position).then_some(word)
+    })
 }
 
 /// [`dangerous_secret_operand`] for a regex or filter command's PATTERN
@@ -9157,6 +9297,201 @@ mod tests {
             let result = SecretLeaksGuard::default().run(&make_bash_input(command));
             assert_eq!(result.outcome, expected, "{command}: {why}");
         }
+    }
+
+    #[test]
+    fn globs_sharing_letters_with_no_stem_allowed() {
+        // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
+        // `jks` and `cadence` shares `den` with `credentials`, but only a
+        // wildcard could spell those names, so nothing secret is named.
+        assert_bash(
+            &[
+                "find /tmp -path '*cadence-hooks*' -name '*.rs' | xargs grep -n alias",
+                "find /tmp -path '*cadence-hooks*' -name '*.rs'",
+                "find /tmp -path '*foo*' -name '*.rs' | xargs grep -n alias",
+                "find /tmp -path '*hooks*' -name '*.rs' | xargs grep -n alias",
+                "find /tmp -path '*hooks*' | xargs cat",
+                "grep -r alias '*cadence-hooks*'",
+                "grep -n alias '*cadence*'",
+                "grep -n alias '*dence*'",
+                "grep -n alias 'cadence*'",
+                "grep -n alias '*hook*'",
+                "grep -n alias '*hooks'",
+                "grep -n alias 'hooks*'",
+                "grep -n alias '*ooks*'",
+                "grep -n alias '*nce*'",
+                "grep -n alias '*cad*'",
+                "grep -n alias hooks/",
+                "cat src/hooks/mod.rs",
+                "cat *hooks*",
+                "cat src/*cadence*/*.rs",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "the glob's letters cannot land on a secret stem",
+        );
+    }
+
+    #[test]
+    fn globs_that_spell_a_stem_still_block() {
+        // cadence-hooks#1285 controls.
+        assert_bash(
+            &[
+                "grep x .env",
+                "grep x ~/.ssh/id_rsa",
+                "cat *.env*",
+                "cat *id_rsa*",
+                "cat *credentials*",
+                "cat .e*",
+                "cat *.key",
+                "cat .e*v",
+                "cat .[e]nv",
+                "cat .n?trc",
+                "cat *.k?y",
+                "cat *env",
+                "cat *hooks*.jks",
+                "cat *cadence*.key",
+                "find /tmp -path '*hooks*' -name '*.env*' | xargs cat",
+                // #1293 review C1: a dotenv glob with its suffix spelled out.
+                "cat .e*.local",
+                "cat .e*.production",
+                "cat .e*.staging",
+                "cat .e*.keys",
+                "cat .e*.secret",
+                "cat .e[n][v].local",
+                "cat .[e]n[v].local",
+                "cat .?n[v].loca?",
+                "cat .e??.production",
+                "cat .e*duction",
+                "cat .e*.l*",
+                "cat .e*.lac5",
+                "cat .e*.{local,production}",
+                "cat */.e*.local",
+                "cat sub/.e*.local",
+                "shopt -s globstar; cat **/.e*.local",
+                "find . -name '.e*.local' -exec cat {} +",
+                "find . -path '*/.e*.local' -exec cat {} +",
+                "rg -uu CANARY -g '.e*.local' .",
+                "tar cf - .e*.local | tar xOf -",
+                "cp .e*.local /dev/stdout",
+                // A glob letter on a stem in a name they share, or a name
+                // spelled without the glob's words.
+                "cat app.?1?",
+                "cat *[c]*nt*.json",
+                "cat *_k*.pem",
+                "cat .zshenv*",
+                "cat .git-c*",
+                // #1293 review M3: the new local-override names.
+                "cat .zshrc.l*",
+                "cat .zshrc.lo*",
+                "cat .gitconfig.l*",
+                "cat .gitconfig.lo*",
+                "cat ~/.z*.local",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "the glob can name a secret",
+        );
+    }
+
+    #[test]
+    fn gh_api_endpoint_is_not_a_local_file() {
+        // cadence-hooks#1276: `?ref=$ref` read as `?ref=*`, whose stray
+        // letters matched `pfx`/`private`; the endpoint is a URL path.
+        assert_bash(
+            &[
+                "gh api \"repos/tmux/tmux/contents/format.c?ref=$ref\"",
+                "gh api 'repos/o/r/contents/.e*'",
+                "gh api -X GET 'repos/o/r/contents/.e*'",
+                "gh api -i --paginate \"repos/o/r/contents/id_$x\"",
+                "gh api repos/o/r -f body=@prod.env",
+                "gh api repos/o/r -F body=@-",
+                "gh api repos/o/r --input -",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a gh api endpoint names no local file",
+        );
+        assert_bash(
+            &[
+                // A remote secret file is printed all the same.
+                "gh api repos/o/r/contents/.env",
+                "gh api \"repos/o/r/contents/.env?ref=$ref\"",
+                // A substitution in the endpoint runs locally.
+                "gh api \"repos/$(cat .env)/x\"",
+                // Files gh reads and sends.
+                "gh api --input .env repos/o/r",
+                "gh api --input prod.env repos/o/r",
+                "gh api --input=prod.env repos/o/r",
+                "gh api repos/o/r -F field=@.env",
+                "gh api repos/o/r -F field=@prod.env",
+                "gh api repos/o/r -Ffield=@prod.env",
+                "gh api repos/o/r -iF field=@prod.env",
+                "gh api repos/o/r --field x=@~/.ssh/id_rsa",
+                "gh api repos/o/r --field=x=@prod.env",
+                // #1293 review I1: pflag drops the `=` after any shorthand.
+                "gh api r -iF=x=@.env",
+                "gh api r -iF=x=@prod.env",
+                "gh api r -F=x=@prod.env",
+                "gh api r -iFx=@.env",
+                // #1293 review M4: an assignment prefix keeps the gh reading.
+                "GH_HOST=x gh api r --input prod.env",
+                "GH_HOST=x GH_TOKEN=y gh api r -F x=@prod.env",
+                // Unparsed shapes keep the full operand scan.
+                "gh api --bogus 'repos/o/r/contents/.e*'",
+                "gh api -- 'repos/o/r/contents/.e*'",
+                "sudo gh api 'repos/o/r/contents/.e*'",
+                "gh api repos/o/r/contents/.e*",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a secret file is read or printed",
+        );
+    }
+
+    #[test]
+    fn a_flood_of_distinct_glob_words_blocks_promptly() {
+        // #1293 review M1: once the walk budget is spent the guard blocks
+        // rather than run out the hook deadline, which fails open.
+        let words: Vec<String> = (0..6000)
+            .map(|i| format!("*{i}c?r?e?d*e?n?t*i?a?l*s*.?s?o?n*"))
+            .collect();
+        let command = format!("cat {}", words.join(" "));
+        let started = std::time::Instant::now();
+        let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn local_override_shell_config_reads_block() {
+        // cadence-hooks#1288.
+        assert_bash(
+            &[
+                "cat ~/.zshrc.local",
+                "grep -n TOKEN ~/.zshrc.local",
+                "xargs grep x ~/.zshrc.local",
+                "cat ~/.gitconfig.local",
+                "cat ~/.bashrc.local",
+                "head ~/.bash_profile.local",
+                "less ~/.profile.local",
+                "cat ~/.zshenv.local ~/.zprofile.local",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a local override holds tokens",
+        );
+        assert_bash(
+            &[
+                "cat ~/.zshrc",
+                "cat ~/.gitconfig",
+                "cat ~/.bashrc",
+                "ls ~/.local/bin",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "the tracked dotfile is not secret",
+        );
+        for path in ["/home/u/.zshrc.local", "/home/u/.gitconfig.local"] {
+            let result = SecretLeaksGuard::default().run(&make_read_input(path));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block, "{path}");
+        }
+        let result = SecretLeaksGuard::default().run(&make_read_input("/home/u/.zshrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

@@ -291,6 +291,10 @@ enum CadenceCommands {
     },
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
+    /// Mask secret values in Bash output before they reach the transcript
+    RedactSecretOutput,
+    /// Ask before a command prints a bare, unnamed secret value
+    GuardSecretDump,
     /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
     /// the plugin-shipped platform baseline (SessionStart)
     PlatformDrift {
@@ -313,6 +317,11 @@ enum CadenceCommands {
         /// (default: config originAudience, else public)
         #[arg(long, value_name = "TIER")]
         audience: Option<String>,
+        /// Destination repo (OWNER/REPO, as `gh -R` takes it). When it is none
+        /// of the current checkout's remotes, this checkout's allowlist,
+        /// category ceilings and originAudience are not applied
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
         /// Scaffold the redaction section of .claude/cadence.json and exit
         #[arg(long)]
         init: bool,
@@ -641,6 +650,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::AuditRunnerPool => "audit-runner-pool",
             CadenceCommands::GuardHeldClose { .. } => "guard-held-close",
             CadenceCommands::RedactExternalContent => "redact-external-content",
+            CadenceCommands::RedactSecretOutput => "redact-secret-output",
+            CadenceCommands::GuardSecretDump => "guard-secret-dump",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
             CadenceCommands::ModelPosture => "model-posture",
             // record-polish and redact-scan are CLI actions, not hooks — no
@@ -855,6 +866,14 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             CadenceCommands::RedactExternalContent => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::redact_external_content::RedactExternalContent),
+                pre,
+            ),
+            CadenceCommands::RedactSecretOutput => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::redact_secret_output::RedactSecretOutput),
+                post,
+            ),
+            CadenceCommands::GuardSecretDump => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::guard_secret_dump::SecretDumpGuard),
                 pre,
             ),
             CadenceCommands::PlatformDrift { baseline } => CheckPlan::new(
@@ -1695,6 +1714,7 @@ fn main() {
             CadenceCommands::RedactScan {
                 file,
                 audience,
+                repo,
                 init,
                 status,
                 validate_config,
@@ -1711,8 +1731,10 @@ fn main() {
                     );
                 }
                 process::exit(
-                    cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
-                        .into(),
+                    cadence_hooks_cadence::redact_external_content::run_scan_to(
+                        file, audience, repo, init,
+                    )
+                    .into(),
                 );
             }
             // Hook checks dispatched above, through `check_plan`.
