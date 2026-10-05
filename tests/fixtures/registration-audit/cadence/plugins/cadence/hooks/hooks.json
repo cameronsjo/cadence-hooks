@@ -210,6 +210,84 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-held-close --ledger \"${CLAUDE_PLUGIN_ROOT}/config/held-issues.txt\"",
             "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence guard-secret-dump",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
           }
         ]
       },
@@ -240,6 +318,11 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" user-prompt-submit",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session nudge-afk-gap",
             "timeout": 5
           }
         ]
@@ -305,6 +388,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-secret-output",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SubagentStart": [
@@ -341,6 +434,17 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session backstop-record",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" session plan-driver",
+            "timeout": 10
           }
         ]
       }
