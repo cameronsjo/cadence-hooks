@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.123.0] - 2026-10-05
+
 ### Added
 
 - **`session guard` counts every nudge it fires in `guard_nudges.jsonl`.** Each branch-switch, blanket-staging, or lane-collision nudge appends one row (`check`, `tool`, `sessionId`, `peerCount`, `repo`) to the metrics dir, so whether any of them earns a block tier can be decided from counts. The row is the only side effect: no context is added, and a write failure is a silent no-op (cameronsjo/cadence-hooks#272).
