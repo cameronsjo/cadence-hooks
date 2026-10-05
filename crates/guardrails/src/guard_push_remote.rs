@@ -2601,12 +2601,21 @@ mod tests {
             let cwd = repo.path().to_string_lossy();
             let unit = "for i in 1; do git push origin main; git config user.name x; done;";
             let flood = unit.repeat(200_000 / unit.len());
+            // Pin the #1161 regression by counting spawns, not by timing
+            // the run: one probe per looped push is ~2300 spawns here, one
+            // per distinct remote is a handful. A wall-clock bound fails on
+            // a loaded runner with the guard behaving correctly (#1314).
+            let spawns_before = cadence_hooks_core::shell::git_spawn_count();
             let started = std::time::Instant::now();
             let result = PushRemoteGuard.run(&make_bash_with_cwd(&flood, &cwd));
+            let elapsed = started.elapsed();
+            let spawns = cadence_hooks_core::shell::git_spawn_count() - spawns_before;
+            // Measured 4 on a healthy run, independent of the loop count.
+            assert!(spawns <= 8, "{spawns} git spawns for one looped remote");
+            // Hang guard only, far above a healthy run.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "took {:?}",
-                started.elapsed()
+                elapsed < std::time::Duration::from_secs(30),
+                "took {elapsed:?}"
             );
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
             let distinct: String = (0..6)
@@ -2974,22 +2983,23 @@ mod tests {
         // 200 KB of `cd a; ` before one push: each `cd` copied the whole
         // path the walk had built, so the walk was quadratic and took ~0.5 s
         // in release — at the hook deadline, which fails open. Now ~0.3 s in
-        // release; the bound is loose because `parse_work_dir`'s own flat
-        // scan still joins a fresh path per `cd`, which a debug build pays
-        // several times over.
+        // release, linear in the number of `cd`s.
         with_env(&owners_only(), || {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
-            let command = format!("{}git push", "cd a; ".repeat(40_000));
-            let started = std::time::Instant::now();
-            let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "took {:?}",
-                started.elapsed()
+            // The regression is quadratic growth, so pin the scaling rather
+            // than a wall-clock bound a loaded runner can trip (#1314). The
+            // larger size is the original 40 000 `cd`s (~200 KB).
+            cadence_hooks_core::test_builders::assert_scales_linearly(
+                "cd flood before a push",
+                10_000,
+                |count| {
+                    let command = format!("{}git push", "cd a; ".repeat(count));
+                    let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                    // Not a repository: git fails the push itself.
+                    assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+                },
             );
-            // Not a repository: git fails the push itself.
-            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
 

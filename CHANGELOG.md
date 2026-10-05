@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Three more flood tests no longer assert wall-clock time.** `guard_push_remote::tests::a_looped_push_flood_probes_each_remote_once` (2 s) and `warn_stacked_base_delete::tests::clone_floods_allow_before_the_deadline` (2 s, Unix only) now count git spawns, which is the work their regressions multiplied (one probe per push): at most 8 and 4, measured 4 and 0. `guard_push_remote::tests::a_cd_flood_before_a_push_is_judged_before_the_deadline` (5 s) now asserts linear scaling through `test_builders::assert_scales_linearly`, since its regression was quadratic. Each keeps a generous hang guard (30 s, or the helper's 120 s). Test-only; no guard behavior changes (cameronsjo/cadence-hooks#1314).
+
 ## [0.123.0] - 2026-10-05
 
 ### Added

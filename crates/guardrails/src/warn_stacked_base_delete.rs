@@ -579,16 +579,21 @@ mod tests {
         ] {
             let flood = unit.repeat(200_000 / unit.len());
             let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&flood, cwd);
-            #[cfg(not(windows))]
+            // Pin the regression by counting git spawns, not by timing the
+            // run: two config probes per bare push is thousands of spawns
+            // here. A wall-clock bound sat at its limit on the Windows runner
+            // with no regression (#1314).
+            let spawns_before = cadence_hooks_core::shell::git_spawn_count();
             let started = std::time::Instant::now();
             let result = WarnStackedBaseDelete.run(&input);
-            // Unix only: a debug build on the Windows runner spawns processes
-            // slowly enough to sit at the bound (2.26 s) with no regression.
-            #[cfg(not(windows))]
+            let elapsed = started.elapsed();
+            let spawns = cadence_hooks_core::shell::git_spawn_count() - spawns_before;
+            // Measured 0: no push here deletes, so nothing is probed.
+            assert!(spawns <= 4, "{unit}: {spawns} git spawns");
+            // Hang guard only, far above a healthy run on any runner.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "{unit}: took {:?}",
-                started.elapsed()
+                elapsed < std::time::Duration::from_secs(30),
+                "{unit}: took {elapsed:?}"
             );
             assert_eq!(result.outcome, Outcome::Allow, "{unit}");
         }
