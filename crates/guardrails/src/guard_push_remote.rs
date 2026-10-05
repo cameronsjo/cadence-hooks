@@ -625,15 +625,25 @@ fn check_pushes_elsewhere(
     None
 }
 
-/// [`push_locations`] for the command being judged, walked at most once.
-/// Every caller passes the same verb-normalized command and start directory.
+/// [`push_locations`] and [`may_push`] for the command being judged, each
+/// worked out at most once. Every caller passes the same verb-normalized
+/// command and start directory. [`may_push`] walks every segment of the
+/// command, and asking it for both the gate and the nudge doubled that walk
+/// on a 200 KB flood (cameronsjo/cadence-hooks#1266 review C3).
 #[derive(Default)]
-struct PushWalk(std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation>>);
+struct PushWalk {
+    pushes: std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation>>,
+    may_push: std::cell::OnceCell<bool>,
+}
 
 impl PushWalk {
     fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
-        self.0
+        self.pushes
             .get_or_init(|| push_locations_both_readings(command, cwd))
+    }
+
+    fn may_push(&self, command: &str) -> bool {
+        *self.may_push.get_or_init(|| may_push(command))
     }
 }
 
@@ -728,7 +738,7 @@ impl Check for PushRemoteGuard {
 fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<CheckResult> {
     let command = input.command()?;
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
-    if !may_push(&command) {
+    if !walk.may_push(&command) {
         return None;
     }
     let cwd_fallback = std::env::current_dir()
@@ -763,7 +773,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // extraction, and work-dir resolution all judge the same command.
     let command = GIT_PUSH_VERB.replace_all(command, "git push");
     let command = command.as_ref();
-    if !may_push(command) {
+    if !walk.may_push(command) {
         return CheckResult::allow();
     }
     // The structural gate. A tokenized push in command position is the
