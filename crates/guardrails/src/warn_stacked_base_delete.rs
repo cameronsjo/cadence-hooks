@@ -241,14 +241,28 @@ fn run_push_with(input: &HookInput, command: &str, make_gh: &GhFactory<'_>) -> O
     // (two git spawns per push) runs only for pushes whose refspecs are all
     // implicit, and an implicit refspec is never a delete, so it could only
     // spend budget on pushes this hook skips anyway.
+    // One delete is counted once: core may read the same push twice, once
+    // per reading of a script whose spellings differ
+    // (cameronsjo/cadence-hooks#1231 review I2).
+    let mut seen = std::collections::HashSet::new();
     let deletes: Vec<_> = push_locations(command, cwd)
         .into_iter()
         .filter_map(|push| {
+            if push.unresolved {
+                return None;
+            }
             let branches: Vec<String> = push
                 .refspecs
                 .iter()
                 .filter(|r| r.is_delete)
                 .filter_map(|r| deleted_branch(&r.raw, r.destination.as_deref()))
+                .filter(|branch| {
+                    seen.insert((
+                        push.work_dir.clone(),
+                        push.repository.clone(),
+                        branch.clone(),
+                    ))
+                })
                 .collect();
             (!branches.is_empty() && !push.unresolved).then_some((push, branches))
         })
@@ -523,6 +537,36 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_read_two_ways_is_counted_once() {
+        // cameronsjo/cadence-hooks#1231 round 2 review I2: core reads a
+        // script whose spellings differ both ways, so five `-x` deletes came
+        // back as ten, past the eight this hook checks, and no dependent PR
+        // was looked up. Each delete counts once, so all five are checked.
+        use cadence_hooks_core::git_fixtures::{git_in, init_repo};
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        for values in [1, 5, 8] {
+            let command = format!(
+                "git rebase {}HEAD~1",
+                (0..values)
+                    .map(|n| format!("-x 'echo a\\b; git push origin --delete f{n}' "))
+                    .collect::<String>()
+            );
+            let (msg, calls) = push_calls(repo.path(), &command);
+            assert!(
+                calls > 0,
+                "{values}: checked, not counted past the cap: {msg:?}"
+            );
+            let msg = msg.expect("dependents nudge");
+            assert!(!msg.contains("than the"), "{values}: {msg}");
+        }
+    }
+
+    #[test]
     fn clone_floods_allow_before_the_deadline() {
         // A 200 KB flood of clones and bare pushes took ~3.1 s in release:
         // every bare push spent two git config probes in its own directory,
@@ -571,9 +615,20 @@ mod tests {
             ),
             "git push origin --delete a b c d e f g h i".to_string(),
         ] {
+            // 2 s everywhere but a debug build on the Windows runner, which
+            // reads this flood ~2.5x slower than Linux debug: after #1278's
+            // second reading it sat past 2 s on every main commit while Linux
+            // debug took 0.9 s and release 0.17 s. A return to quadratic work
+            // still trips the wider bound.
+            let limit = std::time::Duration::from_secs(if cfg!(all(windows, debug_assertions)) {
+                6
+            } else {
+                2
+            });
             let started = std::time::Instant::now();
             let (msg, calls) = push_calls(repo.path(), &command);
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            let took = started.elapsed();
+            assert!(took < limit, "{}: {took:?}", &command[..40]);
             assert_eq!(calls, 0);
             assert!(msg.is_some_and(|m| m.contains("more than the 8 checked")));
         }

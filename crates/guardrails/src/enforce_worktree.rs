@@ -7010,6 +7010,68 @@ mod tests {
         assert!(!r.message.unwrap().contains("could not be resolved"));
     }
 
+    /// cameronsjo/cadence-hooks#1287: a `cd`/`git -C`/`--git-dir` target the
+    /// same command bound to a literal is read as that literal — at the
+    /// dispatch seam, which the test drives through
+    /// [`cadence_hooks_core::with_resolved_dir_variables`]. Unix-only: a
+    /// Windows fixture path carries a backslash, which is never spliced.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_bound_to_a_literal_earlier_in_the_command_is_resolved() {
+        let scratch = scratch("var-target");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let other = scratch.path().join("wt2");
+        git_in(
+            &primary,
+            &["worktree", "add", &other.to_string_lossy(), "-b", "feat/y"],
+        );
+        let run = |cmd: &str| {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let input = cadence_hooks_core::with_resolved_dir_variables(&input);
+            run_enforce(&input, &cfg(false, false))
+        };
+        let other = other.display();
+        let primary = primary.display();
+
+        // The reported command, into another linked worktree, and its siblings.
+        for cmd in [
+            format!(
+                r#"M={other}; (cd "$M" && npx markdownlint-cli2 a.md); git -C "$M" add a.md; git -C "$M" commit -F msg -- a.md"#
+            ),
+            format!(r#"M={other}; cd "$M" && git commit -m x"#),
+            format!(r#"export M={other} && git --git-dir="$M/.git" --work-tree "$M" commit -m x"#),
+            format!(r#"(M={other}; git -C "${{M}}" commit -m x)"#),
+        ] {
+            let r = run(&cmd);
+            assert_eq!(r.outcome, Outcome::Allow, "{cmd}: {:?}", r.message);
+        }
+
+        // Into the primary, the directory is read and judged as the primary.
+        let r = run(&format!(
+            r#"M={primary}; (cd "$M" && npx markdownlint-cli2 a.md); git -C "$M" commit -F msg -- a.md"#
+        ));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("is a primary checkout"), "{msg}");
+        assert!(!msg.contains("could not be resolved"), "{msg}");
+
+        // Anything that may not hold the literal when the commit runs keeps
+        // refusing.
+        for cmd in [
+            format!(r#"M=$(echo {other}); git -C "$M" commit -m x"#),
+            format!(r#"true || M={other}; git -C "$M" commit -m x"#),
+            format!(r#"M={other} git -C "$M" commit -m x"#),
+            format!(r#"(M={other}); cd "$M" && git commit -m x"#),
+            format!(r#"M={other} | true; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; read M </dev/null; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; read "$n" </dev/null; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; if x; then M={primary}; fi; git -C "$M" commit -m x"#),
+        ] {
+            assert_eq!(run(&cmd).outcome, Outcome::Block, "{cmd}");
+        }
+    }
+
     #[test]
     fn cd_dash_previous_dir_target_blocks_judged_against_pre_cd_dir() {
         // `cd -` (go to $OLDPWD) is unknowable at guard-eval time; the pre-cd
@@ -11832,8 +11894,16 @@ mod tests {
                 assert!(scan.unresolved_cd.is_some(), "{name}");
             }
             // Debug builds get headroom; release is the hook's real budget.
-            let limit =
-                std::time::Duration::from_millis(if cfg!(debug_assertions) { 6000 } else { 500 });
+            // The Windows runner's debug build runs ~3x slower than Linux
+            // debug (`subst-heredoc-nest`: 6.14 s there, 2.03 s on Linux, no
+            // algorithmic change), so it gets twice the debug headroom.
+            let limit = std::time::Duration::from_millis(if cfg!(all(windows, debug_assertions)) {
+                12_000
+            } else if cfg!(debug_assertions) {
+                6000
+            } else {
+                500
+            });
             assert!(took < limit, "{name}: {took:?}");
             // Without a commit anywhere there is nothing to refuse.
             let quiet = scan_targets(&body, "/w", false);

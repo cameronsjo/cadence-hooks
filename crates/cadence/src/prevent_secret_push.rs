@@ -132,6 +132,12 @@
 //! reachable from what is pushed, including tags the remote already has. A
 //! submodule-recursing push in a repository whose index is too large to list
 //! (over ~300k entries) is refused as too large to check for submodules.
+//! A git command that sets, on its own command line, a value git runs as a
+//! command (`-c core.sshCommand=…`, `-c core.pager=…`, `-c credential.helper=…`,
+//! a `GIT_SSH_COMMAND=`/`GIT_PAGER=` prefix, …) reads as a push core cannot
+//! resolve and is refused whatever its subcommand, `GIT_SSH_COMMAND='ssh -i
+//! key' git push` included; the value is not parsed. An empty value and a
+//! pager of `cat` are not counted (cameronsjo/cadence-hooks#1231).
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than
@@ -2094,6 +2100,10 @@ impl Check for PreventSecretPushGuard {
         "prevent-secret-push"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         self.run_with_escape(input, std::env::var(ESCAPE_ENV).ok().as_deref())
     }
@@ -3379,6 +3389,37 @@ mod tests {
             "read GIT_DIR <<< /tmp/x; export GIT_DIR; git log -1",
         ] {
             assert_allows(&fx.run(cmd));
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1287: `W=/abs; git -C "$W" …` names its
+    /// directory, read at the dispatch seam
+    /// ([`cadence_hooks_core::with_resolved_dir_variables`]). Unix-only: a
+    /// Windows fixture path carries a backslash, which is never spliced.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_bound_to_a_literal_earlier_in_the_command_is_resolved() {
+        let fx = Fx::new("vardir");
+        let work = fx.work.display().to_string();
+        let run = |cmd: &str| {
+            let input = make_bash_with_cwd(cmd, &work);
+            let input = cadence_hooks_core::with_resolved_dir_variables(&input);
+            PreventSecretPushGuard.run_with(&input, None, |_| false)
+        };
+        for cmd in [
+            format!(r#"W={work}; git -C "$W" fetch origin --quiet; git -C "$W" zz"#),
+            format!(r#"W={work} && cd "$W" && git zz"#),
+        ] {
+            assert_allows(&run(&cmd));
+        }
+        for cmd in [
+            r#"W=$(pwd); git -C "$W" zz"#.to_string(),
+            format!(r#"true || W={work}; git -C "$W" zz"#),
+            format!(r#"W={work} git -C "$W" zz"#),
+            format!(r#"(W={work}); git -C "$W" zz"#),
+            format!(r#"W={work}; unset W; git -C "$W" zz"#),
+        ] {
+            assert_blocks(&run(&cmd), &["alias"]);
         }
     }
 
