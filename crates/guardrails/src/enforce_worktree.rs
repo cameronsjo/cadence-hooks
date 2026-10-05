@@ -3241,6 +3241,21 @@ fn union_commits(
                 }
                 merge_scan(out, trapped);
             }
+        } else if out.unreadable.is_none()
+            && union_children(argv, &segment)
+                .iter()
+                .any(|child| may_hold_a_commit(child))
+        {
+            // Past the wrapper depth the script a segment nests is not read
+            // (`cat <(echo $(echo $(echo $(git commit -m x))))`): one that may
+            // hold a commit fails closed, judged from every directory, as
+            // core lists such a body for every other guard
+            // (cameronsjo/cadence-hooks#1267).
+            out.unreadable = Some(unreadable_commit_message(
+                &segment,
+                "nests a script past the depth the guard reads, and it may run a git commit",
+            ));
+            out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
         if cd_word(&marked).is_some() {
             continue;
@@ -3300,6 +3315,19 @@ fn union_commits(
             out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
     }
+}
+
+/// Could `script`, nested past the depth the union walk reads, run a git
+/// commit? It names `commit` read quote-blind (`com""mit`, `\commit`), or
+/// once tokenized, which expands braces and decodes `$'…'` (`co{m,}mit`).
+/// A brace word past core's bounds is [`commit_gaps::brace_overflow_hides_commit`]'s.
+fn may_hold_a_commit(script: &str) -> bool {
+    strip_quotes_and_escapes(script)
+        .to_ascii_lowercase()
+        .contains("commit")
+        || tokenize(script)
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("commit"))
 }
 
 /// Does a word come out of a command substitution (`$(…)`, a backtick, or a
