@@ -6576,6 +6576,39 @@ mod tests {
         parent_session_id_from_pointer_lines(&[line.as_str()], CHILD_ID, root, &store, POINTER_BODY)
     }
 
+    /// `path`'s plain components joined with `/`, which every platform
+    /// accepts as a separator.
+    fn slash_join(path: &Path) -> String {
+        path.components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// A `cwd`-relative spelling of `target` (walk up to the root, back down),
+    /// or `None` when the two do not share an anchor: on Windows a relative
+    /// path cannot leave the cwd's drive, and CI keeps the workspace on `D:`
+    /// but the temp dir on `C:`.
+    fn cwd_relative(cwd: &Path, target: &Path) -> Option<String> {
+        use std::path::Component;
+        fn anchor(p: &Path) -> Vec<Component<'_>> {
+            p.components()
+                .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+                .collect()
+        }
+        if anchor(cwd) != anchor(target) {
+            return None;
+        }
+        let up = cwd
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+        Some(format!("{}{}", "../".repeat(up), slash_join(target)))
+    }
+
     /// cadence-hooks#1255: the pointer is a claim written by whoever wrote the
     /// first user message. Only an absolute path into the transcript store,
     /// with a UUID stem that is not the child's own, whose file records the
@@ -6619,15 +6652,28 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        // The #1255 repro: a file named by a relative path. Walk up from the
-        // test's cwd to `/` so the relative path really resolves to `real`
-        // (a missing file would pass for the wrong reason).
-        let depth = std::env::current_dir().unwrap().components().count() - 1;
-        let relative = format!(
-            "{}{}",
-            "../".repeat(depth),
-            real.display().to_string().trim_start_matches('/')
-        );
+        // The #1255 repro: a file named by a relative path that really
+        // resolves to a store transcript recording this plan (a missing file
+        // would pass for the wrong reason). When the temp dir shares the
+        // cwd's volume, walk up to the root and back down to `real`. When it
+        // does not (Windows CI: workspace on `D:`, temp dir on `C:`), no
+        // relative path crosses volumes, so the same transcript is planted
+        // in a store under the cwd and named relative to it.
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_store;
+        let relative = match cwd_relative(&cwd, &real) {
+            Some(relative) => relative,
+            None => {
+                cwd_store = TempDir::new_in(&cwd).unwrap();
+                let planted = write_parent_transcript(
+                    &cwd_store.path().join("projects"),
+                    PARENT_ID,
+                    POINTER_BODY,
+                );
+                slash_join(planted.strip_prefix(&cwd).unwrap())
+            }
+        };
+        assert!(!Path::new(&relative).is_absolute(), "{relative}");
         assert!(
             Path::new(&relative).is_file(),
             "control: {relative} resolves"
