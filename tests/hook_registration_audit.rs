@@ -311,13 +311,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
-    // Guard logic ships here first; its cadence-guardrails hooks.json entry
-    // (PreToolUse Write/Edit/MultiEdit + an unfiltered Bash matcher) rides the
-    // follow-up monorepo wiring PR (two-PR shape, cameronsjo/cadence-hooks#755).
-    (
-        "guardrails guard-runbook-scrub",
-        "cameronsjo/cadence-hooks#755",
-    ),
     // Binary half of the two-PR shape: the cadence plugin's hooks.json entries
     // (PostToolUse Bash for the redactor, PreToolUse Bash for the Ask guard)
     // ride the follow-up monorepo wiring PR (cameronsjo/cadence-hooks#776).
@@ -354,6 +347,11 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
+    // Unfiltered so every Bash write form into `CADENCE_RUNBOOKS_DIR`
+    // (redirects, `tee`, `cp`, `rsync`, `sed -i`, …) reaches it: no glob names
+    // them all, and a Bash write there blocks outright
+    // (cameronsjo/cadence-hooks#755, wired in cameronsjo/cadence#1547).
+    "guardrails guard-runbook-scrub",
 ];
 
 /// Entries of [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] whose wiring still carries
