@@ -3392,6 +3392,37 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1287: `W=/abs; git -C "$W" …` names its
+    /// directory, read at the dispatch seam
+    /// ([`cadence_hooks_core::with_resolved_dir_variables`]). Unix-only: a
+    /// Windows fixture path carries a backslash, which is never spliced.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_bound_to_a_literal_earlier_in_the_command_is_resolved() {
+        let fx = Fx::new("vardir");
+        let work = fx.work.display().to_string();
+        let run = |cmd: &str| {
+            let input = make_bash_with_cwd(cmd, &work);
+            let input = cadence_hooks_core::with_resolved_dir_variables(&input);
+            PreventSecretPushGuard.run_with(&input, None, |_| false)
+        };
+        for cmd in [
+            format!(r#"W={work}; git -C "$W" fetch origin --quiet; git -C "$W" zz"#),
+            format!(r#"W={work} && cd "$W" && git zz"#),
+        ] {
+            assert_allows(&run(&cmd));
+        }
+        for cmd in [
+            r#"W=$(pwd); git -C "$W" zz"#.to_string(),
+            format!(r#"true || W={work}; git -C "$W" zz"#),
+            format!(r#"W={work} git -C "$W" zz"#),
+            format!(r#"(W={work}); git -C "$W" zz"#),
+            format!(r#"W={work}; unset W; git -C "$W" zz"#),
+        ] {
+            assert_blocks(&run(&cmd), &["alias"]);
+        }
+    }
+
     #[test]
     fn unresolvable_subcommand_word_blocks() {
         let fx = Fx::new("subvar");

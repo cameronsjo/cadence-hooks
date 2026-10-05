@@ -14,6 +14,7 @@ pub mod bypass;
 pub mod capability;
 pub mod config;
 pub mod deadline;
+pub mod dir_variables;
 pub mod display;
 pub mod gh_bodies;
 pub mod gitstate;
@@ -2106,6 +2107,9 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     }
     shell::reset_command_unread();
     shell::note_command_home(input.command().unwrap_or(""));
+    // A `cd`/`git -C` target the command bound to a literal earlier reads as
+    // that literal to every check (cameronsjo/cadence-hooks#1287).
+    let input = &*with_resolved_dir_variables(input);
     let result = check.run(input);
     // A fail-closed guard never allows a command it could not read in full:
     // padding a command until the brace budget was spent left a later
@@ -2121,6 +2125,26 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
         return Some(CheckResult::block(UNREAD_COMMAND_BLOCK));
     }
     Some(result)
+}
+
+/// `input` with each directory-target read of a variable the command bound to
+/// a literal replaced by that literal ([`dir_variables`]), or `input` itself
+/// when there is none. The rewrite is an identity under bash, so a check reads
+/// the same command, with `git -C "$M"` spelled the way it runs.
+pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, HookInput> {
+    let Some(command) = input.command() else {
+        return std::borrow::Cow::Borrowed(input);
+    };
+    match dir_variables::resolve_literal_dir_variables(command) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(input),
+        std::borrow::Cow::Owned(resolved) => {
+            let mut owned = input.clone();
+            if let Some(tool_input) = owned.tool_input.as_mut() {
+                tool_input.command = Some(resolved);
+            }
+            std::borrow::Cow::Owned(owned)
+        }
+    }
 }
 
 /// The emit-and-exit half of [`run_check`]: render the outcome to stdout/stderr
