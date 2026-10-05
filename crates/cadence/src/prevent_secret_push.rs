@@ -192,8 +192,8 @@ const MAX_HITS: usize = 5;
 #[cfg(not(test))]
 const SPAWN_CAP: Duration = Duration::from_millis(2000);
 /// Unit tests run the guard against real git fixtures with no hook deadline
-/// armed, so this cap alone bounds each probe there (see [`git_bytes`]). On a loaded Windows
-/// runner a healthy `git config` probe passed 2 s, and the timed-out probe
+/// armed, so this cap alone bounds each probe there (see [`git_bytes`]). On a
+/// loaded Windows runner a healthy `git config` probe passed 2 s, and the timed-out probe
 /// turned an expected allow into a fail-closed block
 /// (cameronsjo/cadence-hooks#1319). No test depends on a probe timing out;
 /// the production cap above is unchanged, and an armed deadline still bounds
@@ -260,10 +260,17 @@ fn git_bytes(
             return Git::Down;
         }
         BudgetState::Armed(left) => cap(left),
-        // A unit test arms no deadline; it takes the generous test cap below,
-        // like a disabled deadline, rather than the CLI's per-spawn budget.
-        BudgetState::Unarmed(total) if !cfg!(test) => cap(total),
-        BudgetState::Unarmed(_) | BudgetState::Disabled => match budget {
+        #[cfg(not(test))]
+        BudgetState::Unarmed(total) => cap(total),
+        // A unit test arms no deadline: it takes the caps of a disabled one
+        // (the generous test `SPAWN_CAP`, and `LONG_CAP` for a scan) rather
+        // than the CLI's 3 s per-spawn budget.
+        #[cfg(test)]
+        BudgetState::Unarmed(_) => match budget {
+            Budget::Probe => SPAWN_CAP,
+            Budget::Scan => LONG_CAP,
+        },
+        BudgetState::Disabled => match budget {
             Budget::Probe => SPAWN_CAP,
             Budget::Scan => LONG_CAP,
         },

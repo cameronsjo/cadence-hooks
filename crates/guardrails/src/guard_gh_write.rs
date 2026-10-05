@@ -2189,10 +2189,20 @@ fn api_orgs_owner(endpoint: &str) -> Option<String> {
     let is_login = !org.is_empty()
         && !org.starts_with('-')
         && org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    let rest_is_plain = segments.all(|segment| {
+    let rest: Vec<&str> = segments.collect();
+    // A later `repos/<owner>/…` names a repository too
+    // (`orgs/<org>/teams/<team>/repos/<owner>/<repo>`): one owned by
+    // another account is not this org's to grant, so it keeps the old verdict.
+    let names_another_owner = rest
+        .windows(2)
+        .any(|pair| pair[0] == "repos" && !pair[1].eq_ignore_ascii_case(org));
+    if names_another_owner {
+        return None;
+    }
+    let rest_is_plain = rest.iter().all(|segment| {
         !segment.is_empty()
-            && segment != "."
-            && segment != ".."
+            && *segment != "."
+            && *segment != ".."
             && segment
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -6960,6 +6970,12 @@ mod tests {
             ("orgs/cameronsjo/%2e%2e/evil", None),
             ("orgs/cameronsjo//x", None),
             ("https://api.github.com/orgs/cameronsjo", None),
+            // A team grant on another owner's repository is not the org's.
+            ("orgs/cameronsjo/teams/core/repos/evil/x", None),
+            (
+                "orgs/cameronsjo/teams/core/repos/CameronSjo/x",
+                Some("cameronsjo"),
+            ),
         ] {
             assert_eq!(api_orgs_owner(endpoint).as_deref(), want, "{endpoint}");
         }
@@ -6996,6 +7012,7 @@ mod tests {
                 "gh api -X POST \"orgs/evil-org/repos?ref=orgs/cameronsjo\" -f name=x",
                 "gh api -X PATCH orgs/$ORG -f name=x",
                 "gh api -X PATCH orgs/cameronsjo/../evil-org -f name=x",
+                "gh api -X PUT orgs/cameronsjo/teams/core/repos/evil/x -f permission=push",
                 "gh api -X PATCH orgs/cameronsjo --hostname evil.example -f name=x",
                 "GH_HOST=evil.example gh api -X PATCH orgs/cameronsjo -f name=x",
             ] {
