@@ -662,13 +662,21 @@ fn check_pushes_elsewhere(
 #[derive(Default)]
 struct PushWalk {
     pushes: std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation>>,
+    segments: std::cell::OnceCell<Vec<LocatedSegment>>,
     may_push: std::cell::OnceCell<bool>,
 }
 
 impl PushWalk {
     fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
         self.pushes
-            .get_or_init(|| push_locations_both_readings(command, cwd))
+            .get_or_init(|| push_locations_both_readings(command, cwd, self.segments(command, cwd)))
+    }
+
+    /// [`segment_work_dirs`] for the command, walked once for both
+    /// [`push_locations_both_readings`] and [`segments_run_here`].
+    fn segments(&self, command: &str, cwd: &str) -> &[LocatedSegment] {
+        self.segments
+            .get_or_init(|| segment_work_dirs(command, cwd))
     }
 
     fn may_push(&self, command: &str) -> bool {
@@ -690,13 +698,14 @@ impl PushWalk {
 fn push_locations_both_readings(
     command: &str,
     cwd: &str,
+    located: &[LocatedSegment],
 ) -> Vec<cadence_hooks_core::push::PushInvocation> {
     let mut pushes = push_locations(command, cwd);
     let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
         .iter()
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
-    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+    for LocatedSegment { raw, dir } in located {
         // Text only, not [`may_push`]: a git exec whose text spells no push —
         // `git rebase -x "$CMD"`, a nested `git q` under an outer
         // `-c alias.q=push` — reaches this guard only through the walk above,
@@ -705,10 +714,10 @@ fn push_locations_both_readings(
         // segment adds no verdict, and asking `runs_a_git_exec` of every
         // segment of a 200 KB flood cost the test deadline on the Windows
         // runner.
-        if !mentions_push(&raw) {
+        if !mentions_push(raw) {
             continue;
         }
-        for push in push_locations(strip_group_wrappers(&raw), &dir) {
+        for push in push_locations(strip_group_wrappers(raw), dir) {
             if placed.insert((push.work_dir.clone(), push.repository.clone())) {
                 pushes.push(push);
             }
@@ -723,20 +732,16 @@ fn push_locations_both_readings(
 /// `top_level_segments` top-level segments first, then the shell-fed heredoc
 /// segments, which no walk places and which therefore always stay.
 ///
-/// A top-level segment is dropped only when the walk of that segment alone
-/// (the same [`push_locations`] call [`push_locations_both_readings`] makes,
-/// so [`check_pushes_elsewhere`] has already judged the result) finds exactly
-/// as many pushes as the segment holds, and every one of them runs outside
-/// `work_dir` in a directory the walk could read: no unverified or
-/// unresolvable directory, no unreadable destination, no alias. `git -C
+/// A located segment is dropped only when every listing of its text, in
+/// every directory the walk gives it, passes [`placed_elsewhere`]. `git -C
 /// <dir> push origin main` is the everyday shape.
 ///
-/// Anything the two readings do not agree on keeps the old verdict: if the
-/// per-segment reading accounts for a different number of push segments than
-/// [`git_push_segments`] found, every segment stays.
+/// Each dropped segment's argument lists are taken out of the top-level
+/// segments one at a time, as a multiset. If any one finds no equal list
+/// left, the two readings disagree, and every segment stays: the old
+/// verdict.
 fn segments_run_here(
-    command: &str,
-    cwd: &str,
+    located: &[LocatedSegment],
     work_dir: &str,
     push_segments: &[Vec<String>],
     top_level_segments: usize,
@@ -747,46 +752,70 @@ fn segments_run_here(
     if top_level_segments == 0 || walked.iter().all(|push| push.work_dir == work_dir) {
         return push_segments.to_vec();
     }
-    let mut kept: Vec<Vec<String>> = Vec::new();
-    let mut accounted = 0usize;
-    // A flood repeats one segment in one directory: walk each pair once.
-    let mut placed_elsewhere: std::collections::HashMap<(String, std::rc::Rc<str>), bool> =
+    // Per distinct segment text: its push argument lists, and whether every
+    // listing of it runs elsewhere. A flood repeats one segment, so each
+    // text is parsed once and each (text, directory) pair walked once.
+    let mut by_text: std::collections::HashMap<&str, (Vec<Vec<String>>, bool)> =
         std::collections::HashMap::new();
-    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
-        if !mentions_push(&raw) {
+    let mut walked_pairs: std::collections::HashSet<(&str, &str)> =
+        std::collections::HashSet::new();
+    for LocatedSegment { raw, dir } in located {
+        if !mentions_push(raw) {
             continue;
         }
-        let stripped = strip_group_wrappers(&raw);
-        let segments = git_push_segments(stripped);
-        if segments.is_empty() {
+        let stripped = strip_group_wrappers(raw);
+        let entry = by_text
+            .entry(raw.as_str())
+            .or_insert_with(|| (git_push_segments(stripped), true));
+        if entry.0.is_empty() || !entry.1 || !walked_pairs.insert((raw.as_str(), dir)) {
             continue;
         }
-        accounted += segments.len();
-        if accounted > top_level_segments {
-            return push_segments.to_vec();
-        }
-        let elsewhere = *placed_elsewhere
-            .entry((raw.clone(), std::rc::Rc::clone(&dir)))
-            .or_insert_with(|| {
-                let placed = push_locations(stripped, &dir);
-                placed.len() == segments.len()
-                    && placed.iter().all(|push| {
-                        push.work_dir != work_dir
-                            && !push.directory_unverified
-                            && !push.repository_unresolved
-                            && !push.destination_unreadable
-                            && !push.via_alias
-                    })
-            });
-        if !elsewhere {
-            kept.extend(segments);
+        entry.1 = placed_elsewhere(stripped, dir, &entry.0, work_dir);
+    }
+    let mut remaining: Vec<Option<&Vec<String>>> = push_segments[..top_level_segments]
+        .iter()
+        .map(Some)
+        .collect();
+    for LocatedSegment { raw, .. } in located {
+        let Some((segments, true)) = by_text.get(raw.as_str()) else {
+            continue;
+        };
+        for words in segments {
+            let Some(slot) = remaining.iter_mut().find(|slot| *slot == &Some(words)) else {
+                return push_segments.to_vec();
+            };
+            *slot = None;
         }
     }
-    if accounted != top_level_segments {
-        return push_segments.to_vec();
-    }
+    let mut kept: Vec<Vec<String>> = remaining.into_iter().flatten().cloned().collect();
     kept.extend_from_slice(&push_segments[top_level_segments..]);
     kept
+}
+
+/// Does the walk of one segment, `stripped`, run in `dir`, place every push
+/// it holds outside `work_dir`, in a directory it could read, with a
+/// destination [`check_pushes_elsewhere`] fully judged?
+///
+/// Exactly as many pushes as `segments` holds, none unverified,
+/// unresolvable, unreadable or aliased. A push naming both a positional
+/// destination and `--repo` keeps its segment: the walk records one
+/// repository, and only the segment reading here checks both.
+fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_dir: &str) -> bool {
+    if segments.iter().any(|words| {
+        let found = cadence_hooks_core::shell::push_repository_argument(words);
+        found.positional.is_some() && found.repo_flag.is_some()
+    }) {
+        return false;
+    }
+    let placed = push_locations(stripped, dir);
+    placed.len() == segments.len()
+        && placed.iter().all(|push| {
+            push.work_dir != work_dir
+                && !push.directory_unverified
+                && !push.repository_unresolved
+                && !push.destination_unreadable
+                && !push.via_alias
+        })
 }
 
 /// The directory the command starts in: the payload's `cwd`, else the hook
@@ -1123,8 +1152,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // `bash <<'EOF'` / `git push` / `EOF` leaves the walk empty while the
     // heredoc's segment still pushes here. Those segments always stay.
     let here_segments = segments_run_here(
-        command,
-        cwd,
+        walk.segments(command, cwd),
         &work_dir,
         &push_segments,
         top_level_segments,
@@ -2274,6 +2302,16 @@ mod tests {
                 ("bash <<'EOF'\ngit push origin main\nEOF", Block),
                 (
                     "bash -c 'git -C {owned} push origin main'; bash <<'EOF'\ngit push\nEOF",
+                    Block,
+                ),
+                // Both a positional and `--repo`: the walk records one, so
+                // the segment stays and both are judged here.
+                (
+                    "git -C {owned} push -o val --repo=https://github.com/evil/z.git main",
+                    Block,
+                ),
+                (
+                    "git -C {owned} push --push-option val --repo=https://github.com/evil/z.git main",
                     Block,
                 ),
                 // A directory the walk cannot read keeps the old verdict.

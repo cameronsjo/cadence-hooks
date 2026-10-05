@@ -3184,6 +3184,9 @@ fn persist_plan_approval_stays_on_every_post_tool_use() {
     }
 }
 
+/// One required entry for a [`MULTI_MATCHER_HOOKS`] row: `(event, probe)`.
+type MatcherEntry = (&'static str, Option<&'static str>);
+
 /// Hooks wired under more than one `(event, matcher)` entry, with every entry
 /// each one needs.
 ///
@@ -3201,9 +3204,9 @@ fn persist_plan_approval_stays_on_every_post_tool_use() {
 ///
 /// [`every_multi_matcher_hook_is_pinned`] keeps the table complete: a command
 /// that gains a second entry must be added here with all of its entries.
-/// One required entry for a [`MULTI_MATCHER_HOOKS`] row: `(event, probe)`.
-type MatcherEntry = (&'static str, Option<&'static str>);
-
+/// A hook already in the table that gains another entry is NOT caught by
+/// that test: add the new entry to its row by hand, or losing it later
+/// passes every assertion.
 const MULTI_MATCHER_HOOKS: &[(&str, &[MatcherEntry])] = &[
     (
         "guardrails guard-runbook-scrub",

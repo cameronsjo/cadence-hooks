@@ -576,6 +576,11 @@ pub enum Strength {
     /// value itself looks like metadata ([`metadata_value`]) — a URL, path,
     /// number, reference, plain word or lowercase k8s-style name.
     Meta,
+    /// A glued `…pass` word whose stem also names a counter or a timestamp
+    /// (`lastpass`, `hashpass`, `endpass`): masked as [`Strength::Strong`] is,
+    /// except a value that is only digits (`lastpass=1696500000`,
+    /// `HASHPASS: 12`), which counts something.
+    Counter,
 }
 
 /// Per-call memo of [`name_strength`], so a long run of the same name is
@@ -681,7 +686,8 @@ pub fn name_strength(name: &str) -> Option<Strength> {
                 .is_some_and(|p| matches!(*p, "password" | "token")))
         || (matches!(last, "secret" | "secrets") && body.last() == Some(&"existing"));
     if meta_suffix {
-        return (classify(body) == Some(Strength::Strong)).then_some(Strength::Meta);
+        return matches!(classify(body), Some(Strength::Strong | Strength::Counter))
+            .then_some(Strength::Meta);
     }
     classify(segs)
 }
@@ -702,10 +708,11 @@ fn classify(segs: &[&str]) -> Option<Strength> {
         match *seg {
             "token" => {
                 // `NextToken`, `next_page_token`, `IdempotencyToken`: the
-                // camelCase and separated spellings of a [`NON_SECRET_GLUED`]
-                // compound are pagination and idempotency handles too.
+                // camelCase and separated spellings of the pagination and
+                // idempotency handles. Other glued exemptions (`keytoken`,
+                // `synctoken`) stay glued-only, so `KEY_TOKEN` is strong.
                 if prev.is_none_or(|p| {
-                    !TOKEN_COUNT_QUALIFIERS.contains(&p) && !non_secret_token_compound(p)
+                    !TOKEN_COUNT_QUALIFIERS.contains(&p) && !HANDLE_TOKEN_QUALIFIERS.contains(&p)
                 }) {
                     return Some(Strength::Strong);
                 }
@@ -719,6 +726,12 @@ fn classify(segs: &[&str]) -> Option<Strength> {
             },
             "auth" => weak = true,
             "pass" => weak |= prev.is_some(),
+            s if s
+                .strip_suffix("pass")
+                .is_some_and(|stem| COUNTER_PASS_PREFIXES.contains(&stem)) =>
+            {
+                return Some(Strength::Counter);
+            }
             s if STRONG_WORDS.contains(&s) || glued_strong(s) => return Some(Strength::Strong),
             _ => {}
         }
@@ -755,13 +768,23 @@ fn glued_strong(seg: &str) -> bool {
         .any(|w| seg.len() > w.len() && seg.ends_with(w))
 }
 
-/// Is `{prev}token` one of the [`NON_SECRET_GLUED`] compounds? Asked of a
-/// `token` segment whose previous segment is `prev`, so `NextToken` and
-/// `next_token` read like the glued `nexttoken`.
-fn non_secret_token_compound(prev: &str) -> bool {
-    NON_SECRET_GLUED
-        .iter()
-        .any(|glued| glued.strip_suffix("token") == Some(prev))
+/// Segments before a separate `token` segment that make it a pagination or
+/// idempotency handle, not a credential (`NextToken`, `next_page_token`,
+/// `IdempotencyToken`).
+const HANDLE_TOKEN_QUALIFIERS: &[&str] = &["next", "page", "idempotency"];
+
+/// Stems of a glued `…pass` word that may count something: see
+/// [`Strength::Counter`].
+const COUNTER_PASS_PREFIXES: &[&str] = &["hash", "last", "end"];
+
+/// A value that is only digits, once quotes and a trailing `,`/`;` are
+/// trimmed.
+fn is_count(value: &str) -> bool {
+    let v = value
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim_matches(['"', '\'']);
+    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
@@ -795,7 +818,7 @@ const GLUED_KEY_PREFIXES: &[&str] = &[
 /// Word stems before `pass` that are ordinary words (`bypass`, `compass`).
 const NON_SECRET_PASS_PREFIXES: &[&str] = &[
     "by", "com", "sur", "over", "under", "tres", "encom", "im", "re", "first", "second", "single",
-    "multi", "one", "two", "ask", "sshask", "gitask", "hash", "last", "end",
+    "multi", "one", "two", "ask", "sshask", "gitask",
 ];
 
 /// Glued `…token` words that are not credential names.
@@ -973,6 +996,7 @@ fn value_masks(strength: Strength, value: &str, colon: bool) -> bool {
     let v = value.trim();
     match (strength, colon) {
         (Strength::Meta, _) => maskable(v) && !metadata_value(v),
+        (Strength::Counter, colon) => !is_count(v) && value_masks(Strength::Strong, v, colon),
         (Strength::Strong, true) => {
             maskable(v)
                 && !PROSE_VALUES.contains(&v.to_ascii_lowercase().as_str())
@@ -1454,7 +1478,7 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 let stop = |c: char| match lead {
                     Some(q @ ('"' | '\'')) => c == q,
                     Some('?' | '&') => c == '&' || c.is_whitespace(),
-                    _ if strength == Strength::Strong => false,
+                    _ if matches!(strength, Strength::Strong | Strength::Counter) => false,
                     _ => c.is_whitespace() || matches!(c, '&' | '"' | '\''),
                 };
                 let len = text[start..eol].find(stop).unwrap_or(eol - start);
@@ -1726,7 +1750,7 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
         .split([' ', '\t'])
         .next()
         .unwrap_or("");
-    if names.get(first) != Some(Strength::Strong) {
+    if !matches!(names.get(first), Some(Strength::Strong | Strength::Counter)) {
         return;
     }
     let Some(caps) = WS_ROW.captures(line) else {
@@ -1753,8 +1777,10 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
     } else {
         wide || !indent.as_str().is_empty()
     };
+    let strength = names.get(name.as_str());
     if tabular
-        && names.get(name.as_str()) == Some(Strength::Strong)
+        && matches!(strength, Some(Strength::Strong | Strength::Counter))
+        && !(strength == Some(Strength::Counter) && is_count(value.as_str()))
         && maskable(value.as_str())
         && !PROSE_VALUES.contains(&value.as_str().to_ascii_lowercase().as_str())
     {
@@ -2517,6 +2543,7 @@ mod tests {
                 .to_string(),
             "lastpass=1696500000\nendpass=42\n".to_string(),
             "HASHPASS: 12\n".to_string(),
+            "{\"lastpass\": 1696500000}\n".to_string(),
         ];
         for input in &kept {
             assert_eq!(redact(input), None, "{input:?}");
@@ -2534,6 +2561,19 @@ mod tests {
             "{\"password\": \"yes\"}\n".to_string(),
             format!("mypass={p}\n"),
             format!("PGPASSWORD={p}\n"),
+            // Only the issue's names and spellings are exempt.
+            format!("KEY_TOKEN={p}\n"),
+            format!("SYNC_TOKEN={p}\n"),
+            format!("RESUME_TOKEN={p}\n"),
+            format!("CONTINUATION_TOKEN={p}\n"),
+            format!("{{\"keyToken\": \"{p}\"}}\n"),
+            // A counter stem exempts only a value of digits.
+            format!("LASTPASS={p}\n"),
+            format!("HASHPASS={p}\n"),
+            format!("lastpass: {p}\n"),
+            format!("{{\"hashpass\": \"{p}\"}}\n"),
+            format!("endpass={p}\n"),
+            "LASTPASS=12ab34cd\n".to_string(),
         ];
         for input in &masks {
             assert_ne!(redact(input), None, "{input:?} was not masked");
