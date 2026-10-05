@@ -6612,6 +6612,7 @@ mod tests {
         fs::write(&unedited, original).unwrap();
         let foreign = outside.path().join("foreign.md");
         fs::write(&foreign, POINTER_BODY).unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases: Vec<(&str, PathBuf, Option<&str>)> = vec![
             (
                 "store file holds the edited body",
