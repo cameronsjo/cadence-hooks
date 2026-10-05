@@ -30,6 +30,10 @@ const RECORDING: &[(&str, &[&str])] = &[
         &["crates/cadence/src/prevent_secret_push.rs"],
     ),
     (
+        "CADENCE_ALLOW_SECRET_OUTPUT",
+        &["crates/cadence/src/redact_secret_output.rs"],
+    ),
+    (
         "CADENCE_ALLOW_SOPS_DECRYPT",
         &["crates/guardrails/src/guard_sops_decrypt.rs"],
     ),

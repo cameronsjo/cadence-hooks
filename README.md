@@ -12,7 +12,7 @@ Claude Code hooks run on every tool invocation. Shell scripts accumulate startup
 
 | Namespace | Plugin | Hooks | Focus |
 |-----------|--------|-------|-------|
-| `cadence` | cadence | 22 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
+| `cadence` | cadence | 24 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
 | `guardrails` | git-guardrails | 37 | Push & gh-write allowlists, branch/PR/issue nudges, dotfile & vault guards |
 | `rules` | cadence-rules | 4 | Frontmatter validation + a security anti-pattern scan |
 | `obsidian` | cadence-obsidian | 2 | Block `rm` and empty `Write`s inside the Obsidian vault; SessionStart liveness check |

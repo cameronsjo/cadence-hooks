@@ -370,9 +370,11 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
 }
 
 /// Build the SessionStart blocker envelope: the only thing `doctor --quiet`
-/// reports about findings. Wrapped in a `<cadence-system-message>` envelope and
-/// addressed to the hosting session (never the human directly), so a reader
-/// can tell machine-directed instruction text from a plain status line.
+/// reports about findings. Wrapped in a `<cadence-system-message>` envelope so
+/// a reader can tell a binary-emitted status from surrounding text. The
+/// envelope is data with no authority (like `<relay>`; cameronsjo/cadence#865):
+/// it states what is wrong and where to look, addressed to the operator, and
+/// never orders the hosting session to act (#1251).
 ///
 /// It fires only for [`Blocker`] findings — wired hooks that are not running —
 /// and never for advisory warnings (hook latency, stale telemetry, orphans),
@@ -388,10 +390,10 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
 ///
 /// **Invariant: no untrusted text.** Everything interpolated here is
 /// binary-controlled (the compile-time version, two counts, the static upgrade
-/// hints). The envelope is trust-elevated instruction text addressed to the
-/// hosting session, so interpolating a plugin-controlled `diagnosis` into it
-/// would hand plugin metadata a prompt-injection channel — keep specifics in
-/// the full `doctor` output, never in the envelope.
+/// hints). The envelope lands in the hosting session's context, so
+/// interpolating a plugin-controlled `diagnosis` into it would hand plugin
+/// metadata a prompt-injection channel — keep specifics in the full `doctor`
+/// output, never in the envelope.
 ///
 /// **Known degraded mode:** the gate is content-keyed, not date-keyed, and it
 /// is skipped entirely (every call fires) whenever
@@ -407,8 +409,7 @@ fn quiet_blocker_envelope(
     upgrade_fixes: bool,
     channel: InstallChannel,
 ) -> String {
-    let mut action_line =
-        "Run 'cadence-hooks doctor' and tell the user in one line before other work.".to_string();
+    let mut action_line = "Running 'cadence-hooks doctor' shows which hooks and why.".to_string();
     if upgrade_fixes {
         action_line.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
     }
@@ -7677,16 +7678,43 @@ mod tests {
     // ── quiet_blocker_envelope (#306, #632) ─────────────────────────────────
 
     #[test]
-    fn quiet_envelope_carries_tags_counts_and_directive() {
+    fn quiet_envelope_carries_tags_counts_and_pointer() {
         let s = quiet_blocker_envelope("0.60.0", 1, 2, false, InstallChannel::Unknown);
         assert_eq!(
             s,
             "<cadence-system-message>\n\
              cadence-hooks 0.60.0: 1 error(s) and 2 inert hook wiring(s) — hooks are not \
              running as wired.\n\
-             Run 'cadence-hooks doctor' and tell the user in one line before other work.\n\
+             Running 'cadence-hooks doctor' shows which hooks and why.\n\
              </cadence-system-message>"
         );
+    }
+
+    /// #1251: the envelope is information for the operator, not an order to
+    /// the hosting session — no model-addressed imperatives, in any shape.
+    #[test]
+    fn quiet_envelope_never_instructs_the_session() {
+        for (skew, channel) in [
+            (false, InstallChannel::Unknown),
+            (true, InstallChannel::Homebrew),
+            (true, InstallChannel::Cargo),
+            (true, InstallChannel::Unknown),
+        ] {
+            let s = quiet_blocker_envelope("0.60.0", 1, 1, skew, channel);
+            for imperative in [
+                "tell the user",
+                "before other work",
+                "Claude:",
+                "MUST",
+                "You must",
+                "Run '",
+            ] {
+                assert!(
+                    !s.contains(imperative),
+                    "{imperative:?} in envelope (skew={skew}): {s}"
+                );
+            }
+        }
     }
 
     #[test]
