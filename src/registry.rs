@@ -300,6 +300,24 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "redact-secret-output",
+        description: "Mask secret values in Bash output before they reach the transcript",
+        namespace: "cadence",
+        events: &[HookEvent::PostToolUse],
+        // Remote: pure text transform of the tool output; the cloud VM prints secrets too.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
+        name: "guard-secret-dump",
+        description: "Ask before a command prints a bare, unnamed secret value",
+        namespace: "cadence",
+        events: &[HookEvent::PreToolUse],
+        // Remote: no-op when the producing tools are absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "guard-held-close",
         description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
         namespace: "cadence",
