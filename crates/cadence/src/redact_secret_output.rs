@@ -703,6 +703,9 @@ fn classify(segs: &[&str]) -> Option<Strength> {
         return Some(Strength::Strong);
     }
     let mut weak = false;
+    // A counter stem (`lastpass`) only lowers the name when no later segment
+    // is strong: `LASTPASS_PASSWORD` is still a password.
+    let mut counter = false;
     for (i, seg) in segs.iter().enumerate() {
         let prev = i.checked_sub(1).map(|p| segs[p]);
         match *seg {
@@ -730,11 +733,14 @@ fn classify(segs: &[&str]) -> Option<Strength> {
                 .strip_suffix("pass")
                 .is_some_and(|stem| COUNTER_PASS_PREFIXES.contains(&stem)) =>
             {
-                return Some(Strength::Counter);
+                counter = true;
             }
             s if STRONG_WORDS.contains(&s) || glued_strong(s) => return Some(Strength::Strong),
             _ => {}
         }
+    }
+    if counter {
+        return Some(Strength::Counter);
     }
     weak.then_some(Strength::Weak)
 }
@@ -2574,6 +2580,11 @@ mod tests {
             format!("{{\"hashpass\": \"{p}\"}}\n"),
             format!("endpass={p}\n"),
             "LASTPASS=12ab34cd\n".to_string(),
+            // A later strong segment still decides: the counter stem does not
+            // cut the name short.
+            "LASTPASS_PASSWORD=48213907\n".to_string(),
+            "HASHPASS_SECRET=12345678\n".to_string(),
+            "ENDPASS_TOKEN=12345678\n".to_string(),
         ];
         for input in &masks {
             assert_ne!(redact(input), None, "{input:?} was not masked");
