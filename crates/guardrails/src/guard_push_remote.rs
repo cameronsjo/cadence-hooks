@@ -180,9 +180,10 @@ enum PushTarget {
 /// first cut of this fix: an unmodelled option's value posed as a positional and
 /// discarded a recorded evil `--repo` URL that `main` had caught.
 ///
-/// An empty result means no explicit destination — the tracking-remote fallback.
-/// A [`PushTarget::None`] entry beside explicit ones means a parsed push names
-/// no repository, so the tracking remote is judged as well.
+/// A [`PushTarget::None`] entry means a parsed or walked push names no
+/// repository, so the tracking remote is judged, beside any explicit
+/// destinations. An empty result (no push in `work_dir` names anything git
+/// would resolve) takes the same tracking-remote fallback.
 /// `walk_pushes` is the push walk's reading of the same command
 /// ([`PushWalk::of`]); the repositories of its pushes running in `work_dir`
 /// are judged alongside `push_segments`, so a push only the walk sees is
@@ -232,8 +233,9 @@ fn extract_push_targets(
         walk_pushes
             .iter()
             .filter(|push| push.work_dir == work_dir)
-            .filter_map(|push| push.repository.clone())
-            .map(|repository| vec![repository]),
+            // A bare walked push stays, as an empty list, so it marks the
+            // tracking remote below like a bare segment does.
+            .map(|push| push.repository.clone().into_iter().collect::<Vec<String>>()),
     );
 
     // Resolve destinations through git's own option grammar. Taking the first
@@ -249,15 +251,17 @@ fn extract_push_targets(
     // 200 KB `git -C d push origin main; …` flood spent the whole deadline on
     // `git remote` and the guard failed open (cadence-hooks#1131).
     let mut candidates: Vec<String> = Vec::new();
-    // A parsed push naming no repository pushes to the tracking remote, which
-    // must still be judged when another push names a destination: the walked
-    // repositories above made `git push; bash -c 'git push <owned-url> main'`
-    // look fully explicit, so an unowned tracking remote was never checked.
-    let mut bare_segment = false;
+    // A push naming no repository — parsed or walked — pushes to the
+    // tracking remote, which must still be judged when another push names a
+    // destination: an owned explicit URL elsewhere in the command
+    // (`git push; bash -c 'git push <owned-url> main'`, or the reverse) made
+    // the command look fully explicit, so an unowned tracking remote was
+    // never checked.
+    let mut bare_push = false;
     for words in &argument_lists {
         let found = cadence_hooks_core::shell::push_repository_argument(words);
         if found.positional.is_none() && found.repo_flag.is_none() {
-            bare_segment = true;
+            bare_push = true;
         }
         for candidate in [found.positional, found.repo_flag].into_iter().flatten() {
             if !candidates.contains(&candidate) {
@@ -265,16 +269,17 @@ fn extract_push_targets(
             }
         }
     }
-    if candidates.is_empty() {
-        return Vec::new();
+    let mut targets: Vec<PushTarget> = Vec::new();
+    if !candidates.is_empty() {
+        let remotes = RemoteNames::of(work_dir);
+        targets.extend(
+            candidates
+                .iter()
+                .map(|candidate| classify_push_target(candidate, &remotes))
+                .filter(|t| !matches!(t, PushTarget::None)),
+        );
     }
-    let remotes = RemoteNames::of(work_dir);
-    let mut targets: Vec<PushTarget> = candidates
-        .iter()
-        .map(|candidate| classify_push_target(candidate, &remotes))
-        .filter(|t| !matches!(t, PushTarget::None))
-        .collect();
-    if bare_segment {
+    if bare_push {
         targets.push(PushTarget::None);
     }
     targets
@@ -2343,13 +2348,25 @@ mod tests {
             for command in [
                 walked,
                 "git push --tags; bash -c 'git push https://github.com/cameronsjo/x.git main'",
+                // A walked bare push marks the tracking remote too.
+                "bash -c 'git push'; bash -c 'git push https://github.com/cameronsjo/x.git main'",
+                "echo $(git push); bash -c 'git push https://github.com/cameronsjo/x.git main'",
+                "git push https://github.com/cameronsjo/x.git main; bash -c 'git push'",
+                "bash -c 'git push'",
             ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
                 assert_eq!(result.outcome, Block, "{command}: {:?}", result.message);
             }
             let owned = checkout_with_origin("https://github.com/cameronsjo/scratch.git");
             let cwd = owned.path().to_string_lossy().to_string();
-            for command in [walked, "git push", "git push origin main"] {
+            for command in [
+                walked,
+                "git push",
+                "git push origin main",
+                "bash -c 'git push'",
+                "git push https://github.com/cameronsjo/x.git main; bash -c 'git push'",
+                "echo $(git push); bash -c 'git push https://github.com/cameronsjo/x.git main'",
+            ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
                 assert_eq!(result.outcome, Allow, "{command}: {:?}", result.message);
             }
