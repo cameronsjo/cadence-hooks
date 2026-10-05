@@ -1440,6 +1440,15 @@ impl Check for RunbookScrubGuard {
         "guard-runbook-scrub"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
+    // `touch`/`mkdir` operands are paths this guard judges.
+    fn unread_inert_commands(&self) -> &'static [&'static str] {
+        cadence_hooks_core::shell::UNREAD_INERT_COMMANDS
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let dir = std::env::var(DIR_ENV).ok();
         let escape = std::env::var(ESCAPE_ENV).ok();

@@ -16,8 +16,8 @@ use crate::secret_patterns::{
 use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, child_scripts, command_segments, command_word,
-    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, heredoc_introducers,
-    is_assignment_word, skip_git_global_options, skip_transparent_prefixes, split_segments,
+    dollar_opens_quote_after, executable_tokens, executable_tokens_marked, is_assignment_word,
+    shell_fed_heredoc_bodies, skip_git_global_options, skip_transparent_prefixes, split_segments,
     split_segments_with_ops, strip_group_wrappers, strip_heredoc_bodies, su_command_value,
     tokenize, tokenize_marked, unescape_word,
 };
@@ -3340,7 +3340,7 @@ fn command_reads_process_environ(command: &str) -> bool {
     if !command.contains("/pro") && !command.contains(['\'', '"', '\\']) {
         return false;
     }
-    let words = tokenize(command);
+    let words = tokenize(&without_data_heredocs(command));
     let last_is_environ = |path: &str| {
         // `/proc/<pid>/environ` at the least: `/proc/*` lists pids, not an
         // environment.
@@ -5310,63 +5310,22 @@ fn eval_operand_is_opaque(operand: &str) -> bool {
         )
 }
 
-/// Bodies of heredocs a SHELL reads on stdin (#1082): `bash <<EOF`, `sh -s
-/// <<'X'`, `source /dev/stdin <<EOF`, `cat <<EOF | bash`, also inside `$( … )`
-/// or backticks. Every heredoc on a shell-fed line is collected — an
-/// over-collection only adds text to judge. An unterminated body runs to the
-/// end of the command, as bash runs it.
-fn shell_fed_heredoc_bodies(command: &str) -> Vec<String> {
-    static SHELL_FED: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?:^|[\s;&|(`{}])(?:(?:\S*/)?(?:bash|sh|zsh|dash|ksh|mksh|ash)(?:\s+[-+]\S+)*\s*(?:[0-9]*<<|[|;&)`}]|$)|(?:source|\.)\s+(?:/dev/stdin|/dev/fd/0|/proc/self/fd/0)\b)",
-        )
-        .expect("shell-fed heredoc regex compiles")
-    });
+/// `command` with the bodies of heredocs no shell runs left out, for a
+/// whole-command [`tokenize`]. Those bodies are data, so this guard never
+/// judges a reading of them, and expanding the braces in one (minified JSON,
+/// a commit message quoting `{1..5000}`) spent the brace budget and marked a
+/// command unread that hides nothing (cameronsjo/cadence-hooks#1279, round
+/// 3). A shell-fed body is kept, appended as the script it is.
+fn without_data_heredocs(command: &str) -> Cow<'_, str> {
     if !command.contains("<<") {
-        return Vec::new();
+        return Cow::Borrowed(command);
     }
-    let physical: Vec<&str> = command.split('\n').collect();
-    let mut bodies = Vec::new();
-    let mut i = 0;
-    while i < physical.len() {
-        // Join backslash-newline continuations the way the shell does.
-        let mut line = physical[i].to_string();
-        i += 1;
-        while i < physical.len() && (line.len() - line.trim_end_matches('\\').len()) % 2 == 1 {
-            line.pop();
-            line.push_str(physical[i]);
-            i += 1;
-        }
-        if !line.contains("<<") {
-            continue;
-        }
-        let intros = heredoc_introducers(&line);
-        if intros.is_empty() {
-            continue;
-        }
-        let fed = SHELL_FED.is_match(&line);
-        for intro in intros {
-            let dash = line[intro.start..].starts_with("<<-");
-            let mut body: Vec<&str> = Vec::new();
-            while i < physical.len() {
-                let candidate = physical[i];
-                i += 1;
-                let end = if dash {
-                    candidate.trim_start_matches('\t') == intro.word
-                } else {
-                    candidate == intro.word
-                };
-                if end {
-                    break;
-                }
-                body.push(candidate);
-            }
-            if fed && !body.is_empty() {
-                bodies.push(body.join("\n"));
-            }
-        }
+    let mut text = strip_heredoc_bodies(command);
+    for body in shell_fed_heredoc_bodies(command) {
+        text.push('\n');
+        text.push_str(&body);
     }
-    bodies
+    Cow::Owned(text)
 }
 
 /// Findings of [`command_level_reads`].
@@ -5639,7 +5598,7 @@ fn bash_leaks_secrets_within(
         // segment shadows `jq` in every later one.
         let context = ScanContext {
             plain_jq_pipeline: command_is_plain_jq_pipeline(command),
-            git_env_rebound: tokenize(command)
+            git_env_rebound: tokenize(&without_data_heredocs(command))
                 .iter()
                 .any(|t| is_assignment_word(t) && t.starts_with("GIT_")),
         };
@@ -5832,6 +5791,10 @@ impl Default for SecretLeaksGuard {
 impl Check for SecretLeaksGuard {
     fn name(&self) -> &str {
         "prevent-secret-leaks"
+    }
+
+    fn refuses_unread_commands(&self) -> bool {
+        true
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {

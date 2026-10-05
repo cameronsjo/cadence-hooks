@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, apply_cd_target,
+    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, Readings, TRANSPARENT, apply_cd_target,
     child_scripts_but_git_exec, command_word, executable_tokens_marked, git_command_line_aliases,
     git_exec, git_output_detailed, installs_trap_action, is_assignment_word, peel_command_runners,
     resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories,
@@ -766,7 +766,7 @@ fn collect_push_invocations(
     // the directory state each open one started from, and the closes the
     // previous segment left to apply. Off for a script with a `case`, whose
     // `pattern)` arms read as closers this walk cannot tell from real ones.
-    let mut scopes_subshells = !script.contains("case");
+    let mut scopes_subshells = !crate::shell::mentions_case_keyword(script);
     let mut subshells: Vec<(String, bool)> = Vec::new();
     let mut pending_closes = 0;
     for (segment, _next_op) in split_segments_with_ops(script) {
@@ -903,6 +903,21 @@ fn collect_push_invocations(
         // command can have redefined the name and the segment has no quoting
         // that could make the text a literal (cadence-hooks#1095 review).
         let known_ok = walk.trusts_known_commands && substitutions_are_live(segment);
+        // A substitution the splitter cut open — `echo $(cd /u && git push
+        // origin main )`, `diff <(cd /u` ⏎ `git push origin main` ⏎ `) x` —
+        // starts its subshell inside THIS segment, so a directory verb there
+        // is not this segment's command and the walk never moved. The
+        // segments after it, up to the `)`, run in that subshell's directory,
+        // which this walk cannot vouch for: they are marked directory-
+        // unverified rather than placed in the parent's cwd, and the subshell
+        // scope pushed above restores the flag at its `)` (#1233).
+        if segment.contains('(')
+            && crate::shell::cut_inner_tails(segment).iter().any(|tail| {
+                directory_verb(&crate::shell::executable_tokens(tail), known_ok).is_some()
+            })
+        {
+            scope_directory = true;
+        }
         // `env -C DIR`/`--chdir=DIR` runs this segment's command in DIR — and
         // any child script it starts — without moving the scope.
         //
@@ -936,22 +951,72 @@ fn collect_push_invocations(
                     || runs_in_found_directories(argv),
                 directory: segment_directory,
             };
-            for child in child_scripts_but_git_exec(argv, segment) {
-                collect_push_invocations(
-                    &child,
-                    &segment_dir,
-                    depth + 1,
-                    child_doubt,
-                    walk,
-                    writes,
-                    out,
-                );
+            for (child, readings) in crate::shell::child_scripts_but_git_exec_read(argv, segment) {
+                crate::shell::in_reading(readings, || {
+                    collect_push_invocations(
+                        &child,
+                        &segment_dir,
+                        depth + 1,
+                        child_doubt,
+                        walk,
+                        writes,
+                        out,
+                    );
+                });
             }
+        } else if (segment.contains("push") || mentions_an_exec_setting(segment))
+            && child_scripts_but_git_exec(argv, segment)
+                .iter()
+                .any(|child| {
+                    crate::shell::command_segments(child).iter().any(|inner| {
+                        !crate::shell::git_push_segments(inner).is_empty()
+                            || sets_git_config_past_the_bound(inner)
+                    })
+                })
+        {
+            // So is a git command past the bound that runs a command of its
+            // own or sets one (`GIT_SSH_COMMAND=… git fetch`), which the walk
+            // would otherwise refuse (cameronsjo/cadence-hooks#1231 review I1).
+            // Past the depth bound the children are not walked, but a push
+            // in one still runs: `cat <(echo $(echo $(echo $(git push origin
+            // main))))` nests it one level past what this walk follows
+            // (cameronsjo/cadence-hooks#1233 review). It is reported as a push
+            // this walk cannot place, so fail-closed callers refuse it.
+            out.push(unresolvable_push(&segment_dir, segment_directory));
         }
-        if let Some(exec) = git_exec(&tokens) {
+        // The exec values are scripts, read as bash builds them (a backslash
+        // `'…'` made literal survives the one unescape a value gets) and as
+        // before (cameronsjo/cadence-hooks#1231, see `segment_scripts`).
+        // The script spelling's scripts are the ones counted against the
+        // cap; the as-typed reading's that differ are walked beside them, so
+        // one exec value is never counted twice (#1231 review I2).
+        let readings = crate::shell::current_readings();
+        let pair = (readings != Readings::Typed && crate::shell::may_quote_a_backslash(segment))
+            .then(|| crate::shell::executable_token_pair(segment));
+        let (exec, alternates) = if pair.as_ref().is_none_or(|pair| pair.1 == pair.0) {
+            (git_exec(&tokens), Vec::new())
+        } else if let Some(pair) = pair.as_ref().filter(|_| readings == Readings::Script) {
+            (git_exec(&pair.1), Vec::new())
+        } else if let Some(pair) = pair.as_ref() {
+            match (git_exec(&pair.1), git_exec(&tokens)) {
+                (Some(mut built), typed) => {
+                    let alternates = typed.map_or_else(Vec::new, |typed| {
+                        built.opaque |= typed.opaque;
+                        built.elsewhere |= typed.elsewhere;
+                        typed.scripts
+                    });
+                    (Some(built), alternates)
+                }
+                (None, typed) => (typed, Vec::new()),
+            }
+        } else {
+            (git_exec(&tokens), Vec::new())
+        };
+        if let Some(exec) = exec {
             collect_git_exec_pushes(
                 argv,
                 &exec,
+                &alternates,
                 &segment_dir,
                 depth,
                 Doubt {
@@ -1183,6 +1248,9 @@ const MAX_GIT_EXEC_SCRIPTS: usize = 16;
 /// one: a command whose name is an expansion (`-x "$CMD"`), more scripts than
 /// [`MAX_GIT_EXEC_SCRIPTS`], or nesting past [`MAX_WRAPPER_DEPTH`] — so a
 /// `git rebase -x "git rebase -x …"` flood stops at the bound and refuses.
+/// So is an invocation that sets a value git runs as a command
+/// (`-c core.sshCommand=…`, `GIT_SSH_COMMAND=… git fetch`;
+/// [`crate::shell::GitExec::opaque`]).
 /// A script that runs `sh -c "$CMD"` or `eval "$CMD"` is read like the same
 /// command at the top level, which does not refuse it
 /// (cameronsjo/cadence-hooks#1231).
@@ -1190,6 +1258,7 @@ const MAX_GIT_EXEC_SCRIPTS: usize = 16;
 fn collect_git_exec_pushes(
     argv: &[String],
     exec: &GitExec,
+    alternates: &[String],
     segment_dir: &str,
     depth: usize,
     inherited: Doubt,
@@ -1252,6 +1321,7 @@ fn collect_git_exec_pushes(
         || exec
             .scripts
             .iter()
+            .chain(alternates)
             .any(|script| unreadable(script) || runs_an_outer_alias(script))
     {
         out.push(unresolvable_push(&work_dir, doubt.directory));
@@ -1259,9 +1329,96 @@ fn collect_git_exec_pushes(
     if depth >= MAX_WRAPPER_DEPTH || exec.scripts.len() > MAX_GIT_EXEC_SCRIPTS {
         return;
     }
-    for script in &exec.scripts {
-        collect_push_invocations(script, &work_dir, depth + 1, doubt, walk, writes, out);
+    // Each script in the reading that found it: the script reading's alone
+    // when the as-typed one did not find it too, the as-typed one's extras
+    // alone (cameronsjo/cadence-hooks#1231 review C2).
+    for (script, readings) in
+        crate::shell::merge_readings(exec.scripts.clone(), alternates.to_vec())
+    {
+        let readings = match readings {
+            Readings::Both => crate::shell::current_readings(),
+            _ if alternates.is_empty() => crate::shell::current_readings(),
+            other => other,
+        };
+        crate::shell::in_reading(readings, || {
+            collect_push_invocations(&script, &work_dir, depth + 1, doubt, walk, writes, out);
+        });
     }
+}
+
+/// A cheap superset test for a segment past the wrapper depth that may set a
+/// value git runs ([`crate::shell::git_exec`]'s settings): one of the names
+/// such a setting is spelled with appears in it. Only such a segment pays to
+/// list its children (cameronsjo/cadence-hooks#1231 review I1).
+fn mentions_an_exec_setting(segment: &str) -> bool {
+    const MARKS: &[&str] = &[
+        "git_",
+        "pager",
+        "askpass",
+        "config-env",
+        "sshcommand",
+        "fsmonitor",
+        "hookspath",
+        "external",
+        "gitproxy",
+        "textconv",
+        "driver",
+        "smudge",
+        "clean",
+        "process",
+        "helper",
+        "program",
+        "command",
+        "cmd",
+        "protocol",
+        "difffilter",
+        "uploadpack",
+        "receivepack",
+        "vcs",
+        "-c $",
+        "-c`",
+    ];
+    let lower = unquoted_lowercase(segment);
+    lower.contains("git") && MARKS.iter().any(|mark| lower.contains(mark))
+}
+
+/// `text` lowercased with its quotes and backslashes dropped, so a cheap
+/// substring test is not defeated by `ssh"C"ommand` or `gi""t`
+/// (cameronsjo/cadence-hooks#1231 review).
+fn unquoted_lowercase(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether a segment past the wrapper depth runs git with a setting that
+/// may make it run a command: a `GIT_*` assignment in front of it, a `-c`
+/// or `--config-env` word, or anything [`crate::shell::git_exec`] reads
+/// (cameronsjo/cadence-hooks#1231 review I1).
+fn sets_git_config_past_the_bound(inner: &str) -> bool {
+    if !unquoted_lowercase(inner).contains("git") {
+        return false;
+    }
+    let tokens = crate::shell::executable_tokens(inner);
+    if git_exec(&tokens).is_some() {
+        return true;
+    }
+    let argv = peel_command_runners(crate::shell::strip_compound_heads(&tokens));
+    if argv
+        .first()
+        .is_none_or(|first| !command_word(first).starts_with("git"))
+    {
+        return false;
+    }
+    let prefix = &tokens[..tokens.len() - argv.len()];
+    prefix.iter().any(|word| {
+        let word = crate::shell::unescape_word(word);
+        word.starts_with("GIT_") && word.contains('=')
+    }) || argv[1..].iter().any(|word| {
+        let word = crate::shell::unescape_word(word);
+        word.starts_with("-c") || word.starts_with("--config-env")
+    })
 }
 
 /// `segment` without a leading function-definition head — `f()`, `f ( )`,
@@ -4110,7 +4267,8 @@ mod tests {
                 "/repo",
                 vec![refused("/repo")],
             ),
-            // A `.` operand is not the `.` builtin.
+            // An expansion-named editor refuses whatever precedes it
+            // (review 10); this row does not test the `.` operand.
             (
                 "git add . && GIT_EDITOR=\"$EDITOR\" git commit",
                 "/repo",
@@ -4326,6 +4484,293 @@ mod tests {
     }
 
     #[test]
+    fn nested_escaped_wrappers_reach_the_push_walk() {
+        // cameronsjo/cadence-hooks#1231: three levels of `bash -c` with
+        // escaped inner quotes are read to the push; four reach the wrapper
+        // depth and are refused as a push the walk cannot resolve.
+        // Each runs `git push origin main` under bash.
+        for (command, resolved) in [
+            (
+                r#"bash -c 'bash -c "bash -c \"git push origin main\""'"#,
+                true,
+            ),
+            (
+                r#"bash -c 'bash -c '\''bash -c '\''\'\'''\''git push origin main'\''\'\'''\'''\'''"#,
+                true,
+            ),
+            (
+                r#"git rebase -x 'git rebase -x "git rebase -x \"git push origin main\" HEAD" HEAD' HEAD"#,
+                true,
+            ),
+            (
+                r#"bash -c 'bash -c "bash -c \"bash -c \\\"git push origin main\\\"\""'"#,
+                false,
+            ),
+        ] {
+            let found = push_locations(command, "/repo");
+            // The push itself reaches the walk (a rebase's lost top level
+            // may still leave it unverified, which is not this row's point).
+            let read = found
+                .iter()
+                .any(|push| push.refspecs.iter().any(|r| r.raw == "main"));
+            assert_eq!(read, resolved, "{command:?}: {found:?}");
+            if !resolved {
+                assert!(
+                    found.iter().any(|push| push.unresolved),
+                    "{command:?}: {found:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exec_valued_git_settings_are_read_as_nested_scripts_when_literal() {
+        // cameronsjo/cadence-hooks#1231: a value git runs as a command is a
+        // script nested in the invocation. A fully literal one is read like
+        // any other script (`less -R`, `ssh -i k` push nothing; `git push
+        // evil main` is a push); one that is not literal, or that cannot be
+        // read at all, is a push the walk cannot resolve, so fail-closed
+        // guards refuse it.
+        #[derive(Debug, PartialEq)]
+        enum Read {
+            /// No push anywhere.
+            Nothing,
+            /// A push the walk cannot resolve.
+            Unresolved,
+        }
+        use Read::{Nothing, Unresolved};
+        for (command, want) in [
+            // Everyday literal values: nothing pushes.
+            ("git -c core.pager=\"less -R\" log", Nothing),
+            ("git -ccore.pager=less log", Nothing),
+            ("git -c pager.diff=delta diff", Nothing),
+            ("GIT_PAGER=less git log", Nothing),
+            ("PAGER='less -FRX' git log -p", Nothing),
+            ("GIT_SSH_COMMAND=\"ssh -i k\" git fetch", Nothing),
+            (
+                "GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git clone u",
+                Nothing,
+            ),
+            ("env GIT_SSH_COMMAND='ssh -i k' git fetch", Nothing),
+            ("git -c core.sshCommand=\"ssh -i k\" pull", Nothing),
+            ("GIT_SSH=/usr/bin/ssh git fetch", Nothing),
+            (
+                "git -c credential.helper='!f() { echo x; }; f' fetch",
+                Nothing,
+            ),
+            ("git -c credential.helper=store fetch", Nothing),
+            ("git -c diff.external=difft diff", Nothing),
+            ("GIT_EXTERNAL_DIFF=difft git diff", Nothing),
+            ("GIT_ASKPASS=/bin/askpass git fetch", Nothing),
+            (
+                "git -c interactive.diffFilter='delta --color-only' add -p",
+                Nothing,
+            ),
+            ("bash -c 'GIT_SSH_COMMAND=ssh git fetch'", Nothing),
+            ("GIT_SSH_COMMAND=ssh git-fetch", Nothing),
+            ("GIT_PAGER=cat git log", Nothing),
+            ("git -c core.pager=cat log", Nothing),
+            ("git -c pager.log=false log", Nothing),
+            ("git -c credential.helper= fetch", Nothing),
+            ("git -c core.hooksPath=/dev/null commit -m x", Nothing),
+            ("git -c protocol.ext.allow=never fetch", Nothing),
+            ("git -c user.name=x commit -m y", Nothing),
+            ("GIT_EDITOR=true git commit", Nothing),
+            ("GIT_ALLOW_PROTOCOL=https git ls-remote x", Nothing),
+            ("git status", Nothing),
+            ("FOO=1 git log", Nothing),
+            ("echo $(echo $(echo $(echo $(git status))))", Nothing),
+            // `$HOME`/`${HOME}`/`~` in an otherwise literal value, while
+            // nothing in the command can rebind HOME past one path.
+            ("GIT_SSH_COMMAND=\"ssh -i $HOME/.ssh/k\" git fetch", Nothing),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME}/.ssh/k\" git fetch",
+                Nothing,
+            ),
+            ("git -c core.sshCommand=\"ssh -i ~/.ssh/k\" fetch", Nothing),
+            ("git -c core.sshCommand='ssh -i $HOME/k' pull", Nothing),
+            (
+                "HOME=/x GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "export HOME=/tmp/h; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            (
+                "git add . && GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Nothing,
+            ),
+            // A literal hooks directory: hooks on disk are outside the
+            // reading, as the ones `git commit` runs anyway are.
+            ("git -c core.hooksPath=.githooks commit -m x", Nothing),
+            ("git -c core.hooksPath=~/.hooks commit -m x", Nothing),
+            ("git -c core.hooksPath=\"$HOME/hooks\" commit -m x", Nothing),
+            // HOME rebound, or any other expansion: refused as before.
+            (
+                "HOME='git push evil main' git -c core.pager='$HOME' log",
+                Unresolved,
+            ),
+            (
+                "HOME=\"a b\" GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "HOME=$(pwd) GIT_SSH_COMMAND='ssh -i $HOME/k' git fetch",
+                Unresolved,
+            ),
+            (
+                "unset HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "export HO\"\"ME=x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "read HOME; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "source x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                "eval x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            (
+                ". x; GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                Unresolved,
+            ),
+            ("GIT_SSH_COMMAND=\"ssh -i $HOMEX/k\" git fetch", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh -i $USER/k\" git fetch", Unresolved),
+            (
+                "GIT_SSH_COMMAND=\"ssh -i ${HOME:-/x}/k\" git fetch",
+                Unresolved,
+            ),
+            ("git -c core.hooksPath=\"$H\" commit -m x", Unresolved),
+            // A literal value that pushes is judged as the push it is; git
+            // runs it at the top of the working tree, which `/repo` (no
+            // repository) cannot place.
+            ("GIT_SSH_COMMAND='git push evil main' git fetch", Unresolved),
+            (
+                "GIT_PAGER=\"sh -c 'git push evil main'\" git log",
+                Unresolved,
+            ),
+            // Under a `-c` global, which git exports to the git it runs.
+            (
+                "git -c core.sshCommand='git push origin main' fetch",
+                Unresolved,
+            ),
+            (
+                "git -c core.pager='sh -c \"git push evil main\"' log",
+                Unresolved,
+            ),
+            // Not literal, or not readable: refused as before.
+            ("GIT_PAGER=\"$P\" git log", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh $(id -u)\" git fetch", Unresolved),
+            ("git -c core.pager='less `x`' log", Unresolved),
+            ("GIT_SSH_COMMAND=\"ssh 'x\" git fetch", Unresolved),
+            ("git --config-env=core.sshCommand=V fetch", Unresolved),
+            ("git --config-env core.pager=V log", Unresolved),
+            ("git -c protocol.ext.allow=always fetch ext::x", Unresolved),
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=x git fetch",
+                Unresolved,
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\" git fetch",
+                Unresolved,
+            ),
+            ("GIT_ALLOW_PROTOCOL=ext git ls-remote ext::x", Unresolved),
+            ("git -c \"$K=x\" fetch", Unresolved),
+            ("GIT_SSH_COMMAND+=x git fetch", Unresolved),
+            // Past the wrapper depth any such setting reads the same,
+            // spelled with quotes the text test must see through (round 2
+            // review I1).
+            (
+                "echo $(echo $(echo $(echo $(git -c core.ssh\"C\"ommand=x fetch))))",
+                Unresolved,
+            ),
+            (
+                "echo $(echo $(echo $(echo $(gi\"\"t -c core.sshCommand=x fetch))))",
+                Unresolved,
+            ),
+            (
+                "echo $(echo $(echo $(echo $(git -c \"$K=x\" fetch))))",
+                Unresolved,
+            ),
+            (
+                "echo $(echo $(echo $(echo $(GIT_DIR=/x git fetch))))",
+                Unresolved,
+            ),
+            (
+                r#"bash -c 'bash -c "bash -c \"bash -c \\\"GIT_SSH_COMMAND=x git fetch\\\"\""'"#,
+                Unresolved,
+            ),
+        ] {
+            // As `decide_check` does before a check reads the command.
+            crate::shell::note_command_home(command);
+            let found = push_locations(command, "/repo");
+            let read = if found.iter().any(|push| push.unresolved) {
+                Unresolved
+            } else {
+                assert!(found.is_empty(), "{command:?}: {found:?}");
+                Nothing
+            };
+            assert_eq!(read, want, "{command:?}: {found:?}");
+        }
+        // The pushing value is read as the push it is.
+        let found = push_locations("GIT_SSH_COMMAND='git push evil main' git fetch", "/repo");
+        assert!(
+            found
+                .iter()
+                .any(|push| push.repository.as_deref() == Some("evil")),
+            "{found:?}"
+        );
+        // A push beside a literal setting is read as it is.
+        let found = push_locations(
+            "git -c core.sshCommand='ssh -i k' push origin main",
+            "/repo",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|push| !push.unresolved && push.refspecs.iter().any(|r| r.raw == "main")),
+            "{found:?}"
+        );
+        // Beside one that is not literal, it is still read, and refused.
+        let found = push_locations("git -c core.sshCommand=\"$S\" push origin main", "/repo");
+        assert!(found.iter().any(|push| push.unresolved), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|push| push.refspecs.iter().any(|r| r.raw == "main")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_exec_value_read_both_ways_counts_once_against_the_cap() {
+        // cameronsjo/cadence-hooks#1231 review I2: nine `-x` values whose
+        // spellings differ were counted twice (18 > 16) and the walk stopped
+        // at the cap; each is counted once, and every delete is read.
+        let command = format!(
+            "git rebase {}HEAD~1",
+            (0..9)
+                .map(|n| format!("-x 'echo a\\b; git push origin --delete feat{n}' "))
+                .collect::<String>()
+        );
+        let found = push_locations(&command, "/repo");
+        let deletes = found
+            .iter()
+            .filter(|push| push.refspecs.iter().any(|r| r.is_delete))
+            .count();
+        assert!(deletes >= 9, "{found:?}");
+    }
+
+    #[test]
     fn bare_git_push_yields_an_implicit_head_refspec() {
         let invocation = only("git push", "/repo");
         assert_eq!(invocation.work_dir, "/repo");
@@ -4476,6 +4921,157 @@ mod tests {
         // belongs to a subshell and must not re-point the parent's push.
         let invocation = only("echo $(cd /x) && git push", "/repo");
         assert_eq!(invocation.work_dir, "/repo");
+    }
+
+    /// A process substitution's body runs in a subshell started from the
+    /// directory in effect where it is written, and its own `cd` dies with it
+    /// (cameronsjo/cadence-hooks#1233). Rows are `(command, the directory of
+    /// every push, in order)`; quoted `<(` is literal and pushes nothing.
+    #[test]
+    fn a_process_substitution_push_runs_in_the_parents_directory() {
+        for (command, want) in [
+            ("diff <(git push origin main) x", &["/repo"][..]),
+            ("cat >(git push origin main)", &["/repo"]),
+            ("tee >(git push origin main) >/dev/null", &["/repo"]),
+            ("cd /other && cat <(git push origin main)", &["/other"]),
+            ("cat <(cd /other) && git push origin main", &["/repo"]),
+            ("cat <(cd /other; true) && git push origin main", &["/repo"]),
+            (
+                "cat <(cd /other; true) >(cd /x); git push origin main",
+                &["/repo"],
+            ),
+            ("echo \"<(git push origin main)\"", &[]),
+            ("echo '>(git push origin main)'", &[]),
+        ] {
+            let dirs: Vec<String> = push_invocations(command, "/repo")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, want, "{command}");
+        }
+    }
+
+    /// A substitution the splitter cuts at a separator starts its subshell in
+    /// the segment that opens it, so a `cd` there is not that segment's
+    /// command: the walk never moves, and the push after it, still inside the
+    /// substitution, ran somewhere else. Such a push is directory-unverified
+    /// rather than placed in the parent's cwd, and the flag ends at the `)`
+    /// (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_cd_opening_a_cut_substitution_unverifies_the_push_inside_it() {
+        for command in [
+            "echo $(cd /other && git push origin main )",
+            "echo $(cd /other; git push origin main )",
+            "diff <(cd /other && git push origin main ) x",
+            "diff <(cd /other\ngit push origin main\n) x",
+            "cat >(cd /other || exit; git push origin main )",
+            "echo $(a $(cd /other; git push origin main ) )",
+            "echo $(pushd /other; git push origin main )",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}: no push");
+            for push in &pushes {
+                assert!(
+                    push.directory_unverified || push.work_dir == "/other",
+                    "{command:?}: a push placed in {} unflagged",
+                    push.work_dir
+                );
+            }
+        }
+        // Closed again: the parent's later push is placed as before.
+        for command in [
+            "echo $(cd /other; true) ; git push origin main",
+            "cat <(cd /other\ntrue\n) ; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+    }
+
+    /// A 200 KB flood of unclosed openers leaves 100 000 cut substitutions in
+    /// one segment. Reading each one's text to its end was quadratic — past
+    /// 20 s in release, and a hook past its deadline fails open.
+    #[test]
+    fn a_cut_substitution_opener_flood_walks_in_linear_time() {
+        for opener in ["<(", ">(", "$(", "<(\"", "echo <(cd a "] {
+            let command = format!(
+                "{} ; git push origin main",
+                opener.repeat(200 * 1024 / opener.len())
+            );
+            let started = std::time::Instant::now();
+            let pushes = push_invocations(&command, "/repo");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{opener:?}: {:?}",
+                started.elapsed()
+            );
+            assert!(!pushes.is_empty(), "{opener:?}");
+        }
+    }
+
+    /// A push nested one level past what this walk follows still runs, and
+    /// reads as a push it cannot place (#1233 review C1, #1267).
+    #[test]
+    fn a_push_nested_past_the_walk_depth_is_unresolvable() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(git push origin main))))))",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(
+                pushes.iter().any(|push| push.unresolved),
+                "{command:?}: {pushes:?}"
+            );
+        }
+        let quiet = push_invocations("cat <(echo $(echo $(echo $(git status))))", "/repo");
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// The word `case` in a comment or a quoted message leaves the subshell
+    /// scoping on, so a `$(cd …)` idiom does not strand its flag on the
+    /// parent's push (#1233 review I1). A real `case` still turns it off.
+    #[test]
+    fn a_case_mention_outside_a_case_keeps_subshell_scoping() {
+        for command in [
+            "D=$(cd /tmp && pwd); git push origin main # just in case",
+            "D=$(cd /tmp && pwd); git commit -m \"just in case\"; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+        let pushes = push_invocations(
+            "D=$(cd /tmp && pwd); case x in x) true;; esac; git push origin main",
+            "/repo",
+        );
+        assert!(
+            pushes.iter().all(|push| push.directory_unverified),
+            "{pushes:?}"
+        );
+        // An arithmetic `<<` is a shift, not a heredoc: the `case` after it
+        // is real, so its `y)` arm restores no scope (#1266 round-6 C1).
+        for opener in [
+            "(( y=1<<E ))",
+            "for ((i=1<<E; i<0; i++)); do :; done",
+            "if (( 1<<E )); then :; fi",
+            "while (( 0<<E )); do :; done",
+        ] {
+            let command = format!(
+                "(cd /other; {opener}\ncase x in x) true\nE\n;; y) true;; esac; git push origin main)"
+            );
+            let pushes = push_invocations(&command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}");
+            assert!(
+                pushes
+                    .iter()
+                    .all(|push| push.work_dir != "/repo" || push.directory_unverified),
+                "{command:?}: {pushes:?}"
+            );
+        }
     }
 
     #[test]
@@ -4739,12 +5335,15 @@ mod tests {
 
     #[test]
     fn a_git_config_env_prefix_marks_the_invocation_unresolved() {
+        // The `-c`-as-environment form also reads as setting an exec value
+        // (cameronsjo/cadence-hooks#1231), a second refusal beside the push.
+        let found = push_invocations(
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push",
+            "/repo",
+        );
         assert!(
-            only(
-                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push",
-                "/repo"
-            )
-            .unresolved
+            !found.is_empty() && found.iter().all(|push| push.unresolved),
+            "{found:?}"
         );
         assert!(only("GIT_CONFIG_GLOBAL=/x git push origin main", "/repo").unresolved);
         assert!(only("GIT_CONFIG_SYSTEM=/x git push origin main", "/repo").unresolved);
@@ -5857,12 +6456,13 @@ mod tests {
         // git honours this one standalone — no GIT_CONFIG_COUNT needed:
         // `GIT_CONFIG_PARAMETERS="'push.default=matching'" git config --get
         // push.default` prints `matching`.
+        let found = push_invocations(
+            "GIT_CONFIG_PARAMETERS='push.default=matching' git push origin",
+            "/repo",
+        );
         assert!(
-            only(
-                "GIT_CONFIG_PARAMETERS='push.default=matching' git push origin",
-                "/repo"
-            )
-            .unresolved
+            !found.is_empty() && found.iter().all(|push| push.unresolved),
+            "{found:?}"
         );
     }
 

@@ -203,6 +203,35 @@ pub fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
+/// Open `path` as a regular file WITHOUT following a symlink at its final
+/// component and without blocking on a FIFO: `O_NOFOLLOW | O_NONBLOCK |
+/// O_NOCTTY | O_CLOEXEC`, then the OPENED handle must `fstat` as a regular
+/// file. `None` for a symlink, FIFO, device, directory, or any IO error, so a
+/// planted non-regular file at a predictable path reads as absent instead of
+/// stalling the hook until its deadline (cameronsjo/cadence-hooks#1256). No
+/// stat-then-open window: the verdict is on the handle actually read. Off
+/// Unix it is a plain open plus the same handle check.
+pub fn open_regular_nofollow(path: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// [`read_capped`] through [`open_regular_nofollow`]: whole-file UTF-8 read of
+/// a regular, non-symlink file of at most `max_bytes`, else `None`.
+pub fn read_capped_nofollow(path: &Path, max_bytes: u64) -> Option<String> {
+    read_opened_capped(open_regular_nofollow(path)?, max_bytes).ok()
+}
+
 /// [`read_capped`], reporting *why* instead of collapsing to `None`. The single
 /// implementation — `read_capped` is a projection of it, so the two can never
 /// drift on where the cap sits or what counts as a readable file.
@@ -397,6 +426,46 @@ mod tests {
         std::fs::write(&regular, "use flake\n").unwrap();
         let file = open_nonblocking(&regular).unwrap();
         assert_eq!(read_opened_capped(file, 1024).as_deref(), Ok("use flake\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_nofollow_table() {
+        // cameronsjo/cadence-hooks#1256 M-3: a planted FIFO or symlink at a
+        // predictable plan path reads as absent, never stalls, never follows.
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("plan.md");
+        std::fs::write(&regular, "body\n").unwrap();
+        let big = dir.path().join("big.md");
+        std::fs::write(&big, "x".repeat(65)).unwrap();
+        let fifo = dir.path().join("fifo.md");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let link = dir.path().join("link.md");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let cases: [(&Path, Option<&str>); 6] = [
+            (&regular, Some("body\n")),
+            (&big, None),
+            (&fifo, None),
+            (&link, None),
+            (&sub, None),
+            (Path::new("/nonexistent/plan.md"), None),
+        ];
+        for (path, want) in cases {
+            assert_eq!(
+                read_capped_nofollow(path, 64).as_deref(),
+                want,
+                "{}",
+                path.display()
+            );
+        }
     }
 
     use super::*;

@@ -15,6 +15,8 @@ mod forgectl_hint;
 pub mod git_safety;
 /// Block `gh issue close` against the HELD-issue ledger.
 pub mod guard_held_close;
+/// Ask before a command prints a bare, unnamed secret value (PreToolUse).
+pub mod guard_secret_dump;
 /// Run markdownlint on markdown files being written.
 pub mod markdown_lint;
 /// Enforce line limits on MEMORY.md and topic files.
@@ -38,6 +40,8 @@ pub mod record_polish;
 /// Record that a runbook's content passed the secret scrub (writes a content-hash marker). CLI action.
 pub mod record_scrub;
 pub mod redact_external_content;
+/// Mask secret values in Bash output before they reach the transcript (PostToolUse).
+pub mod redact_secret_output;
 /// Shared secret file patterns for both secret guards.
 pub mod secret_patterns;
 /// Block inclusive terminology violations in written content.

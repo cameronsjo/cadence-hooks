@@ -808,6 +808,10 @@ impl Check for GitSafetyGuard {
         "git-safety"
     }
 
+    fn refuses_unread_commands(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
@@ -2504,5 +2508,96 @@ mod tests {
         let message = result.message.unwrap_or_default();
         assert!(message.contains("may modify history"), "{message}");
         assert!(!message.contains("cannot see inside"), "{message}");
+    }
+
+    /// A process substitution runs its body (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_dangerous_git_command_inside_a_process_substitution_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("diff <(git push --force origin main) x", Block),
+            ("cat >(git reset --hard)", Block),
+            ("cat <(cat <(git reset --hard))", Block),
+            ("echo \"<(git reset --hard)\"", Allow),
+            ("echo '<(git reset --hard)'", Allow),
+            ("diff <(git show HEAD:a) <(git show HEAD~1:a)", Allow),
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
+
+    /// A command nested past the expansion depth still reaches the guard,
+    /// whatever mix of substitutions holds it (#1233 review C1, #1267).
+    #[test]
+    fn a_dangerous_git_command_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git reset --hard))))",
+            "diff <(git diff) <(echo $(echo $(echo $(git reset --hard))))",
+            "echo $(echo $(cat <(echo $(git reset --hard))))",
+            "x=$(cat <(echo $(echo $(git reset --hard))))",
+            "(( 1<(2+$(echo $(echo $(git reset --hard)))) ))",
+            "echo $(echo $(echo $(echo $(git reset --hard))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(git reset --hard))))))))",
+            "echo $(echo $(echo $(echo `git reset --hard`)))",
+            "cat <(cat <(cat <(cat <(cat <(git reset --hard)))))",
+            "cat <(echo $(echo $(echo $(bash -c 'git reset --hard'))))",
+            "echo \"$(true >(true >(echo $(eval 'git reset --hard'))))\"",
+            "sh -c 'true >(echo $(bash -c '\"'\"'eval '\"'\"'\"'\"'\"'\"'\"'\"'git reset --hard'\"'\"'\"'\"'\"'\"'\"'\"''\"'\"'))'",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "echo $(echo $(echo $(echo $(git status))))",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// A process substitution spends no expansion level, so a literal
+    /// substitution inside one is evaluated as before (#1266 review C2).
+    #[test]
+    fn a_substitution_inside_a_process_substitution_is_evaluated() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git $(echo reset) --hard))))",
+            "cat <(echo $(echo $(echo $(git `echo reset` --hard))))",
+            "cat <(echo $(echo $(echo $(git reset $(echo --hard)))))",
+            "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    /// A 200 KB flood of process-substitution openers still reaches the
+    /// dangerous tail, promptly. Generous for a debug build.
+    #[test]
+    fn a_process_substitution_flood_before_a_reset_still_blocks_promptly() {
+        for opener in ["<(", "cat <(x) ", "<(a; "] {
+            let command = format!(
+                "{}\ngit reset --hard",
+                opener.repeat(200 * 1024 / opener.len())
+            );
+            let started = std::time::Instant::now();
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{opener:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(4),
+                "{opener:?}: {:?}",
+                started.elapsed()
+            );
+        }
     }
 }

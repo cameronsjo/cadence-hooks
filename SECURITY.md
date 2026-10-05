@@ -84,13 +84,15 @@ gh attestation verify cadence-hooks-vX.Y.Z-macos-aarch64.tar.gz \
 
 A different trust path: the detached Cosign bundle verifies against Sigstore's public
 transparency log without GitHub's attestation API. Requires
-[`cosign`](https://github.com/sigstore/cosign) (v2+).
+[`cosign`](https://github.com/sigstore/cosign) v2.5.0 or later (v3 recommended). Releases
+signed with cosign v3 ship the newer Sigstore bundle format, which cosign v2.4.x and
+earlier cannot read (`bundle does not contain cert`).
 
 ```bash
 # Download checksums.txt and its bundle from the release, then:
 cosign verify-blob \
   --bundle checksums.txt.cosign.bundle \
-  --certificate-identity-regexp 'https://github.com/cameronsjo/cadence-hooks/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-identity-regexp '^https://github\.com/cameronsjo/cadence-hooks/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   checksums.txt
 
@@ -101,8 +103,13 @@ sha256sum -c checksums.txt --ignore-missing
 `cosign verify-blob` printing `Verified OK` proves `checksums.txt` was signed by this
 repo's release workflow; `sha256sum -c` then chains that trust to the archive you hold.
 
-> The `--certificate-identity-regexp` above pins the exact workflow path; a looser
-> `'github.com/cameronsjo/cadence-hooks'` also works if you only need to confirm the repo.
+> The `--certificate-identity-regexp` above is anchored and pins the exact workflow
+> file and a release tag. Do not loosen it to the repository name alone: any workflow
+> on any branch of this repo can obtain a Sigstore certificate whose identity contains
+> `github.com/cameronsjo/cadence-hooks`, so a repo-only pattern accepts a signature
+> that no release produced. To pin one release, pass
+> `--certificate-identity 'https://github.com/cameronsjo/cadence-hooks/.github/workflows/release.yml@refs/tags/vX.Y.Z'`
+> instead.
 
 ## Reporting a vulnerability
 
