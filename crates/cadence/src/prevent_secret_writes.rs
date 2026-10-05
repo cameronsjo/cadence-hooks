@@ -1136,6 +1136,43 @@ mod tests {
     }
 
     #[test]
+    fn local_override_dotfile_writes_block_like_npmrc() {
+        // #1288: the shared deny-set covers writes as it does `.npmrc`; the
+        // tracked dotfile stays writable.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (path, expected) in [
+            ("/home/u/.zshrc.local", Block),
+            ("/home/u/.gitconfig.local", Block),
+            ("/home/u/.bash_profile.local", Block),
+            ("/home/u/.zshrc", Allow),
+            ("/home/u/.gitconfig", Allow),
+        ] {
+            let guard = SecretWritesGuard::default();
+            assert_eq!(
+                guard.run(&make_write_input(path)).outcome,
+                expected,
+                "{path}"
+            );
+            let redirect = make_bash_input(&format!("echo x >> {path}"));
+            assert_eq!(guard.run(&redirect).outcome, expected, "{path}");
+        }
+        // #1293 review C1: a dotenv glob with its suffix spelled out is a
+        // write to that file.
+        for command in [
+            "echo x >> .e*.local",
+            "echo x > .e*.production",
+            "cp /tmp/a .e*.local",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn write_suffix_env_blocked() {
         // #854: a Write to `prod.env` was allowed while `.env` blocked, so the
         // gap was on the tool path too, not only the Bash path.
@@ -2684,6 +2721,58 @@ mod tests {
                 cadence_hooks_core::Outcome::Allow,
                 "{command}"
             );
+        }
+    }
+
+    /// A write nested past the expansion depth still reaches the guard
+    /// (#1233 review C1, #1267).
+    #[test]
+    fn a_write_nested_past_the_depth_bound_blocks() {
+        for command in [
+            "cat <(echo $(echo $(echo $(cp d .env))))",
+            "echo $(echo $(echo $(echo $(echo $(cp d .env)))))",
+            "echo $(echo $(echo $(echo `cp d .env`)))",
+            "cat <(cat <(cat <(cat <(cat <(cp d .env)))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(mv d .env))))))))",
+            "echo $(cat <(echo $(echo $(sh -c 'cp d .env'))))",
+            "diff <(git diff) <(echo $(echo $(echo $(eval cp d .env))))",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    /// A process substitution runs its body, so a writer there writes
+    /// (cameronsjo/cadence-hooks#1233). Quoted, it is literal text.
+    #[test]
+    fn a_write_inside_a_process_substitution_blocks() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("true <(mv d .env)", Block),
+            (": <(tee .env < d)", Block),
+            ("cat <(dd if=d of=.env)", Block),
+            ("cat <( cat <(cp d .env) )", Block),
+            ("cat a<(cp d .env)", Block),
+            ("echo $<(cp d .env)", Block),
+            ("echo 2>(cp d .env)", Block),
+            ("echo ${v:-<(cp d .env)}", Block),
+            ("x=<(cp d .env)", Block),
+            ("echo \"$(cat <(cp d .env))\"", Block),
+            ("cat <(cp d .env", Block),
+            ("watch <(cp d .env)", Block),
+            ("tee >(cat > .env)", Block),
+            ("echo \"<(cp d .env)\"", Allow),
+            ("echo '<(cp d .env)'", Allow),
+            ("echo \"${v:-<(cp d .env)}\"", Allow),
+            ("cat <(echo ok) <(sort a)", Allow),
+            ("while read l; do echo $l; done < <(git ls-files)", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command}");
         }
     }
 }

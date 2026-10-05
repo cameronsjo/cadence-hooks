@@ -62,8 +62,8 @@ use cadence_hooks_core::gh_bodies::{
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, gh_command_path, heredoc_introducers,
-    peel_command_runners, redirect_operator_span, skip_git_global_options, split_segments_with_ops,
-    strip_quotes, unescape_word,
+    parse_gh_repo_value, peel_command_runners, redirect_operator_span, skip_git_global_options,
+    split_segments_with_ops, strip_quotes, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 mod context;
@@ -963,6 +963,54 @@ struct RedactionConfig {
     resolve_visibility: bool,
 }
 
+impl RedactionConfig {
+    /// Does this config relax anything: an allowlist, a category ceiling, or
+    /// an `originAudience` below public?
+    fn softens(&self) -> bool {
+        !self.allowlist.is_empty() || !self.categories.is_empty() || self.origin_audience.is_some()
+    }
+
+    /// This config for a post that leaves the checkout it was read from
+    /// (cameronsjo/cadence-hooks#1245): the allowlist, category ceilings and
+    /// `originAudience` describe this repo, not the destination, so they are
+    /// dropped. `additionalPatterns` only add hits, so they stay.
+    fn for_foreign_destination(self) -> Self {
+        RedactionConfig {
+            additional_patterns: self.additional_patterns,
+            ..RedactionConfig::default()
+        }
+    }
+}
+
+/// `config`, read from the checkout at `base_dir`, as it applies to a post
+/// bound for `targets`, plus the destination when this checkout's softening
+/// was dropped because a target is none of its remotes (#1245). `targets` is
+/// only resolved when the config softens anything, so a plain config never
+/// spawns `git` for it.
+fn config_for_targets<'a>(
+    config: RedactionConfig,
+    targets: impl FnOnce() -> &'a [Option<context::Target>],
+    base_dir: &str,
+) -> (RedactionConfig, Option<String>) {
+    if !config.softens() {
+        return (config, None);
+    }
+    match context::foreign_target(targets(), &context::checkout_repos(base_dir)) {
+        Some(dest) => (config.for_foreign_destination(), Some(dest)),
+        None => (config, None),
+    }
+}
+
+/// The note for a scan that dropped this checkout's softening because the
+/// post goes to `dest` (cameronsjo/cadence-hooks#1245).
+fn foreign_destination_note(dest: &str) -> String {
+    format!(
+        "this post goes to {dest}, not this checkout's repo, so this checkout's \
+         .claude/cadence.json redaction allowlist, category ceilings and originAudience \
+         were not applied"
+    )
+}
+
 /// One `categories[<name>]` entry: a per-category ceiling override.
 #[derive(Debug, Deserialize)]
 struct CategoryOverride {
@@ -1127,19 +1175,24 @@ impl Check for RedactExternalContent {
         // the section still applies — one bad `categories` shape no longer
         // silently voids a valid `allowlist` beside it.
         let loaded = load_redaction_config(&base_dir);
-        let config = loaded.config;
+
+        // The post's target repo, resolved at most once and only when a
+        // consumer needs it: a config that softens anything (#1245), a
+        // `destinations`-scoped allow (#630) or a shaped hit the owned-target
+        // downgrade could silence (#684). It spawns `git` for an origin
+        // lookup, so a command with none of these pays nothing.
+        let targets: std::cell::OnceCell<Vec<Option<context::Target>>> = std::cell::OnceCell::new();
+        let targets = || targets.get_or_init(|| context::post_targets(command, &base_dir));
+
+        // A post to another repo (`gh … -R owner/repo`) does not inherit this
+        // checkout's softening (#1245): this repo's allowlist says nothing
+        // about what the destination accepts.
+        let (config, foreign) = config_for_targets(loaded.config, || targets(), &base_dir);
 
         // Phase 3.5 — resolve the destination-tier ordinal once. `CADENCE_AUDIENCE`
         // wins over the config's `originAudience`; both fall back to public.
         let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
         let d = resolve_dest_tier(env_audience.as_deref(), &config);
-
-        // The post's target repo, resolved at most once and only when a
-        // consumer needs it: a `destinations`-scoped allow (#630) or a shaped
-        // hit the owned-target downgrade could silence (#684). It spawns `git`
-        // for an origin lookup, so a command with neither pays nothing.
-        let targets: std::cell::OnceCell<Vec<Option<context::Target>>> = std::cell::OnceCell::new();
-        let targets = || targets.get_or_init(|| context::post_targets(command, &base_dir));
         let destination = if identity_list.uses_destinations() {
             context::shared_destination(targets())
         } else {
@@ -1214,6 +1267,16 @@ impl Check for RedactExternalContent {
                 .and_then(pasted_output_note)
         {
             notes.push(n);
+        }
+        // Say which config applied, but only when there is a finding to read
+        // it against: a clean cross-repo post stays silent.
+        if let Some(dest) = &foreign
+            && !hits.is_empty()
+        {
+            notes.push(format!(
+                "ℹ️  redact-external-content: {}.",
+                foreign_destination_note(dest)
+            ));
         }
 
         // Config warnings ride the nudge channel (exit 0 / stdout → lands in
@@ -1996,6 +2059,20 @@ pub fn run_validate_config() -> u8 {
 
 /// Entry for the `redact-scan` CLI action. Returns the process exit code.
 pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u8 {
+    run_scan_to(file, audience, None, init)
+}
+
+/// [`run_scan`] for a named destination repo (`--repo OWNER/REPO`,
+/// cameronsjo/cadence-hooks#1245). A destination that is none of the current
+/// checkout's remotes is scanned without this checkout's allowlist, category
+/// ceilings and `originAudience`; with no `--repo` the checkout's config
+/// applies as before.
+pub fn run_scan_to(
+    file: Option<String>,
+    audience: Option<String>,
+    repo: Option<String>,
+    init: bool,
+) -> u8 {
     // Audience validates BEFORE the --init branch — deliberate parity with
     // the deleted script (`--init --audience bogus` is a usage error there
     // too), not ordering to "fix".
@@ -2007,6 +2084,19 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
         );
         return 2;
     }
+    let dest = match repo.as_deref().map(|r| (r, parse_gh_repo_value(r))) {
+        None => None,
+        Some((_, Some(spec))) => Some((
+            spec.host
+                .unwrap_or_else(cadence_hooks_core::config::default_host)
+                .to_ascii_lowercase(),
+            format!("{}/{}", spec.owner, spec.name).to_ascii_lowercase(),
+        )),
+        Some((r, None)) => {
+            eprintln!("redact-scan: invalid --repo: {r} (expected OWNER/REPO or HOST/OWNER/REPO)");
+            return 2;
+        }
+    };
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string());
@@ -2071,7 +2161,8 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
             cadence_hooks_core::config::render_config_warnings(&loaded.warnings)
         );
     }
-    let config = loaded.config;
+    let dest: Vec<Option<context::Target>> = dest.into_iter().map(Some).collect();
+    let (config, foreign) = config_for_targets(loaded.config, || &dest, &cwd);
 
     // Destination tier: --audience flag > CADENCE_AUDIENCE env > config
     // originAudience > public — the env fallback keeps the CLI and the hook
@@ -2161,6 +2252,11 @@ pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u
                 eprintln!("[{}]:{lineno}:{}", hit.category, hit.snippet);
             }
         }
+    }
+    if let Some(dest) = &foreign
+        && any
+    {
+        eprintln!("redact-scan: {}", foreign_destination_note(dest));
     }
     if identity_blocks || any { 1 } else { 0 }
 }
@@ -4935,6 +5031,153 @@ destinations = ["me/*", "them/exact"]
                 Outcome::Nudge
             );
         });
+    }
+
+    /// A checkout whose origin is `me/meta` (plus an `upstream` of
+    /// `up/meta`), carrying a redaction config that allow-lists `cadence`.
+    fn softening_checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "https://github.com/me/meta.git"]);
+        git(&["remote", "add", "upstream", "git@github.com:up/meta.git"]);
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            r#"{"version":1,"redaction":{"allowlist":["cadence"]}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn foreign_destination_drops_this_checkouts_softening() {
+        // (command, outcome, message names the dropped config) — run from a
+        // checkout whose allowlist clears `cadence:*` (#1245).
+        let table: &[(&str, Outcome, bool)] = &[
+            // Another repo: the allowlist is not the destination's.
+            (
+                "gh issue comment 1 -R me/tool --body 'see cadence:attune'",
+                Outcome::Nudge,
+                true,
+            ),
+            (
+                "gh issue comment 1 --repo=other/x --body 'see cadence:attune'",
+                Outcome::Nudge,
+                true,
+            ),
+            // This checkout's own repo, by any remote or by default.
+            (
+                "gh issue comment 1 -R me/meta --body 'see cadence:attune'",
+                Outcome::Allow,
+                false,
+            ),
+            (
+                "gh issue comment 1 -R Me/Meta --body 'see cadence:attune'",
+                Outcome::Allow,
+                false,
+            ),
+            (
+                "gh issue comment 1 -R up/meta --body 'see cadence:attune'",
+                Outcome::Allow,
+                false,
+            ),
+            (
+                "gh issue comment 1 --body 'see cadence:attune'",
+                Outcome::Allow,
+                false,
+            ),
+            ("git commit -m 'see cadence:attune'", Outcome::Allow, false),
+            // Unresolved targets keep the checkout's config, as before.
+            (
+                "gh api -X POST repos/me/tool/issues -f body='see cadence:attune'",
+                Outcome::Allow,
+                false,
+            ),
+            // A clean post to another repo says nothing.
+            (
+                "gh issue comment 1 -R me/tool --body 'plain words'",
+                Outcome::Allow,
+                false,
+            ),
+        ];
+        let dir = softening_checkout();
+        with_env(FIXTURE, &[], || {
+            for (cmd, want, names) in table {
+                let r = run_in(cmd, dir.path());
+                assert_eq!(r.outcome, *want, "cmd: {cmd}");
+                let msg = r.message.unwrap_or_default();
+                assert_eq!(
+                    msg.contains("not this checkout's repo"),
+                    *names,
+                    "{cmd}: {msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn config_for_targets_table() {
+        let dh = cadence_hooks_core::config::default_host();
+        let dir = softening_checkout();
+        let base = dir.path().to_str().unwrap();
+        let t = |slug: &str| Some((dh.clone(), slug.to_string()));
+        // (targets, config softens?, expected foreign destination)
+        type Row = (Vec<Option<context::Target>>, bool, Option<&'static str>);
+        let table: Vec<Row> = vec![
+            (vec![t("me/tool")], true, Some("me/tool")),
+            (vec![t("me/meta")], true, None),
+            (vec![t("up/meta")], true, None),
+            (vec![t("me/meta"), t("me/tool")], true, Some("me/tool")),
+            (vec![None], true, None),
+            (vec![], true, None),
+            // A config with nothing to soften is returned untouched.
+            (vec![t("me/tool")], false, None),
+        ];
+        for (targets, softens, want) in table {
+            let config = if softens {
+                RedactionConfig {
+                    allowlist: vec!["cadence".into()],
+                    origin_audience: Some("owned-internal".into()),
+                    additional_patterns: vec![AdditionalPattern {
+                        pattern: "x".into(),
+                        replacement: String::new(),
+                        ceiling: None,
+                    }],
+                    ..Default::default()
+                }
+            } else {
+                RedactionConfig::default()
+            };
+            let (out, foreign) = config_for_targets(config, || &targets, base);
+            assert_eq!(foreign.as_deref(), want, "{targets:?}");
+            if want.is_some() {
+                assert!(!out.softens(), "softening must be dropped: {targets:?}");
+                assert_eq!(out.additional_patterns.len(), 1, "additions stay");
+            } else if softens {
+                assert!(out.softens(), "own repo keeps its config: {targets:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_scan_rejects_a_malformed_repo() {
+        for bad in ["bad", "", "a/b/c/d"] {
+            assert_eq!(
+                run_scan_to(None, None, Some(bad.into()), false),
+                2,
+                "--repo {bad:?}"
+            );
+        }
     }
 
     fn fenced(lines: usize) -> String {

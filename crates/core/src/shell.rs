@@ -4844,12 +4844,27 @@ fn kill_process_group(child: &std::process::Child) {
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
 
+thread_local! {
+    static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many git spawns this thread has attempted through [`run_git_bounded`]
+/// (including ones the shared deadline skipped). Test support, public only
+/// because guard crates' tests call it. Lets a test pin "judged with N probes" without
+/// timing it: a wall-clock bound on a flood fails on a loaded runner with the
+/// guard behaving correctly (cadence-hooks#1228).
+pub fn git_spawn_count() -> usize {
+    GIT_SPAWNS.with(std::cell::Cell::get)
+}
+
 /// Run a prepared git command bounded by the process deadline
 /// ([`crate::deadline`]): armed hook paths share one budget across spawns
 /// (a pre-exhausted budget skips the spawn entirely), unarmed CLI paths cap
 /// each spawn individually, and a disabled deadline runs unbounded.
 pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     use crate::deadline::{self, BudgetState};
+
+    GIT_SPAWNS.with(|n| n.set(n.get() + 1));
 
     let timeout = match deadline::state() {
         BudgetState::Disabled => {
@@ -6498,6 +6513,96 @@ pub(crate) fn subshell_shape(raw: &str) -> (usize, usize) {
     (opens, shape.paren_closes)
 }
 
+/// Whether `script` may hold a `case` construct whose `pattern)` arms a
+/// subshell walk would read as closers: the whole word `case` anywhere in
+/// the script outside comments, and outside quotes when the quoting is
+/// plain enough to read confidently. A quoted `"just in case"` or a
+/// `# in case` comment is not one, which a plain substring test counted
+/// (cameronsjo/cadence-hooks#1233 review).
+///
+/// Heredoc prose counts: the heredoc reader takes the shift in
+/// `(( y=1<<E ))` for an opener, and stripping its "body" hid the only real
+/// `case` (#1266 round-6 review C1). A commit message saying "in case" in a
+/// heredoc turns scoping off, which is the conservative side.
+///
+/// No command-position test: bash takes `case` as a keyword after `f()`,
+/// `function f`, `coproc`, `time -p` and more, and each position the test
+/// missed restored a `cd` scope early (round-4 review C2). An operand such
+/// as `grep case x` counts too, which only turns scoping off — the walk then
+/// lets a subshell's `cd` leak, as it did before scoping existed.
+///
+/// Quotes are honoured only in text with no substitution, ANSI-C or locale
+/// string, or backslash: a flat quote reader misreads `"$(echo 'a"b')"`,
+/// and the phantom quote it opens would hide every later `case`. With any
+/// of those present, a quoted `case` counts as well.
+pub(crate) fn mentions_case_keyword(script: &str) -> bool {
+    if !script.contains("case") {
+        return false;
+    }
+    let text = strip_comments(script);
+    let chars: Vec<char> = text.chars().collect();
+    if !has_case_word(&chars, false) {
+        return false;
+    }
+    let plain = !["$(", "`", "<(", ">(", "$'", "$\"", "\\"]
+        .iter()
+        .any(|syntax| text.contains(syntax));
+    !plain || has_case_word(&chars, true)
+}
+
+/// Whether the whole word `case` appears in `chars`, skipping quoted runs
+/// when `honour_quotes`. A quote still open at the end is a misreading, so
+/// it counts as a `case` there.
+fn has_case_word(chars: &[char], honour_quotes: bool) -> bool {
+    let mut quote: Option<Quote> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if honour_quotes && let Some(next) = scan_quote_syntax(chars, i, &mut quote) {
+            i = next;
+            continue;
+        }
+        if chars[i..].starts_with(&['c', 'a', 's', 'e'])
+            && chars
+                .get(i + 4)
+                .is_none_or(|&c| c.is_whitespace() || c == '\\')
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| chars[p].is_alphanumeric() || chars[p] == '_')
+        {
+            return true;
+        }
+        i += 1;
+    }
+    quote.is_some()
+}
+
+/// The text after each inner `(` a top-level segment leaves open at its end
+/// ([`SegmentShape::inner_open`]), outermost first: `cd /u` for
+/// `echo $(cd /u`. The splitter cut that substitution at a separator inside
+/// it, so this text is a command its subshell runs before the segments that
+/// follow, up to the `)` that closes it (cameronsjo/cadence-hooks#1233).
+///
+/// Each tail ends where the next one's `(` begins, so its command word is
+/// its own and the tails together are no longer than the segment: a flood of
+/// 100 000 unclosed `<(` would otherwise copy the rest of the segment once per
+/// opener.
+pub(crate) fn cut_inner_tails(raw: &str) -> Vec<String> {
+    let mut scratch = Vec::new();
+    let peeled = peel_segment(raw, &mut scratch);
+    let command = peeled.command.unwrap_or("");
+    let starts = segment_shape_reading(command, true).inner_tails;
+    let ends = starts
+        .iter()
+        .skip(1)
+        .map(|&next| next - 1)
+        .chain(std::iter::once(command.len()));
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&at, end)| command[at..end].to_string())
+        .collect()
+}
+
 /// How far a segment opens (positive) or closes (negative) groups — the
 /// depth a function body's definition is recorded by.
 fn group_depth_change(raw: &str) -> isize {
@@ -6596,6 +6701,10 @@ struct SegmentShape {
     /// splitter cut at a `;` inside it. What follows, up to its `)`, runs
     /// in the substitution's subshell.
     inner_open: usize,
+    /// Where the text inside each of those opens begins, as a byte offset
+    /// into the segment, outermost first. Recorded only by
+    /// [`segment_shape_reading`] with tails on; empty otherwise.
+    inner_tails: Vec<usize>,
 }
 
 /// Read [`SegmentShape`] from a segment. Quoted text (`'…'`, `"…"`,
@@ -6605,6 +6714,14 @@ struct SegmentShape {
 /// opens an inner group that its `)` closes; only a `)` left unpaired
 /// closes a subshell.
 fn segment_shape(segment: &str) -> SegmentShape {
+    segment_shape_reading(segment, false)
+}
+
+/// [`segment_shape`], recording [`SegmentShape::inner_tails`] when
+/// `with_tails` is set — off for every per-segment walk, which needs only the
+/// counts and would otherwise allocate once per segment.
+fn segment_shape_reading(segment: &str, with_tails: bool) -> SegmentShape {
+    let mut tails = with_tails.then(Vec::new);
     let mut shape = SegmentShape::default();
     let mut rest = segment.trim_start();
     while let Some(after) = rest.strip_prefix('}') {
@@ -6625,10 +6742,11 @@ fn segment_shape(segment: &str) -> SegmentShape {
             break;
         }
     }
+    let base = segment.len() - rest.len();
     let mut inner = 0usize;
     let mut previous: Option<char> = None;
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = rest.char_indices();
+    while let Some((at, c)) = chars.next() {
         match c {
             '\\' => {
                 chars.next();
@@ -6638,21 +6756,32 @@ fn segment_shape(segment: &str) -> SegmentShape {
             '\'' if previous == Some('$') => skip_quoted(&mut chars, '\'', true),
             '\'' => skip_quoted(&mut chars, '\'', false),
             '"' => skip_quoted(&mut chars, '"', true),
-            '(' => inner += 1,
-            ')' if inner > 0 => inner -= 1,
+            '(' => {
+                inner += 1;
+                if let Some(tails) = tails.as_mut() {
+                    tails.push(base + at + 1);
+                }
+            }
+            ')' if inner > 0 => {
+                inner -= 1;
+                if let Some(tails) = tails.as_mut() {
+                    tails.pop();
+                }
+            }
             ')' => shape.paren_closes += 1,
             _ => {}
         }
         previous = Some(c);
     }
     shape.inner_open = inner;
+    shape.inner_tails = tails.unwrap_or_default();
     shape
 }
 
 /// Advance past a quoted run up to its closing `quote`; `escapes` honors
 /// `\` inside it (`"…"`, `$'…'`). An unterminated quote runs to the end.
-fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char, escapes: bool) {
-    while let Some(c) = chars.next() {
+fn skip_quoted(chars: &mut std::str::CharIndices<'_>, quote: char, escapes: bool) {
+    while let Some((_, c)) = chars.next() {
         if escapes && c == '\\' {
             chars.next();
         } else if c == quote {
@@ -8191,8 +8320,184 @@ pub fn command_segments(command: &str) -> Vec<String> {
     // A command that already carries the mark cannot be told apart from one
     // this walk wrote, so it is expanded without the dedupe at all.
     let dedupe = !command.contains(EXPANDED_MARK);
+    let flatten = FlattenWork::start(command);
     expand_segments(command, &mut assignments, 0, &mut out, dedupe);
+    drop(flatten);
     out
+}
+
+thread_local! {
+    static FREE_LEVELS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    static OPEN_PROCSUB_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set while [`emit_segment`] reads an unclosed `<(`/`>(`'s own body, whose
+/// `$(…)`s the pass through every `<(` has already read; restored on drop.
+struct OpenProcSubRead(bool);
+
+impl OpenProcSubRead {
+    fn active() -> bool {
+        OPEN_PROCSUB_READ.with(std::cell::Cell::get)
+    }
+
+    fn enter() -> Self {
+        Self(OPEN_PROCSUB_READ.with(|flag| flag.replace(true)))
+    }
+
+    /// The `$(…)` bodies that pass reads are fresh text of their own.
+    fn leave() -> Self {
+        Self(OPEN_PROCSUB_READ.with(|flag| flag.replace(false)))
+    }
+}
+
+impl Drop for OpenProcSubRead {
+    fn drop(&mut self) {
+        OPEN_PROCSUB_READ.with(|flag| flag.set(self.0));
+    }
+}
+
+/// One process-substitution level [`emit_segment`] reads without charging
+/// the wrapper depth, held while that body is read. At most
+/// [`MAX_WRAPPER_DEPTH`] are held at once.
+struct FreeLevel;
+
+impl FreeLevel {
+    fn take() -> Option<FreeLevel> {
+        FREE_LEVELS.with(|held| {
+            (held.get() < MAX_WRAPPER_DEPTH).then(|| {
+                held.set(held.get() + 1);
+                FreeLevel
+            })
+        })
+    }
+}
+
+impl Drop for FreeLevel {
+    fn drop(&mut self) {
+        FREE_LEVELS.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+thread_local! {
+    static FLATTEN_WORK: std::cell::RefCell<Option<FlattenWork>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What one [`command_segments`] call lets [`flattened_bodies`] spend,
+/// shared by every segment it lists past the bound: those segments are
+/// overlapping copies of the same text (a widened body is the rest of its
+/// segment, at each level), so an allowance per segment multiplied with
+/// their count. The texts already listed are kept so a copy lists nothing
+/// twice.
+///
+/// Once the allowance is gone the whole `command` is listed by
+/// [`fragments_of`], once: every segment past the bound is a reading of its
+/// text, so its fragments hold every command word those segments could.
+struct FlattenWork {
+    left: usize,
+    listed: std::collections::HashSet<String>,
+    command: Option<String>,
+    /// Each text the pass through every `<(` has read, and the shallowest
+    /// level it was read at: an unclosed `<(`'s readings are near-copies of
+    /// one another, so the same bodies came back once per copy.
+    through: std::collections::HashMap<String, usize>,
+    /// Bytes of body the pass through every `<(` may still expand. Each
+    /// unclosed `<(` in a flood hands it a near-copy of the rest of the
+    /// command, so without a cap of its own it re-read the input a few dozen
+    /// times.
+    through_left: usize,
+}
+
+/// The text [`FlattenWork::first_through_read`] keys a body by: without its
+/// trailing closers and blanks. A widened substitution is read twice, as the
+/// rest of the text and as the text up to its last `)`, and the two differ
+/// only by those closers, which open and run nothing.
+fn through_key(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c == ')' || c.is_whitespace())
+}
+
+/// Restores the enclosing call's [`FlattenWork`] when dropped.
+struct FlattenScope(Option<FlattenWork>);
+
+impl FlattenWork {
+    /// Whether `text` has not yet been read by the pass through every `<(`
+    /// at `depth` or shallower in this call, recording it if not. A read at a
+    /// shallower level expands at least as much, so a repeat adds nothing.
+    fn first_through_read(text: &str, depth: usize) -> bool {
+        let text = through_key(text);
+        FLATTEN_WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            let Some(work) = work.as_mut() else {
+                return true;
+            };
+            match work.through.get_mut(text) {
+                Some(seen) if *seen <= depth => false,
+                Some(seen) => {
+                    *seen = depth;
+                    true
+                }
+                None => {
+                    work.through.insert(text.to_string(), depth);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Whether the pass through every `<(` has read `text` at `depth` or
+    /// shallower in this call.
+    fn through_read_by(text: &str, depth: usize) -> bool {
+        let text = through_key(text);
+        FLATTEN_WORK.with(|work| {
+            work.borrow()
+                .as_ref()
+                .and_then(|work| work.through.get(text))
+                .is_some_and(|&seen| seen <= depth)
+        })
+    }
+
+    /// Spend `n` bytes of the pass-through allowance; `false` once it cannot
+    /// cover them. Outside [`command_segments`] there is no allowance.
+    fn charge_through(n: usize) -> bool {
+        FLATTEN_WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            let Some(work) = work.as_mut() else {
+                return true;
+            };
+            match work.through_left.checked_sub(n) {
+                Some(rest) => {
+                    work.through_left = rest;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    fn start(command: &str) -> FlattenScope {
+        let fresh = FlattenWork {
+            left: FLATTEN_WORK_FACTOR
+                .saturating_mul(command.len())
+                .saturating_add(FLATTEN_WORK_FLOOR),
+            listed: std::collections::HashSet::new(),
+            command: Some(command.to_string()),
+            through: std::collections::HashMap::new(),
+            through_left: THROUGH_WORK_FACTOR
+                .saturating_mul(command.len())
+                .saturating_add(FLATTEN_WORK_FLOOR),
+        };
+        FlattenScope(FLATTEN_WORK.with(|work| work.replace(Some(fresh))))
+    }
+}
+
+impl Drop for FlattenScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        FLATTEN_WORK.with(|work| *work.borrow_mut() = previous);
+    }
 }
 
 /// The other readings of `script` as ONE script, for a walker that keeps the
@@ -8291,6 +8596,17 @@ impl ExpansionWork {
                 }
             },
         })
+    }
+
+    /// Mark an armed allowance spent: a reader stopped with text unread for
+    /// a reason of its own. Unarmed, nothing changes.
+    fn exhaust() {
+        EXPANSION_WORK_LEFT.with(|left| {
+            if left.get().is_some() {
+                left.set(Some(0));
+                EXPANSION_WORK_SPENT.with(|spent| spent.set(true));
+            }
+        });
     }
 
     /// Whether an armed allowance ran out, leaving part of a command unread.
@@ -8638,14 +8954,103 @@ fn emit_segment(
     // expanded there. The tagged copy is also the worse one: the word it
     // came from lost its quotes to [`tokenize`], and it sits one level deeper
     // with less depth budget.
+    //
+    // **A process substitution's body is read at this segment's depth.**
+    // Before `<(…)`/`>(…)` bodies were surfaced (cameronsjo/cadence-hooks#1233)
+    // their text sat in this segment, and every `$(…)` inside was expanded
+    // at the level its own nesting put it; charging a level for the `<(`
+    // pushed a third `$(…)` inside one past the bound, where it is listed
+    // but not read (#1266 review C2). The free levels are capped at
+    // [`MAX_WRAPPER_DEPTH`] held at once, so a flood of nested `<(` still
+    // ends; past them the `$(…)`s inside are read through every `<(` in one
+    // pass, at the level they had before.
     if depth < MAX_WRAPPER_DEPTH {
-        for body in substitution_bodies(&segment) {
+        for (body, kind) in substitution_bodies_kinded(&segment) {
             if dedupe && body.starts_with(EXPANDED_MARK) {
+                continue;
+            }
+            // Inside an unclosed `<(`'s own reading, a `$(…)` the pass
+            // through every `<(` already read one level up is the same text
+            // again, one level deeper: reading it twice doubled a flood.
+            if kind == BodyKind::Plain
+                && OpenProcSubRead::active()
+                && FlattenWork::through_read_by(&body, depth + 1)
+            {
                 continue;
             }
             // A substitution is its own subshell too — a child scope.
             let mut scope = assignments.child();
-            expand_segments(&body, &mut scope, depth + 1, out, dedupe);
+            let free = (kind == BodyKind::ProcSub).then(FreeLevel::take).flatten();
+            match free {
+                Some(_level) => expand_segments(&body, &mut scope, depth, out, dedupe),
+                None => {
+                    // Inside an unclosed `<(`'s own reading, every `$(…)` it
+                    // holds was already read by the pass below at a
+                    // shallower level; a nested unclosed `<(` there repeats
+                    // that pass on most of the same text, once per level.
+                    let through = match kind {
+                        BodyKind::Plain => false,
+                        BodyKind::ProcSub => true,
+                        BodyKind::OpenProcSub => !OpenProcSubRead::active(),
+                    };
+                    // Past the free levels a nested `<(` spends one, so the
+                    // `$(…)`s inside are also read where they sat before
+                    // bodies were surfaced: one pass through every `<(` to
+                    // them, each read at this segment's next level.
+                    let mut read_tail: Option<usize> = None;
+                    if through
+                        && FlattenWork::first_through_read(&body, depth)
+                        && ExpansionWork::charge(body.len())
+                    {
+                        let _fresh = OpenProcSubRead::leave();
+                        for inner in substitution_bodies_through_procsubs(&body) {
+                            if dedupe && inner.starts_with(EXPANDED_MARK) {
+                                continue;
+                            }
+                            if FlattenWork::first_through_read(&inner, depth + 1) {
+                                if !FlattenWork::charge_through(inner.len()) {
+                                    // Past the allowance the body is still
+                                    // listed as written, not evaluated; a
+                                    // guard that arms the expansion
+                                    // allowance refuses.
+                                    ExpansionWork::exhaust();
+                                    break;
+                                }
+                                let mut scope = assignments.child();
+                                expand_segments(&inner, &mut scope, depth + 1, out, dedupe);
+                            }
+                            // Read now, or already at this level or above.
+                            if kind == BodyKind::OpenProcSub
+                                && inner.len() > read_tail.unwrap_or(0)
+                                && open_tail_of(&body, &inner)
+                            {
+                                read_tail = Some(inner.len());
+                            }
+                        }
+                    }
+                    // The body itself is read after that pass, so the
+                    // `$(…)`s inside it that the pass already read one level
+                    // shallower are skipped there rather than read twice.
+                    //
+                    // A `$(` the pass read that nothing in the body can close
+                    // (no `)` follows it) runs to the body's end, so that
+                    // whole tail is the reading the pass just read: the body
+                    // is read without it rather than as one more copy of a
+                    // flood. Text after a `)` is never cut — a substitution
+                    // the scanner only gave up on (its depth cap) may close
+                    // there, and what follows is then the body's own words.
+                    // An unclosed substitution is never evaluated into the
+                    // words around it, so the cut changes no reading of them.
+                    {
+                        let _open = (kind == BodyKind::OpenProcSub).then(OpenProcSubRead::enter);
+                        let body = match read_tail {
+                            Some(len) => &body[..body.len() - len - 2],
+                            None => body.as_str(),
+                        };
+                        expand_segments(body, &mut scope, depth + 1, out, dedupe);
+                    }
+                }
+            }
         }
     }
     //
@@ -8680,10 +9085,22 @@ fn emit_segment(
     // sees the command one level further in (cameronsjo/cadence-hooks#1226
     // review: a fourth `git bisect run` hid `rm .env` from every
     // segment-based guard).
+    //
+    // The substitutions it runs past the bound are listed the same way, at
+    // every nesting level ([`flattened_bodies`]): a `$(…)` that sat one level
+    // too deep reached no guard as a command, so a fourth nested `$(…)`, or a
+    // third inside a `<(…)`, hid `git reset --hard` (cameronsjo/cadence-hooks#1267,
+    // #1233 review).
     let unread = if depth < MAX_WRAPPER_DEPTH {
         Vec::new()
     } else {
-        scripts_past_the_bound(&segment)
+        let mut unread = flattened_bodies(&segment, dedupe);
+        for script in scripts_past_the_bound(&segment) {
+            let inner = flattened_bodies(&script, dedupe);
+            unread.push(script);
+            unread.extend(inner);
+        }
+        unread
     };
     out.push(unmark(segment));
     out.extend(whole);
@@ -8710,6 +9127,259 @@ fn scripts_past_the_bound(segment: &str) -> Vec<String> {
         } else {
             out.push(unmark(script));
         }
+    }
+    out
+}
+
+/// Char steps [`flattened_bodies`] may spend per char of its input, and the
+/// floor under that, before it stops reading deeper levels.
+const FLATTEN_WORK_FACTOR: usize = 2;
+const FLATTEN_WORK_FLOOR: usize = 1 << 16;
+
+/// Bytes of body the pass through every `<(` in [`emit_segment`] may expand
+/// per byte of the command, over [`FLATTEN_WORK_FLOOR`]: room for the one
+/// pass a real command needs, with its widened readings.
+const THROUGH_WORK_FACTOR: usize = 4;
+
+/// Every substitution body in `segment`, at every nesting level, each read
+/// with the substitutions nested in it collapsed to their bare opener
+/// (`echo $(git push $(x) main)` gives `git push $() main` and `x`), split
+/// into segments as written — what [`emit_segment`] lists past
+/// [`MAX_WRAPPER_DEPTH`] in place of expanding them.
+///
+/// A wrapper script in a listed segment (`bash -c`, `eval`, every
+/// [`wrapped_scripts`] runner) is read the same way, its segments listed and
+/// its own bodies and wrappers followed.
+///
+/// **Listed, not read.** Past the bound a body is text as written: no
+/// literal substitution is evaluated, no variable resolved, no glob
+/// expanded, so `git $(echo) reset --hard` nested four deep stays
+/// `git $() reset --hard` and is not recognized as `git reset --hard` (the
+/// #1266 review's residual, which main misses too).
+///
+/// Each char of `segment` lands in the text of exactly one level, so the
+/// output is no longer than the input however deep the nesting goes (the
+/// widening arms' extra readings aside); expanding each level whole instead
+/// repeated every inner level once per level above it. With `dedupe`, a
+/// body tagged [`EXPANDED_MARK`] was expanded by the segment this one's
+/// script came from, and is skipped.
+///
+/// The walk is charged to [`ExpansionWork`] and to the enclosing
+/// [`command_segments`] call's [`FlattenWork`] — [`FLATTEN_WORK_FACTOR`]
+/// steps per char of the whole command. Out of either, the levels not yet
+/// read are listed by [`fragments_of`] instead, and an armed caller sees
+/// [`ExpansionWork::spent`] and refuses. A text already listed in the same
+/// call is not listed again.
+fn flattened_bodies(segment: &str, dedupe: bool) -> Vec<String> {
+    if !runs_commands(segment) {
+        return Vec::new();
+    }
+    let _scope = FLATTEN_WORK
+        .with(|work| work.borrow().is_none())
+        .then(|| FlattenWork::start(segment));
+    FLATTEN_WORK.with(|work| {
+        let mut work = work.borrow_mut();
+        let work = work.as_mut().expect("started above");
+        let mut out = Vec::new();
+        // Texts still to read: the segment, then each wrapper script found in
+        // a listed level that runs substitutions of its own.
+        let mut texts = std::collections::VecDeque::from([(segment.to_string(), dedupe)]);
+        let mut exhausted = false;
+        while let Some((text, dedupe)) = texts.pop_front() {
+            if !flatten_text(work, &text, dedupe, &mut out, &mut texts) {
+                exhausted = true;
+                break;
+            }
+        }
+        if exhausted {
+            ExpansionWork::exhaust();
+            if let Some(command) = work.command.take() {
+                let whole: Vec<char> = command.chars().collect();
+                for fragment in fragments_of(&whole, [(0, whole.len())]) {
+                    list_unwrapped(work, fragment, &mut out);
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Most nested wrapper scripts [`list_unwrapped`] reads out of one
+/// fragment once the allowance is gone.
+const MAX_FALLBACK_UNWRAP: usize = 8;
+
+/// The fallback reading of one fragment: its own segments, always listed,
+/// then the segments of every script they run through a wrapper, nested up
+/// to [`MAX_FALLBACK_UNWRAP`] deep while those levels stay within twice the
+/// fragment's own length. An `eval eval …` chain peels one word per level,
+/// each level a near-full copy, so the levels need a cap; each fragment has
+/// its own, so one flood cannot spend the share of a command after it
+/// (#1266 review C1).
+fn list_unwrapped(work: &mut FlattenWork, fragment: String, out: &mut Vec<String>) {
+    let cap = 2 * fragment.len();
+    let mut spent = 0;
+    let mut level = vec![fragment];
+    for unwrapped in 0..=MAX_FALLBACK_UNWRAP {
+        if unwrapped > 0 {
+            spent += level.iter().map(String::len).sum::<usize>();
+            if spent > cap {
+                break;
+            }
+        }
+        let mut next = Vec::new();
+        for text in level {
+            for segment in split_segments(&text).into_iter().map(unmark) {
+                if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
+                    continue;
+                }
+                next.extend(wrapped_scripts(&executable_tokens(&segment)));
+                out.push(segment);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+}
+
+/// List the segments of `text` not listed yet in this call. With `unwrap`,
+/// each one's wrapper scripts (`bash -c`, `eval`, every [`wrapped_scripts`]
+/// runner) are listed too, one level, as [`scripts_past_the_bound`] lists
+/// the scripts of the segment at the bound (#1266 review), and a script that
+/// runs substitutions is queued on `texts` for its own levels.
+///
+/// One level only: an `eval eval …` chain peels one word per level, each
+/// level a near-full copy that every guard then reads again. A wrapper
+/// nested in a wrapper is followed by the ordinary walk wherever it sits
+/// above the bound, which is where `<(…)` bodies no longer spend a level.
+fn list_level(
+    work: &mut FlattenWork,
+    text: &str,
+    unwrap: bool,
+    out: &mut Vec<String>,
+    mut texts: Option<&mut std::collections::VecDeque<(String, bool)>>,
+) {
+    for segment in split_segments(text).into_iter().map(unmark) {
+        if segment.trim().is_empty() || !work.listed.insert(segment.clone()) {
+            continue;
+        }
+        let scripts = if unwrap {
+            wrapped_scripts(&executable_tokens(&segment))
+        } else {
+            Vec::new()
+        };
+        out.push(segment);
+        for script in scripts {
+            list_level(work, &script, false, out, None);
+            if let Some(texts) = texts.as_deref_mut()
+                && runs_commands(&script)
+            {
+                texts.push_back((script, false));
+            }
+        }
+    }
+}
+
+/// One text of [`flattened_bodies`]: every body level in it, collapsed and
+/// listed through [`list_level`]. `false` when the allowance ran out before
+/// the text was read.
+fn flatten_text(
+    work: &mut FlattenWork,
+    text: &str,
+    dedupe: bool,
+    out: &mut Vec<String>,
+    texts: &mut std::collections::VecDeque<(String, bool)>,
+) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > work.left || !ExpansionWork::charge(chars.len()) {
+        return false;
+    }
+    work.left -= chars.len();
+    let mut pending = std::collections::VecDeque::new();
+    let mut top = BodyRanges::default();
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), Some(&mut top), None, true);
+    pending.extend(
+        top.bodies
+            .into_iter()
+            .filter(|&(start, _)| !(dedupe && chars.get(start) == Some(&EXPANDED_MARK))),
+    );
+    while let Some((start, end)) = pending.pop_front() {
+        if start >= end {
+            continue;
+        }
+        let len = end - start;
+        if len > work.left || !ExpansionWork::charge(len) {
+            return false;
+        }
+        work.left -= len;
+        let body = &chars[start..end];
+        let mut ranges = BodyRanges::default();
+        scan_substitution_bodies_in(body, &mut Vec::new(), Some(&mut ranges), None, true);
+        let mut collapsed = String::with_capacity(len);
+        let mut at = 0;
+        for &(from, to) in &ranges.hidden {
+            if from >= at {
+                collapsed.extend(&body[at..from]);
+                at = to;
+            }
+        }
+        if at < body.len() {
+            collapsed.extend(&body[at..]);
+        }
+        list_level(work, &collapsed, true, out, Some(texts));
+        pending.extend(
+            ranges
+                .bodies
+                .into_iter()
+                .map(|(from, to)| (start + from, start + to)),
+        );
+    }
+    true
+}
+
+/// The text of `ranges` of `chars`, overlaps merged, cut at every
+/// substitution opener and closer with no regard to quoting, as segments:
+/// the reading [`flattened_bodies`] falls back to once its allowance is gone.
+/// Linear in the text however the ranges nest, and every command word in it
+/// lands at the head of some fragment, so a command nested past what the
+/// allowance could read is still listed on its own — with fewer operands,
+/// and alongside text that is not a command at all, which only adds reading.
+fn fragments_of(chars: &[char], ranges: impl IntoIterator<Item = (usize, usize)>) -> Vec<String> {
+    let mut ranges: Vec<(usize, usize)> = ranges.into_iter().collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = Vec::new();
+    for (start, end) in merged {
+        let mut piece = String::new();
+        let mut flush = |piece: &mut String| {
+            out.extend(
+                split_segments(piece)
+                    .into_iter()
+                    .map(unmark)
+                    .filter(|segment| !segment.trim().is_empty()),
+            );
+            piece.clear();
+        };
+        let mut i = start;
+        while i < end {
+            let c = chars[i];
+            let opener = matches!(c, '$' | '<' | '>') && chars.get(i + 1) == Some(&'(');
+            if opener || c == '`' || c == ')' {
+                flush(&mut piece);
+                i += if opener { 2 } else { 1 };
+                continue;
+            }
+            piece.push(c);
+            i += 1;
+        }
+        flush(&mut piece);
     }
     out
 }
@@ -8764,7 +9434,7 @@ fn unmark(text: String) -> String {
 fn is_only_an_expanded_substitution(script: &str) -> bool {
     let chars: Vec<char> = script.trim().chars().collect();
     match chars.as_slice() {
-        ['$', '(', EXPANDED_MARK, ..] => {
+        ['$' | '<' | '>', '(', EXPANDED_MARK, ..] => {
             matches!(scan_substitution_body(&chars, 2, true), Ok((_, end)) if end == chars.len())
         }
         ['`', EXPANDED_MARK, rest @ ..] => {
@@ -8776,7 +9446,8 @@ fn is_only_an_expanded_substitution(script: &str) -> bool {
 
 /// Scripts a single segment will itself execute in a child shell context: a
 /// `sh`/`bash`/`zsh`/`dash` `-c <script>` wrapper's script AND any
-/// `$(…)`/backtick substitution bodies in executed context. Both can coexist —
+/// `$(…)`/backtick substitution bodies in executed context, and any unquoted
+/// `<(…)`/`>(…)` process substitution body (cameronsjo/cadence-hooks#1233). Both can coexist —
 /// `bash -c 'true' "$(git commit)"` runs the substitution in the parent before
 /// spawning bash — so the two are unioned rather than either/or (guardrails
 /// issue cameronsjo/cadence-hooks#228, review finding 2).
@@ -10077,6 +10748,8 @@ fn quoted_substitution_bound(chars: &[char], i: usize) -> SubstBound {
 /// parens and quoting) and `` `…` `` backticks, in executed context only.
 /// Single quotes suppress; double quotes do not. A backslash escapes the next
 /// char outside single quotes, so `\$(` and an escaped backtick are literal.
+/// Unquoted process substitutions `<(…)` and `>(…)` are read like `$(…)`;
+/// double quotes suppress those (cameronsjo/cadence-hooks#1233).
 ///
 /// Backticks deliberately get NO quote tracking for where the span CLOSES —
 /// bash truncates a backtick span at the first unescaped backtick even inside
@@ -10090,6 +10763,44 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     scan_substitution_bodies(segment, &mut Vec::new())
 }
 
+/// What opened a body [`substitution_bodies_kinded`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyKind {
+    /// A `$(…)` or a backtick span, closed or widened.
+    Plain,
+    /// A closed `<(…)`/`>(…)`.
+    ProcSub,
+    /// A reading of a `<(`/`>(` the scan found no terminator for.
+    OpenProcSub,
+}
+
+/// [`substitution_bodies`], each paired with what opened it.
+fn substitution_bodies_kinded(segment: &str) -> Vec<(String, BodyKind)> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut kinds = Vec::new();
+    let bodies = scan_substitution_bodies_in(&chars, &mut Vec::new(), None, Some(&mut kinds), true);
+    bodies.into_iter().zip(kinds).collect()
+}
+
+/// Whether `inner` is the reading of a `$(` in `body` that nothing after it
+/// can close: `body` ends `$(` + `inner`, and `inner` holds no `)`.
+fn open_tail_of(body: &str, inner: &str) -> bool {
+    !inner.is_empty()
+        && !inner.contains(')')
+        && body.len() >= inner.len() + 2
+        && body.ends_with(inner)
+        && body[..body.len() - inner.len()].ends_with("$(")
+}
+
+/// The `$(…)` and backtick bodies of `text` with every `<(…)`/`>(…)` in it
+/// read as plain text, however deeply nested: what the scan found before
+/// process substitutions opened bodies of their own. One pass, not one per
+/// nesting level.
+fn substitution_bodies_through_procsubs(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    scan_substitution_bodies_in(&chars, &mut Vec::new(), None, None, false)
+}
+
 /// [`substitution_bodies`], also recording in `starts` the char index where
 /// each CONFIDENTLY bounded body begins — a terminated `$(…)`, or a closed
 /// backtick span whose own quoting resolved — when the body holds no
@@ -10098,6 +10809,41 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
 /// keyed on `starts` treats every one of them as unknown.
 fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
+    scan_substitution_bodies_in(&chars, starts, None, None, true)
+}
+
+/// Where [`scan_substitution_bodies_in`] found each body, as char ranges of
+/// the text it scanned: for [`flattened_bodies`], which walks every nesting
+/// level of one text without copying it.
+#[derive(Default)]
+struct BodyRanges {
+    /// Each span the scan emitted as a body — the widening arms' extra
+    /// readings included — to be read again as the commands it holds.
+    bodies: Vec<(usize, usize)>,
+    /// The spans a substitution occupies in the text that holds it, in text
+    /// order and disjoint: what that text reads as without them.
+    hidden: Vec<(usize, usize)>,
+}
+
+/// [`scan_substitution_bodies`] over `chars`, also recording each body's
+/// range in `ranges` when asked. Without `procsub_opens`, a `<(`/`>(` opens
+/// no body: its text is read as part of the surrounding text, so the `$(…)`s
+/// and backticks inside it are bodies of this text.
+fn scan_substitution_bodies_in(
+    chars: &[char],
+    starts: &mut Vec<usize>,
+    mut ranges: Option<&mut BodyRanges>,
+    mut kinds: Option<&mut Vec<BodyKind>>,
+    procsub_opens: bool,
+) -> Vec<String> {
+    let mut record = |body: (usize, usize), hidden: bool| {
+        if let Some(ranges) = ranges.as_deref_mut() {
+            ranges.bodies.push(body);
+            if hidden {
+                ranges.hidden.push(body);
+            }
+        }
+    };
     let mut bodies = Vec::new();
     let mut i = 0;
     let mut quote: Option<Quote> = None;
@@ -10113,7 +10859,7 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
         // and `tokenize` use, so the three cannot drift on where a quoted run
         // ends.
         if matches!(quote, Some(Quote::Single | Quote::AnsiC))
-            && let Some(next) = scan_quote_syntax(&chars, i, &mut quote)
+            && let Some(next) = scan_quote_syntax(chars, i, &mut quote)
         {
             i = next;
             continue;
@@ -10132,13 +10878,34 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
         // `$(` … `)` with paren-depth AND quote tracking. `$(< file)` keeps
         // its `<`. Reached in executed context only — unquoted or inside double
         // quotes, both of which run the substitution.
-        if c == '$' && chars.get(i + 1) == Some(&'(') {
-            if let Ok((body, end)) = scan_substitution_body(&chars, i + 2, true) {
+        //
+        // A process substitution `<(` … `)` / `>(` … `)` runs its body the
+        // same way, in a subshell started from the parent's directory, and
+        // bash parses the body with the same reader, so it takes this arm
+        // (cameronsjo/cadence-hooks#1233). Unquoted only: inside `"…"` it is
+        // literal text (`echo "<(x)"` prints `<(x)`), where a `$(` still runs.
+        // Anywhere else in a word it opens one — `a<(x)`, `$<(x)`, `2>(x)`,
+        // `${v:-<(x)}` and `x=<(y)` all run their bodies in bash 5.2 — so no
+        // word-start test narrows it. Inside `(( … ))` arithmetic `<(` is a
+        // comparison, which this reads as a body anyway: that surfaces more
+        // than bash runs, never less.
+        let opens = c == '$' || (procsub_opens && quote.is_none() && matches!(c, '<' | '>'));
+        if opens && chars.get(i + 1) == Some(&'(') {
+            if let Ok((body, end)) = scan_substitution_body(chars, i + 2, true) {
+                record((i + 2, end - 1), true);
                 if !body.trim().is_empty() {
                     if !body.contains('\\') {
                         starts.push(i + 2);
                     }
                     bodies.push(body);
+                }
+                if let Some(kinds) = kinds.as_deref_mut() {
+                    let kind = if c == '$' {
+                        BodyKind::Plain
+                    } else {
+                        BodyKind::ProcSub
+                    };
+                    kinds.resize(bodies.len(), kind);
                 }
                 i = end;
                 continue;
@@ -10165,12 +10932,40 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
             // tail downstream — it is the quote-blind reading plus its post-`)`
             // text that actually surfaces the hidden command. Both are emitted
             // for completeness; do not assume the quote-aware one is load-bearing.
-            push_nonblank(&mut bodies, &chars[i + 2..]);
-            if let Ok((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
+            let blind = scan_substitution_body(chars, i + 2, false);
+            // When the quote-blind reading closes on the text's last char,
+            // the quote-aware one is that same text plus its `)`: a copy
+            // that holds no other command, and every nested level of a
+            // closed-but-deep flood made one.
+            if !matches!(blind, Ok((_, end)) if end == chars.len()) {
+                push_nonblank(&mut bodies, &chars[i + 2..]);
+            }
+            record((i + 2, chars.len()), true);
+            if let Ok((blind_body, blind_end)) = blind {
                 if !blind_body.trim().is_empty() {
                     bodies.push(blind_body);
                 }
                 push_nonblank(&mut bodies, &chars[blind_end..]);
+                record((i + 2, blind_end - 1), false);
+                record((blind_end, chars.len()), false);
+            }
+            // A widened reading is not a body bash bounds the same way, and
+            // each is most of the text again: it spends a level like any
+            // other, or free levels would multiply the copies — an unclosed
+            // `<(eval ` flood took most of the hook deadline that way. One
+            // opened by a `<(`/`>(` is still a process substitution to bash
+            // (typically the splitter cut it at a `;` or newline inside it),
+            // so the `$(…)`s inside it are also read at the level they had
+            // before its body was surfaced: charging the level alone pushed
+            // a `$(…)` behind three unclosed `<(` past the bound, where it
+            // was listed but never read (#1266 round-4 review C1).
+            if let Some(kinds) = kinds.as_deref_mut() {
+                let kind = if c == '$' {
+                    BodyKind::Plain
+                } else {
+                    BodyKind::OpenProcSub
+                };
+                kinds.resize(bodies.len(), kind);
             }
             break;
         }
@@ -10186,6 +10981,7 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
                 body.push(chars[j]);
                 j += 1;
             }
+            record((i + 1, j.min(chars.len())), true);
             let quoting_unterminated =
                 j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]);
             let confident = j < chars.len() && !quoting_unterminated;
@@ -10209,8 +11005,12 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
             // any substitution inside it surfaces when that body is itself
             // re-scanned, and continuing the outer loop here would re-walk —
             // and could double-emit — the same text char by char.
+            if let Some(kinds) = kinds.as_deref_mut() {
+                kinds.resize(bodies.len(), BodyKind::Plain);
+            }
             if quoting_unterminated {
                 push_nonblank(&mut bodies, &chars[j + 1..]);
+                record((j + 1, chars.len()), false);
                 break;
             }
             i = j + 1;
@@ -10220,11 +11020,14 @@ fn scan_substitution_bodies(segment: &str, starts: &mut Vec<usize>) -> Vec<Strin
         // current double quote, or consume an outside-quotes escape; otherwise
         // step one char. Inside double quotes this keeps `$(`/backtick
         // detection live while still tracking the closing `"`.
-        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+        if let Some(next) = scan_quote_syntax(chars, i, &mut quote) {
             i = next;
             continue;
         }
         i += 1;
+    }
+    if let Some(kinds) = kinds {
+        kinds.resize(bodies.len(), BodyKind::Plain);
     }
     bodies
 }
@@ -19544,6 +20347,448 @@ mod tests {
         );
     }
 
+    // --- process substitution (cameronsjo/cadence-hooks#1233)
+
+    /// An unquoted `<(…)`/`>(…)` runs its body, so the body is a segment of
+    /// its own. Every row was run through bash 5.2 with a harmless body:
+    /// each prints `/dev/fd/63` (or glues it into the word) and runs the
+    /// body. Rows are `(command, a segment it must surface)`.
+    #[test]
+    fn command_segments_surfaces_process_substitution_bodies() {
+        for (command, want) in [
+            ("true <(mv d .env)", "mv d .env"),
+            (": <(tee .env < d)", "tee .env < d"),
+            ("cat <(dd if=d of=.env)", "dd if=d of=.env"),
+            ("tee >(cat > .env)", "cat > .env"),
+            ("echo hi > >(cat > .env)", "cat > .env"),
+            ("cat <( cat <(cp d .env) )", "cp d .env"),
+            ("cat <(cat <(cat <(cp d .env)))", "cp d .env"),
+            // Glued into a word, after `$` or a digit, inside an unquoted
+            // `${…}` default, as an assignment value, and in `[[ … ]]`.
+            ("cat a<(cp d .env)", "cp d .env"),
+            ("cat <(cp d .env)b", "cp d .env"),
+            ("echo $<(cp d .env)", "cp d .env"),
+            ("echo 2>(cp d .env)", "cp d .env"),
+            ("echo ${v:-<(cp d .env)}", "cp d .env"),
+            ("x=<(cp d .env)", "cp d .env"),
+            ("[[ -e <(cp d .env) ]]", "cp d .env"),
+            ("for f in <(cp d .env); do cat $f; done", "cp d .env"),
+            // Inside a substitution that bash re-parses.
+            ("echo \"$(cat <(cp d .env))\"", "cp d .env"),
+            ("echo `cat <(cp d .env)`", "cp d .env"),
+            ("bash -c 'cat <(cp d .env)'", "cp d .env"),
+            ("bash -c \"cat <(cp d .env)\"", "cp d .env"),
+            // A quoted `)` does not end the body. The splitter cuts at a `;`
+            // inside it, as it cuts a `$(…)`, and the tail keeps the `)`.
+            ("cat <(echo ')' x; cp d .env)", "cp d .env)"),
+            ("cat <(echo \")\" x) .env", "echo \")\" x"),
+            // Unterminated (bash rejects it): the rest is kept, not dropped.
+            ("cat <(cp d .env", "cp d .env"),
+            ("cat <(cat <(cp d .env", "cp d .env"),
+            // A wrapper's argument is a path, and the body still runs.
+            ("watch <(cp d .env)", "cp d .env"),
+            ("diff <(git push origin main) x", "git push origin main"),
+        ] {
+            let out = command_segments(command);
+            assert!(
+                out.iter().any(|s| s == want),
+                "{command:?} surfaced no {want:?}: {out:?}"
+            );
+        }
+    }
+
+    /// `n` levels of `open … close` around `inner`, each level an `echo`.
+    fn nest(open: &str, close: &str, n: usize, inner: &str) -> String {
+        format!(
+            "{}{inner}{}",
+            format!("echo {open}").repeat(n),
+            close.repeat(n)
+        )
+    }
+
+    /// A command nested past [`MAX_WRAPPER_DEPTH`] is still a segment of its
+    /// own, whatever mix of `$(…)`, `<(…)`, `>(…)` and backticks holds it
+    /// (cameronsjo/cadence-hooks#1267, and the #1233 review: a `<(…)` spent a
+    /// level, pushing a third `$(…)` inside it past the bound).
+    #[test]
+    fn command_segments_surfaces_a_command_nested_past_the_depth_bound() {
+        for inner in ["git reset --hard", "cp d .env", "git push origin main"] {
+            for depth in 4..=8 {
+                for (open, close) in [("$(", ")"), ("<(", ")"), (">(", ")")] {
+                    let command = nest(open, close, depth, inner);
+                    let out = command_segments(&command);
+                    assert!(out.iter().any(|s| s == inner), "{command:?}: {out:?}");
+                }
+                // Mixed openers, and a backtick at the innermost level.
+                let mixed = format!(
+                    "cat <({})",
+                    nest("$(", ")", depth - 1, &format!("echo `{inner}`"))
+                );
+                let out = command_segments(&mixed);
+                assert!(out.iter().any(|s| s == inner), "{mixed:?}: {out:?}");
+            }
+        }
+        for command in [
+            "cat <(echo $(echo $(echo $(git reset --hard))))",
+            "diff <(git diff) <(echo $(echo $(echo $(git reset --hard))))",
+            "echo $(echo $(cat <(echo $(git reset --hard))))",
+            "x=$(cat <(echo $(echo $(git reset --hard))))",
+            "(( 1<(2+$(echo $(echo $(git reset --hard)))) ))",
+            "bash -c 'echo $(echo $(echo $(echo $(git reset --hard))))'",
+            // A wrapper past the bound is unwrapped too (#1266 review).
+            "cat <(echo $(echo $(echo $(bash -c 'git reset --hard'))))",
+            "echo \"$(true >(true >(echo $(eval 'git reset --hard'))))\"",
+            "diff <(git diff) <(echo $(echo $(echo $(eval git reset --hard))))",
+            "true >(echo \"$(echo $(sh -c 'sh -c '\"'\"'git reset --hard'\"'\"''))\")",
+            "x=$(true >(echo \"$(sh -c 'bash -c '\"'\"'git reset --hard'\"'\"'')\"))",
+            "cat <(echo $(echo $(echo $(xargs sh -c 'git reset --hard'))))",
+        ] {
+            let out = command_segments(command);
+            assert!(
+                out.iter().any(|s| s == "git reset --hard"),
+                "{command:?}: {out:?}"
+            );
+        }
+    }
+
+    /// A process substitution does not spend a level, so the `$(…)`s inside
+    /// one are read where they were before its body was surfaced: a literal
+    /// substitution three levels in is evaluated (#1266 review C2).
+    #[test]
+    fn a_process_substitution_body_is_read_at_its_parent_s_depth() {
+        for (command, want) in [
+            (
+                "cat <(echo $(echo $(echo $(git $(echo reset) --hard))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(echo $(echo $(echo $(git `echo reset` --hard))))",
+                "git reset --hard",
+            ),
+            (
+                "diff <(git diff) <(echo $(echo $(echo $(cp d .$(echo env)))))",
+                "cp d .env",
+            ),
+            (
+                "echo \"$(true >(true >(echo $($(echo rm) note.md))))\"",
+                "rm note.md",
+            ),
+            // A `<(` the splitter cut open at a `;`, `&&`, `|` or newline
+            // inside it is still free (#1266 round-4 review C1).
+            (
+                "cat <(cat <(cat <(echo $(git $(echo reset) --hard; true))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(cat <(cat <(echo $(git `echo reset` --hard && true))))",
+                "git reset --hard",
+            ),
+            (
+                "true >(true >(true >(echo $(cp d .$(echo env) | true))))",
+                "cp d .env",
+            ),
+            (
+                "cat <(cat <(cat <(cat <(echo $(git $(echo reset) --hard\ntrue)))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <<E\nx $(cat <(cat <(echo $(git $(echo reset) --hard && true))))\nE",
+                "git reset --hard",
+            ),
+            // Nesting past the scanner's cap behind the cut `$(…)` still
+            // leaves its own substitution read.
+            (
+                "cat <(cat <(cat <(echo $(git $(echo reset) --hard $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x $(x ))))))))))))))))))); true))))",
+                "git reset --hard",
+            ),
+            // Past the free levels, the `$(…)`s are read through every `<(`.
+            (
+                "cat <(cat <(cat <(cat <(echo $(echo $(echo $(git $(echo reset) --hard)))))))",
+                "git reset --hard",
+            ),
+            (
+                "cat <(cat <(cat <(cat <(cat <(cat <(echo $(echo $(cp d .$(echo env)))))))))",
+                "cp d .env",
+            ),
+        ] {
+            // A word after the command (the capped tail) may follow it.
+            let out = command_segments(command);
+            assert!(
+                out.iter()
+                    .any(|s| s == want || s.starts_with(&format!("{want} "))),
+                "{command:?}: {out:?}"
+            );
+        }
+    }
+
+    /// A cut-open `<(`'s own words are still read when a `$(` inside it
+    /// that the pass through every `<(` read is left off its body (#1266
+    /// round-5 review). Rows are `(command, segment wanted)`.
+    #[test]
+    fn a_cut_open_process_substitution_keeps_its_own_words() {
+        let deep = format!("{}{}", "$(x ".repeat(20), ")".repeat(20));
+        for (command, want) in [
+            ("cat <(cp d .env $(echo x; true)".to_string(), "cp d .env"),
+            (
+                "cat <(cp d .env \"$(echo x; true)\"".to_string(),
+                "cp d .env",
+            ),
+            (format!("cat <(cp d {deep} .env; true)"), ".env"),
+        ] {
+            let out = command_segments(&command);
+            assert!(
+                out.iter()
+                    .any(|s| s.starts_with("cp d") && s.contains(want)),
+                "{command:?}: {out:?}"
+            );
+        }
+        assert!(open_tail_of("echo $(cat x", "cat x"));
+        assert!(!open_tail_of("echo $(cat x) y", "cat x) y"));
+        assert!(!open_tail_of("echo `cat x", "cat x"));
+    }
+
+    /// Out of allowance, every fragment is still listed, and each unwraps
+    /// its own wrapper: one flood cannot spend another's share (#1266 review
+    /// C1).
+    #[test]
+    fn two_eval_floods_past_the_bound_do_not_hide_a_later_command() {
+        let (open, close) = ("echo $(echo $(echo $(echo $(", "))))");
+        let pad = "A".repeat(20_000);
+        for dangerous in [
+            format!("X={pad} cp d .env"),
+            format!("git reset --hard {pad}"),
+            format!("bash -c 'cp d .env' {pad}"),
+        ] {
+            let command = format!(
+                "{open}{}true{close}; {open}{}:{close}; {open}{dangerous}{close}",
+                "eval ".repeat(2000),
+                "eval ".repeat(2000)
+            );
+            let out = command_segments(&command);
+            assert!(
+                out.iter()
+                    .any(|s| s.ends_with("cp d .env") || s.starts_with("git reset --hard")),
+                "{:.20}: {} segments",
+                dangerous,
+                out.len()
+            );
+        }
+    }
+
+    /// Past the bound each level is read once, its own nested substitutions
+    /// collapsed to their opener, so the operands around one are kept.
+    #[test]
+    fn flattened_bodies_reads_each_level_once_with_its_own_operands() {
+        assert_eq!(
+            flattened_bodies("echo $(git push $(echo origin) main) `cp $(x) .env`", false),
+            ["git push $() main", "cp $() .env", "echo origin", "x"]
+        );
+        assert_eq!(
+            flattened_bodies("echo '$(rm a)' \"<(rm b)\" \"$(rm c)\"", false),
+            ["rm c"]
+        );
+    }
+
+    /// Out of allowance, the levels left are still listed, cut at their
+    /// openers: the innermost command heads a segment of its own.
+    #[test]
+    fn fragments_of_lists_every_level_s_command_word() {
+        let chars: Vec<char> = "echo $(a `b x` <(c; d) >(e) $(f 'g)')".chars().collect();
+        let out = fragments_of(&chars, [(0, chars.len()), (5, 20)]);
+        for want in ["b x", "c", "d", "e", "f 'g"] {
+            assert!(out.iter().any(|s| s == want), "{want:?}: {out:?}");
+        }
+    }
+
+    /// Deep nesting floods stay linear past the bound: every level is read
+    /// once, not once per level above it.
+    #[test]
+    fn command_segments_deep_nesting_floods_stay_linear() {
+        let limit = std::time::Duration::from_secs(if cfg!(debug_assertions) { 8 } else { 1 });
+        for (open, close) in [
+            ("$(", ")"),
+            ("<(", ")"),
+            ("$(echo ", ")"),
+            ("<(cat <(", "))"),
+        ] {
+            let n = 200 * 1024 / (open.len() + close.len() + 5);
+            let command = nest(open, close, n, "git reset --hard");
+            let started = std::time::Instant::now();
+            let out = command_segments(&command);
+            let took = started.elapsed();
+            let bytes: usize = out.iter().map(String::len).sum();
+            assert!(took < limit, "{open:?}: {took:?}");
+            assert!(bytes <= 16 * command.len(), "{open:?}: {bytes} bytes");
+        }
+    }
+
+    /// Only a `case` keyword in unquoted, uncommented text turns the push
+    /// walk's subshell scoping off (#1233 review I1).
+    #[test]
+    fn mentions_case_keyword_reads_only_the_keyword() {
+        for (script, want) in [
+            ("case x in a) true;; esac", true),
+            ("(cd /x; \\case x in x) true;; esac)", true),
+            ("(cd /x; case $y in a) true;; esac)", true),
+            ("x=$(case a in a) echo;; esac)", true),
+            ("if true; then case a in *) :;; esac; fi", true),
+            ("git push origin main # just in case", false),
+            ("git commit -m \"just in case\"", false),
+            ("echo 'case x in'", false),
+            ("echo showcase lowercase", false),
+            ("echo in_case", false),
+            ("echo showcase case_x", false),
+            ("git commit -F- <<'E'\njust in case\nE\ngit push", true),
+            // An arithmetic shift is no heredoc (#1266 round-6 review C1).
+            (
+                "(( y=1<<E ))\ncase x in x) true\nE\n;; y) true;; esac",
+                true,
+            ),
+            (
+                "for ((i=1<<E; i<0; i++)); do :; done\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
+            (
+                "if (( 1<<E )); then :; fi\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
+            (
+                "while (( 0<<E )); do :; done\ncase x in x) :\nE\n;; esac",
+                true,
+            ),
+            ("echo case", true),
+            ("grep case x", true),
+            ("grep \\case x", true),
+            ("f() case x in x) true;; esac", true),
+            ("function f case x in x) true;; esac", true),
+            ("function f () case x in x) true;; esac", true),
+            ("coproc case x in x) true;; esac", true),
+            ("time -p case x in x) true;; esac", true),
+            ("time -p -- case x in x) true;; esac", true),
+            ("cat <<E\n$(case x in x) true;; esac)\nE", true),
+            // A flat quote reader misreads nested quotes (round-4 C2).
+            (
+                "echo \"$(echo 'a\"b')\"; (f() case x in x) true;; esac)",
+                true,
+            ),
+            (
+                "echo \"$(echo \"'\")\"; (coproc case x in x) :;; esac)",
+                true,
+            ),
+            (
+                "git commit -m \"fix the case x in y\" && echo $(date)",
+                true,
+            ),
+            ("true && case a in a) :;; esac", true),
+            ("true |\ncase a in a) :;; esac", true),
+            ("while true; do case a in a) break;; esac; done", true),
+            ("! case a in a) :;; esac", true),
+            ("echo `case x in x) true;; esac`", true),
+            ("echo $'\\'' case x in x) true;; esac", true),
+        ] {
+            assert_eq!(mentions_case_keyword(script), want, "{script:?}");
+        }
+    }
+
+    /// Where `<(` is literal text, its body runs nowhere and is not a
+    /// segment. Rows are `(command, text no segment may equal)`.
+    #[test]
+    fn command_segments_leaves_literal_process_substitution_text() {
+        for (command, never) in [
+            ("echo \"<(cp d .env)\"", "cp d .env"),
+            ("echo '<(cp d .env)'", "cp d .env"),
+            ("echo $'<(cp d .env)'", "cp d .env"),
+            ("echo \"${v:-<(cp d .env)}\"", "cp d .env"),
+            ("echo \"a >(cp d .env) b\"", "cp d .env"),
+            ("echo hi # <(cp d .env)", "cp d .env"),
+            ("cat <<E\n<(cp d .env)\nE", "cp d .env"),
+            ("cat <<'E'\n$(cat <(cp d .env))\nE", "cp d .env"),
+        ] {
+            let out = command_segments(command);
+            assert!(
+                !out.iter().any(|s| s == never),
+                "{command:?} surfaced {never:?}: {out:?}"
+            );
+        }
+    }
+
+    /// The unquoted heredoc's `$(…)` does run, and a process substitution
+    /// inside it with it.
+    #[test]
+    fn command_segments_surfaces_process_substitution_in_a_heredoc_substitution() {
+        let out = command_segments("cat <<E\n$(cat <(cp d .env))\nE");
+        assert!(out.iter().any(|s| s == "cp d .env"), "{out:?}");
+    }
+
+    /// A process substitution's body is a child script of its segment, for a
+    /// walker that recurses with a fresh scope (the push walk,
+    /// `enforce-worktree`), and quoted text gives none.
+    #[test]
+    fn child_scripts_surfaces_process_substitution_bodies() {
+        for (segment, want) in [
+            (
+                "diff <(git push origin main) x",
+                &["git push origin main"][..],
+            ),
+            ("tee >(git commit -m x)", &["git commit -m x"]),
+            ("diff <(a) >(b)", &["a", "b"]),
+            ("echo \"<(git push origin main)\"", &[]),
+            ("echo '>(git push origin main)'", &[]),
+        ] {
+            let argv = tokenize(segment);
+            assert_eq!(child_scripts(&argv, segment), want, "{segment:?}");
+        }
+    }
+
+    /// `watch <(cmd)`'s script is the `/dev/fd/N` path, and `cmd` is a body of
+    /// the segment already, so nesting does not double the work per level —
+    /// the process-substitution twin of
+    /// `a_substitution_inside_a_wrapper_is_expanded_once`.
+    #[test]
+    fn a_process_substitution_inside_a_wrapper_is_expanded_once() {
+        for wrapper in ["watch", "env -S", "eval", "bash -c"] {
+            for fill in [" x", "x; "] {
+                let open = format!("{wrapper} <(").repeat(4);
+                let body = fill.repeat((200 * 1024 - open.len()) / fill.len());
+                let command = format!("{open}{body}{}", ")".repeat(4));
+                let segments = command_segments(&command);
+                let bytes: usize = segments.iter().map(String::len).sum();
+                // Eight readings, plus the fourth level's body listed past the
+                // depth bound (cameronsjo/cadence-hooks#1267).
+                assert!(
+                    bytes <= 10 * command.len(),
+                    "{wrapper:?} {fill:?}: {bytes} bytes from {}",
+                    command.len()
+                );
+            }
+        }
+    }
+
+    /// 200 KB floods of process-substitution openers return quickly and keep
+    /// the trailing payload. The bound is generous for a debug build; the
+    /// release timing is checked by the guard-level flood tests.
+    #[test]
+    fn command_segments_process_substitution_floods_stay_linear() {
+        for opener in ["<(", ">(", "<(a ", "<(a; ", "cat <(x) ", "<(\"", "a<(#"] {
+            let input = format!("{} ; cat .env", opener.repeat(200 * 1024 / opener.len()));
+            let started = std::time::Instant::now();
+            let segs = command_segments(&input);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(if cfg!(debug_assertions) {
+                    8000
+                } else {
+                    500
+                }),
+                "{opener:?}: command_segments took {took:?}"
+            );
+            assert!(
+                opener.contains(['#', '"']) || segs.iter().any(|s| s.contains("cat .env")),
+                "{opener:?}: the trailing payload was dropped"
+            );
+        }
+    }
+
     #[test]
     fn command_segments_escaped_backtick_not_expanded() {
         let out = command_segments(r#"tool --note "use \`cat .env\` here""#);
@@ -20337,6 +21582,24 @@ mod tests {
         }
     }
 
+    /// The command each cut-open substitution starts with, disjoint so a flood
+    /// of openers costs the segment's length once (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn cut_inner_tails_reads_each_open_substitution_s_own_text() {
+        for (segment, want) in [
+            ("echo $(cd /u", &["cd /u"][..]),
+            ("diff <(cd /u", &["cd /u"]),
+            ("echo $(a $(cd /u", &["a $", "cd /u"]),
+            ("echo $(cd /u $(b) x", &["cd /u $(b) x"]),
+            ("echo $(pwd) x", &[]),
+            ("echo \"$(cd /u\"", &[]),
+            ("echo '<(cd /u'", &[]),
+            ("<(<(<(", &["<", "<", ""]),
+        ] {
+            assert_eq!(cut_inner_tails(segment), want, "{segment:?}");
+        }
+    }
+
     #[test]
     fn segment_shape_skips_quotes_and_pairs_inner_parens() {
         let shape = |opens: &[bool], brace_closes, paren_closes| SegmentShape {
@@ -20344,6 +21607,7 @@ mod tests {
             brace_closes,
             paren_closes,
             inner_open: 0,
+            inner_tails: Vec::new(),
         };
         for (segment, want) in [
             ("gh pr create", shape(&[], 0, 0)),
@@ -21980,8 +23244,10 @@ mod tests {
                 let command = nested_substitution_flood(wrapper, 4, fill);
                 let segments = command_segments(&command);
                 let bytes: usize = segments.iter().map(String::len).sum();
+                // Eight readings, plus the fourth level's body listed past the
+                // depth bound (cameronsjo/cadence-hooks#1267).
                 assert!(
-                    bytes <= 8 * command.len(),
+                    bytes <= 10 * command.len(),
                     "{wrapper:?} {fill:?}: {bytes} bytes from {}",
                     command.len()
                 );

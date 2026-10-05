@@ -938,6 +938,31 @@ fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
     scan_targets(command, cwd, false).mutations
 }
 
+/// Every location a Bash `command` run from `cwd` writes into, per the #234
+/// subprocess tree-mutation walk: a package-manager verb's effective
+/// directory, a `sed -i`/`tee` target, and every `>`/`>>` redirect target —
+/// resolved through the same `cd`/`-C`/wrapper tracking the nudge channel uses.
+///
+/// Exported for `session guard`'s peer-lane Bash arm (cadence-hooks#272), so
+/// the lane predicate rides this walker rather than growing a second parser.
+/// The walk is advisory-grade: it names the paths it can resolve and omits the
+/// rest (see the module docs' named v1 misses). No existence filter — a new
+/// file is still a write. `session` cannot depend on this crate (the
+/// dependency runs the other way), so the binary injects this function into
+/// `cadence_hooks_session::guard::Guard`.
+pub fn bash_write_targets(command: &str, cwd: &str) -> Vec<String> {
+    let home = dollar_home(command);
+    let env = CdEnv::for_command(command, home.as_deref(), true);
+    let plain = plain_of(command, cwd, env);
+    scan_prepared(command, cwd, env, plain.as_ref())
+        .mutations
+        .into_iter()
+        .map(|target| match target {
+            MutationTarget::Dir(path) | MutationTarget::File(path) => path,
+        })
+        .collect()
+}
+
 /// A package-manager subcommand that mutates a manifest/lockfile in its cwd:
 /// `uv add|remove|sync`, `cargo add|rm`, `pip install`, `npm install|i|add`,
 /// `pnpm add|install`, `poetry add`, `yarn add`. Coarse v1 taxonomy — the cwd
@@ -3216,6 +3241,21 @@ fn union_commits(
                 }
                 merge_scan(out, trapped);
             }
+        } else if out.unreadable.is_none()
+            && union_children(argv, &segment)
+                .iter()
+                .any(|child| may_hold_a_commit(child))
+        {
+            // Past the wrapper depth the script a segment nests is not read
+            // (`cat <(echo $(echo $(echo $(git commit -m x))))`): one that may
+            // hold a commit fails closed, judged from every directory, as
+            // core lists such a body for every other guard
+            // (cameronsjo/cadence-hooks#1267).
+            out.unreadable = Some(unreadable_commit_message(
+                &segment,
+                "nests a script past the depth the guard reads, and it may run a git commit",
+            ));
+            out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
         if cd_word(&marked).is_some() {
             continue;
@@ -3275,6 +3315,19 @@ fn union_commits(
             out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
     }
+}
+
+/// Could `script`, nested past the depth the union walk reads, run a git
+/// commit? It names `commit` read quote-blind (`com""mit`, `\commit`), or
+/// once tokenized, which expands braces and decodes `$'…'` (`co{m,}mit`).
+/// A brace word past core's bounds is [`commit_gaps::brace_overflow_hides_commit`]'s.
+fn may_hold_a_commit(script: &str) -> bool {
+    strip_quotes_and_escapes(script)
+        .to_ascii_lowercase()
+        .contains("commit")
+        || tokenize(script)
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("commit"))
 }
 
 /// Does a word come out of a command substitution (`$(…)`, a backtick, or a

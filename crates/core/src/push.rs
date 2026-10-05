@@ -766,7 +766,7 @@ fn collect_push_invocations(
     // the directory state each open one started from, and the closes the
     // previous segment left to apply. Off for a script with a `case`, whose
     // `pattern)` arms read as closers this walk cannot tell from real ones.
-    let mut scopes_subshells = !script.contains("case");
+    let mut scopes_subshells = !crate::shell::mentions_case_keyword(script);
     let mut subshells: Vec<(String, bool)> = Vec::new();
     let mut pending_closes = 0;
     for (segment, _next_op) in split_segments_with_ops(script) {
@@ -903,6 +903,21 @@ fn collect_push_invocations(
         // command can have redefined the name and the segment has no quoting
         // that could make the text a literal (cadence-hooks#1095 review).
         let known_ok = walk.trusts_known_commands && substitutions_are_live(segment);
+        // A substitution the splitter cut open — `echo $(cd /u && git push
+        // origin main )`, `diff <(cd /u` ⏎ `git push origin main` ⏎ `) x` —
+        // starts its subshell inside THIS segment, so a directory verb there
+        // is not this segment's command and the walk never moved. The
+        // segments after it, up to the `)`, run in that subshell's directory,
+        // which this walk cannot vouch for: they are marked directory-
+        // unverified rather than placed in the parent's cwd, and the subshell
+        // scope pushed above restores the flag at its `)` (#1233).
+        if segment.contains('(')
+            && crate::shell::cut_inner_tails(segment).iter().any(|tail| {
+                directory_verb(&crate::shell::executable_tokens(tail), known_ok).is_some()
+            })
+        {
+            scope_directory = true;
+        }
         // `env -C DIR`/`--chdir=DIR` runs this segment's command in DIR — and
         // any child script it starts — without moving the scope.
         //
@@ -947,6 +962,21 @@ fn collect_push_invocations(
                     out,
                 );
             }
+        } else if segment.contains("push")
+            && child_scripts_but_git_exec(argv, segment)
+                .iter()
+                .any(|child| {
+                    crate::shell::command_segments(child)
+                        .iter()
+                        .any(|inner| !crate::shell::git_push_segments(inner).is_empty())
+                })
+        {
+            // Past the depth bound the children are not walked, but a push
+            // in one still runs: `cat <(echo $(echo $(echo $(git push origin
+            // main))))` nests it one level past what this walk follows
+            // (cameronsjo/cadence-hooks#1233 review). It is reported as a push
+            // this walk cannot place, so fail-closed callers refuse it.
+            out.push(unresolvable_push(&segment_dir, segment_directory));
         }
         if let Some(exec) = git_exec(&tokens) {
             collect_git_exec_pushes(
@@ -4110,7 +4140,8 @@ mod tests {
                 "/repo",
                 vec![refused("/repo")],
             ),
-            // A `.` operand is not the `.` builtin.
+            // An expansion-named editor refuses whatever precedes it
+            // (review 10); this row does not test the `.` operand.
             (
                 "git add . && GIT_EDITOR=\"$EDITOR\" git commit",
                 "/repo",
@@ -4476,6 +4507,157 @@ mod tests {
         // belongs to a subshell and must not re-point the parent's push.
         let invocation = only("echo $(cd /x) && git push", "/repo");
         assert_eq!(invocation.work_dir, "/repo");
+    }
+
+    /// A process substitution's body runs in a subshell started from the
+    /// directory in effect where it is written, and its own `cd` dies with it
+    /// (cameronsjo/cadence-hooks#1233). Rows are `(command, the directory of
+    /// every push, in order)`; quoted `<(` is literal and pushes nothing.
+    #[test]
+    fn a_process_substitution_push_runs_in_the_parents_directory() {
+        for (command, want) in [
+            ("diff <(git push origin main) x", &["/repo"][..]),
+            ("cat >(git push origin main)", &["/repo"]),
+            ("tee >(git push origin main) >/dev/null", &["/repo"]),
+            ("cd /other && cat <(git push origin main)", &["/other"]),
+            ("cat <(cd /other) && git push origin main", &["/repo"]),
+            ("cat <(cd /other; true) && git push origin main", &["/repo"]),
+            (
+                "cat <(cd /other; true) >(cd /x); git push origin main",
+                &["/repo"],
+            ),
+            ("echo \"<(git push origin main)\"", &[]),
+            ("echo '>(git push origin main)'", &[]),
+        ] {
+            let dirs: Vec<String> = push_invocations(command, "/repo")
+                .into_iter()
+                .map(|push| push.work_dir)
+                .collect();
+            assert_eq!(dirs, want, "{command}");
+        }
+    }
+
+    /// A substitution the splitter cuts at a separator starts its subshell in
+    /// the segment that opens it, so a `cd` there is not that segment's
+    /// command: the walk never moves, and the push after it, still inside the
+    /// substitution, ran somewhere else. Such a push is directory-unverified
+    /// rather than placed in the parent's cwd, and the flag ends at the `)`
+    /// (cameronsjo/cadence-hooks#1233).
+    #[test]
+    fn a_cd_opening_a_cut_substitution_unverifies_the_push_inside_it() {
+        for command in [
+            "echo $(cd /other && git push origin main )",
+            "echo $(cd /other; git push origin main )",
+            "diff <(cd /other && git push origin main ) x",
+            "diff <(cd /other\ngit push origin main\n) x",
+            "cat >(cd /other || exit; git push origin main )",
+            "echo $(a $(cd /other; git push origin main ) )",
+            "echo $(pushd /other; git push origin main )",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}: no push");
+            for push in &pushes {
+                assert!(
+                    push.directory_unverified || push.work_dir == "/other",
+                    "{command:?}: a push placed in {} unflagged",
+                    push.work_dir
+                );
+            }
+        }
+        // Closed again: the parent's later push is placed as before.
+        for command in [
+            "echo $(cd /other; true) ; git push origin main",
+            "cat <(cd /other\ntrue\n) ; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+    }
+
+    /// A 200 KB flood of unclosed openers leaves 100 000 cut substitutions in
+    /// one segment. Reading each one's text to its end was quadratic — past
+    /// 20 s in release, and a hook past its deadline fails open.
+    #[test]
+    fn a_cut_substitution_opener_flood_walks_in_linear_time() {
+        for opener in ["<(", ">(", "$(", "<(\"", "echo <(cd a "] {
+            let command = format!(
+                "{} ; git push origin main",
+                opener.repeat(200 * 1024 / opener.len())
+            );
+            let started = std::time::Instant::now();
+            let pushes = push_invocations(&command, "/repo");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{opener:?}: {:?}",
+                started.elapsed()
+            );
+            assert!(!pushes.is_empty(), "{opener:?}");
+        }
+    }
+
+    /// A push nested one level past what this walk follows still runs, and
+    /// reads as a push it cannot place (#1233 review C1, #1267).
+    #[test]
+    fn a_push_nested_past_the_walk_depth_is_unresolvable() {
+        for command in [
+            "cat <(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(git push origin main))))",
+            "echo $(echo $(echo $(echo $(echo $(echo $(git push origin main))))))",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert!(
+                pushes.iter().any(|push| push.unresolved),
+                "{command:?}: {pushes:?}"
+            );
+        }
+        let quiet = push_invocations("cat <(echo $(echo $(echo $(git status))))", "/repo");
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// The word `case` in a comment or a quoted message leaves the subshell
+    /// scoping on, so a `$(cd …)` idiom does not strand its flag on the
+    /// parent's push (#1233 review I1). A real `case` still turns it off.
+    #[test]
+    fn a_case_mention_outside_a_case_keeps_subshell_scoping() {
+        for command in [
+            "D=$(cd /tmp && pwd); git push origin main # just in case",
+            "D=$(cd /tmp && pwd); git commit -m \"just in case\"; git push origin main",
+        ] {
+            let pushes = push_invocations(command, "/repo");
+            assert_eq!(pushes.len(), 1, "{command:?}");
+            assert_eq!(pushes[0].work_dir, "/repo", "{command:?}");
+            assert!(!pushes[0].directory_unverified, "{command:?}");
+        }
+        let pushes = push_invocations(
+            "D=$(cd /tmp && pwd); case x in x) true;; esac; git push origin main",
+            "/repo",
+        );
+        assert!(
+            pushes.iter().all(|push| push.directory_unverified),
+            "{pushes:?}"
+        );
+        // An arithmetic `<<` is a shift, not a heredoc: the `case` after it
+        // is real, so its `y)` arm restores no scope (#1266 round-6 C1).
+        for opener in [
+            "(( y=1<<E ))",
+            "for ((i=1<<E; i<0; i++)); do :; done",
+            "if (( 1<<E )); then :; fi",
+            "while (( 0<<E )); do :; done",
+        ] {
+            let command = format!(
+                "(cd /other; {opener}\ncase x in x) true\nE\n;; y) true;; esac; git push origin main)"
+            );
+            let pushes = push_invocations(&command, "/repo");
+            assert!(!pushes.is_empty(), "{command:?}");
+            assert!(
+                pushes
+                    .iter()
+                    .all(|push| push.work_dir != "/repo" || push.directory_unverified),
+                "{command:?}: {pushes:?}"
+            );
+        }
     }
 
     #[test]
