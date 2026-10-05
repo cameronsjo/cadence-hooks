@@ -576,6 +576,11 @@ pub enum Strength {
     /// value itself looks like metadata ([`metadata_value`]) — a URL, path,
     /// number, reference, plain word or lowercase k8s-style name.
     Meta,
+    /// A whole name that is a glued `…pass` word whose stem also names a
+    /// counter or a timestamp (`lastpass`, `hashpass`, `endpass`): masked as
+    /// [`Strength::Strong`] is, except a value that is only digits
+    /// (`lastpass=1696500000`, `HASHPASS: 12`), which counts something.
+    Counter,
 }
 
 /// Per-call memo of [`name_strength`], so a long run of the same name is
@@ -642,6 +647,11 @@ pub fn name_strength(name: &str) -> Option<Strength> {
     if matches!(name, "PASS" | "FAIL" | "OK" | "PWD" | "OLDPWD") {
         return None;
     }
+    // AWS's request idempotency field, in the API's own PascalCase spelling
+    // only: Vault's `client_token` is a real token and stays strong.
+    if name == "ClientToken" {
+        return None;
+    }
     if name.len() > MAX_NAME {
         return None;
     }
@@ -676,7 +686,8 @@ pub fn name_strength(name: &str) -> Option<Strength> {
                 .is_some_and(|p| matches!(*p, "password" | "token")))
         || (matches!(last, "secret" | "secrets") && body.last() == Some(&"existing"));
     if meta_suffix {
-        return (classify(body) == Some(Strength::Strong)).then_some(Strength::Meta);
+        return matches!(classify(body), Some(Strength::Strong | Strength::Counter))
+            .then_some(Strength::Meta);
     }
     classify(segs)
 }
@@ -696,7 +707,19 @@ fn classify(segs: &[&str]) -> Option<Strength> {
         let prev = i.checked_sub(1).map(|p| segs[p]);
         match *seg {
             "token" => {
-                if prev.is_none_or(|p| !TOKEN_COUNT_QUALIFIERS.contains(&p)) {
+                // `NextToken`, `next_page_token`, `IdempotencyToken`: the
+                // camelCase and separated spellings of the pagination and
+                // idempotency handles. A `page` token is a handle only as the
+                // next or previous page's: `PAGE_TOKEN`/`FB_PAGE_TOKEN` is a
+                // Facebook Page access token. Other glued exemptions
+                // (`keytoken`, `synctoken`) stay glued-only, so `KEY_TOKEN`
+                // is strong.
+                let handle = match prev {
+                    Some("page") => i >= 2 && matches!(segs[i - 2], "next" | "prev"),
+                    Some(p) => HANDLE_TOKEN_QUALIFIERS.contains(&p),
+                    None => false,
+                };
+                if !handle && prev.is_none_or(|p| !TOKEN_COUNT_QUALIFIERS.contains(&p)) {
                     return Some(Strength::Strong);
                 }
             }
@@ -709,6 +732,19 @@ fn classify(segs: &[&str]) -> Option<Strength> {
             },
             "auth" => weak = true,
             "pass" => weak |= prev.is_some(),
+            s if s
+                .strip_suffix("pass")
+                .is_some_and(|stem| COUNTER_PASS_PREFIXES.contains(&stem)) =>
+            {
+                // Only the whole name is a counter (`lastpass`, `HASHPASS`).
+                // Beside any other segment it is the strong word it was
+                // (`LASTPASS_PASSWORD`, `LASTPASS_PIN`).
+                return Some(if segs.len() == 1 {
+                    Strength::Counter
+                } else {
+                    Strength::Strong
+                });
+            }
             s if STRONG_WORDS.contains(&s) || glued_strong(s) => return Some(Strength::Strong),
             _ => {}
         }
@@ -743,6 +779,26 @@ fn glued_strong(seg: &str) -> bool {
     STRONG_SUFFIXES
         .iter()
         .any(|w| seg.len() > w.len() && seg.ends_with(w))
+}
+
+/// Segments before a separate `token` segment that make it a pagination or
+/// idempotency handle, not a credential (`NextToken`, `IdempotencyToken`).
+/// `page` counts only after `next`/`prev` (`next_page_token`), handled where
+/// this is read.
+const HANDLE_TOKEN_QUALIFIERS: &[&str] = &["next", "idempotency"];
+
+/// Stems of a glued `…pass` word that may count something: see
+/// [`Strength::Counter`].
+const COUNTER_PASS_PREFIXES: &[&str] = &["hash", "last", "end"];
+
+/// A value that is only digits, once quotes and a trailing `,`/`;` are
+/// trimmed.
+fn is_count(value: &str) -> bool {
+    let v = value
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim_matches(['"', '\'']);
+    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
@@ -789,6 +845,7 @@ const NON_SECRET_GLUED: &[&str] = &[
     "synctoken",
     "resumetoken",
     "keytoken",
+    "idempotencytoken",
 ];
 
 /// Word endings that make a glued segment strong.
@@ -953,14 +1010,24 @@ fn value_masks(strength: Strength, value: &str, colon: bool) -> bool {
     let v = value.trim();
     match (strength, colon) {
         (Strength::Meta, _) => maskable(v) && !metadata_value(v),
+        (Strength::Counter, colon) => !is_count(v) && value_masks(Strength::Strong, v, colon),
         (Strength::Strong, true) => {
             maskable(v)
                 && !PROSE_VALUES.contains(&v.to_ascii_lowercase().as_str())
+                && !is_yes_no(v)
                 && !is_code_value(v)
         }
         (Strength::Weak, true) => secret_like(v),
         (_, false) => maskable(v),
     }
+}
+
+/// A bare `YES`/`NO`, optionally closing a parenthesis: MySQL's
+/// `Access denied for user 'u'@'h' (using password: YES)` reports whether a
+/// password was sent, not the password.
+fn is_yes_no(value: &str) -> bool {
+    let word = value.trim_end_matches(')').trim();
+    word.eq_ignore_ascii_case("yes") || word.eq_ignore_ascii_case("no")
 }
 
 /// Does `value` look like metadata rather than a credential: a URL, a path, a
@@ -1425,7 +1492,7 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 let stop = |c: char| match lead {
                     Some(q @ ('"' | '\'')) => c == q,
                     Some('?' | '&') => c == '&' || c.is_whitespace(),
-                    _ if strength == Strength::Strong => false,
+                    _ if matches!(strength, Strength::Strong | Strength::Counter) => false,
                     _ => c.is_whitespace() || matches!(c, '&' | '"' | '\''),
                 };
                 let len = text[start..eol].find(stop).unwrap_or(eol - start);
@@ -1697,7 +1764,7 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
         .split([' ', '\t'])
         .next()
         .unwrap_or("");
-    if names.get(first) != Some(Strength::Strong) {
+    if !matches!(names.get(first), Some(Strength::Strong | Strength::Counter)) {
         return;
     }
     let Some(caps) = WS_ROW.captures(line) else {
@@ -1724,8 +1791,10 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
     } else {
         wide || !indent.as_str().is_empty()
     };
+    let strength = names.get(name.as_str());
     if tabular
-        && names.get(name.as_str()) == Some(Strength::Strong)
+        && matches!(strength, Some(Strength::Strong | Strength::Counter))
+        && !(strength == Some(Strength::Counter) && is_count(value.as_str()))
         && maskable(value.as_str())
         && !PROSE_VALUES.contains(&value.as_str().to_ascii_lowercase().as_str())
     {
@@ -2466,6 +2535,77 @@ mod tests {
         ];
         for input in corpus {
             assert_eq!(redact(input), None, "masked something in {input:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1274's false-positive subset: pagination and
+    /// idempotency handles, MySQL's 1045 message, and glued `…pass` words that
+    /// are not credentials. The neighbouring credential shapes still mask.
+    #[test]
+    fn issue_1274_false_positives_pass_through() {
+        let handle = alnum(40);
+        let kept = [
+            format!("{{\"NextToken\": \"{handle}\"}}\n"),
+            format!("{{\"nextToken\": \"{handle}\"}}\n"),
+            format!("NextToken: {handle}\n"),
+            format!("{{\"next_page_token\": \"{handle}\"}}\n"),
+            format!("{{\"nextPageToken\": \"{handle}\"}}\n"),
+            format!("{{\"prev_page_token\": \"{handle}\"}}\n"),
+            format!("{{\"ClientToken\": \"{handle}\"}}\n"),
+            format!("{{\"IdempotencyToken\": \"{handle}\"}}\n"),
+            "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)\n"
+                .to_string(),
+            "ERROR 1045 (28000): Access denied for user 'app'@'10.0.0.5' (using password: NO)\n"
+                .to_string(),
+            "lastpass=1696500000\nendpass=42\n".to_string(),
+            "HASHPASS: 12\n".to_string(),
+            "{\"lastpass\": 1696500000}\n".to_string(),
+        ];
+        for input in &kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+        let p = pw();
+        let masks = [
+            format!("{{\"client_token\": \"{p}\"}}\n"),
+            format!("{{\"SessionToken\": \"{p}\"}}\n"),
+            format!("{{\"AccessToken\": \"{p}\"}}\n"),
+            format!("{{\"ClientSecret\": \"{p}\"}}\n"),
+            format!("ClientTokenSecret={p}\n"),
+            format!("NEXT_TOKEN_SECRET={p}\n"),
+            format!("password: {p}\n"),
+            format!("password: NO{p}\n"),
+            "{\"password\": \"yes\"}\n".to_string(),
+            format!("mypass={p}\n"),
+            format!("PGPASSWORD={p}\n"),
+            // Only the issue's names and spellings are exempt.
+            format!("KEY_TOKEN={p}\n"),
+            format!("SYNC_TOKEN={p}\n"),
+            format!("RESUME_TOKEN={p}\n"),
+            format!("CONTINUATION_TOKEN={p}\n"),
+            format!("{{\"keyToken\": \"{p}\"}}\n"),
+            // A counter stem exempts only a value of digits.
+            format!("LASTPASS={p}\n"),
+            format!("HASHPASS={p}\n"),
+            format!("lastpass: {p}\n"),
+            format!("{{\"hashpass\": \"{p}\"}}\n"),
+            format!("endpass={p}\n"),
+            "LASTPASS=12ab34cd\n".to_string(),
+            // A later strong segment still decides: the counter stem does not
+            // cut the name short.
+            "LASTPASS_PASSWORD=48213907\n".to_string(),
+            "HASHPASS_SECRET=12345678\n".to_string(),
+            "ENDPASS_TOKEN=12345678\n".to_string(),
+            "LASTPASS_PIN=4821\n".to_string(),
+            // A page token is a credential unless it is the next or
+            // previous page's (Facebook Page access tokens).
+            format!("FB_PAGE_TOKEN={}\n", alnum(32)),
+            format!("FACEBOOK_PAGE_TOKEN={}\n", alnum(32)),
+            format!("PAGE_TOKEN={}\n", alnum(32)),
+            format!("page_token: {}\n", alnum(32)),
+            format!("pageToken: {}\n", alnum(32)),
+        ];
+        for input in &masks {
+            assert_ne!(redact(input), None, "{input:?} was not masked");
         }
     }
 

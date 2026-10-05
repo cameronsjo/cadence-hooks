@@ -662,13 +662,21 @@ fn check_pushes_elsewhere(
 #[derive(Default)]
 struct PushWalk {
     pushes: std::cell::OnceCell<Vec<cadence_hooks_core::push::PushInvocation>>,
+    segments: std::cell::OnceCell<Vec<LocatedSegment>>,
     may_push: std::cell::OnceCell<bool>,
 }
 
 impl PushWalk {
     fn of(&self, command: &str, cwd: &str) -> &[cadence_hooks_core::push::PushInvocation] {
         self.pushes
-            .get_or_init(|| push_locations_both_readings(command, cwd))
+            .get_or_init(|| push_locations_both_readings(command, cwd, self.segments(command, cwd)))
+    }
+
+    /// [`segment_work_dirs`] for the command, walked once for both
+    /// [`push_locations_both_readings`] and [`segments_run_here`].
+    fn segments(&self, command: &str, cwd: &str) -> &[LocatedSegment] {
+        self.segments
+            .get_or_init(|| segment_work_dirs(command, cwd))
     }
 
     fn may_push(&self, command: &str) -> bool {
@@ -690,13 +698,14 @@ impl PushWalk {
 fn push_locations_both_readings(
     command: &str,
     cwd: &str,
+    located: &[LocatedSegment],
 ) -> Vec<cadence_hooks_core::push::PushInvocation> {
     let mut pushes = push_locations(command, cwd);
     let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
         .iter()
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
         .collect();
-    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+    for LocatedSegment { raw, dir } in located {
         // Text only, not [`may_push`]: a git exec whose text spells no push —
         // `git rebase -x "$CMD"`, a nested `git q` under an outer
         // `-c alias.q=push` — reaches this guard only through the walk above,
@@ -705,16 +714,108 @@ fn push_locations_both_readings(
         // segment adds no verdict, and asking `runs_a_git_exec` of every
         // segment of a 200 KB flood cost the test deadline on the Windows
         // runner.
-        if !mentions_push(&raw) {
+        if !mentions_push(raw) {
             continue;
         }
-        for push in push_locations(strip_group_wrappers(&raw), &dir) {
+        for push in push_locations(strip_group_wrappers(raw), dir) {
             if placed.insert((push.work_dir.clone(), push.repository.clone())) {
                 pushes.push(push);
             }
         }
     }
     pushes
+}
+
+/// The push segments that run in `work_dir`: `push_segments` less every
+/// top-level segment the per-segment walk places wholly in another directory
+/// (cameronsjo/cadence-hooks#1330). `push_segments` holds the
+/// `top_level_segments` top-level segments first, then the shell-fed heredoc
+/// segments, which no walk places and which therefore always stay.
+///
+/// A located segment is dropped only when every listing of its text, in
+/// every directory the walk gives it, passes [`placed_elsewhere`]. `git -C
+/// <dir> push origin main` is the everyday shape.
+///
+/// Each dropped segment's argument lists are taken out of the top-level
+/// segments one at a time, as a multiset. If any one finds no equal list
+/// left, the two readings disagree, and every segment stays: the old
+/// verdict.
+fn segments_run_here(
+    located: &[LocatedSegment],
+    work_dir: &str,
+    push_segments: &[Vec<String>],
+    top_level_segments: usize,
+    walked: &[cadence_hooks_core::push::PushInvocation],
+) -> Vec<Vec<String>> {
+    // Nothing runs elsewhere: nothing can be dropped, and the per-segment
+    // walk below is not worth its cost.
+    if top_level_segments == 0 || walked.iter().all(|push| push.work_dir == work_dir) {
+        return push_segments.to_vec();
+    }
+    // Per distinct segment text: its push argument lists, and whether every
+    // listing of it runs elsewhere. A flood repeats one segment, so each
+    // text is parsed once and each (text, directory) pair walked once.
+    let mut by_text: std::collections::HashMap<&str, (Vec<Vec<String>>, bool)> =
+        std::collections::HashMap::new();
+    let mut walked_pairs: std::collections::HashSet<(&str, &str)> =
+        std::collections::HashSet::new();
+    for LocatedSegment { raw, dir } in located {
+        if !mentions_push(raw) {
+            continue;
+        }
+        let stripped = strip_group_wrappers(raw);
+        let entry = by_text
+            .entry(raw.as_str())
+            .or_insert_with(|| (git_push_segments(stripped), true));
+        if entry.0.is_empty() || !entry.1 || !walked_pairs.insert((raw.as_str(), dir)) {
+            continue;
+        }
+        entry.1 = placed_elsewhere(stripped, dir, &entry.0, work_dir);
+    }
+    let mut remaining: Vec<Option<&Vec<String>>> = push_segments[..top_level_segments]
+        .iter()
+        .map(Some)
+        .collect();
+    for LocatedSegment { raw, .. } in located {
+        let Some((segments, true)) = by_text.get(raw.as_str()) else {
+            continue;
+        };
+        for words in segments {
+            let Some(slot) = remaining.iter_mut().find(|slot| *slot == &Some(words)) else {
+                return push_segments.to_vec();
+            };
+            *slot = None;
+        }
+    }
+    let mut kept: Vec<Vec<String>> = remaining.into_iter().flatten().cloned().collect();
+    kept.extend_from_slice(&push_segments[top_level_segments..]);
+    kept
+}
+
+/// Does the walk of one segment, `stripped`, run in `dir`, place every push
+/// it holds outside `work_dir`, in a directory it could read, with a
+/// destination [`check_pushes_elsewhere`] fully judged?
+///
+/// Exactly as many pushes as `segments` holds, none unverified,
+/// unresolvable, unreadable or aliased. A push naming both a positional
+/// destination and `--repo` keeps its segment: the walk records one
+/// repository, and only the segment reading here checks both.
+fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_dir: &str) -> bool {
+    if segments.iter().any(|words| {
+        let found = cadence_hooks_core::shell::push_repository_argument(words);
+        found.positional.is_some() && found.repo_flag.is_some()
+    }) {
+        return false;
+    }
+    let placed = push_locations(stripped, dir);
+    placed.len() == segments.len()
+        && placed.iter().all(|push| {
+            push.work_dir != work_dir
+                && !push.directory_unverified
+                && !push.repository_unresolved
+                && !push.destination_unreadable
+                && !push.via_alias
+        })
 }
 
 /// The directory the command starts in: the payload's `cwd`, else the hook
@@ -816,6 +917,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // argument or a heredoc body was judged as one and blocked a command
     // that pushes nothing (cameronsjo/cadence-hooks#1321).
     let mut push_segments = git_push_segments(command);
+    let top_level_segments = push_segments.len();
     // A heredoc a shell reads on stdin (`bash <<'EOF'`, `cat <<EOF | sh`) is
     // a script: its pushes are segments too. A heredoc fed to anything else
     // is data. Accepted gap: script text piped from a producer that is not a
@@ -1037,6 +1139,34 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         }
     }
 
+    // Every push that runs somewhere other than `work_dir` was judged in its
+    // own repository by `check_pushes_elsewhere` above. What is left for the
+    // tracking-remote fallback below is the pushes that run HERE: the
+    // segments not placed elsewhere, and the walked pushes in `work_dir`.
+    // When there are none, the fallback would judge the cwd's remote for a
+    // push that never goes there (cameronsjo/cadence-hooks#1330:
+    // `bash -c 'git -C <owned> push origin main'` from an unowned checkout
+    // blocked on the checkout's origin).
+    //
+    // Never keyed on the walk alone: it does not read shell-fed heredocs, so
+    // `bash <<'EOF'` / `git push` / `EOF` leaves the walk empty while the
+    // heredoc's segment still pushes here. Those segments always stay.
+    let here_segments = segments_run_here(
+        walk.segments(command, cwd),
+        &work_dir,
+        &push_segments,
+        top_level_segments,
+        walk.of(command, cwd),
+    );
+    if here_segments.is_empty()
+        && !walk
+            .of(command, cwd)
+            .iter()
+            .any(|push| push.work_dir == work_dir)
+    {
+        return CheckResult::allow();
+    }
+
     // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
     // on this single-command path is the accepted common-path degradation:
     // a normal `git push` on a slow host must not false-block (ADR-0001), so
@@ -1057,7 +1187,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // closing the bypass where a URL silently fell back to validating
     // `origin`. A named remote or bare push resolves through git's
     // tracking remote, exactly as before.
-    let targets = extract_push_targets(&push_segments, walk.of(command, cwd), &work_dir);
+    let targets = extract_push_targets(&here_segments, walk.of(command, cwd), &work_dir);
 
     // Validate EVERY explicitly-named destination. git prefers the
     // positional over `--repo`, but checking only git's preferred one is
@@ -2129,6 +2259,89 @@ mod tests {
         });
     }
 
+    /// cameronsjo/cadence-hooks#1330: the reverse of
+    /// [`push_moved_to_another_repository_is_judged_there`]. Every row runs
+    /// from an UNOWNED checkout, with `{owned}` an owned one. A push that runs
+    /// in the owned repository is judged against that repository's remote,
+    /// not the cwd's; a push that runs here, including one only a shell-fed
+    /// heredoc holds, is still judged against the cwd's.
+    #[cfg(unix)]
+    #[test]
+    fn push_moved_out_of_an_unowned_checkout_is_judged_where_it_runs() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let unowned = checkout_with_origin("https://github.com/evil/x.git");
+        let owned = checkout_with_origin("https://github.com/cameronsjo/y.git");
+        let cwd = unowned.path().to_string_lossy().to_string();
+        let owned = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // The issue's rows: each push runs in the owned repository.
+                ("git -C {owned} push origin main", Allow),
+                ("bash -c 'git -C {owned} push origin main'", Allow),
+                ("bash -c 'cd {owned} && git push origin main'", Allow),
+                ("cd {owned} && git push origin main", Allow),
+                ("git -C {owned} push -u origin feat", Allow),
+                ("git -C {owned} push", Allow),
+                ("sh -c 'cd {owned} && git push'", Allow),
+                (
+                    "git -C {owned} add -A && git -C {owned} commit -m x && git -C {owned} push origin feat",
+                    Allow,
+                ),
+                // A push here as well is still judged here.
+                (
+                    "git -C {owned} push origin main; git push origin main",
+                    Block,
+                ),
+                ("bash -c 'git -C {owned} push origin main'; git push", Block),
+                ("git push origin main", Block),
+                ("git push", Block),
+                ("git -C {cwd} push origin main", Block),
+                // A shell-fed heredoc's push runs here; the walk does not
+                // read it, so it must not make the command look elsewhere.
+                ("bash <<'EOF'\ngit push\nEOF", Block),
+                ("bash <<'EOF'\ngit push origin main\nEOF", Block),
+                (
+                    "bash -c 'git -C {owned} push origin main'; bash <<'EOF'\ngit push\nEOF",
+                    Block,
+                ),
+                // Both a positional and `--repo`: the walk records one, so
+                // the segment stays and both are judged here.
+                (
+                    "git -C {owned} push -o val --repo=https://github.com/evil/z.git main",
+                    Block,
+                ),
+                (
+                    "git -C {owned} push --push-option val --repo=https://github.com/evil/z.git main",
+                    Block,
+                ),
+                // A directory the walk cannot read keeps the old verdict.
+                ("git -C \"$D\" push origin main", Block),
+                ("cd \"$D\" && git push origin main", Block),
+            ] {
+                let command = command.replace("{owned}", &owned).replace("{cwd}", &cwd);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+        // An unowned `-C` target from an owned checkout still blocks.
+        let owned_dir = checkout_with_origin("https://github.com/cameronsjo/z.git");
+        let unowned_dir = checkout_with_origin("https://github.com/evil/w.git");
+        let cwd = owned_dir.path().to_string_lossy().to_string();
+        let other = unowned_dir.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for command in [
+                "git -C {other} push origin main",
+                "git -C {other} push",
+                "bash -c 'git -C {other} push origin main'",
+                "git -C {other} push origin main; git push origin main",
+            ] {
+                let command = command.replace("{other}", &other);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, Block, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
     /// cadence-hooks#1144 review round 2: the substitution a child script runs
     /// after its own `cd`/`export` is judged there, even when the parent
     /// expands a textually identical one in another argument. A text-keyed
@@ -2601,12 +2814,21 @@ mod tests {
             let cwd = repo.path().to_string_lossy();
             let unit = "for i in 1; do git push origin main; git config user.name x; done;";
             let flood = unit.repeat(200_000 / unit.len());
+            // Pin the #1161 regression by counting spawns, not by timing
+            // the run: one probe per looped push is ~2300 spawns here, one
+            // per distinct remote is a handful. A wall-clock bound fails on
+            // a loaded runner with the guard behaving correctly (#1314).
+            let spawns_before = cadence_hooks_core::shell::git_spawn_count();
             let started = std::time::Instant::now();
             let result = PushRemoteGuard.run(&make_bash_with_cwd(&flood, &cwd));
+            let elapsed = started.elapsed();
+            let spawns = cadence_hooks_core::shell::git_spawn_count() - spawns_before;
+            // Measured 4 on a healthy run, independent of the loop count.
+            assert!(spawns <= 8, "{spawns} git spawns for one looped remote");
+            // Hang guard only, far above a healthy run.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "took {:?}",
-                started.elapsed()
+                elapsed < std::time::Duration::from_secs(30),
+                "took {elapsed:?}"
             );
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
             let distinct: String = (0..6)
@@ -2974,22 +3196,23 @@ mod tests {
         // 200 KB of `cd a; ` before one push: each `cd` copied the whole
         // path the walk had built, so the walk was quadratic and took ~0.5 s
         // in release — at the hook deadline, which fails open. Now ~0.3 s in
-        // release; the bound is loose because `parse_work_dir`'s own flat
-        // scan still joins a fresh path per `cd`, which a debug build pays
-        // several times over.
+        // release, linear in the number of `cd`s.
         with_env(&owners_only(), || {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
-            let command = format!("{}git push", "cd a; ".repeat(40_000));
-            let started = std::time::Instant::now();
-            let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "took {:?}",
-                started.elapsed()
+            // The regression is quadratic growth, so pin the scaling rather
+            // than a wall-clock bound a loaded runner can trip (#1314). The
+            // larger size is the original 40 000 `cd`s (~200 KB).
+            cadence_hooks_core::test_builders::assert_scales_linearly(
+                "cd flood before a push",
+                10_000,
+                |count| {
+                    let command = format!("{}git push", "cd a; ".repeat(count));
+                    let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                    // Not a repository: git fails the push itself.
+                    assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+                },
             );
-            // Not a repository: git fails the push itself.
-            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
 
