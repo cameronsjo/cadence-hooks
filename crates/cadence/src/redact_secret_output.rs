@@ -642,6 +642,11 @@ pub fn name_strength(name: &str) -> Option<Strength> {
     if matches!(name, "PASS" | "FAIL" | "OK" | "PWD" | "OLDPWD") {
         return None;
     }
+    // AWS's request idempotency field, in the API's own PascalCase spelling
+    // only: Vault's `client_token` is a real token and stays strong.
+    if name == "ClientToken" {
+        return None;
+    }
     if name.len() > MAX_NAME {
         return None;
     }
@@ -696,7 +701,12 @@ fn classify(segs: &[&str]) -> Option<Strength> {
         let prev = i.checked_sub(1).map(|p| segs[p]);
         match *seg {
             "token" => {
-                if prev.is_none_or(|p| !TOKEN_COUNT_QUALIFIERS.contains(&p)) {
+                // `NextToken`, `next_page_token`, `IdempotencyToken`: the
+                // camelCase and separated spellings of a [`NON_SECRET_GLUED`]
+                // compound are pagination and idempotency handles too.
+                if prev.is_none_or(|p| {
+                    !TOKEN_COUNT_QUALIFIERS.contains(&p) && !non_secret_token_compound(p)
+                }) {
                     return Some(Strength::Strong);
                 }
             }
@@ -745,6 +755,15 @@ fn glued_strong(seg: &str) -> bool {
         .any(|w| seg.len() > w.len() && seg.ends_with(w))
 }
 
+/// Is `{prev}token` one of the [`NON_SECRET_GLUED`] compounds? Asked of a
+/// `token` segment whose previous segment is `prev`, so `NextToken` and
+/// `next_token` read like the glued `nexttoken`.
+fn non_secret_token_compound(prev: &str) -> bool {
+    NON_SECRET_GLUED
+        .iter()
+        .any(|glued| glued.strip_suffix("token") == Some(prev))
+}
+
 /// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
 /// `…key` is too common a word ending (`monkey`, `hotkey`, `turnkey`,
 /// `sortkey`) to accept any prefix.
@@ -776,7 +795,7 @@ const GLUED_KEY_PREFIXES: &[&str] = &[
 /// Word stems before `pass` that are ordinary words (`bypass`, `compass`).
 const NON_SECRET_PASS_PREFIXES: &[&str] = &[
     "by", "com", "sur", "over", "under", "tres", "encom", "im", "re", "first", "second", "single",
-    "multi", "one", "two", "ask", "sshask", "gitask",
+    "multi", "one", "two", "ask", "sshask", "gitask", "hash", "last", "end",
 ];
 
 /// Glued `…token` words that are not credential names.
@@ -789,6 +808,7 @@ const NON_SECRET_GLUED: &[&str] = &[
     "synctoken",
     "resumetoken",
     "keytoken",
+    "idempotencytoken",
 ];
 
 /// Word endings that make a glued segment strong.
@@ -956,11 +976,20 @@ fn value_masks(strength: Strength, value: &str, colon: bool) -> bool {
         (Strength::Strong, true) => {
             maskable(v)
                 && !PROSE_VALUES.contains(&v.to_ascii_lowercase().as_str())
+                && !is_yes_no(v)
                 && !is_code_value(v)
         }
         (Strength::Weak, true) => secret_like(v),
         (_, false) => maskable(v),
     }
+}
+
+/// A bare `YES`/`NO`, optionally closing a parenthesis: MySQL's
+/// `Access denied for user 'u'@'h' (using password: YES)` reports whether a
+/// password was sent, not the password.
+fn is_yes_no(value: &str) -> bool {
+    let word = value.trim_end_matches(')').trim();
+    word.eq_ignore_ascii_case("yes") || word.eq_ignore_ascii_case("no")
 }
 
 /// Does `value` look like metadata rather than a credential: a URL, a path, a
@@ -2466,6 +2495,48 @@ mod tests {
         ];
         for input in corpus {
             assert_eq!(redact(input), None, "masked something in {input:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1274's false-positive subset: pagination and
+    /// idempotency handles, MySQL's 1045 message, and glued `…pass` words that
+    /// are not credentials. The neighbouring credential shapes still mask.
+    #[test]
+    fn issue_1274_false_positives_pass_through() {
+        let handle = alnum(40);
+        let kept = [
+            format!("{{\"NextToken\": \"{handle}\"}}\n"),
+            format!("{{\"nextToken\": \"{handle}\"}}\n"),
+            format!("NextToken: {handle}\n"),
+            format!("{{\"next_page_token\": \"{handle}\"}}\n"),
+            format!("{{\"ClientToken\": \"{handle}\"}}\n"),
+            format!("{{\"IdempotencyToken\": \"{handle}\"}}\n"),
+            "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)\n"
+                .to_string(),
+            "ERROR 1045 (28000): Access denied for user 'app'@'10.0.0.5' (using password: NO)\n"
+                .to_string(),
+            "lastpass=1696500000\nendpass=42\n".to_string(),
+            "HASHPASS: 12\n".to_string(),
+        ];
+        for input in &kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+        let p = pw();
+        let masks = [
+            format!("{{\"client_token\": \"{p}\"}}\n"),
+            format!("{{\"SessionToken\": \"{p}\"}}\n"),
+            format!("{{\"AccessToken\": \"{p}\"}}\n"),
+            format!("{{\"ClientSecret\": \"{p}\"}}\n"),
+            format!("ClientTokenSecret={p}\n"),
+            format!("NEXT_TOKEN_SECRET={p}\n"),
+            format!("password: {p}\n"),
+            format!("password: NO{p}\n"),
+            "{\"password\": \"yes\"}\n".to_string(),
+            format!("mypass={p}\n"),
+            format!("PGPASSWORD={p}\n"),
+        ];
+        for input in &masks {
+            assert_ne!(redact(input), None, "{input:?} was not masked");
         }
     }
 
