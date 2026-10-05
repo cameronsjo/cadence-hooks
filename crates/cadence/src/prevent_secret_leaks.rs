@@ -8463,24 +8463,19 @@ mod tests {
     #[test]
     fn oversized_substitution_word_is_bounded_and_judged_by_its_tail() {
         // #815 review I3: resolution built one candidate per echo argument,
-        // quadratic in the word. A 100k-argument word must stay fast, and a
-        // secret-shaped tail past the limit still blocks.
-        let args = "a ".repeat(100_000);
-        let started = std::time::Instant::now();
-        let allow = format!("cat \"$(echo {args})\"");
-        let block = format!("cat \"$(echo {args})/.env\"");
+        // quadratic in the word. A 100k-argument word must stay linear, and a
+        // secret-shaped tail after it still blocks. Pinned as a ratio between
+        // two word lengths, not a wall-clock bound: a 3 s bound failed at
+        // 3.0 s on a loaded CI runner with the guard behaving correctly.
         let small = format!("cat \"$(echo {})\"", "a ".repeat(3_000));
-        assert_bash(
-            &[&allow, &small],
-            cadence_hooks_core::Outcome::Allow,
-            "no secret",
-        );
-        assert_bash(&[&block], cadence_hooks_core::Outcome::Block, "secret tail");
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(3000),
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_bash(&[&small], cadence_hooks_core::Outcome::Allow, "no secret");
+        cadence_hooks_core::test_builders::assert_scales_linearly("echo word", 25_000, |count| {
+            let args = "a ".repeat(count);
+            let allow = format!("cat \"$(echo {args})\"");
+            let block = format!("cat \"$(echo {args})/.env\"");
+            assert_bash(&[&allow], cadence_hooks_core::Outcome::Allow, "no secret");
+            assert_bash(&[&block], cadence_hooks_core::Outcome::Block, "secret tail");
+        });
     }
 
     #[test]
