@@ -880,10 +880,19 @@ fn plan_problems(content: &str) -> Vec<Problem> {
     errors
 }
 
+/// Cap on the on-disk `before` read of a living plan. A plan past it is not
+/// read; every current problem then counts as introduced (the conservative
+/// side — the edit is judged on its own content).
+const PLAN_BEFORE_MAX_BYTES: u64 = 1024 * 1024;
+
 fn check_plan(path: &str, content: &str) -> CheckResult {
-    let before = std::fs::read_to_string(path)
-        .ok()
-        .map(|old| plan_problems(&old));
+    // Regular, non-symlink, capped (cameronsjo/cadence-hooks#1256): a FIFO
+    // planted at the plan path must not stall the hook to its deadline.
+    let before = cadence_hooks_core::paths::read_capped_nofollow(
+        std::path::Path::new(path),
+        PLAN_BEFORE_MAX_BYTES,
+    )
+    .map(|old| plan_problems(&old));
     let errors = introduced(plan_problems(content), before);
     if errors.is_empty() {
         CheckResult::allow()
@@ -2598,6 +2607,47 @@ mod tests {
                 "{prose:?}"
             );
         }
+    }
+
+    /// cameronsjo/cadence-hooks#1256 M-3: the on-disk `before` read of a
+    /// plan never stalls on a planted FIFO and never follows a symlink; an
+    /// unread `before` judges the edit on its own content (conservative).
+    #[cfg(unix)]
+    #[test]
+    fn check_plan_before_read_refuses_fifo_symlink_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = "---\nstatus: planned\n---\n---\ndate: x\n---\n# Plan\n";
+        let regular = dir.path().join("regular.md");
+        std::fs::write(&regular, legacy).unwrap();
+        let fifo = dir.path().join("fifo.md");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let link = dir.path().join("link.md");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let big = dir.path().join("big.md");
+        std::fs::write(
+            &big,
+            format!("{legacy}{}", "x".repeat(PLAN_BEFORE_MAX_BYTES as usize)),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        // (path, verdict on re-saving the legacy content)
+        let cases = [
+            (&regular, cadence_hooks_core::Outcome::Allow),
+            (&fifo, cadence_hooks_core::Outcome::Block),
+            (&link, cadence_hooks_core::Outcome::Block),
+            (&big, cadence_hooks_core::Outcome::Block),
+        ];
+        for (path, want) in cases {
+            let r = check_plan(&path.to_string_lossy(), legacy);
+            assert_eq!(r.outcome, want, "{}", path.display());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
