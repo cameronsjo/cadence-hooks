@@ -717,6 +717,78 @@ fn push_locations_both_readings(
     pushes
 }
 
+/// The push segments that run in `work_dir`: `push_segments` less every
+/// top-level segment the per-segment walk places wholly in another directory
+/// (cameronsjo/cadence-hooks#1330). `push_segments` holds the
+/// `top_level_segments` top-level segments first, then the shell-fed heredoc
+/// segments, which no walk places and which therefore always stay.
+///
+/// A top-level segment is dropped only when the walk of that segment alone
+/// (the same [`push_locations`] call [`push_locations_both_readings`] makes,
+/// so [`check_pushes_elsewhere`] has already judged the result) finds exactly
+/// as many pushes as the segment holds, and every one of them runs outside
+/// `work_dir` in a directory the walk could read: no unverified or
+/// unresolvable directory, no unreadable destination, no alias. `git -C
+/// <dir> push origin main` is the everyday shape.
+///
+/// Anything the two readings do not agree on keeps the old verdict: if the
+/// per-segment reading accounts for a different number of push segments than
+/// [`git_push_segments`] found, every segment stays.
+fn segments_run_here(
+    command: &str,
+    cwd: &str,
+    work_dir: &str,
+    push_segments: &[Vec<String>],
+    top_level_segments: usize,
+    walked: &[cadence_hooks_core::push::PushInvocation],
+) -> Vec<Vec<String>> {
+    // Nothing runs elsewhere: nothing can be dropped, and the per-segment
+    // walk below is not worth its cost.
+    if top_level_segments == 0 || walked.iter().all(|push| push.work_dir == work_dir) {
+        return push_segments.to_vec();
+    }
+    let mut kept: Vec<Vec<String>> = Vec::new();
+    let mut accounted = 0usize;
+    // A flood repeats one segment in one directory: walk each pair once.
+    let mut placed_elsewhere: std::collections::HashMap<(String, std::rc::Rc<str>), bool> =
+        std::collections::HashMap::new();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        if !mentions_push(&raw) {
+            continue;
+        }
+        let stripped = strip_group_wrappers(&raw);
+        let segments = git_push_segments(stripped);
+        if segments.is_empty() {
+            continue;
+        }
+        accounted += segments.len();
+        if accounted > top_level_segments {
+            return push_segments.to_vec();
+        }
+        let elsewhere = *placed_elsewhere
+            .entry((raw.clone(), std::rc::Rc::clone(&dir)))
+            .or_insert_with(|| {
+                let placed = push_locations(stripped, &dir);
+                placed.len() == segments.len()
+                    && placed.iter().all(|push| {
+                        push.work_dir != work_dir
+                            && !push.directory_unverified
+                            && !push.repository_unresolved
+                            && !push.destination_unreadable
+                            && !push.via_alias
+                    })
+            });
+        if !elsewhere {
+            kept.extend(segments);
+        }
+    }
+    if accounted != top_level_segments {
+        return push_segments.to_vec();
+    }
+    kept.extend_from_slice(&push_segments[top_level_segments..]);
+    kept
+}
+
 /// The directory the command starts in: the payload's `cwd`, else the hook
 /// process's own.
 fn input_cwd(input: &HookInput) -> String {
@@ -816,6 +888,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // argument or a heredoc body was judged as one and blocked a command
     // that pushes nothing (cameronsjo/cadence-hooks#1321).
     let mut push_segments = git_push_segments(command);
+    let top_level_segments = push_segments.len();
     // A heredoc a shell reads on stdin (`bash <<'EOF'`, `cat <<EOF | sh`) is
     // a script: its pushes are segments too. A heredoc fed to anything else
     // is data. Accepted gap: script text piped from a producer that is not a
@@ -1037,6 +1110,35 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         }
     }
 
+    // Every push that runs somewhere other than `work_dir` was judged in its
+    // own repository by `check_pushes_elsewhere` above. What is left for the
+    // tracking-remote fallback below is the pushes that run HERE: the
+    // segments not placed elsewhere, and the walked pushes in `work_dir`.
+    // When there are none, the fallback would judge the cwd's remote for a
+    // push that never goes there (cameronsjo/cadence-hooks#1330:
+    // `bash -c 'git -C <owned> push origin main'` from an unowned checkout
+    // blocked on the checkout's origin).
+    //
+    // Never keyed on the walk alone: it does not read shell-fed heredocs, so
+    // `bash <<'EOF'` / `git push` / `EOF` leaves the walk empty while the
+    // heredoc's segment still pushes here. Those segments always stay.
+    let here_segments = segments_run_here(
+        command,
+        cwd,
+        &work_dir,
+        &push_segments,
+        top_level_segments,
+        walk.of(command, cwd),
+    );
+    if here_segments.is_empty()
+        && !walk
+            .of(command, cwd)
+            .iter()
+            .any(|push| push.work_dir == work_dir)
+    {
+        return CheckResult::allow();
+    }
+
     // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
     // on this single-command path is the accepted common-path degradation:
     // a normal `git push` on a slow host must not false-block (ADR-0001), so
@@ -1057,7 +1159,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // closing the bypass where a URL silently fell back to validating
     // `origin`. A named remote or bare push resolves through git's
     // tracking remote, exactly as before.
-    let targets = extract_push_targets(&push_segments, walk.of(command, cwd), &work_dir);
+    let targets = extract_push_targets(&here_segments, walk.of(command, cwd), &work_dir);
 
     // Validate EVERY explicitly-named destination. git prefers the
     // positional over `--repo`, but checking only git's preferred one is
@@ -2125,6 +2227,79 @@ mod tests {
                 let command = command.replace("{other}", &other).replace("{cwd}", &cwd);
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1330: the reverse of
+    /// [`push_moved_to_another_repository_is_judged_there`]. Every row runs
+    /// from an UNOWNED checkout, with `{owned}` an owned one. A push that runs
+    /// in the owned repository is judged against that repository's remote,
+    /// not the cwd's; a push that runs here, including one only a shell-fed
+    /// heredoc holds, is still judged against the cwd's.
+    #[cfg(unix)]
+    #[test]
+    fn push_moved_out_of_an_unowned_checkout_is_judged_where_it_runs() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let unowned = checkout_with_origin("https://github.com/evil/x.git");
+        let owned = checkout_with_origin("https://github.com/cameronsjo/y.git");
+        let cwd = unowned.path().to_string_lossy().to_string();
+        let owned = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // The issue's rows: each push runs in the owned repository.
+                ("git -C {owned} push origin main", Allow),
+                ("bash -c 'git -C {owned} push origin main'", Allow),
+                ("bash -c 'cd {owned} && git push origin main'", Allow),
+                ("cd {owned} && git push origin main", Allow),
+                ("git -C {owned} push -u origin feat", Allow),
+                ("git -C {owned} push", Allow),
+                ("sh -c 'cd {owned} && git push'", Allow),
+                (
+                    "git -C {owned} add -A && git -C {owned} commit -m x && git -C {owned} push origin feat",
+                    Allow,
+                ),
+                // A push here as well is still judged here.
+                (
+                    "git -C {owned} push origin main; git push origin main",
+                    Block,
+                ),
+                ("bash -c 'git -C {owned} push origin main'; git push", Block),
+                ("git push origin main", Block),
+                ("git push", Block),
+                ("git -C {cwd} push origin main", Block),
+                // A shell-fed heredoc's push runs here; the walk does not
+                // read it, so it must not make the command look elsewhere.
+                ("bash <<'EOF'\ngit push\nEOF", Block),
+                ("bash <<'EOF'\ngit push origin main\nEOF", Block),
+                (
+                    "bash -c 'git -C {owned} push origin main'; bash <<'EOF'\ngit push\nEOF",
+                    Block,
+                ),
+                // A directory the walk cannot read keeps the old verdict.
+                ("git -C \"$D\" push origin main", Block),
+                ("cd \"$D\" && git push origin main", Block),
+            ] {
+                let command = command.replace("{owned}", &owned).replace("{cwd}", &cwd);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+        // An unowned `-C` target from an owned checkout still blocks.
+        let owned_dir = checkout_with_origin("https://github.com/cameronsjo/z.git");
+        let unowned_dir = checkout_with_origin("https://github.com/evil/w.git");
+        let cwd = owned_dir.path().to_string_lossy().to_string();
+        let other = unowned_dir.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for command in [
+                "git -C {other} push origin main",
+                "git -C {other} push",
+                "bash -c 'git -C {other} push origin main'",
+                "git -C {other} push origin main; git push origin main",
+            ] {
+                let command = command.replace("{other}", &other);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, Block, "{command}: {:?}", result.message);
             }
         });
     }
