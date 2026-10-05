@@ -79,7 +79,12 @@ pub fn posture_line(
         // Already on Fable — the seat did not change.
         HookEvent::PostModelSwitch if from.is_some_and(is_fable) => None,
         HookEvent::PostModelSwitch => Some(FABLE_POSTURE_LINE),
-        HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::UserPromptSubmit => None,
+        // The switch has not happened yet on PreModelSwitch (and may be
+        // refused); the posture line belongs to the PostModelSwitch half.
+        HookEvent::PreToolUse
+        | HookEvent::PostToolUse
+        | HookEvent::UserPromptSubmit
+        | HookEvent::PreModelSwitch => None,
     }
 }
 
@@ -107,7 +112,10 @@ impl Check for ModelPosture {
         let (from, target) = match event {
             HookEvent::SessionStart => (None, input.model.as_deref()),
             HookEvent::PostModelSwitch => (input.from_model.as_deref(), input.to_model.as_deref()),
-            HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::UserPromptSubmit => {
+            HookEvent::PreToolUse
+            | HookEvent::PostToolUse
+            | HookEvent::UserPromptSubmit
+            | HookEvent::PreModelSwitch => {
                 return CheckResult::allow();
             }
         };
@@ -350,6 +358,19 @@ mod tests {
 
     #[test]
     fn run_with_an_unmodeled_event_allows() {
+        let input = HookInput {
+            hook_event_name: Some("SessionEnd".into()),
+            from_model: Some("claude-opus-5".into()),
+            to_model: Some("claude-fable-5-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(ModelPosture.run(&input).outcome, Outcome::Allow);
+    }
+
+    /// PreModelSwitch is modeled (cameronsjo/cadence-hooks#989) but the switch
+    /// has not happened yet, so the posture line stays with the post half.
+    #[test]
+    fn run_on_pre_model_switch_onto_fable_allows() {
         let input = HookInput {
             hook_event_name: Some("PreModelSwitch".into()),
             from_model: Some("claude-opus-5".into()),
