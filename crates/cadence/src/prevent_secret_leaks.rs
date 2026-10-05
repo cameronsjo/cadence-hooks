@@ -19,7 +19,8 @@ use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, TRANSPARENT, command_segments, command_word, dollar_opens_quote_after,
     executable_tokens, executable_tokens_marked, is_assignment_word, peel_command_runners,
-    split_segments, split_segments_with_ops, tokenize, unescape_word,
+    shell_fed_heredoc_bodies, split_segments, split_segments_with_ops, strip_heredoc_bodies,
+    tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -555,7 +556,7 @@ fn command_reads_process_environ(command: &str) -> bool {
     if !command.contains("/pro") && !command.contains(['\'', '"', '\\']) {
         return false;
     }
-    let words = tokenize(command);
+    let words = tokenize(&without_data_heredocs(command));
     let last_is_environ = |path: &str| {
         // `/proc/<pid>/environ` at the least: `/proc/*` lists pids, not an
         // environment.
@@ -3072,6 +3073,24 @@ fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
     (reads, children)
 }
 
+/// `command` with the bodies of heredocs no shell runs left out, for a
+/// whole-command [`tokenize`]. Those bodies are data, so this guard never
+/// judges a reading of them, and expanding the braces in one (minified JSON,
+/// a commit message quoting `{1..5000}`) spent the brace budget and marked a
+/// command unread that hides nothing (cameronsjo/cadence-hooks#1279, round
+/// 3). A shell-fed body is kept, appended as the script it is.
+fn without_data_heredocs(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+    let mut text = strip_heredoc_bodies(command);
+    for body in shell_fed_heredoc_bodies(command) {
+        text.push('\n');
+        text.push_str(&body);
+    }
+    Cow::Owned(text)
+}
+
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
@@ -3191,6 +3210,10 @@ impl Default for SecretLeaksGuard {
 impl Check for SecretLeaksGuard {
     fn name(&self) -> &str {
         "prevent-secret-leaks"
+    }
+
+    fn refuses_unread_commands(&self) -> bool {
+        true
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
@@ -8591,9 +8614,12 @@ mod tests {
                 "git push --receive-pack 'cat .env' origin",
                 "git -c alias.x='!cat .env' x",
                 "GIT_EDITOR='cat .env' git commit",
+                // Core expands these command strings into segments too.
+                "git -c core.pager='cat .env' log",
+                "GIT_SSH_COMMAND='cat .env' git fetch",
             ],
             cadence_hooks_core::Outcome::Block,
-            "a git option that prints content or runs a command drops the exemption",
+            "a command string git runs is judged as the commands it is",
         );
         assert_bash(
             &[
@@ -8611,8 +8637,6 @@ mod tests {
                 "env GIT_EDITOR=vi git commit .env",
                 "export GIT_CONFIG_PARAMETERS=x; git add .env",
                 "GIT_CONFIG_KEY_0=core.pager git log -- .env",
-                "git -c core.pager='cat .env' log",
-                "GIT_SSH_COMMAND='cat .env' git fetch",
                 "git filter-repo --filename-callback 'return 1' --path .env",
             ],
             cadence_hooks_core::Outcome::Allow,

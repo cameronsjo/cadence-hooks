@@ -291,6 +291,10 @@ enum CadenceCommands {
     },
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
+    /// Mask secret values in Bash output before they reach the transcript
+    RedactSecretOutput,
+    /// Ask before a command prints a bare, unnamed secret value
+    GuardSecretDump,
     /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
     /// the plugin-shipped platform baseline (SessionStart)
     PlatformDrift {
@@ -313,6 +317,11 @@ enum CadenceCommands {
         /// (default: config originAudience, else public)
         #[arg(long, value_name = "TIER")]
         audience: Option<String>,
+        /// Destination repo (OWNER/REPO, as `gh -R` takes it). When it is none
+        /// of the current checkout's remotes, this checkout's allowlist,
+        /// category ceilings and originAudience are not applied
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
         /// Scaffold the redaction section of .claude/cadence.json and exit
         #[arg(long)]
         init: bool,
@@ -598,6 +607,8 @@ enum SessionCommands {
     WarnPlanReadyFlip,
     /// Block ExitPlanMode on a plan with no settled Panel: line; nudge on other missing stanzas (PreToolUse:ExitPlanMode)
     LintPlanShape,
+    /// Ask to confirm a /model switch away from the in-flight plan's Driver family (PreModelSwitch)
+    PlanDriver,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -641,6 +652,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::AuditRunnerPool => "audit-runner-pool",
             CadenceCommands::GuardHeldClose { .. } => "guard-held-close",
             CadenceCommands::RedactExternalContent => "redact-external-content",
+            CadenceCommands::RedactSecretOutput => "redact-secret-output",
+            CadenceCommands::GuardSecretDump => "guard-secret-dump",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
             CadenceCommands::ModelPosture => "model-posture",
             // record-polish and redact-scan are CLI actions, not hooks — no
@@ -741,6 +754,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
             SessionCommands::LintPlanShape => "lint-plan-shape",
+            SessionCommands::PlanDriver => "plan-driver",
             // declare, status, and plans are CLI actions, not hooks — no
             // hooks.json wiring and not subject to CADENCE_DISABLE (same
             // treatment as dismiss-main-branch-warn).
@@ -769,6 +783,7 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let pre_model_switch = HookEvent::PreModelSwitch;
     Some(match cmd {
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => CheckPlan::new(
@@ -855,6 +870,14 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             CadenceCommands::RedactExternalContent => CheckPlan::new(
                 Box::new(cadence_hooks_cadence::redact_external_content::RedactExternalContent),
+                pre,
+            ),
+            CadenceCommands::RedactSecretOutput => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::redact_secret_output::RedactSecretOutput),
+                post,
+            ),
+            CadenceCommands::GuardSecretDump => CheckPlan::new(
+                Box::new(cadence_hooks_cadence::guard_secret_dump::SecretDumpGuard),
                 pre,
             ),
             CadenceCommands::PlatformDrift { baseline } => CheckPlan::new(
@@ -1062,9 +1085,12 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             SessionCommands::Start => {
                 CheckPlan::new(Box::new(cadence_hooks_session::start::Start), session)
             }
-            SessionCommands::Guard => {
-                CheckPlan::new(Box::new(cadence_hooks_session::guard::Guard), pre)
-            }
+            SessionCommands::Guard => CheckPlan::new(
+                Box::new(cadence_hooks_session::guard::Guard::new(
+                    cadence_hooks_guardrails::enforce_worktree::bash_write_targets,
+                )),
+                pre,
+            ),
             SessionCommands::WarnBranchDrift => CheckPlan::new(
                 Box::new(cadence_hooks_session::branch_drift::WarnBranchDrift),
                 pre,
@@ -1096,6 +1122,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             SessionCommands::LintPlanShape => CheckPlan::new(
                 Box::new(cadence_hooks_session::plan_guards::LintPlanShape),
                 pre,
+            ),
+            SessionCommands::PlanDriver => CheckPlan::new(
+                Box::new(cadence_hooks_session::plan_driver::PlanDriver),
+                pre_model_switch,
             ),
             _ => return None,
         },
@@ -1692,6 +1722,7 @@ fn main() {
             CadenceCommands::RedactScan {
                 file,
                 audience,
+                repo,
                 init,
                 status,
                 validate_config,
@@ -1708,8 +1739,10 @@ fn main() {
                     );
                 }
                 process::exit(
-                    cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
-                        .into(),
+                    cadence_hooks_cadence::redact_external_content::run_scan_to(
+                        file, audience, repo, init,
+                    )
+                    .into(),
                 );
             }
             // Hook checks dispatched above, through `check_plan`.
