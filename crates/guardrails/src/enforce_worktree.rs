@@ -938,6 +938,31 @@ fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
     scan_targets(command, cwd, false).mutations
 }
 
+/// Every location a Bash `command` run from `cwd` writes into, per the #234
+/// subprocess tree-mutation walk: a package-manager verb's effective
+/// directory, a `sed -i`/`tee` target, and every `>`/`>>` redirect target —
+/// resolved through the same `cd`/`-C`/wrapper tracking the nudge channel uses.
+///
+/// Exported for `session guard`'s peer-lane Bash arm (cadence-hooks#272), so
+/// the lane predicate rides this walker rather than growing a second parser.
+/// The walk is advisory-grade: it names the paths it can resolve and omits the
+/// rest (see the module docs' named v1 misses). No existence filter — a new
+/// file is still a write. `session` cannot depend on this crate (the
+/// dependency runs the other way), so the binary injects this function into
+/// `cadence_hooks_session::guard::Guard`.
+pub fn bash_write_targets(command: &str, cwd: &str) -> Vec<String> {
+    let home = dollar_home(command);
+    let env = CdEnv::for_command(command, home.as_deref(), true);
+    let plain = plain_of(command, cwd, env);
+    scan_prepared(command, cwd, env, plain.as_ref())
+        .mutations
+        .into_iter()
+        .map(|target| match target {
+            MutationTarget::Dir(path) | MutationTarget::File(path) => path,
+        })
+        .collect()
+}
+
 /// A package-manager subcommand that mutates a manifest/lockfile in its cwd:
 /// `uv add|remove|sync`, `cargo add|rm`, `pip install`, `npm install|i|add`,
 /// `pnpm add|install`, `poetry add`, `yarn add`. Coarse v1 taxonomy — the cwd

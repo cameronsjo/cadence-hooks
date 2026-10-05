@@ -300,6 +300,24 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "redact-secret-output",
+        description: "Mask secret values in Bash output before they reach the transcript",
+        namespace: "cadence",
+        events: &[HookEvent::PostToolUse],
+        // Remote: pure text transform of the tool output; the cloud VM prints secrets too.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
+        name: "guard-secret-dump",
+        description: "Ask before a command prints a bare, unnamed secret value",
+        namespace: "cadence",
+        events: &[HookEvent::PreToolUse],
+        // Remote: no-op when the producing tools are absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "guard-held-close",
         description: "Block `gh issue close` when the target is on the HELD-issue ledger (`--ledger` file, or `CADENCE_DRAIN_HELD`)",
         namespace: "cadence",
@@ -920,6 +938,17 @@ pub const HOOKS: &[HookEntry] = &[
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).
         remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
+        name: "plan-driver",
+        description: "Ask to confirm a /model switch (command or picker, attended TUI only: CLAUDE_CODE_ENTRYPOINT=cli and CLAUDE_CODE_SESSION_ATTENDED=1, never -p, stream-json, SDK or CLAUDE_CODE_REMOTE, where an ask refuses the switch) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
+        namespace: "session",
+        events: &[HookEvent::PreModelSwitch],
+        // Remote: read-only; the check self-silences under CLAUDE_CODE_REMOTE,
+        // where a streamed /model cannot answer an ask and would be refused (#989).
+        remote: RemotePolicy::Run,
+        // It asks, never nudges.
         suppressible: false,
     },
 ];

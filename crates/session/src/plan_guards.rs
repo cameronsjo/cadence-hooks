@@ -145,9 +145,49 @@ pub fn run_lint_plan_shape(input: &HookInput) -> CheckResult {
         return CheckResult::allow();
     }
     let Some(plan) = plan_text(input) else {
+        // ADR-0001 allow, but not a silent one (cameronsjo/cadence-hooks#1256
+        // M-3): a `planFilePath` that yields no plan — outside
+        // `<config_dir>/plans` (a user-configured plans directory, another
+        // CLAUDE_CONFIG_DIR) or unreadable inside it — means the one blocking
+        // plan guard judged nothing. Record it in `failopen.jsonl`.
+        // No plan text and no `planFilePath` at all is the same miss
+        // (#1277 gate-2 m-3).
+        log_unjudged(match input.plan_file_path() {
+            Some(path) => {
+                let root = cadence_hooks_core::paths::claude_config_dir().join("plans");
+                plan_store_miss(Path::new(path), &root)
+            }
+            None => "no-plan-text",
+        });
         return CheckResult::allow();
     };
     judge_plan_shape(&plan)
+}
+
+/// Why a `planFilePath` produced no plan to judge — static text only, never
+/// the payload's path (the `failopen.jsonl` discipline, cadence-hooks#959).
+/// Lexical: the containment-checked read already decided; this only labels.
+fn plan_store_miss(path: &Path, plan_store_root: &Path) -> &'static str {
+    let inside = path.starts_with(plan_store_root)
+        || plan_store_root
+            .canonicalize()
+            .is_ok_and(|root| path.starts_with(root));
+    if inside {
+        "plan-store-file-unreadable"
+    } else {
+        "plan-file-outside-store"
+    }
+}
+
+/// Record a `lint-plan-shape` allow that judged nothing.
+fn log_unjudged(case: &str) {
+    cadence_hooks_metrics::log_failopen(
+        "unjudged",
+        Some("session"),
+        Some("lint-plan-shape"),
+        env!("CARGO_PKG_VERSION"),
+        Some(case),
+    );
 }
 
 /// The plan text to judge: the call-side inline `tool_input.plan` first (what
@@ -540,10 +580,22 @@ fn commit_summary_present(stdout: &str) -> bool {
 /// Did any of the last [`TICK_NUDGE_COMMIT_WINDOW`] commits touch
 /// `rel_path`? A failed spawn reads as "touched" — fail-open means never
 /// nudging on missing evidence.
+///
+/// `core.quotePath=false` (cameronsjo/cadence-hooks#1256 M-6): under git's
+/// default a non-ASCII name prints C-quoted (`"docs/plans/caf\303\251.md"`)
+/// and never equals the raw `rel_path`, so a plan named `café.md` drew a false
+/// "living plan untouched" nudge on the very commit that touched it.
 fn recent_commits_touch(repo_root: &str, rel_path: &str) -> bool {
     let Some(out) = cadence_hooks_core::shell::git_command(
         repo_root,
-        &["log", TICK_NUDGE_COMMIT_WINDOW, "--format=", "--name-only"],
+        &[
+            "-c",
+            "core.quotePath=false",
+            "log",
+            TICK_NUDGE_COMMIT_WINDOW,
+            "--format=",
+            "--name-only",
+        ],
     ) else {
         return true;
     };
@@ -576,7 +628,10 @@ fn working_tree_touches(repo_root: &str, rel_path: &str) -> bool {
 /// than inventing boxes.
 fn unticked_boxes(path: &Path) -> usize {
     use std::io::Read as _;
-    let Ok(file) = std::fs::File::open(path) else {
+    // O_NOFOLLOW | O_NONBLOCK + fstat regular-file check: the symlink filter
+    // upstream ran on a path, and a FIFO swapped in after it must not stall
+    // the hook (cameronsjo/cadence-hooks#1256).
+    let Some(file) = cadence_hooks_core::paths::open_regular_nofollow(path) else {
         return 0;
     };
     let mut buf = Vec::new();
@@ -598,6 +653,73 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // --- lint-plan-shape unjudged allows (cameronsjo/cadence-hooks#1256 M-3) ---
+
+    #[test]
+    fn plan_store_miss_table() {
+        let root = Path::new("/cfg/plans");
+        let cases = [
+            ("/cfg/plans/x.md", "plan-store-file-unreadable"),
+            ("/cfg/plans/sub/x.md", "plan-store-file-unreadable"),
+            ("/elsewhere/plans/x.md", "plan-file-outside-store"),
+            ("/cfg/plans-evil/x.md", "plan-file-outside-store"),
+            ("relative/x.md", "plan-file-outside-store"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(plan_store_miss(Path::new(path), root), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn lint_plan_shape_records_a_failopen_row_when_it_judges_nothing() {
+        let metrics = TempDir::new().unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "", "planFilePath": "/nowhere/custom-plans/p.md"},
+        }))
+        .unwrap();
+        let r = crate::registry::test_metrics_env::with_metrics_dir(metrics.path(), || {
+            run_lint_plan_shape(&input)
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        let ledger = fs::read_to_string(metrics.path().join("failopen.jsonl")).unwrap();
+        assert!(ledger.contains("\"reason\":\"unjudged\""), "{ledger}");
+        assert!(ledger.contains("plan-file-outside-store"), "{ledger}");
+        assert!(
+            !ledger.contains("custom-plans"),
+            "no payload text: {ledger}"
+        );
+
+        // Empty plan and no planFilePath: still a row (gate-2 m-3).
+        let bare = TempDir::new().unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "  "},
+        }))
+        .unwrap();
+        let r = crate::registry::test_metrics_env::with_metrics_dir(bare.path(), || {
+            run_lint_plan_shape(&input)
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        let ledger = fs::read_to_string(bare.path().join("failopen.jsonl")).unwrap();
+        assert!(ledger.contains("no-plan-text"), "{ledger}");
+
+        // An inline plan is judged: no row.
+        let judged = TempDir::new().unwrap();
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "# T\n", "planFilePath": "/nowhere/p.md"},
+        }))
+        .unwrap();
+        crate::registry::test_metrics_env::with_metrics_dir(judged.path(), || {
+            run_lint_plan_shape(&input)
+        });
+        assert!(!judged.path().join("failopen.jsonl").exists());
+    }
+
     // --- judge_plan_shape message pins ---
 
     #[test]
@@ -611,7 +733,9 @@ mod tests {
             "the block says only Panel: blocks: {msg}"
         );
         assert!(
-            msg.contains("Also missing, advisory only (a nudge, never a block): an Alternatives"),
+            msg.contains(
+                "Also missing, advisory only (a nudge, never a block): a ## Loop section, an Alternatives"
+            ),
             "the other stanzas are named as advice: {msg}"
         );
         assert!(
@@ -654,6 +778,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("plan-shape gate: plan lacks "));
+        assert!(msg.contains("a ## Loop section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -668,6 +793,48 @@ mod tests {
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
             "the stanza nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_missing_only_loop_nudges_and_never_blocks() {
+        let r = judge_plan_shape(&plan_scan::template_shaped_plan_without_loop());
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a missing Loop section never blocks"
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("plan-shape gate: plan lacks a ## Loop section — advisory, from "),
+            "the nudge names only the Loop stanza and marks it advisory: {msg}"
+        );
+        assert!(
+            !msg.contains("the one stanza that blocks"),
+            "the block wording is for an unsettled Panel: line: {msg}"
+        );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the Loop nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_loop_is_advisory_when_the_panel_line_blocks() {
+        // Panel: and Loop both missing: the block is for `Panel:` alone, and
+        // the Loop stanza rides along in the advisory tail.
+        let plan = plan_scan::template_shaped_plan_without_loop()
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let r = judge_plan_shape(&plan);
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("Also missing, advisory only (a nudge, never a block): a ## Loop section"),
+            "Loop is named as advice, not as the blocking stanza: {msg}"
+        );
+        assert!(
+            msg.contains("this plan lacks a settled Panel: line — the one stanza that blocks"),
+            "{msg}"
         );
     }
 
@@ -713,6 +880,57 @@ mod tests {
         };
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", msg]);
+    }
+
+    /// cameronsjo/cadence-hooks#1256 M-6: a committed plan with a non-ASCII
+    /// name counts as touched (git's default C-quoting used to hide it).
+    #[test]
+    fn recent_commits_touch_matches_non_ascii_plan_names() {
+        for name in [
+            "ascii-plan.md",
+            "2026-09-30-caf\u{e9}.md",
+            "\u{65e5}\u{672c}.md",
+            "sp ace.md",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            write_plan(tmp.path(), name, "in-flight", "main", "- [ ] a\n");
+            commit_all(tmp.path(), "plan");
+            let root = tmp.path().to_string_lossy();
+            assert!(
+                recent_commits_touch(&root, &format!("docs/plans/{name}")),
+                "{name}"
+            );
+            assert!(
+                !recent_commits_touch(&root, "docs/plans/other.md"),
+                "control: {name}"
+            );
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1256 M-3: a FIFO or symlink at the plan path
+    /// reads as zero boxes without stalling; a regular file still counts.
+    #[cfg(unix)]
+    #[test]
+    fn unticked_boxes_refuses_fifo_and_symlink_without_stalling() {
+        let tmp = TempDir::new().unwrap();
+        let regular = tmp.path().join("p.md");
+        fs::write(&regular, "- [ ] a\n- [ ] b\n- [x] c\n").unwrap();
+        let fifo = tmp.path().join("fifo.md");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let started = std::time::Instant::now();
+        for (path, want) in [(&regular, 2), (&fifo, 0), (&link, 0)] {
+            assert_eq!(unticked_boxes(path), want, "{}", path.display());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn write_plan(dir: &Path, name: &str, status: &str, branch: &str, body: &str) {
