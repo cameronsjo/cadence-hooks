@@ -105,26 +105,25 @@ pub fn is_safe_template(filename: &str) -> bool {
 
 /// Check if a filename matches blocked patterns (definite secrets).
 pub fn is_blocked(filename: &str, path: &str) -> bool {
-    let lower = filename.to_lowercase();
+    is_secret_name_at(
+        &filename.to_lowercase(),
+        &path.to_lowercase(),
+        Filename::Known,
+    )
+}
 
-    // The whole `.env` family — not just the handful in BLOCKED_FILENAMES — so
-    // the tool path agrees with the Bash path's predicate (#64).
-    if is_env_family_secret(&lower) {
-        return true;
-    }
-
-    if BLOCKED_FILENAMES.iter().any(|&p| lower == p) {
-        return true;
-    }
-
-    if is_key_material_name(&lower, Filename::Known) {
-        return true;
-    }
-
-    let lower_path = path.to_lowercase();
-    BLOCKED_PATH_FRAGMENTS
-        .iter()
-        .any(|frag| lower_path.contains(frag))
+/// [`is_blocked`] on an already-lowercased component and path, told whether
+/// the caller knows the word names a file. The `.env` family (the whole
+/// family, not just `BLOCKED_FILENAMES`, so the tool path agrees with the
+/// Bash path, #64), the exact credential-store names, key material, and the
+/// dir-qualified fragments.
+pub(crate) fn is_secret_name_at(component: &str, path: &str, position: Filename) -> bool {
+    is_env_family_secret_at(component, position)
+        || BLOCKED_FILENAMES.contains(&component)
+        || is_key_material_name(component, position)
+        || BLOCKED_PATH_FRAGMENTS
+            .iter()
+            .any(|frag| path.contains(frag))
 }
 
 /// Is this lowercased component a key-material file by NAME — the
@@ -180,11 +179,12 @@ pub fn is_ambiguous(filename: &str) -> bool {
 /// `BLOCKED_FILENAMES` membership — which missed `.env.prod`, `.env.dev`,
 /// `.env.development.local`, … and let the tools read what the shell blocked
 /// (#64). Callers pass an already-lowercased basename/component.
+#[cfg(test)]
 pub(crate) fn is_env_family_secret(component: &str) -> bool {
     is_env_family_secret_at(component, Filename::Known)
 }
 
-/// [`is_env_family_secret`], told whether the caller knows this names a file.
+/// `is_env_family_secret`, told whether the caller knows this names a file.
 pub(crate) fn is_env_family_secret_at(component: &str, position: Filename) -> bool {
     // `.envrc` is a direnv loader rather than a dotenv file. It is in the deny
     // set and NOT in the dotenv shape — exactly the kind of difference the
@@ -201,7 +201,7 @@ pub(crate) fn is_env_family_secret_at(component: &str, position: Filename) -> bo
 /// The single home for the three spellings, because two predicates need the
 /// same shape question and disagreed about it for months. `is_forgectl_env_file`
 /// (which decides what `forgectl env --file` accepts) knew all three;
-/// [`is_env_family_secret`] knew only the first two, so `prod.env` was readable
+/// `is_env_family_secret` knew only the first two, so `prod.env` was readable
 /// and writable while `.env` blocked, and the shipped guidance naming `*.env`
 /// as guarded was false for that shape (cadence-hooks#854).
 ///
@@ -385,7 +385,7 @@ pub(crate) fn envrc_carveout_allows(filename: &str, content: Option<&str>) -> bo
 /// `settings.environment`, `.environment`, and `my.envelope.txt` stay clean
 /// (closes the #86 substring false-block class for both secret guards).
 /// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
-/// trailing `)` (subshell close) before classifying via [`is_env_family_secret`].
+/// trailing `)` (subshell close) before classifying via [`is_env_family_secret_at`].
 pub fn is_dangerous_env_token(token: &str) -> bool {
     is_dangerous_env_token_at(token, Filename::Unqualified)
 }
@@ -427,17 +427,12 @@ pub fn is_dangerous_secret_token(token: &str) -> bool {
 /// [`is_dangerous_secret_token`], told whether the caller already knows the
 /// token names a file — a redirection target, a writer verb's operand, or an
 /// operand of a command that does nothing but read files.
+///
+/// Since cameronsjo/cadence-hooks#1303 only `prevent_secret_writes` asks this
+/// question, glob walk included; `prevent_secret_leaks` judges a literal name
+/// through [`is_blocked`] and a glob by its literal runs.
 pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
-    unescaped_verdict(token, position, true) || secret_token_verdict(token, position, true)
-}
-
-/// [`is_dangerous_secret_token_at`] without the glob judgment, for a word
-/// that a command reads as a PATTERN (`grep`'s regex, `jq`'s filter), where
-/// `*`, `?` and `[` are regex syntax rather than filename expansion. A
-/// literal secret name still counts, and so does a brace group, which the
-/// shell expands into separate words before the command runs.
-pub fn is_dangerous_secret_name_at(token: &str, position: Filename) -> bool {
-    unescaped_verdict(token, position, false) || secret_token_verdict(token, position, false)
+    unescaped_verdict(token, position) || secret_token_verdict(token, position)
 }
 
 /// True when a backslash in `token` escapes a brace- or glob-expansion
@@ -450,12 +445,12 @@ pub fn is_dangerous_secret_name_at(token: &str, position: Filename) -> bool {
 /// group (`\{cat,.env\}`, one literal file to bash) stays non-matching. For
 /// the same reason a word that escapes a brace or glob character is skipped.
 /// A quoted backslash dropped here can only over-block.
-fn unescaped_verdict(token: &str, position: Filename, globs: bool) -> bool {
+fn unescaped_verdict(token: &str, position: Filename) -> bool {
     if !token.contains('\\') || escapes_expansion_syntax(token) {
         return false;
     }
     let unescaped = cadence_hooks_core::shell::unescape_word(token);
-    unescaped != token && secret_token_verdict(&unescaped, position, globs)
+    unescaped != token && secret_token_verdict(&unescaped, position)
 }
 
 fn escapes_expansion_syntax(token: &str) -> bool {
@@ -471,7 +466,7 @@ fn escapes_expansion_syntax(token: &str) -> bool {
     false
 }
 
-fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
+fn secret_token_verdict(token: &str, position: Filename) -> bool {
     // Checked before any brace or glob analysis, both of which grow with the
     // token: a 100 KB `{{{…` took seconds (#1097 review). Nothing legitimate
     // needs a 4 KiB word with glob syntax in it.
@@ -486,7 +481,7 @@ fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
         Some(words) if words.len() > 1 => {
             return words
                 .iter()
-                .any(|word| secret_token_verdict(word, position, globs));
+                .any(|word| secret_token_verdict(word, position));
         }
         Some(_) => {}
     }
@@ -503,10 +498,8 @@ fn secret_token_verdict(token: &str, position: Filename, globs: bool) -> bool {
         || BLOCKED_PATH_FRAGMENTS
             .iter()
             .any(|frag| trimmed.contains(frag))
-        || (globs
-            && has_glob_syntax(trimmed)
-            && glob_may_name_secret(trim_operand(token), position))
-        || (globs && var_glob_may_name_secret(token, position))
+        || (has_glob_syntax(trimmed) && glob_may_name_secret(trim_operand(token), position))
+        || var_glob_may_name_secret(token, position)
 }
 
 /// `token` with each unexpanded parameter reference (`$X`, `${X}`, `${X:-a}`,
@@ -3159,16 +3152,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn pattern_operands_skip_only_the_glob_judgment() {
-        use Filename::Unqualified;
-        assert!(!is_dangerous_secret_name_at(".env*", Unqualified));
-        assert!(!is_dangerous_secret_name_at(".*", Unqualified));
-        assert!(is_dangerous_secret_name_at(".env", Unqualified));
-        assert!(is_dangerous_secret_name_at("{x,.env}", Unqualified));
-        assert!(is_dangerous_secret_token_at(".env*", Unqualified));
     }
 
     #[test]

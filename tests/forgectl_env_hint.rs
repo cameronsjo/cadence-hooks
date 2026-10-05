@@ -76,18 +76,15 @@ fn a_path_free_environment_still_blocks() {
 }
 
 #[test]
-fn a_path_qualified_forgectl_read_blocks() {
-    // The B0 hardening, end to end through the shipped dispatch. This exited
-    // 0 on 0.89.0.
+fn a_path_qualified_forgectl_read_is_not_judged() {
+    // cameronsjo/cadence-hooks#1303: `forgectl` is not an enumerated reader,
+    // so no spelling of it is judged — this blocked from 0.89.0 (the B0
+    // hardening) until the reader model replaced the verb-agnostic scan.
     let payload =
         r#"{"tool_name":"Bash","tool_input":{"command":"./forgectl env keys --file .env"}}"#;
     let (code, stderr) = run_guard("prevent-secret-leaks", payload, "/usr/bin:/bin");
 
-    assert_eq!(code, 2, "stderr was: {stderr}");
-    assert!(
-        stderr.contains("prevent-secret-leaks"),
-        "the leaks guard owns this shape: {stderr}"
-    );
+    assert_eq!(code, 0, "stderr was: {stderr}");
 }
 
 #[test]
