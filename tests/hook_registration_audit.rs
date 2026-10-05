@@ -311,22 +311,6 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
-    // Binary half of the two-PR shape: the cadence plugin's hooks.json entries
-    // (PostToolUse Bash for the redactor, PreToolUse Bash for the Ask guard)
-    // ride the follow-up monorepo wiring PR (cameronsjo/cadence-hooks#776).
-    (
-        "cadence redact-secret-output",
-        "cameronsjo/cadence-hooks#776",
-    ),
-    ("cadence guard-secret-dump", "cameronsjo/cadence-hooks#776"),
-    // The PreModelSwitch confirm ships here first; its cadence-plugin hooks.json
-    // entry (a `PreModelSwitch` block) rides the follow-up monorepo wiring PR,
-    // which also needs an INTENTIONAL_CROSS_PLUGIN_HOOKS row (two-PR shape,
-    // cameronsjo/cadence-hooks#989).
-    ("session plan-driver", "cameronsjo/cadence-hooks#989"),
-    // Opt-in UserPromptSubmit gap marker: binary first, its `cadence` plugin
-    // hooks.json entry rides the follow-up monorepo wiring PR (two-PR shape).
-    ("session nudge-afk-gap", "cameronsjo/cadence-hooks#480"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -360,6 +344,10 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // them all, and a Bash write there blocks outright
     // (cameronsjo/cadence-hooks#755, wired in cameronsjo/cadence#1547).
     "guardrails guard-runbook-scrub",
+    // Wired on a PostToolUse `Bash` matcher with no `if:`: it masks secret
+    // values in the command's *output*, which no command-side glob can predict
+    // (cameronsjo/cadence-hooks#776, wired in cameronsjo/cadence#1565).
+    "cadence redact-secret-output",
 ];
 
 /// Entries of [`INTENTIONAL_UNFILTERED_BASH_HOOKS`] whose wiring still carries
@@ -459,6 +447,20 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "session backstop-record",
         "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
     ),
+    // The PreModelSwitch confirm and the opt-in UserPromptSubmit gap marker ride
+    // the always-on cadence plugin while `session` owns plan/session state
+    // (cameronsjo/cadence-hooks#989 wired in cameronsjo/cadence#1564;
+    // cameronsjo/cadence-hooks#480 wired in cameronsjo/cadence#1563).
+    (
+        "cadence",
+        "session plan-driver",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session nudge-afk-gap",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
 ];
 
 /// Commands a plugin registers MORE THAN ONCE inside a single matcher block —
@@ -493,6 +495,10 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "guardrails guard-forge-write",
     "metrics log-polish-nudge",
     "session guard",
+    // Wired as thirteen single-rule `if:` entries, one per secret-producing CLI
+    // (`security`, `kubectl`, `op`, `aws`, `vault`, …), because `if:`
+    // alternation is unsupported (cameronsjo/cadence#1565).
+    "cadence guard-secret-dump",
 ];
 
 /// claude-configurations#472: the binary's dedupe allowlist may only name hooks
