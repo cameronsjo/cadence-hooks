@@ -4182,6 +4182,7 @@ mod tests {
         // (cameronsjo/cadence-hooks#715) — never three separate sentences.
         assert!(msg.contains("format gate: plan lacks "));
         assert!(msg.contains("a settled Panel: line"));
+        assert!(msg.contains("a ## Loop section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -4217,6 +4218,51 @@ mod tests {
         let msg2 = r2.message.unwrap();
         assert!(!msg2.contains("format gate:"));
         assert!(!msg2.contains("panel gate:"));
+    }
+
+    #[test]
+    fn format_gate_names_a_missing_loop_section_and_nothing_else() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        // Every other stanza present, no `## Loop` heading.
+        let input = exit_plan_mode_post_tool_use(
+            "fmt-loop-session",
+            &crate::plan_scan::template_shaped_plan_without_loop(),
+            &cwd,
+            &tmp.path().join("fmt-loop-session.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(
+                &input,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+                &test_env(),
+            )
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "the format gate only ever nudges"
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(
+                "format gate: plan lacks a ## Loop section — the plan template: \
+                 `cadence:arrange` `references/plan-template.md`."
+            ),
+            "the persist-time sentence names the Loop stanza alone: {msg}"
+        );
+        assert!(
+            !msg.contains("a settled Panel: line")
+                && !msg.contains("an Alternatives-declined stanza")
+                && !msg.contains("checkbox tasks"),
+            "no other stanza is reported missing: {msg}"
+        );
     }
 
     #[test]

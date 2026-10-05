@@ -57,7 +57,7 @@
 //! hosts the ONE implementation of the plan template's mandatory-stanza
 //! checks ([`missing_stanzas`], built on [`panel_line_settled`],
 //! [`alternatives_stanza_present`], [`checkbox_present`], and the shared
-//! [`visible_lines`] fence/quote filter). Two gates consume it: the
+//! [`visible_lines`] filter for fences, quotes, comments and frontmatter). Two gates consume it: the
 //! persist-time format-gate sentence in [`crate::persist_plan`] (after
 //! approval) and the call-time `session lint-plan-shape` block in
 //! [`crate::plan_guards`] (at `PreToolUse:ExitPlanMode`). They share one
@@ -123,21 +123,18 @@ pub(crate) struct InFlightPlan {
 /// consumer uses (the living-plan-guards plan's Task 3 shared-reader bullet;
 /// two independent scanners diverged on fence discipline in this feature's
 /// first cut, which is exactly the drift a single reader prevents). Lines
-/// inside fenced code blocks (``` / ~~~ toggles) never count — a plan that
-/// *documents* checklist syntax in a fenced example carries no real boxes
-/// there. Both tick spellings count as ticked (`[x]`/`[X]`).
+/// the plan-shape detectors skip never count: it reads through
+/// [`visible_lines`], so a box in fenced code, an HTML comment block or the
+/// leading frontmatter is an example, not a task, and the two readers agree
+/// on every hidden span (cameronsjo/cadence-hooks#1283). Hiding cuts both
+/// ways for the unticked count `plan_guards` reads: a hidden example box no
+/// longer raises it, and a box hidden by an unterminated fence or comment no
+/// longer counts either (an advisory nudge, never a block). Both tick
+/// spellings count as ticked (`[x]`/`[X]`).
 pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
-    let mut in_fence = false;
     let (mut unticked, mut ticked) = (0usize, 0usize);
-    for line in text.lines() {
+    for line in visible_lines(text) {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
         if trimmed.starts_with("- [ ]") {
             unticked += 1;
         } else if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
@@ -149,24 +146,160 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
 
 /// Every plan-shape detector in this module ([`alternatives_stanza_present`],
 /// [`panel_line_settled`]) and the `## Orchestrator` reader in
-/// [`crate::persist_plan`] skip the same two things before inspecting a
-/// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
-/// matching, which errs toward skipping ambiguous lines) and block quotes
-/// (`>`). One shared filter so the discipline can't drift between detectors.
+/// [`crate::persist_plan`] skip the same things before inspecting a line —
+/// so a line the operator never sees in a rendered view cannot settle a gate
+/// (cameronsjo/cadence-hooks#1283): fenced code, block quotes (`>`), HTML
+/// comment blocks, and the leading YAML frontmatter block. One shared filter
+/// so the discipline can't drift between detectors.
+///
+/// Fences follow CommonMark: a line whose first non-space run is three or
+/// more backticks or tildes opens one, and only a line of the SAME character,
+/// at least as long as the opener, with nothing after it but whitespace, and
+/// indented at most 3 columns past the opener (a tab is 4) closes it — so a
+/// four-backtick fence holding a three-backtick fence, a backtick fence
+/// holding a tilde fence, or a fence holding a 4-space-indented nested fence
+/// stays one fence (see [`fence_opener`]). An unterminated fence runs to EOF, as it renders: the
+/// error leans toward hiding, so a stray opener can only make a stanza read
+/// as missing, never let an example satisfy one.
+///
+/// Comments follow CommonMark's HTML block (type 2): outside a fence, only a
+/// line whose `<!--` STARTS it (after at most 3 spaces of indent) opens one.
+/// That line, and — when it carries no `-->` after its `<!` (so `<!-->`
+/// and `<!--->` are complete, empty comments) — every
+/// following line up to and including the first carrying `-->`, is skipped;
+/// an unterminated opener runs to EOF, as it renders. A mid-line `<!--`
+/// (prose, inline code) renders as literal text and toggles nothing (#1277
+/// gate-2 I-1: treating it as an opener hid a visible `Panel:`/`Driver:`
+/// line). Text after a closing `-->` on the same line is dropped with it.
+/// Frontmatter: see [`leading_frontmatter_line_count`].
 pub(crate) fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
-    let mut in_fence = false;
-    body.lines().filter(move |line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+    visible_lines_after(body, leading_frontmatter_line_count(body))
+}
+
+/// [`visible_lines`] WITHOUT the frontmatter skip, for the one reader whose
+/// subject lives there: the legacy `recommended_model:` frontmatter field.
+fn visible_lines_with_frontmatter(body: &str) -> impl Iterator<Item = &str> {
+    visible_lines_after(body, 0)
+}
+
+fn visible_lines_after(body: &str, skip: usize) -> impl Iterator<Item = &str> {
+    // The open fence's character, run length and indent, while inside one.
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut in_comment = false;
+    body.lines().skip(skip).filter(move |line| {
+        if in_comment {
+            if line.contains("-->") {
+                in_comment = false;
+            }
             return false;
         }
-        !in_fence && !line.starts_with('>')
+        let trimmed = line.trim_start();
+        if let Some((ch, len, open_indent)) = fence {
+            // A closer indented 4+ columns past the opener is content.
+            if indent_columns(line) <= open_indent + 3 && fence_closes(trimmed, ch, len) {
+                fence = None;
+            }
+            return false;
+        }
+        if let Some((ch, len)) = fence_opener(trimmed) {
+            fence = Some((ch, len, indent_columns(line)));
+            return false;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent <= 3
+            && let Some(comment) = line.trim_start_matches(' ').strip_prefix("<!")
+            && comment.starts_with("--")
+        {
+            // The opener's `--` may double as the closer's, so `<!-->` and
+            // `<!--->` are complete (empty) comments ending on this line.
+            in_comment = !comment.contains("-->");
+            return false;
+        }
+        !line.starts_with('>')
     })
 }
 
+/// The fence character and run length when `trimmed` (a line with its
+/// leading whitespace removed) opens a fenced code block: three or more
+/// backticks or tildes, an info string allowed after. Any indent opens one —
+/// wider than CommonMark's 3 spaces, so a fence nested in a list item is
+/// still skipped; the error leans toward hiding.
+fn fence_opener(trimmed: &str) -> Option<(u8, usize)> {
+    let ch = *trimmed.as_bytes().first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == ch).count();
+    (len >= 3).then_some((ch, len))
+}
+
+/// Columns of leading whitespace in `line`, a tab advancing to the next
+/// multiple of 4 (CommonMark's tab stop).
+fn indent_columns(line: &str) -> usize {
+    let mut cols = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => cols += 1,
+            b'\t' => cols += 4 - cols % 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
+/// True when `trimmed` closes a fence opened by `len` × `ch`: the same
+/// character, a run at least as long, and no info string after it.
+fn fence_closes(trimmed: &str, ch: u8, len: usize) -> bool {
+    let run = trimmed.bytes().take_while(|&b| b == ch).count();
+    run >= len && trimmed[run..].trim().is_empty()
+}
+
+/// Lines (fences included) of a leading YAML frontmatter block, or 0.
+///
+/// A first line of exactly `---`, a later `---`/`...` close, and a body that
+/// reads as frontmatter: its first line a column-0 `key:` line, then only
+/// `key:` lines, indented continuation lines, `- ` items, or `#` comments —
+/// no blank line. Anything else (a line-1 `---` thematic break followed by a
+/// blank line and prose, #1277 gate-2 m-1) is not frontmatter, and its lines
+/// stay visible.
+fn leading_frontmatter_line_count(body: &str) -> usize {
+    // A leading BOM is invisible and does not stop a renderer's frontmatter.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+    let mut lines = body.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return 0;
+    }
+    let Some(close) = lines
+        .clone()
+        .position(|l| matches!(l.trim_end(), "---" | "..."))
+    else {
+        return 0;
+    };
+    let is_key = |l: &str| {
+        l.split_once(':').is_some_and(|(k, _)| {
+            !k.is_empty()
+                && k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    };
+    let mut block = lines.take(close);
+    let first_is_key = block.next().is_some_and(is_key);
+    let rest_ok = block.all(|l| {
+        !l.trim().is_empty()
+            && (is_key(l)
+                || l.starts_with([' ', '\t'])
+                || l.starts_with("- ")
+                || l.starts_with('#'))
+    });
+    if first_is_key && rest_ok {
+        close + 2
+    } else {
+        0
+    }
+}
+
 /// True when the plan body carries an `## Alternatives declined` heading at
-/// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
+/// line start ([`visible_lines`]'s skip discipline). Case-exact:
 /// the template writes it one way.
 pub(crate) fn alternatives_stanza_present(body: &str) -> bool {
     visible_lines(body).any(|line| line.starts_with("## Alternatives declined"))
@@ -220,11 +353,11 @@ fn trivial_none_reason(reason: &str) -> bool {
 /// block quotes are skipped before the first-match rule applies
 /// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
 /// with no stanza at all must not mint a settled verdict (security review of
-/// this change; same class as the quoted-example hole above). The fence
-/// tracker is deliberately naive — it toggles without matching fence
-/// lengths — which errs toward skipping ambiguous lines: on a malformed
-/// document the failure mode is a spurious nudge (fail-loud), never a
-/// suppressed one. Detection only; the caller names this stanza (a static
+/// this change; same class as the quoted-example hole above). HTML
+/// comments, nested fences and leading frontmatter are skipped the same way
+/// (cameronsjo/cadence-hooks#1283), and an unterminated fence or comment
+/// hides to EOF: on a malformed document the failure mode is a spurious
+/// block (fail-loud), never a hidden line settling the gate. Detection only; the caller names this stanza (a static
 /// string, "a settled Panel: line") in the composed format-gate line, never
 /// any matched text.
 pub(crate) fn panel_line_settled(body: &str) -> bool {
@@ -251,8 +384,12 @@ pub(crate) fn panel_line_settled(body: &str) -> bool {
 /// text (cameronsjo/cadence-hooks#715). Both consumers (the persist-time
 /// format-gate sentence in [`crate::persist_plan`] and the call-time
 /// `session lint-plan-shape` guard in [`crate::plan_guards`]) name the same
-/// three stanzas through the same strings.
+/// stanzas through the same strings.
 pub(crate) const PANEL_STANZA: &str = "a settled Panel: line";
+/// The template's `## Loop` section: a table, or the single line
+/// `Loop: none — <reason>`. The detector checks only that the heading exists,
+/// never what sits under it (cameronsjo/cadence-hooks#1281).
+pub(crate) const LOOP_STANZA: &str = "a ## Loop section";
 pub(crate) const ALTERNATIVES_STANZA: &str = "an Alternatives-declined stanza";
 pub(crate) const CHECKBOX_STANZA: &str = "checkbox tasks";
 pub(crate) const GLOBAL_CONSTRAINTS_STANZA: &str = "a ## Global Constraints section";
@@ -271,15 +408,34 @@ pub(crate) const TEMPLATE_POINTER: &str =
 #[cfg(test)]
 pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
     Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n\
+    ## Loop\n\nLoop: none — nothing outlives the work\n\n\
     ## Alternatives declined\n\n- none\n\n\
     ## Global Constraints\n\n- keep it small\n\n\
     ## Orchestrator\n\n**Driver:** sonnet\n\n\
     ## Tasks\n\n- [ ] task\n";
 
+/// [`TEMPLATE_SHAPED_PLAN`] with its `## Loop` section removed: a plan that
+/// lacks exactly [`LOOP_STANZA`]. Panics when the section is not there to
+/// strip, so a later edit to the fixture cannot quietly turn this into a plan
+/// that still carries one.
+#[cfg(test)]
+pub(crate) fn template_shaped_plan_without_loop() -> String {
+    let plan =
+        TEMPLATE_SHAPED_PLAN.replace("## Loop\n\nLoop: none — nothing outlives the work\n\n", "");
+    assert_ne!(
+        plan, TEMPLATE_SHAPED_PLAN,
+        "the fixture must carry a Loop section to strip"
+    );
+    plan
+}
+
 /// The ONE plan-shape detector both gates consume: the plan template's
-/// stanzas `body` lacks, in template order (`Panel:` line through checkbox
-/// tasks). Only the `Panel:` line blocks at call time; the rest nudge
-/// (cadence-hooks#1019). Empty for a template-shaped
+/// stanzas `body` lacks, the `Panel:` line first and the rest in template
+/// order (`## Loop`, Alternatives declined, `## Global Constraints`,
+/// `## Orchestrator`, `## Tasks`, checkbox tasks). Only the `Panel:` line
+/// blocks at call time;
+/// the rest nudge, `## Loop` included (cadence-hooks#1019,
+/// cadence-hooks#1281). Empty for a template-shaped
 /// plan. Two scanners drifted once already (the #675 polish), which is why
 /// persist-time and call-time share this single entry point rather than
 /// each composing the list inline.
@@ -287,6 +443,11 @@ pub(crate) fn missing_stanzas(body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !panel_line_settled(body) {
         missing.push(PANEL_STANZA);
+    }
+    // Heading only: a table or `Loop: none — <reason>` under it is the
+    // author's to write, so what sits below the heading is never judged.
+    if !section_heading_present(body, "## Loop") {
+        missing.push(LOOP_STANZA);
     }
     if !alternatives_stanza_present(body) {
         missing.push(ALTERNATIVES_STANZA);
@@ -951,7 +1112,7 @@ fn find_drivable_token(block: &[&str]) -> Option<Tier> {
 /// anchored, so a decoy can't reach it, and stripping would eat a
 /// legitimately backtick-wrapped value).
 fn legacy_recommended_model(body: &str) -> Option<Tier> {
-    visible_lines(body)
+    visible_lines_with_frontmatter(body)
         .take_while(|line| !line.starts_with("## "))
         .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
 }
@@ -1817,6 +1978,7 @@ mod tests {
             missing_stanzas("# T\n\n## Context\n\nprose\n"),
             vec![
                 PANEL_STANZA,
+                LOOP_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -1827,6 +1989,7 @@ mod tests {
         assert_eq!(
             missing_stanzas("# T\n\nPanel: none — no seat warranted\n\nprose\n"),
             vec![
+                LOOP_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -1855,7 +2018,8 @@ mod tests {
         // tier (priority 3) but does NOT satisfy the template detector — the
         // nudge teaches the `## Orchestrator` + `Driver:` form (deliverable 7).
         let body = "---\nrecommended_model: sonnet\n---\n\n# T\n\n\
-                    Panel: r ran — 1 finding, folded\n\n## Alternatives declined\n\n- none\n\n\
+                    Panel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
+                    ## Alternatives declined\n\n- none\n\n\
                     ## Global Constraints\n\n- c\n\n## Tasks\n\n- [ ] task\n";
         assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
         assert_eq!(missing_stanzas(body), vec![ORCHESTRATOR_STANZA]);
@@ -1863,9 +2027,343 @@ mod tests {
 
     #[test]
     fn missing_stanzas_deeper_heading_does_not_satisfy_section_detector() {
-        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Alternatives declined\n\n\
+        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
+                    ## Alternatives declined\n\n\
                     - none\n\n### Global Constraints\n\n- c\n\n## Orchestrator\n\n\
                     **Driver:** sonnet\n\n## Tasks\n\n- [ ] task\n";
         assert_eq!(missing_stanzas(body), vec![GLOBAL_CONSTRAINTS_STANZA]);
+    }
+
+    // --- the `## Loop` stanza (cadence-hooks#1281) ---
+
+    #[test]
+    fn missing_stanzas_reports_only_loop_when_the_loop_heading_is_absent() {
+        assert_eq!(
+            missing_stanzas(&template_shaped_plan_without_loop()),
+            vec![LOOP_STANZA]
+        );
+    }
+
+    /// `decoy` placed where the Loop section would sit, in a plan that has
+    /// every other stanza: the heading must still read as missing.
+    fn without_loop_but_with(decoy: &str) -> String {
+        let plan = TEMPLATE_SHAPED_PLAN.replace(
+            "## Loop\n\nLoop: none — nothing outlives the work\n\n",
+            decoy,
+        );
+        assert!(
+            plan.contains(decoy),
+            "the decoy must be in the plan under test"
+        );
+        plan
+    }
+
+    #[test]
+    fn missing_stanzas_loop_heading_match_is_exact() {
+        // A longer heading that merely starts with `## Loop`.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("## Loopback\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        // A deeper heading.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("### Loop\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        // A heading inside a fenced code block is an example, not a stanza.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with(
+                "```markdown\n## Loop\n\nLoop: none — x\n```\n\n"
+            )),
+            vec![LOOP_STANZA]
+        );
+        // Markdown would render these two as the heading. The lint wants
+        // the exact line, so each still reads as missing.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with(" ## Loop\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("## loop\n\nLoop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+        // The `Loop: none` line with no heading above it.
+        assert_eq!(
+            missing_stanzas(&without_loop_but_with("Loop: none — x\n\n")),
+            vec![LOOP_STANZA]
+        );
+    }
+
+    #[test]
+    fn missing_stanzas_loop_heading_tolerates_trailing_whitespace() {
+        for heading in ["## Loop  ", "## Loop\t"] {
+            let plan = without_loop_but_with(&format!("{heading}\n\nLoop: none — x\n\n"));
+            assert!(
+                missing_stanzas(&plan).is_empty(),
+                "trailing whitespace after the heading must still count: {heading:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_stanzas_accepts_the_loop_table_and_the_none_line() {
+        let table = TEMPLATE_SHAPED_PLAN.replace(
+            "## Loop\n\nLoop: none — nothing outlives the work\n\n",
+            "## Loop\n\n| Thing created | Opened by (surfaces) | Closed by (surfaces) | Who closes |\n|---|---|---|---|\n| flag | `flag` (CLI) | `unflag` (CLI) | the user |\n\n",
+        );
+        assert!(table.contains("| flag | `flag` (CLI) | `unflag` (CLI) | the user |"));
+        assert!(missing_stanzas(&table).is_empty(), "table form");
+        // The fixture itself uses the `Loop: none — <reason>` form.
+        assert!(TEMPLATE_SHAPED_PLAN.contains("Loop: none — "));
+        assert!(
+            missing_stanzas(TEMPLATE_SHAPED_PLAN).is_empty(),
+            "none form"
+        );
+    }
+
+    // --- hidden positions: comment, nested fence, frontmatter (cadence-hooks#1283) ---
+
+    /// `inner` (a `Panel:` line or a `## Loop` section, newline-terminated)
+    /// in each position the plan-shape scan must treat as hidden, and the
+    /// one plain position it must count. `(label, plan text, visible)`.
+    fn positions(inner: &str) -> Vec<(&'static str, String, bool)> {
+        vec![
+            ("html comment block", format!("<!--\n{inner}-->\n\n"), false),
+            (
+                "one-line html comment",
+                format!("<!-- {inner}-->\n\n"),
+                false,
+            ),
+            (
+                "indented html comment",
+                format!("   <!--\n{inner}-->\n\n"),
+                false,
+            ),
+            (
+                "unterminated html comment",
+                format!("<!--\n{inner}\n"),
+                false,
+            ),
+            (
+                "4-backtick fence holding 3",
+                format!("````md\n```\n{inner}```\n````\n\n"),
+                false,
+            ),
+            (
+                "backtick fence holding tilde",
+                format!("```md\n~~~\n{inner}~~~\n```\n\n"),
+                false,
+            ),
+            (
+                "tilde fence holding backtick",
+                format!("~~~md\n```\n{inner}```\n~~~\n\n"),
+                false,
+            ),
+            (
+                "closer with an info string",
+                format!("```\n```md\n{inner}```\n\n"),
+                false,
+            ),
+            ("unterminated fence", format!("````\n{inner}```\n\n"), false),
+            (
+                "fence holding a 4-space-indented nested fence",
+                format!("```md\n1. Step\n\n    ```bash\n    make ci\n    ```\n\n{inner}```\n\n"),
+                false,
+            ),
+            (
+                "tilde fence holding a 4-space-indented nested fence",
+                format!("~~~md\n1. Step\n\n    ~~~sh\n    make ci\n    ~~~\n\n{inner}~~~\n\n"),
+                false,
+            ),
+            (
+                "tab-indented closer",
+                format!("```\n\t```\n{inner}```\n\n"),
+                false,
+            ),
+            ("visible", format!("{inner}\n"), true),
+            ("after an empty comment", format!("<!-->\n{inner}\n"), true),
+            (
+                "after an empty comment, 3 dashes",
+                format!("<!--->\n{inner}\n"),
+                true,
+            ),
+            (
+                "after an indented fence's indented closer",
+                format!("    ```\n    x\n       ```\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a closed comment",
+                format!("<!--\nx\n-->\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a closed nested fence",
+                format!("````\n```\n````\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a longer closer",
+                format!("```\nx\n`````\n{inner}\n"),
+                true,
+            ),
+            (
+                "after a mid-line <!--",
+                format!("note <!-- x\n\n{inner}\n"),
+                true,
+            ),
+        ]
+    }
+
+    const PANEL_LINE: &str = "Panel: r ran — 1 finding, 1 folded in, 0 declined\n";
+    const LOOP_SECTION: &str = "## Loop\n\nLoop: none — nothing outlives the work\n";
+
+    #[test]
+    fn panel_line_in_each_hidden_position_reads_as_missing_table() {
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        assert!(without_panel.contains("## Loop"));
+        for (label, decoy, visible) in positions(PANEL_LINE) {
+            let plan = without_panel.replacen("## Loop", &format!("{decoy}## Loop"), 1);
+            assert!(plan.contains(&decoy), "{label}: decoy placed");
+            // An unterminated span hides the rest of the plan too, so a
+            // hidden case asserts this stanza is missing, not that it alone is.
+            let missing = missing_stanzas(&plan);
+            if visible {
+                assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
+            } else {
+                assert!(
+                    missing.contains(&PANEL_STANZA),
+                    "{label}: {missing:?} in {plan:?}"
+                );
+            }
+            assert_eq!(panel_line_settled(&plan), visible, "{label}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn loop_section_in_each_hidden_position_reads_as_missing_table() {
+        for (label, decoy, visible) in positions(LOOP_SECTION) {
+            let plan = without_loop_but_with(&decoy);
+            // An unterminated span hides the rest of the plan too, so a
+            // hidden case asserts this stanza is missing, not that it alone is.
+            let missing = missing_stanzas(&plan);
+            if visible {
+                assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
+            } else {
+                assert!(
+                    missing.contains(&LOOP_STANZA),
+                    "{label}: {missing:?} in {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stanzas_inside_leading_frontmatter_read_as_missing() {
+        // A YAML comment line is legal frontmatter, so a `## Loop` there is
+        // hidden with the block.
+        let loop_in_fm = format!(
+            "---\nstatus: in-flight\n## Loop\n---\n{}",
+            template_shaped_plan_without_loop()
+        );
+        assert_eq!(missing_stanzas(&loop_in_fm), vec![LOOP_STANZA]);
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let panel_in_fm = format!("---\n{PANEL_LINE}---\n{without_panel}");
+        assert_eq!(missing_stanzas(&panel_in_fm), vec![PANEL_STANZA]);
+        let panel_after_dots = format!("---\nstatus: x\n...\n{PANEL_LINE}{without_panel}");
+        assert!(
+            missing_stanzas(&panel_after_dots).is_empty(),
+            "after a `...` close"
+        );
+        // A line-1 `---` thematic break followed by prose is not frontmatter.
+        let hr = format!("---\n\n{TEMPLATE_SHAPED_PLAN}");
+        assert!(missing_stanzas(&hr).is_empty(), "thematic break: {hr:?}");
+        // The legacy reader still sees its own frontmatter field.
+        assert_eq!(
+            legacy_recommended_model("---\nrecommended_model: sonnet\n---\n\n# T\n"),
+            Some(Tier::Sonnet)
+        );
+    }
+
+    /// Gate-2 I-1 on #1289: a closer indented 4+ columns past its opener is
+    /// content. Closing there would expose the quoted `Panel:` example and
+    /// flip the real closer into an opener that hides `## Tasks`.
+    #[test]
+    fn indented_nested_closer_keeps_the_outer_fence_open() {
+        for (open, inner_open, inner_close) in
+            [("```md", "```bash", "```"), ("~~~md", "~~~sh", "~~~")]
+        {
+            let close = &open[..3];
+            let plan = format!(
+                "# T\n\nThe template, quoted:\n\n{open}\n1. Step one\n\n    {inner_open}\n    \
+                 make ci\n    {inner_close}\n\n{PANEL_LINE}{close}\n\n## Tasks\n\n- [ ] open task\n"
+            );
+            assert!(!panel_line_settled(&plan), "{plan:?}");
+            let missing = missing_stanzas(&plan);
+            assert!(missing.contains(&PANEL_STANZA), "{missing:?}");
+            assert!(!missing.contains(&TASKS_STANZA), "{missing:?}");
+            assert!(!missing.contains(&CHECKBOX_STANZA), "{missing:?}");
+            assert_eq!(checkbox_counts(&plan), (1, 0), "{plan:?}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_after_a_bom_is_hidden() {
+        let without_panel = TEMPLATE_SHAPED_PLAN
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let plan = format!("\u{feff}---\nstatus: x\n{PANEL_LINE}---\n{without_panel}");
+        assert_eq!(missing_stanzas(&plan), vec![PANEL_STANZA], "{plan:?}");
+        let plain = format!("\u{feff}---\nstatus: x\n---\n{TEMPLATE_SHAPED_PLAN}");
+        assert!(missing_stanzas(&plain).is_empty(), "{plain:?}");
+    }
+
+    #[test]
+    fn checkbox_counts_match_nested_fences_table() {
+        // (body, unticked, ticked)
+        let cases: &[(&str, usize, usize)] = &[
+            ("````\n```\n- [ ] a\n```\n````\n- [x] b\n", 0, 1),
+            ("```\n~~~\n- [ ] a\n~~~\n```\n- [ ] b\n", 1, 0),
+            ("````\n```\n````\n- [ ] a\n", 1, 0),
+            ("```\n```md\n- [ ] a\n", 0, 0),
+            // Same visibility as `visible_lines`: comments and frontmatter.
+            ("<!--\n- [ ] example\n-->\n- [x] b\n", 0, 1),
+            ("<!-->\n- [ ] a\n", 1, 0),
+            ("---\nstatus: x\ntodo:\n- [ ] in yaml\n---\n- [ ] a\n", 1, 0),
+            ("```md\n    ```\n- [ ] example\n```\n- [ ] a\n", 1, 0),
+        ];
+        for (body, unticked, ticked) in cases {
+            assert_eq!(checkbox_counts(body), (*unticked, *ticked), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn fence_opener_and_closer_table() {
+        // (line, opener)
+        let openers: &[(&str, Option<(u8, usize)>)] = &[
+            ("```", Some((b'`', 3))),
+            ("````md", Some((b'`', 4))),
+            ("~~~~~", Some((b'~', 5))),
+            ("``", None),
+            ("~~", None),
+            ("x```", None),
+        ];
+        for (line, want) in openers {
+            assert_eq!(fence_opener(line), *want, "{line:?}");
+        }
+        // (line, opener char, opener len, closes)
+        let closers: &[(&str, u8, usize, bool)] = &[
+            ("```", b'`', 3, true),
+            ("````", b'`', 3, true),
+            ("```  ", b'`', 3, true),
+            ("```", b'`', 4, false),
+            ("~~~", b'`', 3, false),
+            ("```md", b'`', 3, false),
+            ("``` x", b'`', 3, false),
+        ];
+        for (line, ch, len, want) in closers {
+            assert_eq!(fence_closes(line, *ch, *len), *want, "{line:?}");
+        }
     }
 }
