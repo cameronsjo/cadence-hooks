@@ -1067,9 +1067,12 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             SessionCommands::Start => {
                 CheckPlan::new(Box::new(cadence_hooks_session::start::Start), session)
             }
-            SessionCommands::Guard => {
-                CheckPlan::new(Box::new(cadence_hooks_session::guard::Guard), pre)
-            }
+            SessionCommands::Guard => CheckPlan::new(
+                Box::new(cadence_hooks_session::guard::Guard::new(
+                    cadence_hooks_guardrails::enforce_worktree::bash_write_targets,
+                )),
+                pre,
+            ),
             SessionCommands::WarnBranchDrift => CheckPlan::new(
                 Box::new(cadence_hooks_session::branch_drift::WarnBranchDrift),
                 pre,
