@@ -14,6 +14,7 @@ pub mod bypass;
 pub mod capability;
 pub mod config;
 pub mod deadline;
+pub mod dir_variables;
 pub mod display;
 pub mod gh_bodies;
 pub mod gitstate;
@@ -89,6 +90,15 @@ pub enum HookEvent {
     /// changed — so the only output it accepts is
     /// `hookSpecificOutput.additionalContext`, delivered with the next request.
     PostModelSwitch,
+    /// PreModelSwitch — fires before Claude Code applies a switch the operator
+    /// requested (`/model <id>`, the `/model` picker, or an SDK `set_model`).
+    /// Requires Claude Code 2.1.251 or later. It can block the switch, and
+    /// `Outcome::Ask` renders as `permissionDecision: "ask"`, which the TUI
+    /// shows as a "Switch model?" confirm. **Measured on 2.1.285
+    /// (cameronsjo/cadence-hooks#989): with no human attached (`source: "sdk"`)
+    /// an `ask` is refused exactly like a `deny`** — so a check that means to
+    /// confirm, never block, must ask only on an interactive `source`.
+    PreModelSwitch,
 }
 
 impl HookEvent {
@@ -101,6 +111,7 @@ impl HookEvent {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
             HookEvent::PostModelSwitch => "PostModelSwitch",
+            HookEvent::PreModelSwitch => "PreModelSwitch",
         }
     }
 
@@ -114,6 +125,7 @@ impl HookEvent {
             "SessionStart" => Some(HookEvent::SessionStart),
             "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
             "PostModelSwitch" => Some(HookEvent::PostModelSwitch),
+            "PreModelSwitch" => Some(HookEvent::PreModelSwitch),
             _ => None,
         }
     }
@@ -133,6 +145,9 @@ impl HookEvent {
             HookEvent::UserPromptSubmit => r#"{"prompt":"test prompt"}"#,
             HookEvent::PostModelSwitch => {
                 r#"{"session_id":"test","hook_event_name":"PostModelSwitch","from_model":"claude-opus-5","to_model":"claude-sonnet-5","source":"command"}"#
+            }
+            HookEvent::PreModelSwitch => {
+                r#"{"session_id":"test","hook_event_name":"PreModelSwitch","from_model":"claude-opus-5-5","to_model":"claude-sonnet-5-5","requested_model":"claude-sonnet-5-5","source":"command"}"#
             }
         }
     }
@@ -161,7 +176,8 @@ pub enum Outcome {
     /// an `ask` decision prompts the user *even when a settings `allow` rule
     /// would otherwise auto-approve* — so a guard can force a confirmation on an
     /// operation it can neither prove safe (Allow) nor prove dangerous (Block).
-    /// PreToolUse only; never emitted by a PostToolUse hook.
+    /// PreToolUse and PreModelSwitch only (the latter renders the TUI's
+    /// "Switch model?" confirm); never emitted by a PostToolUse hook.
     Ask,
 }
 
@@ -506,6 +522,13 @@ fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
 pub struct ToolResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    /// Bash tool: the command was interrupted. Carried so a PostToolUse
+    /// output rewrite can return the full Bash output object
+    /// (cameronsjo/cadence-hooks#776).
+    pub interrupted: Option<bool>,
+    /// Bash tool: stdout is an image payload. Same reason as `interrupted`.
+    #[serde(rename = "isImage")]
+    pub is_image: Option<bool>,
     /// AskUserQuestion tool: answers keyed by question text. Values are strings
     /// (multiSelect = comma-joined) or null when unanswered. Present only on the
     /// PostToolUse payload for AskUserQuestion.
@@ -1641,6 +1664,14 @@ pub struct CheckResult {
     /// fine on its own. `None` for a normal allow/nudge/block. When `Some`, the
     /// dispatch seam records a `used` line in `bypasses.jsonl`.
     pub bypass: Option<BypassProvenance>,
+    /// A replacement for the tool's output, emitted as PostToolUse
+    /// `hookSpecificOutput.updatedToolOutput` (cameronsjo/cadence-hooks#776).
+    /// Only ever set on an `Allow` by [`CheckResult::rewrite_output`]; must be
+    /// the tool's **full** output object (for Bash:
+    /// `{stdout, stderr, interrupted, isImage}`) — Claude Code silently ignores
+    /// a wrong shape. `None` everywhere else: an identity rewrite would compete
+    /// last-write-wins with a sibling hook's real rewrite.
+    pub updated_tool_output: Option<serde_json::Value>,
 }
 
 impl CheckResult {
@@ -1650,6 +1681,7 @@ impl CheckResult {
             message: None,
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1659,6 +1691,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1668,6 +1701,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1680,6 +1714,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: Some(meta),
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1693,6 +1728,7 @@ impl CheckResult {
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
+            updated_tool_output: None,
         }
     }
 
@@ -1706,6 +1742,7 @@ impl CheckResult {
             message: None,
             block_metadata: None,
             bypass: Some(bypass),
+            updated_tool_output: None,
         }
     }
 
@@ -1722,6 +1759,18 @@ impl CheckResult {
     /// bypass armed and both an identity and a shaped hit present, the honest
     /// result is a nudge carrying the shaped finding *and* the attribution that
     /// a bypass suppressed the block.
+    /// Allow the tool call and replace what it returned with `output`, the
+    /// tool's full output object. The one PostToolUse shape that changes both
+    /// what the model sees and what the transcript JSONL stores (probe on
+    /// Claude Code 2.1.285, cameronsjo/cadence-hooks#776). Callers must only
+    /// build this when the output actually changed.
+    pub fn rewrite_output(output: serde_json::Value) -> Self {
+        Self {
+            updated_tool_output: Some(output),
+            ..Self::allow()
+        }
+    }
+
     pub fn with_bypass(mut self, bypass: BypassProvenance) -> Self {
         self.bypass = Some(bypass);
         self
@@ -1747,6 +1796,64 @@ pub trait Check {
     fn skip_at_effort(&self) -> &[&str] {
         &[]
     }
+
+    /// Whether this check refuses a Bash command part of which no reading
+    /// could take in ([`shell::command_unread`]): a word bash brace-expands
+    /// left whole when the expansion budget is spent. `false` (default) for
+    /// advisory checks; the fail-closed guards answer `true`
+    /// (cameronsjo/cadence-hooks#1279).
+    fn refuses_unread_commands(&self) -> bool {
+        false
+    }
+
+    /// The commands whose argument lists this refusing check never judges,
+    /// so a brace word left whole there for its own bound cannot hide
+    /// anything from it ([`shell::unexpanded_word_may_hide_a_command`]). A
+    /// check that judges the paths `touch`/`mkdir` create narrows it to
+    /// [`shell::UNREAD_INERT_COMMANDS`].
+    fn unread_inert_commands(&self) -> &'static [&'static str] {
+        shell::UNREAD_INERT_OR_CREATING_COMMANDS
+    }
+}
+
+/// The block a fail-closed guard gives a command it could not read in full
+/// ([`Check::refuses_unread_commands`]).
+///
+/// **When a command counts as unread** ([`command_is_unread`]):
+///
+/// - **The brace budget is spent** — the call's or the thread's
+///   ([`shell::command_unread`]). Every expanding word after that point is left
+///   whole, so what follows may be unread whatever it is: padding a command
+///   until the budget ran out left `{git,reset,--hard}` whole
+///   (cameronsjo/cadence-hooks#1279). Also when a wrapper's second reading
+///   runs past its allowance (a ~400 KB `git commit -m '…\n…'` does).
+/// - **One word is past its own bound** (more than 4,096 words or 64 groups),
+///   the budget intact ([`shell::brace_word_left_whole`]), **and** it may sit
+///   where it hides what runs ([`shell::unexpanded_word_may_hide_a_command`]):
+///   in command position, under a command that is not a fixed literal, inside
+///   a wrapper's script (`bash -c`, `eval`, `xargs`, `find -exec`), in a
+///   heredoc a shell runs, or in an argument list a guard judges.
+///
+/// Deliberately **not** refused: such a word alone in the argument list of a
+/// fixed inert command ([`Check::unread_inert_commands`]: `echo`, `printf`,
+/// `:`, `for … in`, and `touch`/`mkdir` for checks that do not judge created
+/// paths) whose output is not piped past a data sink, and any word in a
+/// heredoc body no shell runs. Bash runs `for i in {1..5000}`, `touch
+/// file{1..5000}.txt` and minified JSON in `cat > x.json <<'EOF'` harmlessly,
+/// and no guard judges those words, so they hide nothing. Words after the
+/// lone word are still expanded and judged, so `: {1..5000}; {git,reset,--hard}`
+/// blocks on its merits.
+pub const UNREAD_COMMAND_BLOCK: &str = "command too large to read in full — a brace expansion \
+     (or a wrapper's second reading) ran past what the guard reads, so what it runs cannot be \
+     verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions \
+     (or a shorter quoted message with backslashes)";
+
+/// Whether `command`, just read by `check`, counts as unread
+/// ([`UNREAD_COMMAND_BLOCK`] says when).
+fn command_is_unread(check: &dyn Check, command: &str) -> bool {
+    shell::command_unread()
+        || (shell::brace_word_left_whole()
+            && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands()))
 }
 
 /// Pure: should `run_check` short-circuit for the given effort level?
@@ -1998,7 +2105,46 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
         return None;
     }
-    Some(check.run(input))
+    shell::reset_command_unread();
+    shell::note_command_home(input.command().unwrap_or(""));
+    // A `cd`/`git -C` target the command bound to a literal earlier reads as
+    // that literal to every check (cameronsjo/cadence-hooks#1287).
+    let input = &*with_resolved_dir_variables(input);
+    let result = check.run(input);
+    // A fail-closed guard never allows a command it could not read in full:
+    // padding a command until the brace budget was spent left a later
+    // `{git,reset,--hard}` whole, and it ran past every guard
+    // (cameronsjo/cadence-hooks#1279). A bypass the guard honoured stands.
+    if check.refuses_unread_commands()
+        && matches!(result.outcome, Outcome::Allow | Outcome::Nudge)
+        && result.bypass.is_none()
+        && input
+            .command()
+            .is_some_and(|command| command_is_unread(check, command))
+    {
+        return Some(CheckResult::block(UNREAD_COMMAND_BLOCK));
+    }
+    Some(result)
+}
+
+/// `input` with each directory-target read of a variable the command bound to
+/// a literal replaced by that literal ([`dir_variables`]), or `input` itself
+/// when there is none. The rewrite is an identity under bash, so a check reads
+/// the same command, with `git -C "$M"` spelled the way it runs.
+pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, HookInput> {
+    let Some(command) = input.command() else {
+        return std::borrow::Cow::Borrowed(input);
+    };
+    match dir_variables::resolve_literal_dir_variables(command) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(input),
+        std::borrow::Cow::Owned(resolved) => {
+            let mut owned = input.clone();
+            if let Some(tool_input) = owned.tool_input.as_mut() {
+                tool_input.command = Some(resolved);
+            }
+            std::borrow::Cow::Owned(owned)
+        }
+    }
 }
 
 /// The emit-and-exit half of [`run_check`]: render the outcome to stdout/stderr
@@ -2008,20 +2154,14 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    let rendered = render_output(
-        result.outcome,
-        result.message.as_deref(),
-        result.block_metadata.as_ref(),
-        event,
-        feedback_footer().as_deref(),
-    );
+    let (rendered, code) = render_check_result(result, event, feedback_footer().as_deref());
     if let Some(out) = rendered.stdout {
         crate::outln!("{out}");
     }
     if let Some(err) = rendered.stderr {
         eprint!("{err}");
     }
-    process::exit(result.outcome.code());
+    process::exit(code);
 }
 
 /// What [`emit_and_exit`] would write for `result`, as `(stdout, stderr)`,
@@ -2031,14 +2171,79 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
 /// and has to merge their outputs into the single response one hook process
 /// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
 pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
+    let (rendered, _) = render_check_result(result, event, feedback_footer().as_deref());
+    (rendered.stdout, rendered.stderr)
+}
+
+/// The `hookSpecificOutput` envelope that replaces a tool's output
+/// (cameronsjo/cadence-hooks#776). Shared by the single-check path and the
+/// `group` merge so the two cannot drift.
+pub fn updated_tool_output_envelope(event: HookEvent, output: &serde_json::Value) -> String {
+    updated_tool_output_json(event, output, None)
+}
+
+/// [`updated_tool_output_envelope`] with an optional `additionalContext`.
+///
+/// Deliberately never carries a top-level `decision: "block"`: the pairing of
+/// `decision` with `updatedToolOutput` is undocumented and unprobed, and if
+/// Claude Code dropped the rewrite beside it the model would get the raw
+/// output. A sibling's block reason rides `additionalContext` instead.
+pub fn updated_tool_output_json(
+    event: HookEvent,
+    output: &serde_json::Value,
+    context: Option<&str>,
+) -> String {
+    let mut specific = serde_json::Map::new();
+    specific.insert("hookEventName".into(), event.name().into());
+    specific.insert("updatedToolOutput".into(), output.clone());
+    if let Some(context) = context {
+        specific.insert("additionalContext".into(), context.into());
+    }
+    serde_json::json!({ "hookSpecificOutput": specific }).to_string()
+}
+
+/// [`render_output`] for a whole [`CheckResult`], plus the exit code to use.
+///
+/// A result carrying [`CheckResult::updated_tool_output`] on PostToolUse
+/// renders the output-replacement envelope with exit 0 — **including a
+/// `Block`**. The tool already ran, so an exit 2 would discard stdout and the
+/// raw output would reach the model. The block's (or a Nudge's) message rides
+/// as `additionalContext`, never as `decision: "block"` (see
+/// [`updated_tool_output_json`]). Everything else renders exactly as
+/// [`render_output`] does.
+fn render_check_result(
+    result: &CheckResult,
+    event: HookEvent,
+    footer: Option<&str>,
+) -> (RenderedOutput, i32) {
+    if let Some(output) = &result.updated_tool_output
+        && event == HookEvent::PostToolUse
+        && result.outcome != Outcome::Ask
+    {
+        let context = result
+            .message
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|msg| {
+                let msg = display::clamp_hook_output(msg, display::HOOK_OUTPUT_BUDGET_UTF16, None);
+                apply_feedback_footer(result.outcome, &msg, footer)
+            });
+        return (
+            RenderedOutput {
+                stdout: Some(updated_tool_output_json(event, output, context.as_deref())),
+                stderr: None,
+            },
+            0,
+        );
+    }
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
         result.block_metadata.as_ref(),
         event,
-        feedback_footer().as_deref(),
+        footer,
     );
-    (rendered.stdout, rendered.stderr)
+    (rendered, result.outcome.code())
 }
 
 /// The generic fallback payload for fire-and-forget loggers ([`MetricsInput`]
@@ -4160,6 +4365,7 @@ mod tests {
         assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
         assert_eq!(HookEvent::UserPromptSubmit.name(), "UserPromptSubmit");
         assert_eq!(HookEvent::PostModelSwitch.name(), "PostModelSwitch");
+        assert_eq!(HookEvent::PreModelSwitch.name(), "PreModelSwitch");
     }
 
     #[test]
@@ -4178,20 +4384,21 @@ mod tests {
     fn from_name_rejects_an_unmodeled_event() {
         // Silence, not a defaulted event: a caller that guessed would emit a
         // `hookEventName` naming an event that never fired.
-        assert_eq!(HookEvent::from_name("PreModelSwitch"), None);
         assert_eq!(HookEvent::from_name("SessionEnd"), None);
+        assert_eq!(HookEvent::from_name("premodelswitch"), None);
         assert_eq!(HookEvent::from_name(""), None);
         assert_eq!(HookEvent::from_name("pretooluse"), None);
     }
 
     /// Every modeled event, so an added variant joins the enumerated tests
     /// instead of quietly skipping them.
-    const EVERY_EVENT: [HookEvent; 5] = [
+    const EVERY_EVENT: [HookEvent; 6] = [
         HookEvent::PreToolUse,
         HookEvent::PostToolUse,
         HookEvent::SessionStart,
         HookEvent::UserPromptSubmit,
         HookEvent::PostModelSwitch,
+        HookEvent::PreModelSwitch,
     ];
 
     #[test]
@@ -4222,6 +4429,40 @@ mod tests {
         assert!(input.from_model.is_some());
         assert!(input.to_model.is_some());
         assert_eq!(input.source.as_deref(), Some("command"));
+    }
+
+    #[test]
+    fn pre_model_switch_sample_carries_the_switch_fields() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::PreModelSwitch.sample_payload()).unwrap();
+        assert_eq!(input.hook_event_name.as_deref(), Some("PreModelSwitch"));
+        assert!(input.from_model.is_some());
+        assert!(input.to_model.is_some());
+        assert_eq!(input.source.as_deref(), Some("command"));
+    }
+
+    /// The probe-verified confirm shape (cameronsjo/cadence-hooks#989, Claude
+    /// Code 2.1.285): an `Ask` on PreModelSwitch must render as
+    /// `hookSpecificOutput.permissionDecision: "ask"` under the
+    /// `PreModelSwitch` event name, reason in `permissionDecisionReason`.
+    #[test]
+    fn ask_on_pre_model_switch_renders_the_probe_verified_confirm_shape() {
+        let out = render_output(
+            Outcome::Ask,
+            Some("confirm this"),
+            None,
+            HookEvent::PreModelSwitch,
+            None,
+        );
+        assert!(out.stderr.is_none());
+        let v: serde_json::Value = serde_json::from_str(&out.stdout.unwrap()).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreModelSwitch");
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "confirm this"
+        );
+        assert_eq!(Outcome::Ask.code(), 0);
     }
 
     // --- model_matches (shared by guard-read-model and model-posture) ---

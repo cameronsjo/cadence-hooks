@@ -56,6 +56,9 @@ pub mod identity;
 /// approving turn leaves no durable trace — the approve-and-clear wipe
 /// (cadence#505) and same-session approval (cadence-hooks#396) respectively.
 pub mod persist_plan;
+/// PreModelSwitch confirm when a switch leaves the in-flight plan's Driver
+/// family (cadence-hooks#989).
+pub mod plan_driver;
 pub mod plan_guards;
 /// `docs/plans/*.md` frontmatter scan consumed by [`start`]'s SessionStart
 /// disclosure — surfaces in-flight/blocked plans without a GitHub call

@@ -311,6 +311,19 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // Binary half of the two-PR shape: the cadence plugin's hooks.json entries
+    // (PostToolUse Bash for the redactor, PreToolUse Bash for the Ask guard)
+    // ride the follow-up monorepo wiring PR (cameronsjo/cadence-hooks#776).
+    (
+        "cadence redact-secret-output",
+        "cameronsjo/cadence-hooks#776",
+    ),
+    ("cadence guard-secret-dump", "cameronsjo/cadence-hooks#776"),
+    // The PreModelSwitch confirm ships here first; its cadence-plugin hooks.json
+    // entry (a `PreModelSwitch` block) rides the follow-up monorepo wiring PR,
+    // which also needs an INTENTIONAL_CROSS_PLUGIN_HOOKS row (two-PR shape,
+    // cameronsjo/cadence-hooks#989).
+    ("session plan-driver", "cameronsjo/cadence-hooks#989"),
     // Opt-in UserPromptSubmit gap marker: binary first, its `cadence` plugin
     // hooks.json entry rides the follow-up monorepo wiring PR (two-PR shape).
     ("session nudge-afk-gap", "cameronsjo/cadence-hooks#480"),
@@ -2482,7 +2495,11 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let event = if window.contains(", post") || window.contains("post)") {
+        // `pre_model_switch` first: `, pre_model_switch` also contains `, pre`.
+        let event = if window.contains(", pre_model_switch") || window.contains("pre_model_switch)")
+        {
+            "PreModelSwitch"
+        } else if window.contains(", post") || window.contains("post)") {
             "PostToolUse"
         } else if window.contains(", session") || window.contains("session)") {
             "SessionStart"

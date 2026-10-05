@@ -3241,6 +3241,21 @@ fn union_commits(
                 }
                 merge_scan(out, trapped);
             }
+        } else if out.unreadable.is_none()
+            && union_children(argv, &segment)
+                .iter()
+                .any(|child| may_hold_a_commit(child))
+        {
+            // Past the wrapper depth the script a segment nests is not read
+            // (`cat <(echo $(echo $(echo $(git commit -m x))))`): one that may
+            // hold a commit fails closed, judged from every directory, as
+            // core lists such a body for every other guard
+            // (cameronsjo/cadence-hooks#1267).
+            out.unreadable = Some(unreadable_commit_message(
+                &segment,
+                "nests a script past the depth the guard reads, and it may run a git commit",
+            ));
+            out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
         if cd_word(&marked).is_some() {
             continue;
@@ -3300,6 +3315,19 @@ fn union_commits(
             out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
     }
+}
+
+/// Could `script`, nested past the depth the union walk reads, run a git
+/// commit? It names `commit` read quote-blind (`com""mit`, `\commit`), or
+/// once tokenized, which expands braces and decodes `$'…'` (`co{m,}mit`).
+/// A brace word past core's bounds is [`commit_gaps::brace_overflow_hides_commit`]'s.
+fn may_hold_a_commit(script: &str) -> bool {
+    strip_quotes_and_escapes(script)
+        .to_ascii_lowercase()
+        .contains("commit")
+        || tokenize(script)
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("commit"))
 }
 
 /// Does a word come out of a command substitution (`$(…)`, a backtick, or a
@@ -6980,6 +7008,68 @@ mod tests {
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert!(!r.message.unwrap().contains("could not be resolved"));
+    }
+
+    /// cameronsjo/cadence-hooks#1287: a `cd`/`git -C`/`--git-dir` target the
+    /// same command bound to a literal is read as that literal — at the
+    /// dispatch seam, which the test drives through
+    /// [`cadence_hooks_core::with_resolved_dir_variables`]. Unix-only: a
+    /// Windows fixture path carries a backslash, which is never spliced.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_bound_to_a_literal_earlier_in_the_command_is_resolved() {
+        let scratch = scratch("var-target");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let other = scratch.path().join("wt2");
+        git_in(
+            &primary,
+            &["worktree", "add", &other.to_string_lossy(), "-b", "feat/y"],
+        );
+        let run = |cmd: &str| {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let input = cadence_hooks_core::with_resolved_dir_variables(&input);
+            run_enforce(&input, &cfg(false, false))
+        };
+        let other = other.display();
+        let primary = primary.display();
+
+        // The reported command, into another linked worktree, and its siblings.
+        for cmd in [
+            format!(
+                r#"M={other}; (cd "$M" && npx markdownlint-cli2 a.md); git -C "$M" add a.md; git -C "$M" commit -F msg -- a.md"#
+            ),
+            format!(r#"M={other}; cd "$M" && git commit -m x"#),
+            format!(r#"export M={other} && git --git-dir="$M/.git" --work-tree "$M" commit -m x"#),
+            format!(r#"(M={other}; git -C "${{M}}" commit -m x)"#),
+        ] {
+            let r = run(&cmd);
+            assert_eq!(r.outcome, Outcome::Allow, "{cmd}: {:?}", r.message);
+        }
+
+        // Into the primary, the directory is read and judged as the primary.
+        let r = run(&format!(
+            r#"M={primary}; (cd "$M" && npx markdownlint-cli2 a.md); git -C "$M" commit -F msg -- a.md"#
+        ));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("is a primary checkout"), "{msg}");
+        assert!(!msg.contains("could not be resolved"), "{msg}");
+
+        // Anything that may not hold the literal when the commit runs keeps
+        // refusing.
+        for cmd in [
+            format!(r#"M=$(echo {other}); git -C "$M" commit -m x"#),
+            format!(r#"true || M={other}; git -C "$M" commit -m x"#),
+            format!(r#"M={other} git -C "$M" commit -m x"#),
+            format!(r#"(M={other}); cd "$M" && git commit -m x"#),
+            format!(r#"M={other} | true; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; read M </dev/null; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; read "$n" </dev/null; git -C "$M" commit -m x"#),
+            format!(r#"M={other}; if x; then M={primary}; fi; git -C "$M" commit -m x"#),
+        ] {
+            assert_eq!(run(&cmd).outcome, Outcome::Block, "{cmd}");
+        }
     }
 
     #[test]

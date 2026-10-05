@@ -100,6 +100,8 @@ Rules for wiring:
 | `audit-runner-pool` | PostToolUse (Write, Edit, MultiEdit) | After an edit to `.github/workflows/*.yml`/`*.yaml`, run `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` (newest copy under `<config dir>/plugins/cache/*/cadence-forge/`; 3.5s cap) and return FAIL findings as a nudge. Never blocks: a missing script, no `python3`, a timeout or an unknown exit is silent; the audit's exit 2 ("could not run") becomes a one-line note | run |
 | `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger | run |
 | `redact-external-content` | PreToolUse (Write, Edit, write-shaped `mcp__*` tools, Bash) | Nudge when an external post mentions internal harness vocabulary | run |
+| `redact-secret-output` | PostToolUse (Bash) | Mask secret values in Bash output via `updatedToolOutput`: credential tokens, private keys, URL passwords, and values whose name is secret-shaped (env, YAML, JSON, k8s/ECS name/value, flags, headers, tables, `.netrc`), after stripping ANSI codes and decoding JSON escapes. Emits nothing when nothing was masked; `CADENCE_ALLOW_SECRET_OUTPUT` passes output through | run |
+| `guard-secret-dump` | PreToolUse (Bash) | Ask before a bare-value producer prints (`security … -w`, `kubectl get secret` jsonpath/template/custom-columns or json/yaml into `jq`/`yq`, `op read`, `op item get --reveal`, `vault … -field`, `aws secretsmanager get-secret-value`, `gcloud secrets versions access`, `pass show`), unless the pipeline's last stage is a hash (`sha256sum`-family) or stdout goes to a real file; stdin consumers such as `docker login --password-stdin` ask too | run |
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) | run |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable | run |
 
@@ -290,17 +292,20 @@ deregistration ceremony. Stale entries are swept on the next `session start`.
 
 ### Living-plan guards
 
-Three more `session` hooks serve the living-plan lifecycle (ADR-0038) rather than
-multi-session identity. They are wired by the **cadence** plugin, and all three
-bind to the plan doc for the current branch.
+Four more `session` hooks serve the living-plan lifecycle (ADR-0038) rather than
+multi-session identity. They are wired by the **cadence** plugin. The first three
+bind to the plan doc for the current branch; `plan-driver` binds first by the plan's
+frontmatter `approved_session_id`, then by `branch:`.
 
 | Hook | Event | What it does | Remote |
 |------|-------|--------------|--------|
 | `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched | run |
 | `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch | run |
 | `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) | run |
+| `plan-driver` | PreModelSwitch (`source` `command`/`picker`, attended TUI) | Ask the operator to confirm a `/model` switch whose target family differs from the in-flight plan's `## Orchestrator` → `Driver:`; silent unless the hook env shows `CLAUDE_CODE_ENTRYPOINT=cli` and `CLAUDE_CODE_SESSION_ATTENDED=1` with no `CLAUDE_CODE_REMOTE` (with no human attached — SDK, `claude -p`, stream-json — an `ask` refuses the switch outright), on disagreeing or driverless plans, and on an unrecognized model | run |
 
-`nudge-plan-tick` and `warn-plan-ready-flip` only ever warn. `lint-plan-shape` is the
+`nudge-plan-tick` and `warn-plan-ready-flip` only ever warn; `plan-driver` only ever
+asks, and only where a human can answer. `lint-plan-shape` is the
 one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
 (`agent_id` present) and every internal failure allow (ADR-0001).
 

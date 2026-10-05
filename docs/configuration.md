@@ -287,6 +287,7 @@ kept unprefixed because it's a cross-tool convention.
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Maximum seconds to wait after `gh pr merge` before checking for straggler issues; returns early after 2 s once every referenced issue is closed (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
 | `CADENCE_ALLOW_SECRET_PUSH` | `prevent-secret-push` | Set truthy (`1`/`true`/`yes`) in the hook's environment (not inline on the command) to let a push through that the guard would block; the allow is recorded as a bypass row. **Weakens a protected guard** |
+| `CADENCE_ALLOW_SECRET_OUTPUT` | `redact-secret-output` | Set truthy (`1`/`true`/`yes`) in the hook's environment to pass Bash output through unmasked; the allow is recorded as a bypass row |
 | `CADENCE_ALLOW_SOPS_DECRYPT` | `guard-sops-decrypt` | Set truthy (`1`/`true`/`yes`) to let a decrypt through; the allow is recorded as a bypass row. **Weakens a protected guard** |
 | `CADENCE_RUNBOOKS_DIR` | `guard-runbook-scrub` | The runbooks directory the guard protects (a leading `~/` is expanded). Unset or blank leaves the guard inert |
 | `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK` | `guard-runbook-scrub` | Set truthy (`1`/`true`/`yes`) in the hook's environment (not inline on the command) to let an unscrubbed write into `CADENCE_RUNBOOKS_DIR` through; the allow is recorded as a bypass row. **Weakens a protected guard** |
