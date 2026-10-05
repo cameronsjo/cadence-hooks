@@ -940,6 +940,17 @@ pub const HOOKS: &[HookEntry] = &[
         remote: RemotePolicy::Run,
         suppressible: false,
     },
+    HookEntry {
+        name: "plan-driver",
+        description: "Ask to confirm a /model switch (command or picker, attended TUI only: CLAUDE_CODE_ENTRYPOINT=cli and CLAUDE_CODE_SESSION_ATTENDED=1, never -p, stream-json, SDK or CLAUDE_CODE_REMOTE, where an ask refuses the switch) away from the Driver family of this session's in-flight plan — matched by frontmatter approved_session_id, else branch: (PreModelSwitch)",
+        namespace: "session",
+        events: &[HookEvent::PreModelSwitch],
+        // Remote: read-only; the check self-silences under CLAUDE_CODE_REMOTE,
+        // where a streamed /model cannot answer an ask and would be refused (#989).
+        remote: RemotePolicy::Run,
+        // It asks, never nudges.
+        suppressible: false,
+    },
 ];
 
 /// Whether `.claude/cadence.json` may silence `hook`'s nudges. `false` for an
