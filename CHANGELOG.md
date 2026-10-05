@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The plan-shape lint nudges on a plan with no `## Loop` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Loop section` among the stanzas a plan lacks, between the `Panel:` line and the Alternatives-declined stanza. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Loop: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the exact line `## Loop` with optional trailing whitespace, so `## Loopback`, `### Loop`, `## loop`, an indented heading, and a `## Loop` line inside a single fenced code block do not count. (tracked in cameronsjo/cadence-hooks#1281)
 
+### Fixed
+
+- **A plan-shape stanza hidden from the rendered plan no longer counts.** The shared line filter behind `lint-plan-shape`, the persist-time format gate and the `## Orchestrator` reader now skips HTML comment blocks (a line-start `<!--` through the line carrying `-->`; a mid-line `<!--` stays literal text), the plan's leading YAML frontmatter (after an optional BOM), and nested fences: a fence closes only on the same character, at least as long as the opener, with no info string, indented at most 3 columns past the opener, so a four-backtick fence holding a three-backtick one, a backtick fence holding a tilde one, or a fence quoting a 4-space-indented nested fence stays one fence. `<!-->` and `<!--->` are complete empty comments. A `Panel:` line in any of those positions now reads as missing and blocks, and a `## Loop` heading there reads as missing. An unterminated fence or comment hides the rest of the plan, so it can only make a stanza read as missing. The checkbox counter reads through the same filter, so a box in a fence, comment or frontmatter is never counted. (cameronsjo/cadence-hooks#1283)
+
 ## [0.121.0] - 2026-09-30
 
 ### Security
