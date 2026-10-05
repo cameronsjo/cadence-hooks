@@ -181,6 +181,8 @@ enum PushTarget {
 /// discarded a recorded evil `--repo` URL that `main` had caught.
 ///
 /// An empty result means no explicit destination — the tracking-remote fallback.
+/// A [`PushTarget::None`] entry beside explicit ones means a parsed push names
+/// no repository, so the tracking remote is judged as well.
 /// `walk_pushes` is the push walk's reading of the same command
 /// ([`PushWalk::of`]); the repositories of its pushes running in `work_dir`
 /// are judged alongside `push_segments`, so a push only the walk sees is
@@ -247,8 +249,16 @@ fn extract_push_targets(
     // 200 KB `git -C d push origin main; …` flood spent the whole deadline on
     // `git remote` and the guard failed open (cadence-hooks#1131).
     let mut candidates: Vec<String> = Vec::new();
+    // A parsed push naming no repository pushes to the tracking remote, which
+    // must still be judged when another push names a destination: the walked
+    // repositories above made `git push; bash -c 'git push <owned-url> main'`
+    // look fully explicit, so an unowned tracking remote was never checked.
+    let mut bare_segment = false;
     for words in &argument_lists {
         let found = cadence_hooks_core::shell::push_repository_argument(words);
+        if found.positional.is_none() && found.repo_flag.is_none() {
+            bare_segment = true;
+        }
         for candidate in [found.positional, found.repo_flag].into_iter().flatten() {
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);
@@ -259,11 +269,15 @@ fn extract_push_targets(
         return Vec::new();
     }
     let remotes = RemoteNames::of(work_dir);
-    candidates
+    let mut targets: Vec<PushTarget> = candidates
         .iter()
         .map(|candidate| classify_push_target(candidate, &remotes))
         .filter(|t| !matches!(t, PushTarget::None))
-        .collect()
+        .collect();
+    if bare_segment {
+        targets.push(PushTarget::None);
+    }
+    targets
 }
 
 /// One `git remote` listing, taken once per directory and shared by every
@@ -1048,6 +1062,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // precedence and costs only a nonsense command.
     let mut named_remotes: Vec<String> = Vec::new();
     let mut owned_url_validated = false;
+    let mut tracking_remote = false;
     let mut unresolvable: Option<String> = None;
     for target in &targets {
         match target {
@@ -1097,7 +1112,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 }
                 unresolvable = Some(token.clone());
             }
-            PushTarget::None => {}
+            PushTarget::None => tracking_remote = true,
         }
     }
 
@@ -1105,18 +1120,19 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // resolution — nothing left to check. An unresolvable token is
     // deliberately excluded: it still takes the tracking-remote fallback
     // below, and the nudge rides that path's allow.
-    if named_remotes.is_empty() && owned_url_validated && unresolvable.is_none() {
+    if named_remotes.is_empty() && owned_url_validated && unresolvable.is_none() && !tracking_remote
+    {
         return CheckResult::allow();
     }
 
     // Resolve and validate EVERY named remote, not only the last one seen.
     // With no named remote at all, the single `None` probe is the
     // tracking-remote fallback — the bare-`git push` path, unchanged.
-    let probes: Vec<Option<&str>> = if named_remotes.is_empty() {
-        vec![None]
-    } else {
-        named_remotes.iter().map(|r| Some(r.as_str())).collect()
-    };
+    // A bare push beside named ones adds that same `None` probe.
+    let mut probes: Vec<Option<&str>> = named_remotes.iter().map(|r| Some(r.as_str())).collect();
+    if probes.is_empty() || tracking_remote {
+        probes.push(None);
+    }
 
     let mut url = String::new();
     for probe in probes {
@@ -2310,6 +2326,32 @@ mod tests {
                     "{command}: {:?}",
                     result.message
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn a_bare_push_beside_an_owned_walked_url_still_judges_the_tracking_remote() {
+        // CodeRabbit on #1328: the walked repository made the command look
+        // fully explicit, so the bare push's unowned tracking remote went
+        // unjudged.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let walked = "git push; bash -c 'git push https://github.com/cameronsjo/x.git main'";
+        with_env(&owners_only(), || {
+            let unowned = checkout_with_origin("https://github.com/evil/x.git");
+            let cwd = unowned.path().to_string_lossy().to_string();
+            for command in [
+                walked,
+                "git push --tags; bash -c 'git push https://github.com/cameronsjo/x.git main'",
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, Block, "{command}: {:?}", result.message);
+            }
+            let owned = checkout_with_origin("https://github.com/cameronsjo/scratch.git");
+            let cwd = owned.path().to_string_lossy().to_string();
+            for command in [walked, "git push", "git push origin main"] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, Allow, "{command}: {:?}", result.message);
             }
         });
     }
