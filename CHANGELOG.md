@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.123.1] - 2026-10-05
+
 ### Fixed
 
 - **`redact-secret-output` stops masking five non-secret shapes.** A `token` after `next`, `idempotency`, or `page` preceded by `next`/`prev`, is a pagination or idempotency handle in every spelling (`NextToken`, `nextToken`, `next_page_token`, `nextPageToken`, `prev_page_token`, `IdempotencyToken`), and AWS's PascalCase `ClientToken` is exempt by its exact name; Vault's `client_token`, a bare page token (`PAGE_TOKEN`, `FB_PAGE_TOKEN`, `pageToken`: a Facebook Page access token), `KEY_TOKEN`, `SYNC_TOKEN`, `RESUME_TOKEN` and `CONTINUATION_TOKEN` still mask. A bare `YES`/`NO` after a strong name in the `name: value` form is prose, so MySQL's `Access denied … (using password: YES)` keeps its text. A name that is only a glued `lastpass`, `hashpass` or `endpass` keeps a value of digits only (`lastpass=1696500000`, `HASHPASS: 12`); any other value (`LASTPASS=<secret>`), and any longer name (`LASTPASS_PASSWORD`, `LASTPASS_PIN`), still masks. Matching only narrows; no detection is added, and `SessionToken`, `AccessToken`, `ClientSecret`, `password: <value>` and the existing canaries still mask. The redactor is not wired yet (cameronsjo/cadence#1565). Part of cameronsjo/cadence-hooks#1274; its miss list is outside the threat model.
