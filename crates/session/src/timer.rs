@@ -142,17 +142,7 @@ pub fn apply(
             }
         }
         TimerAction::Stop => {
-            // Claim the timer by renaming it away first: of two concurrent
-            // stops exactly one rename succeeds, so exactly one logs a row.
-            // `~` is outside the label charset, so no valid label can name
-            // (and so collide with) a claim file.
-            let claim = path.with_file_name(format!("{label}~stop.{}", std::process::id()));
-            if std::fs::rename(&path, &claim).is_err() {
-                return not_running(label);
-            }
-            let claimed = read_start(&claim);
-            let _ = std::fs::remove_file(&claim);
-            let Some(start) = claimed else {
+            let Some(start) = claim_for_stop(&path) else {
                 return not_running(label);
             };
             let elapsed = now.saturating_sub(start);
@@ -172,6 +162,56 @@ pub fn apply(
             ))
         }
     }
+}
+
+/// Claim a running timer for `stop`, returning its start. Of any number of
+/// concurrent stops on the same timer, exactly one gets `Some`, so exactly one
+/// logs a ledger row.
+///
+/// The claim is "read and consume under an exclusive file lock": each stopper
+/// opens the timer file, takes an exclusive lock, and only the first to read a
+/// start truncates it to empty before unlocking; every later holder of a handle
+/// to that same file then reads it empty. The file is removed afterwards so a
+/// stopped timer leaves nothing behind.
+///
+/// A rename-to-claim-file is NOT exclusive on Windows: `std::fs::rename` there
+/// opens a handle to the source and renames *through the handle*, so a stopper
+/// that opened the source before a peer's rename follows the file to the
+/// peer's claim path and renames it again — both "win" (cadence-hooks#480,
+/// `concurrent_stops_log_exactly_once` failing 2 vs 1 on windows-latest).
+fn claim_for_stop(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // A filesystem with no lock support degrades to the unlocked read rather
+    // than refusing every stop.
+    if let Err(e) = file.lock()
+        && e.kind() != std::io::ErrorKind::Unsupported
+    {
+        return None;
+    }
+    let mut raw = String::new();
+    let start = file
+        .read_to_string(&mut raw)
+        .ok()
+        .and_then(|_| raw.trim().parse::<u64>().ok());
+    if start.is_some() {
+        // Consume while still holding the lock; a failed truncate must not
+        // let a second stopper read the same start, so it forfeits the claim.
+        if file.set_len(0).is_err() {
+            let _ = file.unlock();
+            return None;
+        }
+    }
+    let _ = file.unlock();
+    drop(file);
+    if start.is_some() {
+        let _ = std::fs::remove_file(path);
+    }
+    start
 }
 
 fn not_running(label: &str) -> TimerOutcome {
