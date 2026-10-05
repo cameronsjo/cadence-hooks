@@ -247,3 +247,52 @@ pub fn make_user_prompt_submit(
 
 // Git-fixture builders (`Scratch`, `git_in`, `init_repo`) live in the sibling
 // `git_fixtures` module — see there.
+
+/// Assert that `run(n)` costs time linear in `n`, for a flood test whose
+/// property is "this input shape does not blow up".
+///
+/// An absolute wall-clock bound on a flood fails on a loaded runner with the
+/// code behaving correctly: a 2.3 s run took 9.6 s on a busy CI box. The
+/// ratio between two sizes measured in the same process does not, because
+/// load slows both. `run` is timed at `size` and then at four times `size`,
+/// and the fastest time seen at each size is compared: linear work takes
+/// about 4x as long at the larger size, quadratic work about 16x, so a ratio
+/// under [`LINEAR_RATIO_LIMIT`] passes. A round over it is measured again, up
+/// to [`LINEAR_ROUNDS`] rounds, so a load burst that lands on one measurement
+/// does not decide the verdict; a real quadratic stays over it every round.
+///
+/// Each larger run is also held to [`FLOOD_HANG_LIMIT`], a hang guard far
+/// above a healthy run so runner load cannot trip it.
+pub fn assert_scales_linearly(what: &str, size: usize, mut run: impl FnMut(usize)) {
+    let mut timed = |n: usize| {
+        let started = std::time::Instant::now();
+        run(n);
+        started.elapsed()
+    };
+    let mut small = std::time::Duration::MAX;
+    let mut large = std::time::Duration::MAX;
+    for _ in 0..LINEAR_ROUNDS {
+        small = small.min(timed(size));
+        let took = timed(4 * size);
+        assert!(took < FLOOD_HANG_LIMIT, "{what}: {took:?} at {}", 4 * size);
+        large = large.min(took);
+        if large.as_secs_f64() < LINEAR_RATIO_LIMIT * small.as_secs_f64() {
+            return;
+        }
+    }
+    panic!(
+        "{what}: {large:?} at {} vs {small:?} at {size} is over {LINEAR_RATIO_LIMIT}x \
+         for 4x the input, so the work grows faster than linearly",
+        4 * size
+    );
+}
+
+/// The most a run at four times the size may cost relative to the base size
+/// in [`assert_scales_linearly`]: about 4 is linear and about 16 quadratic.
+pub const LINEAR_RATIO_LIMIT: f64 = 8.0;
+
+/// Rounds [`assert_scales_linearly`] measures before it gives a verdict.
+pub const LINEAR_ROUNDS: usize = 5;
+
+/// Hang guard for one flood run in [`assert_scales_linearly`].
+pub const FLOOD_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);

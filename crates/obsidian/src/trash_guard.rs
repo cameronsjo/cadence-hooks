@@ -2693,22 +2693,26 @@ mod tests {
     }
 
     /// A 200 KB flood of process-substitution openers, whose bodies are now
-    /// walked as commands, is judged inside the deadline, and a delete after
-    /// it still blocks (cameronsjo/cadence-hooks#1233).
+    /// walked as commands, is judged in time linear in its length, and a
+    /// delete after it still blocks (cameronsjo/cadence-hooks#1233).
+    ///
+    /// Linear, not under a wall-clock bound: an 8 s debug bound failed at
+    /// 9.6 s on a loaded CI runner with the guard behaving correctly, and a
+    /// flood that went quadratic again would cost 16x at four times the size.
     #[test]
     fn a_process_substitution_flood_is_judged_promptly() {
-        let limit =
-            std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 });
         for opener in ["<(", ">(", ">(a "] {
-            let flood = opener.repeat(200 * 1024 / opener.len());
-            let started = std::time::Instant::now();
-            assert_eq!(
-                outcome_in_vault(&format!("{flood}\nrm note.md")),
-                cadence_hooks_core::Outcome::Block,
-                "{opener:?}"
+            cadence_hooks_core::test_builders::assert_scales_linearly(
+                opener,
+                50 * 1024 / opener.len(),
+                |count| {
+                    assert_eq!(
+                        outcome_in_vault(&format!("{}\nrm note.md", opener.repeat(count))),
+                        cadence_hooks_core::Outcome::Block,
+                        "{opener:?} x {count}"
+                    );
+                },
             );
-            let took = started.elapsed();
-            assert!(took < limit, "{opener:?}: {took:?}");
         }
     }
 
