@@ -615,9 +615,20 @@ mod tests {
             ),
             "git push origin --delete a b c d e f g h i".to_string(),
         ] {
+            // 2 s everywhere but a debug build on the Windows runner, which
+            // reads this flood ~2.5x slower than Linux debug: after #1278's
+            // second reading it sat past 2 s on every main commit while Linux
+            // debug took 0.9 s and release 0.17 s. A return to quadratic work
+            // still trips the wider bound.
+            let limit = std::time::Duration::from_secs(if cfg!(all(windows, debug_assertions)) {
+                6
+            } else {
+                2
+            });
             let started = std::time::Instant::now();
             let (msg, calls) = push_calls(repo.path(), &command);
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            let took = started.elapsed();
+            assert!(took < limit, "{}: {took:?}", &command[..40]);
             assert_eq!(calls, 0);
             assert!(msg.is_some_and(|m| m.contains("more than the 8 checked")));
         }
