@@ -61,7 +61,23 @@
 //! commit whose `encoding` header is not UTF-8, US-ASCII or ISO-8859-* (a
 //! token in it need not be ASCII bytes).
 //!
-//! **Aliases.** A `git <sub>` whose subcommand is not a builtin is looked up in
+//! **Aliases.** git runs a builtin before any alias or `git-<name>`, so a
+//! subcommand spelled exactly as one (`BUILTINS`, else, for a plain `git`
+//! in a command that does not name `PATH`, `git --list-cmds=builtins` of
+//! the running git; case-sensitive, as git is: `git STATUS` runs
+//! `alias.status`) is never probed, whatever the env or directory. "Builtin"
+//! here means "not an alias", not "cannot publish": hooks, credential and
+//! other helpers, and fsmonitor commands a builtin runs are outside this
+//! guard's model, and `for-each-repo`, which runs a git command its arguments
+//! name, is probed like any other subcommand, as is `git hook` with any
+//! argument but `list` (`hook run` runs whatever hook the config names). The running git vouches only for
+//! a plain `git` in a command that does not name `PATH`; a `git` swapped
+//! without naming it (`hash -p`, a nameref built from an expansion, a sourced
+//! file) is outside the model. An exec-path script (`submodule`, `bisect`),
+//! which git also runs before any alias, is probed for a real alias, but a
+//! probe that is blind, capped or failing leaves it allowed unless the command
+//! spells out a moved exec path (`GIT_EXEC_PATH`, `--exec-path`). Any other
+//! `git <sub>` is looked up in
 //! the repository's config (`alias.<sub>`, following alias-of-alias, past any
 //! global options an alias value opens with). It blocks as unresolved when:
 //! its value names `push` or `send-pack` or starts with `!`; an alias opens
@@ -77,7 +93,6 @@
 //! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
 //! neither an alias, a builtin or exec-path command `git --list-cmds` knows,
 //! nor an executable `git-<name>` in an absolute `PATH` directory.
-//! Builtins skip all of it.
 //!
 //! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
 //! (process-group kill, stdout cap, shared hook deadline, stdin written from
@@ -300,6 +315,8 @@ struct GitCall {
     /// git runs under a name that picks its subcommand: a dashed `git-push`
     /// executable, or `exec -a <name>` (git dispatches on argv[0]).
     renamed: bool,
+    /// The command word is plain `git` (found on `PATH`), not a path to one.
+    bare: bool,
 }
 
 /// Plumbing that publishes objects without `git push`.
@@ -370,6 +387,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
                 globals: Vec::new(),
                 rest: vec!["exec -a".to_string()],
                 renamed: true,
+                bare: false,
             });
             continue;
         }
@@ -382,6 +400,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
                     .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
                     .collect(),
                 renamed: sub == "push",
+                bare: false,
             });
             continue;
         }
@@ -408,6 +427,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
                 .collect(),
             rest: rest.iter().map(|w| unescape_word(w).into_owned()).collect(),
             renamed: false,
+            bare: unescape_word(first) == "git",
         });
     }
     out
@@ -441,72 +461,262 @@ fn command_hints(calls: &[GitCall]) -> CommandHints {
     hints
 }
 
-/// Git builtins an alias cannot shadow (git runs the builtin), so a segment
-/// running one needs no alias probe. Not exhaustive: a missing name costs one
-/// config read, never a verdict.
+/// Commands compiled into EVERY git from 2.30.0 to the 2026-10 `master`:
+/// git looks a subcommand up in its builtin table before it tries an
+/// exec-path or `PATH` `git-<name>` and before any alias, so `alias.<name>`
+/// and a `git-<name>` executable can never replace one. The table is
+/// independent of env, config and directory, so a call running one needs no
+/// alias probe however blind that probe would be. Sorted (binary search);
+/// the intersection of `commands[]` in git.c at `v2.30.0` and `master`,
+/// minus `pack-redundant` and `whatchanged` (compiled out under
+/// `WITH_BREAKING_CHANGES`, so a git 3 alias can shadow them). Matched
+/// case-sensitively, as git does: `git STATUS` is not the builtin, and runs
+/// `alias.status`. A builtin added since 2.30 is confirmed with the running
+/// git instead ([`is_builtin`]).
 const BUILTINS: &[&str] = &[
     "add",
     "am",
+    "annotate",
     "apply",
     "archive",
-    "bisect",
     "blame",
     "branch",
+    "bugreport",
     "bundle",
     "cat-file",
+    "check-attr",
     "check-ignore",
+    "check-mailmap",
+    "check-ref-format",
     "checkout",
+    "checkout-index",
     "cherry",
     "cherry-pick",
     "clean",
     "clone",
+    "column",
     "commit",
+    "commit-graph",
+    "commit-tree",
     "config",
+    "count-objects",
+    "credential",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
     "describe",
     "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "difftool",
+    "fast-export",
+    "fast-import",
     "fetch",
+    "fetch-pack",
+    "fmt-merge-msg",
     "for-each-ref",
+    "for-each-repo",
     "format-patch",
     "fsck",
+    "fsck-objects",
     "gc",
+    "get-tar-commit-id",
     "grep",
+    "hash-object",
     "help",
+    "index-pack",
     "init",
+    "init-db",
+    "interpret-trailers",
     "log",
     "ls-files",
     "ls-remote",
     "ls-tree",
+    "mailinfo",
+    "mailsplit",
+    "maintenance",
     "merge",
     "merge-base",
+    "merge-file",
+    "merge-index",
+    "merge-ours",
+    "merge-recursive",
+    "merge-recursive-ours",
+    "merge-recursive-theirs",
+    "merge-subtree",
+    "merge-tree",
+    "mktag",
+    "mktree",
+    "multi-pack-index",
     "mv",
+    "name-rev",
     "notes",
+    "pack-objects",
+    "pack-refs",
+    "patch-id",
+    "pickaxe",
+    "prune",
+    "prune-packed",
     "pull",
     "push",
     "range-diff",
+    "read-tree",
     "rebase",
+    "receive-pack",
     "reflog",
     "remote",
+    "remote-ext",
+    "remote-fd",
+    "repack",
+    "replace",
+    "rerere",
     "reset",
     "restore",
     "rev-list",
     "rev-parse",
     "revert",
     "rm",
+    "send-pack",
     "shortlog",
     "show",
+    "show-branch",
+    "show-index",
     "show-ref",
     "sparse-checkout",
+    "stage",
     "stash",
     "status",
-    "submodule",
+    "stripspace",
+    "submodule--helper",
     "switch",
     "symbolic-ref",
     "tag",
+    "unpack-file",
+    "unpack-objects",
+    "update-index",
     "update-ref",
+    "update-server-info",
+    "upload-archive",
+    "upload-archive--writer",
+    "upload-pack",
     "var",
+    "verify-commit",
+    "verify-pack",
+    "verify-tag",
     "version",
     "worktree",
+    "write-tree",
 ];
+
+/// Commands every git since 2.30 ships as a builtin or an exec-path script
+/// (`git-bisect` became a builtin later; `git-submodule` is still a script).
+/// git runs an exec-path command before any alias and puts the exec-path ahead
+/// of `PATH`, so only a moved exec path ([`CommandEnv::exec_path_moved`]) lets
+/// an alias or a `PATH` executable stand in for one.
+const EXEC_PATH_COMMANDS: &[&str] = &["bisect", "submodule"];
+
+/// Builtins that run a git command their arguments or config name
+/// (`for-each-repo --config=<key> <subcommand>…`): no alias replaces them, but
+/// they are still probed like an unknown subcommand, so a blind probe fails
+/// closed as it did before builtins were skipped.
+const RUNS_A_GIT_COMMAND: &[&str] = &["for-each-repo"];
+
+/// Is `word` a builtin of git, so no alias can replace it: one in
+/// [`BUILTINS`], or, when `ask_git` (the call runs plain `git` from an
+/// unchanged `PATH`), one the running git lists (`git --list-cmds=builtins`,
+/// a compiled-in table no env or config changes). The query runs at most once
+/// per process, so a long command costs one spawn; if it fails only
+/// [`BUILTINS`] counts (stricter). A [`RUNS_A_GIT_COMMAND`] builtin never
+/// counts.
+fn is_builtin(word: &str, ask_git: bool) -> bool {
+    static RUNNING: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    if RUNS_A_GIT_COMMAND.contains(&word) {
+        return false;
+    }
+    if BUILTINS.binary_search(&word).is_ok() {
+        return true;
+    }
+    if !ask_git || word.is_empty() || word.contains(['/', '\\']) {
+        return false;
+    }
+    RUNNING
+        .get_or_init(|| {
+            let dir = std::env::temp_dir();
+            match git(
+                &dir.to_string_lossy(),
+                &["--list-cmds=builtins"],
+                64 * 1024,
+                Budget::Probe,
+            ) {
+                Git::Ok(list) if !list.trim().is_empty() => {
+                    Some(list.lines().map(|l| l.trim().to_string()).collect())
+                }
+                _ => None,
+            }
+        })
+        .as_ref()
+        .is_some_and(|running| running.contains(word))
+}
+
+/// What a command's whole text says about the environment its git calls run
+/// in, read once per command so a padded command repeating a call costs one
+/// pass over the text, not one per call.
+struct CommandEnv {
+    /// Why no repository probe can see the config ([`command_probe_blind`]).
+    blind: Option<&'static str>,
+    /// The same, for an exec-path script: a moved exec path does not change
+    /// the config, and for a script it is judged by
+    /// [`CommandEnv::exec_path_moved`] instead.
+    script_blind: Option<&'static str>,
+    /// The command names `GIT_EXEC_PATH` (quotes and backslashes removed).
+    exec_path_moved: bool,
+    /// The command names the `PATH` variable other than to expand it
+    /// ([`names_path_variable`]), so another `git` may run.
+    path_moved: bool,
+}
+
+impl CommandEnv {
+    fn of(command: &str) -> Self {
+        let plain: String = command
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+            .collect();
+        Self {
+            blind: command_probe_blind(command, true),
+            script_blind: command_probe_blind(command, false),
+            exec_path_moved: contains_ignoring_ascii_case(&plain, "GIT_EXEC_PATH"),
+            path_moved: names_path_variable(&plain),
+        }
+    }
+}
+
+/// Does `text` name the shell variable `PATH` other than to expand it: the
+/// word `PATH`, exactly as the shell spells it, not inside a longer name
+/// (`GIT_EXEC_PATH`, `MANPATH`) and not right after `$` or `${`. That catches
+/// `PATH=…`, `PATH+=…`, `export PATH`, `declare -x PATH=…`, `read PATH`,
+/// `printf -v PATH` and `declare -n r=PATH`, and leaves `$PATH`,
+/// `core.hooksPath` and `--git-path` alone.
+fn names_path_variable(text: &str) -> bool {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
+    text.match_indices("PATH").any(|(at, _)| {
+        let before = &bytes[..at];
+        let after = bytes.get(at + 4).copied();
+        !before.last().copied().is_some_and(ident)
+            && !after.is_some_and(ident)
+            && !before.ends_with(b"$")
+            && !before.ends_with(b"${")
+    })
+}
+
+/// Can this call's own options move git's exec path (`--exec-path=`)?
+fn call_moves_exec_path(call: &GitCall) -> bool {
+    call.globals
+        .iter()
+        .any(|w| w.to_ascii_lowercase().starts_with("--exec-path"))
+}
 
 /// Read `git config -z --get-regexp <regex>` as `(key, value)` pairs. A key
 /// with no value reads as `true`, which is what git's boolean parser does.
@@ -625,7 +835,12 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 /// its value names `push`, `send-pack` or `http-push`, runs a shell (`!`),
 /// opens with an option this cannot follow, or reaches a subcommand
 /// `help.autocorrect` would guess at.
-fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static str> {
+fn alias_runs_push(
+    cfg: &AliasConfig,
+    dir: &str,
+    name: &str,
+    ask_git: bool,
+) -> Option<&'static str> {
     const PUSHES: &str = "is an alias that can run a push (its value names `push` or \
                           `send-pack`, or runs a shell command)";
     let mut name = name.to_string();
@@ -641,11 +856,11 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
         };
         // git splits an alias with its own quoting, so `pu\sh` and `p"u"sh`
         // are `push` to it.
-        let plain: String = value
+        let unquoted: String = value
             .chars()
             .filter(|c| !matches!(c, '\\' | '"' | '\''))
-            .collect::<String>()
-            .to_ascii_lowercase();
+            .collect();
+        let plain = unquoted.to_ascii_lowercase();
         if plain.trim_start().starts_with('!')
             || plain.contains("push")
             || plain.contains("send-pack")
@@ -654,7 +869,8 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
         }
         // An alias may open with git's global options (`-c a.b=c x`,
         // `--paginate x`); its subcommand is the first word after them.
-        let words: Vec<String> = plain.split_whitespace().map(str::to_string).collect();
+        // Case kept: the next word is a builtin only as git spells it.
+        let words: Vec<String> = unquoted.split_whitespace().map(str::to_string).collect();
         let rest = skip_git_global_options(&words);
         match rest.first() {
             // Options only: git 2.43 refuses it as empty, but nothing here
@@ -666,8 +882,8 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
             Some(next) if next.starts_with('-') => {
                 return Some("is an alias opening with an option this guard cannot follow");
             }
-            Some(next) if BUILTINS.contains(&next.as_str()) => return None,
-            Some(next) => name = next.clone(),
+            Some(next) if is_builtin(next, ask_git) => return None,
+            Some(next) => name = next.to_ascii_lowercase(),
         }
     }
     Some("is an alias chain too deep to follow")
@@ -678,12 +894,15 @@ fn alias_runs_push(cfg: &AliasConfig, dir: &str, name: &str) -> Option<&'static 
 /// an alias (or autocorrected guess) that can push.
 fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> Option<String> {
     let mut probed: HashMap<String, Result<AliasConfig, String>> = HashMap::new();
-    let mut command_blind: Option<Option<&'static str>> = None;
+    let mut env: Option<CommandEnv> = None;
     let mut judged: std::collections::HashSet<(String, String)> = Default::default();
     for call in calls {
         let Some(sub) = call.rest.first() else {
             continue;
         };
+        // git matches its builtins case-sensitively but alias names
+        // case-insensitively, so `git STATUS` runs `alias.status`.
+        let exact = sub.as_str();
         let sub = sub.to_ascii_lowercase();
         if call.renamed {
             return Some(format!(
@@ -704,23 +923,45 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
                 sane(&sub)
             ));
         }
-        if sub.starts_with('-') || BUILTINS.contains(&sub.as_str()) {
+        if sub.starts_with('-') || (exact != "hook" && is_builtin(exact, false)) {
             continue;
         }
+        let env = env.get_or_insert_with(|| CommandEnv::of(command));
+        let ask_git = call.bare && !env.path_moved;
+        // `git hook run` runs whatever hook the config names: probed like an
+        // unknown subcommand, so a blind or failed probe fails closed as it
+        // did before. Only bare `git hook` and `git hook list` run nothing.
+        let runs_hook = exact == "hook" && call.rest.get(1).is_some_and(|w| w.as_str() != "list");
+        if !runs_hook && is_builtin(exact, ask_git) {
+            continue;
+        }
+        // An exec-path script is probed for a real alias like any other
+        // subcommand; where that probe cannot run or see, it stays exempt
+        // unless the command spells out a moved exec path.
+        let script_exempt = EXEC_PATH_COMMANDS.contains(&exact)
+            && !env.exec_path_moved
+            && !call_moves_exec_path(call);
         if hints.aliases.contains(&sub) {
             return Some(format!(
                 "`git {}` runs an alias this same command writes",
                 sane(&sub)
             ));
         }
-        let blind = *command_blind.get_or_insert_with(|| command_probe_blind(command));
+        let script = EXEC_PATH_COMMANDS.contains(&exact);
+        let blind = if script { env.script_blind } else { env.blind };
         if let Some(why) = alias_probe_blind(blind, call) {
+            if script_exempt {
+                continue;
+            }
             return Some(format!(
                 "`git {}` may be an alias this guard cannot resolve ({why})",
                 sane(&sub)
             ));
         }
         if !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES {
+            if script_exempt {
+                continue;
+            }
             return Some(format!(
                 "`git {}` may be an alias, in more directories than this guard will probe",
                 sane(&sub)
@@ -734,6 +975,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         });
         let cfg = match cfg {
             Ok(cfg) => cfg,
+            Err(_) if script_exempt => continue,
             Err(why) => {
                 return Some(format!("`git {}` may be an alias, and {why}", sane(&sub)));
             }
@@ -743,7 +985,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         if !judged.insert((call.dir.clone(), sub.clone())) {
             continue;
         }
-        if let Some(why) = alias_runs_push(cfg, &call.dir, &sub) {
+        if let Some(why) = alias_runs_push(cfg, &call.dir, &sub, ask_git) {
             return Some(format!("`git {}` {why}", sane(&sub)));
         }
     }
@@ -757,7 +999,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
 /// `HOME=`, or a config include. Plain substrings of the text with quotes and
 /// backslashes removed (`GIT_"DIR"=` is `GIT_DIR=` to the shell), so a
 /// mention anywhere counts — stricter, never looser.
-fn command_probe_blind(command: &str) -> Option<&'static str> {
+fn command_probe_blind(command: &str, exec_path_blinds: bool) -> Option<&'static str> {
     const ENV: &[&str] = &[
         "GIT_CONFIG",
         "GIT_DIR",
@@ -771,7 +1013,11 @@ fn command_probe_blind(command: &str) -> Option<&'static str> {
         .chars()
         .filter(|c| !matches!(c, '"' | '\'' | '\\'))
         .collect();
-    if ENV.iter().any(|name| plain.contains(name)) {
+    if ENV
+        .iter()
+        .filter(|name| exec_path_blinds || **name != "GIT_EXEC_PATH")
+        .any(|name| plain.contains(name))
+    {
         return Some("the command sets git's config or repository environment");
     }
     if contains_ignoring_ascii_case(&plain, "include.path")
@@ -2587,6 +2833,297 @@ mod tests {
             &fresh.run("git config alias.qq push; git qq origin main"),
             &["qq", "alias"],
         );
+    }
+
+    /// cadence-hooks#1284: git runs a builtin before any alias, so no env,
+    /// config or directory state can make one a push. Every row of the issue's
+    /// table, and the comment's `merge-tree` with an unresolved directory.
+    #[test]
+    fn a_git_builtin_is_never_a_possible_alias_whatever_the_env_or_dir() {
+        let fx = Fx::new("builtin-blind");
+        let plain = fx.work.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let cred = "GIT_TRACE=1 git -c credential.helper= credential fill";
+        let mut cases: Vec<(String, String)> = vec![
+            (cred.into(), plain.display().to_string()),
+            (cred.into(), "/nonexistent/cadence-1284".into()),
+            (
+                format!("cd /nonexistent && {cred}"),
+                plain.display().to_string(),
+            ),
+            (
+                format!("HOME=/tmp/fakehome {cred}"),
+                plain.display().to_string(),
+            ),
+            (
+                "git -C \"$W\" merge-tree --write-tree --name-only \
+                 refs/remotes/origin/main refs/remotes/origin/b"
+                    .into(),
+                fx.work.display().to_string(),
+            ),
+            (
+                "HOME=/tmp/x git credential fill".into(),
+                fx.work.display().to_string(),
+            ),
+        ];
+        for env in [
+            "GIT_CONFIG_GLOBAL=/tmp/x",
+            "GIT_DIR=/tmp/x",
+            "XDG_CONFIG_HOME=/tmp/x",
+            "GIT_CONFIG_NOSYSTEM=1",
+        ] {
+            cases.push((format!("{env} {cred}"), plain.display().to_string()));
+        }
+        for sub in [
+            "status",
+            "log",
+            "config --list",
+            "var",
+            "for-each-ref",
+            "rev-parse",
+            "worktree",
+            "credential",
+            "credential-cache",
+            "credential-store",
+            "hook",
+            "maintenance",
+            "merge-tree",
+        ] {
+            cases.push((
+                format!("HOME=/tmp/fakehome git {sub}"),
+                fx.work.display().to_string(),
+            ));
+        }
+        // An alias shadowing a builtin is ignored by git.
+        fx.git(&["config", "alias.credential", "push"]);
+        cases.push(("git credential fill".into(), fx.work.display().to_string()));
+        for (command, cwd) in &cases {
+            let input = make_bash_with_cwd(command, cwd);
+            let r = PreventSecretPushGuard.run_with(&input, None, |_| false);
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "{command} in {cwd}: {:?}",
+                r.message
+            );
+        }
+    }
+
+    /// The other side of #1284: only an exact builtin is skipped. git matches
+    /// builtins case-sensitively and aliases case-insensitively (`git STATUS`
+    /// runs `alias.status`), an exec-path script yields to an alias once the
+    /// exec path moves, and a genuine unknown still fails closed.
+    #[test]
+    fn only_an_exact_builtin_skips_the_alias_probe() {
+        let fx = Fx::new("builtin-exact");
+        fx.git(&["config", "alias.status", "push"]);
+        fx.git(&["config", "alias.credential", "push"]);
+        fx.git(&["config", "alias.submodule", "push"]);
+        fx.git(&["config", "alias.up", "STATUS"]);
+        for (command, needle) in [
+            ("git STATUS", "alias"),
+            ("git Credential fill", "alias"),
+            ("git up", "alias"),
+            ("git -c alias.q=Status q", "alias"),
+            ("git --exec-path=/nonexistent submodule", "alias"),
+            ("GIT_EXEC_PATH=/nonexistent git submodule", "alias"),
+            ("HOME=/tmp/x git mycustomalias", "cannot resolve"),
+            ("HOME=/tmp/x git Credential fill", "cannot resolve"),
+            ("git -C \"$W\" mycustomalias", "cannot resolve"),
+        ] {
+            assert_blocks(&fx.run(command), &[needle]);
+        }
+        // Raw push plumbing is a builtin too, and still refused.
+        assert_blocks(&fx.run("HOME=/tmp/x git send-pack r main"), &["send-pack"]);
+        // An exec-path script is probed for a real alias where the probe can
+        // see; a blind probe leaves it allowed while the exec path stays.
+        assert_blocks(&fx.run("git submodule"), &["submodule", "alias"]);
+        assert_allows(&fx.run("HOME=/tmp/x git submodule update"));
+    }
+
+    /// Gate 2 C1: a padded command repeating `git submodule` reads its text
+    /// once, not once per call. Quadratic, a 300 KB flood ran past the hook
+    /// deadline, which fails open, and the push after it went unscanned. The
+    /// bound is loose so a loaded test machine does not fail it; the release
+    /// timings are the measurement.
+    #[test]
+    fn a_submodule_flood_reads_the_command_text_once() {
+        let fx = Fx::new("submodule-flood");
+        fx.commit("s.txt", &format!("{}\n", aws_key()), "s");
+        let flood = "git submodule; ".repeat(20_000);
+        let calls = git_calls(&flood, fx.work.to_str().unwrap());
+        assert_eq!(calls.len(), 20_000);
+        let started = std::time::Instant::now();
+        let hints = command_hints(&calls);
+        assert_eq!(hidden_alias_push(&flood, &calls, &hints), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        let padded = format!("if false; then {flood}fi; git push origin main");
+        assert_blocks(&fx.run(&padded), &["s.txt"]);
+    }
+
+    /// Gate 2 I1: `for-each-repo` is a builtin no alias replaces, but it runs
+    /// the git command its arguments name (`push` among them), so it keeps
+    /// the probe an unknown subcommand gets and a blind one fails closed.
+    #[test]
+    fn for_each_repo_is_probed_like_an_unknown_subcommand() {
+        let fx = Fx::new("for-each-repo");
+        for command in [
+            "HOME=/tmp/x git -c r.x=. for-each-repo --config=r.x push origin main",
+            "cd \"$W\" && git -c r.x=. for-each-repo --config=r.x push origin main",
+            "GIT_DIR=/tmp/x git for-each-repo --config=r.x status",
+        ] {
+            assert_blocks(&fx.run(command), &["for-each-repo", "cannot resolve"]);
+        }
+        assert!(!is_builtin("for-each-repo", true));
+    }
+
+    /// Gate 2 M2 and round 2 I-1: an exec-path script is probed for a real
+    /// alias whenever the probe can see the config, so an alias reached
+    /// through any exec-path move is found, while a repository with no such
+    /// alias allows every everyday form. A blind probe keeps it allowed
+    /// unless the command spells out a moved exec path.
+    #[test]
+    fn an_exec_path_script_is_judged_by_its_real_alias() {
+        let fx = Fx::new("exec-alias");
+        fx.git(&["config", "alias.submodule", "push"]);
+        for command in [
+            "G=GIT_EXEC; export ${G}_PATH=/nonexistent; git submodule",
+            "export $(printf 'GIT_EXEC_%s' PATH)=/nonexistent; git submodule",
+            "G=GIT_EXEC; set -a; printf -v \"${G}_PATH\" /nonexistent; git submodule",
+            "G=GIT_EXEC; declare -n r=\"${G}_PATH\"; export r=/nonexistent; git submodule",
+            "env GIT_EXEC_$'\\x50'ATH=/nonexistent git submodule",
+            "BASH_ENV=.envf bash -c 'git submodule'",
+            ". ./.envf; git submodule",
+            "GIT_EXEC_PATH=/nonexistent git submodule",
+            "git --exec-path=/nonexistent submodule",
+        ] {
+            assert_blocks(&fx.run(command), &["submodule"]);
+        }
+        // Blind, with the exec path spelled out as moved: refused.
+        assert_blocks(
+            &fx.run("HOME=/tmp/x git --exec-path=/nonexistent submodule"),
+            &["submodule", "cannot resolve"],
+        );
+        assert_blocks(
+            &fx.run("cd \"$W\" && GIT_EXEC_PATH=/nonexistent git submodule"),
+            &["submodule"],
+        );
+        // Blind with the exec path left alone: allowed, as before.
+        assert_allows(&fx.run("cd \"$W\" && GIT_DIR=x git submodule"));
+        let clean = Fx::new("exec-clean");
+        for command in [
+            "eval \"$(direnv export bash)\"; git submodule update",
+            "cd \"$W\" && eval \"$(ssh-agent -s)\" && git submodule update --init",
+            "source .venv/bin/activate && cd \"$W\" && git submodule update",
+            "for d in a b; do eval \"x_$d=1\"; done; git submodule status",
+            "GIT_EXEC_PATH=/usr/lib/git-core git bisect start",
+            "GIT_EXEC_PATH=/usr/lib/git-core git submodule update",
+            "git submodule update --init",
+        ] {
+            assert_allows(&clean.run(command));
+        }
+    }
+
+    /// Gate 2 M3: the running git vouches only for the `git` it is: a call
+    /// through a path, or under a command that mentions `PATH`, may run a
+    /// different git, so a builtin missing from [`BUILTINS`] (`diagnose`, added
+    /// in 2.38) is probed again and fails closed when blind.
+    #[test]
+    fn the_running_git_vouches_only_for_a_plain_git_on_an_unchanged_path() {
+        let fx = Fx::new("ask-git");
+        assert!(!BUILTINS.contains(&"diagnose"));
+        assert_allows(&fx.run("HOME=/tmp/x git diagnose -o /tmp/x"));
+        for command in [
+            "HOME=/tmp/x /usr/bin/git diagnose -o /tmp/x",
+            "HOME=/tmp/x ./git diagnose -o /tmp/x",
+            "PATH=/opt/old/bin:$PATH HOME=/tmp/x git diagnose -o /tmp/x",
+            "export PATH=/opt/old/bin; HOME=/tmp/x git diagnose -o /tmp/x",
+            "PATH+=:/opt; HOME=/tmp/x git diagnose -o /tmp/x",
+            "declare -n r=PATH; r=/opt; HOME=/tmp/x git diagnose -o /tmp/x",
+        ] {
+            assert_blocks(&fx.run(command), &["diagnose", "cannot resolve"]);
+        }
+        // A static builtin needs no vouching.
+        assert_allows(&fx.run("PATH=/x HOME=/tmp/x /usr/bin/git credential fill"));
+        // Round 2 m4: only the `PATH` variable itself counts, not an
+        // expansion of it or a longer name.
+        for command in [
+            "HOME=/tmp/x git diagnose -o /tmp/x; echo $PATH ${PATH}",
+            "HOME=/tmp/x MANPATH=/x git diagnose -o /tmp/x",
+            "cd \"$W\" && git -c core.hooksPath=.h diagnose -o /tmp/x",
+            "HOME=/tmp/x git diagnose -o /tmp/x --git-path x",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+    }
+
+    /// Gate 2 rounds 3-4: `git hook run` runs whatever hook the config
+    /// names, and a config can set `core.hooksPath` in more ways than a text
+    /// check can follow, so any `hook` call but bare `git hook` and
+    /// `git hook list` takes main's alias probe: blind fails closed, a
+    /// readable config with no `alias.hook` allows.
+    #[test]
+    fn hook_run_takes_the_alias_probe() {
+        let fx = Fx::new("hookrun");
+        for command in [
+            "HOME=/tmp/x git -c core.hooksPath=.h hook run pre-push",
+            "cd \"$W\" && git -c core.hooksPath=.h hook run pre-push",
+            "K=core.hooks; HOME=/tmp/x git -c ${K}Path=.h hook run pre-push",
+            "GIT_CONFIG_GLOBAL=/tmp/x/g git hook run pre-push",
+            "HOME=/tmp/x git hook run pre-push",
+            "git -c include.path=/tmp/x/g hook run pre-push",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooks$'P'ath \
+             GIT_CONFIG_VALUE_0=.h git hook run pre-push",
+            "cd \"$W\" && git hook run pre-commit",
+            "HOME=/tmp/x git hook Run pre-push",
+        ] {
+            assert_blocks(&fx.run(command), &["hook", "cannot resolve"]);
+        }
+        for command in [
+            "HOME=/tmp/fakehome git hook",
+            "HOME=/tmp/x git hook list pre-push",
+            "cd \"$W\" && git hook list pre-commit",
+            // A readable config with no `alias.hook`.
+            "git hook run pre-push",
+            "git -c core.hooksPath=.h hook run pre-push",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+        // A readable config whose `alias.hook` pushes: git runs the builtin,
+        // but main's probe refuses it, and so does this.
+        fx.git(&["config", "alias.hook", "push"]);
+        assert_blocks(&fx.run("git hook run pre-push"), &["hook", "alias"]);
+    }
+
+    /// [`BUILTINS`] is sorted for its binary search, and every entry is a
+    /// builtin of the git running the tests (git 2.30 or later).
+    #[test]
+    fn builtins_list_is_sorted_and_names_real_git_builtins() {
+        assert!(
+            BUILTINS.windows(2).all(|w| w[0] < w[1]),
+            "BUILTINS unsorted"
+        );
+        let out = std::process::Command::new("git")
+            .arg("--list-cmds=builtins")
+            .output()
+            .expect("git runs");
+        let running: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for name in BUILTINS {
+            assert!(
+                running.iter().any(|r| r == name),
+                "{name} is not a git builtin"
+            );
+        }
+        for name in ["pack-redundant", "whatchanged", "submodule", "STATUS"] {
+            assert!(!BUILTINS.contains(&name), "{name} must not be listed");
+        }
     }
 
     #[test]
