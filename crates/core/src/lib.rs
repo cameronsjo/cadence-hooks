@@ -1596,6 +1596,10 @@ pub enum BypassKind {
     GlobalBypass,
     /// `CADENCE_DISABLE` named this hook and switched it off (recorded in `main.rs`).
     GlobalDisable,
+    /// A `cd`'d command fell under two repos' configs that judged it
+    /// differently, and the guard nudged instead of blocking
+    /// (cameronsjo/cadence-hooks#225).
+    ConfigDisagreement,
 }
 
 impl BypassKind {
@@ -1607,6 +1611,7 @@ impl BypassKind {
             BypassKind::EnvSwitch => "env_switch",
             BypassKind::GlobalBypass => "global_bypass",
             BypassKind::GlobalDisable => "global_disable",
+            BypassKind::ConfigDisagreement => "config_disagreement",
         }
     }
 }
@@ -3743,6 +3748,10 @@ mod tests {
         assert_eq!(BypassKind::EnvSwitch.as_str(), "env_switch");
         assert_eq!(BypassKind::GlobalBypass.as_str(), "global_bypass");
         assert_eq!(BypassKind::GlobalDisable.as_str(), "global_disable");
+        assert_eq!(
+            BypassKind::ConfigDisagreement.as_str(),
+            "config_disagreement"
+        );
     }
 
     // --- JSON deserialization ---

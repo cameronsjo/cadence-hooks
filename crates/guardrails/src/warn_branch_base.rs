@@ -15,7 +15,6 @@
 
 use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::gitstate::GitState;
-use cadence_hooks_core::shell::parse_work_dir;
 use cadence_hooks_core::worktree::would_block_here;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
@@ -160,27 +159,21 @@ fn is_main_branch(name: &str) -> bool {
 }
 
 /// The directory whose repo `command` operates in: the payload `cwd` after any
-/// leading `cd` chain ([`parse_work_dir`]), resolved to the innermost repo
+/// leading `cd` chain, resolved to the innermost repo
 /// root through [`cadence_hooks_core::target_repo`].
 ///
 /// - No `cd` in effect: the cwd itself (long-standing behavior; `.` with no cwd).
-/// - A `cd` that resolves into a repo: that repo's root — the nested repo of a
-///   meta-repo session, a linked worktree, or another checkout.
-/// - A `cd` into somewhere that is no repo, does not exist, or cannot be
-///   read: `None`, so the caller stays quiet rather than judging the wrong repo
-///   (or, worse, the hook process's own directory).
+/// - An unconditional `cd` into the session's repo or a repo nested inside its
+///   tree: that repo's root — the nested repo of a meta-repo session.
+/// - Anything else (a conditional `cd`, a repo outside the session's tree, a
+///   directory that is no repo or does not exist): `None`, so the caller stays
+///   quiet rather than judging the wrong repo (or, worse, the hook process's
+///   own directory). See [`cadence_hooks_core::target_repo::command_repo_dir`].
 fn effective_repo_dir(command: &str, cwd: Option<&str>) -> Option<String> {
-    use cadence_hooks_core::target_repo::{TargetKind, resolve_effective_repo};
     let Some(cwd) = cwd else {
         return Some(".".to_string());
     };
-    let work = parse_work_dir(command, cwd);
-    if work == cwd {
-        return Some(cwd.to_string());
-    }
-    resolve_effective_repo(Path::new(cwd), Path::new(&work), TargetKind::Dir)
-        .resolved()
-        .map(|r| r.state.repo_root.to_string_lossy().into_owned())
+    cadence_hooks_core::target_repo::command_repo_dir(command, cwd)
 }
 
 /// The current branch of the repo enclosing `cwd`, or `None` for a detached
@@ -551,10 +544,17 @@ mod tests {
                     "",
                 ),
                 (
-                    "nested cwd, cd out to the meta primary: worktree-first",
+                    "nested cwd, cd out to the enclosing meta primary: outside the session tree, quiet",
                     format!("cd {m} && git checkout -b feat/y"),
                     w,
-                    Some("enforce-worktree"),
+                    None,
+                    "",
+                ),
+                (
+                    "meta cwd, a cd behind `false &&` may never run: quiet",
+                    format!("false && cd {w} && git checkout -b feat/y"),
+                    m,
+                    None,
                     "",
                 ),
                 (
