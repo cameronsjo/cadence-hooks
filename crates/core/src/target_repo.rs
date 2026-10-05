@@ -695,6 +695,7 @@ mod tests {
         let p = canon(&plugin).to_string_lossy().into_owned();
         let meta_root = canon(&meta).to_string_lossy().into_owned();
         // (label, command, cwd, expected)
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases: Vec<(&str, String, &str, Option<String>)> = vec![
             (
                 "no cd: the cwd, unchanged",

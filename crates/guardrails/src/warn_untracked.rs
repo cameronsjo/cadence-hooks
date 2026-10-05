@@ -612,6 +612,7 @@ mod tests {
     /// A repo whose own config names a program git would run: `core.fsmonitor`
     /// (runs on an index read), or a clean filter on a modified tracked file
     /// (runs on an index refresh). Either touches `marker` when it runs.
+    #[cfg(unix)]
     fn plant_exec_repo(dir: &std::path::Path, marker: &std::path::Path, kind: &str) {
         use cadence_hooks_core::git_fixtures::{git_in, init_repo};
         std::fs::create_dir_all(dir).unwrap();
