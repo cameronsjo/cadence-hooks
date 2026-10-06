@@ -2437,6 +2437,13 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
     // The endpoint is the first positional after `api`, skipping flag values.
     while i < tokens.len() {
         let tok = &tokens[i];
+        // A flag spelled through an expansion (`--$b`, `-X$m`) is a flag only
+        // the shell can name: `--jq` would take the next word as its value,
+        // `--hostname=…` would move the host. No endpoint can be read past
+        // it (cameronsjo/cadence-hooks#1344 review).
+        if tok.starts_with('-') && (tok.contains('$') || tok.contains('`')) {
+            return Some(String::new());
+        }
         if tok.starts_with("--") {
             if api_flag_takes_separate_value(tok) && !tok.contains('=') {
                 i += 2;
@@ -3153,9 +3160,14 @@ fn loop_targets_are_literal(command: &str) -> bool {
         let words: Vec<&str> = segment.split_whitespace().collect();
         match words.as_slice() {
             ["for", name, "in", values @ ..] => {
+                // Lowercase only: a loop over `IFS`, `GH_HOST`, `HOME`, or any
+                // other setting the shell or gh reads changes how gh runs, and
+                // those are all uppercase.
                 let ident = !name.is_empty()
                     && !name.starts_with(|c: char| c.is_ascii_digit())
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
                 // A value that starts with `-` would arrive in gh's argv as a flag.
                 if !ident || !values.iter().all(|v| plain(v) && !v.starts_with('-')) {
                     return false;
@@ -3163,10 +3175,11 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 loop_vars.push((*name).to_string());
             }
             ["gh", args @ ..] => {
-                if !args
-                    .iter()
-                    .all(|a| plain(a) || expands_to_plain(a, &loop_vars))
-                {
+                if !args.iter().all(|a| {
+                    plain(a)
+                        || (!a.trim_start_matches('"').starts_with('-')
+                            && expands_to_plain(a, &loop_vars))
+                }) {
                     return false;
                 }
             }
@@ -5683,6 +5696,16 @@ mod tests {
             r#"for b in ../../evil/x; do gh api -X DELETE "repos/cameronsjo/forgectl/${b}"; done"#,
             "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/../../evil/x/$b; done",
             "for b in a b; do gh api -X DELETE -iq repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/$b; done",
+            // Second pass: a flag name built from a loop variable.
+            "for b in jq; do gh api -X DELETE --$b repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/a; done",
+            "for b in preview; do gh api -X DELETE --$b repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/a; done",
+            "for b in hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x --$b; done",
+            r#"for b in hostname; do gh api -X DELETE "--${b}=evil.example" repos/cameronsjo/forgectl/x; done"#,
+            // A loop over a setting the shell or gh reads.
+            "for IFS in ,; do gh api -X DELETE repos/cameronsjo/forgectl/x${IFS}--hostname=evil.example; done",
+            "for IFS in ,; do for b in x,--hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done; done",
+            "for GH_HOST in evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            "for HOME in /tmp/evilhome; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
         ] {
             for strict in [false, true] {
                 let result = run_1344(command, "cameronsjo", strict);
@@ -5739,6 +5762,14 @@ mod tests {
             ("gh api -i repos/evil/x/y", "repos/evil/x/y"),
             // A letter gh api does not have: no endpoint can be named.
             ("gh api -X DELETE -Z repos/o/decoy repos/evil/x/y", ""),
+            // Nor past a flag spelled through an expansion.
+            ("gh api -X DELETE --$b repos/o/decoy repos/evil/x/y", ""),
+            ("gh api -X DELETE -i$b repos/o/decoy repos/evil/x/y", ""),
+            // A value that merely carries one is still a value.
+            (
+                "gh api -X DELETE -f \"body=$x\" repos/evil/x/y",
+                "repos/evil/x/y",
+            ),
         ];
         for (cmd, want) in cases {
             assert_eq!(gh_api_endpoint(cmd).as_deref(), Some(want), "{cmd}");
