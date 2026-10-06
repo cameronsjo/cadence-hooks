@@ -698,7 +698,13 @@ pub fn name_strength(name: &str) -> Option<Strength> {
         )
         .then_some(Strength::Meta);
     }
-    classify(segs)
+    // Only the whole name `pass` is a tally. A numbered one (`pass1`,
+    // `pass_2`) reaches the bare-`pass` branch once its digit segment is
+    // dropped, and keeps the strength a lone `pass` had before #1342.
+    match classify(segs) {
+        Some(Strength::Tally) if !name.eq_ignore_ascii_case("pass") => Some(Strength::Strong),
+        s => s,
+    }
 }
 
 fn classify(segs: &[&str]) -> Option<Strength> {
@@ -815,24 +821,48 @@ fn is_count(value: &str) -> bool {
     !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The length of a [`Strength::Counter`] value's leading tally when more
-/// words follow it on the line (`pass=5 fail=0`, #1342): the value ends at
-/// the tally, so it passes as a count and the words after it are judged on
-/// their own. `None` when the first word is not all digits or is the whole
-/// value, which keeps a strong name's mask-to-end-of-line extent.
-fn tally_len(value: &str) -> Option<usize> {
-    let word_len = value.find([' ', '\t'])?;
-    let word = value[..word_len].trim_end_matches([',', ';']);
-    (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())).then_some(word_len)
+/// The length of a counter value's leading number when that number is the
+/// whole value (#1342): it ends the line, is closed by `,`, `;` or `)`, or
+/// the next word starts its own `key=` / `key:` field (`pass=5 fail=0`). The
+/// value then ends at the number, and the words after it are judged on their
+/// own. A number followed by any other word (`pass=5 hunter2`) is not a count:
+/// `None`, which keeps the mask-to-end-of-line extent. `max_digits` bounds the
+/// number (a long one under a bare `pass` reads as a PIN).
+fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || max_digits.is_some_and(|max| digits > max) {
+        return None;
+    }
+    let after = &value[digits..];
+    let next = after.trim_start_matches([' ', '\t']);
+    let complete = after.trim_end().is_empty()
+        || after.starts_with([',', ';', ')'])
+        || (next.len() < after.len() && starts_key_field(next));
+    complete.then_some(digits)
 }
 
-/// The length of a [`Strength::Tally`] value's leading tally: a first word of
-/// one to six digits, alone or followed by a blank (`pass=5 fail=0`, #1342).
-/// A longer number reads as a PIN or a password, so it masks.
+/// Does `text` begin with a `name=` or `name:` field?
+fn starts_key_field(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let starts_name = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
+    let name_len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    starts_name && matches!(bytes.get(name_len), Some(b'=' | b':'))
+}
+
+/// [`leading_count_len`] for a [`Strength::Counter`] stem (`lastpass`).
+fn tally_len(value: &str) -> Option<usize> {
+    leading_count_len(value, None)
+}
+
+/// [`leading_count_len`] for a [`Strength::Tally`] (`pass`): at most six
+/// digits.
 fn short_tally_len(value: &str) -> Option<usize> {
-    let word_len = value.find([' ', '\t']).unwrap_or(value.trim_end().len());
-    let word = &value[..word_len];
-    ((1..=6).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_digit())).then_some(word_len)
+    leading_count_len(value, Some(6))
 }
 
 /// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
@@ -2636,6 +2666,9 @@ mod tests {
         let kept = [
             "stand-in rc=0 pass=5 fails=0\n",
             "pass=5 fail=0\n",
+            "pass=5, fail=0\n",
+            "pass=5; fail=0\n",
+            "(pass=5)\n",
             "pass=12 fail=0 skip=3\n",
             "pass: 7\n",
             "Pass=0\n",
@@ -2654,6 +2687,15 @@ mod tests {
             "pass: s3cret\n".to_string(),
             format!("pass={p}\n"),
             "pass=12ab34\n".to_string(),
+            // Numbered names are not the bare tally name.
+            "pass1=4821\n".to_string(),
+            "pass_2=4821\n".to_string(),
+            // A number followed by another word is not a complete count.
+            "pass=5 hunter2\n".to_string(),
+            "lastpass=5 hunter2\n".to_string(),
+            "pass=4821\tsecretword\n".to_string(),
+            "x pass=5 hunter2\n".to_string(),
+            "pass: 5 hunter2\n".to_string(),
             // A tally ends the value; a secret after it is judged on its own.
             format!("pass=5 token={p}\n"),
             format!("x pass=5 token={p}\n"),
