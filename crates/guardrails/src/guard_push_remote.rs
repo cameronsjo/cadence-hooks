@@ -954,17 +954,28 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             ));
         }
         ChainAnalysis::MissingRemotes(cmds) => {
-            let bare: Vec<String> = cmds
-                .iter()
-                .filter(|c| c.explicit_repo.is_none())
-                .map(|c| format!("`git {}`", c.args.join(" ")))
-                .collect();
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                 Found: {}\n   \
-                 Fix: add explicit remote, e.g. `git push origin main`",
-                bare.join(", "),
-            ));
+            // Each push is judged on its own target below: a bare push's is
+            // the remote git resolves for it, judged by the tracking-remote
+            // probe, and a named one's is that remote
+            // (cameronsjo/cadence-hooks#1329). The chain shape alone used to
+            // block `git push origin feat && git push --tags`. Two different
+            // explicit remotes still block exactly as they do without a bare
+            // push beside them, so adding one cannot lift that block.
+            let mut explicit: Vec<&str> = Vec::new();
+            for remote in cmds.iter().filter_map(|c| c.explicit_repo.as_deref()) {
+                if !explicit.contains(&remote) {
+                    explicit.push(remote);
+                }
+            }
+            if explicit.len() > 1 {
+                let remotes: Vec<String> = explicit.iter().map(|r| format!("`{r}`")).collect();
+                return CheckResult::block(format!(
+                    "🚫 git-guardrails: chained git push to different remotes\n   \
+                     Found: remotes {}\n   \
+                     Fix: run each push individually, e.g. `git push origin main`",
+                    remotes.join(", "),
+                ));
+            }
         }
         ChainAnalysis::ParseFailed => {
             // Fall back to counting. The substring count alone misses a
@@ -1569,10 +1580,12 @@ mod tests {
     }
 
     #[test]
-    fn chained_pushes_missing_remote_blocked() {
+    fn chained_pushes_missing_remote_are_not_blocked_as_a_chain() {
+        // Each push is judged on its own target (cameronsjo/cadence-hooks#1329);
+        // the chain shape alone no longer blocks.
         let result = PushRemoteGuard.run(&make_bash("git push && git push origin main"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("without explicit remotes"));
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(!msg.contains("without explicit remotes"), "{msg}");
     }
 
     #[test]
@@ -2076,6 +2089,101 @@ mod tests {
                 assert_eq!(
                     result.outcome == cadence_hooks_core::Outcome::Block,
                     blocks,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A bare push chained after one that names its remote is judged by its
+    /// own target, git's: `branch.<b>.pushRemote`, `remote.pushDefault`,
+    /// `branch.<b>.remote`, then `origin` (cameronsjo/cadence-hooks#1329).
+    /// It used to block as "chained git push without explicit remotes"
+    /// whatever that target was. Every row is `(command, blocks?)`, run on a
+    /// branch with no upstream.
+    #[test]
+    fn a_chained_bare_push_is_judged_by_its_own_target() {
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &[
+                "remote",
+                "add",
+                "mine",
+                "https://github.com/cameronsjo/y.git",
+            ],
+        );
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/cameronsjo/z.git",
+            ],
+        );
+        cadence_hooks_core::git_fixtures::git_in(owned.path(), &["checkout", "-q", "-b", "feat"]);
+        let o = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, blocks) in [
+                // The issue's two shapes.
+                ("git push origin feat && git push --tags", false),
+                ("git push mine HEAD && git push", false),
+                ("git push origin feat; git push --tags", false),
+                ("git push && git push origin feat", false),
+                ("git push -u origin feat && git push --follow-tags", false),
+                // Two explicit remotes still block, with or without a bare
+                // push beside them: adding one must not lift that block.
+                ("git push origin a && git push mine b", true),
+                ("git push origin a && git push mine b && git push", true),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &o));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+
+        // The bare push's own target is unowned: it blocks on that remote.
+        let unowned = checkout_with_origin("https://github.com/evil/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            unowned.path(),
+            &[
+                "remote",
+                "add",
+                "mine",
+                "https://github.com/cameronsjo/y.git",
+            ],
+        );
+        let u = unowned.path().to_string_lossy().to_string();
+        // No remote a bare push could resolve to (no upstream, no
+        // `origin`): the old verdict, a block.
+        let lonely = tempfile::tempdir().expect("create git fixture");
+        cadence_hooks_core::git_fixtures::init_repo(lonely.path());
+        cadence_hooks_core::git_fixtures::git_in(
+            lonely.path(),
+            &[
+                "remote",
+                "add",
+                "mine",
+                "https://github.com/cameronsjo/y.git",
+            ],
+        );
+        let l = lonely.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, cwd) in [
+                ("git push mine HEAD && git push", &u),
+                ("git push mine HEAD && git push --tags", &u),
+                ("git push mine HEAD && git push", &l),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, cwd));
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Block,
                     "{command} (from {cwd}): {:?}",
                     result.message
                 );

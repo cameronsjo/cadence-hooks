@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-push-remote` judges a bare push chained after a named one by its own target.** `git push origin feat && git push --tags` and `git push mine HEAD && git push` blocked as "chained git push without explicit remotes" whatever the bare push's remote was. Each push is now judged on its own: a bare push by the remote git resolves for it (`branch.<b>.pushRemote`, `remote.pushDefault`, `branch.<b>.remote`, then `origin`), a named one by that remote. A bare push whose resolved remote is unowned, or that has no remote to resolve, still blocks, and a chain naming two different remotes still blocks as before, with or without a bare push beside them (cameronsjo/cadence-hooks#1329).
+
 ## [0.123.1] - 2026-10-05
 
 ### Fixed
