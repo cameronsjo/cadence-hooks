@@ -11,7 +11,7 @@ use crate::prevent_secret_leaks::{argv_program_opens, unquoted_substitution_bodi
 use crate::secret_patterns::{
     Filename, ProgramOpen, curl_write_targets, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token_at, is_safe_template, is_secret_scan_exempt, scan_secret_values,
-    wget_write_targets,
+    unresolved_parameter_cause, wget_write_targets,
 };
 use cadence_hooks_core::shell::{
     carries_substitution, command_segments, command_word, executable_tokens, peel_command_runners,
@@ -764,7 +764,21 @@ impl Check for SecretWritesGuard {
                     // The matched target classifies the shape; it is never
                     // rendered. The hint's path is the literal `<path>`
                     // placeholder, so nothing derived from the command text
-                    // reaches the message.
+                    // reaches the message — except an unresolved parameter's
+                    // own name, charset-limited by `unresolved_parameter_cause`.
+                    //
+                    // #1337: when only an unresolved `$VAR` makes the target
+                    // read as a secret (`.env$X`), the block stays but says
+                    // so instead of claiming a deny-set file.
+                    if let Some(reference) = unresolved_parameter_cause(&target, Filename::Known) {
+                        return CheckResult::block(format!(
+                            "🚫 BLOCKED: prevent-secret-writes: a write target has an unresolved {reference}\n\
+                             Found: a redirect or writer-verb target whose literal part could \
+                             complete a deny-set secret name (.env family, id_rsa, …) once \
+                             {reference} expands; this guard cannot see its value.\n\
+                             Fix: name the target file literally, without the variable."
+                        ));
+                    }
                     let mut message = "🚫 BLOCKED: prevent-secret-writes: command would write or delete a secret file\n\
                          Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, sed -i, perl -i, rm) targeting a deny-set secret file (.env family, id_rsa, .aws/credentials, .git-credentials, .pgpass, .kube/config, .netrc, …)\n\
                          Fix: modify secret files manually outside Claude Code.\n\
@@ -2232,6 +2246,74 @@ mod tests {
     }
 
     const ENV_WRITE_BLOCK: &str = "🚫 BLOCKED: '.env' is a protected file (secrets/credentials). Modify manually outside Claude Code.";
+
+    // --- #1337: name the unresolved variable, not a deny-set file it was never shown to be
+
+    #[test]
+    fn a_target_completed_only_by_a_variable_names_the_variable() {
+        let guard = SecretWritesGuard { detect: present };
+        for (command, reference) in [
+            ("cat x > .env$X", "\"$X\""),
+            ("echo k > ~/.ssh/id_rsa${SUFFIX}", "\"${SUFFIX}\""),
+            ("cp a .env$1", "\"$1\""),
+        ] {
+            let result = guard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+            let message = result.message.unwrap();
+            assert!(
+                message.contains(&format!("has an unresolved {reference}")),
+                "{command}: {message}"
+            );
+            assert!(
+                !message.contains("targeting a deny-set secret file"),
+                "{message}"
+            );
+            assert!(!message.contains("forgectl"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_literal_secret_name_beside_a_variable_keeps_the_secret_file_message() {
+        let guard = SecretWritesGuard { detect: absent };
+        for command in [
+            "echo x > $DIR/.env",
+            "echo x > \"${OUT}\"/id_rsa",
+            "echo x > .env",
+        ] {
+            let result = guard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command}"
+            );
+            let message = result.message.unwrap();
+            assert!(
+                message.contains("targeting a deny-set secret file"),
+                "{command}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_that_names_no_secret_family_still_allows() {
+        let guard = SecretWritesGuard { detect: absent };
+        for command in [
+            "gh api x | base64 -d > /tmp/x/renovate-$f",
+            "for f in config.js default.json; do base64 -d < a > \"/tmp/x/renovate-$f\"; done",
+            "echo x > $OUT.json",
+        ] {
+            let result = guard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn write_env_message_is_unchanged_when_forgectl_is_absent() {

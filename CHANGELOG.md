@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`warn-unreviewed-ready-flip` nudges at `gh pr review` when the marker's values sit off line 1 (#1335).** A review body carrying `head=<40-char SHA>`, `crit=` and `imp=` whose first line is not a well-formed `<!-- cadence-review: … -->` marker used to look reviewed to a person and surface only at `gh pr ready`. The nudge now fires on the review itself and gives the literal line to paste, prefilled with the body's own head SHA and counts (`<reviewer>` left to fill). It reads an inline `--body`, an on-disk `--body-file`, or a readable same-command heredoc; it never calls `gh`, never blocks, and is silent when line 1 parses or a trigger token is missing. The existing `Bash(*gh pr *)` wiring already reaches `gh pr review`.
+
+### Changed
+
+- **`guard-body-budget` measures a body file the same command writes by heredoc (#1334).** `cadence:redaction`'s gated form writes the body, scans it and posts it in one command, so the file on disk was stale and the guard only nudged "cannot measure". When the only write of the body file is a bare `cat > FILE <<'EOF'` before the post, with a found terminator and text that cannot expand, that heredoc text is now measured, and an over-budget one gets the verdict the same text in a separate file gets. Every other same-command write keeps the nudge, which now names the redaction gated form as the known-unmeasurable case and says the write can move to its own command, since the gate sits between the scan and the post.
+- **`guard-gh-write` and `prevent-secret-writes` name the unresolved variable when one is what blocks (#1337 item 1).** A loop write whose only blocked target is an expansion (`for …; do gh pr merge 3 -R "$r"; done`) now says `cannot resolve "$r" in -R; use a literal owner/repo` instead of `gh loop targets repo you don't own`, matching the single-command arm. A write target that reads as a secret only because a `$VAR` may complete it (`> .env$X`, `> id_rsa${SUFFIX}`) now says the target `has an unresolved "$X"` instead of claiming a deny-set secret file. Verdicts are unchanged; a literal secret name beside a variable (`> $DIR/.env`) keeps the old message. `prevent-secret-leaks` needed no change: since #1303 it never judges a name containing a variable.
+
 ### Fixed
 
 - **`guard-push-remote` judges each push in a chain by its own target.** `git push origin feat && git push --tags` and `git push mine HEAD && git push` blocked as "chained git push without explicit remotes", and `git push origin a && git push mine b` as "chained git push to different remotes", even when every remote was owned. The chain shape no longer blocks: a bare push is judged by the remote git resolves for it (`branch.<b>.pushRemote`, `remote.pushDefault`, `branch.<b>.remote`, then `origin`), a named one by that remote's URL, and an explicit URL directly. The chain still blocks when any push goes to an unowned remote or one that does not resolve; loops and an unparseable command with several pushes keep their blocks (cameronsjo/cadence-hooks#1329).
