@@ -581,6 +581,12 @@ pub enum Strength {
     /// [`Strength::Strong`] is, except a value that is only digits
     /// (`lastpass=1696500000`, `HASHPASS: 12`), which counts something.
     Counter,
+    /// A whole name that is a bare `pass` (#1342): masked as
+    /// [`Strength::Strong`] is, except an unquoted value of at most six digits
+    /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
+    /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
+    /// string's `&pass=` all mask, as does a longer number.
+    Tally,
 }
 
 /// Per-call memo of [`name_strength`], so a long run of the same name is
@@ -686,21 +692,35 @@ pub fn name_strength(name: &str) -> Option<Strength> {
                 .is_some_and(|p| matches!(*p, "password" | "token")))
         || (matches!(last, "secret" | "secrets") && body.last() == Some(&"existing"));
     if meta_suffix {
-        return matches!(classify(body), Some(Strength::Strong | Strength::Counter))
-            .then_some(Strength::Meta);
+        return matches!(
+            classify(body),
+            Some(Strength::Strong | Strength::Counter | Strength::Tally)
+        )
+        .then_some(Strength::Meta);
     }
-    classify(segs)
+    // Only the whole name `pass` is a tally. A numbered one (`pass1`,
+    // `pass_2`) reaches the bare-`pass` branch once its digit segment is
+    // dropped, and keeps the strength a lone `pass` had before #1342.
+    match classify(segs) {
+        Some(Strength::Tally) if !name.eq_ignore_ascii_case("pass") => Some(Strength::Strong),
+        s => s,
+    }
 }
 
 fn classify(segs: &[&str]) -> Option<Strength> {
     // Whole-name directives that are not English words (redis, slapd).
     if let [only] = segs
-        && matches!(
-            *only,
-            "requirepass" | "masterauth" | "rootpw" | "pass" | "pw"
-        )
+        && matches!(*only, "requirepass" | "masterauth" | "rootpw" | "pw")
     {
         return Some(Strength::Strong);
+    }
+    // A bare `pass` is also a test runner's tally (`pass=5 fail=0`): see
+    // [`Strength::Tally`] (#1342). `DB_PASS` and `PASSWORD` never reach here
+    // as a lone `pass` segment and keep their strength.
+    if let [only] = segs
+        && *only == "pass"
+    {
+        return Some(Strength::Tally);
     }
     let mut weak = false;
     for (i, seg) in segs.iter().enumerate() {
@@ -799,6 +819,77 @@ fn is_count(value: &str) -> bool {
         .trim_end_matches([',', ';'])
         .trim_matches(['"', '\'']);
     !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The length of a counter value's leading number when that number is the
+/// whole value (#1342): it ends the line, is closed by `,`, `;` or `)`, or
+/// the next word starts its own `key=` / `key:` field (`pass=5 fail=0`). The
+/// value then ends at the number, and the words after it are judged on their
+/// own. A number followed by any other word (`pass=5 hunter2`) is not a count:
+/// `None`, which keeps the mask-to-end-of-line extent. `max_digits` bounds the
+/// number (a long one under a bare `pass` reads as a PIN).
+fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || max_digits.is_some_and(|max| digits > max) {
+        return None;
+    }
+    let after = &value[digits..];
+    let next = after.trim_start_matches([' ', '\t']);
+    let complete = after.trim_end().is_empty()
+        || closes_count(after)
+        || (next.len() < after.len() && starts_key_field(next));
+    complete.then_some(digits)
+}
+
+/// Does `after` start with a closer (`,` `;` `)`) that ends the value?
+/// A closer glued to more text counts only when that text is another
+/// count field (`5,fail=0`), not a word (`1234,hunter2`, `1234,a:b`).
+fn closes_count(after: &str) -> bool {
+    let rest = after.trim_start_matches([',', ';', ')']);
+    rest.len() < after.len()
+        && (rest.chars().next().is_none_or(char::is_whitespace) || starts_count_field(rest))
+}
+
+/// Does `text` begin with a `name=<digits>` or `name:<digits>` field that
+/// ends at a closer, whitespace or the end of the line?
+fn starts_count_field(text: &str) -> bool {
+    if !starts_key_field(text) {
+        return false;
+    }
+    let Some(sep) = text.find(['=', ':']) else {
+        return false;
+    };
+    let value = &text[sep + 1..];
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && value[digits..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, ',' | ';' | ')'))
+}
+
+/// Does `text` begin with a `name=` or `name:` field?
+fn starts_key_field(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let starts_name = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
+    let name_len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    starts_name && matches!(bytes.get(name_len), Some(b'=' | b':'))
+}
+
+/// [`leading_count_len`] for a [`Strength::Counter`] stem (`lastpass`).
+fn tally_len(value: &str) -> Option<usize> {
+    leading_count_len(value, None)
+}
+
+/// [`leading_count_len`] for a [`Strength::Tally`] (`pass`): at most six
+/// digits.
+fn short_tally_len(value: &str) -> Option<usize> {
+    leading_count_len(value, Some(6))
 }
 
 /// Prefixes that make a glued `…key` a credential (`MASTERKEY`, `SSHKEY`).
@@ -1011,6 +1102,9 @@ fn value_masks(strength: Strength, value: &str, colon: bool) -> bool {
     match (strength, colon) {
         (Strength::Meta, _) => maskable(v) && !metadata_value(v),
         (Strength::Counter, colon) => !is_count(v) && value_masks(Strength::Strong, v, colon),
+        // The tally exemption lives in the plain forms that read it
+        // ([`short_tally_len`]); everywhere else a bare `pass` is strong.
+        (Strength::Tally, colon) => value_masks(Strength::Strong, v, colon),
         (Strength::Strong, true) => {
             maskable(v)
                 && !PROSE_VALUES.contains(&v.to_ascii_lowercase().as_str())
@@ -1492,10 +1586,32 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 let stop = |c: char| match lead {
                     Some(q @ ('"' | '\'')) => c == q,
                     Some('?' | '&') => c == '&' || c.is_whitespace(),
-                    _ if matches!(strength, Strength::Strong | Strength::Counter) => false,
+                    _ if matches!(
+                        strength,
+                        Strength::Strong | Strength::Counter | Strength::Tally
+                    ) =>
+                    {
+                        false
+                    }
                     _ => c.is_whitespace() || matches!(c, '&' | '"' | '\''),
                 };
-                let len = text[start..eol].find(stop).unwrap_or(eol - start);
+                // A plain `… pass=5` (#1342): not a `--pass=` flag, not a
+                // query string's `&pass=`, not quoted or inside a `{…}`.
+                let plain = matches!(lead, Some(' ' | '\t' | ';' | '|' | '('))
+                    && !head[1..].starts_with('-');
+                if strength == Strength::Tally
+                    && plain
+                    && let Some(n) = short_tally_len(&text[start..eol])
+                {
+                    done = start + n;
+                    continue;
+                }
+                let tally = (strength == Strength::Counter
+                    && !matches!(lead, Some('"' | '\'' | '?' | '&')))
+                .then(|| tally_len(&text[start..eol]))
+                .flatten();
+                let len =
+                    tally.unwrap_or_else(|| text[start..eol].find(stop).unwrap_or(eol - start));
                 (start, start + len)
             }
         };
@@ -1537,7 +1653,17 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 let inner = &rest[1..];
                 (1, 1 + closing_quote(inner, q).unwrap_or(inner.len()), true)
             }
-            _ => (0, rest.trim_end().len(), false),
+            _ => {
+                if strength == Strength::Tally
+                    && head.starts_with([' ', '\t'])
+                    && let Some(n) = short_tally_len(rest)
+                {
+                    done = start + n;
+                    continue;
+                }
+                let tally = (strength == Strength::Counter).then(|| tally_len(rest));
+                (0, tally.flatten().unwrap_or(rest.trim_end().len()), false)
+            }
         };
         done = start + ve;
         let value = &rest[vs..ve];
@@ -1733,6 +1859,19 @@ fn line_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         }
         let (vs, ve) = unquote(value_start, value);
         let quoted = vs != value_start;
+        let ve = match (quoted, strength) {
+            (false, Strength::Counter) => tally_len(value).map_or(ve, |n| vs + n),
+            _ => ve,
+        };
+        // A plain line-start `pass=5` / `pass: 5` (#1342); a quoted name
+        // (`"pass": 5`) is a JSON or quoted form and keeps the mask.
+        if strength == Strength::Tally
+            && !quoted
+            && !line[..head.end()].contains(['"', '\''])
+            && short_tally_len(value).is_some()
+        {
+            continue;
+        }
         // `token = get_token(request)` — a spaced `=` (source code, not an env
         // line) whose value is a call, attribute path or `await …` expression.
         let spaced = sep == "=" && line[..head.end() - 1].ends_with([' ', '\t']);
@@ -1764,7 +1903,10 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
         .split([' ', '\t'])
         .next()
         .unwrap_or("");
-    if !matches!(names.get(first), Some(Strength::Strong | Strength::Counter)) {
+    if !matches!(
+        names.get(first),
+        Some(Strength::Strong | Strength::Counter | Strength::Tally)
+    ) {
         return;
     }
     let Some(caps) = WS_ROW.captures(line) else {
@@ -1793,8 +1935,12 @@ fn row_span(line: &str, start: usize, table: bool, names: &mut Names, spans: &mu
     };
     let strength = names.get(name.as_str());
     if tabular
-        && matches!(strength, Some(Strength::Strong | Strength::Counter))
+        && matches!(
+            strength,
+            Some(Strength::Strong | Strength::Counter | Strength::Tally)
+        )
         && !(strength == Some(Strength::Counter) && is_count(value.as_str()))
+        && !(strength == Some(Strength::Tally) && short_tally_len(value.as_str()).is_some())
         && maskable(value.as_str())
         && !PROSE_VALUES.contains(&value.as_str().to_ascii_lowercase().as_str())
     {
@@ -2538,6 +2684,89 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1342: a bare `pass` key is a test runner's
+    /// tally (`pass=5 fail=0`), so a plain unquoted value of at most six
+    /// digits passes. Any other value or form, and every longer pass name,
+    /// masks.
+    #[test]
+    fn issue_1342_bare_pass_tally_passes_through() {
+        let kept = [
+            "stand-in rc=0 pass=5 fails=0\n",
+            "pass=5 fail=0\n",
+            "pass=5, fail=0\n",
+            "pass=5; fail=0\n",
+            "(pass=5)\n",
+            "pass=12 fail=0 skip=3\n",
+            "pass: 7\n",
+            "Pass=0\n",
+            "pass=123456\n",
+            "PASS=5\n",
+            "rc: 0 pass: 5 fail: 0\n",
+            "pass=5,fail=0\n",
+            "pass=5,fail=0,skip=1\n",
+            "pass=5;fail=0\n",
+            "lastpass=12 endpass=13\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+        let p = pw();
+        let masks = [
+            "pass=hunter2\n".to_string(),
+            "Pass=hunter2\n".to_string(),
+            "pass: s3cret\n".to_string(),
+            format!("pass={p}\n"),
+            "pass=12ab34\n".to_string(),
+            // Numbered names are not the bare tally name.
+            "pass1=4821\n".to_string(),
+            "pass_2=4821\n".to_string(),
+            // A number followed by another word is not a complete count.
+            "pass=5 hunter2\n".to_string(),
+            "lastpass=5 hunter2\n".to_string(),
+            "pass=4821\tsecretword\n".to_string(),
+            "x pass=5 hunter2\n".to_string(),
+            "pass: 5 hunter2\n".to_string(),
+            // A closer glued to more text does not end the count.
+            "pass=1234,hunter2\n".to_string(),
+            "pass=1234;hunter2\n".to_string(),
+            "pass=1234)hunter2\n".to_string(),
+            "lastpass=1234,hunter2\n".to_string(),
+            "pass=1234,hunter2=\n".to_string(),
+            "pass=1234,a:b\n".to_string(),
+            "pass=1234;abc=def\n".to_string(),
+            "pass=123456,P4ss:word\n".to_string(),
+            "lastpass=1234,s3cret:x\n".to_string(),
+            // A tally ends the value; a secret after it is judged on its own.
+            format!("pass=5 token={p}\n"),
+            format!("x pass=5 token={p}\n"),
+            "pass=hunter2 fail=0\n".to_string(),
+            format!("{{\"pass\": \"{p}\"}}\n"),
+            // Only a short, plain, unquoted tally passes: a longer number,
+            // a quoted or JSON value, a flag and a query string all mask.
+            "pass=48213907\n".to_string(),
+            "pass=\"48213907\"\n".to_string(),
+            "pass=\"5\"\n".to_string(),
+            "{\"pass\": \"48213907\"}\n".to_string(),
+            "{\"pass\": 42}\n".to_string(),
+            // (A flag at the very start of a line is not read by any form,
+            // for any name, on main either: `--password=x` stays as it is.)
+            "run --pass=48213907\n".to_string(),
+            "run --pass=4821\n".to_string(),
+            "--pass 48213907\n".to_string(),
+            "run --pass 4821\n".to_string(),
+            "GET /login?user=bob&pass=48213907\n".to_string(),
+            "GET /login?user=bob&pass=4821\n".to_string(),
+            "user=bob pass=48213907 host=db\n".to_string(),
+            // Longer names keep their strength: digits mask there.
+            "DB_PASS=1234\n".to_string(),
+            "PASSWORD=1234\n".to_string(),
+            "mypass=1234\n".to_string(),
+        ];
+        for input in &masks {
+            assert!(redact(input).is_some(), "{input:?} was not masked");
+        }
+    }
+
     /// cameronsjo/cadence-hooks#1274's false-positive subset: pagination and
     /// idempotency handles, MySQL's 1045 message, and glued `…pass` words that
     /// are not credentials. The neighbouring credential shapes still mask.
@@ -2696,11 +2925,17 @@ mod tests {
             "requirepass",
             "masterauth",
             "rootpw",
-            "pass",
             "pw",
             "PW",
         ] {
             assert_eq!(name_strength(name), Some(Strength::Strong), "{name}");
+        }
+        // A bare `pass` is a test tally as often as a password (#1342).
+        for name in ["lastpass", "HASHPASS"] {
+            assert_eq!(name_strength(name), Some(Strength::Counter), "{name}");
+        }
+        for name in ["pass", "Pass"] {
+            assert_eq!(name_strength(name), Some(Strength::Tally), "{name}");
         }
         // Strong name, metadata suffix: the value decides.
         for name in [
