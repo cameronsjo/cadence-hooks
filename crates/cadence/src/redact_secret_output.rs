@@ -842,12 +842,30 @@ fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
 }
 
 /// Does `after` start with a closer (`,` `;` `)`) that ends the value?
-/// A closer glued to a plain word (`1234,hunter2`) does not count; one
-/// glued to the next `key=` field (`5,fail=0`) does.
+/// A closer glued to more text counts only when that text is another
+/// count field (`5,fail=0`), not a word (`1234,hunter2`, `1234,a:b`).
 fn closes_count(after: &str) -> bool {
     let rest = after.trim_start_matches([',', ';', ')']);
     rest.len() < after.len()
-        && (rest.chars().next().is_none_or(char::is_whitespace) || starts_key_field(rest))
+        && (rest.chars().next().is_none_or(char::is_whitespace) || starts_count_field(rest))
+}
+
+/// Does `text` begin with a `name=<digits>` or `name:<digits>` field that
+/// ends at a closer, whitespace or the end of the line?
+fn starts_count_field(text: &str) -> bool {
+    if !starts_key_field(text) {
+        return false;
+    }
+    let Some(sep) = text.find(['=', ':']) else {
+        return false;
+    };
+    let value = &text[sep + 1..];
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && value[digits..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, ',' | ';' | ')'))
 }
 
 /// Does `text` begin with a `name=` or `name:` field?
@@ -2713,6 +2731,11 @@ mod tests {
             "pass=1234;hunter2\n".to_string(),
             "pass=1234)hunter2\n".to_string(),
             "lastpass=1234,hunter2\n".to_string(),
+            "pass=1234,hunter2=\n".to_string(),
+            "pass=1234,a:b\n".to_string(),
+            "pass=1234;abc=def\n".to_string(),
+            "pass=123456,P4ss:word\n".to_string(),
+            "lastpass=1234,s3cret:x\n".to_string(),
             // A tally ends the value; a secret after it is judged on its own.
             format!("pass=5 token={p}\n"),
             format!("x pass=5 token={p}\n"),
