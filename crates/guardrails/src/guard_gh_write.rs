@@ -1914,19 +1914,19 @@ const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only 
      newlines only, with no redirect, `||`/`&&`, pipe, `&`, comment, or other command; make the loop plain or run each call \
      outside it";
 
-/// The fix for a loop whose every write names its target, but mixes `-R`
-/// writes with literal-path `gh api` writes: the loop gate counts only `-R`
-/// as a target in that case, so the loop keeps the cwd-based policy.
-const MIXED_LOOP_FIX: &str = "every write names its target, but a loop that mixes `-R` writes \
-     with literal-path `gh api` writes is still judged by the working directory; run the \
-     `gh api` writes and the `-R` writes in separate loops";
+/// The fix for a loop in which every gh command names its target, but which
+/// mixes `-R` commands with literal-path `gh api` writes: the loop gate counts
+/// only `-R` as a target in that case, so the loop keeps the cwd-based policy.
+/// Two loops in one command are read together, so the split must be into
+/// separate commands.
+const MIXED_LOOP_FIX: &str = "every command names its target, but a loop that mixes `-R` \
+     commands with literal-path `gh api` writes is still judged by the working directory; run \
+     the `gh api` loop and the `-R` loop as separate commands";
 
 /// The structured `fix` for a looped-write block: `-R` for commands that take
 /// it, the endpoint path for `gh api`, both when the loop holds both.
 fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> String {
-    if writes.is_empty() && api_writes.is_empty() {
-        MIXED_LOOP_FIX.to_string()
-    } else if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
+    if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
         PLAIN_LOOP_FIX.to_string()
     } else if only_api_writes(writes, api_writes) {
         format!("gh api repos/{target}/…")
@@ -1949,20 +1949,16 @@ fn looped_write_block_message(
     suggestion: Option<&str>,
 ) -> String {
     let fix_target = suggestion.unwrap_or("owner/repo");
-    let found: Vec<&str> = writes
+    let mut found: Vec<&str> = writes
         .iter()
         .chain(api_writes)
         .map(String::as_str)
         .collect();
-    let mut fixes = Vec::new();
     if found.is_empty() {
-        // Every write has `-R` or a literal path; only the mix is refused.
-        return format!(
-            "🚫 git-guardrails: gh loop mixes -R writes with gh api writes\n   \
-             Fix: {MIXED_LOOP_FIX}"
-        );
+        found.push("gh write command(s) without a target");
     }
-    if !writes.is_empty() {
+    let mut fixes = Vec::new();
+    if !writes.is_empty() || api_writes.is_empty() {
         fixes.push(format!("add `-R {fix_target}` to each command"));
     }
     // A literal path counts as the target only in a plain loop
@@ -3906,6 +3902,35 @@ impl Check for GhWriteGuard {
                         let quote = |v: Vec<String>| -> Vec<String> {
                             v.into_iter().map(|c| format!("`{c}`")).collect()
                         };
+                        // Every command names its target (`-R` or a literal
+                        // api path) and only the mix is refused: say so,
+                        // since `-R` advice would not apply.
+                        // A loop here lacks a target somewhere, so if every
+                        // command is a literal api write or has `-R`, at
+                        // least one is the api write.
+                        let mixed = writes.is_empty()
+                            && api_writes.is_empty()
+                            && cmds.iter().all(|c| {
+                                kind(c) == LoopedWriteKind::ApiPathWrite
+                                    || c.explicit_repo.is_some()
+                            });
+                        if mixed {
+                            return CheckResult::block_structured(
+                                format!(
+                                    "🚫 git-guardrails: gh loop mixes -R commands with gh api writes\n   \
+                                     Fix: {MIXED_LOOP_FIX}"
+                                ),
+                                BlockMetadata {
+                                    rule_id: "gh-write-loop-missing-repo".to_string(),
+                                    fix: MIXED_LOOP_FIX.to_string(),
+                                    allowed_owners: allowed_display_list(
+                                        &allowed_owners,
+                                        &allowed_repos,
+                                    ),
+                                    severity: "error",
+                                },
+                            );
+                        }
                         let (writes, api_writes) = (quote(writes), quote(api_writes));
                         let target = suggestion.as_deref().unwrap_or("<owner>/<repo>");
                         let fix = looped_write_fix(&writes, &api_writes, target);
@@ -5970,7 +5995,16 @@ mod tests {
             true,
         );
         assert!(blocks(&result));
-        assert!(msg(&result).contains("mixes -R writes"), "{}", msg(&result));
+        assert!(
+            msg(&result).contains("mixes -R commands"),
+            "{}",
+            msg(&result)
+        );
+        assert!(
+            msg(&result).contains("separate commands"),
+            "{}",
+            msg(&result)
+        );
         assert!(!msg(&result).contains("add `-R"), "{}", msg(&result));
         assert!(
             !msg(&result).contains("without a target"),
@@ -5979,6 +6013,28 @@ mod tests {
         );
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.fix, MIXED_LOOP_FIX);
+    }
+
+    #[test]
+    fn a_target_less_read_beside_a_dash_r_write_still_gets_dash_r_advice() {
+        // Code review of 0ee2aa7: no gh api write here, so the mixed-loop
+        // text does not apply; adding `-R` to the read is the fix.
+        let result = run_1344(
+            "for i in 1 2; do gh pr view $i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
+            "cameronsjo",
+            true,
+        );
+        assert!(blocks(&result));
+        assert!(!msg(&result).contains("mixes -R"), "{}", msg(&result));
+        assert!(msg(&result).contains("add `-R"), "{}", msg(&result));
+        // With a literal api write too, the read still lacks `-R`.
+        let result = run_1344(
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr view $i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
+            "cameronsjo",
+            true,
+        );
+        assert!(blocks(&result));
+        assert!(!msg(&result).contains("mixes -R"), "{}", msg(&result));
     }
 
     #[test]
