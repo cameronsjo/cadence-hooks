@@ -3148,7 +3148,9 @@ enum LoopedWriteKind {
 /// - a `gh` command whose subcommand is in a fixed list that cannot change
 ///   gh's host, login, or config and writes no file to a path it is given
 ///   (so not `auth`, `config`, `alias`, `release`, `run`, `repo`, `gist`, or
-///   an extension), that is not `pr checkout` or `issue develop`, and whose arguments are plain words, optionally wrapped in
+///   an extension), that is not `pr checkout` or `issue develop` (a `pr` or
+///   `issue` command has no `checkout`, `co`, or `develop` word anywhere,
+///   and expands no variable when a header value is one of those), and whose arguments are plain words, optionally wrapped in
 ///   one pair of double quotes, that may expand the loop's own variables in
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
@@ -3264,7 +3266,13 @@ fn loop_targets_are_literal(command: &str) -> bool {
     {
         return false;
     }
+    fn is_checkout_verb(word: &str) -> bool {
+        matches!(word, "checkout" | "co" | "develop")
+    }
     let mut loop_vars: Vec<String> = Vec::new();
+    // Whether any header value is a checkout verb a `pr`/`issue` command
+    // could expand.
+    let mut verb_values = false;
     // The raw segments, not `command_segments`: that one expands parameters
     // it can read statically and treats a loop variable as unset, so
     // `${b:-x}` would reach this check as plain `x`.
@@ -3295,17 +3303,22 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 if !ident || !values.iter().all(value_ok) {
                     return false;
                 }
+                verb_values |= values.iter().any(|v| is_checkout_verb(v));
                 loop_vars.push((*name).to_string());
             }
             ["gh", subcommand, args @ ..] => {
                 // `pr checkout` and `issue develop` rewrite the working tree
                 // and `branch.*` config. Any word is checked, quotes removed,
                 // so a flag before the verb (`gh pr -R o/r checkout`) or a
-                // quoted verb (`gh pr "checkout"`) is refused too.
+                // quoted verb (`gh pr "checkout"`) is refused too, and so is
+                // any expansion once a header value is one of the verbs
+                // (`for b in checkout; … gh pr $b 1`). Ordinary words such as
+                // `--search develop` are refused as well; a refusal only keeps
+                // the loop policy.
                 let checks_out = matches!(*subcommand, "pr" | "issue")
-                    && args
-                        .iter()
-                        .any(|a| matches!(a.trim_matches('"'), "checkout" | "co" | "develop"));
+                    && args.iter().any(|a| {
+                        (verb_values && a.contains('$')) || is_checkout_verb(a.trim_matches('"'))
+                    });
                 if checks_out
                     || !LOOP_SUBCOMMANDS.contains(subcommand)
                     || !args.iter().all(|a| {
@@ -6068,6 +6081,9 @@ mod tests {
             r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr "checkout" 1; done"#,
             r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue "develop" 1 --checkout; done"#,
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr -R cameronsjo/forgectl checkout 1; done",
+            "for b in checkout; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr $b 1; done",
+            "for b in co; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr ${b} 1; done",
+            "for b in develop; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue $b 1 --checkout; done",
             // Segments join with `;` and newlines only.
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b | gh pr list; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
