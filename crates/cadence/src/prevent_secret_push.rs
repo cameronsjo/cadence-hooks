@@ -82,7 +82,9 @@
 //! global options an alias value opens with). It blocks as unresolved when:
 //! its value names `push` or `send-pack` or starts with `!`; an alias opens
 //! with an option this cannot follow or holds options only; this same command
-//! writes it with `git config`; the subcommand word carries `$` or a backtick;
+//! writes it with `git config`; the subcommand word carries `$` or a backtick
+//! (except a wrapper function's `git … "$@"` whose every call site in the
+//! command hands it a literal builtin that cannot push, cameronsjo/cadence-hooks#1338);
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
 //! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
 //! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
@@ -914,6 +916,198 @@ fn alias_runs_push(
     Some("is an alias chain too deep to follow")
 }
 
+/// The spellings of a function's positional parameters a wrapper hands git
+/// as its subcommand: all of them, or the first.
+fn is_positional_parameter(word: &str) -> bool {
+    matches!(word, "$@" | "${@}" | "$*" | "${*}" | "$1" | "${1}")
+}
+
+/// Builtins a wrapper's call site may not hand it for the wrapper to count as
+/// unable to push: the push and fetch families (core reads their
+/// `--exec`/`--upload-pack`/`--receive-pack` values on a direct call), the
+/// builtins that run a command of their own (`rebase -x`, `bisect run`,
+/// `submodule foreach`, `filter-branch`, `difftool -x`), `hook`, and the
+/// config writers [`command_hints`] reads from direct calls only.
+const WRAPPER_UNSAFE_SUBCOMMANDS: &[&str] = &[
+    "archive",
+    "bisect",
+    "clone",
+    "config",
+    "difftool",
+    "fetch",
+    "fetch-pack",
+    "filter-branch",
+    "hook",
+    "http-push",
+    "ls-remote",
+    "pull",
+    "push",
+    "rebase",
+    "receive-pack",
+    "remote",
+    "send-pack",
+    "submodule",
+    "submodule--helper",
+    "upload-archive",
+    "upload-pack",
+];
+
+/// Shell functions the command defines: `(name, body)` per definition, the
+/// body the byte range between the opening `{` and its matching `}`. `None`
+/// when a definition's body cannot be delimited (an unbalanced brace or
+/// quote).
+fn function_definitions(command: &str) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[\s;&|(){}])(?:function\s+([A-Za-z_][\w.-]*)\s*(?:\(\s*\))?|([A-Za-z_][\w.-]*)\s*\(\s*\))\s*\{",
+        )
+        .expect("pattern should compile")
+    });
+    let mut out = Vec::new();
+    for caps in HEAD.captures_iter(command) {
+        let name = caps.get(1).or_else(|| caps.get(2))?.as_str().to_string();
+        let open = caps.get(0)?.end();
+        let close = matching_brace(&command[open..])?;
+        out.push((name, open..open + close));
+    }
+    Some(out)
+}
+
+/// The byte offset of the `}` closing a body that starts right after its `{`,
+/// skipping quoted text and backslash escapes. `None` when it is never closed.
+fn matching_brace(body: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (Some('"'), '"') => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '{') => depth += 1,
+            (None, '}') if depth == 0 => return Some(at),
+            (None, '}') => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How often `name` stands in `text` as a whole word (bounded by anything a
+/// function name cannot contain).
+fn word_occurrences(text: &str, name: &str) -> usize {
+    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    text.match_indices(name)
+        .filter(|(at, _)| {
+            !text[..*at].chars().next_back().is_some_and(part)
+                && !text[at + name.len()..].chars().next().is_some_and(part)
+        })
+        .count()
+}
+
+/// Can no git call that names its subcommand through a function's positional
+/// parameters (`gg() { git -C "$R" "$@"; }`) push? True only when every such
+/// call sits in a function body this command defines, no such body shifts or
+/// resets its parameters, and every mention of those functions' names is
+/// either a definition or a call site whose command word is the bare name and
+/// whose first argument is a literal builtin outside
+/// [`WRAPPER_UNSAFE_SUBCOMMANDS`] (cameronsjo/cadence-hooks#1338). A function
+/// never called runs nothing. Anything else keeps the old verdict.
+fn wrapper_calls_cannot_push(command: &str) -> bool {
+    let positional = |text: &str| {
+        git_calls(text, ".")
+            .iter()
+            .filter(|call| {
+                call.rest
+                    .first()
+                    .is_some_and(|sub| is_positional_parameter(sub))
+            })
+            .count()
+    };
+    let Some(definitions) = function_definitions(command) else {
+        return false;
+    };
+    let mut wrappers: Vec<&str> = Vec::new();
+    // The command with every function body blanked out: a positional git
+    // call left in it is not a wrapper's (`bash -c 'git "$@"' _ push`,
+    // `set -- push; git "$@"`).
+    let mut outside = command.as_bytes().to_vec();
+    for (name, range) in &definitions {
+        let body = &command[range.clone()];
+        outside[range.clone()].fill(b' ');
+        if positional(body) == 0 {
+            continue;
+        }
+        if word_occurrences(body, "shift") > 0 || word_occurrences(body, "set") > 0 {
+            return false;
+        }
+        if !wrappers.contains(&name.as_str()) {
+            wrappers.push(name);
+        }
+    }
+    let outside = String::from_utf8_lossy(&outside);
+    if wrappers.is_empty() || positional(&outside) != 0 {
+        return false;
+    }
+    let segments = cadence_hooks_core::shell::command_segments(command);
+    // Text run in this shell that the command does not spell out (`eval
+    // "$CMD"`, a sourced file, a trap, a command word built by an expansion)
+    // can call the wrapper without naming it here.
+    if segments.iter().any(|segment| {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+        tokens.first().is_some_and(|first| {
+            first.contains(['$', '`'])
+                || matches!(
+                    unescape_word(first).as_ref(),
+                    "eval" | "source" | "." | "trap" | "builtin" | "command"
+                )
+        })
+    }) {
+        return false;
+    }
+    for name in wrappers {
+        let defined = definitions.iter().filter(|(n, _)| n == name).count();
+        let mut calls = 0;
+        for segment in &segments {
+            let tokens =
+                executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+            if tokens.first().map(|w| unescape_word(w)).as_deref() != Some(name) {
+                continue;
+            }
+            if tokens
+                .get(1)
+                .is_some_and(|w| w == "()" || w.starts_with('('))
+            {
+                continue;
+            }
+            calls += 1;
+            let Some(first) = tokens.get(1) else {
+                continue;
+            };
+            let sub = unescape_word(first);
+            if first.contains(['$', '`', '*', '?', '['])
+                || sub.starts_with('-')
+                || WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
+                || unscannable_push(&sub)
+                || !is_builtin(&sub, false)
+            {
+                return false;
+            }
+        }
+        if word_occurrences(command, name) != defined + calls {
+            return false;
+        }
+    }
+    true
+}
+
 /// Why a `git` call the command makes may publish objects this guard cannot
 /// scan, if one may: a raw push command, a subcommand word it cannot read, or
 /// an alias (or autocorrected guess) that can push.
@@ -921,6 +1115,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
     let mut probed: HashMap<String, Result<AliasConfig, String>> = HashMap::new();
     let mut env: Option<CommandEnv> = None;
     let mut judged: std::collections::HashSet<(String, String)> = Default::default();
+    let mut wrapper_resolved: Option<bool> = None;
     for call in calls {
         let Some(sub) = call.rest.first() else {
             continue;
@@ -942,6 +1137,15 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             ));
         }
         if sub.contains(['$', '`']) {
+            // A wrapper function's `git … "$@"` names its subcommand at its
+            // call sites (cameronsjo/cadence-hooks#1338): resolved once for
+            // the whole command, and skipped only when every call site hands
+            // it a builtin that publishes nothing.
+            if is_positional_parameter(&sub)
+                && *wrapper_resolved.get_or_insert_with(|| wrapper_calls_cannot_push(command))
+            {
+                continue;
+            }
             return Some(format!(
                 "`git {}` names its subcommand through an expansion this guard cannot \
                  resolve",
@@ -3835,5 +4039,48 @@ mod tests {
             raw_commit(&fx, header, "clean");
         }
         assert_allows(&fx.run("git push origin main"));
+    }
+
+    /// A shell function wrapping `git … "$@"` names its subcommand at its
+    /// call sites. When every call site in the same command hands it a
+    /// literal builtin that publishes nothing, the wrapper cannot push
+    /// (cameronsjo/cadence-hooks#1338).
+    #[test]
+    fn a_git_wrapper_function_is_judged_by_its_call_sites() {
+        let fx = Fx::new("wrapper-fn");
+        for command in [
+            // The issue's shape.
+            "gg() { git -C \"$REPO\" -c core.fsmonitor=false --no-optional-locks \"$@\"; }\n\
+             gg diff --name-only \"$base\" > \"$FILES_F\"\n\
+             gg log --oneline \"$base\"..HEAD",
+            "gg() { git \"$@\"; }; gg status",
+            "function gg { git \"$@\"; }; gg log -1 && gg diff",
+            "gg () {\n  git --no-pager \"$@\"\n}\ngg show HEAD",
+            "g1() { git \"$1\" --stat; }; g1 diff",
+            // Defined, never called: nothing runs.
+            "gg() { git \"$@\"; }",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+        // The old verdict wherever a call site could push or cannot be read.
+        for command in [
+            "gg() { git \"$@\"; }; gg push origin main",
+            "gg() { git \"$@\"; }; gg status; gg push origin main",
+            "gg() { git \"$@\"; }; gg \"$sub\" origin main",
+            "gg() { git \"$@\"; }; gg -C . push origin main",
+            "gg() { git \"$@\"; }; eval gg push origin main",
+            "gg() { git \"$@\"; }; x=gg; $x push origin main",
+            "gg() { shift; git \"$@\"; }; gg x push origin main",
+            "gg() { git \"$@\"; }; gg rebase -x 'git push origin main' HEAD~1",
+            "gg() { git \"$@\"; }; gg pu origin main",
+            "gg() { git \"$@\"; }; echo gg push | bash",
+            "gg() { git \"$@\"; }; gg status; eval \"$CMD\"",
+            "gg() { git \"$@\"; }; gg status; . ./steps.sh",
+            // Not a function's positional parameters at all.
+            "bash -c 'git \"$@\"' _ push origin main",
+            "set -- push origin main; git \"$@\"",
+        ] {
+            assert_blocks(&fx.run(command), &["cannot resolve"]);
+        }
     }
 }
