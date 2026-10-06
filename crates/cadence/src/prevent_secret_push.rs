@@ -337,6 +337,9 @@ struct GitCall {
     /// The directory could not be followed (`cd "$D"`, `-C "$D"`, a
     /// backtick): `dir` is a stand-in, so an alias probe there proves nothing.
     dir_unresolved: bool,
+    /// The `-C` value that made [`GitCall::dir_unresolved`] true, when that
+    /// was the cause.
+    dir_token: Option<String>,
     globals: Vec<String>,
     rest: Vec<String>,
     /// git runs under a name that picks its subcommand: a dashed `git-push`
@@ -402,6 +405,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             continue;
         }
         let mut dir_unresolved = &*dir == UNRESOLVABLE_DIR || dir.contains(['$', '`']);
+        let mut dir_token: Option<String> = None;
         let mut at = if &*dir == UNRESOLVABLE_DIR {
             cwd.to_string()
         } else {
@@ -411,6 +415,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             out.push(GitCall {
                 dir: at,
                 dir_unresolved,
+                dir_token: None,
                 globals: Vec::new(),
                 rest: vec!["exec -a".to_string()],
                 renamed: true,
@@ -422,6 +427,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             out.push(GitCall {
                 dir: at,
                 dir_unresolved,
+                dir_token: None,
                 globals: Vec::new(),
                 rest: std::iter::once(sub.to_string())
                     .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
@@ -440,6 +446,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             {
                 if value.contains(['$', '`']) {
                     dir_unresolved = true;
+                    dir_token.get_or_insert_with(|| unescape_word(value).into_owned());
                 } else {
                     at = resolve_cd_target(value, &at);
                 }
@@ -448,6 +455,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         out.push(GitCall {
             dir: at,
             dir_unresolved,
+            dir_token,
             globals: globals
                 .iter()
                 .map(|w| unescape_word(w).into_owned())
@@ -916,6 +924,43 @@ fn alias_runs_push(
     Some("is an alias chain too deep to follow")
 }
 
+/// The first directory the command changes to through a word only the shell
+/// can resolve (`cd "$D"`, `pushd $(…)`, `git -C "$W"`, `env -C "$D"`), as
+/// written less its quotes, for a message that names the real cause of a
+/// block. Reads text only; it never decides a verdict.
+fn unreadable_directory_token(command: &str) -> Option<String> {
+    let unreadable = |word: &str| word.contains(['$', '`']);
+    for segment in cadence_hooks_core::shell::command_segments(command) {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(&segment));
+        let mut words = tokens.iter().map(|w| unescape_word(w));
+        if tokens
+            .first()
+            .is_some_and(|first| matches!(unescape_word(first).as_ref(), "cd" | "pushd"))
+        {
+            if let Some(target) = words.skip(1).find(|w| !w.starts_with('-') || unreadable(w))
+                && unreadable(&target)
+            {
+                return Some(target.into_owned());
+            }
+            continue;
+        }
+        while let Some(word) = words.next() {
+            if let Some(value) = word.strip_prefix("--chdir=")
+                && unreadable(value)
+            {
+                return Some(value.to_string());
+            }
+            if matches!(word.as_ref(), "-C" | "--chdir")
+                && let Some(value) = words.next()
+                && unreadable(&value)
+            {
+                return Some(value.into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// The spellings of a function's positional parameters a wrapper hands git
 /// as its subcommand: all of them, or the first.
 fn is_positional_parameter(word: &str) -> bool {
@@ -1181,6 +1226,23 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         if let Some(why) = alias_probe_blind(blind, call) {
             if script_exempt {
                 continue;
+            }
+            // Only the directory is unknown: name the token that hides it
+            // rather than suggest an alias (cameronsjo/cadence-hooks#1337).
+            if blind.is_none()
+                && call.dir_unresolved
+                && let Some(token) = call
+                    .dir_token
+                    .clone()
+                    .or_else(|| unreadable_directory_token(command))
+            {
+                return Some(format!(
+                    "`git {}` runs in a directory named by `{}`, which this guard cannot \
+                     resolve to check whether `{}` is an alias that pushes (use a literal path)",
+                    sane(&sub),
+                    sane(&token),
+                    sane(&sub)
+                ));
             }
             return Some(format!(
                 "`git {}` may be an alias this guard cannot resolve ({why})",
@@ -2243,6 +2305,19 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             continue;
         }
         if inv.unresolved {
+            // An unreadable directory change is the cause the message can
+            // name: say which token, not "which repository"
+            // (cameronsjo/cadence-hooks#1337).
+            if inv.directory_unverified
+                && !inv.repository_unresolved
+                && let Some(token) = unreadable_directory_token(command)
+            {
+                return Err(Stop::Refused(format!(
+                    "the push runs in a directory named by `{}`, which this guard cannot \
+                     resolve, so what it publishes could not be read (use a literal path)",
+                    sane(&token)
+                )));
+            }
             return Err(Stop::Refused(
                 "could not resolve which repository or refs this push publishes (a directory \
                  change, config override or environment it cannot follow)"
@@ -4134,5 +4209,48 @@ mod tests {
                 .unwrap()
                 .contains("could not read the config")
         );
+    }
+
+    /// A directory a variable or substitution names is the block's real
+    /// cause, and the message names that token rather than an alias or "which
+    /// repository" (cameronsjo/cadence-hooks#1337 item 1). A variable bound to
+    /// a literal earlier in the line resolves (item 2), and read-only
+    /// builtins never reach the push scan (item 3).
+    #[test]
+    fn an_unresolved_directory_token_is_named() {
+        let fx = Fx::new("unresolved-token");
+        fx.git(&["config", "alias.st", "status"]);
+        for (command, token) in [
+            (
+                "cd \"$(cat /tmp/dir)\" && git push origin main",
+                "$(cat /tmp/dir)",
+            ),
+            ("git -C \"$VAR\" push origin main", "$VAR"),
+            ("cd $D && git push origin main", "$D"),
+            ("git -C \"$VAR\" st", "$VAR"),
+            ("cd \"$(cat /tmp/dir)\" && git st", "$(cat /tmp/dir)"),
+        ] {
+            let r = fx.run(command);
+            assert_blocks(&r, &[token, "use a literal"]);
+            let msg = r.message.as_deref().unwrap();
+            assert!(!msg.contains("may be an alias"), "{command}: {msg}");
+            assert!(!msg.contains("which repository"), "{command}: {msg}");
+        }
+        let work = fx.work.to_str().unwrap();
+        for command in [
+            format!(
+                "W={work}; git -C \"$W\" commit -q --allow-empty -m x && git -C \"$W\" push origin main"
+            ),
+            format!("W='{work}'; git -C $W push origin main"),
+            "cd \"$(cat /tmp/dir)\" && git merge x && git verify-commit HEAD".to_string(),
+            "git -C \"$VAR\" write-tree".to_string(),
+            "git -C $VAR verify-commit HEAD".to_string(),
+        ] {
+            // The dispatch seam binds a literal-assigned variable before any
+            // guard runs (`decide_check`, cameronsjo/cadence-hooks#1287).
+            let seen = cadence_hooks_core::dir_variables::resolve_literal_dir_variables(&command);
+            let r = fx.run(&seen);
+            assert_eq!(r.outcome, Outcome::Allow, "{command}: {:?}", r.message);
+        }
     }
 }
