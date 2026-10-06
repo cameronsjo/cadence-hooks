@@ -1076,6 +1076,13 @@ fn wrapper_calls_cannot_push(command: &str) -> bool {
             })
             .count()
     };
+    // [`matching_brace`] reads quotes and escapes only: a `#` comment
+    // (`# don't page`), an ANSI-C `$'…'` string or a heredoc body can hold a
+    // quote or brace that moves the boundary it finds, and a mis-placed body
+    // can swallow a push outside it (review C1). Keep the old verdict.
+    if command.contains('#') || command.contains("$'") || command.contains("<<") {
+        return false;
+    }
     let Some(definitions) = function_definitions(command) else {
         return false;
     };
@@ -4162,6 +4169,7 @@ mod tests {
             "gg() { git \"$@\"; }; gg status",
             "function gg { git \"$@\"; }; gg log -1 && gg diff",
             "gg () {\n  git --no-pager \"$@\"\n}\ngg show HEAD",
+            "gg() {\n  git -C \"$R\" \"$@\"\n}\ngg status\ngg log -3",
             "g1() { git \"$1\" --stat; }; g1 diff",
             // Defined, never called: nothing runs.
             "gg() { git \"$@\"; }",
@@ -4182,6 +4190,12 @@ mod tests {
             "gg() { git \"$@\"; }; echo gg push | bash",
             "gg() { git \"$@\"; }; gg status; eval \"$CMD\"",
             "gg() { git \"$@\"; }; gg status; . ./steps.sh",
+            // A comment or an ANSI-C string can carry a quote or brace that
+            // mis-delimits the body, and so hide a later push: the old
+            // block whenever the boundary is unsure (review C1).
+            "gg() {\n  git \"$@\"  # don't page\n}\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
+            "gg() { git \"$@\"; echo $'\\''; }\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
+            "gg() { git \"$@\"; } # wrapper\ngg status",
             // Not a function's positional parameters at all.
             "bash -c 'git \"$@\"' _ push origin main",
             "set -- push origin main; git \"$@\"",

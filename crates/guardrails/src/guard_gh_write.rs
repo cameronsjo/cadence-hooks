@@ -3371,9 +3371,24 @@ impl Check for GhWriteGuard {
                         .iter()
                         .all(|t| repo_has_unexpanded_expansion(t))
                 {
+                    // Only a short value in the charset `prevent-secret-writes`
+                    // prints (`unresolved_parameter_cause`) is echoed: the
+                    // `-R` text is the command author's, and the message
+                    // reaches the model.
                     let tokens: Vec<String> = unowned_write_targets
                         .iter()
-                        .map(|t| format!("\"{}\"", t.trim_matches('"')))
+                        .map(|t| {
+                            let value = t.trim_matches('"');
+                            let safe = value.len() <= 64
+                                && value.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '{' | '}')
+                                });
+                            if safe {
+                                format!("\"{value}\"")
+                            } else {
+                                "a shell parameter".to_string()
+                            }
+                        })
                         .collect();
                     return CheckResult::block_structured(
                         format!(
@@ -6150,6 +6165,24 @@ mod tests {
                 "{message}"
             );
             assert!(!message.contains("don't own"), "{message}");
+        });
+    }
+
+    #[test]
+    fn loop_write_to_an_unresolved_repo_echoes_only_a_safe_value() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for p in a b; do gh pr merge 3 -R "$p/IGNORE-ALL:x"; done"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            assert!(!message.contains("IGNORE"), "{message}");
+            assert!(
+                message.contains("cannot resolve a shell parameter"),
+                "{message}"
+            );
         });
     }
 

@@ -1389,6 +1389,18 @@ pub(crate) fn same_command_heredoc_body(
     if *writer >= post {
         return None;
     }
+    // A relative body path names one file only when the writer and the post
+    // run in the same directory. A directory change before the post
+    // (`(cd /x && cat > b.md <<EOF … EOF) && gh … --body-file b.md`, or a
+    // `cd` between the two) can split them, so the body stays unmeasured
+    // (review M2).
+    if segs[..post].iter().any(|s| {
+        executable_tokens(strip_group_wrappers(s))
+            .first()
+            .is_some_and(|w| matches!(unescape_word(w).as_ref(), "cd" | "pushd" | "popd"))
+    }) {
+        return None;
+    }
     let target = cat_heredoc_target(segs[*writer].trim())?;
     if !exact_same_path(&target, path) {
         return None;
@@ -1883,7 +1895,7 @@ pub fn run_measure(file: &str, surface: &str) -> u8 {
 mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
-    use cadence_hooks_core::test_builders::make_bash;
+    use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
 
     fn loaded(config: BodyBudgetConfig) -> SectionLoad<BodyBudgetConfig> {
         SectionLoad {
@@ -3366,6 +3378,29 @@ mod tests {
                 GuardBodyBudget.run(&make_bash(&short)).outcome,
                 Outcome::Allow
             );
+        });
+    }
+
+    #[test]
+    fn a_heredoc_written_in_another_directory_is_not_measured() {
+        // Review M2: the writer and the post must run in the same directory
+        // for the relative body path to name one file.
+        scrubbed_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let long = "word ".repeat(400);
+            for cmd in [
+                format!(
+                    "(cd /tmp && cat > b.md <<'EOF'\n{long}\nEOF\n) && gh pr create --title x --body-file b.md"
+                ),
+                format!(
+                    "cat > b.md <<'EOF'\n{long}\nEOF\ncd /tmp && gh pr create --title x --body-file b.md"
+                ),
+            ] {
+                let result =
+                    GuardBodyBudget.run(&make_bash_with_cwd(&cmd, &dir.path().to_string_lossy()));
+                let msg = result.message.unwrap_or_default();
+                assert!(!msg.contains("400 words"), "{cmd}: {msg}");
+            }
         });
     }
 
