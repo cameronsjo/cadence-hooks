@@ -819,29 +819,51 @@ fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_di
 }
 
 /// Git subcommands that neither check out another branch nor change where
-/// one tracks. Everything else a chain runs through `git` (`checkout`,
-/// `switch`, `rebase <upstream> <branch>`, `branch`, `worktree`, an alias, a
-/// subcommand built by an expansion) counts as a possible switch.
+/// one tracks, in the forms [`moves_branch_or_tracking`] does not single out
+/// (`rebase <upstream> <branch>`, `branch -u`, `worktree add`, …).
+/// Everything else a chain runs through `git` (`checkout`, `switch`,
+/// `bisect`, an alias, a subcommand built by an expansion) counts as a
+/// possible switch. `remote` is here because a remote's URL change is the
+/// destination-config check's to judge, not this one's.
 const NON_SWITCHING_SUBCOMMANDS: &[&str] = &[
     "add",
+    "am",
+    "apply",
     "blame",
+    "branch",
     "cat-file",
+    "cherry",
     "cherry-pick",
+    "clean",
     "commit",
     "config",
+    "count-objects",
     "describe",
     "diff",
     "fetch",
     "for-each-ref",
+    "format-patch",
+    "fsck",
+    "gc",
     "grep",
+    "init",
+    "lfs",
     "log",
     "ls-files",
     "ls-remote",
+    "ls-tree",
+    "maintenance",
     "merge",
+    "merge-base",
     "mv",
     "notes",
+    "prune",
     "pull",
     "push",
+    "range-diff",
+    "rebase",
+    "reflog",
+    "remote",
     "reset",
     "restore",
     "rev-list",
@@ -851,15 +873,24 @@ const NON_SWITCHING_SUBCOMMANDS: &[&str] = &[
     "shortlog",
     "show",
     "show-ref",
+    "sparse-checkout",
     "stash",
     "status",
+    "submodule",
     "tag",
+    "verify-commit",
+    "verify-tag",
+    "whatchanged",
+    "worktree",
 ];
 
 /// Can a segment of the command move which branch is checked out, or where
 /// the current branch tracks, before a later bare push resolves its remote?
 /// Any `git` call is taken to, unless its subcommand is a literal in
-/// [`NON_SWITCHING_SUBCOMMANDS`] (and not `stash branch`, nor a `config` that
+/// [`NON_SWITCHING_SUBCOMMANDS`] (and not `stash branch`, a `fetch`/`pull`
+/// with `--set-upstream`, a `rebase` naming a branch or `--root`, a `branch`
+/// with a tracking option or `-f <name> <start>`, a `worktree add`, nor a
+/// `config` that
 /// names a `branch.*`/`remote.*`/push key or opens the editor); so are
 /// `gh pr checkout`, a dashed `git-*` or `hub` command, and a command word
 /// built by an expansion. Errs toward true: a match only keeps the old chain
@@ -892,6 +923,54 @@ fn moves_branch_or_tracking(command: &str) -> bool {
                 }
                 match sub.as_str() {
                     "stash" => words.get(1).is_some_and(|w| w == "branch"),
+                    // `--set-upstream` (git takes any unique prefix) records
+                    // the fetched branch as the current one's upstream.
+                    "fetch" | "pull" => words[1..].iter().any(|w| w.starts_with("--set-u")),
+                    // Checking out its last positional when it names two
+                    // (`rebase <upstream> <branch>`), or rewriting from the
+                    // root.
+                    "rebase" => {
+                        let mut positionals = 0;
+                        let mut args = words[1..].iter();
+                        while let Some(w) = args.next() {
+                            if w == "--root" {
+                                return true;
+                            }
+                            if matches!(
+                                w.as_str(),
+                                "--onto"
+                                    | "-x"
+                                    | "--exec"
+                                    | "-s"
+                                    | "--strategy"
+                                    | "-X"
+                                    | "--strategy-option"
+                            ) {
+                                args.next();
+                            } else if !w.starts_with('-') {
+                                positionals += 1;
+                            }
+                        }
+                        positionals >= 2
+                    }
+                    // A tracking option, or `-f <name> <start>` resetting a
+                    // branch; listing, deleting and renaming (whose tracking
+                    // moves with it) do not count.
+                    "branch" => {
+                        let args = &words[1..];
+                        let force = args.iter().any(|w| w == "-f" || w == "--force");
+                        let positionals = args.iter().filter(|w| !w.starts_with('-')).count();
+                        (force && positionals >= 2)
+                            || args.iter().any(|w| {
+                                w.starts_with("--set-upstream")
+                                    || w.starts_with("--track")
+                                    || w == "--unset-upstream"
+                                    || (w.starts_with('-')
+                                        && !w.starts_with("--")
+                                        && w.contains(['u', 't']))
+                            })
+                    }
+                    "worktree" => words.get(1).is_some_and(|w| w == "add"),
                     "config" => words[1..].iter().any(|w| {
                         let w = w.to_ascii_lowercase();
                         w.starts_with("branch.")
@@ -2374,6 +2453,74 @@ mod tests {
                 (
                     "git push origin feat && git config branch.feat.remote upstream && git push",
                     true,
+                ),
+                (
+                    "git push origin feat && git fetch --set-upstream upstream main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git pull --set-u upstream main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git fetch --no-set-upstream upstream && git push",
+                    false,
+                ),
+                (
+                    "git push origin feat && git branch -f other main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git rebase --root && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git remote set-url origin https://github.com/evil/x.git && git push",
+                    true,
+                ),
+                // Inspection, housekeeping, and the forms of `rebase`,
+                // `branch`, `worktree` and `remote` that leave the checked-out
+                // branch and its tracking alone.
+                (
+                    "git fetch && git rebase origin/main && git push origin feat && git push --tags",
+                    false,
+                ),
+                (
+                    "git rebase -i HEAD~3 && git push origin feat && git push",
+                    false,
+                ),
+                (
+                    "git rebase --continue && git push && git push --tags",
+                    false,
+                ),
+                (
+                    "git push origin feat && git branch -d old && git push",
+                    false,
+                ),
+                (
+                    "git branch -m feat2 && git push origin feat && git push",
+                    false,
+                ),
+                ("git branch -vv && git push origin feat && git push", false),
+                (
+                    "git worktree list && git push origin feat && git push --tags",
+                    false,
+                ),
+                (
+                    "git remote -v && git push origin feat && git push --tags",
+                    false,
+                ),
+                (
+                    "git reflog -3 && git merge-base HEAD main && git push origin feat && git push",
+                    false,
+                ),
+                (
+                    "git clean -fd && git gc && git push origin feat && git push --tags",
+                    false,
+                ),
+                (
+                    "git submodule update --init && git lfs pull && git push origin feat && git push",
+                    false,
                 ),
                 // No switch in between: judged per push, as #1329 rules.
                 ("git push origin feat && git push --tags", false),
