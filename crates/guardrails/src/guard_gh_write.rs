@@ -3140,7 +3140,7 @@ enum LoopedWriteKind {
 /// change a later iteration's target is refused, as an allowlist rather than a
 /// list of dangers. Every segment must be one of:
 ///
-/// - a `for NAME in <values>` header: `NAME` is lowercase, starts with a
+/// - a `for NAME in <values>` header with at least one value: `NAME` is lowercase, starts with a
 ///   letter (`$_` is reset after every command), and is not a name the
 ///   shell or gh reads; each value is plain text that does not start with
 ///   `-` or `=` and does not start or end with `.`;
@@ -3312,7 +3312,9 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 let value_ok = |v: &&str| {
                     plain(v) && !v.starts_with('-') && !v.starts_with('.') && !v.ends_with('.')
                 };
-                if !ident || !values.iter().all(value_ok) {
+                // An empty list never assigns the name, so a later `$NAME`
+                // keeps whatever value the shell already had.
+                if !ident || values.is_empty() || !values.iter().all(value_ok) {
                     return false;
                 }
                 loop_vars.push((*name).to_string());
@@ -5867,6 +5869,8 @@ mod tests {
             // zsh keeps three characters of `histchars`: `//.x` becomes `//.`.
             "for histchars in //.x; do gh api -X DELETE repos/cameronsjo/forgectl/${histchars}./${histchars}./evil/repo/x; done",
             "for pipestatus in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$pipestatus; done",
+            // An empty list leaves `b` holding whatever the shell had.
+            "for b in; do gh pr list; done; for n in 1; do gh api -X DELETE repos/cameronsjo/forgectl/x $b; done",
             // `$_` is the previous command's last argument, not the value.
             "for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x $_; done",
             r#"for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x "${_}"; done"#,
