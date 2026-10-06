@@ -1932,12 +1932,27 @@ fn looped_write_block_message(
     if !writes.is_empty() || api_writes.is_empty() {
         fixes.push(format!("add `-R {fix_target}` to each command"));
     }
-    if !api_writes.is_empty() {
+    // A literal path counts as the target only in a plain loop
+    // ([`loop_targets_are_literal`]), so a write that already has one was
+    // refused for the loop's shape, not its path.
+    let (literal, unwritten): (Vec<&String>, Vec<&String>) = api_writes
+        .iter()
+        .partition(|w| api_literal_repo_target(w.trim_matches('`')).is_some());
+    if !unwritten.is_empty() {
         fixes.push(format!(
             "`gh api` has no -R flag: write the repo literally in the path \
              (`gh api repos/{fix_target}/…`), with no variable or `{{owner}}`/`{{repo}}` \
              placeholder in the owner or repo name"
         ));
+    }
+    if !literal.is_empty() {
+        fixes.push(
+            "the `gh api` path is already literal, but it only counts as the target \
+             in a plain loop: `for name in <words>`, `do`, `done`, and `gh` commands with plain \
+             arguments, with no redirect, `||`/`&&`, pipe, comment, or other command; drop \
+             those or run each call outside the loop"
+                .to_string(),
+        );
     }
     let header = if only_api_writes(writes, api_writes) {
         "gh api write in loop without a literal repos/<owner>/<repo> path"
@@ -3131,10 +3146,12 @@ enum LoopedWriteKind {
 /// function, `source`, `eval`, a `while` condition, a glob, `%`).
 fn loop_targets_are_literal(command: &str) -> bool {
     /// gh subcommands a plain loop may run. None of them changes which host
-    /// or account a later iteration's `gh api` reaches.
+    /// or account a later iteration's `gh api` reaches, and none writes
+    /// files to a path it is given (`release download -D`, `run download`,
+    /// `repo clone` and `gist clone` could write into gh's config dir).
     const LOOP_SUBCOMMANDS: &[&str] = &[
-        "api", "pr", "issue", "repo", "release", "run", "workflow", "label", "search", "browse",
-        "status", "cache", "variable", "secret", "ruleset", "gist", "project",
+        "api", "pr", "issue", "workflow", "label", "search", "browse", "status", "cache",
+        "variable", "secret", "ruleset", "project",
     ];
     /// Lowercase names the shell or gh reads: zsh's arrays tied to `PATH`
     /// and friends, and the proxy variables Go's `ProxyFromEnvironment` reads.
@@ -3207,6 +3224,17 @@ fn loop_targets_are_literal(command: &str) -> bool {
             out.push('v');
         }
         Some(out)
+    }
+    // Printable ASCII, space, tab, and newline only, and no `#`: the comment
+    // stripper behind `split_segments` reads some characters the shell does
+    // not as a word boundary (U+3000, VT, CR), so `x<U+3000>#; export …`
+    // would hide the `export` from this check while the shell runs it.
+    if command.contains('#')
+        || !command
+            .bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n') || b.is_ascii_graphic())
+    {
+        return false;
     }
     let mut loop_vars: Vec<String> = Vec::new();
     // The raw segments, not `command_segments`: that one expands parameters
@@ -5793,6 +5821,11 @@ mod tests {
             r#"for b in a b; do gh api -X DELETE "repos/cameronsjo/forgectl/contents/${b}.json"; done"#,
             "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x/${b}:y; done",
             "for b in v1.2 x.y; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/tags/$b; done",
+            // Each byte allowed after an unbraced name.
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b,y; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b@y; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b+y; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b=y; done",
         ] {
             assert!(
                 loop_targets_are_literal(command),
@@ -5820,8 +5853,47 @@ mod tests {
             for strict in [false, true] {
                 let result = run_1344(command, "cameronsjo", strict);
                 assert!(blocks(&result), "strict={strict}: {command} was allowed");
+                assert!(
+                    msg(&result).contains("in loop"),
+                    "strict={strict}: {command} was not blocked by the loop gate: {}",
+                    msg(&result)
+                );
             }
         }
+    }
+
+    #[test]
+    fn a_literal_path_refused_for_the_loop_shape_says_so() {
+        // Code review of 5db0fea: telling this user to write the path
+        // literally repeats the #1344 complaint.
+        let result = run_1344(
+            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b >/dev/null; done",
+            "cameronsjo",
+            true,
+        );
+        assert!(blocks(&result));
+        assert!(msg(&result).contains("already literal"), "{}", msg(&result));
+        assert!(
+            !msg(&result).contains("write the repo literally"),
+            "{}",
+            msg(&result)
+        );
+        // A path that is not literal still gets the path advice.
+        let result = run_1344(
+            r#"for o in a b; do gh api -X DELETE "repos/$o/y"; done"#,
+            "cameronsjo",
+            true,
+        );
+        assert!(
+            msg(&result).contains("write the repo literally"),
+            "{}",
+            msg(&result)
+        );
+        assert!(
+            !msg(&result).contains("already literal"),
+            "{}",
+            msg(&result)
+        );
     }
 
     #[test]
@@ -5926,7 +5998,30 @@ mod tests {
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh extension install evil/gh-x; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh x; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh; done",
+            // A download into gh's config dir could change the next host.
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh release download v1 -R cameronsjo/forgectl -D /Users/x/.config/gh; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh run download 1 -R cameronsjo/forgectl -D /Users/x/.config/gh; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh repo clone cameronsjo/forgectl /Users/x/.config/gh; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh gist clone 1 /Users/x/.config/gh; done",
         ]);
+    }
+
+    #[test]
+    fn a_character_the_comment_stripper_misreads_keeps_the_loop_gate() {
+        // Security review of 5db0fea: the comment stripper treats these as a
+        // word boundary and the shell does not, so a `#` after one hides the
+        // rest of the line from `split_segments` while the shell runs it.
+        let mut commands = Vec::new();
+        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
+            commands.push(format!(
+                "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; gh pr list{c}#; export GH_HOST=evil.example; done"
+            ));
+        }
+        commands.push(
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b # note\nexport GH_HOST=evil.example; done"
+                .to_string(),
+        );
+        assert_loop_gate_kept(&commands.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     #[test]
