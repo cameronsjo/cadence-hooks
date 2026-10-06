@@ -507,12 +507,20 @@ fn secret_token_verdict(token: &str, position: Filename) -> bool {
 /// substitution `$(…)` and an ANSI-C `$'…'` are not parameters and stay as
 /// they are.
 fn parameters_as_globs(token: &str) -> Option<String> {
+    replace_parameters(token, "*").map(|(out, _)| out)
+}
+
+/// `token` with each unexpanded parameter reference replaced by `with`, plus
+/// the first reference as written, or `None` when it carries none. The
+/// shared walk behind [`parameters_as_globs`] and
+/// [`unresolved_parameter_cause`].
+fn replace_parameters<'a>(token: &'a str, with: &str) -> Option<(String, &'a str)> {
     if !token.contains('$') {
         return None;
     }
     let mut out = String::with_capacity(token.len());
     let mut rest = token;
-    let mut found = false;
+    let mut first: Option<&str> = None;
     while let Some(at) = rest.find('$') {
         out.push_str(&rest[..at]);
         let tail = &rest[at + 1..];
@@ -531,9 +539,10 @@ fn parameters_as_globs(token: &str) -> Option<String> {
         };
         match consumed {
             Some(n) => {
-                out.push('*');
-                found = true;
-                rest = &tail[n.min(tail.len())..];
+                let n = n.min(tail.len());
+                out.push_str(with);
+                first.get_or_insert(&rest[at..at + 1 + n]);
+                rest = &tail[n..];
             }
             None => {
                 out.push('$');
@@ -542,7 +551,32 @@ fn parameters_as_globs(token: &str) -> Option<String> {
         }
     }
     out.push_str(rest);
-    found.then_some(out)
+    first.map(|reference| (out, reference))
+}
+
+/// The unresolved parameter reference (`$f`, `${X}`) that makes `token` read
+/// as a secret name, or `None` when the literal text alone names one (or the
+/// token carries no reference). Message-only (#1337): a write target such as
+/// `.env$X` blocks because `$X` may complete a deny-set name, not because the
+/// guard established that it does, so the verdict should name `$X` rather than
+/// claim a secret file. The test is that a non-empty value the guard picked
+/// (`zz`) no longer names a secret while the token still blocks. The returned
+/// reference comes back quoted, and only when it is limited to a parameter's
+/// own characters, so nothing else from the command text reaches a message.
+pub fn unresolved_parameter_cause(token: &str, position: Filename) -> Option<String> {
+    let (filled, reference) = replace_parameters(token, "zz")?;
+    if is_dangerous_secret_token_at(&filled, position) {
+        return None;
+    }
+    let safe = reference.len() <= 64
+        && reference
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '{' | '}'));
+    Some(if safe {
+        format!("\"{reference}\"")
+    } else {
+        "a shell parameter".to_string()
+    })
 }
 
 /// An unknown `$VAR` in a filename may hold any text, so it is read as `*` for

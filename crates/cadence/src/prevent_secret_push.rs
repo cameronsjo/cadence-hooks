@@ -82,7 +82,10 @@
 //! global options an alias value opens with). It blocks as unresolved when:
 //! its value names `push` or `send-pack` or starts with `!`; an alias opens
 //! with an option this cannot follow or holds options only; this same command
-//! writes it with `git config`; the subcommand word carries `$` or a backtick;
+//! writes it with `git config`; the subcommand word carries `$` or a backtick
+//! (except a wrapper function whose body is one plain `git … "$@"` and whose
+//! every call site in the command hands it a literal builtin that cannot
+//! push, cameronsjo/cadence-hooks#1338);
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
 //! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
 //! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
@@ -335,6 +338,9 @@ struct GitCall {
     /// The directory could not be followed (`cd "$D"`, `-C "$D"`, a
     /// backtick): `dir` is a stand-in, so an alias probe there proves nothing.
     dir_unresolved: bool,
+    /// The `-C` value that made [`GitCall::dir_unresolved`] true, when that
+    /// was the cause.
+    dir_token: Option<String>,
     globals: Vec<String>,
     rest: Vec<String>,
     /// git runs under a name that picks its subcommand: a dashed `git-push`
@@ -400,6 +406,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             continue;
         }
         let mut dir_unresolved = &*dir == UNRESOLVABLE_DIR || dir.contains(['$', '`']);
+        let mut dir_token: Option<String> = None;
         let mut at = if &*dir == UNRESOLVABLE_DIR {
             cwd.to_string()
         } else {
@@ -409,6 +416,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             out.push(GitCall {
                 dir: at,
                 dir_unresolved,
+                dir_token: None,
                 globals: Vec::new(),
                 rest: vec!["exec -a".to_string()],
                 renamed: true,
@@ -420,6 +428,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             out.push(GitCall {
                 dir: at,
                 dir_unresolved,
+                dir_token: None,
                 globals: Vec::new(),
                 rest: std::iter::once(sub.to_string())
                     .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
@@ -438,6 +447,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
             {
                 if value.contains(['$', '`']) {
                     dir_unresolved = true;
+                    dir_token.get_or_insert_with(|| unescape_word(value).into_owned());
                 } else {
                     at = resolve_cd_target(value, &at);
                 }
@@ -446,6 +456,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         out.push(GitCall {
             dir: at,
             dir_unresolved,
+            dir_token,
             globals: globals
                 .iter()
                 .map(|w| unescape_word(w).into_owned())
@@ -914,6 +925,304 @@ fn alias_runs_push(
     Some("is an alias chain too deep to follow")
 }
 
+/// The first directory the command changes to through a word only the shell
+/// can resolve (`cd "$D"`, `pushd $(…)`, `git -C "$W"`, `env -C "$D"`), as
+/// written less its quotes, for a message that names the real cause of a
+/// block. Reads text only; it never decides a verdict.
+fn unreadable_directory_token(command: &str) -> Option<String> {
+    let unreadable = |word: &str| word.contains(['$', '`']);
+    for segment in cadence_hooks_core::shell::command_segments(command) {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(&segment));
+        let mut words = tokens.iter().map(|w| unescape_word(w));
+        if tokens
+            .first()
+            .is_some_and(|first| matches!(unescape_word(first).as_ref(), "cd" | "pushd"))
+        {
+            if let Some(target) = words.skip(1).find(|w| !w.starts_with('-') || unreadable(w))
+                && unreadable(&target)
+            {
+                return Some(target.into_owned());
+            }
+            continue;
+        }
+        while let Some(word) = words.next() {
+            if let Some(value) = word.strip_prefix("--chdir=")
+                && unreadable(value)
+            {
+                return Some(value.to_string());
+            }
+            if matches!(word.as_ref(), "-C" | "--chdir")
+                && let Some(value) = words.next()
+                && unreadable(&value)
+            {
+                return Some(value.into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The spellings of a function's positional parameters a wrapper hands git
+/// as its subcommand: all of them, or the first.
+fn is_positional_parameter(word: &str) -> bool {
+    matches!(word, "$@" | "${@}" | "$*" | "${*}" | "$1" | "${1}")
+}
+
+/// Builtins a wrapper's call site may not hand it for the wrapper to count as
+/// unable to push: the push and fetch families (core reads their
+/// `--exec`/`--upload-pack`/`--receive-pack` values on a direct call), the
+/// builtins that run a command of their own (`rebase -x`, `bisect run`,
+/// `submodule foreach`, `filter-branch`, `difftool -x`), `hook`, and the
+/// config writers [`command_hints`] reads from direct calls only.
+const WRAPPER_UNSAFE_SUBCOMMANDS: &[&str] = &[
+    "archive",
+    "bisect",
+    "clone",
+    "config",
+    "difftool",
+    "fetch",
+    "fetch-pack",
+    "filter-branch",
+    "for-each-repo",
+    "hook",
+    "http-push",
+    "ls-remote",
+    "pull",
+    "push",
+    "rebase",
+    "receive-pack",
+    "remote",
+    "send-pack",
+    "submodule",
+    "submodule--helper",
+    "upload-archive",
+    "upload-pack",
+];
+
+/// Shell functions the command defines: `(name, body)` per definition, the
+/// body the byte range between the opening `{` and its matching `}`. `None`
+/// when a definition's body cannot be delimited (an unbalanced brace or
+/// quote).
+fn function_definitions(command: &str) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[\s;&|(){}])(?:function\s+([A-Za-z_][\w.-]*)\s*(?:\(\s*\))?|([A-Za-z_][\w.-]*)\s*\(\s*\))\s*\{",
+        )
+        .expect("pattern should compile")
+    });
+    let mut out = Vec::new();
+    for caps in HEAD.captures_iter(command) {
+        let name = caps.get(1).or_else(|| caps.get(2))?.as_str().to_string();
+        let open = caps.get(0)?.end();
+        let close = matching_brace(&command[open..])?;
+        out.push((name, open..open + close));
+    }
+    Some(out)
+}
+
+/// The byte offset of the `}` closing a body that starts right after its `{`,
+/// skipping quoted text and backslash escapes. `None` when it is never closed.
+fn matching_brace(body: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (Some('"'), '"') => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '{') => depth += 1,
+            (None, '}') if depth == 0 => return Some(at),
+            (None, '}') => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How often `name` stands in `text` as a whole word (bounded by anything a
+/// function name cannot contain).
+fn word_occurrences(text: &str, name: &str) -> usize {
+    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    text.match_indices(name)
+        .filter(|(at, _)| {
+            !text[..*at].chars().next_back().is_some_and(part)
+                && !text[at + name.len()..].chars().next().is_some_and(part)
+        })
+        .count()
+}
+
+/// Is a function body exactly one plain `git` invocation that hands on its
+/// positional parameters (`git -C "$R" -c k=v --no-pager "$@"`)? Every word
+/// after `git` is a literal of plain characters, a quoted positional
+/// parameter, or the quoted `"$NAME"` value of a `-C`; one trailing `;` and
+/// surrounding whitespace are allowed, nothing else (no second command, no
+/// other quote or expansion), so a body this guard mis-delimited cannot pass
+/// for a wrapper (review C1).
+fn plain_git_wrapper_body(body: &str) -> bool {
+    let text = body.trim();
+    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
+    if text.contains(['\n', '\r']) {
+        return false;
+    }
+    let plain = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,%".contains(c))
+    };
+    let quoted_name = |w: &str| {
+        w.strip_prefix("\"$")
+            .and_then(|w| w.strip_suffix('"'))
+            .is_some_and(|name| {
+                name.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+    };
+    let quoted_positional = |w: &str| {
+        w.strip_prefix('"')
+            .and_then(|w| w.strip_suffix('"'))
+            .is_some_and(|inner| matches!(inner, "$@" | "$*") || is_positional_parameter(inner))
+    };
+    let mut words = text.split_whitespace();
+    if words.next() != Some("git") {
+        return false;
+    }
+    let mut prev = "git";
+    let mut hands_on = false;
+    for word in words {
+        if quoted_positional(word) {
+            hands_on = true;
+        } else if !((plain(word) && word != "git") || (prev == "-C" && quoted_name(word))) {
+            return false;
+        }
+        prev = word;
+    }
+    hands_on
+}
+
+/// Can no git call that names its subcommand through a function's positional
+/// parameters (`gg() { git -C "$R" "$@"; }`) push? True only when every such
+/// call sits in a function body this command defines, each such body is one
+/// plain git invocation ([`plain_git_wrapper_body`]), the command holds no
+/// `${`, `$(` or backtick, and every mention of those functions' names is
+/// either a definition or a call site whose command word is the bare name and
+/// whose first argument is a literal builtin outside
+/// [`WRAPPER_UNSAFE_SUBCOMMANDS`] (cameronsjo/cadence-hooks#1338). A function
+/// never called runs nothing. Anything else keeps the old verdict.
+fn wrapper_calls_cannot_push(command: &str) -> bool {
+    let positional = |text: &str| {
+        git_calls(text, ".")
+            .iter()
+            .filter(|call| {
+                call.rest
+                    .first()
+                    .is_some_and(|sub| is_positional_parameter(sub))
+            })
+            .count()
+    };
+    // [`matching_brace`] reads quotes and escapes only: a `#` comment
+    // (`# don't page`), an ANSI-C `$'…'` string or a heredoc body can hold a
+    // quote or brace that moves the boundary it finds, and a mis-placed body
+    // can swallow a push outside it (review C1). Keep the old verdict.
+    // Nor does it nest quotes inside `${…}`, `$(…)` or backticks
+    // (`x="${y:-"'"}"`), so the same holds for any of those anywhere in the
+    // command: the body it finds is trusted only when nothing could have
+    // moved it.
+    if command.contains('#')
+        || command.contains("$'")
+        || command.contains("<<")
+        || command.contains("${")
+        || command.contains("$(")
+        || command.contains('`')
+    {
+        return false;
+    }
+    let Some(definitions) = function_definitions(command) else {
+        return false;
+    };
+    let mut wrappers: Vec<&str> = Vec::new();
+    // The command with every function body blanked out: a positional git
+    // call left in it is not a wrapper's (`bash -c 'git "$@"' _ push`,
+    // `set -- push; git "$@"`).
+    let mut outside = command.as_bytes().to_vec();
+    for (name, range) in &definitions {
+        let body = &command[range.clone()];
+        outside[range.clone()].fill(b' ');
+        if positional(body) == 0 {
+            continue;
+        }
+        if !plain_git_wrapper_body(body) {
+            return false;
+        }
+        if !wrappers.contains(&name.as_str()) {
+            wrappers.push(name);
+        }
+    }
+    let outside = String::from_utf8_lossy(&outside);
+    if wrappers.is_empty() || positional(&outside) != 0 {
+        return false;
+    }
+    let segments = cadence_hooks_core::shell::command_segments(command);
+    // Text run in this shell that the command does not spell out (`eval
+    // "$CMD"`, a sourced file, a trap, a command word built by an expansion)
+    // can call the wrapper without naming it here.
+    if segments.iter().any(|segment| {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+        tokens.first().is_some_and(|first| {
+            first.contains(['$', '`'])
+                || matches!(
+                    unescape_word(first).as_ref(),
+                    "eval" | "source" | "." | "trap" | "builtin" | "command"
+                )
+        })
+    }) {
+        return false;
+    }
+    for name in wrappers {
+        let defined = definitions.iter().filter(|(n, _)| n == name).count();
+        let mut calls = 0;
+        for segment in &segments {
+            let tokens =
+                executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+            if tokens.first().map(|w| unescape_word(w)).as_deref() != Some(name) {
+                continue;
+            }
+            if tokens
+                .get(1)
+                .is_some_and(|w| w == "()" || w.starts_with('('))
+            {
+                continue;
+            }
+            calls += 1;
+            let Some(first) = tokens.get(1) else {
+                continue;
+            };
+            let sub = unescape_word(first);
+            if first.contains(['$', '`', '*', '?', '['])
+                || sub.starts_with('-')
+                || WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
+                || unscannable_push(&sub)
+                || !is_builtin(&sub, false)
+            {
+                return false;
+            }
+        }
+        if word_occurrences(command, name) != defined + calls {
+            return false;
+        }
+    }
+    true
+}
+
 /// Why a `git` call the command makes may publish objects this guard cannot
 /// scan, if one may: a raw push command, a subcommand word it cannot read, or
 /// an alias (or autocorrected guess) that can push.
@@ -921,6 +1230,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
     let mut probed: HashMap<String, Result<AliasConfig, String>> = HashMap::new();
     let mut env: Option<CommandEnv> = None;
     let mut judged: std::collections::HashSet<(String, String)> = Default::default();
+    let mut wrapper_resolved: Option<bool> = None;
     for call in calls {
         let Some(sub) = call.rest.first() else {
             continue;
@@ -942,6 +1252,15 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             ));
         }
         if sub.contains(['$', '`']) {
+            // A wrapper function's `git … "$@"` names its subcommand at its
+            // call sites (cameronsjo/cadence-hooks#1338): resolved once for
+            // the whole command, and skipped only when every call site hands
+            // it a builtin that publishes nothing.
+            if is_positional_parameter(&sub)
+                && *wrapper_resolved.get_or_insert_with(|| wrapper_calls_cannot_push(command))
+            {
+                continue;
+            }
             return Some(format!(
                 "`git {}` names its subcommand through an expansion this guard cannot \
                  resolve",
@@ -977,6 +1296,23 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         if let Some(why) = alias_probe_blind(blind, call) {
             if script_exempt {
                 continue;
+            }
+            // Only the directory is unknown: name the token that hides it
+            // rather than suggest an alias (cameronsjo/cadence-hooks#1337).
+            if blind.is_none()
+                && call.dir_unresolved
+                && let Some(token) = call
+                    .dir_token
+                    .clone()
+                    .or_else(|| unreadable_directory_token(command))
+            {
+                return Some(format!(
+                    "`git {}` runs in a directory named by `{}`, which this guard cannot \
+                     resolve to check whether `{}` is an alias that pushes (use a literal path)",
+                    sane(&sub),
+                    sane(&token),
+                    sane(&sub)
+                ));
             }
             return Some(format!(
                 "`git {}` may be an alias this guard cannot resolve ({why})",
@@ -2039,39 +2375,83 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             continue;
         }
         if inv.unresolved {
+            // An unreadable directory change is the cause the message can
+            // name: say which token, not "which repository"
+            // (cameronsjo/cadence-hooks#1337).
+            if inv.directory_unverified
+                && !inv.repository_unresolved
+                && let Some(token) = unreadable_directory_token(command)
+            {
+                return Err(Stop::Refused(format!(
+                    "the push runs in a directory named by `{}`, which this guard cannot \
+                     resolve, so what it publishes could not be read (use a literal path)",
+                    sane(&token)
+                )));
+            }
             return Err(Stop::Refused(
                 "could not resolve which repository or refs this push publishes (a directory \
                  change, config override or environment it cannot follow)"
                     .into(),
             ));
         }
-        let Some(range) = range_of(&inv, &hints)? else {
-            continue;
-        };
-        sources_are_commits(&inv.work_dir, &range)?;
-        hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
-        let (shas, over) = outbound(&inv.work_dir, &range)?;
-        let mut hits = if shas.is_empty() {
-            Vec::new()
-        } else {
-            let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
-            if hits.len() <= MAX_HITS {
-                hits.extend(scan_messages(&inv.work_dir, &shas)?);
+        judge_invocation(&inv, &hints, exempt).map_err(|stop| match stop {
+            // A directory an earlier command in the same line creates (`git
+            // worktree add <p> … && git -C <p> push`) does not exist yet, so
+            // every probe there fails: say so rather than blame whatever
+            // probe failed first (cameronsjo/cadence-hooks#1336). The verdict
+            // is unchanged.
+            Stop::Refused(_) if !std::path::Path::new(&inv.work_dir).exists() => {
+                Stop::Refused(missing_directory(&inv.work_dir))
             }
-            hits
-        };
+            stop => stop,
+        })?;
+    }
+    Ok(())
+}
+
+/// Why a push or git call in `dir` cannot be judged when `dir` does not
+/// exist when the guard runs.
+fn missing_directory(dir: &str) -> String {
+    format!(
+        "the push runs in `{}`, which does not exist yet (an earlier command in the same line, \
+         such as `git worktree add`, creates it), so what it publishes cannot be read. Run the \
+         push as its own command once the directory exists",
+        sane(dir)
+    )
+}
+
+/// [`judge`] for one push that is neither a dry run nor unresolved.
+fn judge_invocation(
+    inv: &PushInvocation,
+    hints: &CommandHints,
+    exempt: Exempt,
+) -> Result<(), Stop> {
+    let Some(range) = range_of(inv, hints)? else {
+        return Ok(());
+    };
+    sources_are_commits(&inv.work_dir, &range)?;
+    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
+    let (shas, over) = outbound(&inv.work_dir, &range)?;
+    let mut hits = if shas.is_empty() {
+        Vec::new()
+    } else {
+        let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
         if hits.len() <= MAX_HITS {
-            hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
+            hits.extend(scan_messages(&inv.work_dir, &shas)?);
         }
-        if !hits.is_empty() {
-            return Err(Stop::Found(hits));
-        }
-        if over {
-            return Err(Stop::Refused(format!(
-                "the range is too large to fully scan (over {MAX_COMMITS} commits; the newest \
+        hits
+    };
+    if hits.len() <= MAX_HITS {
+        hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
+    }
+    if !hits.is_empty() {
+        return Err(Stop::Found(hits));
+    }
+    if over {
+        return Err(Stop::Refused(format!(
+            "the range is too large to fully scan (over {MAX_COMMITS} commits; the newest \
                  {MAX_COMMITS} were clean) — push blocked rather than partly scanned"
-            )));
-        }
+        )));
     }
     Ok(())
 }
@@ -3835,5 +4215,140 @@ mod tests {
             raw_commit(&fx, header, "clean");
         }
         assert_allows(&fx.run("git push origin main"));
+    }
+
+    /// A shell function wrapping `git … "$@"` names its subcommand at its
+    /// call sites. When every call site in the same command hands it a
+    /// literal builtin that publishes nothing, the wrapper cannot push
+    /// (cameronsjo/cadence-hooks#1338).
+    #[test]
+    fn a_git_wrapper_function_is_judged_by_its_call_sites() {
+        let fx = Fx::new("wrapper-fn");
+        for command in [
+            // The issue's shape.
+            "gg() { git -C \"$REPO\" -c core.fsmonitor=false --no-optional-locks \"$@\"; }\n\
+             gg diff --name-only \"$base\" > \"$FILES_F\"\n\
+             gg log --oneline \"$base\"..HEAD",
+            "gg() { git \"$@\"; }; gg status",
+            "function gg { git \"$@\"; }; gg log -1 && gg diff",
+            "gg () {\n  git --no-pager \"$@\"\n}\ngg show HEAD",
+            "gg() {\n  git -C \"$R\" \"$@\"\n}\ngg status\ngg log -3",
+            "g1() { git \"$1\" --stat; }; g1 diff",
+            // Defined, never called: nothing runs.
+            "gg() { git \"$@\"; }",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+        // The old verdict wherever a call site could push or cannot be read.
+        for command in [
+            "gg() { git \"$@\"; }; gg push origin main",
+            "gg() { git \"$@\"; }; gg status; gg push origin main",
+            "gg() { git \"$@\"; }; gg \"$sub\" origin main",
+            "gg() { git \"$@\"; }; gg -C . push origin main",
+            "gg() { git \"$@\"; }; eval gg push origin main",
+            "gg() { git \"$@\"; }; x=gg; $x push origin main",
+            "gg() { shift; git \"$@\"; }; gg x push origin main",
+            "gg() { git \"$@\"; }; gg rebase -x 'git push origin main' HEAD~1",
+            "gg() { git \"$@\"; }; gg pu origin main",
+            "gg() { git \"$@\"; }; echo gg push | bash",
+            "gg() { git \"$@\"; }; gg status; eval \"$CMD\"",
+            "gg() { git \"$@\"; }; gg status; . ./steps.sh",
+            // A comment or an ANSI-C string can carry a quote or brace that
+            // mis-delimits the body, and so hide a later push: the old
+            // block whenever the boundary is unsure (review C1).
+            "gg() {\n  git \"$@\"  # don't page\n}\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
+            "gg() { git \"$@\"; echo $'\\''; }\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
+            "gg() { git \"$@\"; } # wrapper\ngg status",
+            // A body that is more than one plain git invocation.
+            "gg() { git \"$@\"; git push origin main; }; gg status",
+            "gg() { cd /tmp && git \"$@\"; }; gg status",
+            "gg() { git \"$@\" | cat; }; gg status",
+            "gg() { git -c \"$K\" \"$@\"; }; gg status",
+            // Not a function's positional parameters at all.
+            "bash -c 'git \"$@\"' _ push origin main",
+            "set -- push origin main; git \"$@\"",
+        ] {
+            let r = fx.run(command);
+            assert_eq!(r.outcome, Outcome::Block, "{command}: {:?}", r.message);
+            assert_blocks(&r, &["cannot resolve"]);
+        }
+        // A quote nested in `${…}` can mis-delimit the body the same way, so
+        // the wrapper reading refuses any command holding one. (The guard as
+        // a whole allows this command on main as well: the shell reader in
+        // core does not see its `git` calls at all, which is not this
+        // exemption's doing.)
+        assert!(!wrapper_calls_cannot_push(
+            "gg() { x=\"${y:-\"'\"}\"; git \"$@\"; }; bash -c 'git \"$@\"' _ push origin main; echo '}'"
+        ));
+    }
+
+    /// A push into a directory an earlier command in the same line creates
+    /// (`git worktree add <p> … && git -C <p> push`) cannot be scanned, since
+    /// the directory does not exist yet. It still blocks, and the message
+    /// says why instead of blaming the config (cameronsjo/cadence-hooks#1336).
+    #[test]
+    fn a_push_into_a_directory_not_yet_created_names_it() {
+        let fx = Fx::new("missing-dir");
+        // Forward slashes: an unquoted Windows path in a shell string loses
+        // its backslashes to shell escaping, as in real bash.
+        let wt = fx.work.parent().unwrap().join("wt-new");
+        let wt = wt.to_str().unwrap().replace('\\', "/");
+        let wt = wt.as_str();
+        let r = fx.run(&format!(
+            "git worktree add -q {wt} -b nb main && git -C {wt} push -q -u origin nb"
+        ));
+        assert_blocks(&r, &[wt, "does not exist", "as its own command"]);
+        assert!(
+            !r.message
+                .as_deref()
+                .unwrap()
+                .contains("could not read the config")
+        );
+    }
+
+    /// A directory a variable or substitution names is the block's real
+    /// cause, and the message names that token rather than an alias or "which
+    /// repository" (cameronsjo/cadence-hooks#1337 item 1). A variable bound to
+    /// a literal earlier in the line resolves (item 2), and read-only
+    /// builtins never reach the push scan (item 3).
+    #[test]
+    fn an_unresolved_directory_token_is_named() {
+        let fx = Fx::new("unresolved-token");
+        fx.git(&["config", "alias.st", "status"]);
+        for (command, token) in [
+            (
+                "cd \"$(cat /tmp/dir)\" && git push origin main",
+                "$(cat /tmp/dir)",
+            ),
+            ("git -C \"$VAR\" push origin main", "$VAR"),
+            ("cd $D && git push origin main", "$D"),
+            ("git -C \"$VAR\" st", "$VAR"),
+            ("cd \"$(cat /tmp/dir)\" && git st", "$(cat /tmp/dir)"),
+        ] {
+            let r = fx.run(command);
+            assert_blocks(&r, &[token, "use a literal"]);
+            let msg = r.message.as_deref().unwrap();
+            assert!(!msg.contains("may be an alias"), "{command}: {msg}");
+            assert!(!msg.contains("which repository"), "{command}: {msg}");
+        }
+        // Forward slashes, single-quoted: a backslash in the value (a native
+        // Windows path) is never bound by the dispatch seam (#1287), and an
+        // unquoted one is a shell escape.
+        let work = fx.work.to_str().unwrap().replace('\\', "/");
+        for command in [
+            format!(
+                "W='{work}'; git -C \"$W\" commit -q --allow-empty -m x && git -C \"$W\" push origin main"
+            ),
+            format!("W='{work}'; git -C $W push origin main"),
+            "cd \"$(cat /tmp/dir)\" && git merge x && git verify-commit HEAD".to_string(),
+            "git -C \"$VAR\" write-tree".to_string(),
+            "git -C $VAR verify-commit HEAD".to_string(),
+        ] {
+            // The dispatch seam binds a literal-assigned variable before any
+            // guard runs (`decide_check`, cameronsjo/cadence-hooks#1287).
+            let seen = cadence_hooks_core::dir_variables::resolve_literal_dir_variables(&command);
+            let r = fx.run(&seen);
+            assert_eq!(r.outcome, Outcome::Allow, "{command}: {:?}", r.message);
+        }
     }
 }

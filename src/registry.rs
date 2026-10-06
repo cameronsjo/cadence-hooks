@@ -611,7 +611,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "warn-unreviewed-ready-flip",
-        description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
+        description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker), and on a gh pr review whose marker values sit off line 1",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
