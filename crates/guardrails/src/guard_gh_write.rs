@@ -1890,6 +1890,24 @@ fn allowed_display_list(owners: &[AllowEntry], repos: &[AllowEntry]) -> Vec<Stri
         .collect()
 }
 
+/// True when every looped write the block names is a `gh api` call, so no
+/// `-R` advice applies.
+fn only_api_writes(writes: &[String], api_writes: &[String]) -> bool {
+    writes.is_empty() && !api_writes.is_empty()
+}
+
+/// The structured `fix` for a looped-write block: `-R` for commands that take
+/// it, the endpoint path for `gh api`, both when the loop holds both.
+fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> String {
+    if only_api_writes(writes, api_writes) {
+        format!("gh api repos/{target}/…")
+    } else if api_writes.is_empty() {
+        format!("-R {target}")
+    } else {
+        format!("-R {target}; for gh api, gh api repos/{target}/…")
+    }
+}
+
 /// Build the block message for a looped gh write, with a concrete fix target
 /// when the cwd resolved to an owned repo.
 ///
@@ -1921,7 +1939,7 @@ fn looped_write_block_message(
              placeholder in the owner or repo name"
         ));
     }
-    let header = if writes.is_empty() && !api_writes.is_empty() {
+    let header = if only_api_writes(writes, api_writes) {
         "gh api write in loop without a literal repos/<owner>/<repo> path"
     } else {
         "gh write command in loop without explicit -R flag"
@@ -1936,13 +1954,13 @@ fn looped_write_block_message(
 }
 
 /// Build the block message for an unresolvable target, naming the directory
-/// that failed to resolve and a concrete `-R` example.
-fn unresolvable_message(work_dir: &str, example_owner: Option<&str>) -> String {
-    let owner = example_owner.unwrap_or("owner");
+/// that failed to resolve and a concrete target example — `fix`, spelled for
+/// the command by [`target_spelling`].
+fn unresolvable_message(work_dir: &str, fix: &str) -> String {
     format!(
         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
          Directory: {work_dir}\n   \
-         Fix: add `-R {owner}/<repo>` to target a repo explicitly"
+         Fix: add `{fix}` to target a repo explicitly"
     )
 }
 
@@ -3200,11 +3218,15 @@ fn judge_resolution(
                  gh reads a repo as a URL or `[HOST/]OWNER/REPO`; this value is neither, or \
                  is spelled in a way this guard cannot split exactly as gh does, so it cannot \
                  be checked for ownership.\n   \
-                 Fix: spell the target as `-R owner/repo`"
+                 Fix: spell the target as `{}`",
+                target_spelling(segment, "owner/repo"),
             ),
             BlockMetadata {
                 rule_id: "gh-write-target-unresolvable".to_string(),
-                fix: "spell the target as -R owner/repo".to_string(),
+                fix: format!(
+                    "spell the target as {}",
+                    target_spelling(segment, "owner/repo")
+                ),
                 allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                 severity: "error",
             },
@@ -3277,13 +3299,13 @@ fn judge_resolution(
         RepoResolution::Unresolvable => {
             // Suggest the first allowed owner so the fix is concrete even when no
             // repo can be inferred from the directory.
-            let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
-            let owner_for_fix = example_owner.unwrap_or("owner");
+            let owner_for_fix = allowed_owners.first().map_or("owner", |e| e.owner.as_str());
+            let fix = target_spelling(segment, &format!("{owner_for_fix}/<repo>"));
             Some(CheckResult::block_structured(
-                unresolvable_message(work_dir, example_owner),
+                unresolvable_message(work_dir, &fix),
                 BlockMetadata {
                     rule_id: "gh-write-target-unresolvable".to_string(),
-                    fix: format!("-R {owner_for_fix}/<repo>"),
+                    fix,
                     allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                     severity: "error",
                 },
@@ -3473,7 +3495,8 @@ impl Check for GhWriteGuard {
                         "🚫 git-guardrails: gh loop targets repo you don't own\n   \
                          Found: {}\n   \
                          Allowed: {}\n   \
-                         Fix: use `-R owner/repo` to target an owned repo",
+                         Fix: use `-R owner/repo` to target an owned repo (`gh api` has no -R: name \
+                         an owned repo in its literal `repos/<owner>/<repo>/…` path)",
                         unowned_write_targets.join(", "),
                         all_entries.join(" "),
                     ));
@@ -3531,11 +3554,7 @@ impl Check for GhWriteGuard {
                         };
                         let (writes, api_writes) = (quote(writes), quote(api_writes));
                         let target = suggestion.as_deref().unwrap_or("<owner>/<repo>");
-                        let fix = if writes.is_empty() && !api_writes.is_empty() {
-                            format!("gh api repos/{target}/…")
-                        } else {
-                            format!("-R {target}")
-                        };
+                        let fix = looped_write_fix(&writes, &api_writes, target);
                         return CheckResult::block_structured(
                             looped_write_block_message(&writes, &api_writes, suggestion.as_deref()),
                             BlockMetadata {
@@ -3559,7 +3578,8 @@ impl Check for GhWriteGuard {
                 if LOOP_PATTERN.is_match(&stripped) {
                     return CheckResult::block(
                         "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                         Fix: run each gh command individually with `-R owner/repo`",
+                         Fix: run each gh command individually with `-R owner/repo` (for \
+                         `gh api`, a literal `repos/<owner>/<repo>/…` path)",
                     );
                 }
             }
@@ -3633,7 +3653,8 @@ fn expansion_allowance(len: usize) -> usize {
 fn too_large_to_read_block() -> CheckResult {
     CheckResult::block_structured(
         "🚫 git-guardrails: command too large to read in full — cannot verify its gh targets\n   \
-         Fix: run each gh command on its own, with `-R owner/repo`"
+         Fix: run each gh command on its own, with `-R owner/repo` (for `gh api`, a \
+         literal `repos/<owner>/<repo>/…` path)"
             .to_string(),
         BlockMetadata {
             rule_id: "gh-write-target-unresolvable".to_string(),
@@ -3677,7 +3698,8 @@ fn too_many_dirs_block(
              Command: {segment}\n   \
              Each directory's repo is looked up to check ownership, and this many cannot be \
              checked in time.\n   \
-             Fix: run the gh writes in fewer commands, or name each target with `-R owner/repo`"
+             Fix: run the gh writes in fewer commands, or name each target with `-R owner/repo` (for `gh api`, a \
+             literal `repos/<owner>/<repo>/…` path)"
         ),
         BlockMetadata {
             rule_id: "gh-write-target-unresolvable".to_string(),
@@ -5110,14 +5132,14 @@ mod tests {
 
     #[test]
     fn unresolvable_message_names_directory() {
-        let msg = unresolvable_message("/Users/cameron/scratch", Some("cameronsjo"));
+        let msg = unresolvable_message("/Users/cameron/scratch", "-R cameronsjo/<repo>");
         assert!(msg.contains("Directory: /Users/cameron/scratch"));
         assert!(msg.contains("-R cameronsjo/<repo>"));
     }
 
     #[test]
     fn unresolvable_message_generic_without_owner() {
-        let msg = unresolvable_message("/tmp", None);
+        let msg = unresolvable_message("/tmp", "-R owner/<repo>");
         assert!(msg.contains("Directory: /tmp"));
         assert!(msg.contains("-R owner/<repo>"));
     }
@@ -5388,6 +5410,84 @@ mod tests {
         assert_eq!(
             meta.fix,
             "pass the target as a literal gh api repos/owner/repo/…"
+        );
+    }
+
+    #[test]
+    fn every_api_block_names_the_path_not_dash_r() {
+        // Each block a gh api write can reach advises the path in its
+        // structured fix, and its message never advises `-R` alone.
+        for (command, rule) in [
+            // A placeholder is judged as written, an unowned `{owner}` account.
+            (
+                "gh api -X DELETE repos/{owner}/{repo}/x",
+                "gh-write-unauthorized-target",
+            ),
+            (
+                r#"for o in a b; do gh api -X DELETE "repos/$o/y"; done"#,
+                "gh-write-loop-missing-repo",
+            ),
+            (
+                "gh api -X DELETE repos/evil/x/y",
+                "gh-write-unauthorized-target",
+            ),
+        ] {
+            let result = run_1344(command, "cameronsjo", false);
+            assert!(blocks(&result), "{command} was allowed");
+            assert!(
+                !msg(&result).contains("add `-R"),
+                "{command}: {}",
+                msg(&result)
+            );
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, rule, "{command}");
+            assert!(
+                meta.fix.contains("gh api repos/"),
+                "{command}: {}",
+                meta.fix
+            );
+            assert!(!meta.fix.starts_with("-R"), "{command}: {}", meta.fix);
+        }
+    }
+
+    #[test]
+    fn unresolvable_and_unreadable_arms_spell_the_fix_for_the_command() {
+        let o = owners(&["cameronsjo"]);
+        let api = "gh api -X DELETE repos/x/y/z";
+        let pr = "gh pr create --title t";
+        let fix = |resolution, segment| {
+            judge_resolution(resolution, segment, "/tmp", &o, &[], &[])
+                .and_then(|r| r.block_metadata)
+                .expect("structured block")
+                .fix
+        };
+        assert_eq!(
+            fix(RepoResolution::Unresolvable, api),
+            "gh api repos/cameronsjo/<repo>/…"
+        );
+        assert_eq!(
+            fix(RepoResolution::Unresolvable, pr),
+            "-R cameronsjo/<repo>"
+        );
+        assert_eq!(
+            fix(RepoResolution::UnreadableFlag("x".to_string()), api),
+            "spell the target as gh api repos/owner/repo/…"
+        );
+        assert_eq!(
+            fix(RepoResolution::UnreadableFlag("x".to_string()), pr),
+            "spell the target as -R owner/repo"
+        );
+    }
+
+    #[test]
+    fn looped_write_fix_spells_each_kind() {
+        let w = vec!["`gh pr comment 1`".to_string()];
+        let a = vec!["`gh api -X DELETE repos/$o/y`".to_string()];
+        assert_eq!(looped_write_fix(&w, &[], "o/r"), "-R o/r");
+        assert_eq!(looped_write_fix(&[], &a, "o/r"), "gh api repos/o/r/…");
+        assert_eq!(
+            looped_write_fix(&w, &a, "o/r"),
+            "-R o/r; for gh api, gh api repos/o/r/…"
         );
     }
 
