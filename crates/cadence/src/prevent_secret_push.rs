@@ -4197,8 +4197,11 @@ mod tests {
     #[test]
     fn a_push_into_a_directory_not_yet_created_names_it() {
         let fx = Fx::new("missing-dir");
+        // Forward slashes: an unquoted Windows path in a shell string loses
+        // its backslashes to shell escaping, as in real bash.
         let wt = fx.work.parent().unwrap().join("wt-new");
-        let wt = wt.to_str().unwrap();
+        let wt = wt.to_str().unwrap().replace('\\', "/");
+        let wt = wt.as_str();
         let r = fx.run(&format!(
             "git worktree add -q {wt} -b nb main && git -C {wt} push -q -u origin nb"
         ));
@@ -4236,10 +4239,13 @@ mod tests {
             assert!(!msg.contains("may be an alias"), "{command}: {msg}");
             assert!(!msg.contains("which repository"), "{command}: {msg}");
         }
-        let work = fx.work.to_str().unwrap();
+        // Forward slashes, single-quoted: a backslash in the value (a native
+        // Windows path) is never bound by the dispatch seam (#1287), and an
+        // unquoted one is a shell escape.
+        let work = fx.work.to_str().unwrap().replace('\\', "/");
         for command in [
             format!(
-                "W={work}; git -C \"$W\" commit -q --allow-empty -m x && git -C \"$W\" push origin main"
+                "W='{work}'; git -C \"$W\" commit -q --allow-empty -m x && git -C \"$W\" push origin main"
             ),
             format!("W='{work}'; git -C $W push origin main"),
             "cd \"$(cat /tmp/dir)\" && git merge x && git verify-commit HEAD".to_string(),
