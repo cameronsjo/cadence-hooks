@@ -49,6 +49,13 @@
 //!   exempt without that repo being the session root. Absent/unparsable/
 //!   non-scalar settings declare nothing and fall through — never a panic or
 //!   an inverted verdict (ADR-0001).
+//!   **The process-env reading is session-wide** (#1242, documented, not
+//!   narrowed): Claude Code exports the session root's settings `env` block
+//!   into every Bash call, so a root that declares the flag exempts every
+//!   target repo the session edits, branch-mode repos beneath it included, not
+//!   just the declaring repo. Anything narrower is declared per repo, in each
+//!   main-by-design repo's own settings, with sessions for branch-mode repos
+//!   started from those repos.
 //! - `CADENCE_NO_ENFORCE_WORKTREE` truthy — user-global kill switch for the
 //!   proving period; rollback without uninstalling.
 //! - Repo root under a temp directory (`/tmp`, `/private/tmp`, `$TMPDIR`) —

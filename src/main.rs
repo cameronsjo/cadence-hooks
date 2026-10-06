@@ -469,7 +469,8 @@ enum GuardrailsCommands {
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
     WarnGhMergePreflight,
-    /// Warn on gh pr ready/merge when the PR head has no reviewed signal
+    /// Warn on gh pr ready/merge when the PR head has no reviewed signal, and on
+    /// a gh pr review whose marker values sit off the body's first line
     WarnUnreviewedReadyFlip,
     /// Warn when `chezmoi apply` would overwrite locally drifted files
     WarnChezmoiApply,
