@@ -982,6 +982,7 @@ const WRAPPER_UNSAFE_SUBCOMMANDS: &[&str] = &[
     "fetch",
     "fetch-pack",
     "filter-branch",
+    "for-each-repo",
     "hook",
     "http-push",
     "ls-remote",

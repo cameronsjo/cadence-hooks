@@ -818,6 +818,56 @@ fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_di
         })
 }
 
+/// Can a segment of the command move which branch is checked out, or where
+/// the current branch tracks, before a later bare push resolves its remote?
+/// `git checkout`/`git switch` (any form), `git branch` with a tracking
+/// option (`-u`, `--set-upstream-to`, `-t`/`--track`, `--unset-upstream`),
+/// and `gh pr checkout`. Errs toward true: a match only keeps the old chain
+/// block (#1340 security review I1).
+fn moves_branch_or_tracking(command: &str) -> bool {
+    use cadence_hooks_core::shell::{
+        command_segments, command_word, executable_tokens, peel_command_runners,
+        skip_git_global_options, unescape_word,
+    };
+    command_segments(command).iter().any(|segment| {
+        let tokens = executable_tokens(strip_group_wrappers(segment));
+        let argv = peel_command_runners(&tokens);
+        let Some(first) = argv.first() else {
+            return false;
+        };
+        match command_word(first).as_ref() {
+            "git" => {
+                let rest = skip_git_global_options(&argv[1..]);
+                let words: Vec<String> =
+                    rest.iter().map(|w| unescape_word(w).into_owned()).collect();
+                match words.first().map(String::as_str) {
+                    Some("checkout" | "switch") => true,
+                    Some("branch") => words[1..].iter().any(|w| {
+                        w == "-u"
+                            || w == "-t"
+                            || w.starts_with("--set-upstream")
+                            || w.starts_with("--track")
+                            || w == "--unset-upstream"
+                            || (w.starts_with('-')
+                                && !w.starts_with("--")
+                                && w.contains(['u', 't']))
+                    }),
+                    _ => false,
+                }
+            }
+            "gh" => {
+                let words: Vec<String> = argv[1..]
+                    .iter()
+                    .map(|w| unescape_word(w).into_owned())
+                    .collect();
+                words.iter().any(|w| w == "checkout")
+                    && words.iter().any(|w| w == "pr" || w == "co")
+            }
+            _ => false,
+        }
+    })
+}
+
 /// The directory the command starts in: the payload's `cwd`, else the hook
 /// process's own.
 fn input_cwd(input: &HookInput) -> String {
@@ -943,6 +993,26 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         // explicit URL directly. Each one must be owned and resolvable, so the
         // chain shape alone — a bare push beside a named one, or two
         // different remotes — no longer blocks.
+        //
+        // Except where a bare push may follow a branch switch or a tracking
+        // change in the same command (`git push origin feat && git checkout
+        // main && git push`): the probe below reads the current branch's
+        // upstream as it is before the command runs, while git pushes the
+        // new branch to ITS remote. That chain keeps the old block (#1340
+        // security review I1).
+        ChainAnalysis::MissingRemotes(cmds) if moves_branch_or_tracking(command) => {
+            let bare: Vec<String> = cmds
+                .iter()
+                .filter(|c| c.explicit_repo.is_none())
+                .map(|c| format!("`git {}`", c.args.join(" ")))
+                .collect();
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: chained git push without explicit remotes\n   \
+                 Found: {} after a branch switch or tracking change in the same command\n   \
+                 Fix: add explicit remote, e.g. `git push origin main`",
+                bare.join(", "),
+            ));
+        }
         ChainAnalysis::SameRemote(_)
         | ChainAnalysis::DifferentRemotes(_)
         | ChainAnalysis::MissingRemotes(_) => {}
@@ -2167,6 +2237,81 @@ mod tests {
                     result.outcome,
                     cadence_hooks_core::Outcome::Block,
                     "{command} (from {cwd}): {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// A bare push after a branch switch or tracking change in the same chain
+    /// goes to the NEW branch's remote, which the probe (reading config as it
+    /// is before the command runs) cannot see: such a chain keeps the old
+    /// block (#1340 security review I1). Without a switch, #1329's shapes
+    /// still allow.
+    #[test]
+    fn a_chained_bare_push_after_a_branch_switch_keeps_the_block() {
+        use cadence_hooks_core::git_fixtures::git_in;
+        // A fork: `feat` tracks the owned origin, `main` the unowned upstream.
+        let fork = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let f = fork.path();
+        git_in(
+            f,
+            &["remote", "add", "upstream", "https://github.com/evil/x.git"],
+        );
+        git_in(f, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git_in(f, &["config", "branch.main.remote", "upstream"]);
+        git_in(f, &["config", "branch.main.merge", "refs/heads/main"]);
+        git_in(f, &["checkout", "-q", "-b", "feat"]);
+        git_in(f, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
+        git_in(f, &["config", "branch.feat.remote", "origin"]);
+        git_in(f, &["config", "branch.feat.merge", "refs/heads/feat"]);
+        let cwd = f.to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, blocks) in [
+                (
+                    "git push origin feat && git checkout main && git push",
+                    true,
+                ),
+                ("git push origin feat && git switch main && git push", true),
+                ("git push origin feat; git checkout main; git push", true),
+                (
+                    "git push origin feat && git checkout main && git pull && git push",
+                    true,
+                ),
+                ("git push --tags && git checkout main && git push", true),
+                (
+                    "git stash && git checkout main && git push && git checkout feat && git push origin feat",
+                    true,
+                ),
+                (
+                    "git push origin main && git checkout -b x upstream/main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git branch -u upstream/main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git branch --set-upstream-to=upstream/main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && gh pr checkout 12 && git push",
+                    true,
+                ),
+                // No switch in between: judged per push, as #1329 rules.
+                ("git push origin feat && git push --tags", false),
+                ("git push origin feat && git push", false),
+                (
+                    "git add -A && git commit -m x && git push origin feat && git push --tags",
+                    false,
+                ),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(
+                    result.outcome == cadence_hooks_core::Outcome::Block,
+                    blocks,
+                    "{command}: {:?}",
                     result.message
                 );
             }
