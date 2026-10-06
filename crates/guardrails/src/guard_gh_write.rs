@@ -1896,10 +1896,30 @@ fn only_api_writes(writes: &[String], api_writes: &[String]) -> bool {
     writes.is_empty() && !api_writes.is_empty()
 }
 
+/// True when every `gh api` write the block names already has a literal
+/// `repos/<owner>/<repo>` path, so it was refused for the loop's shape
+/// ([`loop_targets_are_literal`]), not its path.
+fn api_writes_are_literal(api_writes: &[String]) -> bool {
+    !api_writes.is_empty()
+        && api_writes
+            .iter()
+            .all(|w| api_literal_repo_target(w.trim_matches('`')).is_some())
+}
+
+/// What a plain loop is, for the fix of a literal-path write refused for the
+/// loop's shape.
+const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only in a plain loop: \
+     `for` headers with a lowercase name and plain values, `do`, `done`, and `gh api`, `pr`, \
+     `issue` or similar commands with plain arguments, in printable ASCII, with no redirect, \
+     `||`/`&&`, pipe, comment, or other command; make the loop plain or run each call \
+     outside it";
+
 /// The structured `fix` for a looped-write block: `-R` for commands that take
 /// it, the endpoint path for `gh api`, both when the loop holds both.
 fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> String {
-    if only_api_writes(writes, api_writes) {
+    if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
+        PLAIN_LOOP_FIX.to_string()
+    } else if only_api_writes(writes, api_writes) {
         format!("gh api repos/{target}/…")
     } else if api_writes.is_empty() {
         format!("-R {target}")
@@ -1946,15 +1966,11 @@ fn looped_write_block_message(
         ));
     }
     if !literal.is_empty() {
-        fixes.push(
-            "the `gh api` path is already literal, but it only counts as the target \
-             in a plain loop: `for name in <words>`, `do`, `done`, and `gh` commands with plain \
-             arguments, with no redirect, `||`/`&&`, pipe, comment, or other command; drop \
-             those or run each call outside the loop"
-                .to_string(),
-        );
+        fixes.push(PLAIN_LOOP_FIX.to_string());
     }
-    let header = if only_api_writes(writes, api_writes) {
+    let header = if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
+        "gh api write in a loop the guard cannot follow"
+    } else if only_api_writes(writes, api_writes) {
         "gh api write in loop without a literal repos/<owner>/<repo> path"
     } else {
         "gh write command in loop without explicit -R flag"
@@ -3135,6 +3151,10 @@ enum LoopedWriteKind {
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
 ///
+/// The command must also be printable ASCII, space, tab, and newline only,
+/// with no `#`, and the subcommand list leaves out anything that writes a
+/// file to a path it is given.
+///
 /// Those two forms are the only ones neither bash nor zsh rewrites: the value
 /// is a plain header word, so the expansion is that word, cannot split into a
 /// new argument such as `--hostname`, and cannot join a neighbour into `..`.
@@ -3225,10 +3245,13 @@ fn loop_targets_are_literal(command: &str) -> bool {
         }
         Some(out)
     }
-    // Printable ASCII, space, tab, and newline only, and no `#`: the comment
-    // stripper behind `split_segments` reads some characters the shell does
-    // not as a word boundary (U+3000, VT, CR), so `x<U+3000>#; export …`
-    // would hide the `export` from this check while the shell runs it.
+    // Printable ASCII, space, tab, and newline only: the comment stripper
+    // behind `split_segments` reads some characters the shell does not as a
+    // word boundary (U+3000, VT, CR), so `x<U+3000>#; export …` would hide
+    // the `export` from this check while the shell runs it. With those gone
+    // the stripper and the shell agree on ASCII comments, so the `#` refusal
+    // is a second layer no known input needs; it costs `done # note` the
+    // relaxed policy.
     if command.contains('#')
         || !command
             .bytes()
@@ -5872,12 +5895,20 @@ mod tests {
             true,
         );
         assert!(blocks(&result));
-        assert!(msg(&result).contains("already literal"), "{}", msg(&result));
+        assert!(msg(&result).contains("cannot follow"), "{}", msg(&result));
+        assert!(msg(&result).contains("plain loop"), "{}", msg(&result));
+        assert!(
+            !msg(&result).contains("without a literal"),
+            "{}",
+            msg(&result)
+        );
         assert!(
             !msg(&result).contains("write the repo literally"),
             "{}",
             msg(&result)
         );
+        let meta = result.block_metadata.expect("structured block");
+        assert!(meta.fix.contains("plain loop"), "{}", meta.fix);
         // A path that is not literal still gets the path advice.
         let result = run_1344(
             r#"for o in a b; do gh api -X DELETE "repos/$o/y"; done"#,
