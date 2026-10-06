@@ -3362,6 +3362,37 @@ impl Check for GhWriteGuard {
                     })
                     .filter_map(|c| c.explicit_repo.as_deref())
                     .collect();
+                // #1337: a `-R "$r"` whose value is only known when the shell
+                // runs is unresolvable, not unowned. When every blocked target
+                // is such an expansion, say that and name it, as the
+                // single-command arm does (#757); the verdict is unchanged.
+                if !unowned_write_targets.is_empty()
+                    && unowned_write_targets
+                        .iter()
+                        .all(|t| repo_has_unexpanded_expansion(t))
+                {
+                    let tokens: Vec<String> = unowned_write_targets
+                        .iter()
+                        .map(|t| format!("\"{}\"", t.trim_matches('"')))
+                        .collect();
+                    return CheckResult::block_structured(
+                        format!(
+                            "⚠️  git-guardrails: gh loop: cannot resolve {} in -R; use a literal \
+                             owner/repo\n   \
+                             The value is only known when the shell runs, so this guard cannot \
+                             check it for ownership.\n   \
+                             Fix: spell each target as a literal `-R owner/repo` (one gh command \
+                             per repo, or a loop over literal `-R` values)",
+                            tokens.join(", "),
+                        ),
+                        BlockMetadata {
+                            rule_id: "gh-write-target-unresolvable".to_string(),
+                            fix: "pass the target as a literal -R owner/repo".to_string(),
+                            allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
+                            severity: "error",
+                        },
+                    );
+                }
                 if !unowned_write_targets.is_empty() {
                     let all_entries: Vec<String> = allowed_owners
                         .iter()
@@ -6099,6 +6130,44 @@ mod tests {
             );
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn loop_write_to_an_unresolved_repo_variable_names_the_variable() {
+        // #1337: `-R "$r"` blocks as before, but the verdict names `$r` as
+        // unresolved instead of claiming a repo the caller doesn't own.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for p in a:1 b:2; do r="cameronsjo/${p%%:*}"; gh pr merge 3 -R "$r"; done"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            assert!(
+                message.contains(r#"cannot resolve "$r" in -R; use a literal owner/repo"#),
+                "{message}"
+            );
+            assert!(!message.contains("don't own"), "{message}");
+        });
+    }
+
+    #[test]
+    fn loop_write_mixing_an_unowned_literal_and_a_variable_keeps_the_unowned_message() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for i in 1 2; do gh issue close $i -R stranger/repo; gh issue close $i -R "$r"; done"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            assert!(
+                result
+                    .message
+                    .unwrap_or_default()
+                    .contains("gh loop targets repo you don't own")
+            );
         });
     }
 

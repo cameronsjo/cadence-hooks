@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`guard-gh-write` and `prevent-secret-writes` name the unresolved variable when one is what blocks (#1337 item 1).** A loop write whose only blocked target is an expansion (`for …; do gh pr merge 3 -R "$r"; done`) now says `cannot resolve "$r" in -R; use a literal owner/repo` instead of `gh loop targets repo you don't own`, matching the single-command arm. A write target that reads as a secret only because a `$VAR` may complete it (`> .env$X`, `> id_rsa${SUFFIX}`) now says the target `has an unresolved "$X"` instead of claiming a deny-set secret file. Verdicts are unchanged; a literal secret name beside a variable (`> $DIR/.env`) keeps the old message. `prevent-secret-leaks` needed no change: since #1303 it never judges a name containing a variable.
+
 ## [0.123.1] - 2026-10-05
 
 ### Fixed
