@@ -3149,8 +3149,8 @@ enum LoopedWriteKind {
 ///   gh's host, login, or config and writes no file to a path it is given
 ///   (so not `auth`, `config`, `alias`, `release`, `run`, `repo`, `gist`, or
 ///   an extension), that is not `pr checkout` or `issue develop` (a `pr` or
-///   `issue` command has no `checkout`, `co`, or `develop` word anywhere,
-///   and expands no variable when a header value is one of those), and whose arguments are plain words, optionally wrapped in
+///   `issue` command's verb, after an optional `-R`, is plain literal text,
+///   and no word is `checkout`, `co`, or `develop`), and whose arguments are plain words, optionally wrapped in
 ///   one pair of double quotes, that may expand the loop's own variables in
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
@@ -3178,8 +3178,9 @@ fn loop_targets_are_literal(command: &str) -> bool {
         "api", "pr", "issue", "workflow", "label", "search", "browse", "status", "cache",
         "variable", "secret", "ruleset", "project",
     ];
-    /// Lowercase names the shell or gh reads: zsh's arrays tied to `PATH`
-    /// and friends, and the proxy variables Go's `ProxyFromEnvironment` reads.
+    /// Lowercase names the shell or gh reads, or that zsh rewrites: its
+    /// arrays tied to `PATH` and friends, `histchars` and `pipestatus`, and
+    /// the proxy variables Go's `ProxyFromEnvironment` reads.
     const SETTING_NAMES: &[&str] = &[
         "path",
         "fpath",
@@ -3191,6 +3192,10 @@ fn loop_targets_are_literal(command: &str) -> bool {
         "https_proxy",
         "all_proxy",
         "no_proxy",
+        // zsh keeps only the first three characters of `histchars` and
+        // resets `pipestatus`, so neither holds its header value.
+        "histchars",
+        "pipestatus",
     ];
     fn plain(word: &str) -> bool {
         !word.is_empty()
@@ -3269,10 +3274,17 @@ fn loop_targets_are_literal(command: &str) -> bool {
     fn is_checkout_verb(word: &str) -> bool {
         matches!(word, "checkout" | "co" | "develop")
     }
+    /// The verb of `gh pr`/`gh issue`: the first word after an optional
+    /// `-R`/`--repo`, or `None` when another flag or nothing comes first.
+    fn pr_issue_verb<'a>(args: &[&'a str]) -> Option<&'a str> {
+        let rest = match args {
+            ["-R" | "--repo", _, rest @ ..] => rest,
+            [flag, rest @ ..] if flag.starts_with("--repo=") || flag.starts_with("-R") => rest,
+            _ => args,
+        };
+        rest.first().copied().filter(|v| !v.starts_with('-'))
+    }
     let mut loop_vars: Vec<String> = Vec::new();
-    // Whether any header value is a checkout verb a `pr`/`issue` command
-    // could expand.
-    let mut verb_values = false;
     // The raw segments, not `command_segments`: that one expands parameters
     // it can read statically and treats a loop variable as unset, so
     // `${b:-x}` would reach this check as plain `x`.
@@ -3303,22 +3315,20 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 if !ident || !values.iter().all(value_ok) {
                     return false;
                 }
-                verb_values |= values.iter().any(|v| is_checkout_verb(v));
                 loop_vars.push((*name).to_string());
             }
             ["gh", subcommand, args @ ..] => {
                 // `pr checkout` and `issue develop` rewrite the working tree
-                // and `branch.*` config. Any word is checked, quotes removed,
-                // so a flag before the verb (`gh pr -R o/r checkout`) or a
-                // quoted verb (`gh pr "checkout"`) is refused too, and so is
-                // any expansion once a header value is one of the verbs
-                // (`for b in checkout; … gh pr $b 1`). Ordinary words such as
-                // `--search develop` are refused as well; a refusal only keeps
-                // the loop policy.
+                // and `branch.*` config. The verb is the first word after an
+                // optional `-R`/`--repo`; it must be plain literal text, so a
+                // quoted verb (`gh pr "checkout"`) or one built from a loop
+                // variable (`gh pr $b`, `gh pr c$b`) is refused, as is any
+                // other flag before it. No word anywhere may be a checkout
+                // verb either; that also refuses ordinary words such as
+                // `--search develop`, and a refusal only keeps the loop policy.
                 let checks_out = matches!(*subcommand, "pr" | "issue")
-                    && args.iter().any(|a| {
-                        (verb_values && a.contains('$')) || is_checkout_verb(a.trim_matches('"'))
-                    });
+                    && (!pr_issue_verb(args).is_some_and(|v| plain(v) && !is_checkout_verb(v))
+                        || args.iter().any(|a| is_checkout_verb(a.trim_matches('"'))));
                 if checks_out
                     || !LOOP_SUBCOMMANDS.contains(subcommand)
                     || !args.iter().all(|a| {
@@ -5854,6 +5864,9 @@ mod tests {
             "for GH_HOST in evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
             "for HOME in /tmp/evilhome; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
             "for path in /tmp/evil; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            // zsh keeps three characters of `histchars`: `//.x` becomes `//.`.
+            "for histchars in //.x; do gh api -X DELETE repos/cameronsjo/forgectl/${histchars}./${histchars}./evil/repo/x; done",
+            "for pipestatus in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$pipestatus; done",
             // `$_` is the previous command's last argument, not the value.
             "for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x $_; done",
             r#"for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x "${_}"; done"#,
@@ -6084,6 +6097,8 @@ mod tests {
             "for b in checkout; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr $b 1; done",
             "for b in co; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr ${b} 1; done",
             "for b in develop; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue $b 1 --checkout; done",
+            "for b in o; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr c$b 1; done",
+            "for b in o; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr -R cameronsjo/forgectl c${b} 1; done",
             // Segments join with `;` and newlines only.
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b | gh pr list; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
