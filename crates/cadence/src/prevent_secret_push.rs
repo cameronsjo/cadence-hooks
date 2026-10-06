@@ -83,8 +83,9 @@
 //! its value names `push` or `send-pack` or starts with `!`; an alias opens
 //! with an option this cannot follow or holds options only; this same command
 //! writes it with `git config`; the subcommand word carries `$` or a backtick
-//! (except a wrapper function's `git … "$@"` whose every call site in the
-//! command hands it a literal builtin that cannot push, cameronsjo/cadence-hooks#1338);
+//! (except a wrapper function whose body is one plain `git … "$@"` and whose
+//! every call site in the command hands it a literal builtin that cannot
+//! push, cameronsjo/cadence-hooks#1338);
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
 //! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
 //! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
@@ -1058,10 +1059,61 @@ fn word_occurrences(text: &str, name: &str) -> usize {
         .count()
 }
 
+/// Is a function body exactly one plain `git` invocation that hands on its
+/// positional parameters (`git -C "$R" -c k=v --no-pager "$@"`)? Every word
+/// after `git` is a literal of plain characters, a quoted positional
+/// parameter, or the quoted `"$NAME"` value of a `-C`; one trailing `;` and
+/// surrounding whitespace are allowed, nothing else (no second command, no
+/// other quote or expansion), so a body this guard mis-delimited cannot pass
+/// for a wrapper (review C1).
+fn plain_git_wrapper_body(body: &str) -> bool {
+    let text = body.trim();
+    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
+    if text.contains(['\n', '\r']) {
+        return false;
+    }
+    let plain = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,%".contains(c))
+    };
+    let quoted_name = |w: &str| {
+        w.strip_prefix("\"$")
+            .and_then(|w| w.strip_suffix('"'))
+            .is_some_and(|name| {
+                name.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+    };
+    let quoted_positional = |w: &str| {
+        w.strip_prefix('"')
+            .and_then(|w| w.strip_suffix('"'))
+            .is_some_and(|inner| matches!(inner, "$@" | "$*") || is_positional_parameter(inner))
+    };
+    let mut words = text.split_whitespace();
+    if words.next() != Some("git") {
+        return false;
+    }
+    let mut prev = "git";
+    let mut hands_on = false;
+    for word in words {
+        if quoted_positional(word) {
+            hands_on = true;
+        } else if !((plain(word) && word != "git") || (prev == "-C" && quoted_name(word))) {
+            return false;
+        }
+        prev = word;
+    }
+    hands_on
+}
+
 /// Can no git call that names its subcommand through a function's positional
 /// parameters (`gg() { git -C "$R" "$@"; }`) push? True only when every such
-/// call sits in a function body this command defines, no such body shifts or
-/// resets its parameters, and every mention of those functions' names is
+/// call sits in a function body this command defines, each such body is one
+/// plain git invocation ([`plain_git_wrapper_body`]), the command holds no
+/// `${`, `$(` or backtick, and every mention of those functions' names is
 /// either a definition or a call site whose command word is the bare name and
 /// whose first argument is a literal builtin outside
 /// [`WRAPPER_UNSAFE_SUBCOMMANDS`] (cameronsjo/cadence-hooks#1338). A function
@@ -1081,7 +1133,17 @@ fn wrapper_calls_cannot_push(command: &str) -> bool {
     // (`# don't page`), an ANSI-C `$'…'` string or a heredoc body can hold a
     // quote or brace that moves the boundary it finds, and a mis-placed body
     // can swallow a push outside it (review C1). Keep the old verdict.
-    if command.contains('#') || command.contains("$'") || command.contains("<<") {
+    // Nor does it nest quotes inside `${…}`, `$(…)` or backticks
+    // (`x="${y:-"'"}"`), so the same holds for any of those anywhere in the
+    // command: the body it finds is trusted only when nothing could have
+    // moved it.
+    if command.contains('#')
+        || command.contains("$'")
+        || command.contains("<<")
+        || command.contains("${")
+        || command.contains("$(")
+        || command.contains('`')
+    {
         return false;
     }
     let Some(definitions) = function_definitions(command) else {
@@ -1098,7 +1160,7 @@ fn wrapper_calls_cannot_push(command: &str) -> bool {
         if positional(body) == 0 {
             continue;
         }
-        if word_occurrences(body, "shift") > 0 || word_occurrences(body, "set") > 0 {
+        if !plain_git_wrapper_body(body) {
             return false;
         }
         if !wrappers.contains(&name.as_str()) {
@@ -4197,12 +4259,27 @@ mod tests {
             "gg() {\n  git \"$@\"  # don't page\n}\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
             "gg() { git \"$@\"; echo $'\\''; }\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
             "gg() { git \"$@\"; } # wrapper\ngg status",
+            // A body that is more than one plain git invocation.
+            "gg() { git \"$@\"; git push origin main; }; gg status",
+            "gg() { cd /tmp && git \"$@\"; }; gg status",
+            "gg() { git \"$@\" | cat; }; gg status",
+            "gg() { git -c \"$K\" \"$@\"; }; gg status",
             // Not a function's positional parameters at all.
             "bash -c 'git \"$@\"' _ push origin main",
             "set -- push origin main; git \"$@\"",
         ] {
-            assert_blocks(&fx.run(command), &["cannot resolve"]);
+            let r = fx.run(command);
+            assert_eq!(r.outcome, Outcome::Block, "{command}: {:?}", r.message);
+            assert_blocks(&r, &["cannot resolve"]);
         }
+        // A quote nested in `${…}` can mis-delimit the body the same way, so
+        // the wrapper reading refuses any command holding one. (The guard as
+        // a whole allows this command on main as well: the shell reader in
+        // core does not see its `git` calls at all, which is not this
+        // exemption's doing.)
+        assert!(!wrapper_calls_cannot_push(
+            "gg() { x=\"${y:-\"'\"}\"; git \"$@\"; }; bash -c 'git \"$@\"' _ push origin main; echo '}'"
+        ));
     }
 
     /// A push into a directory an earlier command in the same line creates
