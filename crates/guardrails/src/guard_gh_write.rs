@@ -1925,11 +1925,21 @@ const MIXED_LOOP_FIX: &str = "every command names its target, but a loop that mi
 
 /// The structured `fix` for a looped-write block: `-R` for commands that take
 /// it, the endpoint path for `gh api`, both when the loop holds both.
-fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> String {
+///
+/// `literal_api` says the loop also holds literal-path `gh api` writes that
+/// the `-R` advice must not reach, since `gh api` has no `-R`.
+fn looped_write_fix(
+    writes: &[String],
+    api_writes: &[String],
+    target: &str,
+    literal_api: bool,
+) -> String {
     if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
         PLAIN_LOOP_FIX.to_string()
     } else if only_api_writes(writes, api_writes) {
         format!("gh api repos/{target}/…")
+    } else if api_writes.is_empty() && literal_api {
+        format!("-R {target} on every command but the literal-path gh api writes")
     } else if api_writes.is_empty() {
         format!("-R {target}")
     } else {
@@ -1943,10 +1953,12 @@ fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> S
 /// `writes` are the commands that take `-R`; `api_writes` are `gh api` calls,
 /// which have no `-R` flag (gh rejects it), so their fix is to spell the repo
 /// literally in the endpoint path (cameronsjo/cadence-hooks#1344).
+/// `literal_api` is as for [`looped_write_fix`].
 fn looped_write_block_message(
     writes: &[String],
     api_writes: &[String],
     suggestion: Option<&str>,
+    literal_api: bool,
 ) -> String {
     let fix_target = suggestion.unwrap_or("owner/repo");
     let mut found: Vec<&str> = writes
@@ -1959,7 +1971,14 @@ fn looped_write_block_message(
     }
     let mut fixes = Vec::new();
     if !writes.is_empty() || api_writes.is_empty() {
-        fixes.push(format!("add `-R {fix_target}` to each command"));
+        fixes.push(if literal_api {
+            format!(
+                "add `-R {fix_target}` to each gh command except the literal-path `gh api` \
+                 writes, which have no -R flag"
+            )
+        } else {
+            format!("add `-R {fix_target}` to each command")
+        });
     }
     // A literal path counts as the target only in a plain loop
     // ([`loop_targets_are_literal`]), so a write that already has one was
@@ -3933,9 +3952,17 @@ impl Check for GhWriteGuard {
                         }
                         let (writes, api_writes) = (quote(writes), quote(api_writes));
                         let target = suggestion.as_deref().unwrap_or("<owner>/<repo>");
-                        let fix = looped_write_fix(&writes, &api_writes, target);
+                        let literal_api = cmds
+                            .iter()
+                            .any(|c| kind(c) == LoopedWriteKind::ApiPathWrite);
+                        let fix = looped_write_fix(&writes, &api_writes, target, literal_api);
                         return CheckResult::block_structured(
-                            looped_write_block_message(&writes, &api_writes, suggestion.as_deref()),
+                            looped_write_block_message(
+                                &writes,
+                                &api_writes,
+                                suggestion.as_deref(),
+                                literal_api,
+                            ),
                             BlockMetadata {
                                 rule_id: "gh-write-loop-missing-repo".to_string(),
                                 fix,
@@ -5417,7 +5444,7 @@ mod tests {
     #[test]
     fn looped_write_block_message_includes_suggestion() {
         let writes = vec!["`gh issue close $i`".to_string()];
-        let msg = looped_write_block_message(&writes, &[], Some("cameronsjo/cadence-hooks"));
+        let msg = looped_write_block_message(&writes, &[], Some("cameronsjo/cadence-hooks"), false);
         assert!(msg.contains("-R cameronsjo/cadence-hooks"));
         assert!(msg.contains("`gh issue close $i`"));
     }
@@ -5425,7 +5452,7 @@ mod tests {
     #[test]
     fn looped_write_block_message_generic_without_suggestion() {
         let writes = vec!["`gh pr create`".to_string()];
-        let msg = looped_write_block_message(&writes, &[], None);
+        let msg = looped_write_block_message(&writes, &[], None, false);
         assert!(msg.contains("-R owner/repo"));
     }
 
@@ -5433,7 +5460,7 @@ mod tests {
     fn looped_api_write_message_never_advises_dash_r() {
         // #1344: gh api has no -R, so its advice is the literal path.
         let api = vec!["`gh api -X DELETE repos/$o/x/git/refs/heads/a`".to_string()];
-        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"));
+        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"), false);
         assert!(!msg.contains("add `-R"), "{msg}");
         assert!(msg.contains("gh api repos/cameronsjo/forgectl/…"), "{msg}");
         assert!(
@@ -5446,7 +5473,7 @@ mod tests {
     fn looped_mixed_write_message_gives_each_its_own_fix() {
         let writes = vec!["`gh pr comment $i`".to_string()];
         let api = vec!["`gh api -X DELETE repos/$o/x`".to_string()];
-        let msg = looped_write_block_message(&writes, &api, None);
+        let msg = looped_write_block_message(&writes, &api, None, false);
         assert!(msg.contains("add `-R owner/repo`"), "{msg}");
         assert!(msg.contains("`gh api` has no -R flag"), "{msg}");
     }
@@ -5862,10 +5889,13 @@ mod tests {
     fn looped_write_fix_spells_each_kind() {
         let w = vec!["`gh pr comment 1`".to_string()];
         let a = vec!["`gh api -X DELETE repos/$o/y`".to_string()];
-        assert_eq!(looped_write_fix(&w, &[], "o/r"), "-R o/r");
-        assert_eq!(looped_write_fix(&[], &a, "o/r"), "gh api repos/o/r/…");
+        assert_eq!(looped_write_fix(&w, &[], "o/r", false), "-R o/r");
         assert_eq!(
-            looped_write_fix(&w, &a, "o/r"),
+            looped_write_fix(&[], &a, "o/r", false),
+            "gh api repos/o/r/…"
+        );
+        assert_eq!(
+            looped_write_fix(&w, &a, "o/r", false),
             "-R o/r; for gh api, gh api repos/o/r/…"
         );
     }
@@ -6035,6 +6065,14 @@ mod tests {
         );
         assert!(blocks(&result));
         assert!(!msg(&result).contains("mixes -R"), "{}", msg(&result));
+        // The -R advice must not reach the gh api write, which has no -R.
+        assert!(
+            msg(&result).contains("except the literal-path"),
+            "{}",
+            msg(&result)
+        );
+        let meta = result.block_metadata.expect("structured block");
+        assert!(meta.fix.contains("but the literal-path"), "{}", meta.fix);
     }
 
     #[test]
@@ -6345,7 +6383,10 @@ mod tests {
         assert!(blocks(&result));
         assert!(msg(&result).contains("gh pr comment"), "{}", msg(&result));
         let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.fix, "-R <owner>/<repo>");
+        assert_eq!(
+            meta.fix,
+            "-R <owner>/<repo> on every command but the literal-path gh api writes"
+        );
     }
 
     #[test]
