@@ -1021,40 +1021,58 @@ impl Check for WarnUnreviewedReadyFlip {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(command) = input.command() else {
-            return CheckResult::allow();
-        };
-        // #1335: a `gh pr review` whose body carries the marker's values off
-        // line 1. Advisory, like the flip check; a body this hook cannot read
-        // stays silent.
-        if let Some(msg) = review_body(command, input.cwd.as_deref().unwrap_or("."))
-            .as_deref()
-            .and_then(misplaced_marker_nudge)
-        {
-            return CheckResult::nudge(msg);
-        }
-        let Some(tokens) = flip_segment_tokens(command) else {
-            return CheckResult::allow();
-        };
-        // Conflicting or unparseable repo values: fail-open allow (ADR-0001).
-        let Some(target) = FlipTarget::from_tokens(&tokens) else {
-            return CheckResult::allow();
-        };
-
-        let ctx = FlipContext::for_target(&target, input);
         // Bounded per call (cadence-hooks#986): a gh answer slower than the
         // bounded runner's cap reads as no answer, and the nudge stays silent
         // rather than the external hooks.json timeout killing the hook.
-        let gh = crate::bounded_tool::BoundedGhRunner {
-            cwd: PathBuf::from(&ctx.cwd),
-            env: ctx.env,
-        };
-
-        match evaluate(&target, ctx.origin_host.as_deref(), &gh) {
+        let nudge = combined_nudge(input, |ctx: &FlipContext| {
+            crate::bounded_tool::BoundedGhRunner {
+                cwd: PathBuf::from(&ctx.cwd),
+                env: ctx.env.clone(),
+            }
+        });
+        match nudge {
             Some(msg) => CheckResult::nudge(msg),
             None => CheckResult::allow(),
         }
     }
+}
+
+/// Every nudge this hook has for `input`, joined: the flip nudge first, then
+/// the #1335 misplaced-marker nudge. A command that both posts a review and
+/// flips the PR (`gh pr review … && gh pr ready`) gets both; the marker nudge
+/// never hides the flip nudge. `gh_for` builds the runner for the flip check
+/// from its context, so tests can inject a fake.
+fn combined_nudge<G: GhRunner>(
+    input: &HookInput,
+    gh_for: impl FnOnce(&FlipContext) -> G,
+) -> Option<String> {
+    let command = input.command()?;
+    let flip = flip_nudge(command, input, gh_for);
+    // #1335: a `gh pr review` whose body carries the marker's values off
+    // line 1. Advisory, like the flip check; a body this hook cannot read
+    // stays silent.
+    let marker = review_body(command, input.cwd.as_deref().unwrap_or("."))
+        .as_deref()
+        .and_then(misplaced_marker_nudge);
+    match (flip, marker) {
+        (Some(f), Some(m)) => Some(format!("{f}\n\n{m}")),
+        (f, m) => f.or(m),
+    }
+}
+
+/// The flip nudge for `command`, or `None` when it flips nothing or the
+/// answer is indeterminate (fail-open, ADR-0001).
+fn flip_nudge<G: GhRunner>(
+    command: &str,
+    input: &HookInput,
+    gh_for: impl FnOnce(&FlipContext) -> G,
+) -> Option<String> {
+    let tokens = flip_segment_tokens(command)?;
+    // Conflicting or unparseable repo values: fail-open allow (ADR-0001).
+    let target = FlipTarget::from_tokens(&tokens)?;
+    let ctx = FlipContext::for_target(&target, input);
+    let gh = gh_for(&ctx);
+    evaluate(&target, ctx.origin_host.as_deref(), &gh)
 }
 
 #[cfg(test)]
@@ -1140,6 +1158,42 @@ mod tests {
             let result = WarnUnreviewedReadyFlip.run(&review_input(&command, &cwd));
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
         }
+    }
+
+    impl<T: GhRunner + ?Sized> GhRunner for &T {
+        fn run(&self, args: &[&str]) -> Option<String> {
+            (**self).run(args)
+        }
+    }
+
+    #[test]
+    fn a_review_and_a_flip_in_one_command_get_both_nudges_flip_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let gh = FakeGh::new(
+            "fed9999fedfed9999fedfed9999fedfed9999fed",
+            "cameronsjo",
+            serde_json::json!([]),
+        );
+        let flip_only = eval("gh pr ready 5 -R cameronsjo/x", &gh).expect("flip nudges");
+        let command = format!(
+            "gh pr review 5 -R cameronsjo/x --comment --body 'summary head={SHA_1335} crit=0 imp=0' && gh pr ready 5 -R cameronsjo/x"
+        );
+        let msg = combined_nudge(&review_input(&command, &cwd), |_| &gh).expect("nudges");
+        let marker_at = msg
+            .find("warn-unreviewed-ready-flip: this review body")
+            .expect("marker nudge present");
+        assert!(msg.starts_with(&flip_only), "flip nudge first: {msg}");
+        assert!(marker_at >= flip_only.len(), "{msg}");
+        // Each alone still comes through.
+        let review_only = format!("gh pr review 5 --comment --body 'head={SHA_1335} crit=0 imp=0'");
+        let msg = combined_nudge(&review_input(&review_only, &cwd), |_| &gh).unwrap();
+        assert!(msg.starts_with("warn-unreviewed-ready-flip: this review body"));
+        let msg = combined_nudge(&review_input("gh pr ready 5 -R cameronsjo/x", &cwd), |_| {
+            &gh
+        })
+        .unwrap();
+        assert_eq!(msg, flip_only);
     }
 
     #[test]
