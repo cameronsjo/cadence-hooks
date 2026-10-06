@@ -818,11 +818,51 @@ fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_di
         })
 }
 
+/// Git subcommands that neither check out another branch nor change where
+/// one tracks. Everything else a chain runs through `git` (`checkout`,
+/// `switch`, `rebase <upstream> <branch>`, `branch`, `worktree`, an alias, a
+/// subcommand built by an expansion) counts as a possible switch.
+const NON_SWITCHING_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "blame",
+    "cat-file",
+    "cherry-pick",
+    "commit",
+    "config",
+    "describe",
+    "diff",
+    "fetch",
+    "for-each-ref",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "merge",
+    "mv",
+    "notes",
+    "pull",
+    "push",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "show-ref",
+    "stash",
+    "status",
+    "tag",
+];
+
 /// Can a segment of the command move which branch is checked out, or where
 /// the current branch tracks, before a later bare push resolves its remote?
-/// `git checkout`/`git switch` (any form), `git branch` with a tracking
-/// option (`-u`, `--set-upstream-to`, `-t`/`--track`, `--unset-upstream`),
-/// and `gh pr checkout`. Errs toward true: a match only keeps the old chain
+/// Any `git` call is taken to, unless its subcommand is a literal in
+/// [`NON_SWITCHING_SUBCOMMANDS`] (and not `stash branch`, nor a `config` that
+/// names a `branch.*`/`remote.*`/push key or opens the editor); so are
+/// `gh pr checkout`, a dashed `git-*` or `hub` command, and a command word
+/// built by an expansion. Errs toward true: a match only keeps the old chain
 /// block (#1340 security review I1).
 fn moves_branch_or_tracking(command: &str) -> bool {
     use cadence_hooks_core::shell::{
@@ -835,22 +875,31 @@ fn moves_branch_or_tracking(command: &str) -> bool {
         let Some(first) = argv.first() else {
             return false;
         };
-        match command_word(first).as_ref() {
+        if first.contains(['$', '`']) {
+            return true;
+        }
+        let name = command_word(first);
+        match name.as_ref() {
             "git" => {
                 let rest = skip_git_global_options(&argv[1..]);
                 let words: Vec<String> =
                     rest.iter().map(|w| unescape_word(w).into_owned()).collect();
-                match words.first().map(String::as_str) {
-                    Some("checkout" | "switch") => true,
-                    Some("branch") => words[1..].iter().any(|w| {
-                        w == "-u"
-                            || w == "-t"
-                            || w.starts_with("--set-upstream")
-                            || w.starts_with("--track")
-                            || w == "--unset-upstream"
-                            || (w.starts_with('-')
-                                && !w.starts_with("--")
-                                && w.contains(['u', 't']))
+                let Some(sub) = words.first() else {
+                    return false;
+                };
+                if sub.contains(['$', '`']) || !NON_SWITCHING_SUBCOMMANDS.contains(&sub.as_str()) {
+                    return true;
+                }
+                match sub.as_str() {
+                    "stash" => words.get(1).is_some_and(|w| w == "branch"),
+                    "config" => words[1..].iter().any(|w| {
+                        let w = w.to_ascii_lowercase();
+                        w.starts_with("branch.")
+                            || w.starts_with("remote.")
+                            || w.contains("push")
+                            || w == "-e"
+                            || w == "--edit"
+                            || w.contains(['$', '`'])
                     }),
                     _ => false,
                 }
@@ -863,7 +912,8 @@ fn moves_branch_or_tracking(command: &str) -> bool {
                 words.iter().any(|w| w == "checkout")
                     && words.iter().any(|w| w == "pr" || w == "co")
             }
-            _ => false,
+            "hub" => true,
+            other => other.starts_with("git-"),
         }
     })
 }
@@ -2265,6 +2315,8 @@ mod tests {
         git_in(f, &["update-ref", "refs/remotes/origin/feat", "HEAD"]);
         git_in(f, &["config", "branch.feat.remote", "origin"]);
         git_in(f, &["config", "branch.feat.merge", "refs/heads/feat"]);
+        git_in(f, &["config", "alias.co", "checkout"]);
+        git_in(f, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let cwd = f.to_string_lossy().to_string();
         with_env(&owners_only(), || {
             for (command, blocks) in [
@@ -2299,11 +2351,39 @@ mod tests {
                     "git push origin feat && gh pr checkout 12 && git push",
                     true,
                 ),
+                // Any git subcommand not known to leave the branch alone
+                // counts as a switch: an alias, a rebase onto another branch,
+                // a stash turned into a branch.
+                ("git push origin feat && git co main && git push", true),
+                (
+                    "git push origin feat && git rebase feat other && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git stash branch other2 && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git worktree add ../wt2 main && cd ../wt2 && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git rebase origin/main main && git push",
+                    true,
+                ),
+                (
+                    "git push origin feat && git config branch.feat.remote upstream && git push",
+                    true,
+                ),
                 // No switch in between: judged per push, as #1329 rules.
                 ("git push origin feat && git push --tags", false),
                 ("git push origin feat && git push", false),
                 (
                     "git add -A && git commit -m x && git push origin feat && git push --tags",
+                    false,
+                ),
+                (
+                    "cargo test && git fetch && git status && git push origin feat && git push --tags",
                     false,
                 ),
             ] {
