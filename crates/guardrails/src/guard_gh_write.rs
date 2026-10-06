@@ -2437,14 +2437,19 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
     // The endpoint is the first positional after `api`, skipping flag values.
     while i < tokens.len() {
         let tok = &tokens[i];
-        // A flag spelled through an expansion (`--$b`, `-X$m`) is a flag only
-        // the shell can name: `--jq` would take the next word as its value,
-        // `--hostname=…` would move the host. No endpoint can be read past
-        // it (cameronsjo/cadence-hooks#1344 review).
-        if tok.starts_with('-') && (tok.contains('$') || tok.contains('`')) {
-            return Some(String::new());
-        }
         if tok.starts_with("--") {
+            // A long flag NAME spelled through an expansion (`--$b`) is a
+            // flag only the shell can name: `--jq` would take the next word
+            // as its value, `--hostname=…` would move the host. No endpoint
+            // can be read past it (cameronsjo/cadence-hooks#1344 review). An
+            // attached VALUE (`--field=body=$x`) cannot change the argv
+            // shape, so only the name is checked. A short cluster needs no
+            // check here: the walk below refuses `$` as an unknown letter
+            // before any value letter, and stops reading at one.
+            let name = tok.split('=').next().unwrap_or(tok);
+            if name.contains('$') || name.contains('`') {
+                return Some(String::new());
+            }
             if api_flag_takes_separate_value(tok) && !tok.contains('=') {
                 i += 2;
             } else {
@@ -3162,8 +3167,15 @@ fn loop_targets_are_literal(command: &str) -> bool {
             ["for", name, "in", values @ ..] => {
                 // Lowercase only: a loop over `IFS`, `GH_HOST`, `HOME`, or any
                 // other setting the shell or gh reads changes how gh runs, and
-                // those are all uppercase.
-                let ident = !name.is_empty()
+                // those are all uppercase — except zsh's lowercase arrays tied
+                // to them (`path` is `PATH`, so a loop over it picks the gh
+                // that runs).
+                let zsh_tied = matches!(
+                    *name,
+                    "path" | "fpath" | "cdpath" | "manpath" | "module_path" | "mailpath"
+                );
+                let ident = !zsh_tied
+                    && !name.is_empty()
                     && !name.starts_with(|c: char| c.is_ascii_digit())
                     && name
                         .bytes()
@@ -5706,6 +5718,7 @@ mod tests {
             "for IFS in ,; do for b in x,--hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done; done",
             "for GH_HOST in evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
             "for HOME in /tmp/evilhome; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            "for path in /tmp/evil; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
         ] {
             for strict in [false, true] {
                 let result = run_1344(command, "cameronsjo", strict);
@@ -5765,11 +5778,20 @@ mod tests {
             // Nor past a flag spelled through an expansion.
             ("gh api -X DELETE --$b repos/o/decoy repos/evil/x/y", ""),
             ("gh api -X DELETE -i$b repos/o/decoy repos/evil/x/y", ""),
+            ("gh api -X DELETE --$b=evil.example repos/evil/x/y", ""),
+            ("gh api -X DELETE -$b repos/o/decoy repos/evil/x/y", ""),
             // A value that merely carries one is still a value.
             (
                 "gh api -X DELETE -f \"body=$x\" repos/evil/x/y",
                 "repos/evil/x/y",
             ),
+            (
+                "gh api -X PATCH --field=body=$x repos/evil/x/y",
+                "repos/evil/x/y",
+            ),
+            ("gh api -X PATCH -fbody=$x repos/evil/x/y", "repos/evil/x/y"),
+            ("gh api -X PATCH --jq=$q repos/evil/x/y", "repos/evil/x/y"),
+            ("gh api -X$m repos/evil/x/y", "repos/evil/x/y"),
         ];
         for (cmd, want) in cases {
             assert_eq!(gh_api_endpoint(cmd).as_deref(), Some(want), "{cmd}");
