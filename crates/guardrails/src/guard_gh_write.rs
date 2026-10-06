@@ -1914,10 +1914,19 @@ const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only 
      newlines only, with no redirect, `||`/`&&`, pipe, `&`, comment, or other command; make the loop plain or run each call \
      outside it";
 
+/// The fix for a loop whose every write names its target, but mixes `-R`
+/// writes with literal-path `gh api` writes: the loop gate counts only `-R`
+/// as a target in that case, so the loop keeps the cwd-based policy.
+const MIXED_LOOP_FIX: &str = "every write names its target, but a loop that mixes `-R` writes \
+     with literal-path `gh api` writes is still judged by the working directory; run the \
+     `gh api` writes and the `-R` writes in separate loops";
+
 /// The structured `fix` for a looped-write block: `-R` for commands that take
 /// it, the endpoint path for `gh api`, both when the loop holds both.
 fn looped_write_fix(writes: &[String], api_writes: &[String], target: &str) -> String {
-    if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
+    if writes.is_empty() && api_writes.is_empty() {
+        MIXED_LOOP_FIX.to_string()
+    } else if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
         PLAIN_LOOP_FIX.to_string()
     } else if only_api_writes(writes, api_writes) {
         format!("gh api repos/{target}/…")
@@ -1940,16 +1949,20 @@ fn looped_write_block_message(
     suggestion: Option<&str>,
 ) -> String {
     let fix_target = suggestion.unwrap_or("owner/repo");
-    let mut found: Vec<&str> = writes
+    let found: Vec<&str> = writes
         .iter()
         .chain(api_writes)
         .map(String::as_str)
         .collect();
-    if found.is_empty() {
-        found.push("gh write command(s) without a target");
-    }
     let mut fixes = Vec::new();
-    if !writes.is_empty() || api_writes.is_empty() {
+    if found.is_empty() {
+        // Every write has `-R` or a literal path; only the mix is refused.
+        return format!(
+            "🚫 git-guardrails: gh loop mixes -R writes with gh api writes\n   \
+             Fix: {MIXED_LOOP_FIX}"
+        );
+    }
+    if !writes.is_empty() {
         fixes.push(format!("add `-R {fix_target}` to each command"));
     }
     // A literal path counts as the target only in a plain loop
@@ -5945,6 +5958,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_loop_mixing_dash_r_and_literal_api_writes_names_the_mix() {
+        // Code review of 7ecdbfd: every write names its target, so the block
+        // must not ask for `-R` or list nothing as missing.
+        let result = run_1344(
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
+            "cameronsjo",
+            true,
+        );
+        assert!(blocks(&result));
+        assert!(msg(&result).contains("mixes -R writes"), "{}", msg(&result));
+        assert!(!msg(&result).contains("add `-R"), "{}", msg(&result));
+        assert!(
+            !msg(&result).contains("without a target"),
+            "{}",
+            msg(&result)
+        );
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.fix, MIXED_LOOP_FIX);
     }
 
     #[test]
