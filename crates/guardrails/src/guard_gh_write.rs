@@ -3140,20 +3140,21 @@ enum LoopedWriteKind {
 /// change a later iteration's target is refused, as an allowlist rather than a
 /// list of dangers. Every segment must be one of:
 ///
-/// - a `for NAME in <values>` header: `NAME` is lowercase and not a name the
+/// - a `for NAME in <values>` header: `NAME` is lowercase, starts with a
+///   letter (`$_` is reset after every command), and is not a name the
 ///   shell or gh reads; each value is plain text that does not start with
 ///   `-` or `=` and does not start or end with `.`;
 /// - a bare `do`/`done`;
 /// - a `gh` command whose subcommand is in a fixed list that cannot change
-///   gh's host, login, or config (so not `auth`, `config`, `alias`, or an
-///   extension), and whose arguments are plain words, optionally wrapped in
+///   gh's host, login, or config and writes no file to a path it is given
+///   (so not `auth`, `config`, `alias`, `release`, `run`, `repo`, `gist`, or
+///   an extension), that is not `pr checkout` or `issue develop`, and whose arguments are plain words, optionally wrapped in
 ///   one pair of double quotes, that may expand the loop's own variables in
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
 ///
 /// The command must also be printable ASCII, space, tab, and newline only,
-/// with no `#`, `|`, or `&` (segments are joined by `;` and newlines only), and the subcommand list leaves out anything that writes a
-/// file to a path it is given.
+/// with no `#`, `|`, or `&`, so segments are joined by `;` and newlines only.
 ///
 /// Those two forms are the only ones neither bash nor zsh rewrites: the value
 /// is a plain header word, so the expansion is that word, cannot split into a
@@ -3166,10 +3167,11 @@ enum LoopedWriteKind {
 /// function, `source`, `eval`, a `while` condition, a glob, `%`).
 fn loop_targets_are_literal(command: &str) -> bool {
     /// gh subcommands a plain loop may run. None of them changes which host
-    /// or account a later iteration's `gh api` reaches, and none writes
-    /// files to a path it is given or (with `pr checkout` and `issue develop`
-    /// refused below) changes the working tree (`release download -D`, `run download`,
-    /// `repo clone` and `gist clone` could write into gh's config dir).
+    /// or account a later iteration's `gh api` reaches, and none writes files
+    /// to a path it is given (`release download -D`, `run download`, `repo
+    /// clone` and `gist clone` could write into gh's config dir). Some change
+    /// local git state (`pr merge --delete-branch`), which a literal `gh api`
+    /// path does not read.
     const LOOP_SUBCOMMANDS: &[&str] = &[
         "api", "pr", "issue", "workflow", "label", "search", "browse", "status", "cache",
         "variable", "secret", "ruleset", "project",
@@ -3277,10 +3279,12 @@ fn loop_targets_are_literal(command: &str) -> bool {
             ["for", name, "in", values @ ..] => {
                 // Lowercase only: a loop over `IFS`, `GH_HOST`, `HOME`, or any
                 // other setting the shell or gh reads changes how gh runs, and
-                // those are uppercase except the few in `SETTING_NAMES`.
+                // those are uppercase except the few in `SETTING_NAMES`. The
+                // name starts with a letter: bash and zsh reset `$_` to the
+                // previous command's last argument after every command, so it
+                // is not the header value.
                 let ident = !SETTING_NAMES.contains(name)
-                    && !name.is_empty()
-                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.starts_with(|c: char| c.is_ascii_lowercase())
                     && name.bytes().all(name_byte);
                 // A value that starts with `-` would arrive in gh's argv as a
                 // flag. One that starts or ends with `.` could meet a `.` or
@@ -3294,11 +3298,14 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 loop_vars.push((*name).to_string());
             }
             ["gh", subcommand, args @ ..] => {
-                // These two rewrite the working tree and `branch.*` config.
-                let checks_out = matches!(
-                    (*subcommand, args.first().copied()),
-                    ("pr", Some("checkout" | "co")) | ("issue", Some("develop"))
-                );
+                // `pr checkout` and `issue develop` rewrite the working tree
+                // and `branch.*` config. Any word is checked, quotes removed,
+                // so a flag before the verb (`gh pr -R o/r checkout`) or a
+                // quoted verb (`gh pr "checkout"`) is refused too.
+                let checks_out = matches!(*subcommand, "pr" | "issue")
+                    && args
+                        .iter()
+                        .any(|a| matches!(a.trim_matches('"'), "checkout" | "co" | "develop"));
                 if checks_out
                     || !LOOP_SUBCOMMANDS.contains(subcommand)
                     || !args.iter().all(|a| {
@@ -5834,6 +5841,9 @@ mod tests {
             "for GH_HOST in evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
             "for HOME in /tmp/evilhome; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
             "for path in /tmp/evil; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            // `$_` is the previous command's last argument, not the value.
+            "for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x $_; done",
+            r#"for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x "${_}"; done"#,
         ] {
             for strict in [false, true] {
                 let result = run_1344(command, "cameronsjo", strict);
@@ -5885,8 +5895,16 @@ mod tests {
             for strict in [false, true] {
                 let result = run_1344(command, "cameronsjo", strict);
                 assert!(blocks(&result), "strict={strict}: {command} was allowed");
+                let rule = result
+                    .block_metadata
+                    .as_ref()
+                    .map(|m| m.rule_id.as_str())
+                    .unwrap_or("");
+                // Either loop-gate verdict: a missing target, or a loop body
+                // the loop analysis cannot read at all.
                 assert!(
-                    msg(&result).contains("in loop"),
+                    rule == "gh-write-loop-missing-repo"
+                        || msg(&result).contains("gh command in loop — cannot verify targets"),
                     "strict={strict}: {command} was not blocked by the loop gate: {}",
                     msg(&result)
                 );
@@ -6047,6 +6065,9 @@ mod tests {
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr checkout 1; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr co 1; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue develop 1 --checkout; done",
+            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr "checkout" 1; done"#,
+            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue "develop" 1 --checkout; done"#,
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr -R cameronsjo/forgectl checkout 1; done",
             // Segments join with `;` and newlines only.
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b | gh pr list; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
