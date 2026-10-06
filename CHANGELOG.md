@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`warn-unreviewed-ready-flip` nudges at `gh pr review` when the marker's values sit off line 1 (#1335).** A review body carrying `head=<40-char SHA>`, `crit=` and `imp=` whose first line is not a well-formed `<!-- cadence-review: … -->` marker used to look reviewed to a person and surface only at `gh pr ready`. The nudge now fires on the review itself and gives the literal line to paste, prefilled with the body's own head SHA and counts (`<reviewer>` left to fill). It reads an inline `--body`, an on-disk `--body-file`, or a readable same-command heredoc; it never calls `gh`, never blocks, and is silent when line 1 parses or a trigger token is missing. The existing `Bash(*gh pr *)` wiring already reaches `gh pr review`.
+
 ### Changed
 
 - **`guard-body-budget` measures a body file the same command writes by heredoc (#1334).** `cadence:redaction`'s gated form writes the body, scans it and posts it in one command, so the file on disk was stale and the guard only nudged "cannot measure". When the only write of the body file is a bare `cat > FILE <<'EOF'` before the post, with a found terminator and text that cannot expand, that heredoc text is now measured, and an over-budget one gets the verdict the same text in a separate file gets. Every other same-command write keeps the nudge, which now names the redaction gated form as the known-unmeasurable case and says the write can move to its own command, since the gate sits between the scan and the post.

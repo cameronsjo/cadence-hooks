@@ -15,6 +15,12 @@
 //! deterministic backstop at the Ready-flip capture point, sibling to
 //! `warn-plan-ready-flip`'s reconcile check.
 //!
+//! The same hook also reads `gh pr review` (cadence-hooks#1335): a body that
+//! carries a marker's values (`head=<40 hex>`, `crit=`, `imp=`) without a
+//! well-formed marker on line 1 gets a nudge with the line to paste, prefilled
+//! from the body. It reads only an inline `--body` or an on-disk
+//! `--body-file`, never calls `gh`, and is silent on anything else.
+//!
 //! Advisory only — nudges, never blocks — and fails open (ADR-0001) on any
 //! `gh` fetch error, JSON parse error, or unresolvable PR: an indeterminate
 //! answer must never read as a block.
@@ -36,9 +42,14 @@
 //! otherwise contact a host the user has not approved, and send it
 //! `GH_ENTERPRISE_TOKEN` when that is set.
 
+use crate::guard_body_budget::{
+    BodyArg, body_written_earlier, last_body_flag, same_command_heredoc_body,
+};
+use cadence_hooks_core::gh_bodies::read_body_file;
 use cadence_hooks_core::shell::{
-    PrSelector, git_command, host_and_repo_from_url, pr_flip_segments, pr_selector, pr_url_parts,
-    ship_target,
+    PrSelector, command_segments, command_word, executable_tokens, git_command,
+    host_and_repo_from_url, pr_flip_segments, pr_selector, pr_url_parts, ship_target,
+    skip_transparent_prefixes, strip_group_wrappers, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -920,6 +931,86 @@ impl FlipContext {
     }
 }
 
+/// A `head=<40 hex>` anywhere in a review body: the value a marker carries.
+static BODY_HEAD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^0-9A-Za-z_])head=([0-9a-fA-F]{40})(?:[^0-9a-fA-F]|$)")
+        .expect("pattern should compile")
+});
+
+/// A `crit=<n>` / `imp=<n>` count anywhere in a review body, ASCII digits only.
+static BODY_CRIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"crit=([0-9]{1,6})").expect("pattern should compile"));
+static BODY_IMP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"imp=([0-9]{1,6})").expect("pattern should compile"));
+
+/// The body a `gh pr review` segment posts, when this hook can read it
+/// without guessing: an inline `--body`, or a `--body-file` that is on disk
+/// and not rewritten by the same command (a same-command heredoc whose text
+/// is readable exactly is read instead, as `guard-body-budget` reads it).
+/// `None` for anything else, which keeps the hook silent.
+fn review_body(command: &str, base_dir: &str) -> Option<String> {
+    let segments = command_segments(command);
+    for segment in &segments {
+        let stripped = strip_group_wrappers(segment);
+        let tokens = executable_tokens(stripped);
+        let rest = skip_transparent_prefixes(&tokens);
+        let is_review = rest
+            .first()
+            .is_some_and(|first| command_word(first).as_ref() == "gh")
+            && rest.get(1).is_some_and(|n| unescape_word(n) == "pr")
+            && rest.get(2).is_some_and(|v| unescape_word(v) == "review");
+        if !is_review {
+            continue;
+        }
+        return match last_body_flag(stripped)? {
+            BodyArg::Inline(text) => Some(text),
+            BodyArg::File(path) if body_written_earlier(&segments, stripped, &path) => {
+                same_command_heredoc_body(&segments, stripped, &path, command)
+            }
+            BodyArg::File(path) => read_body_file(&path, base_dir).ok(),
+        };
+    }
+    None
+}
+
+/// A nudge for a `gh pr review` body that carries a marker's values
+/// (`head=<40 hex>`, `crit=`, `imp=`) but not a well-formed marker on its
+/// first line, so the review reads as reviewed to a person and not to this
+/// hook at `gh pr ready` (cadence-hooks#1335). The nudge carries the line to
+/// paste, prefilled from the body's own `head=` and counts; nothing else
+/// from the body is echoed (the SHA is hex, the counts ASCII digits).
+/// `None` when the first line already parses or a trigger token is absent.
+fn misplaced_marker_nudge(body: &str) -> Option<String> {
+    let first_line = body.split('\n').next().unwrap_or_default();
+    if MARKER_RE.is_match(first_line) {
+        return None;
+    }
+    let head = BODY_HEAD_RE.captures(body)?.get(1)?.as_str().to_string();
+    if !body.contains("crit=") || !body.contains("imp=") {
+        return None;
+    }
+    let count = |re: &Regex| {
+        re.captures(body)
+            .and_then(|c| c.get(1))
+            .map_or_else(|| "<n>".to_string(), |m| m.as_str().to_string())
+    };
+    let (crit, imp) = (count(&BODY_CRIT_RE), count(&BODY_IMP_RE));
+    let problems = if first_line.contains("cadence-review") {
+        format!(
+            " Its first line: {}.",
+            marker_problems(first_line).join("; ")
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "warn-unreviewed-ready-flip: this review body carries `head=`, `crit=` and `imp=`, but \
+         its first line is not a well-formed `cadence-review` marker, so `gh pr ready` will not \
+         count this review.{problems} Make this the body's first line (fill in the reviewer):\n\
+         <!-- cadence-review: <reviewer> head={head} crit={crit} imp={imp} -->"
+    ))
+}
+
 /// Nudges on `gh pr ready` / `gh pr merge` when the PR's head SHA has no
 /// reviewed signal.
 pub struct WarnUnreviewedReadyFlip;
@@ -933,6 +1024,15 @@ impl Check for WarnUnreviewedReadyFlip {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
+        // #1335: a `gh pr review` whose body carries the marker's values off
+        // line 1. Advisory, like the flip check; a body this hook cannot read
+        // stays silent.
+        if let Some(msg) = review_body(command, input.cwd.as_deref().unwrap_or("."))
+            .as_deref()
+            .and_then(misplaced_marker_nudge)
+        {
+            return CheckResult::nudge(msg);
+        }
         let Some(tokens) = flip_segment_tokens(command) else {
             return CheckResult::allow();
         };
@@ -962,6 +1062,107 @@ mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_bash;
+
+    // --- #1335: a misplaced marker on `gh pr review` ---
+
+    const SHA_1335: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn review_input(command: &str, cwd: &str) -> HookInput {
+        let mut input = make_bash(command);
+        input.cwd = Some(cwd.to_string());
+        input
+    }
+
+    #[test]
+    fn a_review_body_with_marker_values_off_line_one_nudges_with_the_line_to_paste() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::write(
+            dir.path().join("review.md"),
+            format!(
+                "## Review\n\n| verdict |\n|---|\n| head={SHA_1335} crit=0 imp=2 |\n\ncadence-review head={SHA_1335} crit=0 imp=2\n"
+            ),
+        )
+        .unwrap();
+        for command in [
+            "gh pr review 12 --comment --body-file review.md",
+            "gh pr review --comment -F review.md",
+        ] {
+            let result = WarnUnreviewedReadyFlip.run(&review_input(command, &cwd));
+            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+            let msg = result.message.unwrap();
+            assert!(
+                msg.contains(&format!(
+                    "<!-- cadence-review: <reviewer> head={SHA_1335} crit=0 imp=2 -->"
+                )),
+                "{msg}"
+            );
+        }
+        let inline =
+            format!("gh pr review 3 --comment --body \"summary: head={SHA_1335} crit=1 imp=0\"");
+        let result = WarnUnreviewedReadyFlip.run(&review_input(&inline, &cwd));
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(result.message.unwrap().contains("crit=1 imp=0 -->"));
+    }
+
+    #[test]
+    fn a_broken_marker_on_line_one_names_its_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let body = format!("<!-- cadence-review: head={SHA_1335} crit=0 imp=0 -->\nfindings");
+        let command = format!("gh pr review 4 --comment --body '{body}'");
+        let msg = WarnUnreviewedReadyFlip
+            .run(&review_input(&command, &cwd))
+            .message
+            .unwrap();
+        assert!(msg.contains("`<reviewer>` field"), "{msg}");
+    }
+
+    #[test]
+    fn a_well_formed_marker_or_missing_trigger_tokens_stay_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let good = format!(
+            "<!-- cadence-review: cadence:code-reviewer head={SHA_1335} crit=0 imp=0 -->\nhead={SHA_1335} crit=0 imp=0"
+        );
+        std::fs::write(dir.path().join("good.md"), &good).unwrap();
+        for command in [
+            "gh pr review 1 --comment --body-file good.md".to_string(),
+            // Missing a trigger token each.
+            format!("gh pr review 1 --comment --body 'head={SHA_1335} crit=0'"),
+            "gh pr review 1 --comment --body 'head=abc crit=0 imp=0'".to_string(),
+            "gh pr review 1 --comment --body 'crit=0 imp=0'".to_string(),
+            "gh pr review 1 --approve".to_string(),
+            "gh pr review 1 --comment --body-file missing.md".to_string(),
+            // Not a review.
+            format!("gh pr comment 1 --body 'head={SHA_1335} crit=0 imp=0'"),
+        ] {
+            let result = WarnUnreviewedReadyFlip.run(&review_input(&command, &cwd));
+            assert_eq!(result.outcome, Outcome::Allow, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_review_body_written_by_the_same_heredoc_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let p = dir.path().join("r.md");
+        std::fs::write(&p, "stale").unwrap();
+        let p = p.to_string_lossy();
+        let command = format!(
+            "cat > {p} <<'EOF'\nfindings\nhead={SHA_1335} crit=0 imp=0\nEOF\ngh pr review 9 --comment --body-file {p}"
+        );
+        let result = WarnUnreviewedReadyFlip.run(&review_input(&command, &cwd));
+        assert_eq!(result.outcome, Outcome::Nudge);
+        // A same-command write the hook cannot read stays silent.
+        let unread = format!("printf x > {p} && gh pr review 9 --comment --body-file {p}");
+        assert_eq!(
+            WarnUnreviewedReadyFlip
+                .run(&review_input(&unread, &cwd))
+                .outcome,
+            Outcome::Allow
+        );
+    }
 
     // --- matcher ---
 

@@ -1314,7 +1314,7 @@ fn segment_writes_file(segment: &str, path: &str) -> bool {
 /// posting `segment` in the same command. The file on disk at hook time is
 /// then stale: measuring it can call a 500-word body 5 words
 /// (cameronsjo/cadence-hooks#984). Pure.
-fn body_written_earlier(segs: &[String], segment: &str, path: &str) -> bool {
+pub(crate) fn body_written_earlier(segs: &[String], segment: &str, path: &str) -> bool {
     // Past this many segments the walk (segments x posting segments) is not
     // worth its cost: say "cannot measure" instead of scanning (perf bound).
     const MAX_SEGMENTS: usize = 256;
@@ -1366,7 +1366,7 @@ fn exact_same_path(a: &str, b: &str) -> bool {
 /// on its line, the terminator is found, and the body cannot expand (a quoted
 /// delimiter, or no `$` or backtick in the text). Anything else answers `None`
 /// and the caller keeps today's "cannot measure" nudge. Pure.
-fn same_command_heredoc_body(
+pub(crate) fn same_command_heredoc_body(
     segs: &[String],
     segment: &str,
     path: &str,
