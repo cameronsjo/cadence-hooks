@@ -937,46 +937,15 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
 
     // Chain analysis: multiple pushes in && / ; chains
     match chain_result {
-        ChainAnalysis::SameRemote(_) => {
-            // All chained pushes target the same remote — safe to proceed
-        }
-        ChainAnalysis::DifferentRemotes(cmds) => {
-            let remotes: Vec<String> = cmds
-                .iter()
-                .filter_map(|c| c.explicit_repo.as_ref())
-                .map(|r| format!("`{r}`"))
-                .collect();
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: chained git push to different remotes\n   \
-                 Found: remotes {}\n   \
-                 Fix: run each push individually, e.g. `git push origin main`",
-                remotes.join(", "),
-            ));
-        }
-        ChainAnalysis::MissingRemotes(cmds) => {
-            // Each push is judged on its own target below: a bare push's is
-            // the remote git resolves for it, judged by the tracking-remote
-            // probe, and a named one's is that remote
-            // (cameronsjo/cadence-hooks#1329). The chain shape alone used to
-            // block `git push origin feat && git push --tags`. Two different
-            // explicit remotes still block exactly as they do without a bare
-            // push beside them, so adding one cannot lift that block.
-            let mut explicit: Vec<&str> = Vec::new();
-            for remote in cmds.iter().filter_map(|c| c.explicit_repo.as_deref()) {
-                if !explicit.contains(&remote) {
-                    explicit.push(remote);
-                }
-            }
-            if explicit.len() > 1 {
-                let remotes: Vec<String> = explicit.iter().map(|r| format!("`{r}`")).collect();
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: chained git push to different remotes\n   \
-                     Found: remotes {}\n   \
-                     Fix: run each push individually, e.g. `git push origin main`",
-                    remotes.join(", "),
-                ));
-            }
-        }
+        // Every chained push is judged on its own target below
+        // (cameronsjo/cadence-hooks#1329): a named remote through git's URL
+        // for it, a bare push through the remote git resolves for it, and an
+        // explicit URL directly. Each one must be owned and resolvable, so the
+        // chain shape alone — a bare push beside a named one, or two
+        // different remotes — no longer blocks.
+        ChainAnalysis::SameRemote(_)
+        | ChainAnalysis::DifferentRemotes(_)
+        | ChainAnalysis::MissingRemotes(_) => {}
         ChainAnalysis::ParseFailed => {
             // Fall back to counting. The substring count alone misses a
             // push carrying a git global (`git -C . push …`), which is
@@ -1559,11 +1528,13 @@ mod tests {
     use cadence_hooks_core::test_builders::make_bash;
 
     #[test]
-    fn chained_pushes_different_remotes_blocked() {
+    fn chained_pushes_different_remotes_are_not_blocked_as_a_chain() {
+        // Each push is judged on its own remote (cameronsjo/cadence-hooks#1329);
+        // two different remotes alone no longer block.
         let result =
             PushRemoteGuard.run(&make_bash("git push origin main && git push upstream main"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("different remotes"));
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(!msg.contains("different remotes"), "{msg}");
     }
 
     #[test]
@@ -1596,11 +1567,11 @@ mod tests {
     }
 
     #[test]
-    fn push_chain_with_semicolon_different_remotes_blocked() {
+    fn push_chain_with_semicolon_different_remotes_are_not_blocked_as_a_chain() {
         let result =
             PushRemoteGuard.run(&make_bash("git push origin main; git push upstream feat"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("different remotes"));
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(!msg.contains("different remotes"), "{msg}");
     }
 
     #[test]
@@ -2124,6 +2095,10 @@ mod tests {
             ],
         );
         cadence_hooks_core::git_fixtures::git_in(owned.path(), &["checkout", "-q", "-b", "feat"]);
+        cadence_hooks_core::git_fixtures::git_in(
+            owned.path(),
+            &["remote", "add", "evil", "https://github.com/evil/z.git"],
+        );
         let o = owned.path().to_string_lossy().to_string();
         with_env(&owners_only(), || {
             for (command, blocks) in [
@@ -2133,10 +2108,14 @@ mod tests {
                 ("git push origin feat; git push --tags", false),
                 ("git push && git push origin feat", false),
                 ("git push -u origin feat && git push --follow-tags", false),
-                // Two explicit remotes still block, with or without a bare
-                // push beside them: adding one must not lift that block.
-                ("git push origin a && git push mine b", true),
-                ("git push origin a && git push mine b && git push", true),
+                // Different explicit remotes, every one owned: each push is
+                // judged on its own remote, so the chain allows.
+                ("git push origin a && git push mine b", false),
+                ("git push origin a && git push mine b && git push", false),
+                (
+                    "git push origin a; git push upstream b; git push mine c",
+                    false,
+                ),
             ] {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &o));
                 assert_eq!(
@@ -2176,6 +2155,9 @@ mod tests {
         let l = lonely.path().to_string_lossy().to_string();
         with_env(&owners_only(), || {
             for (command, cwd) in [
+                // A named remote that is unowned blocks the chain.
+                ("git push mine HEAD && git push origin feat", &u),
+                ("git push origin feat && git push evil feat", &o),
                 ("git push mine HEAD && git push", &u),
                 ("git push mine HEAD && git push --tags", &u),
                 ("git push mine HEAD && git push", &l),
