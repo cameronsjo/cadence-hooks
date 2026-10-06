@@ -842,10 +842,12 @@ fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
 }
 
 /// Does `after` start with a closer (`,` `;` `)`) that ends the value?
-/// A closer glued to more text (`1234,hunter2`) does not count.
+/// A closer glued to a plain word (`1234,hunter2`) does not count; one
+/// glued to the next `key=` field (`5,fail=0`) does.
 fn closes_count(after: &str) -> bool {
     let rest = after.trim_start_matches([',', ';', ')']);
-    rest.len() < after.len() && rest.chars().next().is_none_or(char::is_whitespace)
+    rest.len() < after.len()
+        && (rest.chars().next().is_none_or(char::is_whitespace) || starts_key_field(rest))
 }
 
 /// Does `text` begin with a `name=` or `name:` field?
@@ -2682,6 +2684,9 @@ mod tests {
             "pass=123456\n",
             "PASS=5\n",
             "rc: 0 pass: 5 fail: 0\n",
+            "pass=5,fail=0\n",
+            "pass=5,fail=0,skip=1\n",
+            "pass=5;fail=0\n",
             "lastpass=12 endpass=13\n",
         ];
         for input in kept {
