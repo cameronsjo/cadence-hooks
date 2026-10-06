@@ -2249,33 +2249,64 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
                     .into(),
             ));
         }
-        let Some(range) = range_of(&inv, &hints)? else {
-            continue;
-        };
-        sources_are_commits(&inv.work_dir, &range)?;
-        hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
-        let (shas, over) = outbound(&inv.work_dir, &range)?;
-        let mut hits = if shas.is_empty() {
-            Vec::new()
-        } else {
-            let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
-            if hits.len() <= MAX_HITS {
-                hits.extend(scan_messages(&inv.work_dir, &shas)?);
+        judge_invocation(&inv, &hints, exempt).map_err(|stop| match stop {
+            // A directory an earlier command in the same line creates (`git
+            // worktree add <p> … && git -C <p> push`) does not exist yet, so
+            // every probe there fails: say so rather than blame whatever
+            // probe failed first (cameronsjo/cadence-hooks#1336). The verdict
+            // is unchanged.
+            Stop::Refused(_) if !std::path::Path::new(&inv.work_dir).exists() => {
+                Stop::Refused(missing_directory(&inv.work_dir))
             }
-            hits
-        };
+            stop => stop,
+        })?;
+    }
+    Ok(())
+}
+
+/// Why a push or git call in `dir` cannot be judged when `dir` does not
+/// exist when the guard runs.
+fn missing_directory(dir: &str) -> String {
+    format!(
+        "the push runs in `{}`, which does not exist yet (an earlier command in the same line, \
+         such as `git worktree add`, creates it), so what it publishes cannot be read. Run the \
+         push as its own command once the directory exists",
+        sane(dir)
+    )
+}
+
+/// [`judge`] for one push that is neither a dry run nor unresolved.
+fn judge_invocation(
+    inv: &PushInvocation,
+    hints: &CommandHints,
+    exempt: Exempt,
+) -> Result<(), Stop> {
+    let Some(range) = range_of(inv, hints)? else {
+        return Ok(());
+    };
+    sources_are_commits(&inv.work_dir, &range)?;
+    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
+    let (shas, over) = outbound(&inv.work_dir, &range)?;
+    let mut hits = if shas.is_empty() {
+        Vec::new()
+    } else {
+        let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
         if hits.len() <= MAX_HITS {
-            hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
+            hits.extend(scan_messages(&inv.work_dir, &shas)?);
         }
-        if !hits.is_empty() {
-            return Err(Stop::Found(hits));
-        }
-        if over {
-            return Err(Stop::Refused(format!(
-                "the range is too large to fully scan (over {MAX_COMMITS} commits; the newest \
+        hits
+    };
+    if hits.len() <= MAX_HITS {
+        hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
+    }
+    if !hits.is_empty() {
+        return Err(Stop::Found(hits));
+    }
+    if over {
+        return Err(Stop::Refused(format!(
+            "the range is too large to fully scan (over {MAX_COMMITS} commits; the newest \
                  {MAX_COMMITS} were clean) — push blocked rather than partly scanned"
-            )));
-        }
+        )));
     }
     Ok(())
 }
@@ -4082,5 +4113,26 @@ mod tests {
         ] {
             assert_blocks(&fx.run(command), &["cannot resolve"]);
         }
+    }
+
+    /// A push into a directory an earlier command in the same line creates
+    /// (`git worktree add <p> … && git -C <p> push`) cannot be scanned, since
+    /// the directory does not exist yet. It still blocks, and the message
+    /// says why instead of blaming the config (cameronsjo/cadence-hooks#1336).
+    #[test]
+    fn a_push_into_a_directory_not_yet_created_names_it() {
+        let fx = Fx::new("missing-dir");
+        let wt = fx.work.parent().unwrap().join("wt-new");
+        let wt = wt.to_str().unwrap();
+        let r = fx.run(&format!(
+            "git worktree add -q {wt} -b nb main && git -C {wt} push -q -u origin nb"
+        ));
+        assert_blocks(&r, &[wt, "does not exist", "as its own command"]);
+        assert!(
+            !r.message
+                .as_deref()
+                .unwrap()
+                .contains("could not read the config")
+        );
     }
 }
