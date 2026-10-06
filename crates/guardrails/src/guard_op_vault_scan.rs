@@ -15,8 +15,15 @@
 //! command word is `op` and an `item`/`vault` token is immediately followed by
 //! `list` anywhere after the command word, it's a scan. Intervening flags are
 //! just skipped tokens, value-flag or not.
+//!
+//! The command word is read after the exec wrappers are peeled (#1343): the
+//! shared [`peel_command_runners`] walk (`env`, `command`, `nice`, `time`,
+//! `timeout`, `nohup`, `sudo`, `xargs`, …) plus the macOS timeout idiom
+//! `perl -e 'alarm 60; exec @ARGV' op vault list`, which execs its operands.
 
-use cadence_hooks_core::shell::{command_segments, command_word, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, peel_command_runners, tokenize, unescape_word,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Blocks `op item list` / `op vault list` vault enumeration; single-item reads
@@ -49,6 +56,7 @@ fn block_message(found: &str) -> String {
 /// - `op run -- ./tool item list` would match (no real-world shape — accepted).
 fn vault_scan_keyword(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(segment);
+    let tokens = executed_argv(&tokens);
     let first = tokens.first()?;
     if command_word(first).as_ref() != "op" {
         return None;
@@ -63,6 +71,61 @@ fn vault_scan_keyword(segment: &str) -> Option<&'static str> {
             }
             _ => None,
         })
+}
+
+/// How many wrapper layers [`executed_argv`] peels. Each `perl` layer is
+/// followed by a fresh runner peel, so this bounds `perl … exec @ARGV perl …`
+/// nesting; real commands carry one.
+const MAX_WRAPPER_LAYERS: usize = 4;
+
+/// The argv the segment actually executes, with exec wrappers peeled off the
+/// front: the shared runner peel, then `perl -e '…exec @ARGV…'`, repeated.
+/// A shape neither peel recognises is returned unchanged, so the guard keeps
+/// judging the literal command word (the old verdict).
+fn executed_argv(tokens: &[String]) -> &[String] {
+    let mut argv = peel_command_runners(tokens);
+    for _ in 0..MAX_WRAPPER_LAYERS {
+        match perl_exec_operands(argv) {
+            Some(rest) if !rest.is_empty() => argv = peel_command_runners(rest),
+            _ => break,
+        }
+    }
+    argv
+}
+
+/// If `argv` is `perl -e <script> [--] <cmd…>` (or `-E`) whose script execs
+/// its arguments (`exec @ARGV`, `exec(@ARGV)`), return `<cmd…>`.
+///
+/// Deliberately narrow: exactly one `-e`/`-E` script as a separate word, and
+/// nothing else before the operands. Any other perl spelling is not peeled and
+/// keeps the old verdict.
+fn perl_exec_operands(argv: &[String]) -> Option<&[String]> {
+    let (head, rest) = argv.split_first()?;
+    if command_word(head).as_ref() != "perl" {
+        return None;
+    }
+    let (flag, rest) = rest.split_first()?;
+    if !matches!(flag.as_str(), "-e" | "-E") {
+        return None;
+    }
+    let (script, rest) = rest.split_first()?;
+    if !execs_argv(&unescape_word(script)) {
+        return None;
+    }
+    Some(match rest.first() {
+        Some(word) if word == "--" => &rest[1..],
+        _ => rest,
+    })
+}
+
+/// Does this perl script `exec` its argument list? Matches `exec @ARGV` and
+/// `exec(@ARGV)` with any spacing.
+fn execs_argv(script: &str) -> bool {
+    let compact: String = script
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '(')
+        .collect();
+    compact.contains("exec@ARGV")
 }
 
 impl Check for OpVaultScanGuard {
@@ -271,6 +334,68 @@ mod tests {
         // item|vault + list, so this single-item read stays allowed.
         let result = OpVaultScanGuard.run(&make_bash("op item get list"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- #1343: exec wrappers run the scan they wrap ---
+
+    #[test]
+    fn exec_wrapped_vault_scans_blocked() {
+        for cmd in [
+            "perl -e 'alarm 60; exec @ARGV' op vault list",
+            "perl -e 'alarm 60; exec @ARGV' op vault list --format json > /tmp/out.json",
+            "perl -e 'alarm(60); exec(@ARGV)' op item list",
+            "perl -e \"alarm 60; exec @ARGV\" -- op vault list",
+            "perl -E 'alarm 60; exec @ARGV' op item list | grep api",
+            "env op vault list",
+            "env OP_ACCOUNT=me op vault list",
+            "env -i PATH=/usr/bin op item list",
+            "/usr/bin/env op vault list",
+            "command op vault list",
+            "nice op vault list",
+            "nice -n 10 op item list",
+            "time op vault list",
+            "timeout 60 op vault list",
+            "nohup op item list",
+            "sudo op vault list",
+            "sudo -u me op item list",
+            "timeout 30 perl -e 'alarm 60; exec @ARGV' op vault list",
+            "perl -e 'alarm 60; exec @ARGV' env op vault list",
+        ] {
+            let result = OpVaultScanGuard.run(&make_bash(cmd));
+            assert_eq!(result.outcome, Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn exec_wrapped_single_item_reads_allowed() {
+        for cmd in [
+            "perl -e 'alarm 60; exec @ARGV' op item get \"GitHub Token\"",
+            "perl -e 'alarm 60; exec @ARGV' op read op://Private/x/credential",
+            "env op whoami",
+            "env OP_ACCOUNT=me op signin",
+            "timeout 60 op read op://Private/x/credential",
+            "sudo op item get x",
+            "nohup op whoami",
+        ] {
+            let result = OpVaultScanGuard.run(&make_bash(cmd));
+            assert_eq!(result.outcome, Outcome::Allow, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn perl_that_does_not_exec_its_arguments_keeps_the_old_verdict() {
+        // Only a script that execs @ARGV runs its operands; anything else
+        // passes them to perl as data.
+        for cmd in [
+            "perl -e 'print @ARGV' op vault list",
+            "perl -e 'print \"hello\"'",
+            "perl -ne 'print if /list/' notes.txt",
+            "perl -pi -e 's/op item list/x/' notes.md",
+            "perl script.pl op vault list",
+        ] {
+            let result = OpVaultScanGuard.run(&make_bash(cmd));
+            assert_eq!(result.outcome, Outcome::Allow, "{cmd}");
+        }
     }
 
     // --- evasion (documented limitations) ---
