@@ -5894,6 +5894,11 @@ mod tests {
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b@y; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b+y; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b=y; done",
+            // A pr/issue verb after `-R`/`--repo` in each spelling.
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr -R cameronsjo/forgectl view $i; done",
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr --repo cameronsjo/forgectl view $i; done",
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue --repo=cameronsjo/forgectl view $i; done",
+            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue -Rcameronsjo/forgectl view $i; done",
         ] {
             assert!(
                 loop_targets_are_literal(command),
