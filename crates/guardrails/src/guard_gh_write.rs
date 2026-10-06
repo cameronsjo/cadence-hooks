@@ -1910,8 +1910,8 @@ fn api_writes_are_literal(api_writes: &[String]) -> bool {
 /// loop's shape.
 const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only in a plain loop: \
      `for` headers with a lowercase name and plain values, `do`, `done`, and `gh api`, `pr`, \
-     `issue` or similar commands with plain arguments, in printable ASCII, with no redirect, \
-     `||`/`&&`, pipe, comment, or other command; make the loop plain or run each call \
+     `issue` or similar commands with plain arguments, in printable ASCII, joined by `;` or \
+     newlines only, with no redirect, `||`/`&&`, pipe, `&`, comment, or other command; make the loop plain or run each call \
      outside it";
 
 /// The structured `fix` for a looped-write block: `-R` for commands that take
@@ -3152,7 +3152,7 @@ enum LoopedWriteKind {
 ///   word or one of `/ - , @ + =`.
 ///
 /// The command must also be printable ASCII, space, tab, and newline only,
-/// with no `#`, and the subcommand list leaves out anything that writes a
+/// with no `#`, `|`, or `&` (segments are joined by `;` and newlines only), and the subcommand list leaves out anything that writes a
 /// file to a path it is given.
 ///
 /// Those two forms are the only ones neither bash nor zsh rewrites: the value
@@ -3167,7 +3167,8 @@ enum LoopedWriteKind {
 fn loop_targets_are_literal(command: &str) -> bool {
     /// gh subcommands a plain loop may run. None of them changes which host
     /// or account a later iteration's `gh api` reaches, and none writes
-    /// files to a path it is given (`release download -D`, `run download`,
+    /// files to a path it is given or (with `pr checkout` and `issue develop`
+    /// refused below) changes the working tree (`release download -D`, `run download`,
     /// `repo clone` and `gist clone` could write into gh's config dir).
     const LOOP_SUBCOMMANDS: &[&str] = &[
         "api", "pr", "issue", "workflow", "label", "search", "browse", "status", "cache",
@@ -3252,7 +3253,9 @@ fn loop_targets_are_literal(command: &str) -> bool {
     // the stripper and the shell agree on ASCII comments, so the `#` refusal
     // is a second layer no known input needs; it costs `done # note` the
     // relaxed policy.
-    if command.contains('#')
+    // `|` and `&` are refused too: a plain loop is joined by `;` and
+    // newlines only, never a pipe, `&&`/`||`, or a background job.
+    if command.contains(['#', '|', '&'])
         || !command
             .bytes()
             .all(|b| matches!(b, b' ' | b'\t' | b'\n') || b.is_ascii_graphic())
@@ -3291,7 +3294,13 @@ fn loop_targets_are_literal(command: &str) -> bool {
                 loop_vars.push((*name).to_string());
             }
             ["gh", subcommand, args @ ..] => {
-                if !LOOP_SUBCOMMANDS.contains(subcommand)
+                // These two rewrite the working tree and `branch.*` config.
+                let checks_out = matches!(
+                    (*subcommand, args.first().copied()),
+                    ("pr", Some("checkout" | "co")) | ("issue", Some("develop"))
+                );
+                if checks_out
+                    || !LOOP_SUBCOMMANDS.contains(subcommand)
                     || !args.iter().all(|a| {
                         plain(a)
                             || (!a.trim_start_matches('"').starts_with('-')
@@ -6034,6 +6043,15 @@ mod tests {
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh run download 1 -R cameronsjo/forgectl -D /Users/x/.config/gh; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh repo clone cameronsjo/forgectl /Users/x/.config/gh; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh gist clone 1 /Users/x/.config/gh; done",
+            // These rewrite the working tree and branch config.
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr checkout 1; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr co 1; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue develop 1 --checkout; done",
+            // Segments join with `;` and newlines only.
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b | gh pr list; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b || gh pr list; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b & done",
         ]);
     }
 
