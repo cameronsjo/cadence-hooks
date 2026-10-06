@@ -461,10 +461,11 @@ const MAX_PUSH_DIRECTORIES: usize = 4;
 
 /// The verdict for a literal push loop's iterations
 /// ([`loop_analysis::literal_loop_pushes`]): each named remote resolved in the
-/// directory its `git -C` names, and owner-checked there. Allows only when
-/// every iteration's target is owned; `None` hands the command back to the
-/// general checks, which give the old verdict: too many directories to probe,
-/// a remote git cannot resolve in one of them, or an unowned target.
+/// directory its `git -C` names, and owner-checked there. Allows when every
+/// iteration's target is owned and blocks, as the single push would, when a
+/// resolved target is not. `None` hands the command back to the general
+/// checks, which give the old verdict: too many directories to probe, or a
+/// remote git cannot resolve in one of them with no unowned target beside it.
 fn judge_literal_push_loop(
     pushes: &[loop_analysis::LiteralLoopPush],
     cwd: &str,
@@ -478,6 +479,12 @@ fn judge_literal_push_loop(
     if dirs.len() > MAX_PUSH_DIRECTORIES {
         return None;
     }
+    // A resolved unowned target gets the block the same push gets on its own
+    // (`git -C <dir> push origin main`), even beside an iteration that cannot
+    // be resolved; main let it through with a nudge from an owned checkout.
+    // With no unowned target, one unresolvable iteration hands the whole loop
+    // back to the old verdict.
+    let mut unresolved = false;
     for push in pushes {
         let dir = std::path::Path::new(cwd).join(&push.dir);
         let dir = dir.to_str()?;
@@ -486,14 +493,24 @@ fn judge_literal_push_loop(
         } else {
             match resolve_push_url(dir, Some(&push.remote)) {
                 PushUrlResolution::Url(url) => url,
-                PushUrlResolution::Failed | PushUrlResolution::TimedOut => return None,
+                PushUrlResolution::Failed | PushUrlResolution::TimedOut => {
+                    unresolved = true;
+                    continue;
+                }
             }
         };
-        // An unowned target keeps the old verdict rather than a new block
-        // here: this path only clears loops main misjudged from the cwd.
         if !check_owner(&url, allowed_owners, allowed_repos, extra_hosts) {
-            return None;
+            return Some(CheckResult::block(unowned_message(
+                &url,
+                dir,
+                allowed_owners,
+                allowed_repos,
+                extra_hosts,
+            )));
         }
+    }
+    if unresolved {
+        return None;
     }
     Some(CheckResult::allow())
 }
@@ -1262,6 +1279,11 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         && let Some(lit) = loop_analysis::literal_loop_pushes(command)
         && lit.push_commands == push_segments.len()
         && lit.push_commands == walk.of(command, cwd).len()
+        && walk.of(command, cwd).iter().all(|push| {
+            !push.destination_unreadable
+                && push.config_destinations.is_empty()
+                && !push.repository_unresolved
+        })
         && let Some(verdict) = judge_literal_push_loop(
             &lit.pushes,
             cwd,
@@ -1270,7 +1292,9 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             &extra_hosts,
         )
     {
-        walk.every_push_placed.set(true);
+        if verdict.outcome == cadence_hooks_core::Outcome::Allow {
+            walk.every_push_placed.set(true);
+        }
         return verdict;
     }
 
@@ -2881,6 +2905,47 @@ mod tests {
                     "for d in {owned} {owned2}; do GIT_DIR={cwd}/.git git -C \"$d\" push origin main; done",
                     Block,
                 ),
+                // A body that rewrites the push's own config keeps the block.
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" remote set-url origin https://github.com/evil/x.git; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" config remote.origin.pushurl https://github.com/evil/x.git; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" config url.https://github.com/evil/.insteadOf https://github.com/cameronsjo/; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do echo \"[remote \\\"origin\\\"] pushurl = https://github.com/evil/x.git\" >> \"$d/.git/config\"; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" -c remote.origin.pushurl=https://github.com/evil/x.git push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" push origin \"$(git -C \"$d\" config remote.origin.pushurl https://github.com/evil/x.git)main\"; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" remote set-url --push origin https://github.com/evil/x.git && git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" config url.https://github.com/evil/.pushInsteadOf https://github.com/cameronsjo/; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" remote rename upstream origin2; git -C \"$d\" push origin2 main; done",
+                    Block,
+                ),
+                (
+                    "for d in {owned} {owned2}; do git -C \"$d\" remote rename origin old && git -C \"$d\" remote rename upstream origin; git -C \"$d\" push origin main; done",
+                    Block,
+                ),
             ] {
                 let command = command
                     .replace("{owned2}", &owned2)
@@ -2890,6 +2955,69 @@ mod tests {
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
                 if outcome == Allow {
                     assert!(result.message.is_none(), "{command}: {:?}", result.message);
+                }
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1341 review: a resolved literal loop with an
+    /// unowned target gets the block the single push gets, run from an OWNED
+    /// checkout too (main let it through with only a directory nudge). The
+    /// block names the unowned target and its directory.
+    #[cfg(unix)]
+    #[test]
+    fn literal_push_loop_with_an_unowned_target_blocks_like_the_single_push() {
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/y.git");
+        let other = checkout_with_origin("https://github.com/evil/x.git");
+        let mixed = checkout_with_origin("https://github.com/cameronsjo/fork.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            mixed.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/evil/up.git",
+            ],
+        );
+        let cwd = owned.path().to_string_lossy().to_string();
+        let other = other.path().to_string_lossy().to_string();
+        let mixed = mixed.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome, names) in [
+                (
+                    "for d in {cwd} {other}; do git -C \"$d\" push origin main; done",
+                    Block,
+                    "evil/x",
+                ),
+                (
+                    "for d in {cwd} {mixed}; do git -C $d push upstream main; done",
+                    Block,
+                    "evil/up",
+                ),
+                (
+                    "for d in {cwd} {mixed}; do git -C $d push origin main; done",
+                    Allow,
+                    "",
+                ),
+                // Unresolvable with no unowned target: the old verdict (the
+                // unverified-directory nudge), not a block from this path.
+                (
+                    "for d in {cwd} {mixed}; do git -C $d push nosuch main; done",
+                    Nudge,
+                    "",
+                ),
+            ] {
+                let command = command
+                    .replace("{cwd}", &cwd)
+                    .replace("{other}", &other)
+                    .replace("{mixed}", &mixed);
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+                if outcome == Block {
+                    let message = result.message.unwrap_or_default();
+                    assert!(message.contains(names), "{command}: {message}");
+                    assert!(message.contains("Push target is not yours"), "{message}");
                 }
             }
         });

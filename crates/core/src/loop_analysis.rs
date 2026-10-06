@@ -226,6 +226,22 @@ pub struct LiteralLoop {
     pub push_commands: usize,
 }
 
+/// Most distinct iteration pushes [`literal_loop_pushes`] reports; a larger
+/// loop keeps the old verdict.
+const LITERAL_LOOP_MAX_PUSHES: usize = 8;
+
+/// A redirect that writes nothing a later command reads: `2>&1` or
+/// `>/dev/null`. Any other redirect in a literal loop's body could rewrite a
+/// repository's config (`>> "$d/.git/config"`), so it refuses the read.
+fn is_harmless_redirect(redirect: &brush_parser::ast::IoRedirect) -> bool {
+    let text: String = redirect
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    matches!(text.as_str(), "2>&1" | ">/dev/null")
+}
+
 /// Longest command [`literal_loop_pushes`] parses.
 const LITERAL_LOOP_MAX_LEN: usize = 4096;
 
@@ -240,12 +256,15 @@ const LITERAL_LOOP_BODY_COMMANDS: &[&str] = &["git", "echo", "true", "tail", "he
 ///   redirect, chain or pipeline around it;
 /// - every loop word is a literal (no expansion, quote-free or wholly quoted);
 /// - the body holds only simple commands from [`LITERAL_LOOP_BODY_COMMANDS`],
-///   none carrying a prefix assignment or a process substitution;
+///   none carrying a prefix assignment, a command or process substitution,
+///   or a redirect other than `2>&1` / `>/dev/null`;
+/// - every `git` call in the body is a push;
 /// - every push is `git -C <dir> push … <remote> …`, where `<dir>` is a
 ///   literal or exactly the loop variable (`$d`, `"$d"`, `${d}`, `"${d}"`),
 ///   and the remote is a literal positional.
 ///
-/// `None` for anything else, and for a loop with no push: the caller keeps its
+/// `None` for anything else, for more than [`LITERAL_LOOP_MAX_PUSHES`]
+/// iteration pushes, and for a loop with no push: the caller keeps its
 /// old verdict for every shape this does not recognise.
 pub fn literal_loop_pushes(command: &str) -> Option<LiteralLoop> {
     // A second parse of a long command costs the shared deadline (a 200 KB
@@ -308,15 +327,26 @@ pub fn literal_loop_pushes(command: &str) -> Option<LiteralLoop> {
                     return None;
                 }
                 if simple.suffix.as_ref().is_some_and(|suffix| {
-                    suffix
-                        .0
-                        .iter()
-                        .any(|i| matches!(i, CommandPrefixOrSuffixItem::ProcessSubstitution(..)))
+                    suffix.0.iter().any(|i| match i {
+                        CommandPrefixOrSuffixItem::ProcessSubstitution(..) => true,
+                        CommandPrefixOrSuffixItem::IoRedirect(r) => !is_harmless_redirect(r),
+                        // A substitution runs a command of its own, which
+                        // could rewrite the push's config before it runs.
+                        CommandPrefixOrSuffixItem::Word(w)
+                        | CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
+                            w.value.contains("$(") || w.value.contains('`')
+                        }
+                    })
                 }) {
                     return None;
                 }
-                if !is_git_push_command(simple) {
+                // A body `git` call that is not a push (`remote set-url`,
+                // `config …pushurl`) can retarget the push after it.
+                if name != "git" {
                     continue;
+                }
+                if !is_git_push_command(simple) {
+                    return None;
                 }
                 let words = suffix_words(simple);
                 let [flag, dir, verb, ..] = words.as_slice() else {
@@ -350,6 +380,9 @@ pub fn literal_loop_pushes(command: &str) -> Option<LiteralLoop> {
                 pushes.push(push);
             }
         }
+    }
+    if pushes.len() > LITERAL_LOOP_MAX_PUSHES {
+        return None;
     }
     Some(LiteralLoop {
         pushes,
@@ -922,6 +955,17 @@ mod tests {
     }
 
     #[test]
+    fn literal_loop_pushes_allows_harmless_redirects() {
+        for command in [
+            "for d in /a; do git -C \"$d\" push origin main 2>&1 | tail -3; done",
+            "for d in /a; do git -C \"$d\" push origin main >/dev/null; done",
+            "for d in /a; do echo \"$d\"; git -C \"$d\" push -q origin main; done",
+        ] {
+            assert!(literal_loop_pushes(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
     fn literal_loop_pushes_refuses_what_it_cannot_read() {
         for command in [
             "git -C /a push origin main",
@@ -940,6 +984,13 @@ mod tests {
             "for d in /a; do git -C \"$d\" push origin main; done > log",
             "for d in /a; do if true; then git -C \"$d\" push origin main; fi; done",
             "for d in /a; do echo hi; done",
+            "for d in /a; do git -C \"$d\" remote set-url origin x; git -C \"$d\" push origin main; done",
+            "for d in /a; do git -C \"$d\" fetch; git -C \"$d\" push origin main; done",
+            "for d in /a; do echo x >> \"$d/.git/config\"; git -C \"$d\" push origin main; done",
+            "for d in /a; do git -C \"$d\" push origin main > log; done",
+            "for d in /a; do git -C \"$d\" push origin \"$(git -C \"$d\" config remote.origin.pushurl x)\"; done",
+            "for d in /a; do echo `git -C /a remote set-url origin x`; git -C \"$d\" push origin main; done",
+            "for d in /a /b /c /d /e /f /g /h /i; do git -C \"$d\" push origin main; done",
         ] {
             assert_eq!(literal_loop_pushes(command), None, "{command}");
         }
