@@ -25,8 +25,8 @@ use cadence_hooks_core::gh_bodies::{
     strip_flag_prefix,
 };
 use cadence_hooks_core::shell::{
-    command_segments, command_word, executable_tokens, redirect_targets, skip_transparent_prefixes,
-    strip_group_wrappers, tokenize, unescape_word,
+    command_segments, command_word, executable_tokens, heredoc_introducers, redirect_targets,
+    skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -1327,6 +1327,132 @@ fn body_written_earlier(segs: &[String], segment: &str, path: &str) -> bool {
     segs[..pos].iter().any(|s| segment_writes_file(s, path))
 }
 
+/// The one shape whose body a same-command write can still be measured from:
+/// a bare `cat` clobbering exactly the body file from a heredoc, in either
+/// operand order (`cat > F <<'EOF'`, `cat <<'EOF' > F`). Captures the target
+/// (quotes optional) from whichever arm matched.
+static CAT_HEREDOC_WRITE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^\s*cat\s+(?:>\|?\s*(?:"([^"]+)"|'([^']+)'|([^\s"'<>|&;]+))\s*<<-?\s*\S+|<<-?\s*\S+\s+>\|?\s*(?:"([^"]+)"|'([^']+)'|([^\s"'<>|&;]+)))\s*$"#,
+    )
+    .expect("cat heredoc write pattern compiles")
+});
+
+/// The file a [`CAT_HEREDOC_WRITE`] segment writes, or `None` for any other
+/// segment.
+fn cat_heredoc_target(segment: &str) -> Option<String> {
+    let caps = CAT_HEREDOC_WRITE.captures(segment)?;
+    (1..=6)
+        .find_map(|i| caps.get(i))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Whether two body-file spellings are the same path exactly (a leading `./`
+/// aside). Stricter than [`same_file_name`] on purpose: that one over-matches
+/// to say "cannot measure", but text measured from the wrong heredoc would be
+/// a wrong number, so only an exact match is measured.
+fn exact_same_path(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.strip_prefix("./").unwrap_or(p).to_string();
+    norm(a) == norm(b)
+}
+
+/// The text a same-command heredoc writes into the body file `path`, when the
+/// guard can read it exactly (cameronsjo/cadence-hooks#1334).
+///
+/// `cadence:redaction`'s gated form writes the body, scans it and posts it in
+/// one command, so the file on disk is stale at hook time. The one shape read
+/// here is the common one: the ONLY segment in the command that writes `path`
+/// is a bare `cat > path <<'EOF'` before the post, its heredoc is the only one
+/// on its line, the terminator is found, and the body cannot expand (a quoted
+/// delimiter, or no `$` or backtick in the text). Anything else answers `None`
+/// and the caller keeps today's "cannot measure" nudge. Pure.
+fn same_command_heredoc_body(
+    segs: &[String],
+    segment: &str,
+    path: &str,
+    command: &str,
+) -> Option<String> {
+    // Exactly one writer of the file in the whole command, and it is the
+    // heredoc `cat`, before the post.
+    let writers: Vec<usize> = segs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| segment_writes_file(s, path))
+        .map(|(i, _)| i)
+        .collect();
+    let [writer] = writers.as_slice() else {
+        return None;
+    };
+    let post = segs
+        .iter()
+        .position(|s| strip_group_wrappers(s) == segment)?;
+    if *writer >= post {
+        return None;
+    }
+    let target = cat_heredoc_target(segs[*writer].trim())?;
+    if !exact_same_path(&target, path) {
+        return None;
+    }
+
+    // Find that heredoc's body: the one logical line with one introducer whose
+    // own segment is a cat-heredoc write of this exact path.
+    let physical: Vec<&str> = command.split('\n').collect();
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i < physical.len() {
+        let mut line = physical[i].to_string();
+        i += 1;
+        while i < physical.len() && (line.len() - line.trim_end_matches('\\').len()) % 2 == 1 {
+            line.pop();
+            line.push_str(physical[i]);
+            i += 1;
+        }
+        if !line.contains("<<") {
+            continue;
+        }
+        let intros = heredoc_introducers(&line);
+        let writes_here = command_segments(&line)
+            .iter()
+            .any(|s| cat_heredoc_target(s.trim()).is_some_and(|t| exact_same_path(&t, path)));
+        let mut bodies: Vec<(Vec<&str>, bool)> = Vec::new();
+        for intro in &intros {
+            let dash = line[intro.start..].starts_with("<<-");
+            let mut body: Vec<&str> = Vec::new();
+            let mut terminated = false;
+            while i < physical.len() {
+                let candidate = physical[i];
+                i += 1;
+                let bare = if dash {
+                    candidate.trim_start_matches('\t')
+                } else {
+                    candidate
+                };
+                if bare == intro.word {
+                    terminated = true;
+                    break;
+                }
+                body.push(bare);
+            }
+            bodies.push((body, terminated));
+        }
+        if !writes_here {
+            continue;
+        }
+        // A second heredoc writing the same file, or a line this reading
+        // cannot pin to one heredoc, is not measured.
+        if found.is_some() || intros.len() != 1 {
+            return None;
+        }
+        let (body, terminated) = bodies.pop()?;
+        let text = body.join("\n");
+        if !terminated || (intros[0].expands && (text.contains('$') || text.contains('`'))) {
+            return None;
+        }
+        found = Some(text);
+    }
+    found
+}
+
 /// One segment's verdict, plus the provenance it owes the bypass ledger.
 struct SegmentOutcome {
     verdict: Verdict,
@@ -1341,6 +1467,7 @@ struct SegmentOutcome {
 /// segment must not end the walk for the others.
 fn evaluate_segment(
     surface: Surface,
+    command: &str,
     all_segments: &[String],
     segment: &str,
     base_dir: &str,
@@ -1374,64 +1501,82 @@ fn evaluate_segment(
     // the file, where it is reviewable, not in the command string.
     let (source, mut title) = body_source(segment);
     // A body file this same command writes first is stale on disk: nudge
-    // rather than measure the wrong bytes (cameronsjo/cadence-hooks#984).
+    // rather than measure the wrong bytes (cameronsjo/cadence-hooks#984) —
+    // unless the write is a heredoc whose text this guard can read exactly,
+    // which is then measured as the file would be (#1334).
+    let mut heredoc_body: Option<String> = None;
     if let Some(BodySource::File(p) | BodySource::JsonFile(p)) = &source
         && body_written_earlier(all_segments, segment, p)
     {
-        log_unmeasured("body-written-by-same-command");
-        let (soft, hard) = budgets.for_surface(surface);
-        return SegmentOutcome {
-            verdict: Verdict::Nudge(format!(
-                "guard-body-budget: {} not measured: cannot measure the body — it is written by this same command (soft {soft}, hard {hard}). Keep it within budget, or write the file in a separate command first.",
-                surface.label()
-            )),
-            bypass: None,
+        let readable = match &source {
+            Some(BodySource::File(p)) => {
+                same_command_heredoc_body(all_segments, segment, p, command)
+            }
+            _ => None,
         };
+        let Some(text) = readable else {
+            log_unmeasured("body-written-by-same-command");
+            let (soft, hard) = budgets.for_surface(surface);
+            return SegmentOutcome {
+                verdict: Verdict::Nudge(format!(
+                    "guard-body-budget: {} not measured: the body file is written by this same command (soft {soft}, hard {hard}), so the file on disk is not what gh will post. This is the known-unmeasurable case of cadence:redaction's gated form (write, scan and post in one command). Keep it within budget, or write the file in a separate command first — the write is separable from the scan+post gate, which sits between the scan and the post. A `cat > FILE <<'EOF'` heredoc in the same command is measured.",
+                    surface.label()
+                )),
+                bypass: None,
+            };
+        };
+        heredoc_body = Some(text);
     }
-    let (body, escape) = match source {
-        None => {
-            // Accepted gap: `gh pr create` with no body flag opens an
-            // editor, and there is nothing to measure at hook time.
-            log_unmeasured("no-body-flag");
-            return allow();
+    let (body, escape) = match (heredoc_body, source) {
+        (Some(contents), _) => {
+            let escape = extract_escape(&strip_fences(&contents));
+            (contents, escape)
         }
-        Some(BodySource::Stdin) => {
-            // `-F body=@-` / `--input -`: the body is on a pipe the hook
-            // cannot read without consuming what `gh` is about to post.
-            log_unmeasured("stdin-body");
-            return allow();
-        }
-        Some(BodySource::Inline(v)) => (v, None),
-        Some(BodySource::File(p)) => match read_body_file(&p, base_dir) {
-            Ok(contents) => {
-                // Fence-stripped first: an escape line quoted inside a code
-                // fence grants nothing.
-                let escape = extract_escape(&strip_fences(&contents));
-                (contents, escape)
+        (None, source) => match source {
+            None => {
+                // Accepted gap: `gh pr create` with no body flag opens an
+                // editor, and there is nothing to measure at hook time.
+                log_unmeasured("no-body-flag");
+                return allow();
             }
-            Err(e) => return unreadable(e),
-        },
-        Some(BodySource::JsonFile(p)) => match read_body_file(&p, base_dir) {
-            Ok(contents) => {
-                let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
-                    log_unmeasured("input-not-json");
-                    return allow();
-                };
-                let Some(body) = json.get("body").and_then(|b| b.as_str()) else {
-                    // A PATCH that changes only labels or state posts no prose.
-                    log_unmeasured("no-body-field");
-                    return allow();
-                };
-                if title.is_none() {
-                    title = json
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string);
+            Some(BodySource::Stdin) => {
+                // `-F body=@-` / `--input -`: the body is on a pipe the hook
+                // cannot read without consuming what `gh` is about to post.
+                log_unmeasured("stdin-body");
+                return allow();
+            }
+            Some(BodySource::Inline(v)) => (v, None),
+            Some(BodySource::File(p)) => match read_body_file(&p, base_dir) {
+                Ok(contents) => {
+                    // Fence-stripped first: an escape line quoted inside a code
+                    // fence grants nothing.
+                    let escape = extract_escape(&strip_fences(&contents));
+                    (contents, escape)
                 }
-                let escape = extract_escape(&strip_fences(body));
-                (body.to_string(), escape)
-            }
-            Err(e) => return unreadable(e),
+                Err(e) => return unreadable(e),
+            },
+            Some(BodySource::JsonFile(p)) => match read_body_file(&p, base_dir) {
+                Ok(contents) => {
+                    let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                        log_unmeasured("input-not-json");
+                        return allow();
+                    };
+                    let Some(body) = json.get("body").and_then(|b| b.as_str()) else {
+                        // A PATCH that changes only labels or state posts no prose.
+                        log_unmeasured("no-body-field");
+                        return allow();
+                    };
+                    if title.is_none() {
+                        title = json
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string);
+                    }
+                    let escape = extract_escape(&strip_fences(body));
+                    (body.to_string(), escape)
+                }
+                Err(e) => return unreadable(e),
+            },
         },
     };
 
@@ -1597,7 +1742,8 @@ fn judge_command(
     let mut messages: Vec<String> = Vec::new();
     let mut bypasses: Vec<(u8, BypassProvenance)> = Vec::new();
     for (surface, segment) in posts {
-        let outcome = evaluate_segment(*surface, &all_segments, segment, base_dir, budgets);
+        let outcome =
+            evaluate_segment(*surface, command, &all_segments, segment, base_dir, budgets);
         let sev = severity(&outcome.verdict);
         worst = worst.max(sev);
         match outcome.verdict {
@@ -3153,7 +3299,10 @@ mod tests {
                 format!("echo hi | tee -a {p}"),
                 format!("cp /tmp/other {p}"),
                 format!("mv /tmp/other {p}"),
-                format!("cat > {p} <<'EOF'\nbody\nEOF"),
+                // A heredoc the guard cannot read exactly (#1334).
+                format!("cat > {p} <<EOF\n$(date)\nEOF"),
+                format!("cat > {p} <<'EOF'\nbody\nEOF\necho more >> {p}"),
+                format!("cat > {p} <<'EOF'\nunterminated"),
             ] {
                 let cmd = format!("{writer} && gh issue create --title x --body-file {p}");
                 let result = GuardBodyBudget.run(&make_bash(&cmd));
@@ -3161,6 +3310,62 @@ mod tests {
                 let msg = result.message.unwrap();
                 assert!(msg.contains("written by this same command"), "{cmd}: {msg}");
             }
+        });
+    }
+
+    #[test]
+    fn the_unmeasurable_nudge_names_the_redaction_gated_form() {
+        // #1334: the message says why and how to split, not just "can't".
+        scrubbed_env(|| {
+            let cmd =
+                "printf hi > /tmp/b-1334.md && gh pr create --title x --body-file /tmp/b-1334.md";
+            let msg = GuardBodyBudget.run(&make_bash(cmd)).message.unwrap();
+            assert!(msg.contains("cadence:redaction's gated form"), "{msg}");
+            assert!(
+                msg.contains("write the file in a separate command first"),
+                "{msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_same_command_heredoc_body_is_measured_like_a_separate_file() {
+        // #1334: the redaction gated form writes the body by heredoc, scans it
+        // and posts it in one command. The heredoc text is measured, and an
+        // over-budget one gets the verdict the same text in a file gets.
+        scrubbed_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let separate = over_hard_body_file(&dir);
+            let expected = GuardBodyBudget.run(&make_bash(&format!(
+                "gh pr create --title x --body-file {}",
+                separate.display()
+            )));
+            let path = dir.path().join("gated.md");
+            std::fs::write(&path, "stale").unwrap();
+            let p = path.to_string_lossy();
+            let long = "word ".repeat(400);
+            for cmd in [
+                format!(
+                    "cat > {p} <<'EOF'\n{long}\nEOF\nscan {p} && gh pr create --title x --body-file {p}"
+                ),
+                format!(
+                    "cat <<'EOF' > \"{p}\" && gh pr create --title x --body-file {p}\n{long}\nEOF"
+                ),
+                format!("cat > {p} <<EOF\n{long}\nEOF\ngh pr create --title x --body-file {p}"),
+            ] {
+                let result = GuardBodyBudget.run(&make_bash(&cmd));
+                assert_eq!(result.outcome, expected.outcome, "{cmd}");
+                let msg = result.message.unwrap_or_default();
+                assert!(msg.contains("400 words"), "{cmd}: {msg}");
+                assert!(!msg.contains("same command"), "{cmd}: {msg}");
+            }
+            let short = format!(
+                "cat > {p} <<'EOF'\nfive short words here ok\nEOF\ngh pr create --title x --body-file {p}"
+            );
+            assert_eq!(
+                GuardBodyBudget.run(&make_bash(&short)).outcome,
+                Outcome::Allow
+            );
         });
     }
 
