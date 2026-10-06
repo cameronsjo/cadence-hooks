@@ -316,8 +316,17 @@ struct FlagTable {
 
 /// gh `api`'s flag grammar, from `gh api --help` (gh 2.96.0): `-i/--include`
 /// is the ONLY boolean shorthand; every other shorthand takes a value.
+///
+/// `R` is listed although `gh api` has no `-R`/`--repo`: gh rejects the flag
+/// (`unknown flag: --repo`, gh 2.101.0) and sends nothing. Left out, it was an
+/// unknown letter, so the method scan read `gh api -R o/r repos/o/r` as an
+/// ambiguous method and blocked a GET as an unverifiable write
+/// (cameronsjo/cadence-hooks#1344). Modelled as value-taking because that is
+/// the only shape gh could ever give a repo flag: while gh rejects it, every
+/// verdict on such a command is harmless, and if gh ever adds it, this reading
+/// is already the right one.
 const GH_API_FLAGS: FlagTable = FlagTable {
-    value_shorts: "FfHqtpX",
+    value_shorts: "FfHqtpXR",
     bool_shorts: "i",
     long_takes_value: api_flag_takes_separate_value,
 };
@@ -1564,8 +1573,16 @@ fn resolve_target_repos_on(
 ) -> Vec<RepoResolution> {
     let dh = gh_command_host(command, env_host);
 
-    // 1. Explicit -R / --repo flag.
-    let mut resolutions = match repo_flag(command) {
+    // 1. Explicit -R / --repo flag. `gh api` has none (gh rejects it), so on
+    // an api call it never names the target: the endpoint does. Reading it
+    // let `gh api -X DELETE repos/evil/x/y -R owned/x` be judged as the
+    // owned repo (cameronsjo/cadence-hooks#1344).
+    let flag = if gh_api_endpoint(command).is_some() {
+        RepoFlag::Absent
+    } else {
+        repo_flag(command)
+    };
+    let mut resolutions = match flag {
         RepoFlag::Target(repo) => return vec![flag_value_resolution(&repo, &dh)],
         RepoFlag::Ambiguous => return vec![RepoResolution::AmbiguousFlags],
         RepoFlag::TargetOrAbsent(repo) => vec![flag_value_resolution(&repo, &dh)],
@@ -1873,19 +1890,48 @@ fn allowed_display_list(owners: &[AllowEntry], repos: &[AllowEntry]) -> Vec<Stri
         .collect()
 }
 
-/// Build the block message for a looped gh write, with a concrete `-R` fix
+/// Build the block message for a looped gh write, with a concrete fix target
 /// when the cwd resolved to an owned repo.
-fn looped_write_block_message(writes: &[String], suggestion: Option<&str>) -> String {
-    let found = if writes.is_empty() {
-        "gh write command(s) without -R".to_string()
-    } else {
-        writes.join(", ")
-    };
+///
+/// `writes` are the commands that take `-R`; `api_writes` are `gh api` calls,
+/// which have no `-R` flag (gh rejects it), so their fix is to spell the repo
+/// literally in the endpoint path (cameronsjo/cadence-hooks#1344).
+fn looped_write_block_message(
+    writes: &[String],
+    api_writes: &[String],
+    suggestion: Option<&str>,
+) -> String {
     let fix_target = suggestion.unwrap_or("owner/repo");
+    let mut found: Vec<&str> = writes
+        .iter()
+        .chain(api_writes)
+        .map(String::as_str)
+        .collect();
+    if found.is_empty() {
+        found.push("gh write command(s) without a target");
+    }
+    let mut fixes = Vec::new();
+    if !writes.is_empty() || api_writes.is_empty() {
+        fixes.push(format!("add `-R {fix_target}` to each command"));
+    }
+    if !api_writes.is_empty() {
+        fixes.push(format!(
+            "`gh api` has no -R flag: write the repo literally in the path \
+             (`gh api repos/{fix_target}/…`), with no variable or `{{owner}}`/`{{repo}}` \
+             placeholder in the owner or repo name"
+        ));
+    }
+    let header = if writes.is_empty() && !api_writes.is_empty() {
+        "gh api write in loop without a literal repos/<owner>/<repo> path"
+    } else {
+        "gh write command in loop without explicit -R flag"
+    };
     format!(
-        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
-         Found: {found}\n   \
-         Fix: add `-R {fix_target}` to each command",
+        "🚫 git-guardrails: {header}\n   \
+         Found: {}\n   \
+         Fix: {}",
+        found.join(", "),
+        fixes.join("; "),
     )
 }
 
@@ -1966,6 +2012,10 @@ fn api_flag_takes_separate_value(flag: &str) -> bool {
             | "-p"
             | "--preview"
             | "--cache"
+            // Not gh api flags (gh rejects them); value-taking for the reason
+            // given on `GH_API_FLAGS` (cameronsjo/cadence-hooks#1344).
+            | "-R"
+            | "--repo"
     )
 }
 
@@ -2982,7 +3032,43 @@ fn looped_command_kind(c: &loop_analysis::LoopedCommand) -> LoopedWriteKind {
 enum LoopedWriteKind {
     ReadOrAllowed,
     RepoWrite,
-    ApiUnverifiable { undeterminable_query: bool },
+    /// A `gh api` write whose endpoint path names its repository literally
+    /// ([`api_literal_repo_target`]). The target is fixed by the text, the
+    /// same as an explicit `-R`, so the loop gate does not demand `-R` (which
+    /// `gh api` does not have, cameronsjo/cadence-hooks#1344). Ownership is
+    /// judged by the per-segment pass that runs after the loop gate, which
+    /// also reads `--hostname` and an inherited `GH_HOST`.
+    ApiPathWrite,
+    ApiUnverifiable {
+        undeterminable_query: bool,
+    },
+}
+
+/// The `owner/repo` a `gh api` command names literally in its endpoint path,
+/// or `None` when it is not a `gh api` call, the endpoint is not
+/// `repos/<owner>/<repo>`, or either name is anything but plain text.
+///
+/// The character sets are GitHub's own (an owner is letters, digits, and `-`;
+/// a repository adds `_` and `.`), so the shapes whose target is decided at
+/// run time all fall out: a `$` or backtick expansion, gh's `{owner}`/`{repo}`
+/// placeholders (filled from the cwd remote, which a loop body can change),
+/// brace expansion, globs, and percent-escapes. Those stay
+/// [`LoopedWriteKind::RepoWrite`] and keep the cwd-based loop policy.
+fn api_literal_repo_target(command: &str) -> Option<String> {
+    let repo = api_repos_target(&gh_api_endpoint(command)?)?;
+    let (owner, name) = repo.split_once('/')?;
+    let owner_ok = !owner.is_empty()
+        && !owner.starts_with('-')
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let name_ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    (owner_ok && name_ok).then_some(repo)
 }
 
 /// Classify the reconstructed argv retained by loop analysis.
@@ -3012,6 +3098,9 @@ fn looped_write_kind(command: &str) -> LoopedWriteKind {
         return LoopedWriteKind::ApiUnverifiable {
             undeterminable_query: false,
         };
+    }
+    if api_literal_repo_target(command).is_some() {
+        return LoopedWriteKind::ApiPathWrite;
     }
     LoopedWriteKind::RepoWrite
 }
@@ -3080,6 +3169,17 @@ fn judge_write_segment(
                 extra_hosts,
             )
         })
+}
+
+/// How `segment` should name the repo `owner_repo` in a fix: `-R owner/repo`,
+/// or for `gh api`, which has no `-R` (gh rejects it), the endpoint path
+/// (cameronsjo/cadence-hooks#1344).
+fn target_spelling(segment: &str, owner_repo: &str) -> String {
+    if gh_api_endpoint(segment).is_some() {
+        format!("gh api repos/{owner_repo}/…")
+    } else {
+        format!("-R {owner_repo}")
+    }
 }
 
 /// The verdict on one repo a write segment may land on.
@@ -3197,16 +3297,17 @@ fn judge_resolution(
                 // value of, so it is UNRESOLVABLE, not unowned — and the
                 // unowned template's `-R <owner>/<name>` fix would graft an
                 // owner the caller never chose onto `$1` (#757).
+                let literal = target_spelling(segment, "owner/repo");
                 Some(CheckResult::block_structured(
                     format!(
                         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
                          Target:  {repo} (an unexpanded shell expansion — its value is only known \
                          when the shell runs)\n   \
-                         Fix: pass the target as a literal `-R owner/repo`"
+                         Fix: pass the target as a literal `{literal}`"
                     ),
                     BlockMetadata {
                         rule_id: "gh-write-target-unresolvable".to_string(),
-                        fix: "pass the target as a literal -R owner/repo".to_string(),
+                        fix: format!("pass the target as a literal {literal}"),
                         allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                         severity: "error",
                     },
@@ -3224,7 +3325,7 @@ fn judge_resolution(
                 let fix = if host == UNRESOLVED_GH_HOST {
                     "name the host on the gh command itself (--hostname <host>)".to_string()
                 } else {
-                    format!("-R {example_owner}/{repo_name}")
+                    target_spelling(segment, &format!("{example_owner}/{repo_name}"))
                 };
                 Some(CheckResult::block_structured(
                     disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
@@ -3417,20 +3518,26 @@ impl Check for GhWriteGuard {
                         &extra_hosts,
                     );
                     if let LoopWriteDecision::Block { suggestion } = decision {
-                        let writes: Vec<String> = cmds
+                        let (api_writes, writes): (Vec<String>, Vec<String>) = cmds
                             .iter()
                             .filter(|c| {
                                 c.explicit_repo.is_none()
                                     && looped_command_kind(c) == LoopedWriteKind::RepoWrite
                             })
-                            .map(|c| format!("`gh {}`", c.args.join(" ")))
-                            .collect();
-                        let fix = match suggestion.as_deref() {
-                            Some(s) => format!("-R {s}"),
-                            None => "-R <owner>/<repo>".to_string(),
+                            .map(|c| format!("gh {}", c.args.join(" ")))
+                            .partition(|c| gh_api_endpoint(c).is_some());
+                        let quote = |v: Vec<String>| -> Vec<String> {
+                            v.into_iter().map(|c| format!("`{c}`")).collect()
+                        };
+                        let (writes, api_writes) = (quote(writes), quote(api_writes));
+                        let target = suggestion.as_deref().unwrap_or("<owner>/<repo>");
+                        let fix = if writes.is_empty() && !api_writes.is_empty() {
+                            format!("gh api repos/{target}/…")
+                        } else {
+                            format!("-R {target}")
                         };
                         return CheckResult::block_structured(
-                            looped_write_block_message(&writes, suggestion.as_deref()),
+                            looped_write_block_message(&writes, &api_writes, suggestion.as_deref()),
                             BlockMetadata {
                                 rule_id: "gh-write-loop-missing-repo".to_string(),
                                 fix,
@@ -4909,7 +5016,7 @@ mod tests {
     #[test]
     fn looped_write_block_message_includes_suggestion() {
         let writes = vec!["`gh issue close $i`".to_string()];
-        let msg = looped_write_block_message(&writes, Some("cameronsjo/cadence-hooks"));
+        let msg = looped_write_block_message(&writes, &[], Some("cameronsjo/cadence-hooks"));
         assert!(msg.contains("-R cameronsjo/cadence-hooks"));
         assert!(msg.contains("`gh issue close $i`"));
     }
@@ -4917,8 +5024,86 @@ mod tests {
     #[test]
     fn looped_write_block_message_generic_without_suggestion() {
         let writes = vec!["`gh pr create`".to_string()];
-        let msg = looped_write_block_message(&writes, None);
+        let msg = looped_write_block_message(&writes, &[], None);
         assert!(msg.contains("-R owner/repo"));
+    }
+
+    #[test]
+    fn looped_api_write_message_never_advises_dash_r() {
+        // #1344: gh api has no -R, so its advice is the literal path.
+        let api = vec!["`gh api -X DELETE repos/$o/x/git/refs/heads/a`".to_string()];
+        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"));
+        assert!(!msg.contains("add `-R"), "{msg}");
+        assert!(msg.contains("gh api repos/cameronsjo/forgectl/…"), "{msg}");
+        assert!(
+            msg.contains("without a literal repos/<owner>/<repo> path"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn looped_mixed_write_message_gives_each_its_own_fix() {
+        let writes = vec!["`gh pr comment $i`".to_string()];
+        let api = vec!["`gh api -X DELETE repos/$o/x`".to_string()];
+        let msg = looped_write_block_message(&writes, &api, None);
+        assert!(msg.contains("add `-R owner/repo`"), "{msg}");
+        assert!(msg.contains("`gh api` has no -R flag"), "{msg}");
+    }
+
+    #[test]
+    fn api_literal_repo_target_accepts_only_plain_names() {
+        let cases = [
+            (
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a",
+                Some("cameronsjo/forgectl"),
+            ),
+            (
+                "gh api -X DELETE \"repos/o/r.js/git/refs/heads/${b}\"",
+                Some("o/r.js"),
+            ),
+            ("gh api -X DELETE /repos/o/my_repo", Some("o/my_repo")),
+            ("gh api -X DELETE \"repos/$o/r/x\"", None),
+            ("gh api -X DELETE \"repos/o/${r}/x\"", None),
+            ("gh api -X DELETE \"repos/o/r$x/y\"", None),
+            ("gh api -X DELETE 'repos/o/`echo r`/y'", None),
+            ("gh api -X DELETE repos/{owner}/{repo}/x", None),
+            ("gh api -X DELETE repos/o/{repo}/x", None),
+            ("gh api -X DELETE repos/o/r%2Fx/y", None),
+            ("gh api -X DELETE repos/o/../x", None),
+            ("gh api -X DELETE repos/o/*/x", None),
+            ("gh api -X DELETE repos/-o/r", None),
+            ("gh api -X DELETE orgs/o/repos", None),
+            ("gh pr comment 1 --body repos/o/r", None),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(api_literal_repo_target(cmd).as_deref(), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn api_dash_r_is_not_a_method_reading() {
+        // #1344: `-R` is not a gh api flag; it must not make a GET ambiguous.
+        assert!(!is_write_command(
+            "gh api -R cameronsjo/forgectl repos/cameronsjo/forgectl"
+        ));
+        assert!(!is_write_command(
+            "gh api --repo cameronsjo/forgectl repos/cameronsjo/forgectl"
+        ));
+        assert!(!is_write_command(
+            "gh api -Rcameronsjo/forgectl repos/cameronsjo/forgectl"
+        ));
+        // A real method or body still makes it a write, wherever -R sits.
+        assert!(is_write_command("gh api -R o/r -X DELETE repos/o/r/x"));
+        assert!(is_write_command("gh api -X DELETE -R o/r repos/o/r/x"));
+        assert!(is_write_command("gh api -R o/r -XDELETE repos/o/r/x"));
+        assert!(is_write_command(
+            "gh api -R o/r repos/o/r/issues -f title=x"
+        ));
+        // The endpoint is read past -R's value, not as it.
+        assert_eq!(
+            gh_api_endpoint("gh api -R o/r -X DELETE repos/evil/x/y").as_deref(),
+            Some("repos/evil/x/y")
+        );
     }
 
     // --- #44: actionable deny messages ---
@@ -5128,6 +5313,179 @@ mod tests {
                 assert_eq!(meta.severity, "error");
             },
         );
+    }
+
+    /// The command blocked in cameronsjo/cadence-hooks#1344.
+    const ISSUE_1344_LOOP: &str = r#"for b in a b; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/${b}"; done"#;
+
+    /// Run the guard from `/tmp` (no git remote, so no cwd fallback) with
+    /// `owners` allowed, in relaxed or strict loop mode.
+    fn run_1344(command: &str, owners: &str, strict: bool) -> CheckResult {
+        let mut result = None;
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some(owners)),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CADENCE_GH_STRICT_LOOPS", strict.then_some("1")),
+                ("GH_HOST", None),
+                ("GH_REPO", None),
+            ],
+            || result = Some(GhWriteGuard.run(&input_with(command, "/tmp"))),
+        );
+        result.expect("guard ran")
+    }
+
+    fn blocks(result: &CheckResult) -> bool {
+        result.outcome == cadence_hooks_core::Outcome::Block
+    }
+
+    fn msg(result: &CheckResult) -> &str {
+        result.message.as_deref().unwrap_or("")
+    }
+
+    #[test]
+    fn looped_api_write_to_owned_path_is_allowed_in_both_loop_modes() {
+        // #1344: the path names the target, so the loop gate needs no -R.
+        for strict in [false, true] {
+            let result = run_1344(ISSUE_1344_LOOP, "cameronsjo", strict);
+            assert!(!blocks(&result), "strict={strict}: {}", msg(&result));
+        }
+    }
+
+    #[test]
+    fn looped_api_write_to_unowned_path_is_refused_without_dash_r_advice() {
+        // The exact #1344 command against an allowlist that does not own it:
+        // still refused, now as an ownership verdict, never "add -R".
+        let result = run_1344(ISSUE_1344_LOOP, "someone-else", false);
+        assert!(blocks(&result));
+        assert!(
+            msg(&result).contains("targets repo you don't own"),
+            "{}",
+            msg(&result)
+        );
+        assert!(
+            msg(&result).contains("cameronsjo/forgectl"),
+            "{}",
+            msg(&result)
+        );
+        assert!(!msg(&result).contains("-R"), "{}", msg(&result));
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        assert_eq!(meta.fix, "gh api repos/someone-else/forgectl/…");
+    }
+
+    #[test]
+    fn api_write_with_variable_repo_gets_path_advice_outside_loops_too() {
+        let result = run_1344(
+            r#"gh api -X DELETE "repos/$o/x/git/refs/heads/a""#,
+            "cameronsjo",
+            false,
+        );
+        assert!(blocks(&result));
+        assert!(!msg(&result).contains("-R owner/repo"), "{}", msg(&result));
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(
+            meta.fix,
+            "pass the target as a literal gh api repos/owner/repo/…"
+        );
+    }
+
+    #[test]
+    fn dash_r_never_stands_in_for_an_api_path() {
+        // gh api has no -R; the endpoint is the target wherever -R sits.
+        for command in [
+            "gh api -X DELETE repos/evil/x/y -R cameronsjo/x",
+            "gh api -X DELETE repos/evil/x/y --repo cameronsjo/x",
+            "gh api -R cameronsjo/x -X DELETE repos/evil/x/y",
+            r#"for o in a b; do gh api -R cameronsjo/x -X DELETE "repos/$o/y"; done"#,
+            "for b in a b; do gh api -R cameronsjo/x -X DELETE repos/evil/x/$b; done",
+        ] {
+            let result = run_1344(command, "cameronsjo", false);
+            assert!(blocks(&result), "{command} was allowed");
+        }
+    }
+
+    #[test]
+    fn looped_api_write_with_variable_repo_is_refused_with_path_advice() {
+        // The owner comes from the loop variable: no literal target, and the
+        // fix is the path, since gh api has no -R.
+        let command = r#"for o in a b; do gh api -X DELETE "repos/$o/x/git/refs/heads/a"; done"#;
+        let result = run_1344(command, "cameronsjo", false);
+        assert!(blocks(&result));
+        assert!(!msg(&result).contains("add `-R"), "{}", msg(&result));
+        assert!(
+            msg(&result).contains("`gh api` has no -R flag"),
+            "{}",
+            msg(&result)
+        );
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
+        assert_eq!(meta.fix, "gh api repos/<owner>/<repo>/…");
+    }
+
+    #[test]
+    fn looped_api_write_with_placeholder_keeps_the_cwd_loop_policy() {
+        // `{owner}/{repo}` is filled from the cwd remote, which a loop body
+        // can change: no literal target, so the cwd policy still decides.
+        let command =
+            r#"for b in a b; do gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/${b}"; done"#;
+        let result = run_1344(command, "cameronsjo", false);
+        assert!(blocks(&result));
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
+    }
+
+    #[test]
+    fn looped_api_write_to_an_unread_host_is_refused() {
+        // A literal path is owned on a host only: the per-segment pass must
+        // still refuse a host the guard cannot read.
+        let command = r#"for h in a b; do gh api --hostname "$h" -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a; done"#;
+        assert!(blocks(&run_1344(command, "cameronsjo", false)));
+        let command = r#"for b in a b; do GH_HOST=evil.example gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/${b}"; done"#;
+        assert!(blocks(&run_1344(command, "cameronsjo", false)));
+    }
+
+    #[test]
+    fn looped_api_write_beside_a_dash_r_write_still_demands_dash_r() {
+        // The api write is fine; the gh pr comment beside it has no target.
+        let command = r#"for i in 1 2; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/$i"; gh pr comment $i --body x; done"#;
+        let result = run_1344(command, "cameronsjo", false);
+        assert!(blocks(&result));
+        assert!(msg(&result).contains("gh pr comment"), "{}", msg(&result));
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.fix, "-R <owner>/<repo>");
+    }
+
+    #[test]
+    fn looped_api_get_is_allowed() {
+        for command in [
+            "for n in 1 2; do gh api repos/o/r/pulls/$n; done",
+            "for n in 1 2; do gh api -R o/r repos/o/r/pulls/$n; done",
+        ] {
+            let result = run_1344(command, "cameronsjo", false);
+            assert!(!blocks(&result), "{command}: {}", msg(&result));
+        }
+    }
+
+    #[test]
+    fn api_get_with_dash_r_is_not_an_unverifiable_write() {
+        // #1344's second block: following the old advice turned a GET into
+        // "gh api write to an unverifiable target".
+        let result = run_1344(
+            "gh api -R cameronsjo/forgectl repos/cameronsjo/forgectl",
+            "cameronsjo",
+            false,
+        );
+        assert!(!blocks(&result), "{}", msg(&result));
+        // A real write carrying -R is still judged on its path.
+        let result = run_1344(
+            "gh api -R cameronsjo/x -X DELETE repos/evil/x/y",
+            "cameronsjo",
+            false,
+        );
+        assert!(blocks(&result));
+        assert!(msg(&result).contains("evil/x"), "{}", msg(&result));
     }
 
     #[test]

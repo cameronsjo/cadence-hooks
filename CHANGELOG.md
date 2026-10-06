@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` no longer tells a looped `gh api` write to add `-R`, which `gh api` does not have.** A `gh api` write whose endpoint names its repository literally (`repos/<owner>/<repo>/…`, plain names only) now counts as an explicit target in a loop, the same as `-R`, in both relaxed and `CADENCE_GH_STRICT_LOOPS=1` mode; its ownership, host, and inherited `GH_HOST` are judged by the per-segment check, so `for b in a b; do gh api -X DELETE "repos/<owned>/<repo>/git/refs/heads/${b}"; done` is allowed and the same loop against an unowned repo is refused as an unowned target. A path whose owner or repo is a variable, a `{owner}`/`{repo}` placeholder, or any other non-literal text keeps the cwd-based loop policy. Every fix the guard offers for a `gh api` write (the loop block, the unexpanded-expansion block, the unowned-target block) now names the path (`gh api repos/<owner>/<repo>/…`) instead of `-R`. `-R`/`--repo` on `gh api` (which gh rejects with `unknown flag`) is read as a value-taking flag, so `gh api -R o/r repos/o/r` is no longer an "unverifiable write" and a GET carrying it passes, and it never stands in for the endpoint's repository: `gh api -X DELETE repos/<unowned>/x -R <owned>/x` was allowed and now blocks (cameronsjo/cadence-hooks#1344).
+
 ## [0.123.1] - 2026-10-05
 
 ### Fixed
