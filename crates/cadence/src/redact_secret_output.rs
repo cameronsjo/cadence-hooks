@@ -836,9 +836,16 @@ fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
     let after = &value[digits..];
     let next = after.trim_start_matches([' ', '\t']);
     let complete = after.trim_end().is_empty()
-        || after.starts_with([',', ';', ')'])
+        || closes_count(after)
         || (next.len() < after.len() && starts_key_field(next));
     complete.then_some(digits)
+}
+
+/// Does `after` start with a closer (`,` `;` `)`) that ends the value?
+/// A closer glued to more text (`1234,hunter2`) does not count.
+fn closes_count(after: &str) -> bool {
+    let rest = after.trim_start_matches([',', ';', ')']);
+    rest.len() < after.len() && rest.chars().next().is_none_or(char::is_whitespace)
 }
 
 /// Does `text` begin with a `name=` or `name:` field?
@@ -2696,6 +2703,11 @@ mod tests {
             "pass=4821\tsecretword\n".to_string(),
             "x pass=5 hunter2\n".to_string(),
             "pass: 5 hunter2\n".to_string(),
+            // A closer glued to more text does not end the count.
+            "pass=1234,hunter2\n".to_string(),
+            "pass=1234;hunter2\n".to_string(),
+            "pass=1234)hunter2\n".to_string(),
+            "lastpass=1234,hunter2\n".to_string(),
             // A tally ends the value; a secret after it is judged on its own.
             format!("pass=5 token={p}\n"),
             format!("x pass=5 token={p}\n"),
