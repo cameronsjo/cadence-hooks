@@ -206,6 +206,191 @@ fn push_loops_of(program: Option<&brush_parser::ast::Program>) -> LoopAnalysis {
     }
 }
 
+/// One push a literal `for` loop runs in one iteration: the directory its
+/// `git -C` names and the remote it names (cameronsjo/cadence-hooks#1341).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralLoopPush {
+    /// The `-C` directory, with the loop variable replaced by this
+    /// iteration's word. May be relative to the command's cwd.
+    pub dir: String,
+    /// The remote name or URL the push names.
+    pub remote: String,
+}
+
+/// The pushes of a command that is exactly one `for` loop over literal words
+/// whose every push is `git -C <dir> push <remote> …`, one entry per distinct
+/// iteration target, plus the number of push commands in the loop body.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LiteralLoop {
+    pub pushes: Vec<LiteralLoopPush>,
+    pub push_commands: usize,
+}
+
+/// Longest command [`literal_loop_pushes`] parses.
+const LITERAL_LOOP_MAX_LEN: usize = 4096;
+
+/// Commands a literal push loop's body may run besides `git`. None of them
+/// can assign the loop variable, change directory, or run another command.
+const LITERAL_LOOP_BODY_COMMANDS: &[&str] = &["git", "echo", "true", "tail", "head", "grep"];
+
+/// Read `command` as a push loop each of whose pushes can be judged in the
+/// repository it runs in (cameronsjo/cadence-hooks#1341):
+///
+/// - the whole command is one `for VAR in <words>; do …; done`, with no
+///   redirect, chain or pipeline around it;
+/// - every loop word is a literal (no expansion, quote-free or wholly quoted);
+/// - the body holds only simple commands from [`LITERAL_LOOP_BODY_COMMANDS`],
+///   none carrying a prefix assignment or a process substitution;
+/// - every push is `git -C <dir> push … <remote> …`, where `<dir>` is a
+///   literal or exactly the loop variable (`$d`, `"$d"`, `${d}`, `"${d}"`),
+///   and the remote is a literal positional.
+///
+/// `None` for anything else, and for a loop with no push: the caller keeps its
+/// old verdict for every shape this does not recognise.
+pub fn literal_loop_pushes(command: &str) -> Option<LiteralLoop> {
+    // A second parse of a long command costs the shared deadline (a 200 KB
+    // flood is the worst case), and the loops this reads are one line.
+    if command.len() > LITERAL_LOOP_MAX_LEN
+        || !command.trim_start().starts_with("for")
+        || !command.contains("-C")
+    {
+        return None;
+    }
+    let program = parse_command(command)?;
+    let [complete] = program.complete_commands.as_slice() else {
+        return None;
+    };
+    let [item] = complete.0.as_slice() else {
+        return None;
+    };
+    if !item.0.additional.is_empty() {
+        return None;
+    }
+    let pipeline = &item.0.first;
+    if pipeline.bang {
+        return None;
+    }
+    let [Command::Compound(CompoundCommand::ForClause(for_cmd), None)] = pipeline.seq.as_slice()
+    else {
+        return None;
+    };
+    let var = for_cmd.variable_name.as_str();
+    let values: Vec<String> = for_cmd
+        .values
+        .as_ref()?
+        .iter()
+        .map(|w| literal_word(&w.value))
+        .collect::<Option<_>>()?;
+    if values.is_empty() {
+        return None;
+    }
+
+    // (literal dir or `None` for the loop variable, remote) per push command.
+    let mut specs: Vec<(Option<String>, String)> = Vec::new();
+    for body_item in &for_cmd.body.list.0 {
+        let and_or = &body_item.0;
+        let pipelines =
+            std::iter::once(&and_or.first).chain(and_or.additional.iter().map(|additional| {
+                match additional {
+                    brush_parser::ast::AndOr::And(p) | brush_parser::ast::AndOr::Or(p) => p,
+                }
+            }));
+        for body_pipeline in pipelines {
+            for cmd in &body_pipeline.seq {
+                let Command::Simple(simple) = cmd else {
+                    return None;
+                };
+                if simple.prefix.is_some() {
+                    return None;
+                }
+                let name = simple.word_or_name.as_ref()?.value.as_str();
+                if !LITERAL_LOOP_BODY_COMMANDS.contains(&name) {
+                    return None;
+                }
+                if simple.suffix.as_ref().is_some_and(|suffix| {
+                    suffix
+                        .0
+                        .iter()
+                        .any(|i| matches!(i, CommandPrefixOrSuffixItem::ProcessSubstitution(..)))
+                }) {
+                    return None;
+                }
+                if !is_git_push_command(simple) {
+                    continue;
+                }
+                let words = suffix_words(simple);
+                let [flag, dir, verb, ..] = words.as_slice() else {
+                    return None;
+                };
+                if flag != "-C" || verb != "push" {
+                    return None;
+                }
+                let dir = if is_variable_reference(dir, var) {
+                    None
+                } else {
+                    Some(literal_word(dir)?)
+                };
+                let remote = literal_word(&extract_push_remote(simple)?)?;
+                specs.push((dir, remote));
+            }
+        }
+    }
+    if specs.is_empty() {
+        return None;
+    }
+
+    let mut pushes: Vec<LiteralLoopPush> = Vec::new();
+    for value in &values {
+        for (dir, remote) in &specs {
+            let push = LiteralLoopPush {
+                dir: dir.clone().unwrap_or_else(|| value.clone()),
+                remote: remote.clone(),
+            };
+            if !pushes.contains(&push) {
+                pushes.push(push);
+            }
+        }
+    }
+    Some(LiteralLoop {
+        pushes,
+        push_commands: specs.len(),
+    })
+}
+
+/// A word the shell passes through unchanged: plain path and name characters,
+/// optionally wrapped whole in one pair of quotes. No expansion, glob, tilde,
+/// brace or escape, and no leading `-`.
+fn literal_word(raw: &str) -> Option<String> {
+    let inner = ['"', '\'']
+        .iter()
+        .find_map(|q| raw.strip_prefix(*q).and_then(|r| r.strip_suffix(*q)))
+        .unwrap_or(raw);
+    let plain = !inner.is_empty()
+        && !inner.starts_with('-')
+        && inner.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '+' | ',' | '@' | ':' | '%')
+        });
+    plain.then(|| inner.to_string())
+}
+
+/// Is `word` exactly a reference to `var`: `$var`, `"$var"`, `${var}` or
+/// `"${var}"`?
+fn is_variable_reference(word: &str, var: &str) -> bool {
+    let inner = word
+        .strip_prefix('"')
+        .and_then(|w| w.strip_suffix('"'))
+        .unwrap_or(word);
+    let Some(name) = inner.strip_prefix('$') else {
+        return false;
+    };
+    let name = name
+        .strip_prefix('{')
+        .and_then(|n| n.strip_suffix('}'))
+        .unwrap_or(name);
+    name == var
+}
+
 /// Check whether any loop body in the command contains a command that could
 /// change the shell's working directory.
 ///
@@ -714,6 +899,51 @@ fn suffix_words(cmd: &SimpleCommand) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- literal_loop_pushes (#1341) ---
+
+    #[test]
+    fn literal_loop_pushes_expands_each_iteration() {
+        let lit = literal_loop_pushes(
+            r#"for d in /a "/b"; do git -C "$d" push origin main; git -C /c push up x; done"#,
+        )
+        .expect("literal loop");
+        assert_eq!(lit.push_commands, 2);
+        let pairs: Vec<(&str, &str)> = lit
+            .pushes
+            .iter()
+            .map(|p| (p.dir.as_str(), p.remote.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("/a", "origin"), ("/c", "up"), ("/b", "origin")],
+            "one entry per distinct iteration target"
+        );
+    }
+
+    #[test]
+    fn literal_loop_pushes_refuses_what_it_cannot_read() {
+        for command in [
+            "git -C /a push origin main",
+            "for d in /a /b; do git -C \"$d\" push; done",
+            "for d in $DIRS; do git -C \"$d\" push origin main; done",
+            "for d in /a/*; do git -C \"$d\" push origin main; done",
+            "for d in ~/a; do git -C \"$d\" push origin main; done",
+            "for d in /a; do git -C \"$d/sub\" push origin main; done",
+            "for d in /a; do git -C \"$e\" push origin main; done",
+            "for d in /a; do git -C \"$d\" push \"$r\" main; done",
+            "for d in /a; do git push origin main; done",
+            "for d in /a; do cd \"$d\"; git -C . push origin main; done",
+            "for d in /a; do d=/b; git -C \"$d\" push origin main; done",
+            "for d in /a; do X=1 git -C \"$d\" push origin main; done",
+            "for d in /a; do git -C \"$d\" push origin main; done; git push",
+            "for d in /a; do git -C \"$d\" push origin main; done > log",
+            "for d in /a; do if true; then git -C \"$d\" push origin main; fi; done",
+            "for d in /a; do echo hi; done",
+        ] {
+            assert_eq!(literal_loop_pushes(command), None, "{command}");
+        }
+    }
 
     // --- analyze_gh_loops ---
 
