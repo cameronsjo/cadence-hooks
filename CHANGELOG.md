@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-body-budget` ignores a marked provenance block.** A PR, issue, review or comment body that ends with a `<!-- claude-trailer -->` line followed by the producer tuple (`Session-Id`, `Model`, `Harness`, `Machine`, `Co-Authored-By`, the Generated-with line, or any other short `Key: value` line) no longer counts those lines toward the word budget or the narration check. Only the last marker counts, and the block must be at most 12 non-blank lines of at most 100 characters and 30 words in all, every line trailer-shaped. Prose, a long line, or a thirteenth line after the marker voids the cut and the whole body is measured as before. Bodies without the marker keep the old key-based stripping. Probed `redact-external-content`, `warn-overshare`, `warn-pr-issue-link`, `warn-inline-body` and `verify-pr-autoclose` with the tuple: none misfired, so they are unchanged.
+
 ## [0.124.0] - 2026-10-06
 
 ### Added
