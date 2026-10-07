@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.124.0] - 2026-10-06
+
 ### Added
 
 - **`warn-unreviewed-ready-flip` nudges at `gh pr review` when the marker's values sit off line 1 (#1335).** A review body carrying `head=<40-char SHA>`, `crit=` and `imp=` whose first line is not a well-formed `<!-- cadence-review: … -->` marker used to look reviewed to a person and surface only at `gh pr ready`. The nudge now fires on the review itself and gives the literal line to paste, prefilled with the body's own head SHA and counts (`<reviewer>` left to fill). It reads an inline `--body`, an on-disk `--body-file`, or a readable same-command heredoc; it never calls `gh`, never blocks, and is silent when line 1 parses or a trigger token is missing. The existing `Bash(*gh pr *)` wiring already reaches `gh pr review`.
