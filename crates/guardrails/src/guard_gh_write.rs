@@ -1497,6 +1497,12 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
         if token == "--" {
             break;
         }
+        if flag_name_is_dynamic(token, table) {
+            // `--$b` with `b=hostname=evil` is a `--hostname` only the shell
+            // can see, anywhere in the argv (cameronsjo/cadence-hooks#1346).
+            flag_host = Some(UNRESOLVED_GH_HOST.to_string());
+            break;
+        }
         if token == "--hostname" {
             if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
                 flag_host = Some(host.to_ascii_lowercase());
@@ -1525,6 +1531,40 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
     }
 
     flag_host.or(inline_host).unwrap_or(fallback)
+}
+
+/// True when a flag token's NAME comes from a shell expansion (`--$b`,
+/// `` -`x` ``), so the shell, not this guard, decides which flag it is — and
+/// it may be `--hostname`.
+///
+/// Only the name counts. An attached long VALUE (`--field=body=$x`) cannot
+/// rename the flag, and in a shorthand cluster a value-taking letter claims
+/// the rest of the cluster as its value (`-fbody=$x`). Without a flag table,
+/// only a first letter can be attributed, as in [`scan_cluster`].
+fn flag_name_is_dynamic(token: &str, table: Option<&FlagTable>) -> bool {
+    let is_expansion = |c: char| c == '$' || c == '`';
+    if let Some(long) = token.strip_prefix("--") {
+        return long
+            .split('=')
+            .next()
+            .unwrap_or(long)
+            .contains(is_expansion);
+    }
+    let Some(cluster) = token.strip_prefix('-') else {
+        return false;
+    };
+    let Some(table) = table else {
+        return cluster.starts_with(is_expansion);
+    };
+    for c in cluster.chars() {
+        if is_expansion(c) {
+            return true;
+        }
+        if table.value_shorts.contains(c) {
+            return false;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -6978,6 +7018,52 @@ mod tests {
                 let result = GhWriteGuard.run(&input);
                 let meta = result.block_metadata.expect("structured block");
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn expanded_flag_name_after_the_endpoint_cannot_hide_a_hostname() {
+        // cameronsjo/cadence-hooks#1346: with `b=hostname=evil.example`, the
+        // shell turns `--$b` into `--hostname=evil.example`; the guard read
+        // the owned endpoint on the default host and allowed. `b` is set by
+        // an earlier command: an assignment in the same command is already
+        // followed. Every row here allowed before the fix.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x --$b",
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x --${b}",
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x \"--$b\"",
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x -$b",
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x -i$b",
+                "gh pr merge 1 -R cameronsjo/x --$b",
+                "gh pr merge 1 -R cameronsjo/x -$b",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn expansion_in_a_flag_value_still_allows_an_owned_write() {
+        // Only the flag NAME decides the host; a value carrying `$` cannot.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/x",
+                "gh api repos/cameronsjo/x -X POST --field=body=$msg",
+                "gh api repos/cameronsjo/x -X POST -fbody=$msg",
+                "gh api repos/cameronsjo/x -X POST -f \"body=$msg\"",
+                "gh pr comment 1 -R cameronsjo/x -b\"$msg\"",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
             }
         });
     }
