@@ -561,7 +561,7 @@ fn is_trailer_line(line: &str) -> bool {
     if line.chars().count() > TRAILER_MAX_LINE_CHARS {
         return false;
     }
-    if ROBOT_RE.is_match(line) {
+    if line.starts_with("🤖 Generated with [Claude Code]") {
         return true;
     }
     line.split_once(':').is_some_and(|(key, value)| {
@@ -596,7 +596,10 @@ pub fn strip_trailer_block(body: &str) -> &str {
             return body;
         }
     }
-    &body[..at]
+    // Keep the marker line itself: it is a comment that costs no words, and
+    // its `-->` closes any `<!--` left open above it, as before the cut.
+    let marker_end = body[at..].find('\n').map_or(body.len(), |i| at + i);
+    &body[..marker_end]
 }
 
 /// Strip everything that is not prose, then count what is left.
@@ -2265,12 +2268,38 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_word_key_voids_the_cut() {
+        let tail = "We fixed the bug: it now works\n";
+        assert_eq!(measure(&marked("one two three", tail)).words, 10);
+    }
+
+    #[test]
+    fn short_prose_in_key_value_form_over_the_word_cap_counts() {
+        let tail: String = (0..12)
+            .map(|i| format!("Notes{i}: aa bb cc dd ee\n"))
+            .collect();
+        assert!(measure(&marked("one two three", &tail)).words > 60);
+    }
+
+    #[test]
+    fn an_unclosed_comment_above_the_marker_is_closed_by_it() {
+        let body = marked(
+            "real words here\n<!-- template note\nhidden one two",
+            "Session-Id: x\n",
+        );
+        assert_eq!(measure(&body).words, 3);
+    }
+
+    #[test]
     fn only_the_last_marker_counts() {
         // Prose between two markers is outside the final trailer block.
+        let tail = "Session-Name: x y z\n";
         let body = format!(
-            "intro\n{TRAILER_MARKER}\nseven eight nine ten eleven twelve\n{TRAILER_MARKER}\n{TUPLE}"
+            "intro\n{TRAILER_MARKER}\nseven eight nine ten eleven twelve\n{TRAILER_MARKER}\n{tail}"
         );
-        assert!(measure(&body).words >= 7);
+        assert_eq!(measure(&body).words, 7, "the first marker's tail counts");
+        let single = format!("intro\n{TRAILER_MARKER}\n{tail}");
+        assert_eq!(measure(&single).words, 1);
     }
 
     #[test]
