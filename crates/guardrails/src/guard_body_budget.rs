@@ -539,17 +539,74 @@ fn exempt_session_subject(text: &str) -> String {
         .join("\n")
 }
 
+/// The line that opens a body's provenance block. An HTML comment, so GitHub
+/// does not render it.
+pub const TRAILER_MARKER: &str = "<!-- claude-trailer -->";
+
+/// How many non-blank lines a marked trailer block may hold.
+const TRAILER_MAX_LINES: usize = 12;
+
+/// The longest `Key: value` line a marked trailer block may hold. Long enough
+/// for a `Co-Authored-By` line, too short for a sentence of prose.
+const TRAILER_MAX_LINE_CHARS: usize = 100;
+
+/// Whether a line belongs in a marked trailer block: `Key: value` with a
+/// single-token key and a short one-line value, or the robot attribution line.
+fn is_trailer_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.chars().count() > TRAILER_MAX_LINE_CHARS {
+        return false;
+    }
+    if ROBOT_RE.is_match(line) {
+        return true;
+    }
+    line.split_once(':').is_some_and(|(key, value)| {
+        !value.trim().is_empty()
+            && key.starts_with(|c: char| c.is_ascii_alphabetic())
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Cut a body at its last [`TRAILER_MARKER`] line when everything after it is
+/// trailer-shaped: blank lines, `Key: value` lines, the robot line, at most
+/// [`TRAILER_MAX_LINES`] of them. Anything else after the marker (prose, a
+/// long line, too many lines) returns the body whole, so nothing hides behind
+/// a marker. Only the last marker counts.
+///
+/// Pure.
+pub fn strip_trailer_block(body: &str) -> &str {
+    let mut cut: Option<usize> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim() == TRAILER_MARKER {
+            cut = Some(offset);
+        }
+        offset += line.len();
+    }
+    let Some(at) = cut else { return body };
+    let mut count = 0;
+    for line in body[at..].lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        count += 1;
+        if count > TRAILER_MAX_LINES || !is_trailer_line(line) {
+            return body;
+        }
+    }
+    &body[..at]
+}
+
 /// Strip everything that is not prose, then count what is left.
 ///
 /// Strip order matters and is fixed: fenced code blocks first (a fence can
 /// contain anything, including a `-->` or a backtick), then HTML comments, the
 /// provenance trailers, the robot attribution line, markdown link targets, and
-/// finally inline code spans. A body is then counted line by line.
+/// finally inline code spans. A body is then counted line by line. A marked
+/// trailer block ([`TRAILER_MARKER`]) is cut off after the fences go.
 ///
 /// Pure.
 pub fn measure(body: &str) -> Measurement {
     let stripped = strip_fences(body);
-    let stripped = HTML_COMMENT_RE.replace_all(&stripped, "");
+    let stripped = strip_trailer_block(&stripped);
+    let stripped = HTML_COMMENT_RE.replace_all(stripped, "");
     let stripped = TRAILER_RE.replace_all(&stripped, "");
     let stripped = ROBOT_RE.replace_all(&stripped, "");
     // The link TEXT stays (it is prose the reader reads); only the target goes.
@@ -2123,6 +2180,93 @@ mod tests {
         for (name, body) in cases {
             assert_eq!(measure(body).words, 0, "{name} should cost 0 words");
         }
+    }
+
+    // ---- marked trailer block ----
+
+    const TUPLE: &str = "Session-Id: 0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d\n\
+                         Model: claude-sonnet-5-5\n\
+                         Harness: claude-code 2.1.289\n\
+                         Machine: 3fa9c2d10b7e\n\
+                         Co-Authored-By: Claude <noreply@anthropic.com>\n\
+                         \n\
+                         🤖 Generated with [Claude Code](https://claude.com/claude-code)";
+
+    fn marked(prose: &str, tail: &str) -> String {
+        format!("{prose}\n\n{TRAILER_MARKER}\n{tail}")
+    }
+
+    #[test]
+    fn a_marked_trailer_block_costs_no_words() {
+        let prose = "alpha beta gamma delta epsilon";
+        let m = measure(&marked(prose, TUPLE));
+        assert_eq!(m.words, measure(prose).words);
+        assert_eq!(m.words, 5);
+    }
+
+    #[test]
+    fn the_cut_covers_keys_the_unmarked_stripper_does_not_know() {
+        let tail = "Session-Name: fix the retry loop in sync\nReviewed-By: someone else here\n";
+        assert_eq!(measure(&marked("one two three", tail)).words, 3);
+        assert!(measure(&format!("one two three\n\n{tail}")).words > 3);
+    }
+
+    #[test]
+    fn a_marked_trailer_keeps_a_body_at_budget_and_prose_over_budget_still_counts() {
+        let at_budget = vec!["word"; 150].join(" ");
+        assert_eq!(measure(&marked(&at_budget, TUPLE)).words, 150);
+        let over = vec!["word"; 151].join(" ");
+        assert_eq!(measure(&marked(&over, TUPLE)).words, 151);
+    }
+
+    #[test]
+    fn prose_after_the_marker_is_counted_with_the_whole_body() {
+        let tail = "Notes: this is a long sentence of prose hiding behind a marker so that nobody counts it at all, and then it keeps going.\n";
+        let body = marked("one two three", tail);
+        assert!(is_trailer_line("Notes: short value"));
+        assert!(measure(&body).words > 15, "{}", measure(&body).words);
+    }
+
+    #[test]
+    fn a_non_trailer_line_after_the_marker_voids_the_cut() {
+        let body = marked(
+            "one two three",
+            &format!("{TUPLE}\nand then some free prose\n"),
+        );
+        let m = measure(&body);
+        assert!(
+            m.words > 3,
+            "free prose after the trailer must count: {}",
+            m.words
+        );
+    }
+
+    #[test]
+    fn too_many_trailer_lines_void_the_cut() {
+        let tail: String = (0..13).map(|i| format!("Key{i}: v\n")).collect();
+        assert!(measure(&marked("one two three", &tail)).words > 3);
+        let ok: String = (0..12).map(|i| format!("Key{i}: v\n")).collect();
+        assert_eq!(measure(&marked("one two three", &ok)).words, 3);
+    }
+
+    #[test]
+    fn only_the_last_marker_counts() {
+        // Prose between two markers is outside the final trailer block.
+        let body = format!(
+            "intro\n{TRAILER_MARKER}\nseven eight nine ten eleven twelve\n{TRAILER_MARKER}\n{TUPLE}"
+        );
+        assert!(measure(&body).words >= 7);
+    }
+
+    #[test]
+    fn a_marker_inside_a_fence_cuts_nothing() {
+        let body = format!("intro words\n```\n{TRAILER_MARKER}\n```\nmore prose after it\n");
+        assert_eq!(measure(&body).words, 6);
+    }
+
+    #[test]
+    fn a_marker_with_nothing_after_it_cuts_cleanly() {
+        assert_eq!(measure(&format!("a b c\n{TRAILER_MARKER}\n")).words, 3);
     }
 
     #[test]
