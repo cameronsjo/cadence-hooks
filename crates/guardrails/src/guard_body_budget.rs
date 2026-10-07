@@ -546,9 +546,13 @@ pub const TRAILER_MARKER: &str = "<!-- claude-trailer -->";
 /// How many non-blank lines a marked trailer block may hold.
 const TRAILER_MAX_LINES: usize = 12;
 
-/// The longest `Key: value` line a marked trailer block may hold. Long enough
-/// for a `Co-Authored-By` line, too short for a sentence of prose.
+/// The longest `Key: value` line a marked trailer block may hold.
 const TRAILER_MAX_LINE_CHARS: usize = 100;
+
+/// The most whitespace-separated words a marked trailer block may hold in all.
+/// The full producer tuple is about 20; a few prose lines in `Key: value`
+/// shape would blow past this.
+const TRAILER_MAX_WORDS: usize = 30;
 
 /// Whether a line belongs in a marked trailer block: `Key: value` with a
 /// single-token key and a short one-line value, or the robot attribution line.
@@ -569,7 +573,7 @@ fn is_trailer_line(line: &str) -> bool {
 
 /// Cut a body at its last [`TRAILER_MARKER`] line when everything after it is
 /// trailer-shaped: blank lines, `Key: value` lines, the robot line, at most
-/// [`TRAILER_MAX_LINES`] of them. Anything else after the marker (prose, a
+/// [`TRAILER_MAX_LINES`] of them and [`TRAILER_MAX_WORDS`] words in all. Anything else after the marker (prose, a
 /// long line, too many lines) returns the body whole, so nothing hides behind
 /// a marker. Only the last marker counts.
 ///
@@ -584,10 +588,11 @@ pub fn strip_trailer_block(body: &str) -> &str {
         offset += line.len();
     }
     let Some(at) = cut else { return body };
-    let mut count = 0;
+    let (mut count, mut words) = (0, 0);
     for line in body[at..].lines().skip(1).filter(|l| !l.trim().is_empty()) {
         count += 1;
-        if count > TRAILER_MAX_LINES || !is_trailer_line(line) {
+        words += line.split_whitespace().count();
+        if count > TRAILER_MAX_LINES || words > TRAILER_MAX_WORDS || !is_trailer_line(line) {
             return body;
         }
     }
@@ -2247,6 +2252,16 @@ mod tests {
         assert!(measure(&marked("one two three", &tail)).words > 3);
         let ok: String = (0..12).map(|i| format!("Key{i}: v\n")).collect();
         assert_eq!(measure(&marked("one two three", &ok)).words, 3);
+    }
+
+    #[test]
+    fn a_trailer_block_over_the_word_cap_voids_the_cut() {
+        let tail: String = (0..8)
+            .map(|i| format!("Note{i}: one two three four five six\n"))
+            .collect();
+        assert!(measure(&marked("one two three", &tail)).words > 50);
+        // The full producer tuple stays under the cap.
+        assert_eq!(measure(&marked("one two three", TUPLE)).words, 3);
     }
 
     #[test]
