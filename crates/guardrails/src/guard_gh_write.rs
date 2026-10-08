@@ -2483,6 +2483,86 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
     at(1) == Some("gist") || (at(1) == Some("repo") && at(2) == Some("fork"))
 }
 
+/// True when `segment` is `gh issue create` with `--web`/`-w`: gh opens the
+/// new-issue form in the browser and creates nothing, so the person reviews
+/// and submits it there (cameronsjo/cadence-hooks#1351). `gh pr create --web`
+/// is not included: it can still push the head branch before opening the form.
+///
+/// The flag must be its own word in a flag position: a `-w` given as another
+/// flag's value (`--title -w`) is that value to gh, and the issue is created.
+/// Every other word must be a flag gh's `issue create` knows, so anything
+/// else (`--web=false` after `--web`, a flag added in a later gh) keeps the
+/// old verdict. A browser override (`GH_BROWSER=`, `BROWSER=`) runs a command
+/// of its own choosing with the URL, so the caller refuses the exemption when
+/// the command sets one anywhere.
+fn gh_issue_create_opens_browser(segment: &str) -> bool {
+    /// `gh issue create` flags that take the next word as their value.
+    const VALUE_FLAGS: &[&str] = &[
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-l",
+        "--label",
+        "-a",
+        "--assignee",
+        "-p",
+        "--project",
+        "-m",
+        "--milestone",
+        "-R",
+        "--repo",
+        "-T",
+        "--template",
+        "--recover",
+        "--type",
+        "--parent",
+        "--blocked-by",
+        "--blocking",
+    ];
+    if segment.contains("BROWSER=") {
+        return false;
+    }
+    let Some(argv) = gh_argv(segment) else {
+        return false;
+    };
+    if argv.get(1).map(String::as_str) != Some("issue")
+        || argv.get(2).map(String::as_str) != Some("create")
+    {
+        return false;
+    }
+    let mut web = false;
+    let mut args = argv[3..].iter();
+    while let Some(arg) = args.next() {
+        let redirect = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if arg == "--web" || arg == "-w" {
+            web = true;
+        } else if VALUE_FLAGS.contains(&arg.as_str())
+            // A redirect's target (`> -w`, `<<< -w`) is not a gh flag.
+            || matches!(redirect, ">" | ">>" | "<" | "<<" | "<<<" | ">|" | "<>")
+        {
+            args.next();
+        } else if matches!(
+            arg.as_str(),
+            "2>&1" | ">/dev/null" | "2>/dev/null" | "</dev/null"
+        ) || arg
+            .split_once('=')
+            .is_some_and(|(flag, _)| flag.starts_with("--") && VALUE_FLAGS.contains(&flag))
+        {
+            // A plain redirect, or a value joined to its flag (`--title=x`).
+        } else if arg.starts_with('-') || arg.starts_with('>') || arg.starts_with('<') {
+            // `--`, `--web=false`, `-e`, a glued `-tfoo`, any other redirect.
+            return false;
+        } else {
+            // A stray positional (`issue create` takes none) or a pipe target.
+            return false;
+        }
+    }
+    web
+}
+
 /// If `segment` invokes `gh api` (a `gh` invocation per [`gh_argv`], first
 /// non-flag subcommand `api`), return its endpoint — the first positional token
 /// after `api`, skipping flags and their values. `Some("")` for a bare `gh api`
@@ -4396,6 +4476,11 @@ fn judge_write_segments(
 
         // Gists are user-scoped; a fork creates under your account.
         if gh_write_is_user_scoped(&segment) {
+            continue;
+        }
+
+        // `issue create --web` only opens the form in the browser.
+        if !command.contains("BROWSER=") && gh_issue_create_opens_browser(&segment) {
             continue;
         }
 
@@ -7950,6 +8035,57 @@ mod tests {
             let input = input_with("gh gist create x.md", "/tmp");
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn issue_create_web_is_allowed_on_an_unowned_repo() {
+        // cameronsjo/cadence-hooks#1351: `--web` opens the form in the browser
+        // and creates nothing.
+        with_env(&owners_env(), || {
+            for cmd in [
+                "gh issue create -R someowner/somerepo --web --title t --body b",
+                "gh issue create --repo someowner/somerepo -w",
+                "gh issue create --web",
+                "gh issue create -R someowner/somerepo --web 2>&1",
+                "gh issue create --repo=someowner/somerepo --title=\"Bug x\" --web",
+            ] {
+                let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{cmd}"
+                );
+            }
+            // Without `--web`, and for `pr create --web`, the old verdict stays.
+            for cmd in [
+                "gh issue create -R someowner/somerepo --title t --body b",
+                "gh pr create -R someowner/somerepo --web",
+                "gh issue create -R someowner/somerepo --web && gh issue comment 1 -R someowner/somerepo --body x",
+                // `-w` as another flag's value: gh creates the issue.
+                "gh issue create -R someowner/somerepo --title -w --body b",
+                "gh issue create -R someowner/somerepo -t -w -b b",
+                "gh issue create -R someowner/somerepo --body --web --title t",
+                "gh issue create -R someowner/somerepo --title t --body b --label -w",
+                // A redirect target or a word after `--` is not a gh flag.
+                "gh issue create -R someowner/somerepo -t t -b b > -w",
+                "gh issue create -R someowner/somerepo -t t -b b <<< -w",
+                "gh issue create -R someowner/somerepo -t t -b b -- -w",
+                // An unknown or disabling flag keeps the old verdict.
+                "gh issue create -R someowner/somerepo --web --web=false -t t -b b",
+                "gh issue create -R someowner/somerepo --type -w -t t -b b",
+                "gh issue create -R someowner/somerepo --parent -w -t t -b b",
+                // An override exported earlier in the command.
+                "export GH_BROWSER=echo; gh issue create -R someowner/somerepo -w",
+                // A browser override runs its own command with the URL.
+                "GH_BROWSER=echo gh issue create -R someowner/somerepo -w",
+                "BROWSER=echo gh issue create -R someowner/somerepo --web",
+            ] {
+                let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
+                assert!(
+                    !matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{cmd}"
+                );
+            }
         });
     }
 
