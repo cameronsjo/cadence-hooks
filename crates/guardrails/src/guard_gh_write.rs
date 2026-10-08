@@ -2544,15 +2544,17 @@ fn gh_issue_create_opens_browser(segment: &str) -> bool {
             || matches!(redirect, ">" | ">>" | "<" | "<<" | "<<<" | ">|" | "<>")
         {
             args.next();
+        } else if matches!(
+            arg.as_str(),
+            "2>&1" | ">/dev/null" | "2>/dev/null" | "</dev/null"
+        ) || arg
+            .split_once('=')
+            .is_some_and(|(flag, _)| flag.starts_with("--") && VALUE_FLAGS.contains(&flag))
+        {
+            // A plain redirect, or a value joined to its flag (`--title=x`).
         } else if arg.starts_with('-') || arg.starts_with('>') || arg.starts_with('<') {
-            // `--`, `--web=false`, `-e`, a glued `-tfoo`, `2>&1`, `>/dev/null`:
-            // only these plain redirects keep the form.
-            if !matches!(
-                arg.as_str(),
-                "2>&1" | ">/dev/null" | "2>/dev/null" | "</dev/null"
-            ) {
-                return false;
-            }
+            // `--`, `--web=false`, `-e`, a glued `-tfoo`, any other redirect.
+            return false;
         } else {
             // A stray positional (`issue create` takes none) or a pipe target.
             return false;
@@ -8045,6 +8047,8 @@ mod tests {
                 "gh issue create -R someowner/somerepo --web --title t --body b",
                 "gh issue create --repo someowner/somerepo -w",
                 "gh issue create --web",
+                "gh issue create -R someowner/somerepo --web 2>&1",
+                "gh issue create --repo=someowner/somerepo --title=\"Bug x\" --web",
             ] {
                 let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
                 assert!(
