@@ -2528,10 +2528,18 @@ fn gh_issue_create_opens_browser(segment: &str) -> bool {
     }
     let mut args = argv[3..].iter();
     while let Some(arg) = args.next() {
+        if arg == "--" {
+            return false;
+        }
         if arg == "--web" || arg == "-w" {
             return true;
         }
-        if VALUE_FLAGS.contains(&arg.as_str()) {
+        // A flag's value, or a redirect's target (`> -w`, `<<< -w`), is not
+        // a gh flag.
+        let redirect = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if VALUE_FLAGS.contains(&arg.as_str())
+            || matches!(redirect, ">" | ">>" | "<" | "<<" | "<<<" | ">|" | "<>")
+        {
             args.next();
         }
     }
@@ -8039,6 +8047,10 @@ mod tests {
                 "gh issue create -R someowner/somerepo -t -w -b b",
                 "gh issue create -R someowner/somerepo --body --web --title t",
                 "gh issue create -R someowner/somerepo --title t --body b --label -w",
+                // A redirect target or a word after `--` is not a gh flag.
+                "gh issue create -R someowner/somerepo -t t -b b > -w",
+                "gh issue create -R someowner/somerepo -t t -b b <<< -w",
+                "gh issue create -R someowner/somerepo -t t -b b -- -w",
                 // A browser override runs its own command with the URL.
                 "GH_BROWSER=echo gh issue create -R someowner/somerepo -w",
                 "BROWSER=echo gh issue create -R someowner/somerepo --web",
