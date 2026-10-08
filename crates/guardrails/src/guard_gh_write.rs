@@ -2490,8 +2490,11 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
 ///
 /// The flag must be its own word in a flag position: a `-w` given as another
 /// flag's value (`--title -w`) is that value to gh, and the issue is created.
-/// A browser override (`GH_BROWSER=`, `BROWSER=`) runs a command of its own
-/// choosing with the URL, so either one keeps the old verdict.
+/// Every other word must be a flag gh's `issue create` knows, so anything
+/// else (`--web=false` after `--web`, a flag added in a later gh) keeps the
+/// old verdict. A browser override (`GH_BROWSER=`, `BROWSER=`) runs a command
+/// of its own choosing with the URL, so the caller refuses the exemption when
+/// the command sets one anywhere.
 fn gh_issue_create_opens_browser(segment: &str) -> bool {
     /// `gh issue create` flags that take the next word as their value.
     const VALUE_FLAGS: &[&str] = &[
@@ -2514,6 +2517,10 @@ fn gh_issue_create_opens_browser(segment: &str) -> bool {
         "-T",
         "--template",
         "--recover",
+        "--type",
+        "--parent",
+        "--blocked-by",
+        "--blocking",
     ];
     if segment.contains("BROWSER=") {
         return false;
@@ -2526,24 +2533,32 @@ fn gh_issue_create_opens_browser(segment: &str) -> bool {
     {
         return false;
     }
+    let mut web = false;
     let mut args = argv[3..].iter();
     while let Some(arg) = args.next() {
-        if arg == "--" {
-            return false;
-        }
-        if arg == "--web" || arg == "-w" {
-            return true;
-        }
-        // A flag's value, or a redirect's target (`> -w`, `<<< -w`), is not
-        // a gh flag.
         let redirect = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        if VALUE_FLAGS.contains(&arg.as_str())
+        if arg == "--web" || arg == "-w" {
+            web = true;
+        } else if VALUE_FLAGS.contains(&arg.as_str())
+            // A redirect's target (`> -w`, `<<< -w`) is not a gh flag.
             || matches!(redirect, ">" | ">>" | "<" | "<<" | "<<<" | ">|" | "<>")
         {
             args.next();
+        } else if arg.starts_with('-') || arg.starts_with('>') || arg.starts_with('<') {
+            // `--`, `--web=false`, `-e`, a glued `-tfoo`, `2>&1`, `>/dev/null`:
+            // only these plain redirects keep the form.
+            if !matches!(
+                arg.as_str(),
+                "2>&1" | ">/dev/null" | "2>/dev/null" | "</dev/null"
+            ) {
+                return false;
+            }
+        } else {
+            // A stray positional (`issue create` takes none) or a pipe target.
+            return false;
         }
     }
-    false
+    web
 }
 
 /// If `segment` invokes `gh api` (a `gh` invocation per [`gh_argv`], first
@@ -4463,7 +4478,7 @@ fn judge_write_segments(
         }
 
         // `issue create --web` only opens the form in the browser.
-        if gh_issue_create_opens_browser(&segment) {
+        if !command.contains("BROWSER=") && gh_issue_create_opens_browser(&segment) {
             continue;
         }
 
@@ -8051,6 +8066,12 @@ mod tests {
                 "gh issue create -R someowner/somerepo -t t -b b > -w",
                 "gh issue create -R someowner/somerepo -t t -b b <<< -w",
                 "gh issue create -R someowner/somerepo -t t -b b -- -w",
+                // An unknown or disabling flag keeps the old verdict.
+                "gh issue create -R someowner/somerepo --web --web=false -t t -b b",
+                "gh issue create -R someowner/somerepo --type -w -t t -b b",
+                "gh issue create -R someowner/somerepo --parent -w -t t -b b",
+                // An override exported earlier in the command.
+                "export GH_BROWSER=echo; gh issue create -R someowner/somerepo -w",
                 // A browser override runs its own command with the URL.
                 "GH_BROWSER=echo gh issue create -R someowner/somerepo -w",
                 "BROWSER=echo gh issue create -R someowner/somerepo --web",
