@@ -2483,6 +2483,19 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
     at(1) == Some("gist") || (at(1) == Some("repo") && at(2) == Some("fork"))
 }
 
+/// True when `segment` is `gh issue create` with `--web`/`-w`: gh opens the
+/// new-issue form in the browser and creates nothing, so the person reviews
+/// and submits it there (cameronsjo/cadence-hooks#1351). `gh pr create --web`
+/// is not included: it can still push the head branch before opening the form.
+fn gh_issue_create_opens_browser(segment: &str) -> bool {
+    let Some(argv) = gh_argv(segment) else {
+        return false;
+    };
+    argv.get(1).map(String::as_str) == Some("issue")
+        && argv.get(2).map(String::as_str) == Some("create")
+        && argv[3..].iter().any(|a| a == "--web" || a == "-w")
+}
+
 /// If `segment` invokes `gh api` (a `gh` invocation per [`gh_argv`], first
 /// non-flag subcommand `api`), return its endpoint — the first positional token
 /// after `api`, skipping flags and their values. `Some("")` for a bare `gh api`
@@ -4396,6 +4409,11 @@ fn judge_write_segments(
 
         // Gists are user-scoped; a fork creates under your account.
         if gh_write_is_user_scoped(&segment) {
+            continue;
+        }
+
+        // `issue create --web` only opens the form in the browser.
+        if gh_issue_create_opens_browser(&segment) {
             continue;
         }
 
@@ -7950,6 +7968,37 @@ mod tests {
             let input = input_with("gh gist create x.md", "/tmp");
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn issue_create_web_is_allowed_on_an_unowned_repo() {
+        // cameronsjo/cadence-hooks#1351: `--web` opens the form in the browser
+        // and creates nothing.
+        with_env(&owners_env(), || {
+            for cmd in [
+                "gh issue create -R someowner/somerepo --web --title t --body b",
+                "gh issue create --repo someowner/somerepo -w",
+                "gh issue create --web",
+            ] {
+                let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{cmd}"
+                );
+            }
+            // Without `--web`, and for `pr create --web`, the old verdict stays.
+            for cmd in [
+                "gh issue create -R someowner/somerepo --title t --body b",
+                "gh pr create -R someowner/somerepo --web",
+                "gh issue create -R someowner/somerepo --web && gh issue comment 1 -R someowner/somerepo --body x",
+            ] {
+                let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
+                assert!(
+                    !matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{cmd}"
+                );
+            }
         });
     }
 
