@@ -2487,13 +2487,55 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
 /// new-issue form in the browser and creates nothing, so the person reviews
 /// and submits it there (cameronsjo/cadence-hooks#1351). `gh pr create --web`
 /// is not included: it can still push the head branch before opening the form.
+///
+/// The flag must be its own word in a flag position: a `-w` given as another
+/// flag's value (`--title -w`) is that value to gh, and the issue is created.
+/// A browser override (`GH_BROWSER=`, `BROWSER=`) runs a command of its own
+/// choosing with the URL, so either one keeps the old verdict.
 fn gh_issue_create_opens_browser(segment: &str) -> bool {
+    /// `gh issue create` flags that take the next word as their value.
+    const VALUE_FLAGS: &[&str] = &[
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "-l",
+        "--label",
+        "-a",
+        "--assignee",
+        "-p",
+        "--project",
+        "-m",
+        "--milestone",
+        "-R",
+        "--repo",
+        "-T",
+        "--template",
+        "--recover",
+    ];
+    if segment.contains("BROWSER=") {
+        return false;
+    }
     let Some(argv) = gh_argv(segment) else {
         return false;
     };
-    argv.get(1).map(String::as_str) == Some("issue")
-        && argv.get(2).map(String::as_str) == Some("create")
-        && argv[3..].iter().any(|a| a == "--web" || a == "-w")
+    if argv.get(1).map(String::as_str) != Some("issue")
+        || argv.get(2).map(String::as_str) != Some("create")
+    {
+        return false;
+    }
+    let mut args = argv[3..].iter();
+    while let Some(arg) = args.next() {
+        if arg == "--web" || arg == "-w" {
+            return true;
+        }
+        if VALUE_FLAGS.contains(&arg.as_str()) {
+            args.next();
+        }
+    }
+    false
 }
 
 /// If `segment` invokes `gh api` (a `gh` invocation per [`gh_argv`], first
@@ -7992,6 +8034,14 @@ mod tests {
                 "gh issue create -R someowner/somerepo --title t --body b",
                 "gh pr create -R someowner/somerepo --web",
                 "gh issue create -R someowner/somerepo --web && gh issue comment 1 -R someowner/somerepo --body x",
+                // `-w` as another flag's value: gh creates the issue.
+                "gh issue create -R someowner/somerepo --title -w --body b",
+                "gh issue create -R someowner/somerepo -t -w -b b",
+                "gh issue create -R someowner/somerepo --body --web --title t",
+                "gh issue create -R someowner/somerepo --title t --body b --label -w",
+                // A browser override runs its own command with the URL.
+                "GH_BROWSER=echo gh issue create -R someowner/somerepo -w",
+                "BROWSER=echo gh issue create -R someowner/somerepo --web",
             ] {
                 let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
                 assert!(
