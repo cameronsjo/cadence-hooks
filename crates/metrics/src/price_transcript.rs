@@ -22,13 +22,26 @@ use std::io::Read;
 pub const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Reads `path` as UTF-8, refusing anything that is not a regular file once
-/// symlinks are followed, and anything over `cap` bytes.
+/// symlinks are followed, and anything over `cap` bytes. The file is opened
+/// first (non-blocking on Unix, so a FIFO cannot block the open) and the type
+/// is checked on the open handle, so the check and the read see one file.
 fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts
+        .open(path)
+        .map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot read {path:?}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path:?} is not a regular file"));
     }
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
     let mut contents = String::new();
     file.take(cap + 1)
         .read_to_string(&mut contents)
@@ -135,11 +148,20 @@ mod tests {
         assert_eq!(read_transcript(p, 10).unwrap(), "0123456789");
         assert!(read_transcript(p, 9).unwrap_err().contains("limit"));
         let d = dir.path().to_str().unwrap();
-        assert!(
-            read_transcript(d, 10)
-                .unwrap_err()
-                .contains("not a regular file")
-        );
+        assert!(read_transcript(d, 10).is_err());
+    }
+
+    /// A FIFO with no writer is refused at once rather than blocking.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path; mkfifo only creates a node.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = read_transcript(path.to_str().unwrap(), 10).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     #[test]

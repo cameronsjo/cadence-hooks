@@ -161,7 +161,7 @@ fn a_directory_is_not_a_transcript() {
         .arg(dir.path());
     let (code, stdout, stderr) = run(cmd);
     assert_eq!(code, 1, "stdout: {stdout}");
-    assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+    assert!(stderr.contains("metrics price:"), "stderr: {stderr}");
     assert!(stdout.is_empty());
 }
 
