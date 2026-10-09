@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.125.0] - 2026-10-09
+
 ### Added
 
 - **`metrics price --transcript <path> --json` prices one finished transcript.** It scans the transcript with the scan `log-session` uses and prints `{"costUsd", "byModel", "unpricedModels"}` on one line. `byModel` is the array a `sessions.jsonl` row carries (5-minute and 1-hour cache writes kept apart), priced from the same table, so `CADENCE_METRICS_PRICES` and `--prices` apply. Exit 0 on a readable transcript (an unpriced model prices at `$0` and is listed), 1 with a reason on stderr for a missing or unreadable file, 2 on a usage error. Like `metrics grade` it is a CLI action that `CADENCE_BYPASS=1` does not short-circuit.
