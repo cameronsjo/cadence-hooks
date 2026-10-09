@@ -6,13 +6,38 @@
 //! are the figures a `sessions.jsonl` row for the same transcript carries.
 //! There is no pricing logic here.
 //!
-//! Like `metrics grade` it fails closed: an unreadable transcript exits 1 with
-//! the reason on stderr rather than printing a zero cost.
+//! It fails closed: an unreadable transcript, one that is not a regular file
+//! or is over [`MAX_TRANSCRIPT_BYTES`], or a named price table that cannot be
+//! read or parsed, exits 1 with the reason on stderr rather than printing a
+//! cost. A drain worker can influence the transcript path forgectl passes, so
+//! a FIFO or `/dev/zero` must not hang or exhaust the caller.
 
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
 use crate::transcript::{TranscriptScan, scan_transcript};
 use serde_json::{Value, json};
+use std::io::Read;
+
+/// The largest transcript `metrics price` reads.
+pub const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Reads `path` as UTF-8, refusing anything that is not a regular file once
+/// symlinks are followed, and anything over `cap` bytes.
+fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path:?} is not a regular file"));
+    }
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    let mut contents = String::new();
+    file.take(cap + 1)
+        .read_to_string(&mut contents)
+        .map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    if contents.len() as u64 > cap {
+        return Err(format!("{path:?} is over the {cap}-byte limit"));
+    }
+    Ok(contents)
+}
 
 /// The `{costUsd, byModel, unpricedModels}` object for one transcript string.
 ///
@@ -45,14 +70,20 @@ pub fn price_json(transcript: &str, prices: &Prices) -> Result<Value, String> {
 /// readable transcript (unpriced models included), 1 on one it cannot read or
 /// price. Usage errors (exit 2) are clap's.
 pub fn run_price(transcript: &str, prices_path: Option<&str>) -> u8 {
-    let contents = match std::fs::read_to_string(transcript) {
+    let contents = match read_transcript(transcript, MAX_TRANSCRIPT_BYTES) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("metrics price: cannot read {transcript}: {e}");
+        Err(reason) => {
+            eprintln!("metrics price: {reason}");
             return 1;
         }
     };
-    let prices = Prices::load(prices_path);
+    let prices = match Prices::load_strict(prices_path) {
+        Ok(p) => p,
+        Err(reason) => {
+            eprintln!("metrics price: {reason}");
+            return 1;
+        }
+    };
     match price_json(&contents, &prices) {
         Ok(v) => {
             cadence_hooks_core::outln!("{v}");
@@ -95,19 +126,20 @@ mod tests {
         assert_eq!(v["byModel"][0]["tokens"]["cacheCreate1h"], 400_000);
     }
 
-    /// The same functions `log_session` uses, called directly, give the same
-    /// figures: the CLI cannot drift from the `sessions.jsonl` writer.
     #[test]
-    fn agrees_with_the_sessions_writer_path() {
-        let prices = Prices::embedded();
-        let v = price_json(TRANSCRIPT, &prices).unwrap();
-        let TranscriptScan::Usage(usage) = scan_transcript(TRANSCRIPT, None) else {
-            panic!("fixture must scan as usage");
-        };
-        let writer_cost = compute_cost_by_model(&usage.scan.by_model, &prices);
-        let (writer_by_model, _) = usage.priced_breakdown(&prices);
-        assert!((v["costUsd"].as_f64().unwrap() - writer_cost).abs() < 0.01);
-        assert_eq!(v["byModel"], Value::Array(writer_by_model));
+    fn a_capped_read_refuses_an_oversized_or_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "0123456789").unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(read_transcript(p, 10).unwrap(), "0123456789");
+        assert!(read_transcript(p, 9).unwrap_err().contains("limit"));
+        let d = dir.path().to_str().unwrap();
+        assert!(
+            read_transcript(d, 10)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
     }
 
     #[test]

@@ -136,3 +136,55 @@ fn cadence_bypass_does_not_silence_a_cli_action() {
         "a bypassed run still prints the pricing: {stdout}"
     );
 }
+
+#[test]
+fn cadence_disable_does_not_silence_a_cli_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = fixture(dir.path());
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_DISABLE", "metrics,price,metrics-price");
+    cmd.args(["metrics", "price", "--json", "--transcript"])
+        .arg(&path);
+    let (code, stdout, stderr) = run(cmd);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn a_directory_is_not_a_transcript() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = cadence_hooks();
+    cmd.args(["metrics", "price", "--json", "--transcript"])
+        .arg(dir.path());
+    let (code, stdout, stderr) = run(cmd);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn a_named_price_table_that_cannot_be_read_exits_1() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = fixture(dir.path());
+    let mut cmd = cadence_hooks();
+    cmd.env_remove("CADENCE_METRICS_PRICES");
+    cmd.args([
+        "metrics",
+        "price",
+        "--json",
+        "--prices",
+        "/nonexistent/prices.json",
+        "--transcript",
+    ])
+    .arg(&path);
+    let (code, stdout, stderr) = run(cmd);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    assert!(
+        stderr.contains("cannot read price table"),
+        "stderr: {stderr}"
+    );
+    assert!(stdout.is_empty());
+}

@@ -88,6 +88,23 @@ impl Prices {
         Self::embedded()
     }
 
+    /// Like [`Prices::load`], but an override that is named and cannot be
+    /// read or parsed is an error rather than a silent fall back to the
+    /// embedded table. For a CLI caller that asked for a specific table.
+    pub fn load_strict(path: Option<&str>) -> Result<Self, String> {
+        let override_path = std::env::var("CADENCE_METRICS_PRICES")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| path.map(String::from));
+        let Some(p) = override_path else {
+            return Ok(Self::embedded());
+        };
+        let contents = std::fs::read_to_string(&p)
+            .map_err(|e| format!("cannot read price table {p:?}: {e}"))?;
+        serde_json::from_str::<Prices>(&contents)
+            .map_err(|e| format!("cannot parse price table {p:?}: {e}"))
+    }
+
     /// Look up prices for a model, if present in the table.
     ///
     /// Tries an exact key first, so a deliberately dated row in the table
