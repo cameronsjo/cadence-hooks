@@ -45,6 +45,8 @@ pub mod log_sweep;
 pub mod log_timing;
 /// Shared per-model breakdown builders for `byModel[]` / `unpricedModels[]`.
 pub mod model_breakdown;
+/// `metrics price` — price one finished transcript (CLI action).
+pub mod price_transcript;
 /// Embedded + overridable model price table.
 pub mod prices;
 /// Sum transcript token usage over a range.

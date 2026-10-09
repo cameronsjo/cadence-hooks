@@ -244,6 +244,20 @@ The same grading is written to every `sessions.jsonl` row under a `grading` key.
 Unlike a guard, `grade` fails closed: a transcript it cannot identify or read
 exits 1 with the reason on stderr rather than printing a partial grading.
 
+`metrics price` is the same kind of CLI action. It scans one transcript with the
+scan `log-session` uses, prices it with the same table, and prints one JSON line,
+`{"costUsd": …, "byModel": […], "unpricedModels": […]}`. `byModel` is the array a
+`sessions.jsonl` row carries, with 5-minute and 1-hour cache writes kept apart:
+
+```bash
+cadence-hooks metrics price --transcript path/to/transcript.jsonl --json
+```
+
+Exit 0 on a readable transcript (a model missing from the price table prices at
+`$0` and appears in `unpricedModels`), 1 with the reason on stderr when the file
+is missing or unreadable, 2 on a usage error. `CADENCE_BYPASS` and
+`CADENCE_DISABLE` do not silence it.
+
 `log-commit` and `log-session` both read the price table from the embedded
 default, overridable with `--prices <path>` (or `CADENCE_METRICS_PRICES`). Set
 `CADENCE_METRICS_DEBUG=1` to add a `_keys` array of raw payload keys to

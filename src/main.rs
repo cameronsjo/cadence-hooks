@@ -52,12 +52,12 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
         ) | (Some("session"), Some("declare" | "status" | "plans" | "timer"))
-            // `metrics grade` is a CLI action, not a hook. Bypassed it would
-            // exit 0 having printed nothing, and an operator piping it to `jq`
-            // reads the absent output as "no cold restarts" rather than "the
-            // command never ran" — the exact failure its fail-closed exit
-            // codes exist to prevent.
-            | (Some("metrics"), Some("grade"))
+            // `metrics grade` and `metrics price` are CLI actions, not hooks.
+            // Bypassed they would exit 0 having printed nothing, and a caller
+            // piping them to `jq` reads the absent output as "no cold
+            // restarts" or "$0" rather than "the command never ran" — the
+            // exact failure their fail-closed exit codes exist to prevent.
+            | (Some("metrics"), Some("grade" | "price"))
             // The one ENFORCEMENT-path hook that must survive the bypass, and
             // deliberately its own arm rather than a widened `guardrails`
             // alternation — namespace-wide exemption would run every guardrails
@@ -578,6 +578,19 @@ enum MetricsCommands {
         #[arg(long, value_name = "PATH")]
         prices: Option<String>,
     },
+    /// Price one finished transcript and print `{costUsd, byModel, unpricedModels}` (CLI action)
+    Price {
+        /// Transcript JSONL to price.
+        #[arg(long, value_name = "PATH")]
+        transcript: String,
+        /// Print JSON. Accepted for explicitness; the output is always JSON.
+        #[arg(long)]
+        json: bool,
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -771,7 +784,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             // A CLI action, not a hook: no hooks.json wiring, no stdin
             // payload, not subject to CADENCE_DISABLE (same treatment as
             // redact-scan / declare / status / dismiss-*).
-            MetricsCommands::Grade { .. } => return None,
+            MetricsCommands::Grade { .. } | MetricsCommands::Price { .. } => return None,
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
@@ -1877,6 +1890,19 @@ fn main() {
                         .into(),
                 );
             }
+            MetricsCommands::Price {
+                transcript,
+                json: _,
+                prices,
+            } => {
+                process::exit(
+                    cadence_hooks_metrics::price_transcript::run_price(
+                        &transcript,
+                        prices.as_deref(),
+                    )
+                    .into(),
+                );
+            }
             // Hook checks dispatched above, through `check_plan`.
             _ => unreachable!("check subcommands dispatch through check_plan"),
         },
@@ -2251,6 +2277,7 @@ mod tests {
             "record-scrub",
             "redact-scan",
             "grade",
+            "price",
         ];
         for skipped in non_hooks {
             let is_real_subcommand = namespaces.iter().any(|ns| {

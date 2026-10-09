@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`metrics price --transcript <path> --json` prices one finished transcript.** It scans the transcript with the scan `log-session` uses and prints `{"costUsd", "byModel", "unpricedModels"}` on one line. `byModel` is the array a `sessions.jsonl` row carries (5-minute and 1-hour cache writes kept apart), priced from the same table, so `CADENCE_METRICS_PRICES` and `--prices` apply. Exit 0 on a readable transcript (an unpriced model prices at `$0` and is listed), 1 with a reason on stderr for a missing or unreadable file, 2 on a usage error. Like `metrics grade` it is a CLI action that `CADENCE_BYPASS=1` does not short-circuit.
+
 ### Fixed
 
 - **`guard-gh-write` allows `gh issue create --web` on any repo.** With `--web` (or `-w`) gh opens the new-issue form in the browser and creates nothing, so the person reviews and submits it there; the guard blocked it as a write to an unowned repo, which left only a hand-built URL for filing on public trackers. A `-w` or `--web` given as another flag's value (`--title -w`) does not count, any word gh's `issue create` does not know (`--web=false`, a stray argument) keeps the old verdict, and so does a `GH_BROWSER=`/`BROWSER=` set anywhere in the command, since gh runs that command with the URL. `gh pr create --web` keeps its verdict, since gh can push the head branch before opening the form (cameronsjo/cadence-hooks#1351).
