@@ -2,7 +2,9 @@ name: Release environment lint
 
 # Refuses any workflow that names the `release` environment under a
 # pull_request_target, workflow_run, or issue_comment trigger (cadence-ecosystem
-# ADR-0044 (i)). Vendored from cadence-ecosystem scripts/release/.
+# ADR-0044 (i)). Vendored from cadence-ecosystem scripts/release/. Also
+# refuses a workflow that could run the `macos-signing` environment from
+# anything but a `v*` tag push (lint-signing-env.sh, this repo only).
 on:
   pull_request:
   push:
@@ -22,3 +24,6 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github
       - run: bash .github/scripts/lint-release-env.sh
+      # macos-signing (Developer ID key, notary password) must stay tag-only
+      # (cameronsjo/cadence-hooks#280).
+      - run: bash .github/scripts/lint-signing-env.sh
