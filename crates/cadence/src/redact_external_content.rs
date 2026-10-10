@@ -2338,7 +2338,12 @@ pub fn run_scan_to(
              terms were NOT checked (see `cadence-hooks cadence redact-scan --status`)"
         );
     }
-    let identity_hits = identity::scan_identity(&input, &identity_list, None, None);
+    // `--repo` is the post's destination, so a `destinations`-scoped allow
+    // applies exactly as it does in the hook (#1354). No `--repo` leaves it
+    // unresolved, which a scoped entry never matches.
+    let destination = context::shared_destination(&dest);
+    let identity_hits =
+        identity::scan_identity(&input, &identity_list, None, destination.as_deref());
     let bypass = sensitive_terms_bypass();
     // The EXIT MAPPING mirrors `combine` arm for arm: only Enforce blocks, and
     // only with no bypass armed. Warn mode and a bypassed block both fall
@@ -5544,6 +5549,39 @@ destinations = ["me/*", "them/exact"]
                 assert!(out.softens(), "own repo keeps its config: {targets:?}");
             }
         }
+    }
+
+    #[test]
+    fn run_scan_applies_destination_scoped_allows_like_the_hook() {
+        // (--repo, hook command target) — the CLI verdict must equal the
+        // hook's for the same destination, in both directions (#1354).
+        let table: &[(Option<&str>, &str, u8)] = &[
+            (Some("me/tool"), "-R me/tool", 0),
+            (Some("ME/Tool"), "-R ME/Tool", 0),
+            (Some("them/exact"), "-R them/exact", 0),
+            (Some("them/other"), "-R them/other", 1),
+            (Some("out/side"), "-R out/side", 1),
+            (Some("menace/tool"), "-R menace/tool", 1),
+            // No --repo: unresolved, so a scoped entry never matches.
+            (None, "", 1),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body.md");
+        std::fs::write(&body, "acmecorp\n").unwrap();
+        with_env(DEST_FIXTURE, &[], || {
+            for (repo, flag, want) in table {
+                let cli = run_scan_to(
+                    Some(body.to_string_lossy().into_owned()),
+                    Some("owned-internal".into()),
+                    repo.map(str::to_string),
+                    false,
+                );
+                assert_eq!(cli, *want, "CLI --repo {repo:?}");
+                let hook = post(&format!("gh issue comment 1 {flag} --body acmecorp")).outcome;
+                let hook_exit = u8::from(hook == Outcome::Block);
+                assert_eq!(hook_exit, *want, "hook {flag:?} disagrees");
+            }
+        });
     }
 
     #[test]
