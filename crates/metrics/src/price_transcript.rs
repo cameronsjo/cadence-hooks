@@ -25,7 +25,7 @@ pub const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
 /// symlinks are followed, and anything over `cap` bytes. The file is opened
 /// first (non-blocking on Unix, so a FIFO cannot block the open) and the type
 /// is checked on the open handle, so the check and the read see one file.
-fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
+pub(crate) fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -149,6 +149,21 @@ mod tests {
         assert!(read_transcript(p, 9).unwrap_err().contains("limit"));
         let d = dir.path().to_str().unwrap();
         assert!(read_transcript(d, 10).is_err());
+    }
+
+    /// Exactly `cap` bytes is accepted, `cap + 1` refused. Removing
+    /// `take(cap + 1)` leaves this green: the later length check still
+    /// refuses `cap + 1`, so `take` only bounds memory, which a small file
+    /// cannot observe.
+    #[test]
+    fn the_cap_boundary_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        assert_eq!(read_transcript(p, 64).unwrap().len(), 64);
+        std::fs::write(&path, "a".repeat(65)).unwrap();
+        assert!(read_transcript(p, 64).unwrap_err().contains("limit"));
     }
 
     /// A FIFO with no writer is refused at once rather than blocking.

@@ -55,6 +55,11 @@ pub struct Prices {
     pub models: HashMap<String, ModelPrice>,
 }
 
+/// The largest price table `load` and `load_strict` read. The embedded table
+/// is a few KiB, so this leaves room without letting a path swapped for
+/// `/dev/zero` exhaust memory.
+pub const MAX_PRICE_TABLE_BYTES: u64 = 1024 * 1024;
+
 /// The default table, compiled into the binary.
 const EMBEDDED: &str = include_str!("../prices.json");
 
@@ -64,6 +69,44 @@ const EMBEDDED: &str = include_str!("../prices.json");
 const CACHE_WRITE_1H_INPUT_MULTIPLIER: f64 = 2.0;
 
 impl Prices {
+    /// Read and validate an override table. The read is bounded and refuses
+    /// anything that is not a regular file, so a FIFO cannot hang the caller.
+    fn read_override(p: &str) -> Result<Self, String> {
+        let contents = crate::price_transcript::read_transcript(p, MAX_PRICE_TABLE_BYTES)
+            .map_err(|e| format!("cannot read price table: {e}"))?;
+        let prices = serde_json::from_str::<Prices>(&contents)
+            .map_err(|e| format!("cannot parse price table {p:?}: {e}"))?;
+        prices
+            .validate()
+            .map_err(|e| format!("price table {p:?}: {e}"))?;
+        Ok(prices)
+    }
+
+    /// Rejects a table that parses but cannot price anything: no models, or a
+    /// rate that is negative or not finite.
+    fn validate(&self) -> Result<(), String> {
+        if self.models.is_empty() {
+            return Err("has no models".into());
+        }
+        for (model, p) in &self.models {
+            // An absent 1h rate is skipped; `cache_write_1h()` derives it from
+            // the already-checked input rate.
+            let rates = [
+                ("input", p.input_per_mtok),
+                ("output", p.output_per_mtok),
+                ("cache-write", p.cache_write_per_mtok),
+                ("cache-write-1h", p.cache_write_1h_per_mtok.unwrap_or(0.0)),
+                ("cache-read", p.cache_read_per_mtok),
+            ];
+            if let Some((name, _)) = rates.iter().find(|(_, r)| !r.is_finite() || *r < 0.0) {
+                return Err(format!(
+                    "model {model:?} has a negative or non-finite {name} rate"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Parse the embedded default table. Panics only if the embedded JSON is
     /// malformed — a build-time invariant, not a runtime condition.
     pub fn embedded() -> Self {
@@ -80,8 +123,7 @@ impl Prices {
             .or_else(|| path.map(String::from));
 
         if let Some(p) = override_path
-            && let Ok(contents) = std::fs::read_to_string(&p)
-            && let Ok(prices) = serde_json::from_str::<Prices>(&contents)
+            && let Ok(prices) = Self::read_override(&p)
         {
             return prices;
         }
@@ -91,6 +133,10 @@ impl Prices {
     /// Like [`Prices::load`], but an override that is named and cannot be
     /// read or parsed is an error rather than a silent fall back to the
     /// embedded table. For a CLI caller that asked for a specific table.
+    ///
+    /// A table that is valid but lacks a model still lists that model under
+    /// `unpricedModels`; callers must treat a non-empty `unpricedModels` as
+    /// "not priced", never as `$0`.
     pub fn load_strict(path: Option<&str>) -> Result<Self, String> {
         let override_path = std::env::var("CADENCE_METRICS_PRICES")
             .ok()
@@ -99,10 +145,7 @@ impl Prices {
         let Some(p) = override_path else {
             return Ok(Self::embedded());
         };
-        let contents = std::fs::read_to_string(&p)
-            .map_err(|e| format!("cannot read price table {p:?}: {e}"))?;
-        serde_json::from_str::<Prices>(&contents)
-            .map_err(|e| format!("cannot parse price table {p:?}: {e}"))
+        Self::read_override(&p)
     }
 
     /// Look up prices for a model, if present in the table.
@@ -343,5 +386,123 @@ mod tests {
         let m = prices.get("test-model").unwrap();
         assert_eq!(m.input_per_mtok, 1.0);
         assert_eq!(m.cache_read_per_mtok, 4.0);
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    fn write(dir: &tempfile::TempDir, body: &str) -> String {
+        let path = dir.path().join("prices.json");
+        std::fs::write(&path, body).expect("write");
+        path.to_str().expect("utf-8").to_string()
+    }
+
+    const ROW: &str = r#""m":{"inputPerMTok":1.0,"outputPerMTok":2.0,"cacheWritePerMTok":3.0,"cacheReadPerMTok":4.0}"#;
+
+    #[test]
+    fn strict_rejects_empty_and_negative_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = write(&dir, r#"{"models":{}}"#);
+        assert!(
+            Prices::read_override(&empty)
+                .unwrap_err()
+                .contains("no models")
+        );
+        let neg = write(
+            &dir,
+            &format!(r#"{{"models":{{{}}}}}"#, ROW.replace("1.0", "-1.0")),
+        );
+        assert!(
+            Prices::read_override(&neg)
+                .unwrap_err()
+                .contains("negative")
+        );
+        let ok = write(&dir, &format!(r#"{{"models":{{{ROW}}}}}"#));
+        assert!(Prices::read_override(&ok).is_ok());
+    }
+
+    /// JSON cannot carry NaN or infinity (serde rejects them), so the
+    /// `is_finite` arm is reachable only from a table built in Rust.
+    #[test]
+    fn validate_rejects_non_finite_rates() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut table = Prices::embedded();
+            table.models.values_mut().next().unwrap().input_per_mtok = bad;
+            let err = table.validate().unwrap_err();
+            assert!(err.contains("non-finite input rate"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_negative_rate_field_is_rejected_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            ("input", r#""inputPerMTok":1.0"#, r#""inputPerMTok":-1.0"#),
+            (
+                "output",
+                r#""outputPerMTok":2.0"#,
+                r#""outputPerMTok":-2.0"#,
+            ),
+            (
+                "cache-write",
+                r#""cacheWritePerMTok":3.0"#,
+                r#""cacheWritePerMTok":-3.0"#,
+            ),
+            (
+                "cache-read",
+                r#""cacheReadPerMTok":4.0"#,
+                r#""cacheReadPerMTok":-4.0"#,
+            ),
+        ];
+        for (name, from, to) in cases {
+            let body = format!(r#"{{"models":{{{}}}}}"#, ROW.replace(from, to));
+            let err = Prices::read_override(&write(&dir, &body)).unwrap_err();
+            assert!(
+                err.contains(&format!("negative or non-finite {name} rate")),
+                "{name}: {err}"
+            );
+        }
+        let row_1h = ROW.replace(
+            r#""cacheReadPerMTok":4.0"#,
+            r#""cacheReadPerMTok":4.0,"cacheWrite1hPerMTok":-5.0"#,
+        );
+        let body = format!(r#"{{"models":{{{row_1h}}}}}"#);
+        let err = Prices::read_override(&write(&dir, &body)).unwrap_err();
+        assert!(err.contains("cache-write-1h rate"), "{err}");
+    }
+
+    #[test]
+    fn load_and_load_strict_reject_an_empty_table() {
+        assert!(
+            std::env::var("CADENCE_METRICS_PRICES")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "CADENCE_METRICS_PRICES outranks the path argument — rerun under `env -u`"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = write(&dir, r#"{"models":{}}"#);
+        assert!(Prices::load_strict(Some(&empty)).is_err());
+        assert!(Prices::load(Some(&empty)).get("claude-opus-4-7").is_some());
+    }
+
+    #[test]
+    fn oversize_table_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pad = " ".repeat(MAX_PRICE_TABLE_BYTES as usize + 1);
+        let big = write(&dir, &format!(r#"{{"models":{{{ROW}}}}}{pad}"#));
+        assert!(Prices::read_override(&big).unwrap_err().contains("limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_refused_without_hanging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fifo");
+        let c = std::ffi::CString::new(path.to_str().expect("utf-8")).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = Prices::read_override(path.to_str().expect("utf-8")).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 }

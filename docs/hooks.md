@@ -253,9 +253,10 @@ scan `log-session` uses, prices it with the same table, and prints one JSON line
 cadence-hooks metrics price --transcript path/to/transcript.jsonl --json
 ```
 
-Exit 0 on a readable transcript (a model missing from the price table prices at
-`$0` and appears in `unpricedModels`), 1 with the reason on stderr when the file
-is missing or unreadable, 2 on a usage error. `CADENCE_BYPASS` and
+Exit 0 on a readable transcript (a model missing from the price table appears in
+`unpricedModels` and is **not priced**: treat a non-empty list as unknown cost, not `$0`),
+1 with the reason on stderr when the file is missing or unreadable or a named
+price table is unreadable, over 1 MiB, empty or has a negative rate, 2 on a usage error. `CADENCE_BYPASS` and
 `CADENCE_DISABLE` do not silence it.
 
 `log-commit` and `log-session` both read the price table from the embedded

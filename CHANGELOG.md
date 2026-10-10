@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A price table is now read with a 1 MiB cap and only if it is a regular file.** A FIFO or `/dev/zero` path can no longer hang or exhaust the caller. A table with no models, or a negative or non-finite rate, is rejected: `metrics price` exits 1, and `log-commit`, `log-session` and `grade` fall back to the embedded table. A non-empty `unpricedModels` means "not priced", not `$0`.
+
 ## [0.125.0] - 2026-10-09
 
 ### Added
