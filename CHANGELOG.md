@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`metrics price` strips control and bidi characters from model names.** Model strings come from the transcript, and `jq -r` printed ESC and bidi overrides to the terminal unchanged. `byModel[].model` and `unpricedModels` now drop every Cc and Cf character; cost lookup and `sessions.jsonl` still use the raw name. (cameronsjo/cadence-hooks#1362)
 - **A price table is now read with a 1 MiB cap and only if it is a regular file.** A FIFO or `/dev/zero` path can no longer hang or exhaust the caller. A table with no models, or a negative or non-finite rate, is rejected: `metrics price` exits 1, and `log-commit`, `log-session` and `grade` fall back to the embedded table. A non-empty `unpricedModels` means "not priced", not `$0`.
 
 ## [0.125.0] - 2026-10-09

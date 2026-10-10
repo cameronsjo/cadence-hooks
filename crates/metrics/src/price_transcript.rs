@@ -12,6 +12,7 @@
 //! cost. A drain worker can influence the transcript path forgectl passes, so
 //! a FIFO or `/dev/zero` must not hang or exhaust the caller.
 
+use crate::common::display_safe;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
 use crate::transcript::{TranscriptScan, scan_transcript};
@@ -60,7 +61,16 @@ pub(crate) fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
 pub fn price_json(transcript: &str, prices: &Prices) -> Result<Value, String> {
     match scan_transcript(transcript, None) {
         TranscriptScan::Usage(usage) => {
-            let (by_model, unpriced) = usage.priced_breakdown(prices);
+            let (mut by_model, unpriced) = usage.priced_breakdown(prices);
+            // Model strings come from the transcript. JSON escapes them, but
+            // `jq -r` decodes ESC and bidi characters straight onto the
+            // terminal, so strip them here. Pricing already ran on the raw name.
+            for entry in &mut by_model {
+                if let Some(model) = entry["model"].as_str() {
+                    entry["model"] = json!(display_safe(model));
+                }
+            }
+            let unpriced: Vec<String> = unpriced.into_iter().map(display_safe).collect();
             Ok(json!({
                 "costUsd": compute_cost_by_model(&usage.scan.by_model, prices),
                 "byModel": by_model,
@@ -177,6 +187,15 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let err = read_transcript(path.to_str().unwrap(), 10).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn control_and_bidi_characters_in_model_names_are_stripped() {
+        let transcript = r#"{"type":"assistant","message":{"id":"m1","role":"assistant","model":"evil\u001b[31m\u202emodel","usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#;
+        let v = price_json(transcript, &Prices::embedded()).unwrap();
+        assert_eq!(v["byModel"][0]["model"], "evil[31mmodel");
+        assert_eq!(v["unpricedModels"], json!(["evil[31mmodel"]));
+        assert!(!v.to_string().contains("\\u001b"));
     }
 
     #[test]
