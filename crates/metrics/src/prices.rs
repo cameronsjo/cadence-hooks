@@ -423,6 +423,56 @@ mod override_tests {
         assert!(Prices::read_override(&ok).is_ok());
     }
 
+    /// JSON cannot carry NaN or infinity (serde rejects them), so the
+    /// `is_finite` arm is reachable only from a table built in Rust.
+    #[test]
+    fn validate_rejects_non_finite_rates() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut table = Prices::embedded();
+            table.models.values_mut().next().unwrap().input_per_mtok = bad;
+            let err = table.validate().unwrap_err();
+            assert!(err.contains("non-finite input rate"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_negative_rate_field_is_rejected_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            ("input", r#""inputPerMTok":1.0"#, r#""inputPerMTok":-1.0"#),
+            (
+                "output",
+                r#""outputPerMTok":2.0"#,
+                r#""outputPerMTok":-2.0"#,
+            ),
+            (
+                "cache-write",
+                r#""cacheWritePerMTok":3.0"#,
+                r#""cacheWritePerMTok":-3.0"#,
+            ),
+            (
+                "cache-read",
+                r#""cacheReadPerMTok":4.0"#,
+                r#""cacheReadPerMTok":-4.0"#,
+            ),
+        ];
+        for (name, from, to) in cases {
+            let body = format!(r#"{{"models":{{{}}}}}"#, ROW.replace(from, to));
+            let err = Prices::read_override(&write(&dir, &body)).unwrap_err();
+            assert!(
+                err.contains(&format!("negative or non-finite {name} rate")),
+                "{name}: {err}"
+            );
+        }
+        let row_1h = ROW.replace(
+            r#""cacheReadPerMTok":4.0"#,
+            r#""cacheReadPerMTok":4.0,"cacheWrite1hPerMTok":-5.0"#,
+        );
+        let body = format!(r#"{{"models":{{{row_1h}}}}}"#);
+        let err = Prices::read_override(&write(&dir, &body)).unwrap_err();
+        assert!(err.contains("cache-write-1h rate"), "{err}");
+    }
+
     #[test]
     fn load_and_load_strict_reject_an_empty_table() {
         assert!(

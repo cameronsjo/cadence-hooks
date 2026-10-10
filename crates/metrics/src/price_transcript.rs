@@ -151,6 +151,21 @@ mod tests {
         assert!(read_transcript(d, 10).is_err());
     }
 
+    /// Exactly `cap` bytes is accepted, `cap + 1` refused. Removing
+    /// `take(cap + 1)` leaves this green: the later length check still
+    /// refuses `cap + 1`, so `take` only bounds memory, which a small file
+    /// cannot observe.
+    #[test]
+    fn the_cap_boundary_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        assert_eq!(read_transcript(p, 64).unwrap().len(), 64);
+        std::fs::write(&path, "a".repeat(65)).unwrap();
+        assert!(read_transcript(p, 64).unwrap_err().contains("limit"));
+    }
+
     /// A FIFO with no writer is refused at once rather than blocking.
     #[cfg(unix)]
     #[test]
