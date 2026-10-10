@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.125.1] - 2026-10-10
+
 ### Fixed
 
 - **`metrics price` strips control and bidi characters from model names.** Model strings come from the transcript, and `jq -r` printed ESC and bidi overrides to the terminal unchanged. `byModel[].model` and `unpricedModels` now drop every Cc and Cf character; cost lookup and `sessions.jsonl` still use the raw name. (cameronsjo/cadence-hooks#1362)
