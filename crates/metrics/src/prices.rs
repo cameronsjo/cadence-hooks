@@ -89,15 +89,19 @@ impl Prices {
             return Err("has no models".into());
         }
         for (model, p) in &self.models {
+            // An absent 1h rate is skipped; `cache_write_1h()` derives it from
+            // the already-checked input rate.
             let rates = [
-                p.input_per_mtok,
-                p.output_per_mtok,
-                p.cache_write_per_mtok,
-                p.cache_write_1h_per_mtok.unwrap_or(0.0),
-                p.cache_read_per_mtok,
+                ("input", p.input_per_mtok),
+                ("output", p.output_per_mtok),
+                ("cache-write", p.cache_write_per_mtok),
+                ("cache-write-1h", p.cache_write_1h_per_mtok.unwrap_or(0.0)),
+                ("cache-read", p.cache_read_per_mtok),
             ];
-            if rates.iter().any(|r| !r.is_finite() || *r < 0.0) {
-                return Err(format!("model {model:?} has a negative or non-finite rate"));
+            if let Some((name, _)) = rates.iter().find(|(_, r)| !r.is_finite() || *r < 0.0) {
+                return Err(format!(
+                    "model {model:?} has a negative or non-finite {name} rate"
+                ));
             }
         }
         Ok(())
@@ -417,6 +421,20 @@ mod override_tests {
         );
         let ok = write(&dir, &format!(r#"{{"models":{{{ROW}}}}}"#));
         assert!(Prices::read_override(&ok).is_ok());
+    }
+
+    #[test]
+    fn load_and_load_strict_reject_an_empty_table() {
+        assert!(
+            std::env::var("CADENCE_METRICS_PRICES")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "CADENCE_METRICS_PRICES outranks the path argument — rerun under `env -u`"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = write(&dir, r#"{"models":{}}"#);
+        assert!(Prices::load_strict(Some(&empty)).is_err());
+        assert!(Prices::load(Some(&empty)).get("claude-opus-4-7").is_some());
     }
 
     #[test]
