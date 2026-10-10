@@ -25,7 +25,7 @@ pub const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
 /// symlinks are followed, and anything over `cap` bytes. The file is opened
 /// first (non-blocking on Unix, so a FIFO cannot block the open) and the type
 /// is checked on the open handle, so the check and the read see one file.
-fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
+pub(crate) fn read_transcript(path: &str, cap: u64) -> Result<String, String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
