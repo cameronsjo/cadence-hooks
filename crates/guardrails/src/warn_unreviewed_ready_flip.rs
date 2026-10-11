@@ -154,7 +154,7 @@ pub enum RepoChoice {
 
 impl RepoChoice {
     /// The `-R` argument for gh, built only from parsed parts.
-    fn repo_arg(&self) -> Option<String> {
+    pub(crate) fn repo_arg(&self) -> Option<String> {
         match self {
             RepoChoice::GhDefault => None,
             RepoChoice::Explicit {

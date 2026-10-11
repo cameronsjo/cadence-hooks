@@ -384,6 +384,16 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "guard-cloud-merge",
+        description: "In a cloud session (CLAUDE_CODE_REMOTE=true), block gh pr merge (and --auto) and gh api merges of a PR whose head is not a same-repo claude/* branch; fails closed when the head cannot be looked up",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: this guard exists for cloud sessions; it allows everything
+        // locally (#1368).
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "guard-critical-grade",
         description: "Block applying impact:critical / likelihood:critical labels without a human ruling",
         namespace: "guardrails",
@@ -989,6 +999,7 @@ pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "guard-push-remote",
     "guard-gh-dangerous",
     "guard-gh-write",
+    "guard-cloud-merge",
     "guard-op-vault-scan",
     "guard-sops-decrypt",
     "guard-runbook-scrub",
@@ -1092,6 +1103,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ),
         ("guardrails", "warn-stale-pr-body") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr ready 5"}}"#,
+        ),
+        // guard-cloud-merge only engages on a merge, and only in a cloud
+        // session; the generic sample would allow without judging anything.
+        ("guardrails", "guard-cloud-merge") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
         ),
         // guard-critical-grade only engages on a gh call that applies a label;
         // the generic sample would allow without judging anything.

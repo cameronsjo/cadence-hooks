@@ -314,6 +314,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // PreToolUse on Bash with single-rule `if:` entries (`Bash(gh pr *)`,
+    // `Bash(gh api *)`); lands in the cadence-guardrails hooks.json in the
+    // cadence monorepo follow-up.
+    (
+        "guardrails guard-cloud-merge",
+        "cameronsjo/cadence-hooks#1368",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

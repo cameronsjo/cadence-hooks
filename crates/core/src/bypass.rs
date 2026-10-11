@@ -174,6 +174,7 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     "guard-push-remote",
     "guard-gh-dangerous",
     "guard-gh-write",
+    "guard-cloud-merge",
     "guard-op-vault-scan",
     "guard-sops-decrypt",
     "guard-runbook-scrub",

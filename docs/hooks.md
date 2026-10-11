@@ -119,6 +119,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos | run |
 | `guard-forge-write` | PreToolUse (Bash) | Block `tea`/`glab` write operations to non-owned repos (unwired until the plugin entry lands) | run |
 | `guard-critical-grade` | PreToolUse (Bash) | Block applying `impact:critical` / `likelihood:critical` without a human ruling (unwired until the plugin entry lands) | run |
+| `guard-cloud-merge` | PreToolUse (Bash) | In a cloud session (`CLAUDE_CODE_REMOTE=true`), block `gh pr merge` (including `--auto`) and `gh api` merges of a PR whose head is not a same-repo `claude/*` branch; fails closed when the head cannot be looked up (unwired until the plugin entry lands) | run |
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) | run |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` | run |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch | run |

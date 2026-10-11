@@ -61,12 +61,12 @@ static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
         .expect("pattern should compile")
 });
 
-static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i:gh)\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
         .expect("pattern should compile")
 });
 
-static API_INPUT_FLAG: LazyLock<Regex> =
+pub(crate) static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
 
 /// `gh repo` verbs whose FIRST positional argument names the target repo.
@@ -114,7 +114,7 @@ static API_REPOS: LazyLock<Regex> =
 /// case-SENSITIVELY: the operation keyword is lowercase, whereas the *type* name
 /// `Mutation` (e.g. an introspection read `__type(name: "Mutation")`) is
 /// capitalized and must not be mistaken for a write (#263).
-static MUTATION_KEYWORD: LazyLock<Regex> =
+pub(crate) static MUTATION_KEYWORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bmutation\b").expect("pattern should compile"));
 
 /// GraphQL mutation root fields safe to auto-allow: pure boolean thread metadata
@@ -2258,7 +2258,7 @@ fn env_split_string_script(tokens: &[String]) -> Option<String> {
 /// only spelling, and matching a trailing `/graphql` would swallow
 /// `repos/<owner>/graphql` — a real repo named `graphql`, which must stay
 /// owner-checked rather than becoming unverifiable.
-fn is_graphql_endpoint(endpoint: &str) -> bool {
+pub(crate) fn is_graphql_endpoint(endpoint: &str) -> bool {
     let path = endpoint.split(['?', '#']).next().unwrap_or("");
     match path.split_once("://") {
         Some((_scheme, rest)) => {
@@ -2567,7 +2567,7 @@ fn gh_issue_create_opens_browser(segment: &str) -> bool {
 /// non-flag subcommand `api`), return its endpoint — the first positional token
 /// after `api`, skipping flags and their values. `Some("")` for a bare `gh api`
 /// with no endpoint; `None` when the segment isn't a `gh api` call.
-fn gh_api_endpoint(segment: &str) -> Option<String> {
+pub(crate) fn gh_api_endpoint(segment: &str) -> Option<String> {
     let tokens = gh_argv(segment)?;
     // First non-flag token after `gh` must be the `api` subcommand — the same
     // rule [`host_scan_flags`] gates gh api's flag table on, shared so the two
@@ -2643,7 +2643,7 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
 /// `gh api` is inspected, since a `-X` belonging to another subcommand is not
 /// a method. (`-R` no longer shares this scanner: it reads through the shared
 /// [`gh_repo_flags`], cadence-hooks#937.)
-fn api_explicit_method(segment: &str) -> Option<String> {
+pub(crate) fn api_explicit_method(segment: &str) -> Option<String> {
     gh_api_endpoint(segment)?;
     let words = gh_argv(segment)?;
     match scan_unanimous_flag(&words, 'X', "--method", Some(&GH_API_FLAGS)) {
@@ -2666,7 +2666,7 @@ fn api_explicit_method(segment: &str) -> Option<String> {
 ///
 /// A literal non-write method (`GET`, `HEAD`, a typo) stays with the implicit
 /// rule [`is_write_command`] applies below.
-fn api_method_forces_write(segment: &str) -> bool {
+pub(crate) fn api_method_forces_write(segment: &str) -> bool {
     if gh_api_endpoint(segment).is_none() {
         return false;
     }
@@ -2795,7 +2795,7 @@ fn tokens_contain_gh(tokens: &[String]) -> bool {
 /// Extract the value of a `gh api graphql` `query=` field across the
 /// `-f`/`--field`/`-F`/`--raw-field` forms (separate-token, compact `-fquery=…`,
 /// and `=`-joined `--field=query=…`). Returns the substring after `query=`.
-fn graphql_query_value(tokens: &[String]) -> Option<String> {
+pub(crate) fn graphql_query_value(tokens: &[String]) -> Option<String> {
     let is_field_flag = |t: &str| matches!(t, "-f" | "--field" | "-F" | "--raw-field");
     for (i, tok) in tokens.iter().enumerate() {
         // Separate-token form: `-f query=…`.
@@ -2843,7 +2843,7 @@ fn graphql_mutation_status(segment: &str) -> Option<bool> {
 /// mutation classifier and the root-field extractor see only real query
 /// structure (#263). Length is preserved (each consumed char becomes a space)
 /// so byte offsets stay aligned for the extractor.
-fn strip_graphql_literals(query: &str) -> String {
+pub(crate) fn strip_graphql_literals(query: &str) -> String {
     let chars: Vec<char> = query.chars().collect();
     let mut out = String::with_capacity(query.len());
     let mut i = 0;
@@ -2945,7 +2945,7 @@ fn is_graphql_name_cont(b: u8) -> bool {
 /// Aliases resolve to the underlying field (`x: deleteRepository` → `deleteRepository`).
 /// Only identifiers at brace-depth 1 / paren-depth 0 are field heads, so argument
 /// values and sub-selections never leak into the result.
-fn graphql_root_mutation_fields(stripped_query: &str) -> Option<Vec<String>> {
+pub(crate) fn graphql_root_mutation_fields(stripped_query: &str) -> Option<Vec<String>> {
     let mut kw_matches = MUTATION_KEYWORD.find_iter(stripped_query);
     let kw = kw_matches.next()?;
     if kw_matches.next().is_some() {

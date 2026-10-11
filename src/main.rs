@@ -413,6 +413,8 @@ enum GuardrailsCommands {
     GuardGhWrite,
     /// Block tea/glab write operations to non-owned repos
     GuardForgeWrite,
+    /// Block PR merges from Claude Code cloud sessions (CLAUDE_CODE_REMOTE=true)
+    GuardCloudMerge,
     /// Block applying impact:critical / likelihood:critical without a human ruling
     GuardCriticalGrade,
     /// Nudge to scaffold and confirm license after git init or gh repo create
@@ -714,6 +716,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGhDangerous => "guard-gh-dangerous",
             GuardrailsCommands::GuardGhWrite => "guard-gh-write",
             GuardrailsCommands::GuardForgeWrite => "guard-forge-write",
+            GuardrailsCommands::GuardCloudMerge => "guard-cloud-merge",
             GuardrailsCommands::GuardCriticalGrade => "guard-critical-grade",
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
@@ -961,6 +964,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::GuardForgeWrite => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_forge_write::ForgeWriteGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardCloudMerge => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_cloud_merge::GuardCloudMerge),
                 pre,
             ),
             GuardrailsCommands::GuardCriticalGrade => CheckPlan::new(
