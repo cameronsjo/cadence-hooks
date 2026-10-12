@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.126.0] - 2026-10-12
+
 ### Security
 
 - **The macOS release binaries are Developer ID signed and notarized before any checksum is taken.** A new `sign-macos` job in `release.yml` runs between `build` and `release` on a GitHub-hosted macOS runner. It imports the certificate into an ephemeral keychain (with the Developer ID G2 intermediate pinned by SHA-256), signs both binaries with the hardened runtime and a secure timestamp, and checks that each signature names `APPLE_TEAM_ID`. It then notarizes both binaries in one submission that must come back `Accepted`, and replaces the two macOS artifacts with the signed tarballs. So `checksums.txt`, the cosign bundle, both attestations and the Homebrew checksums cover the signed binaries. The tarballs ship notarized but unstapled, because a bare Mach-O cannot be stapled. There is no unsigned fallback: a missing secret, an invalid identity or a rejected notarization fails the release. The `APPLE_*` secrets (the same names as forgectl and minute) live only in a new `macos-signing` environment limited to `v*` tags. `lint-signing-env.sh`, run on every PR, refuses a workflow that could reach that environment from anything but a `v*` tag push; it compares environment names case-insensitively, as GitHub does, and refuses an environment set by an expression. (cameronsjo/cadence-hooks#280)
