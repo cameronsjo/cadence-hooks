@@ -62,6 +62,25 @@ case_ "a different case is still matched" 1 "$(branch_job 'environment: MACOS-Si
 case_ "an expression environment is refused" 1 "$(branch_job "environment: \${{ 'macos-signing' }}")"
 case_ "an expression in a map name is refused" 1 "$(branch_job "environment: {name: \"\${{ inputs.env }}\"}")"
 case_ "an unrelated environment on a branch is clean" 0 "$(branch_job 'environment: release')"
+case_ "no environment on a branch is clean" 0 "$(branch_job '')"
+case_ "a trailing space is still matched" 1 "$(branch_job "environment: 'macos-signing '")"
+case_ "a custom-tagged environment is refused" 1 "$(branch_job 'environment: !x macos-signing')"
+alias_job() {  # environment line using an anchor defined at the top level
+  cat <<EOF
+x-env: &e $1
+on:
+  push:
+    branches: [main]
+jobs:
+  sign:
+    $2
+    runs-on: macos-latest
+    steps: [{run: 'true'}]
+EOF
+}
+case_ "an alias to the name is matched" 1 "$(alias_job macos-signing 'environment: *e')"
+case_ "an alias inside a map name is matched" 1 "$(alias_job macos-signing 'environment: {name: *e}')"
+case_ "an alias to an expression is refused" 1 "$(alias_job "\"\${{ 'macos-signing' }}\"" 'environment: *e')"
 
 if [[ "$fails" -eq 0 ]]; then echo "RESULT: all checks passed"; else echo "RESULT: $fails check(s) FAILED"; fi
 exit "$fails"
