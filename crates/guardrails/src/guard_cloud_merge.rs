@@ -32,12 +32,18 @@
 //! has not made) stay with the convention.
 //!
 //! **The lookup runs before the command does.** It reads the payload cwd,
-//! the checked-out branch, and the hook's env, and an earlier step of the
-//! same command can change all three (`gh pr checkout 7 && gh pr merge`,
-//! `cd other && gh pr merge 5`, `export GH_REPO=a/b; gh pr merge 5`). So a
-//! merge that resolves its PR from that state passes only when every other
-//! step is a known read-only command ([`segment_is_inert`]), and any merge
-//! blocks when another step mentions a `GH_*` variable.
+//! the checked-out branch, and the hook's env, and another step of the same
+//! command can change all three (`gh pr checkout 7 && gh pr merge`,
+//! `cd other && gh pr merge 5`, `export GH_REPO=a/b; gh pr merge 5`), as can
+//! the merge's own step (`GIT_DIR=… gh pr merge`, `find -execdir gh pr merge`)
+//! and an earlier merge (`gh pr merge -d` checks out the base branch). So a
+//! merge that resolves its PR from that state passes only when every step
+//! that can run before it is a known read-only command
+//! ([`segment_is_inert`]) and its own step is unwrapped. In a flat
+//! `&&`/`;`/`||` list ([`is_flat`]) that is only the earlier steps, so
+//! `gh pr merge 5 && git pull` passes; anywhere else every other step counts.
+//! Any merge blocks when a step that can run before it mentions a `GH_*`
+//! variable.
 //!
 //! **Fails closed.** A merge whose head cannot be resolved blocks: an
 //! unreadable selector, a `gh` call that fails or times out, a host the
@@ -57,7 +63,7 @@ use regex::Regex;
 
 use cadence_hooks_core::shell::{
     PrSelector, command_segments, command_word, executable_tokens, gh_command_path, gh_pr_segments,
-    gh_pr_subcommand, may_spell_word, pr_url_parts, skip_transparent_prefixes,
+    gh_pr_subcommand, is_assignment_word, may_spell_word, pr_url_parts, skip_transparent_prefixes,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -185,37 +191,89 @@ fn api_sends_write(segment: &str) -> bool {
 /// The largest GraphQL query file the guard reads.
 const MAX_QUERY_FILE: u64 = 1 << 20;
 
+/// A `GH_*` variable named as its own word (not `HIGH_PRIORITY`).
+static GH_VAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])GH_[A-Za-z0-9_]*").expect("pattern should compile")
+});
+
+/// A `GIT_*` variable named as its own word (`GIT_DIR`, `GIT_WORK_TREE`).
+static GIT_VAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])GIT_[A-Za-z0-9_]*").expect("pattern should compile")
+});
+
+/// Redirects that write nothing a later step reads: to `/dev/null`, or one
+/// stream onto another (`2>&1`, `>&2`).
+static HARMLESS_REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\d*>>?|&>>?)\s*/dev/null|\d*>&\d").expect("pattern should compile")
+});
+
+/// Words that make a command more than a flat `&&`/`;`/`||` list: loops,
+/// functions, wrappers that run a command elsewhere or repeatedly.
+static NOT_FLAT_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9_])(?:for|while|until|select|function|coproc|if|then|else|elif|do|done|case|esac|eval|exec|xargs|find|source|bash|sh|zsh|dash)(?:[^A-Za-z0-9_]|$)",
+    )
+    .expect("pattern should compile")
+});
+
 /// What the rest of the command can do to the state a merge's lookup reads.
 #[derive(Debug, Clone, Copy)]
 struct Surroundings {
-    /// Every other segment is a known read-only command, so none can move
-    /// the cwd, switch the branch, change the default repo, or write a file.
+    /// Every step that can run before the merge is a known read-only
+    /// command, and the merge's own step has no wrapper or `GIT_*` prefix,
+    /// so nothing can move the cwd, switch the branch, change the default
+    /// repo, or write a file before the lookup's state is used.
     inert: bool,
-    /// Some other segment mentions a `GH_*` variable, which can repoint gh
-    /// (`export GH_REPO=…`, `export GH_HOST=…`) even for an explicit `-R`.
+    /// A step that can run before the merge mentions a `GH_*` variable,
+    /// which can repoint gh (`export GH_REPO=…`) even for an explicit `-R`.
     sets_gh_env: bool,
+}
+
+/// Whether `command` is a flat list of simple steps joined by `&&`, `;`, or
+/// `||`, so its steps run in [`command_segments`] order and a step after the
+/// merge cannot run before it. Pipes, background jobs, loops, substitutions,
+/// and wrappers all make it not flat.
+fn is_flat(command: &str) -> bool {
+    if NOT_FLAT_WORD.is_match(command)
+        || ["$(", "`", "<(", ">(", "()"]
+            .iter()
+            .any(|w| command.contains(w))
+    {
+        return false;
+    }
+    let joined = HARMLESS_REDIRECT.replace_all(command, " ");
+    let joined = joined.replace("||", " ").replace("&&", " ");
+    !joined.contains(['|', '&'])
 }
 
 /// Whether a segment is a command that cannot change what a later merge's
 /// lookup reads: the cwd, the checked-out branch, gh's default repo or
 /// host, or a file. An allowlist, so an unknown command counts as a change.
 fn segment_is_inert(segment: &str) -> bool {
-    if segment.contains(['>', '<']) {
+    if HARMLESS_REDIRECT
+        .replace_all(segment, " ")
+        .contains(['>', '<'])
+    {
         return false;
     }
     let tokens = executable_tokens(segment);
     let rest = skip_transparent_prefixes(&tokens);
     let Some(head) = rest.first() else {
-        // Nothing but assignments, which only reach gh through `GH_*`.
-        return !segment.contains("GH_");
+        // Nothing but assignments, which reach gh through `GH_*` and git
+        // through `GIT_*`.
+        return !GH_VAR.is_match(segment) && !GIT_VAR.is_match(segment);
     };
     match command_word(head).as_ref() {
         "echo" | "printf" | "true" | ":" | "test" | "[" | "sleep" | "pwd" | "cat" | "ls"
         | "head" | "tail" | "grep" | "jq" | "wc" => true,
-        "git" => matches!(
-            rest.get(1).map(String::as_str),
-            Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse")
-        ),
+        "git" => {
+            matches!(
+                rest.get(1).map(String::as_str),
+                Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse")
+            ) && !rest
+                .iter()
+                .any(|t| t.starts_with("--output") || t.starts_with("--upload-pack"))
+        }
         "gh" => matches!(
             gh_command_path(rest, 2).as_slice(),
             ["pr" | "issue", "view" | "comment" | "status"] | ["pr", "checks" | "diff"]
@@ -224,31 +282,57 @@ fn segment_is_inert(segment: &str) -> bool {
     }
 }
 
-/// Read a `-F query=@<path>` file against the payload cwd, capped.
+/// Whether a merge's own step runs gh somewhere other than the payload cwd
+/// and repo: anything before `gh` except plain transparent prefixes (`env`
+/// with no options, `time`, `command`, `nohup`, `nice`) and non-`GIT_*`
+/// assignments. `find -execdir`, `xargs`, `sudo`, `env -C`, and
+/// `GIT_DIR=…` all count.
+fn own_step_is_wrapped(segment: &str) -> bool {
+    let tokens = executable_tokens(segment);
+    let Some(at) = tokens.iter().position(|t| command_word(t).as_ref() == "gh") else {
+        return true;
+    };
+    tokens[..at].iter().any(|t| {
+        if is_assignment_word(t) {
+            return GIT_VAR.is_match(t);
+        }
+        !matches!(
+            command_word(t).as_ref(),
+            "env" | "time" | "command" | "nohup" | "nice"
+        )
+    })
+}
+
+/// Read a `-F query=@<path>` file against the payload cwd, capped. Opened
+/// once and read through the cap, so a file that grows is not read whole.
 fn read_query_file(path: &str, cwd: &str) -> Option<String> {
+    use std::io::Read;
     if path.is_empty() || path == "-" || path.contains(['$', '`']) {
         return None;
     }
-    let full = std::path::Path::new(cwd).join(path);
-    let meta = std::fs::metadata(&full).ok()?;
-    if !meta.is_file() || meta.len() > MAX_QUERY_FILE {
+    let file = std::fs::File::open(std::path::Path::new(cwd).join(path)).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    std::fs::read_to_string(full).ok()
+    let mut text = String::new();
+    file.take(MAX_QUERY_FILE + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= MAX_QUERY_FILE).then_some(text)
 }
 
 /// The merge call in a `gh api graphql` argv, if any. A query file is read
-/// only when the call stands alone: another segment could write it first.
-fn graphql_call(argv: &[String], cwd: &str, alone: bool) -> Option<MergeCall> {
+/// only when no earlier step can write it (`quiet_before`).
+fn graphql_call(argv: &[String], cwd: &str, quiet_before: bool) -> Option<MergeCall> {
     let unreadable = Some(MergeCall::Unreadable(
-        "a GraphQL query that is not inline (a query file is read only when the gh call \
-         is the whole command)",
+        "a GraphQL query that is not inline (a query file is read only when no other step \
+         of the command can write it first)",
     ));
     let Some(mut query) = graphql_query_value(argv) else {
         return unreadable;
     };
     if let Some(path) = query.strip_prefix('@') {
-        match read_query_file(path, cwd).filter(|_| alone) {
+        match read_query_file(path, cwd).filter(|_| quiet_before) {
             Some(text) => query = text,
             None => return unreadable,
         }
@@ -287,10 +371,10 @@ fn computed_endpoint_rules_out_merge(endpoint: &str) -> bool {
 }
 
 /// The merge call in one `gh api` segment, if any.
-fn api_call(segment: &str, argv: &[String], cwd: &str, alone: bool) -> Option<MergeCall> {
+fn api_call(segment: &str, argv: &[String], cwd: &str, quiet_before: bool) -> Option<MergeCall> {
     let endpoint = gh_api_endpoint(segment).unwrap_or_default();
     if is_graphql_endpoint(&endpoint) {
-        return graphql_call(argv, cwd, alone);
+        return graphql_call(argv, cwd, quiet_before);
     }
     if !api_sends_write(segment) {
         return None;
@@ -347,13 +431,25 @@ fn merges_nothing(tokens: &[String]) -> bool {
         .any(|t| matches!(t.as_str(), "--disable-auto" | "--help" | "-h"))
 }
 
-/// Every merge call in `command`, and what the rest of the command can do
-/// to the state their lookups read.
-fn merge_calls(command: &str, cwd: &str) -> (Vec<MergeCall>, Surroundings) {
+/// Every merge call in `command`, each with what the rest of the command
+/// can do to the state its lookup reads.
+///
+/// In a flat list ([`is_flat`]) only the steps before a merge can change
+/// that state, so `gh pr merge 5 && git pull` judges the merge alone. In
+/// anything else every other step counts, since it may run first. Another
+/// merge step is never on the read-only list, so it always counts as a change
+/// (`gh pr merge -d` checks out the base branch), and so does a wrapper on
+/// the merge's own step.
+fn merge_calls(command: &str, cwd: &str) -> Vec<(MergeCall, Surroundings)> {
     let segments = command_segments(command);
-    let alone = segments.len() == 1;
-    let mut calls = Vec::new();
-    let mut merge_segments = Vec::new();
+    let flat = is_flat(command);
+    let before = |idx: usize| {
+        segments
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| *i != idx && (!flat || *i < idx))
+    };
+    let mut calls: Vec<(usize, MergeCall)> = Vec::new();
     for (idx, segment) in segments.iter().enumerate() {
         if !segment_invokes_gh(segment) {
             continue;
@@ -369,6 +465,7 @@ fn merge_calls(command: &str, cwd: &str) -> (Vec<MergeCall>, Surroundings) {
             .as_deref()
             .map(|a| gh_command_path(a, 2))
             .unwrap_or_default();
+        let quiet_before = || before(idx).all(|(_, s)| segment_is_inert(s));
         let call = match (pr_merge, argv_path.as_slice()) {
             (Some(tokens), _) if merges_nothing(&tokens) => None,
             (Some(tokens), _) => Some(MergeCall::Pr { tokens }),
@@ -378,26 +475,24 @@ fn merge_calls(command: &str, cwd: &str) -> (Vec<MergeCall>, Surroundings) {
             ),
             (None, ["api", ..]) => argv
                 .as_deref()
-                .and_then(|a| api_call(segment, a, cwd, alone)),
+                .and_then(|a| api_call(segment, a, cwd, quiet_before())),
             _ => None,
         };
         if let Some(call) = call {
-            calls.push(call);
-            merge_segments.push(idx);
+            calls.push((idx, call));
         }
     }
-    let others = || {
-        segments
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !merge_segments.contains(idx))
-            .map(|(_, s)| s)
-    };
-    let surroundings = Surroundings {
-        inert: others().all(|s| segment_is_inert(s)),
-        sets_gh_env: others().any(|s| s.contains("GH_")),
-    };
-    (calls, surroundings)
+    calls
+        .into_iter()
+        .map(|(idx, call)| {
+            let around = Surroundings {
+                inert: !own_step_is_wrapped(&segments[idx])
+                    && before(idx).all(|(_, s)| segment_is_inert(s)),
+                sets_gh_env: before(idx).any(|(_, s)| GH_VAR.is_match(s)),
+            };
+            (call, around)
+        })
+        .collect()
 }
 
 /// Read `gh pr view --json` output.
@@ -562,14 +657,17 @@ fn judge(command: &str, remote: bool, input: &HookInput, gh: &GhFactory<'_>) -> 
         return None;
     }
     let cwd = input.cwd.clone().unwrap_or_else(|| ".".to_string());
-    let (calls, around) = merge_calls(command, &cwd);
-    calls.into_iter().find_map(|call| match call {
-        MergeCall::Pr { tokens } => judge_pr(&tokens, around, input, gh),
-        MergeCall::Api { repo, number } => judge_api(repo.as_deref(), number, around, input, gh),
-        MergeCall::BranchMerge => Some(Finding::BranchMerge),
-        MergeCall::Graphql(field) => Some(Finding::Graphql(field)),
-        MergeCall::Unreadable(why) => Some(Finding::Unresolved(why)),
-    })
+    merge_calls(command, &cwd)
+        .into_iter()
+        .find_map(|(call, around)| match call {
+            MergeCall::Pr { tokens } => judge_pr(&tokens, around, input, gh),
+            MergeCall::Api { repo, number } => {
+                judge_api(repo.as_deref(), number, around, input, gh)
+            }
+            MergeCall::BranchMerge => Some(Finding::BranchMerge),
+            MergeCall::Graphql(field) => Some(Finding::Graphql(field)),
+            MergeCall::Unreadable(why) => Some(Finding::Unresolved(why)),
+        })
 }
 
 /// The block message for a finding.
@@ -772,7 +870,6 @@ mod tests {
     #[test]
     fn cloud_merge_of_its_own_pr_passes() {
         for command in [
-            "eval \"gh pr merge 5\"",
             "gh pr merge 5 --squash",
             "gh pr merge --auto --squash 5",
             "gh pr merge",
@@ -1045,7 +1142,59 @@ mod tests {
             run("gh api graphql -F query=@missing.graphql"),
             Outcome::Block
         );
+        assert_eq!(
+            run("gh api graphql -F query=@read.graphql | jq .data"),
+            Outcome::Allow
+        );
+        assert_eq!(
+            run("gh api graphql -F query=@merge.graphql | jq .data"),
+            Outcome::Block
+        );
+        assert_eq!(
+            run("cp merge.graphql read.graphql | gh api graphql -F query=@read.graphql"),
+            Outcome::Block
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn steps_after_the_merge_in_a_flat_list_do_not_count() {
+        // Second review round I2: these are routine merge-then-sync shapes.
+        for command in [
+            "gh pr merge 5 --squash && git pull",
+            "gh pr merge --squash --delete-branch && git checkout main && git pull",
+            "gh pr merge 5; git switch main",
+            "git status 2>/dev/null && gh pr merge --squash",
+            "gh pr view --json headRefName 2>&1 && gh pr merge --squash",
+            "echo done >&2 && gh pr merge 5",
+            "echo HIGH_PRIORITY && gh pr merge 5",
+        ] {
+            let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
+            assert_eq!(result.outcome, Outcome::Allow, "{command}");
+            assert_eq!(calls.len(), 1, "{command}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn the_merge_steps_own_side_effects_count() {
+        // Second review round I1: an earlier merge checks out the base, and a
+        // wrapper or `GIT_*` prefix points gh at another checkout.
+        for command in [
+            "gh pr merge -d --squash && gh pr merge --squash",
+            "gh pr merge 5 -R o/r -d && gh pr merge",
+            "GIT_DIR=../other/.git gh pr merge",
+            "GIT_WORK_TREE=../other gh pr merge 5",
+            "find ../other -maxdepth 0 -execdir gh pr merge \\;",
+            "env -C ../other gh pr merge 5",
+            "sudo -u bot gh pr merge 5",
+            "eval \"gh pr merge 5\"",
+            "gh pr merge 5 | git checkout x",
+            "gh pr merge 5 & git checkout x",
+            "for i in 1; do gh pr merge 5; git checkout x; done",
+        ] {
+            let (result, _) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
+            assert_eq!(result.outcome, Outcome::Block, "{command}");
+        }
     }
 
     #[test]
