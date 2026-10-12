@@ -31,6 +31,10 @@
 //! conditions (a manual rollout step, a settings change, a decision Cameron
 //! has not made) stay with the convention.
 //!
+//! `gh pr create … && gh pr merge` never passes: the lookup runs before the
+//! command, when the PR does not exist yet. Create the PR, then merge it in a
+//! separate command.
+//!
 //! **The lookup runs before the command does.** It reads the payload cwd,
 //! the checked-out branch, and the hook's env, and another step of the same
 //! command can change all three (`gh pr checkout 7 && gh pr merge`,
@@ -202,10 +206,19 @@ static GIT_VAR: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Redirects that write nothing a later step reads: to `/dev/null`, or one
-/// stream onto another (`2>&1`, `>&2`).
+/// stream onto another (`2>&1`, `>&2`). Each must end at a token boundary
+/// (captured as `b`): `>&1q.gql` writes the file `1q.gql`, and
+/// `>/dev/null.x` a file under `/dev`.
 static HARMLESS_REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:\d*>>?|&>>?)\s*/dev/null|\d*>&\d").expect("pattern should compile")
+    Regex::new(r"(?:(?:\d*>>?|&>>?)\s*/dev/null|\d*>&\d+)(?P<b>$|[\s;&|)])")
+        .expect("pattern should compile")
 });
+
+/// `text` with every [`HARMLESS_REDIRECT`] blanked out. The boundary
+/// character is kept, so a `|` or `&` after a redirect still reads as one.
+fn strip_harmless_redirects(text: &str) -> String {
+    HARMLESS_REDIRECT.replace_all(text, " ${b}").into_owned()
+}
 
 /// Words that make a command more than a flat `&&`/`;`/`||` list: loops,
 /// functions, wrappers that run a command elsewhere or repeatedly.
@@ -241,7 +254,7 @@ fn is_flat(command: &str) -> bool {
     {
         return false;
     }
-    let joined = HARMLESS_REDIRECT.replace_all(command, " ");
+    let joined = strip_harmless_redirects(command);
     let joined = joined.replace("||", " ").replace("&&", " ");
     !joined.contains(['|', '&'])
 }
@@ -250,10 +263,7 @@ fn is_flat(command: &str) -> bool {
 /// lookup reads: the cwd, the checked-out branch, gh's default repo or
 /// host, or a file. An allowlist, so an unknown command counts as a change.
 fn segment_is_inert(segment: &str) -> bool {
-    if HARMLESS_REDIRECT
-        .replace_all(segment, " ")
-        .contains(['>', '<'])
-    {
+    if strip_harmless_redirects(segment).contains(['>', '<']) {
         return false;
     }
     let tokens = executable_tokens(segment);
@@ -266,10 +276,22 @@ fn segment_is_inert(segment: &str) -> bool {
     match command_word(head).as_ref() {
         "echo" | "printf" | "true" | ":" | "test" | "[" | "sleep" | "pwd" | "cat" | "ls"
         | "head" | "tail" | "grep" | "jq" | "wc" => true,
+        // `add`, `commit`, and `push` change the index, history, or remote, not
+        // the cwd, branch, or gh's default repo.
         "git" => {
             matches!(
                 rest.get(1).map(String::as_str),
-                Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse")
+                Some(
+                    "status"
+                        | "log"
+                        | "diff"
+                        | "show"
+                        | "fetch"
+                        | "rev-parse"
+                        | "add"
+                        | "commit"
+                        | "push"
+                )
             ) && !rest
                 .iter()
                 .any(|t| t.starts_with("--output") || t.starts_with("--upload-pack"))
@@ -1154,6 +1176,15 @@ mod tests {
             run("cp merge.graphql read.graphql | gh api graphql -F query=@read.graphql"),
             Outcome::Block
         );
+        // Security review round 3: `>&1q.gql` is a file write, not `>&1`.
+        std::fs::write(dir.join("1q.gql"), "query { viewer { login } }").unwrap();
+        assert_eq!(
+            run(
+                "echo 'mutation { mergePullRequest(input: {}) { clientMutationId } }' >&1q.gql; gh api graphql -F query=@1q.gql"
+            ),
+            Outcome::Block
+        );
+        assert_eq!(run("gh api graphql -F query=@1q.gql"), Outcome::Allow);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1168,6 +1199,10 @@ mod tests {
             "gh pr view --json headRefName 2>&1 && gh pr merge --squash",
             "echo done >&2 && gh pr merge 5",
             "echo HIGH_PRIORITY && gh pr merge 5",
+            "git add . && gh pr merge --squash",
+            "git commit -m x && gh pr merge --squash",
+            "git push && gh pr merge --auto --squash",
+            "git status 2>/dev/null >&2 && gh pr merge 5",
         ] {
             let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
@@ -1191,6 +1226,13 @@ mod tests {
             "gh pr merge 5 | git checkout x",
             "gh pr merge 5 & git checkout x",
             "for i in 1; do gh pr merge 5; git checkout x; done",
+            // The PR does not exist when the lookup runs.
+            "gh pr create --fill && gh pr merge --auto",
+            // A redirect to a real file is a write (`>&2q` writes `2q`).
+            "echo x > f && gh pr merge 5",
+            "echo hi >&2q && gh pr merge 5",
+            "echo hi >/dev/null.x && gh pr merge 5",
+            "echo hi 2>/dev/null| git checkout x; gh pr merge 5",
         ] {
             let (result, _) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
             assert_eq!(result.outcome, Outcome::Block, "{command}");
