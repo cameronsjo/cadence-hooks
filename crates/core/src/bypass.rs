@@ -92,7 +92,9 @@
 //! `CADENCE_ALLOWED_REPOS` and `CADENCE_EXTRA_HOSTS` widen what
 //! `guard-push-remote` and `guard-gh-write` accept as the operator's own, and
 //! `CADENCE_ALLOW_SOPS_DECRYPT` lets `guard-sops-decrypt` allow a decrypt (it
-//! still writes a bypass row). All three guards are protected, and none of
+//! still writes a bypass row). `CADENCE_ALLOW_CLOUD_BRANCH_PUSH` lets
+//! `guard-push-remote` allow a local push to a cloud `claude/*`
+//! branch, also with a bypass row. All three guards are protected, and none of
 //! these variables is reported at session start: `enforcement-status` covers
 //! only the two switches above. The identity tier already
 //! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this

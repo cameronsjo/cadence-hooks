@@ -1093,6 +1093,26 @@ impl Check for PushRemoteGuard {
         // and the nudge: each is a full walk of every child script.
         let walk = PushWalk::default();
         let verdict = judge_push(input, &walk);
+        // A local session's push to a cloud session's branch blocks whatever
+        // the ownership verdict was (cadence-hooks#1367). Judged after it, so
+        // its git probes never spend the deadline the ownership probes need.
+        if verdict.outcome != cadence_hooks_core::Outcome::Block
+            && let Some(command) = input.command()
+            && may_push(command)
+            && let command = GIT_PUSH_VERB.replace_all(command, "git push")
+            && let cwd = input_cwd(input)
+            && let Some(cloud) = crate::cloud_branch_push::check(
+                &command,
+                &cwd,
+                walk.of(&command, &cwd),
+                cadence_hooks_core::remote::is_remote(),
+                std::env::var(crate::cloud_branch_push::ESCAPE_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        {
+            return cloud;
+        }
         if verdict.outcome != cadence_hooks_core::Outcome::Allow
             || verdict.bypass.is_some()
             || walk.every_push_placed.get()
