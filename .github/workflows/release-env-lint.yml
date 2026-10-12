@@ -27,3 +27,4 @@ jobs:
       # macos-signing (Developer ID key, notary password) must stay tag-only
       # (cameronsjo/cadence-hooks#280).
       - run: bash .github/scripts/lint-signing-env.sh
+      - run: bash .github/scripts/test-lint-signing-env.sh

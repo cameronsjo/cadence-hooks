@@ -30,7 +30,17 @@ fail() {
 
 shopt -s nullglob
 for wf in "$dir"/*.yml "$dir"/*.yaml; do
-  jobs="$(yq -r '.jobs // {} | to_entries[] | select((.value.environment | (select(tag == "!!str") // .name // "")) == "'"$env_name"'") | .key' "$wf")" \
+  # An environment set by an expression (`${{ ... }}`, a matrix or inputs
+  # value) cannot be checked here, and could resolve to macos-signing: refuse
+  # it outright. Names compare lowercased, because GitHub resolves environment
+  # names case-insensitively (`MACOS-Signing` is macos-signing).
+  exprs="$(yq -r '.jobs // {} | to_entries[] | select((.value.environment | (select(tag == "!!str") // .name // "")) | test("\$\{\{")) | .key' "$wf")" \
+    || { echo "lint-signing-env: cannot parse $wf" >&2; exit 2; }
+  while IFS= read -r job; do
+    [[ -z "$job" ]] || fail "$wf" "job '$job' sets its environment with an expression; name it literally"
+  done <<< "$exprs"
+
+  jobs="$(yq -r '.jobs // {} | to_entries[] | select((.value.environment | (select(tag == "!!str") // .name // "")) | downcase == "'"$env_name"'") | .key' "$wf")" \
     || { echo "lint-signing-env: cannot parse $wf" >&2; exit 2; }
   [[ -n "$jobs" ]] || continue
 
