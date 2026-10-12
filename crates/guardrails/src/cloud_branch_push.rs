@@ -49,6 +49,12 @@ const CLOUD_PREFIX: &str = "claude/";
 static NAMES_CLOUD_REF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[^A-Za-z0-9._-])claude/").expect("pattern should compile"));
 
+/// `xargs` as a command word: its replacement string (`-I %`) stands for
+/// whatever the producer prints, so a destination written as `%` is not the
+/// name git receives.
+static RUNS_XARGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^A-Za-z0-9_.-])xargs\b").expect("pattern should compile"));
+
 /// Substitutions that print the current branch, read as the current branch
 /// rather than as an unreadable destination.
 const CURRENT_BRANCH_SUBSTITUTIONS: &[&str] = &[
@@ -307,6 +313,12 @@ const MAX_PROBED_DIRECTORIES: usize = 8;
 struct Judge {
     /// The command names a `claude/` ref somewhere ([`NAMES_CLOUD_REF`]).
     names_cloud_ref: bool,
+    /// The command runs `xargs` ([`RUNS_XARGS`]).
+    runs_xargs: bool,
+    /// The command sets push config itself (`-c push.default=…`, `git config
+    /// push.default …`, `GIT_CONFIG_*`), which the probe of the repository's
+    /// config cannot see.
+    sets_push_config: bool,
     heads: HashMap<String, Probe<Head>>,
     refs: HashMap<String, Probe<CloudRefs>>,
 }
@@ -315,6 +327,8 @@ impl Judge {
     fn new(command: &str) -> Self {
         Self {
             names_cloud_ref: NAMES_CLOUD_REF.is_match(command),
+            runs_xargs: RUNS_XARGS.is_match(command),
+            sets_push_config: command.contains("push.default") || command.contains("GIT_CONFIG"),
             heads: HashMap::new(),
             refs: HashMap::new(),
         }
@@ -362,6 +376,11 @@ impl Judge {
                 if is_cloud_ref(name) {
                     return Some(Refusal::Destination(name.clone()));
                 }
+                // `xargs -I % git push origin :%` deletes whatever the
+                // producer prints, and `%` reads as a literal name.
+                if self.names_cloud_ref && self.runs_xargs {
+                    return Some(Refusal::NamedInText(name.clone()));
+                }
                 continue;
             }
             // Every other destination is decided when the command runs: a
@@ -386,9 +405,7 @@ impl Judge {
             }
             let refusal = match dst {
                 Destination::Named(_) => None,
-                Destination::CurrentName | Destination::Unreadable(_) => match self.head(dir) {
-                    // `"$B"` is most often the current branch, so an
-                    // unreadable destination is judged as one.
+                Destination::CurrentName => match self.head(dir) {
                     Probe::Value(h) if is_cloud_ref(&h.branch) => {
                         Some(Refusal::Destination(h.branch.clone()))
                     }
@@ -398,7 +415,22 @@ impl Judge {
                         None
                     }
                 },
+                // `"$B"` is most often the current branch or its upstream (a
+                // bare push the command's own `-c push.default=upstream`
+                // decides lands here too), so it is judged as either.
+                Destination::Unreadable(_) => match self.head(dir) {
+                    Probe::Value(h) => std::iter::once(&h.branch)
+                        .chain(h.upstream.as_ref())
+                        .find(|n| is_cloud_ref(n))
+                        .map(|n| Refusal::Destination(n.clone())),
+                    Probe::Nothing => None,
+                    Probe::Unavailable => {
+                        cadence_hooks_core::deadline::note_suppressed_block();
+                        None
+                    }
+                },
                 Destination::Bare => {
+                    let sets_push_config = self.sets_push_config;
                     let (names, every_branch) = match self.head(dir) {
                         Probe::Value(h) => {
                             if let Some(v) = h.remote_push.iter().find(|v| v.contains(CLOUD_PREFIX))
@@ -406,7 +438,11 @@ impl Judge {
                                 return Some(Refusal::Destination(v.clone()));
                             }
                             let mut names = vec![h.branch.clone()];
-                            if matches!(h.push_default.as_deref(), Some("upstream" | "tracking"))
+                            if (sets_push_config
+                                || matches!(
+                                    h.push_default.as_deref(),
+                                    Some("upstream" | "tracking")
+                                ))
                                 && let Some(up) = &h.upstream
                             {
                                 names.push(up.clone());
@@ -774,6 +810,48 @@ mod tests {
         ] {
             assert_eq!(outcome(cmd, dir(&s)), Outcome::Allow, "{cmd}");
         }
+    }
+
+    #[test]
+    fn an_xargs_replacement_string_is_not_a_literal_destination() {
+        let s = repo("xargs-replace");
+        for cmd in [
+            "git branch -r | grep claude/ | sed 's|origin/||' | xargs -I % git push origin :%",
+            "git branch -r | grep claude/ | sed 's|origin/||' | xargs -I BR git push origin --delete BR",
+            "git branch -r | grep claude/ | sed 's|origin/||' | xargs -I % git push -f origin main:%",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
+        }
+        assert_eq!(
+            outcome("ls | xargs -I % git push origin main:%", dir(&s)),
+            Outcome::Allow,
+            "no cloud ref named"
+        );
+    }
+
+    /// The command's own push config decides a bare push the repository
+    /// probe reads as `simple`.
+    #[test]
+    fn a_command_set_push_default_reads_the_upstream() {
+        let s = repo("command-push-default");
+        git_in(s.path(), &["checkout", "-q", "-b", "rescue"]);
+        git_in(s.path(), &["config", "branch.rescue.remote", "origin"]);
+        git_in(
+            s.path(),
+            &[
+                "config",
+                "branch.rescue.merge",
+                "refs/heads/claude/project-thread-7",
+            ],
+        );
+        for cmd in [
+            "git -c push.default=upstream push",
+            "git config push.default upstream && git push",
+            "git push origin \"HEAD:$UP\"",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
+        }
+        assert_eq!(outcome("git push -u origin HEAD", dir(&s)), Outcome::Allow);
     }
 
     #[test]
