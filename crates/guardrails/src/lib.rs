@@ -93,7 +93,7 @@ pub(crate) fn github_origin_repo() -> tempfile::TempDir {
 
 /// Bounded runner for the external tools (`gh`, `chezmoi`) advisory nudges query.
 pub mod bounded_tool;
-/// Local-session pushes to cloud `claude/project-thread-*` branches, judged by `guard_push_remote`.
+/// Local-session pushes to cloud `claude/*` branches, judged by `guard_push_remote`.
 mod cloud_branch_push;
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;

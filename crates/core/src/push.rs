@@ -99,6 +99,11 @@ pub struct PushInvocation {
     /// every ref under `refs/`, where `--all` is only `refs/heads`. Read only
     /// by a caller that tells the two apart (`prevent-secret-push`).
     pub mirror: bool,
+    /// `--prune`: git deletes every remote ref the push's refspecs cover that
+    /// has no local counterpart. Read by a caller that guards remote refs
+    /// against deletion (`guard-push-remote`'s cloud-branch check,
+    /// cameronsjo/cadence-hooks#1367).
+    pub prune: bool,
     /// `--follow-tags` (`Some(true)`) or `--no-follow-tags` (`Some(false)`),
     /// the last one written; `None` leaves `push.followTags` in charge.
     pub follow_tags: Option<bool>,
@@ -1109,6 +1114,7 @@ fn unresolvable_push(work_dir: &str, directory_unverified: bool) -> PushInvocati
         tags: false,
         dry_run: false,
         mirror: false,
+        prune: false,
         follow_tags: None,
         recurse_submodules: None,
         unresolved: true,
@@ -3264,6 +3270,7 @@ fn push_invocation_of(
             tags: false,
             dry_run: false,
             mirror: false,
+            prune: false,
             follow_tags: None,
             recurse_submodules: None,
             unresolved: true,
@@ -3311,6 +3318,7 @@ fn push_invocation_of(
         tags: scan.tags,
         dry_run: scan.dry_run,
         mirror: scan.mirror,
+        prune: scan.prune,
         follow_tags: scan.follow_tags,
         recurse_submodules: scan.recurse_submodules,
         unresolved: globals.foreign_redirect
@@ -3339,6 +3347,7 @@ struct PushWordScan {
     dry_run: bool,
     delete_flag: bool,
     mirror: bool,
+    prune: bool,
     follow_tags: Option<bool>,
     recurse_submodules: Option<String>,
 }
@@ -3357,6 +3366,7 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
         dry_run: false,
         delete_flag: false,
         mirror: false,
+        prune: false,
         follow_tags: None,
         recurse_submodules: None,
     };
@@ -3433,6 +3443,11 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // field above.
             if abbreviates("mirror", name) {
                 scan.mirror = true;
+            }
+            // By prefix, like `--all`: over-matching only makes a deletion
+            // guard stricter. `--no-prune` does not start with `prune`.
+            if abbreviates("prune", name) {
+                scan.prune = true;
             }
             // `--fol` is the shortest unambiguous `--follow-tags`: git rejects
             // `--fo` as ambiguous with `--force-if-includes` (measured, 2.43),

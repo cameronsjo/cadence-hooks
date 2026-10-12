@@ -9,23 +9,32 @@
 //! ownership verdict (cameronsjo/cadence-hooks#1367).
 //!
 //! Destinations are read from the same push walk the other push guards use
-//! ([`push_locations`]): explicit refspecs, `--delete`, `--all`/`--mirror`,
-//! a bare push under `push.default`, and pushes inside child scripts. A
-//! destination the command text cannot show (`git push origin "$B"`, a glob
-//! refspec, a configured `remote.<name>.push`) fails closed when the
-//! repository holds any `claude/*` ref, local or
-//! remote-tracking. A repository with no such ref has no cloud branch to
-//! overwrite that this clone knows of, so blocking every variable-built push
-//! there would cost ordinary scripts a false block for nothing.
+//! ([`push_locations`]): explicit refspecs, `--delete`, a bare push under
+//! `push.default` and `remote.<name>.push`, `--all`, and `--mirror`/`--prune`
+//! (which delete remote branches the clone has no local copy of), in child
+//! scripts and shell-fed heredocs too.
+//!
+//! A destination the walk cannot read from the text (`git push origin "$B"`,
+//! a bare push after a `git checkout` in the same command, a refspec an
+//! `xargs` appends) blocks when the command text names a `claude/` ref
+//! anywhere, or when the current branch is one. Otherwise it is allowed:
+//! almost every working clone has fetched cloud branches, so blocking every
+//! variable-built push there would be a false block on ordinary scripts.
 //!
 //! The escape is `CADENCE_ALLOW_CLOUD_BRANCH_PUSH` (truthy), read from Claude
 //! Code's environment like `CADENCE_ALLOW_SOPS_DECRYPT`. It allows and records
 //! a bypass row.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use cadence_hooks_core::push::{PushInvocation, push_locations};
-use cadence_hooks_core::shell::{GitOutput, git_output_detailed, shell_fed_heredoc_bodies};
+use cadence_hooks_core::shell::{
+    GitOutput, git_output_detailed, shell_fed_heredoc_bodies, unescape_word,
+};
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, CheckResult};
+use regex::Regex;
 
 /// The returnable escape for a deliberate rescue push.
 pub(crate) const ESCAPE_ENV: &str = "CADENCE_ALLOW_CLOUD_BRANCH_PUSH";
@@ -33,18 +42,42 @@ pub(crate) const ESCAPE_ENV: &str = "CADENCE_ALLOW_CLOUD_BRANCH_PUSH";
 /// The branch-name prefix only cloud sessions push to.
 const CLOUD_PREFIX: &str = "claude/";
 
-/// What one refspec's destination reads as, from the command text alone.
+/// A `claude/` ref named anywhere in the command: `claude/x`, `origin/claude/x`,
+/// `refs/heads/claude/x`, `HEAD:claude/x`. A path segment such as
+/// `.claude/worktrees` does not count: a word character, `.` or `-` before it
+/// makes it part of another name.
+static NAMES_CLOUD_REF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^A-Za-z0-9._-])claude/").expect("pattern should compile"));
+
+/// Substitutions that print the current branch, read as the current branch
+/// rather than as an unreadable destination.
+const CURRENT_BRANCH_SUBSTITUTIONS: &[&str] = &[
+    "$(git branch --show-current)",
+    "$(git rev-parse --abbrev-ref HEAD)",
+    "$(git symbolic-ref --short HEAD)",
+    "`git branch --show-current`",
+    "`git rev-parse --abbrev-ref HEAD`",
+    "`git symbolic-ref --short HEAD`",
+];
+
+/// What one push's destination reads as, from the walk's output alone.
 #[derive(Debug, PartialEq, Eq)]
 enum Destination {
     /// A literal remote ref name, as written.
     Named(String),
-    /// The ref the current branch pushes to: a bare push, `HEAD`, or `@`.
-    Current,
-    /// Every local branch: `--all`, `--mirror`, or the `:` matching refspec.
+    /// An explicit `HEAD`, `@`, or current-branch substitution: git pushes
+    /// it to the current branch's own name.
+    CurrentName,
+    /// A bare push: `push.default` and `remote.<name>.push` decide.
+    Bare,
+    /// Every local branch the pattern covers: `--all`, the `:` matching
+    /// refspec, a glob.
     EveryBranch,
-    /// The text does not show it: a `$`/backtick expansion, a glob, or a
-    /// bare push whose refs come from config (`push.default=matching`,
-    /// `remote.<name>.push`).
+    /// `--mirror` or `--prune`: remote branches with no local counterpart
+    /// are deleted.
+    Deletes,
+    /// The text does not show it: a `$`/backtick expansion, or a bare push
+    /// whose refs the command's own `-c`/`GIT_CONFIG_*` decide.
     Unreadable(String),
 }
 
@@ -59,44 +92,51 @@ fn is_cloud_ref(name: &str) -> bool {
 /// The destinations one push names. Pure: reads only the walk's output.
 fn destinations(push: &PushInvocation) -> Vec<Destination> {
     let mut out = Vec::new();
+    if push.mirror || push.prune {
+        out.push(Destination::Deletes);
+    }
     if push.all_or_mirror {
         out.push(Destination::EveryBranch);
     }
-    for refspec in &push.refspecs {
+    let mut refspecs = push.refspecs.iter();
+    while let Some(refspec) = refspecs.next() {
         if refspec.implicit {
-            // The walk marks a bare push `unresolved` when config or the
-            // command decides its refs. A directory change it could not
-            // follow sets the same flag; that push still reads as the current
-            // branch of the directory the walk tracked, the place
-            // guard-push-remote judges it too.
+            // The walk marks a bare push `unresolved` when the command's own
+            // config decides its refs. A directory change it could not follow
+            // sets the same flag; that push still reads as a bare push in the
+            // directory the walk tracked, where guard-push-remote judges it.
             out.push(if push.unresolved && !push.directory_unverified {
                 Destination::Unreadable(refspec.raw.clone())
             } else {
-                Destination::Current
+                Destination::Bare
             });
             continue;
         }
+        // `git push origin tag <name>` pushes `refs/tags/<name>`.
+        if refspec.raw == "tag" {
+            refspecs.next();
+            continue;
+        }
         // `Refspec::destination` drops the name of a `--delete <ref>`, so read
-        // the remote side from the refspec as written.
+        // the remote side from the refspec as written, then remove the
+        // shell's quoting the way it reaches git.
         let body = refspec.raw.strip_prefix('+').unwrap_or(&refspec.raw);
-        let dst = body.split_once(':').map_or(body, |(_, d)| d);
-        out.push(if dst.contains(['$', '`', '*', '?', '[']) {
+        let raw_dst = body.split_once(':').map_or(body, |(_, d)| d);
+        let dst = unescape_word(raw_dst);
+        let bare_dst = dst.strip_prefix("refs/heads/").unwrap_or(&dst);
+        out.push(if CURRENT_BRANCH_SUBSTITUTIONS.contains(&bare_dst) {
+            Destination::CurrentName
+        } else if dst.contains(['$', '`']) {
             Destination::Unreadable(refspec.raw.clone())
-        } else if dst.is_empty() {
+        } else if dst.is_empty() || (dst.contains(['*', '?', '[']) && !is_cloud_ref(&dst)) {
             Destination::EveryBranch
         } else if dst == "HEAD" || dst == "@" {
-            Destination::Current
+            Destination::CurrentName
         } else {
-            Destination::Named(dst.to_string())
+            Destination::Named(dst.into_owned())
         });
     }
     out
-}
-
-/// Cloud-branch refs this repository knows of, split by namespace.
-struct CloudRefs {
-    local: Vec<String>,
-    any: Vec<String>,
 }
 
 /// A git probe's answer, reduced to what the verdict needs.
@@ -108,6 +148,14 @@ enum Probe<T> {
     /// The guard's own infrastructure failed (timeout, no git): fail open
     /// (ADR-0001) and record the suppressed block.
     Unavailable,
+}
+
+/// Cloud-branch refs this repository knows of.
+struct CloudRefs {
+    /// Local branches under `refs/heads/claude/`.
+    local: Vec<String>,
+    /// Those plus remote-tracking ones (`refs/remotes/<remote>/claude/…`).
+    any: Vec<String>,
 }
 
 fn cloud_refs(work_dir: &str) -> Probe<CloudRefs> {
@@ -131,11 +179,12 @@ fn cloud_refs(work_dir: &str) -> Probe<CloudRefs> {
                         refs.local.push(branch.to_string());
                         refs.any.push(name.to_string());
                     }
-                } else if name
-                    .strip_prefix("refs/remotes/")
-                    .and_then(|rest| rest.split_once('/'))
-                    .is_some_and(|(_, branch)| branch.starts_with(CLOUD_PREFIX))
-                {
+                } else if name.strip_prefix("refs/remotes/").is_some_and(|rest| {
+                    // A remote name may itself contain `/`, so any segment
+                    // boundary can start the branch.
+                    rest.match_indices('/')
+                        .any(|(i, _)| rest[i + 1..].starts_with(CLOUD_PREFIX))
+                }) {
                     refs.any.push(name.to_string());
                 }
             }
@@ -146,18 +195,19 @@ fn cloud_refs(work_dir: &str) -> Probe<CloudRefs> {
     }
 }
 
-/// What a push of the current branch can update.
-enum Current {
-    /// The branch's own name (`push.default` `simple`/`current`) and its
-    /// upstream (`push.default=upstream`). Reading both is stricter than any
-    /// one mode.
-    Names(Vec<String>),
-    /// `push.default=matching` or a `remote.<name>.push` refspec decides
-    /// which refs a bare push sends, so the current branch does not say.
-    ConfigDecides,
+/// The current branch and the config that decides what a bare push sends.
+struct Head {
+    branch: String,
+    /// `branch.<b>.merge`, pushed to under `push.default=upstream`.
+    upstream: Option<String>,
+    push_default: Option<String>,
+    /// Every `remote.<name>.push` refspec value.
+    remote_push: Vec<String>,
 }
 
-fn current_destinations(work_dir: &str) -> Probe<Current> {
+fn head(work_dir: &str) -> Probe<Head> {
+    let mut push_default = None;
+    let mut remote_push = Vec::new();
     // `--get-regexp` matches the lowercased key, so `remote.origin.pushurl`
     // stays out: the pattern is anchored after `.push`.
     match git_output_detailed(
@@ -169,11 +219,13 @@ fn current_destinations(work_dir: &str) -> Probe<Current> {
         ],
     ) {
         GitOutput::Ok(out) => {
-            if out
-                .lines()
-                .any(|line| !line.starts_with("push.default ") || line.ends_with(" matching"))
-            {
-                return Probe::Value(Current::ConfigDecides);
+            for line in out.lines() {
+                let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+                if key == "push.default" {
+                    push_default = Some(value.to_ascii_lowercase());
+                } else {
+                    remote_push.push(value.to_string());
+                }
             }
         }
         // Exit 1 is "no such key", the normal state.
@@ -186,22 +238,28 @@ fn current_destinations(work_dir: &str) -> Probe<Current> {
         GitOutput::Unavailable | GitOutput::TimedOut => return Probe::Unavailable,
     };
     let key = format!("branch.{branch}.merge");
-    let mut out = vec![branch];
-    match git_output_detailed(work_dir, &["config", "--get", &key]) {
-        GitOutput::Ok(merge) if !merge.is_empty() => out.push(merge),
-        // Not configured is a normal state: no upstream to add.
-        GitOutput::Ok(_) | GitOutput::Failed => {}
+    let upstream = match git_output_detailed(work_dir, &["config", "--get", &key]) {
+        GitOutput::Ok(merge) if !merge.is_empty() => Some(merge),
+        // Not configured is a normal state: no upstream.
+        GitOutput::Ok(_) | GitOutput::Failed => None,
         GitOutput::Unavailable | GitOutput::TimedOut => return Probe::Unavailable,
-    }
-    Probe::Value(Current::Names(out))
+    };
+    Probe::Value(Head {
+        branch,
+        upstream,
+        push_default,
+        remote_push,
+    })
 }
 
 /// Why a push was refused, for the message.
 enum Refusal {
     /// The destination is a cloud branch.
     Destination(String),
-    /// The destination cannot be read, and this repository holds cloud-branch refs.
-    Unreadable { token: String, known: Vec<String> },
+    /// The destination cannot be read, and the command names a cloud ref.
+    NamedInText(String),
+    /// `--mirror`/`--prune` would delete remote cloud branches.
+    Deletes(Vec<String>),
     /// The destination depends on repository state, and the walk cannot say
     /// which repository the push runs in.
     UnknownRepository(String),
@@ -211,9 +269,14 @@ fn block_message(refusal: &Refusal) -> String {
     let head = "🚫 git-guardrails: push to a cloud session's branch\n   ";
     let what = match refusal {
         Refusal::Destination(name) => format!("Destination: {name}\n   "),
-        Refusal::Unreadable { token, known } => format!(
-            "Destination cannot be read from the command: `{token}`\n   \
-             This repository has cloud branches it could name: {}\n   ",
+        Refusal::NamedInText(token) => format!(
+            "Destination `{token}` is decided when the command runs, and the command \
+             names a `{CLOUD_PREFIX}` ref. If the push does not go to a cloud branch, \
+             run it as its own command, after any branch switch.\n   "
+        ),
+        Refusal::Deletes(known) => format!(
+            "`--mirror`/`--prune` deletes remote branches with no local copy, and this \
+             repository knows cloud branches: {}\n   ",
             known.join(", ")
         ),
         Refusal::UnknownRepository(token) => format!(
@@ -241,18 +304,51 @@ const MAX_PROBED_DIRECTORIES: usize = 8;
 
 /// Per-command judge, caching each directory's probes so a flood of bare
 /// pushes in one repository costs one probe set, not one per push.
-#[derive(Default)]
 struct Judge {
-    current: std::collections::HashMap<String, Probe<Current>>,
-    refs: std::collections::HashMap<String, Probe<CloudRefs>>,
+    /// The command names a `claude/` ref somewhere ([`NAMES_CLOUD_REF`]).
+    names_cloud_ref: bool,
+    heads: HashMap<String, Probe<Head>>,
+    refs: HashMap<String, Probe<CloudRefs>>,
 }
 
 impl Judge {
+    fn new(command: &str) -> Self {
+        Self {
+            names_cloud_ref: NAMES_CLOUD_REF.is_match(command),
+            heads: HashMap::new(),
+            refs: HashMap::new(),
+        }
+    }
+
     fn over_budget(&self, work_dir: &str) -> bool {
         let mut dirs: std::collections::HashSet<&str> =
-            self.current.keys().map(String::as_str).collect();
+            self.heads.keys().map(String::as_str).collect();
         dirs.extend(self.refs.keys().map(String::as_str));
         !dirs.contains(work_dir) && dirs.len() >= MAX_PROBED_DIRECTORIES
+    }
+
+    fn head(&mut self, work_dir: &str) -> &Probe<Head> {
+        self.heads
+            .entry(work_dir.to_string())
+            .or_insert_with(|| head(work_dir))
+    }
+
+    fn refs(&mut self, work_dir: &str) -> &Probe<CloudRefs> {
+        self.refs
+            .entry(work_dir.to_string())
+            .or_insert_with(|| cloud_refs(work_dir))
+    }
+
+    /// Does any local cloud branch exist in `work_dir`?
+    fn local_cloud_branch(&mut self, work_dir: &str) -> Option<Refusal> {
+        match self.refs(work_dir) {
+            Probe::Value(found) => found.local.first().map(|b| Refusal::Destination(b.clone())),
+            Probe::Nothing => None,
+            Probe::Unavailable => {
+                cadence_hooks_core::deadline::note_suppressed_block();
+                None
+            }
+        }
     }
 
     /// Judge one push. `None` allows it.
@@ -260,68 +356,95 @@ impl Judge {
         if push.dry_run {
             return None;
         }
+        let dir = push.work_dir.as_str();
         for dst in destinations(push) {
-            let dst = match dst {
-                Destination::Named(name) => {
-                    if is_cloud_ref(&name) {
-                        return Some(Refusal::Destination(name));
-                    }
-                    continue;
+            if let Destination::Named(name) = &dst {
+                if is_cloud_ref(name) {
+                    return Some(Refusal::Destination(name.clone()));
                 }
-                other => other,
-            };
-            if push.repository_unresolved || self.over_budget(&push.work_dir) {
+                continue;
+            }
+            // Every other destination is decided when the command runs: a
+            // branch switch, a variable, or a runner's appended argument can
+            // make it a cloud branch the walk never sees. A `claude/` ref in
+            // the text is the one sign of that the text can give.
+            if self.names_cloud_ref {
                 let token = match &dst {
                     Destination::Unreadable(t) => t.clone(),
-                    Destination::EveryBranch => "--all".to_string(),
+                    Destination::EveryBranch | Destination::Deletes => "--all".to_string(),
+                    _ => "HEAD".to_string(),
+                };
+                return Some(Refusal::NamedInText(token));
+            }
+            if push.repository_unresolved || self.over_budget(dir) {
+                let token = match &dst {
+                    Destination::Unreadable(t) => t.clone(),
+                    Destination::EveryBranch | Destination::Deletes => "--all".to_string(),
                     _ => "HEAD".to_string(),
                 };
                 return Some(Refusal::UnknownRepository(token));
             }
-            let dst = match dst {
-                Destination::Current => {
-                    match self
-                        .current
-                        .entry(push.work_dir.clone())
-                        .or_insert_with(|| current_destinations(&push.work_dir))
-                    {
-                        Probe::Value(Current::Names(names)) => {
-                            if let Some(name) = names.iter().find(|n| is_cloud_ref(n)) {
-                                return Some(Refusal::Destination(name.clone()));
+            let refusal = match dst {
+                Destination::Named(_) => None,
+                Destination::CurrentName | Destination::Unreadable(_) => match self.head(dir) {
+                    // `"$B"` is most often the current branch, so an
+                    // unreadable destination is judged as one.
+                    Probe::Value(h) if is_cloud_ref(&h.branch) => {
+                        Some(Refusal::Destination(h.branch.clone()))
+                    }
+                    Probe::Value(_) | Probe::Nothing => None,
+                    Probe::Unavailable => {
+                        cadence_hooks_core::deadline::note_suppressed_block();
+                        None
+                    }
+                },
+                Destination::Bare => {
+                    let (names, every_branch) = match self.head(dir) {
+                        Probe::Value(h) => {
+                            if let Some(v) = h.remote_push.iter().find(|v| v.contains(CLOUD_PREFIX))
+                            {
+                                return Some(Refusal::Destination(v.clone()));
                             }
-                            continue;
+                            let mut names = vec![h.branch.clone()];
+                            if matches!(h.push_default.as_deref(), Some("upstream" | "tracking"))
+                                && let Some(up) = &h.upstream
+                            {
+                                names.push(up.clone());
+                            }
+                            (
+                                names,
+                                !h.remote_push.is_empty()
+                                    || h.push_default.as_deref() == Some("matching"),
+                            )
                         }
-                        Probe::Value(Current::ConfigDecides) => {
-                            Destination::Unreadable("git push (refs set by config)".to_string())
-                        }
-                        Probe::Nothing => continue,
+                        Probe::Nothing => (Vec::new(), false),
                         Probe::Unavailable => {
                             cadence_hooks_core::deadline::note_suppressed_block();
-                            continue;
+                            (Vec::new(), false)
                         }
+                    };
+                    if let Some(name) = names.into_iter().find(|n| is_cloud_ref(n)) {
+                        Some(Refusal::Destination(name))
+                    } else if every_branch {
+                        self.local_cloud_branch(dir)
+                    } else {
+                        None
                     }
                 }
-                other => other,
-            };
-            let probe = self
-                .refs
-                .entry(push.work_dir.clone())
-                .or_insert_with(|| cloud_refs(&push.work_dir));
-            match probe {
-                Probe::Value(found) => match dst {
-                    Destination::Unreadable(token) if !found.any.is_empty() => {
-                        return Some(Refusal::Unreadable {
-                            token,
-                            known: found.any.clone(),
-                        });
+                Destination::EveryBranch => self.local_cloud_branch(dir),
+                Destination::Deletes => match self.refs(dir) {
+                    Probe::Value(found) if !found.any.is_empty() => {
+                        Some(Refusal::Deletes(found.any.clone()))
                     }
-                    Destination::EveryBranch if !found.local.is_empty() => {
-                        return Some(Refusal::Destination(found.local[0].clone()));
+                    Probe::Value(_) | Probe::Nothing => None,
+                    Probe::Unavailable => {
+                        cadence_hooks_core::deadline::note_suppressed_block();
+                        None
                     }
-                    _ => {}
                 },
-                Probe::Nothing => {}
-                Probe::Unavailable => cadence_hooks_core::deadline::note_suppressed_block(),
+            };
+            if refusal.is_some() {
+                return refusal;
             }
         }
         None
@@ -333,8 +456,8 @@ impl Judge {
 ///
 /// `pushes` is `guard-push-remote`'s own push walk ([`push_locations`] read
 /// two ways), reused so a large command is walked once. That walk does not
-/// read repository config, so [`current_destinations`] reads the two keys
-/// that change what a bare push sends.
+/// read repository config, so [`head`] reads the keys that change what a bare
+/// push sends.
 pub(crate) fn check(
     command: &str,
     cwd: &str,
@@ -345,7 +468,7 @@ pub(crate) fn check(
     if remote {
         return None;
     }
-    let mut judge = Judge::default();
+    let mut judge = Judge::new(command);
     let mut refusal = pushes.iter().find_map(|p| judge.push(p));
     // A heredoc a shell reads on stdin is a script too (guard-push-remote
     // reads its pushes the same way). The walk above does not include them.
@@ -504,9 +627,13 @@ mod tests {
         }
     }
 
+    /// The rescue flow: `git checkout -b rescue origin/claude/…` sets the
+    /// upstream to the cloud branch. git pushes `HEAD` to `rescue`, and a
+    /// bare push under `simple` refuses the name mismatch, so only
+    /// `push.default=upstream` sends it to the cloud branch.
     #[test]
-    fn bare_push_whose_upstream_is_a_cloud_branch_blocks() {
-        let s = repo("upstream-thread");
+    fn an_upstream_cloud_branch_blocks_only_under_push_default_upstream() {
+        let s = repo("upstream-cloud");
         git_in(s.path(), &["checkout", "-q", "-b", "rescue"]);
         git_in(s.path(), &["config", "branch.rescue.remote", "origin"]);
         git_in(
@@ -517,7 +644,16 @@ mod tests {
                 "refs/heads/claude/project-thread-7",
             ],
         );
+        for cmd in ["git push", "git push -u origin HEAD", "git push origin @"] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Allow, "{cmd}");
+        }
+        git_in(s.path(), &["config", "push.default", "upstream"]);
         assert_eq!(outcome("git push", dir(&s)), Outcome::Block);
+        assert_eq!(
+            outcome("git push -u origin HEAD", dir(&s)),
+            Outcome::Allow,
+            "an explicit HEAD still goes to the branch's own name"
+        );
     }
 
     #[test]
@@ -528,14 +664,12 @@ mod tests {
         assert_eq!(outcome("git push origin :", dir(&s)), Outcome::Block);
     }
 
+    /// Every working clone has fetched cloud branches, so an unreadable
+    /// destination is judged by the text and the current branch, not by
+    /// whether cloud refs exist.
     #[test]
-    fn unreadable_destination_blocks_only_where_cloud_refs_exist() {
+    fn unreadable_destinations_in_a_clone_with_fetched_cloud_refs() {
         let s = repo("unreadable");
-        let cmd = "git push origin \"HEAD:$B\"";
-        assert_eq!(outcome(cmd, dir(&s)), Outcome::Allow, "no cloud refs yet");
-
-        // A remote-tracking cloud ref is enough: a fetched cloud branch is
-        // exactly what an unreadable destination could overwrite.
         git_in(
             s.path(),
             &[
@@ -545,14 +679,119 @@ mod tests {
             ],
         );
         for cmd in [
-            cmd,
             "git push origin \"$B\"",
+            "git push origin \"HEAD:$B\"",
+            "git push -u origin \"$(git branch --show-current)\"",
+            "BR=$(git branch --show-current); git push -u origin \"$BR\"",
+            "git push --no-follow-tags origin \"$SHA:refs/heads/$BRANCH\"",
+            "git push --all origin",
+            "git push origin main",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Allow, "{cmd}");
+        }
+        for cmd in [
+            "B=claude/project-thread-x; git push origin \"HEAD:$B\"",
+            "for b in claude/project-thread-x; do git push origin \"$b\"; done",
             "git push origin 'refs/heads/*:refs/heads/claude/*'",
-            "git push origin \"$(git branch --show-current)\"",
         ] {
             assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
         }
-        assert_eq!(outcome("git push origin main", dir(&s)), Outcome::Allow);
+        git_in(
+            s.path(),
+            &["checkout", "-q", "-b", "claude/project-thread-7"],
+        );
+        for cmd in [
+            "git push origin \"$B\"",
+            "git push -u origin \"$(git branch --show-current)\"",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn mirror_and_prune_block_where_remote_cloud_branches_are_known() {
+        let s = repo("mirror-prune");
+        for cmd in ["git push --mirror origin", "git push --all --prune origin"] {
+            assert_eq!(
+                outcome(cmd, dir(&s)),
+                Outcome::Allow,
+                "no cloud refs: {cmd}"
+            );
+        }
+        git_in(
+            s.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/claude/project-thread-7",
+                "HEAD",
+            ],
+        );
+        for cmd in [
+            "git push --mirror origin",
+            "git push --all --prune origin",
+            "git push --prune origin 'refs/heads/*:refs/heads/*'",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
+        }
+        assert_eq!(outcome("git push --all origin", dir(&s)), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_remote_name_with_a_slash_still_counts_its_cloud_refs() {
+        let s = repo("slash-remote");
+        git_in(
+            s.path(),
+            &["update-ref", "refs/remotes/my/fork/claude/x", "HEAD"],
+        );
+        assert_eq!(
+            outcome("git push --mirror my/fork", dir(&s)),
+            Outcome::Block
+        );
+    }
+
+    /// A branch switch, a runner's appended argument, or an alias decides the
+    /// destination when the command runs; a `claude/` ref in the text is what
+    /// gives it away.
+    #[test]
+    fn a_cloud_ref_named_beside_a_runtime_destination_blocks() {
+        let s = repo("text-names");
+        for cmd in [
+            "git checkout claude/project-thread-7 && git push",
+            "git switch claude/project-thread-7 && git push origin HEAD",
+            "git checkout -b claude/project-thread-7 origin/claude/project-thread-7 && git push -f",
+            "git branch -r | grep claude/ | sed 's|origin/||' | xargs git push origin --delete",
+            "printf 'claude/project-thread-7\\n' | xargs -n1 git push origin --delete",
+            "echo claude/project-thread-x | xargs git push origin",
+            "git -c alias.p='push origin main:claude/x' p",
+            "git -c remote.origin.push=HEAD:refs/heads/claude/x push",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Block, "{cmd}");
+        }
+        for cmd in [
+            "git checkout -b feat/x && git push -u origin HEAD",
+            "cd .claude/worktrees/x && git push",
+            "git push origin main && echo done",
+        ] {
+            assert_eq!(outcome(cmd, dir(&s)), Outcome::Allow, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn quoting_and_tag_spellings() {
+        let s = repo("spellings");
+        assert_eq!(
+            outcome("git push origin clau\\de/project-thread-7", dir(&s)),
+            Outcome::Block
+        );
+        assert_eq!(
+            outcome("git push origin \"HEAD:claude/project-thread-7\"", dir(&s)),
+            Outcome::Block
+        );
+        assert_eq!(
+            outcome("git push origin tag claude/v1", dir(&s)),
+            Outcome::Allow,
+            "`tag <name>` pushes refs/tags/<name>"
+        );
     }
 
     #[test]
@@ -702,6 +941,37 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// An escaped refusal keeps the ownership verdict, nudge included, and
+    /// adds its bypass row to it.
+    #[test]
+    fn the_escape_keeps_the_ownership_verdict() {
+        use cadence_hooks_core::Check;
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let s = repo("escape-wired");
+        let env = [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+            ("CLAUDE_CODE_REMOTE", None),
+            (ESCAPE_ENV, Some("1")),
+        ];
+        crate::with_env(&env, || {
+            let guard = crate::guard_push_remote::PushRemoteGuard;
+            let r = guard.run(&make_bash_with_cwd(
+                "git push origin main:claude/project-thread-7",
+                dir(&s),
+            ));
+            assert_eq!(r.outcome, Outcome::Allow);
+            assert_eq!(r.bypass.map(|b| b.mechanism).as_deref(), Some(ESCAPE_ENV));
+            let r = guard.run(&make_bash_with_cwd(
+                "cd \"$D\" && git push origin main:claude/project-thread-7",
+                dir(&s),
+            ));
+            assert_eq!(r.outcome, Outcome::Nudge, "the directory nudge survives");
+            assert_eq!(r.bypass.map(|b| b.mechanism).as_deref(), Some(ESCAPE_ENV));
+        });
     }
 
     #[test]

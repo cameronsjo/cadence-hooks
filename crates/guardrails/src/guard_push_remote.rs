@@ -1096,6 +1096,9 @@ impl Check for PushRemoteGuard {
         // A local session's push to a cloud session's branch blocks whatever
         // the ownership verdict was (cadence-hooks#1367). Judged after it, so
         // its git probes never spend the deadline the ownership probes need.
+        // An escaped refusal comes back as an allow carrying its bypass row,
+        // which rides on the ownership verdict below rather than replacing it.
+        let mut cloud_bypass = None;
         if verdict.outcome != cadence_hooks_core::Outcome::Block
             && let Some(command) = input.command()
             && may_push(command)
@@ -1111,15 +1114,23 @@ impl Check for PushRemoteGuard {
                     .as_deref(),
             )
         {
-            return cloud;
+            if cloud.outcome == cadence_hooks_core::Outcome::Block {
+                return cloud;
+            }
+            cloud_bypass = cloud.bypass;
         }
-        if verdict.outcome != cadence_hooks_core::Outcome::Allow
+        let mut verdict = if verdict.outcome != cadence_hooks_core::Outcome::Allow
             || verdict.bypass.is_some()
             || walk.every_push_placed.get()
         {
-            return verdict;
+            verdict
+        } else {
+            unverified_directory_nudge(input, &walk).unwrap_or(verdict)
+        };
+        if verdict.bypass.is_none() {
+            verdict.bypass = cloud_bypass;
         }
-        unverified_directory_nudge(input, &walk).unwrap_or(verdict)
+        verdict
     }
 }
 
