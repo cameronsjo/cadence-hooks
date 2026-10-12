@@ -5,19 +5,22 @@
 //! `docs/research/2026-10-11-cloud-local-agent-coordination.md`, rule 2 as
 //! revised), a cloud session may merge only a PR it wholly owns: one whose head
 //! is its own `claude/*` branch (project threads and gambit lanes,
-//! cameronsjo/cadence#1677) in the same repository. Every
-//! other PR is merged by the local chief-of-staff or by Cameron. In a local
-//! session this guard allows everything.
+//! cameronsjo/cadence#1677) in the same repository. Every other PR is merged
+//! by the local chief-of-staff or by Cameron. In a local session this guard
+//! allows everything.
 //!
-//! **What counts as a merge.** Every way the `gh` CLI starts or queues one:
+//! **What counts as a merge.** Every way the `gh` CLI merges a PR, queues a
+//! PR merge, or merges a branch with no PR:
 //!
 //! - `gh pr merge`, including `--auto` (it queues a merge). `--disable-auto`
-//!   only cancels a queued merge, so it passes.
+//!   only cancels a queued merge and `--help` prints usage, so both pass.
 //! - `gh api` to `repos/<owner>/<repo>/pulls/<n>/merge` with any method but
 //!   `GET`/`HEAD` (a `GET` there only asks whether the PR is merged).
+//! - `gh api` writes to `repos/<owner>/<repo>/merges` (a branch merge with no
+//!   PR to own), which always block.
 //! - `gh api graphql` mutations whose root fields include
-//!   [`MERGE_MUTATIONS`]. These name the PR by node ID, so the head is not
-//!   resolved: they always block, and the fix is `gh pr merge`.
+//!   [`MERGE_MUTATIONS`]. These name the PR by node ID (or name no PR), so the
+//!   head is not resolved: they always block, and the fix is `gh pr merge`.
 //!
 //! **Ownership.** One `gh pr view --json headRefName,isCrossRepository,labels,url`
 //! names the PR's head. The merge passes only when that head starts with
@@ -28,12 +31,24 @@
 //! conditions (a manual rollout step, a settings change, a decision Cameron
 //! has not made) stay with the convention.
 //!
+//! **The lookup runs before the command does.** It reads the payload cwd,
+//! the checked-out branch, and the hook's env, and an earlier step of the
+//! same command can change all three (`gh pr checkout 7 && gh pr merge`,
+//! `cd other && gh pr merge 5`, `export GH_REPO=a/b; gh pr merge 5`). So a
+//! merge that resolves its PR from that state passes only when every other
+//! step is a known read-only command ([`segment_is_inert`]), and any merge
+//! blocks when another step mentions a `GH_*` variable.
+//!
 //! **Fails closed.** A merge whose head cannot be resolved blocks: an
 //! unreadable selector, a `gh` call that fails or times out, a host the
-//! command names other than `github.com` or `origin`'s, and a `gh api` write
-//! whose endpoint the shell computes. A merge sent by another client (`curl`
-//! to the REST API) is outside the threat model: the rule is about agents
-//! following the convention, not an adversary.
+//! command names other than `github.com` or `origin`'s, a `gh api` write
+//! whose computed endpoint may end in `merge`, and a GraphQL query that is
+//! neither inline nor a file read while the call is the whole command. That
+//! last one also blocks read-only queries passed as `"$Q"`; it is the
+//! accepted cost. A merge sent by another client (`curl` to the REST API) or
+//! through a computed program name (`$(which gh) pr merge`) is outside the
+//! threat model: the rule is about agents following the convention, not an
+//! adversary.
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -41,8 +56,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use cadence_hooks_core::shell::{
-    PrSelector, command_segments, gh_command_path, gh_pr_segments, gh_pr_subcommand,
-    may_spell_word, pr_url_parts,
+    PrSelector, command_segments, command_word, executable_tokens, gh_command_path, gh_pr_segments,
+    gh_pr_subcommand, may_spell_word, pr_url_parts, skip_transparent_prefixes,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -63,6 +78,7 @@ const SIGNATURE_GATED_REPOS: &[&str] = &["dotfiles-core", "cadence-lite"];
 
 /// GraphQL mutation root fields that merge a PR or queue one to merge.
 const MERGE_MUTATIONS: &[&str] = &[
+    "mergeBranch",
     "mergePullRequest",
     "enablePullRequestAutoMerge",
     "enqueuePullRequest",
@@ -79,13 +95,21 @@ static PULL_MERGE_PATH: LazyLock<Regex> = LazyLock::new(|| {
         .expect("pattern should compile")
 });
 
+/// The REST branch-merge endpoint (`POST repos/<o>/<r>/merges`), which merges
+/// a head into a base with no PR.
+static BRANCH_MERGE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^repos/[^/]+/[^/]+/merges/?$").expect("pattern should compile")
+});
+
 /// A merge the command asks for, before its PR is looked up.
 #[derive(Debug, PartialEq, Eq)]
 enum MergeCall {
-    /// A `gh pr merge` segment's tokens (`auto` when it only queues one).
-    Pr { tokens: Vec<String>, auto: bool },
+    /// A `gh pr merge` segment's tokens.
+    Pr { tokens: Vec<String> },
     /// A REST merge: `repo` is `None` for gh's `{owner}/{repo}` placeholders.
     Api { repo: Option<String>, number: u64 },
+    /// A REST merge of one branch into another, with no PR.
+    BranchMerge,
     /// A GraphQL mutation that merges or queues a merge.
     Graphql(String),
     /// A call that may merge but cannot be read: what is unreadable.
@@ -115,6 +139,8 @@ enum Finding {
     Citl { url: String, label: String },
     /// The PR's repository merges only with Cameron's signature.
     SignatureGated { url: String },
+    /// A merge of one branch into another, with no PR to own.
+    BranchMerge,
     /// A GraphQL merge mutation, which names the PR by node ID.
     Graphql(String),
     /// The merge's PR could not be resolved: why.
@@ -156,17 +182,81 @@ fn api_sends_write(segment: &str) -> bool {
     }
 }
 
-/// The merge call in a `gh api graphql` argv, if any.
-fn graphql_call(argv: &[String]) -> Option<MergeCall> {
-    let unreadable = Some(MergeCall::Unreadable("a GraphQL query that is not inline"));
-    let Some(query) = graphql_query_value(argv) else {
+/// The largest GraphQL query file the guard reads.
+const MAX_QUERY_FILE: u64 = 1 << 20;
+
+/// What the rest of the command can do to the state a merge's lookup reads.
+#[derive(Debug, Clone, Copy)]
+struct Surroundings {
+    /// Every other segment is a known read-only command, so none can move
+    /// the cwd, switch the branch, change the default repo, or write a file.
+    inert: bool,
+    /// Some other segment mentions a `GH_*` variable, which can repoint gh
+    /// (`export GH_REPO=…`, `export GH_HOST=…`) even for an explicit `-R`.
+    sets_gh_env: bool,
+}
+
+/// Whether a segment is a command that cannot change what a later merge's
+/// lookup reads: the cwd, the checked-out branch, gh's default repo or
+/// host, or a file. An allowlist, so an unknown command counts as a change.
+fn segment_is_inert(segment: &str) -> bool {
+    if segment.contains(['>', '<']) {
+        return false;
+    }
+    let tokens = executable_tokens(segment);
+    let rest = skip_transparent_prefixes(&tokens);
+    let Some(head) = rest.first() else {
+        // Nothing but assignments, which only reach gh through `GH_*`.
+        return !segment.contains("GH_");
+    };
+    match command_word(head).as_ref() {
+        "echo" | "printf" | "true" | ":" | "test" | "[" | "sleep" | "pwd" | "cat" | "ls"
+        | "head" | "tail" | "grep" | "jq" | "wc" => true,
+        "git" => matches!(
+            rest.get(1).map(String::as_str),
+            Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse")
+        ),
+        "gh" => matches!(
+            gh_command_path(rest, 2).as_slice(),
+            ["pr" | "issue", "view" | "comment" | "status"] | ["pr", "checks" | "diff"]
+        ),
+        _ => false,
+    }
+}
+
+/// Read a `-F query=@<path>` file against the payload cwd, capped.
+fn read_query_file(path: &str, cwd: &str) -> Option<String> {
+    if path.is_empty() || path == "-" || path.contains(['$', '`']) {
+        return None;
+    }
+    let full = std::path::Path::new(cwd).join(path);
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > MAX_QUERY_FILE {
+        return None;
+    }
+    std::fs::read_to_string(full).ok()
+}
+
+/// The merge call in a `gh api graphql` argv, if any. A query file is read
+/// only when the call stands alone: another segment could write it first.
+fn graphql_call(argv: &[String], cwd: &str, alone: bool) -> Option<MergeCall> {
+    let unreadable = Some(MergeCall::Unreadable(
+        "a GraphQL query that is not inline (a query file is read only when the gh call \
+         is the whole command)",
+    ));
+    let Some(mut query) = graphql_query_value(argv) else {
         return unreadable;
     };
-    // A query from a file, stdin, or a shell expansion cannot be read. Every
-    // real query has a selection set, so one with no `{` is a shell variable
-    // (`query="$Q"`) the tokenizer left unexpanded.
-    if query.starts_with('@') || query.contains("$(") || query.contains('`') || !query.contains('{')
-    {
+    if let Some(path) = query.strip_prefix('@') {
+        match read_query_file(path, cwd).filter(|_| alone) {
+            Some(text) => query = text,
+            None => return unreadable,
+        }
+    }
+    // A query from a shell expansion cannot be read. Every real query has a
+    // selection set, so one with no `{` is a shell variable (`query="$Q"`)
+    // the tokenizer left unexpanded.
+    if query.contains("$(") || query.contains('`') || !query.contains('{') {
         return unreadable;
     }
     let stripped = strip_graphql_literals(&query);
@@ -184,21 +274,40 @@ fn graphql_call(argv: &[String]) -> Option<MergeCall> {
     }
 }
 
+/// Whether a computed endpoint is still certainly not a merge: its last
+/// path segment is literal and is neither `merge` nor `merges`
+/// (`repos/$R/issues/5/comments`).
+fn computed_endpoint_rules_out_merge(endpoint: &str) -> bool {
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    !last.is_empty()
+        && !last.contains(['$', '`'])
+        && !last.eq_ignore_ascii_case("merge")
+        && !last.eq_ignore_ascii_case("merges")
+}
+
 /// The merge call in one `gh api` segment, if any.
-fn api_call(segment: &str, argv: &[String]) -> Option<MergeCall> {
+fn api_call(segment: &str, argv: &[String], cwd: &str, alone: bool) -> Option<MergeCall> {
     let endpoint = gh_api_endpoint(segment).unwrap_or_default();
     if is_graphql_endpoint(&endpoint) {
-        return graphql_call(argv);
+        return graphql_call(argv, cwd, alone);
     }
     if !api_sends_write(segment) {
         return None;
     }
     if endpoint.is_empty() || endpoint.contains(['$', '`']) {
+        if computed_endpoint_rules_out_merge(&endpoint) {
+            return None;
+        }
         return Some(MergeCall::Unreadable(
             "a `gh api` write whose endpoint the shell computes",
         ));
     }
-    let caps = PULL_MERGE_PATH.captures(endpoint_path(&endpoint))?;
+    let path = endpoint_path(&endpoint);
+    if BRANCH_MERGE_PATH.is_match(path) {
+        return Some(MergeCall::BranchMerge);
+    }
+    let caps = PULL_MERGE_PATH.captures(path)?;
     let unresolved = Some(MergeCall::Unreadable(
         "a `gh api` merge whose PR the guard cannot look up",
     ));
@@ -230,47 +339,65 @@ fn api_call(segment: &str, argv: &[String]) -> Option<MergeCall> {
     Some(MergeCall::Api { repo, number })
 }
 
-/// Whether a `gh pr merge` argv only cancels a queued merge.
-fn cancels_auto(tokens: &[String]) -> bool {
-    tokens.iter().any(|t| t == "--disable-auto")
+/// Whether a `gh pr merge` argv merges nothing: `--disable-auto` only
+/// cancels a queued merge, and `--help` prints usage.
+fn merges_nothing(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "--disable-auto" | "--help" | "-h"))
 }
 
-/// Every merge call in `command`.
-fn merge_calls(command: &str) -> Vec<MergeCall> {
+/// Every merge call in `command`, and what the rest of the command can do
+/// to the state their lookups read.
+fn merge_calls(command: &str, cwd: &str) -> (Vec<MergeCall>, Surroundings) {
+    let segments = command_segments(command);
+    let alone = segments.len() == 1;
     let mut calls = Vec::new();
-    let mut argv_merges = 0;
-    for segment in command_segments(command) {
-        if !segment_invokes_gh(&segment) {
+    let mut merge_segments = Vec::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        if !segment_invokes_gh(segment) {
             continue;
         }
-        let Some(argv) = gh_argv(&segment) else {
-            continue;
+        // The shared `gh pr` walk strips group punctuation (`merge)` inside
+        // `$(…)`) and keeps the prefixes (`GH_REPO=`, `GH_HOST=`) that decide
+        // which PR gh merges, so it is the one the lookup reads.
+        let pr_merge = gh_pr_segments(segment)
+            .into_iter()
+            .find(|t| gh_pr_subcommand(t) == Some("merge"));
+        let argv = gh_argv(segment);
+        let argv_path = argv
+            .as_deref()
+            .map(|a| gh_command_path(a, 2))
+            .unwrap_or_default();
+        let call = match (pr_merge, argv_path.as_slice()) {
+            (Some(tokens), _) if merges_nothing(&tokens) => None,
+            (Some(tokens), _) => Some(MergeCall::Pr { tokens }),
+            // A merge only the argv walk sees has no tokens to look up.
+            (None, ["pr", "merge"]) if !argv.as_deref().is_some_and(merges_nothing) => Some(
+                MergeCall::Unreadable("a `gh pr merge` the guard cannot read"),
+            ),
+            (None, ["api", ..]) => argv
+                .as_deref()
+                .and_then(|a| api_call(segment, a, cwd, alone)),
+            _ => None,
         };
-        match gh_command_path(&argv, 2).as_slice() {
-            ["pr", "merge"] if !cancels_auto(&argv) => argv_merges += 1,
-            ["api", ..] => calls.extend(api_call(&segment, &argv)),
-            _ => {}
+        if let Some(call) = call {
+            calls.push(call);
+            merge_segments.push(idx);
         }
     }
-    // The shared `gh pr` walk keeps the prefixes (`GH_REPO=`, `GH_HOST=`)
-    // that decide which PR gh merges, so it is the one the lookup reads.
-    let prs: Vec<MergeCall> = gh_pr_segments(command)
-        .into_iter()
-        .filter(|tokens| gh_pr_subcommand(tokens) == Some("merge") && !cancels_auto(tokens))
-        .map(|tokens| MergeCall::Pr {
-            auto: tokens.iter().any(|t| t == "--auto"),
-            tokens,
-        })
-        .collect();
-    // A merge the argv walk sees and the shared walk does not (an `eval`
-    // wrapper) has no tokens to look up.
-    if argv_merges > prs.len() {
-        calls.push(MergeCall::Unreadable(
-            "a `gh pr merge` the guard cannot read",
-        ));
-    }
-    calls.extend(prs);
-    calls
+    let others = || {
+        segments
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !merge_segments.contains(idx))
+            .map(|(_, s)| s)
+    };
+    let surroundings = Surroundings {
+        inert: others().all(|s| segment_is_inert(s)),
+        sets_gh_env: others().any(|s| s.contains("GH_")),
+    };
+    (calls, surroundings)
 }
 
 /// Read `gh pr view --json` output.
@@ -328,14 +455,46 @@ fn rule(facts: PrFacts) -> Option<Finding> {
 /// Builds the gh runner for a working dir and env; a seam for tests.
 type GhFactory<'a> = dyn Fn(PathBuf, Vec<(String, String)>) -> Box<dyn GhRunner> + 'a;
 
+/// Why a lookup cannot be trusted when another step of the command can
+/// change what it reads, or `None` when it can. `explicit` is a merge that
+/// names its repo itself (`-R`, a URL, or a literal REST path), so only a
+/// `GH_*` change can repoint it.
+fn surroundings_block(explicit: bool, around: Surroundings) -> Option<Finding> {
+    if around.sets_gh_env {
+        return Some(Finding::Unresolved(
+            "another step of the command sets a `GH_*` variable, which can change the PR gh merges",
+        ));
+    }
+    if !explicit && !around.inert {
+        return Some(Finding::Unresolved(
+            "another step of the command can change the directory, branch, or default repo \
+             the merge resolves its PR from",
+        ));
+    }
+    None
+}
+
 /// Look up a `gh pr merge`'s PR and rule on it.
-fn judge_pr(tokens: &[String], input: &HookInput, gh: &GhFactory<'_>) -> Option<Finding> {
+fn judge_pr(
+    tokens: &[String],
+    around: Surroundings,
+    input: &HookInput,
+    gh: &GhFactory<'_>,
+) -> Option<Finding> {
     let unresolved = Some(Finding::Unresolved(
         "the guard cannot tell which PR it merges",
     ));
     let Some(target) = FlipTarget::from_tokens(tokens) else {
         return unresolved;
     };
+    let explicit = match &target.selector {
+        PrSelector::Url { .. } => true,
+        PrSelector::Number(_) | PrSelector::Other(_) => target.repo.repo_arg().is_some(),
+        PrSelector::None | PrSelector::Unreadable => false,
+    };
+    if let Some(finding) = surroundings_block(explicit, around) {
+        return Some(finding);
+    }
     let ctx = FlipContext::for_target(&target, input);
     if !hosts_are_trusted(&target.named_hosts, ctx.origin_host.as_deref()) {
         return Some(Finding::Unresolved(
@@ -369,9 +528,13 @@ fn judge_pr(tokens: &[String], input: &HookInput, gh: &GhFactory<'_>) -> Option<
 fn judge_api(
     repo: Option<&str>,
     number: u64,
+    around: Surroundings,
     input: &HookInput,
     gh: &GhFactory<'_>,
 ) -> Option<Finding> {
+    if let Some(finding) = surroundings_block(repo.is_some(), around) {
+        return Some(finding);
+    }
     let number = number.to_string();
     let mut args = vec!["pr", "view", "--json", PR_VIEW_FIELDS];
     if let Some(repo) = repo {
@@ -387,7 +550,8 @@ fn lookup(gh: &dyn GhRunner, args: &[&str]) -> Option<Finding> {
     match gh.run(args).as_deref().and_then(parse_facts) {
         Some(facts) => rule(facts),
         None => Some(Finding::Unresolved(
-            "`gh pr view` could not name its head branch",
+            "`gh pr view` gave no head branch (it failed, timed out, or the hook ran out of \
+             time before calling it)",
         )),
     }
 }
@@ -397,14 +561,15 @@ fn judge(command: &str, remote: bool, input: &HookInput, gh: &GhFactory<'_>) -> 
     if !remote || !may_spell_word(command, "gh") {
         return None;
     }
-    merge_calls(command)
-        .into_iter()
-        .find_map(|call| match call {
-            MergeCall::Pr { tokens, .. } => judge_pr(&tokens, input, gh),
-            MergeCall::Api { repo, number } => judge_api(repo.as_deref(), number, input, gh),
-            MergeCall::Graphql(field) => Some(Finding::Graphql(field)),
-            MergeCall::Unreadable(why) => Some(Finding::Unresolved(why)),
-        })
+    let cwd = input.cwd.clone().unwrap_or_else(|| ".".to_string());
+    let (calls, around) = merge_calls(command, &cwd);
+    calls.into_iter().find_map(|call| match call {
+        MergeCall::Pr { tokens } => judge_pr(&tokens, around, input, gh),
+        MergeCall::Api { repo, number } => judge_api(repo.as_deref(), number, around, input, gh),
+        MergeCall::BranchMerge => Some(Finding::BranchMerge),
+        MergeCall::Graphql(field) => Some(Finding::Graphql(field)),
+        MergeCall::Unreadable(why) => Some(Finding::Unresolved(why)),
+    })
 }
 
 /// The block message for a finding.
@@ -428,6 +593,11 @@ fn block(finding: &Finding) -> CheckResult {
             format!("{url} is in a repository whose merges need Cameron's signature"),
             HAND_OFF,
         ),
+        Finding::BranchMerge => (
+            "this `gh api` call merges one branch into another with no PR, so there is no PR to own"
+                .to_string(),
+            HAND_OFF,
+        ),
         Finding::Graphql(field) => (
             format!(
                 "the GraphQL mutation `{field}` names the PR by node ID, so its head is not checked"
@@ -436,8 +606,8 @@ fn block(finding: &Finding) -> CheckResult {
         ),
         Finding::Unresolved(why) => (
             format!("the guard cannot confirm this merge is of the session's own PR: {why}"),
-            "name the PR plainly (`gh pr merge <n> -R owner/repo`), or post your result on the PR \
-             for the local chief-of-staff to merge",
+            "run the merge as its own command and name the PR (`gh pr merge <n> -R owner/repo`), \
+             or post your result on the PR for the local chief-of-staff to merge",
         ),
     };
     CheckResult::block_structured(
@@ -520,10 +690,19 @@ mod tests {
 
     /// Run the guard in a cloud session against a fake gh answering `answer`.
     fn cloud_with(command: &str, answer: Option<String>) -> (CheckResult, Vec<Vec<String>>) {
+        cloud_in("/nonexistent-cloud-merge-test", command, answer)
+    }
+
+    /// [`cloud_with`] with the payload cwd set to `cwd`.
+    fn cloud_in(
+        cwd: &str,
+        command: &str,
+        answer: Option<String>,
+    ) -> (CheckResult, Vec<Vec<String>>) {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&calls);
         let mut input = make_bash(command);
-        input.cwd = Some("/nonexistent-cloud-merge-test".to_string());
+        input.cwd = Some(cwd.to_string());
         let result = GuardCloudMerge::run_with(&input, true, &move |_cwd, _env| {
             Box::new(FakeGh {
                 answer: answer.clone(),
@@ -593,6 +772,7 @@ mod tests {
     #[test]
     fn cloud_merge_of_its_own_pr_passes() {
         for command in [
+            "eval \"gh pr merge 5\"",
             "gh pr merge 5 --squash",
             "gh pr merge --auto --squash 5",
             "gh pr merge",
@@ -682,7 +862,6 @@ mod tests {
     #[test]
     fn unreadable_merges_block_without_a_lookup() {
         for command in [
-            "eval \"gh pr merge 5\"",
             "gh pr merge 5 --bogus-flag x",
             "GH_HOST=evil.example gh pr merge 5",
             "gh api https://ghe.example/api/v3/repos/o/r/pulls/5/merge -X PUT",
@@ -754,11 +933,119 @@ mod tests {
             "gh api graphql -f query='mutation { addComment(input: {subjectId: \"S\", body: \"mergePullRequest\"}) { clientMutationId } }'",
             "echo 'gh pr merge 5'",
             "./gh-pr-merge-helper.sh",
+            "gh pr merge --help",
+            "gh api repos/$GITHUB_REPOSITORY/issues/5/comments -f body=hi",
+            "gh api -X POST \"repos/$REPO/issues/5/labels\" -f labels[]=x",
         ] {
             let (result, calls) = cloud_with(command, None);
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
             assert!(calls.is_empty(), "{command}: {calls:?}");
         }
+    }
+
+    #[test]
+    fn a_step_that_can_change_the_merged_pr_blocks_without_a_lookup() {
+        // Security review C1: each earlier step changes which PR gh merges,
+        // while the lookup would read the state from before the command.
+        for command in [
+            "gh pr checkout 7 && gh pr merge --squash",
+            "git switch feat/x && gh pr merge --squash",
+            "git checkout -b tmp origin/feat && gh pr merge",
+            "cd /tmp/other && gh pr merge 5 --squash",
+            "cd x; gh pr merge 5",
+            "bash -c \"cd x && gh pr merge 5\"",
+            "cd /tmp/other && gh api -X PUT repos/{owner}/{repo}/pulls/5/merge",
+            "export GH_REPO=a/b; gh pr merge 5",
+            "GH_REPO=a/b; gh pr merge 5",
+            "export GH_REPO=a/b; gh api -X PUT repos/{owner}/{repo}/pulls/5/merge",
+            "gh repo set-default a/b && gh pr merge 5",
+            "export GH_HOST=ghe.example; gh pr merge 5 -R o/r",
+            "x=$(gh pr checkout 7 && gh pr merge)",
+            "gh api -X PATCH \"repos/$REPO/pulls/$N\" -f title=x",
+        ] {
+            let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
+            assert_eq!(result.outcome, Outcome::Block, "{command}");
+            assert!(calls.is_empty(), "{command}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_or_undisturbed_merge_still_looks_up() {
+        for command in [
+            "cd /tmp/other && gh pr merge 5 -R o/r",
+            "cd /tmp/other && gh pr merge https://github.com/o/r/pull/5",
+            "cd /tmp/other && gh api -X PUT repos/o/r/pulls/5/merge",
+            "git status && gh pr merge --squash",
+            "gh pr view 5 --json headRefName && gh pr merge 5",
+        ] {
+            let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
+            assert_eq!(result.outcome, Outcome::Allow, "{command}");
+            assert_eq!(calls.len(), 1, "{command}: {calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_gh_repo_prefix_reaches_the_lookup() {
+        let (_, calls) = cloud_with(
+            "GH_REPO=a/b gh pr merge 5",
+            Some(pr_json(OWN, false, &[], URL)),
+        );
+        assert_eq!(
+            calls,
+            vec![vec![
+                "pr",
+                "view",
+                "--json",
+                PR_VIEW_FIELDS,
+                "-R",
+                "a/b",
+                "--",
+                "5"
+            ]]
+        );
+    }
+
+    #[test]
+    fn branch_merges_block() {
+        for command in [
+            "gh api -X POST repos/o/r/merges -f base=main -f head=feat",
+            "gh api repos/o/r/merges -f base=main -f head=feat",
+            "gh api graphql -f query='mutation { mergeBranch(input: {repositoryId: \"R\"}) { clientMutationId } }'",
+        ] {
+            let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
+            assert_eq!(result.outcome, Outcome::Block, "{command}");
+            assert!(calls.is_empty(), "{command}: {calls:?}");
+        }
+        let (result, _) = cloud_with("gh api repos/o/r/merges", None);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn a_graphql_query_file_is_read_only_when_the_call_stands_alone() {
+        let dir = std::env::temp_dir().join(format!("cloud-merge-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("read.graphql"), "query { viewer { login } }").unwrap();
+        std::fs::write(
+            dir.join("merge.graphql"),
+            "mutation { mergePullRequest(input: {pullRequestId: \"P\"}) { clientMutationId } }",
+        )
+        .unwrap();
+        let cwd = dir.to_str().unwrap();
+        let run = |command: &str| cloud_in(cwd, command, None).0.outcome;
+        assert_eq!(run("gh api graphql -F query=@read.graphql"), Outcome::Allow);
+        assert_eq!(
+            run("gh api graphql -F query=@merge.graphql"),
+            Outcome::Block
+        );
+        assert_eq!(
+            run("cp merge.graphql read.graphql && gh api graphql -F query=@read.graphql"),
+            Outcome::Block
+        );
+        assert_eq!(
+            run("gh api graphql -F query=@missing.graphql"),
+            Outcome::Block
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
