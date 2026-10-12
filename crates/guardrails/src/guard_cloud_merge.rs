@@ -34,31 +34,29 @@
 //! `gh pr create … && gh pr merge` never passes: the lookup runs before the
 //! command, when the PR does not exist yet. Create the PR, then merge it in a
 //! separate command.
-//! Likewise `git push && gh pr merge` with no PR named blocks: `git push -u`
-//! rewrites the branch upstream that gh resolves the PR through, after the
-//! lookup ran. A merge that names its repo and PR (`gh pr merge 5 -R o/r`, or
-//! a URL) passes, since that does not read branch config; a bare number
-//! still resolves the repo from the cwd, so it blocks too.
 //!
-//! **The lookup runs before the command does.** It reads the payload cwd,
-//! the checked-out branch, and the hook's env, and another step of the same
-//! command can change all three (`gh pr checkout 7 && gh pr merge`,
-//! `cd other && gh pr merge 5`, `export GH_REPO=a/b; gh pr merge 5`), as can
-//! the merge's own step (`GIT_DIR=… gh pr merge`, `find -execdir gh pr merge`)
-//! and an earlier merge (`gh pr merge -d` checks out the base branch). So a
-//! merge that resolves its PR from that state passes only when every step
-//! that can run before it is a known read-only command
-//! ([`segment_is_inert`]) and its own step is unwrapped. In a flat
-//! `&&`/`;`/`||` list ([`is_flat`]) that is only the earlier steps, so
-//! `gh pr merge 5 && git pull` passes; anywhere else every other step counts.
-//! Any merge blocks when a step that can run before it mentions a `GH_*`
-//! variable.
+//! **An implicit merge must come first; name the repo with `-R` to chain
+//! it.** The lookup runs before the command does. It reads the payload cwd,
+//! the checked-out branch, its upstream config, and the hook's env, and any
+//! earlier step can change them: `gh pr checkout 7`, `cd other`,
+//! `export GH_REPO=a/b`, `git push -u fork HEAD`, `git fetch --set-upstream`,
+//! or another merge (`gh pr merge -d` checks out the base branch). An earlier
+//! read-only list kept missing commands like these, so it is gone. A merge
+//! that does not name its repo and PR (no `-R` with the number, no URL; a
+//! bare `gh pr merge 5` counts as unnamed) passes only when nothing can run
+//! before it and its own step has no wrapper (`find -execdir`, `env -C`) or
+//! `GIT_*` prefix. In a flat `&&`/`;`/`||` list ([`is_flat`]) the steps after
+//! the merge cannot run before it, so `gh pr merge 5 && git pull` passes;
+//! with a pipe, a background job, a loop, or a substitution, every other step
+//! counts as possibly earlier. A named merge (`gh pr merge 5 -R o/r && …`, a
+//! URL) can follow other steps, but any merge blocks when a step that can
+//! run before it mentions a `GH_*` variable.
 //!
 //! **Fails closed.** A merge whose head cannot be resolved blocks: an
 //! unreadable selector, a `gh` call that fails or times out, a host the
 //! command names other than `github.com` or `origin`'s, a `gh api` write
 //! whose computed endpoint may end in `merge`, and a GraphQL query that is
-//! neither inline nor a file read while the call is the whole command. That
+//! neither inline nor a file read while the call is the first step. That
 //! last one also blocks read-only queries passed as `"$Q"`; it is the
 //! accepted cost. A merge sent by another client (`curl` to the REST API) or
 //! through a computed program name (`$(which gh) pr merge`) is outside the
@@ -72,7 +70,7 @@ use regex::Regex;
 
 use cadence_hooks_core::shell::{
     PrSelector, command_segments, command_word, executable_tokens, gh_command_path, gh_pr_segments,
-    gh_pr_subcommand, is_assignment_word, may_spell_word, pr_url_parts, skip_transparent_prefixes,
+    gh_pr_subcommand, is_assignment_word, may_spell_word, pr_url_parts,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -237,10 +235,10 @@ static NOT_FLAT_WORD: LazyLock<Regex> = LazyLock::new(|| {
 /// What the rest of the command can do to the state a merge's lookup reads.
 #[derive(Debug, Clone, Copy)]
 struct Surroundings {
-    /// Every step that can run before the merge is a known read-only
-    /// command, and the merge's own step has no wrapper or `GIT_*` prefix,
-    /// so nothing can move the cwd, switch the branch, change the default
-    /// repo, or write a file before the lookup's state is used.
+    /// No step can run before the merge, and the merge's own step has no
+    /// wrapper or `GIT_*` prefix, so nothing can move the cwd, switch the
+    /// branch, rewrite branch config, change the default repo, or write a
+    /// file before the state the lookup read is used.
     inert: bool,
     /// A step that can run before the merge mentions a `GH_*` variable,
     /// which can repoint gh (`export GH_REPO=…`) even for an explicit `-R`.
@@ -262,42 +260,6 @@ fn is_flat(command: &str) -> bool {
     let joined = strip_harmless_redirects(command);
     let joined = joined.replace("||", " ").replace("&&", " ");
     !joined.contains(['|', '&'])
-}
-
-/// Whether a segment is a command that cannot change what a later merge's
-/// lookup reads: the cwd, the checked-out branch, gh's default repo or
-/// host, or a file. An allowlist, so an unknown command counts as a change.
-fn segment_is_inert(segment: &str) -> bool {
-    if strip_harmless_redirects(segment).contains(['>', '<']) {
-        return false;
-    }
-    let tokens = executable_tokens(segment);
-    let rest = skip_transparent_prefixes(&tokens);
-    let Some(head) = rest.first() else {
-        // Nothing but assignments, which reach gh through `GH_*` and git
-        // through `GIT_*`.
-        return !GH_VAR.is_match(segment) && !GIT_VAR.is_match(segment);
-    };
-    match command_word(head).as_ref() {
-        "echo" | "printf" | "true" | ":" | "test" | "[" | "sleep" | "pwd" | "cat" | "ls"
-        | "head" | "tail" | "grep" | "jq" | "wc" => true,
-        // `add` and `commit` change the index or history, not the cwd, branch,
-        // or gh's default repo. `push` is left off: `push -u` rewrites the
-        // branch upstream that a merge with no PR named resolves through.
-        "git" => {
-            matches!(
-                rest.get(1).map(String::as_str),
-                Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse" | "add" | "commit")
-            ) && !rest
-                .iter()
-                .any(|t| t.starts_with("--output") || t.starts_with("--upload-pack"))
-        }
-        "gh" => matches!(
-            gh_command_path(rest, 2).as_slice(),
-            ["pr" | "issue", "view" | "comment" | "status"] | ["pr", "checks" | "diff"]
-        ),
-        _ => false,
-    }
 }
 
 /// Whether a merge's own step runs gh somewhere other than the payload cwd
@@ -483,7 +445,7 @@ fn merge_calls(command: &str, cwd: &str) -> Vec<(MergeCall, Surroundings)> {
             .as_deref()
             .map(|a| gh_command_path(a, 2))
             .unwrap_or_default();
-        let quiet_before = || before(idx).all(|(_, s)| segment_is_inert(s));
+        let quiet_before = || before(idx).next().is_none();
         let call = match (pr_merge, argv_path.as_slice()) {
             (Some(tokens), _) if merges_nothing(&tokens) => None,
             (Some(tokens), _) => Some(MergeCall::Pr { tokens }),
@@ -504,8 +466,7 @@ fn merge_calls(command: &str, cwd: &str) -> Vec<(MergeCall, Surroundings)> {
         .into_iter()
         .map(|(idx, call)| {
             let around = Surroundings {
-                inert: !own_step_is_wrapped(&segments[idx])
-                    && before(idx).all(|(_, s)| segment_is_inert(s)),
+                inert: !own_step_is_wrapped(&segments[idx]) && before(idx).next().is_none(),
                 sets_gh_env: before(idx).any(|(_, s)| GH_VAR.is_match(s)),
             };
             (call, around)
@@ -1090,8 +1051,8 @@ mod tests {
             "cd /tmp/other && gh pr merge 5 -R o/r",
             "cd /tmp/other && gh pr merge https://github.com/o/r/pull/5",
             "cd /tmp/other && gh api -X PUT repos/o/r/pulls/5/merge",
-            "git status && gh pr merge --squash",
-            "gh pr view 5 --json headRefName && gh pr merge 5",
+            "git status && gh pr merge 5 -R o/r --squash",
+            "gh pr view 5 --json headRefName && gh pr merge 5 -R o/r",
         ] {
             let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
@@ -1160,9 +1121,11 @@ mod tests {
             run("gh api graphql -F query=@missing.graphql"),
             Outcome::Block
         );
+        // A pipe runs its steps together, so `jq` may run first: the file is
+        // not read (round 5 removed the read-only list).
         assert_eq!(
             run("gh api graphql -F query=@read.graphql | jq .data"),
-            Outcome::Allow
+            Outcome::Block
         );
         assert_eq!(
             run("gh api graphql -F query=@merge.graphql | jq .data"),
@@ -1191,15 +1154,15 @@ mod tests {
             "gh pr merge 5 --squash && git pull",
             "gh pr merge --squash --delete-branch && git checkout main && git pull",
             "gh pr merge 5; git switch main",
-            "git status 2>/dev/null && gh pr merge --squash",
-            "gh pr view --json headRefName 2>&1 && gh pr merge --squash",
-            "echo done >&2 && gh pr merge 5",
-            "echo HIGH_PRIORITY && gh pr merge 5",
-            "git add . && gh pr merge --squash",
-            "git commit -m x && gh pr merge --squash",
+            "gh pr merge 5 --squash 2>/dev/null && git pull",
+            "gh pr view 5 2>&1 && gh pr merge 5 -R o/r --squash",
+            "echo done >&2 && gh pr merge 5 -R o/r",
+            // `GH_` matches a whole word, so this is not a `GH_*` change.
+            "echo HIGH_PRIORITY && gh pr merge 5 -R o/r",
+            "git add . && git commit -m x && gh pr merge 5 -R o/r --squash",
             "git push && gh pr merge 5 -R o/r --squash",
             "git push -u origin HEAD && gh pr merge https://github.com/o/r/pull/5",
-            "git status 2>/dev/null >&2 && gh pr merge 5",
+            "git status 2>/dev/null >&2 && gh pr merge 5 -R o/r",
         ] {
             let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
             assert_eq!(result.outcome, Outcome::Allow, "{command}");
@@ -1223,6 +1186,13 @@ mod tests {
             "gh pr merge 5 | git checkout x",
             "gh pr merge 5 & git checkout x",
             "for i in 1; do gh pr merge 5; git checkout x; done",
+            // Round 5: an implicit merge must come first. Each earlier miss
+            // came from a step a read-only list let through.
+            "git fetch --set-upstream fork claude/x && gh pr merge --squash",
+            "git add . && git commit -m x && gh pr merge --squash",
+            "git status && gh pr merge --squash",
+            "echo hi && gh pr merge 5",
+            "gh pr merge 4 -R o/r && gh pr merge 5",
             // `git push -u` repoints the upstream a selector-less merge reads.
             "git push -u fork HEAD && gh pr merge --squash",
             "git push && gh pr merge",
