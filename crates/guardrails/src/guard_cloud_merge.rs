@@ -34,6 +34,11 @@
 //! `gh pr create … && gh pr merge` never passes: the lookup runs before the
 //! command, when the PR does not exist yet. Create the PR, then merge it in a
 //! separate command.
+//! Likewise `git push && gh pr merge` with no PR named blocks: `git push -u`
+//! rewrites the branch upstream that gh resolves the PR through, after the
+//! lookup ran. A merge that names its repo and PR (`gh pr merge 5 -R o/r`, or
+//! a URL) passes, since that does not read branch config; a bare number
+//! still resolves the repo from the cwd, so it blocks too.
 //!
 //! **The lookup runs before the command does.** It reads the payload cwd,
 //! the checked-out branch, and the hook's env, and another step of the same
@@ -276,22 +281,13 @@ fn segment_is_inert(segment: &str) -> bool {
     match command_word(head).as_ref() {
         "echo" | "printf" | "true" | ":" | "test" | "[" | "sleep" | "pwd" | "cat" | "ls"
         | "head" | "tail" | "grep" | "jq" | "wc" => true,
-        // `add`, `commit`, and `push` change the index, history, or remote, not
-        // the cwd, branch, or gh's default repo.
+        // `add` and `commit` change the index or history, not the cwd, branch,
+        // or gh's default repo. `push` is left off: `push -u` rewrites the
+        // branch upstream that a merge with no PR named resolves through.
         "git" => {
             matches!(
                 rest.get(1).map(String::as_str),
-                Some(
-                    "status"
-                        | "log"
-                        | "diff"
-                        | "show"
-                        | "fetch"
-                        | "rev-parse"
-                        | "add"
-                        | "commit"
-                        | "push"
-                )
+                Some("status" | "log" | "diff" | "show" | "fetch" | "rev-parse" | "add" | "commit")
             ) && !rest
                 .iter()
                 .any(|t| t.starts_with("--output") || t.starts_with("--upload-pack"))
@@ -1201,7 +1197,8 @@ mod tests {
             "echo HIGH_PRIORITY && gh pr merge 5",
             "git add . && gh pr merge --squash",
             "git commit -m x && gh pr merge --squash",
-            "git push && gh pr merge --auto --squash",
+            "git push && gh pr merge 5 -R o/r --squash",
+            "git push -u origin HEAD && gh pr merge https://github.com/o/r/pull/5",
             "git status 2>/dev/null >&2 && gh pr merge 5",
         ] {
             let (result, calls) = cloud_with(command, Some(pr_json(OWN, false, &[], URL)));
@@ -1226,6 +1223,10 @@ mod tests {
             "gh pr merge 5 | git checkout x",
             "gh pr merge 5 & git checkout x",
             "for i in 1; do gh pr merge 5; git checkout x; done",
+            // `git push -u` repoints the upstream a selector-less merge reads.
+            "git push -u fork HEAD && gh pr merge --squash",
+            "git push && gh pr merge",
+            "git push && gh pr merge 5",
             // The PR does not exist when the lookup runs.
             "gh pr create --fill && gh pr merge --auto",
             // A redirect to a real file is a write (`>&2q` writes `2q`).
