@@ -70,7 +70,7 @@ use regex::Regex;
 
 use cadence_hooks_core::shell::{
     PrSelector, command_segments, command_word, executable_tokens, gh_command_path, gh_pr_segments,
-    gh_pr_subcommand, is_assignment_word, may_spell_word, pr_url_parts,
+    gh_pr_subcommand, is_assignment_word, may_spell_word, pr_url_parts, strip_group_wrappers,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -78,7 +78,7 @@ use crate::bounded_tool::BoundedGhRunner;
 use crate::guard_gh_write::{
     API_FIELD_FLAGS, API_INPUT_FLAG, MUTATION_KEYWORD, api_explicit_method,
     api_method_forces_write, gh_api_endpoint, gh_argv, graphql_query_value,
-    graphql_root_mutation_fields, is_graphql_endpoint, segment_invokes_gh, strip_graphql_literals,
+    graphql_root_mutation_fields, is_graphql_endpoint, strip_graphql_literals,
 };
 use crate::warn_unreviewed_ready_flip::{FlipContext, FlipTarget, GhRunner, hosts_are_trusted};
 
@@ -417,8 +417,8 @@ fn merges_nothing(tokens: &[String]) -> bool {
 /// In a flat list ([`is_flat`]) only the steps before a merge can change
 /// that state, so `gh pr merge 5 && git pull` judges the merge alone. In
 /// anything else every other step counts, since it may run first. Another
-/// merge step is never on the read-only list, so it always counts as a change
-/// (`gh pr merge -d` checks out the base branch), and so does a wrapper on
+/// merge step counts like any other earlier step (`gh pr merge -d` checks
+/// out the base branch), and so does a wrapper on
 /// the merge's own step.
 fn merge_calls(command: &str, cwd: &str) -> Vec<(MergeCall, Surroundings)> {
     let segments = command_segments(command);
@@ -431,9 +431,11 @@ fn merge_calls(command: &str, cwd: &str) -> Vec<(MergeCall, Surroundings)> {
     };
     let mut calls: Vec<(usize, MergeCall)> = Vec::new();
     for (idx, segment) in segments.iter().enumerate() {
-        if !segment_invokes_gh(segment) {
-            continue;
-        }
+        // No `segment_invokes_gh` pre-filter: it reads `(gh` as one word that
+        // is not `gh`, so `(gh pr merge 99)` was skipped before any walk below
+        // ran. The walks decide, and the argv walk reads the segment without
+        // its group wrappers for the same reason.
+        let segment = strip_group_wrappers(segment);
         // The shared `gh pr` walk strips group punctuation (`merge)` inside
         // `$(…)`) and keeps the prefixes (`GH_REPO=`, `GH_HOST=`) that decide
         // which PR gh merges, so it is the one the lookup reads.
@@ -818,6 +820,13 @@ mod tests {
     #[test]
     fn cloud_merge_of_a_foreign_pr_blocks() {
         for command in [
+            // Round 6: a `(` glued to `gh` used to skip the step entirely.
+            "(gh pr merge 99)",
+            "(gh pr merge 99 --squash) 2>&1 | tail -5",
+            "(gh pr merge 99 --squash && echo ok) || echo failed",
+            "true; (gh pr merge 99)",
+            "(gh api -X PUT repos/e/x/pulls/9/merge)",
+            "(gh api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }')",
             "gh pr merge 5 --squash",
             "gh pr merge --auto --squash 5",
             "gh pr merge",
