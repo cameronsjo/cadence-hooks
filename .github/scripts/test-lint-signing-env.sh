@@ -81,6 +81,20 @@ EOF
 case_ "an alias to the name is matched" 1 "$(alias_job macos-signing 'environment: *e')"
 case_ "an alias inside a map name is matched" 1 "$(alias_job macos-signing 'environment: {name: *e}')"
 case_ "an alias to an expression is refused" 1 "$(alias_job "\"\${{ 'macos-signing' }}\"" 'environment: *e')"
+# A whole job written as an alias is the shape only `explode` resolves:
+# yq follows the other aliases on its own while walking a path.
+case_ "a job that is an alias is matched" 1 "$(cat <<'EOF'
+x-job: &j
+  environment: macos-signing
+  runs-on: macos-latest
+  steps: [{run: 'true'}]
+on:
+  push:
+    branches: [main]
+jobs:
+  sign: *j
+EOF
+)"
 
 if [[ "$fails" -eq 0 ]]; then echo "RESULT: all checks passed"; else echo "RESULT: $fails check(s) FAILED"; fi
 exit "$fails"
