@@ -1066,8 +1066,9 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
 /// `None` keeps the old verdict: a value this cannot read (an expansion that
 /// is not a git call's own parsed `-C`, an option with no value after it),
 /// or `--exec-path`/`--config-env`, which move git somewhere no probe sees.
-/// A path that does not exist holds no config and is left out; another
-/// tool's `-C` (`grep -C 2`, `make -C build`) is probed harmlessly.
+/// A path that does not exist also keeps the old verdict, as the command
+/// may create it first; a count (`grep -C 2`) is skipped, and another tool's
+/// directory (`make -C build`) is probed harmlessly.
 fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
     let plain: String = command
         .chars()
@@ -1102,7 +1103,8 @@ fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
     for option in ["-C", "--git-dir"] {
         for (pos, _) in plain.match_indices(option) {
             let before = plain[..pos].chars().next_back();
-            if before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+            // A dash before it is a default value's (`${o:--C ../x}`).
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
             let after = &plain[pos + option.len()..];
@@ -1114,7 +1116,7 @@ fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
             };
             let value: String = value
                 .chars()
-                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')'))
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')' | '}'))
                 .collect();
             if value.is_empty() {
                 return None;
@@ -1124,8 +1126,17 @@ fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
                 own_values.swap_remove(i);
                 continue;
             }
+            // A count (`grep -C 2`) names no directory.
+            if value.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // A path that does not exist yet may be one the command creates
+            // first (`cp -r ../a ../b; opts="-C ../b"`): the old verdict.
             let dir = resolve_cd_target(&value, at);
-            if std::path::Path::new(&dir).exists() && !dirs.contains(&dir) {
+            if !std::path::Path::new(&dir).exists() {
+                return None;
+            }
+            if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
         }
@@ -4114,6 +4125,9 @@ mod tests {
             "f() { echo \"-C ../other\"; }; for c in status ship; do git $(f) $c; done",
             "echo \"-C ../other\" | { opts=$(cat); git $opts ship; }",
             "o=-C; git $o ../other ship",
+            ": ${opts:=-C ../other}; git $opts ship",
+            "opts=${opts:-\"-C ../other\"}; git $opts ship",
+            "cp -r ../other ../o2; opts=\"-C ../o2\"; git $opts ship",
             // A value read from a here-string, a pipe or `printf -v`.
             "read -r opts <<< \"-C ../other\"; git $opts ship",
             "printf -v opts '%s' \"-C ../other\"; git $opts ship",
@@ -4140,8 +4154,10 @@ mod tests {
             "git \"$(echo pu)sh\" origin main",
             // Another tool's options and prose are not git's.
             "for c in status log; do git $c; done | wc -c",
-            "for c in status log; do git $c; done; grep -C 2 x f; make -C build; bash -c true",
-            "echo \"use git -C dir\"; for c in status; do git $c; done",
+            // A count is no directory, and an existing one is probed. (A
+            // `-C` naming a path that does not exist, even in prose, keeps
+            // the old verdict: the command may create it first.)
+            "for c in status log; do git $c; done; grep -C 2 x f; make -C .; bash -c true",
             // polish's shape: a `-C` directory this guard cannot follow.
             "g() { git -C \"$REPO\" -c core.hooksPath=/dev/null \"$@\"; }\n\
              g status --porcelain > \"$RV/s\"\n{ g diff -U10 \"$BASE\" --; } > \"$OUT\"\n\
